@@ -15,6 +15,11 @@ pub mod oid {
     pub const INT2VECTOR: i32 = 22;
     pub const OIDVECTOR: i32 = 30;
     pub const PG_NODE_TREE: i32 = 194;
+    pub const PG_NDISTINCT: i32 = 3361;
+    pub const PG_DEPENDENCIES: i32 = 3402;
+    pub const PG_MCV_LIST: i32 = 5017;
+    pub const PG_STATISTIC_ARRAY: i32 = 10028;
+    pub const PG_STATISTIC_ROW: i32 = 10029;
     pub const INT4: i32 = 23;
     pub const OID: i32 = 26;
     pub const OID_ARRAY: i32 = 1028;
@@ -130,6 +135,10 @@ pub enum ColType {
     /// PostgreSQL's internal parse-tree text used by catalog definition
     /// reconstructors. It is transient catalog data, never a stored column.
     PgNodeTree,
+    PgNdistinct,
+    PgDependencies,
+    PgMcvList,
+    PgStatisticArray,
     Int4,
     /// PostgreSQL object identity, retaining its catalog and wire metadata
     /// while sharing the engine's four-byte integer datum storage.
@@ -295,7 +304,8 @@ impl BtreeOperatorClass {
             Timetz => Self::Timetz,
             Uuid => Self::Uuid,
             Bit { varying: true } => Self::Varbit,
-            Void | Int2Vector | OidVector | PgNodeTree | Json => return None,
+            Void | Int2Vector | OidVector | PgNodeTree | PgNdistinct | PgDependencies
+            | PgMcvList | PgStatisticArray | Json => return None,
         })
     }
 
@@ -552,6 +562,10 @@ impl ColType {
             Self::Int2Vector => oid::INT2VECTOR,
             Self::OidVector => oid::OIDVECTOR,
             Self::PgNodeTree => oid::PG_NODE_TREE,
+            Self::PgNdistinct => oid::PG_NDISTINCT,
+            Self::PgDependencies => oid::PG_DEPENDENCIES,
+            Self::PgMcvList => oid::PG_MCV_LIST,
+            Self::PgStatisticArray => oid::PG_STATISTIC_ARRAY,
             Self::Int4 => oid::INT4,
             Self::Oid => oid::OID,
             Self::Regtype => oid::REGTYPE,
@@ -606,6 +620,10 @@ impl ColType {
             oid::INT2VECTOR => Some(Self::Int2Vector),
             oid::OIDVECTOR => Some(Self::OidVector),
             oid::PG_NODE_TREE => Some(Self::PgNodeTree),
+            oid::PG_NDISTINCT => Some(Self::PgNdistinct),
+            oid::PG_DEPENDENCIES => Some(Self::PgDependencies),
+            oid::PG_MCV_LIST => Some(Self::PgMcvList),
+            oid::PG_STATISTIC_ARRAY => Some(Self::PgStatisticArray),
             oid::INT4 => Some(Self::Int4),
             oid::OID => Some(Self::Oid),
             oid::REGPROC => Some(Self::Regproc),
@@ -704,7 +722,13 @@ impl ColType {
             Self::Void => 4,
             Self::Bool => 1,
             Self::Int2 => 2,
-            Self::Int2Vector | Self::OidVector | Self::PgNodeTree => -1,
+            Self::Int2Vector
+            | Self::OidVector
+            | Self::PgNodeTree
+            | Self::PgNdistinct
+            | Self::PgDependencies
+            | Self::PgMcvList
+            | Self::PgStatisticArray => -1,
             Self::Int4
             | Self::Oid
             | Self::Regtype
@@ -745,7 +769,14 @@ impl ColType {
     pub fn storage(self) -> ColType {
         match self {
             Self::Float4 => Self::Float8,
-            Self::Varchar | Self::Bpchar | Self::Name | Self::PgNodeTree => Self::Text,
+            Self::Varchar
+            | Self::Bpchar
+            | Self::Name
+            | Self::PgNodeTree
+            | Self::PgNdistinct
+            | Self::PgDependencies
+            | Self::PgMcvList
+            | Self::PgStatisticArray => Self::Text,
             Self::Oid => Self::Int4,
             Self::Regtype
             | Self::Regproc
@@ -768,6 +799,10 @@ impl ColType {
             Self::Int2Vector => "int2vector",
             Self::OidVector => "oidvector",
             Self::PgNodeTree => "pg_node_tree",
+            Self::PgNdistinct => "pg_ndistinct",
+            Self::PgDependencies => "pg_dependencies",
+            Self::PgMcvList => "pg_mcv_list",
+            Self::PgStatisticArray => "pg_statistic[]",
             Self::Int4 => "int4",
             Self::Oid => "oid",
             Self::Regtype => "regtype",
@@ -830,6 +865,10 @@ impl ColType {
             Self::Int2Vector => "int2vector",
             Self::OidVector => "oidvector",
             Self::PgNodeTree => "pg_node_tree",
+            Self::PgNdistinct => "pg_ndistinct",
+            Self::PgDependencies => "pg_dependencies",
+            Self::PgMcvList => "pg_mcv_list",
+            Self::PgStatisticArray => "pg_statistic[]",
             Self::Int4 => "integer",
             Self::Oid => "oid",
             Self::Regtype => "regtype",
@@ -905,6 +944,10 @@ impl ColType {
             Self::Int2Vector => 55,
             Self::OidVector => 68,
             Self::PgNodeTree => 67,
+            Self::PgNdistinct => 69,
+            Self::PgDependencies => 70,
+            Self::PgMcvList => 71,
+            Self::PgStatisticArray => 72,
             Self::Float4 => 13,
             Self::Varchar => 14,
             Self::Bpchar => 15,
@@ -967,6 +1010,10 @@ impl ColType {
             12 => Self::Int2,
             55 => Self::Int2Vector,
             68 => Self::OidVector,
+            69 => Self::PgNdistinct,
+            70 => Self::PgDependencies,
+            71 => Self::PgMcvList,
+            72 => Self::PgStatisticArray,
             13 => Self::Float4,
             14 => Self::Varchar,
             15 => Self::Bpchar,
@@ -1003,6 +1050,9 @@ impl ColType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrElem {
     Bool,
+    /// PostgreSQL's internal one-byte `"char"`, used by system catalogs.
+    /// SQL `char` remains the distinct blank-padded `bpchar` type.
+    Char,
     Int4,
     Oid,
     Int8,
@@ -1073,8 +1123,9 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 48] = [
+    pub const BUILTIN: [Self; 49] = [
         Self::Bool,
+        Self::Char,
         Self::Int2,
         Self::Int4,
         Self::Oid,
@@ -1143,6 +1194,7 @@ impl ArrElem {
     pub fn catalog_name(self) -> &'static str {
         match self {
             ArrElem::Bool => "_bool",
+            ArrElem::Char => "_char",
             ArrElem::Int4 => "_int4",
             ArrElem::Oid => "_oid",
             ArrElem::Int8 => "_int8",
@@ -1206,6 +1258,7 @@ impl ArrElem {
     pub fn array_name(self) -> &'static str {
         match self {
             ArrElem::Bool => "boolean[]",
+            ArrElem::Char => "\"char\"[]",
             ArrElem::Int4 => "integer[]",
             ArrElem::Oid => "oid[]",
             ArrElem::Int8 => "bigint[]",
@@ -1378,6 +1431,7 @@ impl ArrElem {
     pub fn to_coltype(self) -> ColType {
         match self {
             ArrElem::Bool => ColType::Bool,
+            ArrElem::Char => ColType::Bpchar,
             ArrElem::Int4 => ColType::Int4,
             ArrElem::Oid => ColType::Oid,
             ArrElem::Int8 => ColType::Int8,
@@ -1437,6 +1491,7 @@ impl ArrElem {
     pub fn array_oid(self) -> i32 {
         match self {
             ArrElem::Bool => 1000,
+            ArrElem::Char => 1002,
             ArrElem::Int4 => 1007,
             ArrElem::Oid => oid::OID_ARRAY,
             ArrElem::Int8 => 1016,
@@ -1486,6 +1541,7 @@ impl ArrElem {
     pub fn element_oid(self) -> i32 {
         match self {
             ArrElem::Domain { slot, .. } => oid::domain_oid(slot),
+            ArrElem::Char => 18,
             _ => self.to_coltype().oid(),
         }
     }
@@ -1493,6 +1549,7 @@ impl ArrElem {
     pub fn code(self) -> u8 {
         match self {
             ArrElem::Bool => 0,
+            ArrElem::Char => 126,
             ArrElem::Int4 => 1,
             ArrElem::Oid => 63,
             ArrElem::Int8 => 2,
@@ -1539,6 +1596,7 @@ impl ArrElem {
     pub fn from_code(c: u8) -> Option<ArrElem> {
         Some(match c {
             0 => ArrElem::Bool,
+            126 => ArrElem::Char,
             1 => ArrElem::Int4,
             63 => ArrElem::Oid,
             2 => ArrElem::Int8,

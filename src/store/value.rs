@@ -154,10 +154,8 @@ impl ValueIndexWriter {
     }
 }
 
-/// Walks every roster node and data-block identity in a generation. Legacy
-/// one-node rosters remain readable; new generations use the chained form.
-/// Returning false from `visit` stops before any caller-owned keep-set can
-/// overflow.
+/// Walks every roster node and data-block identity in a generation. Returning
+/// false from `visit` stops before any caller-owned keep-set can overflow.
 pub(crate) fn walk_value_roster(
     store: &mut dyn BlockStore,
     root: BlockId,
@@ -174,13 +172,14 @@ pub(crate) fn walk_value_roster(
             return Err(ValueIndexError::Corrupt);
         }
         let raw_count = u32::from_le_bytes(scratch[..4].try_into().unwrap());
-        let chained = raw_count & ROSTER_CHAINED != 0;
-        let block_count = (raw_count & !ROSTER_CHAINED) as usize;
-        let ids_at = if chained { ROSTER_HEADER } else { 4 };
-        if roster_len != ids_at + block_count * 32 {
+        if raw_count & ROSTER_CHAINED == 0 {
             return Err(ValueIndexError::Corrupt);
         }
-        next = if chained && scratch[4..36].iter().any(|byte| *byte != 0) {
+        let block_count = (raw_count & !ROSTER_CHAINED) as usize;
+        if roster_len != ROSTER_HEADER + block_count * 32 {
+            return Err(ValueIndexError::Corrupt);
+        }
+        next = if scratch[4..36].iter().any(|byte| *byte != 0) {
             let mut id = [0; 32];
             id.copy_from_slice(&scratch[4..36]);
             Some(BlockId(id))
@@ -188,7 +187,7 @@ pub(crate) fn walk_value_roster(
             None
         };
         for block in 0..block_count {
-            let at = ids_at + block * 32;
+            let at = ROSTER_HEADER + block * 32;
             let mut id = [0; 32];
             id.copy_from_slice(&scratch[at..at + 32]);
             if !visit(BlockId(id)) {
@@ -244,13 +243,14 @@ impl<'a> ValueIndexReader<'a> {
                 return Err(ValueIndexError::Corrupt);
             }
             let raw_count = u32::from_le_bytes(self.roster[..4].try_into().unwrap());
-            let chained = raw_count & ROSTER_CHAINED != 0;
-            let block_count = (raw_count & !ROSTER_CHAINED) as usize;
-            let ids_at = if chained { ROSTER_HEADER } else { 4 };
-            if roster_len != ids_at + block_count * 32 {
+            if raw_count & ROSTER_CHAINED == 0 {
                 return Err(ValueIndexError::Corrupt);
             }
-            next = if chained && self.roster[4..36].iter().any(|byte| *byte != 0) {
+            let block_count = (raw_count & !ROSTER_CHAINED) as usize;
+            if roster_len != ROSTER_HEADER + block_count * 32 {
+                return Err(ValueIndexError::Corrupt);
+            }
+            next = if self.roster[4..36].iter().any(|byte| *byte != 0) {
                 let mut id = [0; 32];
                 id.copy_from_slice(&self.roster[4..36]);
                 Some(BlockId(id))
@@ -258,7 +258,7 @@ impl<'a> ValueIndexReader<'a> {
                 None
             };
             for block in 0..block_count {
-                let at = ids_at + block * 32;
+                let at = ROSTER_HEADER + block * 32;
                 let mut id = [0; 32];
                 id.copy_from_slice(&self.roster[at..at + 32]);
                 let (data_len, kind) = store.get(&BlockId(id), self.data)?;
@@ -363,5 +363,31 @@ mod tests {
             .unwrap()
         );
         assert_eq!(identities, 3, "two roster roots plus one data block");
+    }
+
+    #[test]
+    fn obsolete_unchained_rosters_are_rejected() {
+        let mut budget = Budget::new(8 << 20);
+        let mut store = MemoryBlockStore::new(&mut budget, "value format", 4 << 20, 32).unwrap();
+        let obsolete = store
+            .put(&0u32.to_le_bytes(), BlockType::ValueIndexRoster, 0)
+            .unwrap();
+        let handle = ValueIndexHandle {
+            roster: obsolete,
+            entries: 0,
+            published_lsn: 1,
+        };
+        let mut roster = vec![0; MAX_PAYLOAD];
+        let mut data = vec![0; MAX_PAYLOAD];
+        assert_eq!(
+            ValueIndexReader::over(&mut roster, &mut data)
+                .walk(&mut store, &handle, |_, _, _, _| {})
+                .unwrap_err(),
+            ValueIndexError::Corrupt
+        );
+        assert_eq!(
+            walk_value_roster(&mut store, obsolete, &mut roster, |_| true).unwrap_err(),
+            ValueIndexError::Corrupt
+        );
     }
 }

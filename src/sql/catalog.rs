@@ -51,6 +51,30 @@ struct IntrinsicRoutine {
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
+        oid: 3415,
+        name: "pg_get_statisticsobjdef",
+        result_oid: 25,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 6173,
+        name: "pg_get_statisticsobjdef_expressions",
+        result_oid: 1009,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 6174,
+        name: "pg_get_statisticsobjdef_columns",
+        result_oid: 25,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 89,
         name: "version",
         result_oid: 25,
@@ -358,6 +382,8 @@ const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_amproc", 2603),
     ("pg_cast", 2605),
     ("pg_constraint", 2606),
+    ("pg_statistic_ext", 3381),
+    ("pg_statistic_ext_data", 3429),
     ("pg_collation", PG_COLLATION_OID),
     ("pg_depend", 2608),
     ("pg_rewrite", 2618),
@@ -449,6 +475,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_inherits"
                 | "pg_stats"
                 | "pg_statistic_ext"
+                | "pg_statistic_ext_data"
                 | "pg_publication"
                 | "pg_publication_rel"
                 | "pg_publication_tables"
@@ -582,23 +609,8 @@ pub fn synthesize<'a>(
         (false, "pg_stats") => pg_stats(storage, txid, arena),
         (false, "pg_policy") => pg_policy(storage, txid, arena),
         (false, "pg_policies") => pg_policies(storage, txid, arena),
-        (false, "pg_statistic_ext") => finish(
-            def_of(
-                "pg_statistic_ext",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("stxrelid", ColType::Int4),
-                    ("stxnamespace", ColType::Int4),
-                    ("stxname", ColType::Text),
-                    ("stxowner", ColType::Int4),
-                    ("stxkind", ColType::Array(super::types::ArrElem::Text)),
-                    ("stxstattarget", ColType::Int4),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_statistic_ext") => pg_statistic_ext(storage, txid, arena),
+        (false, "pg_statistic_ext_data") => pg_statistic_ext_data(storage, txid, arena),
         (false, "pg_publication") => pg_publication(storage, txid, arena),
         (false, "pg_publication_namespace") => pg_publication_namespace(storage, txid, arena),
         (false, "pg_publication_rel") => pg_publication_rel(storage, txid, arena),
@@ -1272,6 +1284,7 @@ fn acl<'a>(
         crate::storage::AccessClass::Routine => crate::storage::PrivilegeSet::FUNCTION_ALL,
         crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
         crate::storage::AccessClass::Tablespace => crate::storage::PrivilegeSet::CREATE,
+        crate::storage::AccessClass::Statistics => crate::storage::PrivilegeSet::NONE,
     };
     let render = |grantee: &str,
                   grantor: &str,
@@ -1605,6 +1618,129 @@ const FIRST_VIEW_COMPOSITE_TYPE_OID: i32 = 140_000;
 /// PostgreSQL gives every named composite a backing `pg_class` relation whose
 /// OID links `pg_type.typrelid` and its `pg_attribute` rows.
 const FIRST_NAMED_COMPOSITE_RELATION_OID: i32 = 180_000;
+const FIRST_EXTENDED_STATISTICS_OID: i32 = 300_000;
+
+pub(crate) fn extended_statistics_oid(slot: usize) -> i32 {
+    FIRST_EXTENDED_STATISTICS_OID + slot as i32
+}
+
+pub(crate) fn extended_statistics_columns_by_oid<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    use core::fmt::Write as _;
+    let Some((_, statistics)) = storage
+        .extended_statistics_visible(txid)
+        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)
+    else {
+        return Ok(None);
+    };
+    let mut output = StackStr::<8192>::new();
+    for (position, key) in statistics.keys_for(txid).iter().enumerate() {
+        if position != 0 {
+            let _ = output.write_str(", ");
+        }
+        match key {
+            crate::storage::ExtendedStatisticsKey::Column(column) => {
+                write_identifier(&mut output, column.as_str());
+            }
+            crate::storage::ExtendedStatisticsKey::Expression(expression) => {
+                let _ = output.write_str(expression.as_str());
+            }
+        }
+    }
+    if output.is_truncated() {
+        return Err(catalog_capacity_exceeded("pg_statistic_ext"));
+    }
+    arena
+        .alloc_str(output.as_str())
+        .map(Some)
+        .map_err(|_| arena_full())
+}
+
+pub(crate) fn extended_statistics_definition_by_oid<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    use core::fmt::Write as _;
+    let Some((_, statistics)) = storage
+        .extended_statistics_visible(txid)
+        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)
+    else {
+        return Ok(None);
+    };
+    let mutable = statistics.definition_for(txid);
+    let table_slot = usize::from(statistics.table);
+    let table = storage.table_def(table_slot, txid);
+    let mut output = StackStr::<8192>::new();
+    let _ = output.write_str("CREATE STATISTICS ");
+    write_identifier(&mut output, mutable.schema.as_str());
+    let _ = output.write_char('.');
+    write_identifier(&mut output, mutable.name.as_str());
+    let _ = output.write_str(" ON ");
+    for (position, key) in statistics.keys_for(txid).iter().enumerate() {
+        if position != 0 {
+            let _ = output.write_str(", ");
+        }
+        match key {
+            crate::storage::ExtendedStatisticsKey::Column(column) => {
+                write_identifier(&mut output, column.as_str());
+            }
+            crate::storage::ExtendedStatisticsKey::Expression(expression) => {
+                let _ = output.write_str(expression.as_str());
+            }
+        }
+    }
+    let _ = output.write_str(" FROM ");
+    if !matches!(
+        storage.resolve_relation(None, table.name.as_str(), txid),
+        Some(crate::storage::ResolvedRelation::Table(slot)) if slot == table_slot
+    ) {
+        write_identifier(&mut output, table.schema.as_str());
+        let _ = output.write_char('.');
+    }
+    write_identifier(&mut output, table.name.as_str());
+    if output.is_truncated() {
+        return Err(catalog_capacity_exceeded("pg_statistic_ext"));
+    }
+    arena
+        .alloc_str(output.as_str())
+        .map(Some)
+        .map_err(|_| arena_full())
+}
+
+pub(crate) fn extended_statistics_expressions_by_oid<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<Datum<'a>>, SqlError> {
+    let Some((_, statistics)) = storage
+        .extended_statistics_visible(txid)
+        .find(|(slot, _)| extended_statistics_oid(*slot) == oid)
+    else {
+        return Ok(None);
+    };
+    let mut values = [Datum::Null; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+    let mut count = 0usize;
+    for key in statistics.keys_for(txid) {
+        if let crate::storage::ExtendedStatisticsKey::Expression(expression) = key {
+            values[count] = text(expression.as_str(), arena)?;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Datum::Array {
+        element: super::types::ArrElem::Text,
+        raw: super::array::build(&values[..count], arena)?,
+    }))
+}
 
 fn named_composite_relation_oid(slot: usize) -> i32 {
     FIRST_NAMED_COMPOSITE_RELATION_OID + slot as i32
@@ -4034,6 +4170,445 @@ fn policy_role_names<'a>(
         element: super::types::ArrElem::Name,
         raw: super::array::build(&values[..roles.entries().len()], arena)?,
     })
+}
+
+fn extended_statistics_kinds<'a>(
+    statistics: &crate::storage::ExtendedStatisticsDef,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; 4];
+    let mut count = 0usize;
+    for (enabled, code) in [
+        (statistics.kinds.ndistinct(), "d"),
+        (statistics.kinds.dependencies(), "f"),
+        (statistics.kinds.mcv(), "m"),
+        (
+            statistics
+                .keys_for(txid)
+                .iter()
+                .any(|key| matches!(key, crate::storage::ExtendedStatisticsKey::Expression(_))),
+            "e",
+        ),
+    ] {
+        if enabled {
+            values[count] = Datum::Bpchar(code);
+            count += 1;
+        }
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Char,
+        raw: super::array::build(&values[..count], arena)?,
+    })
+}
+
+fn extended_statistics_expressions<'a>(
+    statistics: &crate::storage::ExtendedStatisticsDef,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    use core::fmt::Write as _;
+    let mut output = StackStr::<8192>::new();
+    for key in statistics.keys_for(txid) {
+        let crate::storage::ExtendedStatisticsKey::Expression(expression) = key else {
+            continue;
+        };
+        if !output.as_str().is_empty() {
+            let _ = output.write_str(", ");
+        }
+        let _ = write!(output, "({})", expression.as_str());
+    }
+    if output.as_str().is_empty() {
+        Ok(Datum::Null)
+    } else if output.is_truncated() {
+        Err(catalog_capacity_exceeded("pg_statistic_ext"))
+    } else {
+        text(output.as_str(), arena)
+    }
+}
+
+fn pg_statistic_ext<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_statistic_ext",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("stxrelid", ColType::Int4),
+            ("stxname", ColType::Name),
+            ("stxnamespace", ColType::Int4),
+            ("stxowner", ColType::Int4),
+            ("stxkeys", ColType::Int2Vector),
+            ("stxstattarget", ColType::Int2),
+            ("stxkind", ColType::Array(super::types::ArrElem::Char)),
+            ("stxexprs", ColType::PgNodeTree),
+        ],
+    );
+    let rows = arena
+        .alloc_slice_with(storage.extended_statistics_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for (slot, statistics) in storage.extended_statistics_visible(txid) {
+        let mutable = statistics.definition_for(txid);
+        let mut columns = [0u16; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+        let mut n_columns = 0usize;
+        for key in statistics.keys_for(txid) {
+            if let crate::storage::ExtendedStatisticsKey::Column(column) = key {
+                let table = storage.table_def(usize::from(statistics.table), txid);
+                columns[n_columns] = table
+                    .column_index(column.as_str())
+                    .expect("statistics column remains a table dependency")
+                    as u16;
+                n_columns += 1;
+            }
+        }
+        rows[count] = row(
+            &[
+                Datum::Int4(3381),
+                Datum::Int4(extended_statistics_oid(slot)),
+                Datum::Int4(table_oid(storage, usize::from(statistics.table))),
+                text(mutable.name.as_str(), arena)?,
+                Datum::Int4(namespace_oid(storage, mutable.schema.as_str())),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Statistics,
+                    slot,
+                    txid,
+                )),
+                int2vector(&columns[..n_columns], arena)?,
+                mutable
+                    .target
+                    .map_or(Datum::Null, |target| Datum::Int2(target as i16)),
+                extended_statistics_kinds(statistics, txid, arena)?,
+                extended_statistics_expressions(statistics, txid, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn extended_statistics_key_numbers(
+    storage: &Storage,
+    statistics: &crate::storage::ExtendedStatisticsDef,
+    txid: u32,
+) -> [i16; crate::storage::MAX_EXTENDED_STATISTICS_KEYS] {
+    let table = storage.table_def(usize::from(statistics.table), txid);
+    let mut numbers = [0i16; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+    let mut expression = 0i16;
+    for (position, key) in statistics.keys_for(txid).iter().enumerate() {
+        numbers[position] = match key {
+            crate::storage::ExtendedStatisticsKey::Column(column) => table
+                .column_index(column.as_str())
+                .map(|column| column as i16 + 1)
+                .expect("statistics column remains a table dependency"),
+            crate::storage::ExtendedStatisticsKey::Expression(_) => {
+                expression -= 1;
+                expression
+            }
+        };
+    }
+    numbers
+}
+
+fn extended_statistics_ndistinct(
+    key_numbers: &[i16],
+    data: crate::storage::ExtendedStatisticsData,
+) -> StackStr<256> {
+    use core::fmt::Write as _;
+    let mut output = StackStr::new();
+    let _ = output.write_str("{\"");
+    for (key, number) in key_numbers.iter().enumerate() {
+        if key != 0 {
+            let _ = output.write_str(", ");
+        }
+        let _ = write!(output, "{}", number);
+    }
+    let _ = write!(output, "\": {}", data.distinct_values);
+    let _ = output.write_char('}');
+    output
+}
+
+fn extended_statistics_dependencies(
+    key_numbers: &[i16],
+    data: crate::storage::ExtendedStatisticsData,
+) -> StackStr<4096> {
+    use core::fmt::Write as _;
+    let mut output = StackStr::new();
+    let mut first = true;
+    let _ = output.write_char('{');
+    for determinant in 0..key_numbers.len() {
+        for dependent in 0..key_numbers.len() {
+            let strength = data.dependencies_ppm
+                [determinant * crate::storage::MAX_EXTENDED_STATISTICS_KEYS + dependent];
+            if strength == 0 {
+                continue;
+            }
+            if !first {
+                let _ = output.write_str(", ");
+            }
+            first = false;
+            let _ = write!(
+                output,
+                "\"{} => {}\": {}.{:06}",
+                key_numbers[determinant],
+                key_numbers[dependent],
+                strength / 1_000_000,
+                strength % 1_000_000
+            );
+        }
+    }
+    let _ = output.write_char('}');
+    output
+}
+
+fn extended_statistics_mcv<'a>(
+    data: crate::storage::ExtendedStatisticsData,
+    key_count: usize,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    const DIMENSION_INFO_BYTES: usize = 20;
+    const ALIGNMENT: usize = 8;
+
+    fn append(out: &mut [u8], at: &mut usize, bytes: &[u8]) {
+        out[*at..*at + bytes.len()].copy_from_slice(bytes);
+        *at += bytes.len();
+    }
+
+    fn value<'a>(raw: &'a [u8], dimension: usize) -> Datum<'a> {
+        super::array::get(raw, super::types::ArrElem::Text, dimension)
+            .expect("ANALYZE stores one MCV member per statistics key")
+    }
+
+    fn same_value(left: Datum<'_>, right: Datum<'_>) -> bool {
+        match (left, right) {
+            (Datum::Null, Datum::Null) => true,
+            (Datum::Text(left), Datum::Text(right)) => left == right,
+            _ => false,
+        }
+    }
+
+    let item_count = usize::from(data.n_mcv);
+    if item_count == 0 {
+        return Ok(Datum::Null);
+    }
+    let mut values = [&[][..]; crate::storage::MAX_EXTENDED_STATISTICS_MCV];
+    for (position, item) in data.mcv[..item_count].iter().enumerate() {
+        values[position] =
+            super::array::parse_literal(item.values.as_str(), super::types::ArrElem::Text, arena)?;
+        if super::array::len(values[position]) != key_count {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "corrupt extended-statistics MCV width"
+            ));
+        }
+    }
+
+    let mut value_counts = [0usize; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+    let mut value_bytes = [0usize; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+    let mut aligned_bytes = [0usize; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+    for dimension in 0..key_count {
+        for raw in &values[..item_count] {
+            let Datum::Text(text) = value(raw, dimension) else {
+                continue;
+            };
+            value_counts[dimension] += 1;
+            value_bytes[dimension] += 4 + text.len();
+            aligned_bytes[dimension] += (4 + text.len()).next_multiple_of(ALIGNMENT);
+        }
+    }
+    let item_bytes = item_count
+        .checked_mul(key_count + 16 + 2 * key_count)
+        .ok_or_else(arena_full)?;
+    let total = 12usize
+        .checked_add(2)
+        .and_then(|bytes| bytes.checked_add(4 * key_count))
+        .and_then(|bytes| bytes.checked_add(DIMENSION_INFO_BYTES * key_count))
+        .and_then(|bytes| bytes.checked_add(value_bytes[..key_count].iter().sum()))
+        .and_then(|bytes| bytes.checked_add(item_bytes))
+        .ok_or_else(arena_full)?;
+    let binary = arena
+        .alloc_slice_with(total, |_| 0u8)
+        .map_err(|_| arena_full())?;
+    let mut at = 0usize;
+    append(binary, &mut at, &0xE1A6_51C2u32.to_ne_bytes());
+    append(binary, &mut at, &1u32.to_ne_bytes());
+    append(binary, &mut at, &(item_count as u32).to_ne_bytes());
+    append(binary, &mut at, &(key_count as i16).to_ne_bytes());
+    for _ in 0..key_count {
+        append(binary, &mut at, &25u32.to_ne_bytes());
+    }
+    for dimension in 0..key_count {
+        append(
+            binary,
+            &mut at,
+            &(value_counts[dimension] as i32).to_ne_bytes(),
+        );
+        append(
+            binary,
+            &mut at,
+            &(value_bytes[dimension] as i32).to_ne_bytes(),
+        );
+        append(
+            binary,
+            &mut at,
+            &(aligned_bytes[dimension] as i32).to_ne_bytes(),
+        );
+        append(binary, &mut at, &(-1i32).to_ne_bytes());
+        append(binary, &mut at, &[0, 0, 0, 0]);
+    }
+    for dimension in 0..key_count {
+        for raw in &values[..item_count] {
+            let Datum::Text(text) = value(raw, dimension) else {
+                continue;
+            };
+            append(binary, &mut at, &(text.len() as u32).to_ne_bytes());
+            append(binary, &mut at, text.as_bytes());
+        }
+    }
+    for (item, raw) in values[..item_count].iter().enumerate() {
+        for dimension in 0..key_count {
+            binary[at] = u8::from(value(raw, dimension).is_null());
+            at += 1;
+        }
+        let frequency = data.mcv[item].count as f64 / data.rows.max(1) as f64;
+        append(binary, &mut at, &frequency.to_ne_bytes());
+        let mut base_frequency = 1.0f64;
+        for dimension in 0..key_count {
+            let sought = value(raw, dimension);
+            let marginal = values[..item_count]
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| same_value(value(candidate, dimension), sought))
+                .map(|(candidate, _)| data.mcv[candidate].count)
+                .sum::<u64>();
+            base_frequency *= marginal as f64 / data.rows.max(1) as f64;
+        }
+        append(binary, &mut at, &base_frequency.to_ne_bytes());
+        for dimension in 0..key_count {
+            let index = values[..item]
+                .iter()
+                .filter(|candidate| !value(candidate, dimension).is_null())
+                .count() as u16;
+            append(binary, &mut at, &index.to_ne_bytes());
+        }
+    }
+    debug_assert_eq!(at, total);
+    let hex = super::encoding::hex_encode(binary, arena)?;
+    let rendered = arena
+        .alloc_slice_with(hex.len() + 2, |_| 0u8)
+        .map_err(|_| arena_full())?;
+    rendered[..2].copy_from_slice(b"\\x");
+    rendered[2..].copy_from_slice(hex.as_bytes());
+    text(
+        core::str::from_utf8(rendered).expect("hex MCV representation is UTF-8"),
+        arena,
+    )
+}
+
+fn extended_statistics_expression_row(
+    column: crate::storage::ColumnStatistics,
+    rows: u64,
+) -> StackStr<512> {
+    use core::fmt::Write as _;
+    let null_fraction = f64::from(column.null_fraction_ppm) / 1_000_000.0;
+    let distinct = if rows != 0 && column.distinct_values > rows / 10 {
+        -(column.distinct_values as f64 / rows as f64)
+    } else {
+        column.distinct_values as f64
+    };
+    let mut output = StackStr::new();
+    let _ = write!(
+        output,
+        "(0,0,f,{null_fraction},{},{distinct},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,,,,,,,,,,)",
+        column.average_width
+    );
+    output
+}
+
+fn pg_statistic_ext_data<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_statistic_ext_data",
+        &[
+            ("tableoid", ColType::Int4),
+            ("stxoid", ColType::Int4),
+            ("stxdinherit", ColType::Bool),
+            ("stxdndistinct", ColType::PgNdistinct),
+            ("stxddependencies", ColType::PgDependencies),
+            ("stxdmcv", ColType::PgMcvList),
+            ("stxdexpr", ColType::PgStatisticArray),
+        ],
+    );
+    let rows = arena
+        .alloc_slice_with(storage.extended_statistics_count(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for (slot, statistics) in storage.extended_statistics_visible(txid) {
+        let data = storage.extended_statistics_data(slot, txid);
+        if !data.valid {
+            continue;
+        }
+        let key_numbers = extended_statistics_key_numbers(storage, statistics, txid);
+        let key_numbers = &key_numbers[..usize::from(statistics.n_keys)];
+        let ndistinct = extended_statistics_ndistinct(key_numbers, data);
+        let dependencies = extended_statistics_dependencies(key_numbers, data);
+        let mut expressions = [Datum::Null; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+        let mut n_expressions = 0usize;
+        for (key, key_definition) in statistics.keys_for(txid).iter().enumerate() {
+            if matches!(
+                key_definition,
+                crate::storage::ExtendedStatisticsKey::Expression(_)
+            ) {
+                let column = data.expression_statistics[key];
+                expressions[n_expressions] = text(
+                    extended_statistics_expression_row(column, data.rows).as_str(),
+                    arena,
+                )?;
+                n_expressions += 1;
+            }
+        }
+        rows[count] = row(
+            &[
+                Datum::Int4(3429),
+                Datum::Int4(extended_statistics_oid(slot)),
+                Datum::Bool(data.inherited),
+                if statistics.kinds.ndistinct() {
+                    text(ndistinct.as_str(), arena)?
+                } else {
+                    Datum::Null
+                },
+                if statistics.kinds.dependencies() {
+                    text(dependencies.as_str(), arena)?
+                } else {
+                    Datum::Null
+                },
+                if statistics.kinds.mcv() {
+                    extended_statistics_mcv(data, key_numbers.len(), arena)?
+                } else {
+                    Datum::Null
+                },
+                if n_expressions == 0 {
+                    Datum::Null
+                } else {
+                    Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(&expressions[..n_expressions], arena)?,
+                    }
+                },
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
 }
 
 fn pg_policy<'a>(
@@ -6979,6 +7554,10 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Int2,
         ColType::Int2Vector,
         ColType::OidVector,
+        ColType::PgNodeTree,
+        ColType::PgNdistinct,
+        ColType::PgDependencies,
+        ColType::PgMcvList,
         ColType::Int4,
         ColType::Oid,
         ColType::Regtype,
@@ -7039,6 +7618,10 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Interval => "T",
         ColType::Uuid => "U",
         ColType::Bytea => "U",
+        ColType::PgNodeTree
+        | ColType::PgNdistinct
+        | ColType::PgDependencies
+        | ColType::PgMcvList => "Z",
         // Network address types are PostgreSQL typcategory 'I'.
         ColType::Inet | ColType::Cidr | ColType::Macaddr | ColType::Macaddr8 => "I",
         _ => "S",
@@ -7083,6 +7666,58 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
     }
     let mut n = types.len();
+    for (oid, name, length, category, element, array, relation, kind) in [
+        (18, "char", 1, "Z", 0, 1002, 0, "b"),
+        (
+            super::types::oid::PG_STATISTIC_ROW,
+            "pg_statistic",
+            -1,
+            "C",
+            0,
+            super::types::oid::PG_STATISTIC_ARRAY,
+            2619,
+            "c",
+        ),
+        (
+            super::types::oid::PG_STATISTIC_ARRAY,
+            "_pg_statistic",
+            -1,
+            "A",
+            super::types::oid::PG_STATISTIC_ROW,
+            0,
+            0,
+            "b",
+        ),
+    ] {
+        out[n] = row(
+            &[
+                Datum::Int4(oid),
+                text(name, arena)?,
+                Datum::Int4(length),
+                Datum::Int4(0),
+                Datum::Int4(PG_CATALOG_NS_OID),
+                text(kind, arena)?,
+                text(category, arena)?,
+                Datum::Int4(0),
+                Datum::Int4(element),
+                Datum::Int4(array),
+                Datum::Int4(relation),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(10),
+                Datum::Bool(true),
+                text(if length < 0 { "x" } else { "p" }, arena)?,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
     // Arrays are catalog types in their own right. Keeping this inventory on
     // `ArrElem` means an accepted array OID is simultaneously visible to
     // `pg_type`, has a matching `typelem`, and is discoverable by catalog

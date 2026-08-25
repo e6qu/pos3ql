@@ -386,6 +386,19 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
+    /// A named extended-statistics definition. The key shape distinguishes
+    /// PostgreSQL's one-expression form from multivariate statistics before
+    /// execution can observe an invalid kind/key combination.
+    CreateStatistics(CreateStatistics<'a>),
+    AlterStatistics {
+        name: QualName<'a>,
+        action: AlterStatisticsAction<'a>,
+    },
+    DropStatistics {
+        names: &'a [QualName<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS <select> [WITH [NO] DATA]`
     /// and, with `materialized`, `CREATE MATERIALIZED VIEW`. `sql` is the raw
     /// SELECT text, run once to populate the new (backing) table; `columns`
@@ -1350,6 +1363,7 @@ pub enum AlterOwnerKind {
     View,
     MaterializedView,
     Sequence,
+    Statistics,
 }
 
 /// Which kind of relation a `COMMENT ON` names — PostgreSQL rejects a comment
@@ -2604,6 +2618,115 @@ pub struct AlterPolicy<'a> {
     pub roles: Option<&'a [PolicyRole<'a>]>,
     pub using: Option<PolicyExpression<'a>>,
     pub with_check: Option<PolicyExpression<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatisticsName<'a> {
+    Generated,
+    Explicit {
+        name: QualName<'a>,
+        if_not_exists: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatisticsKinds(u8);
+
+impl StatisticsKinds {
+    const NDISTINCT: u8 = 1;
+    const DEPENDENCIES: u8 = 2;
+    const MCV: u8 = 4;
+
+    pub const ALL: Self = Self(Self::NDISTINCT | Self::DEPENDENCIES | Self::MCV);
+    pub const EXPRESSION: Self = Self(0);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub fn insert_ndistinct(&mut self) -> bool {
+        self.insert(Self::NDISTINCT)
+    }
+
+    pub fn insert_dependencies(&mut self) -> bool {
+        self.insert(Self::DEPENDENCIES)
+    }
+
+    pub fn insert_mcv(&mut self) -> bool {
+        self.insert(Self::MCV)
+    }
+
+    fn insert(&mut self, kind: u8) -> bool {
+        let fresh = self.0 & kind == 0;
+        self.0 |= kind;
+        fresh
+    }
+
+    pub const fn ndistinct(self) -> bool {
+        self.0 & Self::NDISTINCT != 0
+    }
+
+    pub const fn dependencies(self) -> bool {
+        self.0 & Self::DEPENDENCIES != 0
+    }
+
+    pub const fn mcv(self) -> bool {
+        self.0 & Self::MCV != 0
+    }
+
+    pub const fn code(self) -> u8 {
+        self.0
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        if code != 0 && code & !Self::ALL.0 == 0 {
+            Some(Self(code))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StatisticsExpression<'a> {
+    pub expression: &'a Expr<'a>,
+    pub source: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StatisticsKey<'a> {
+    Column(&'a str),
+    Expression(StatisticsExpression<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StatisticsKeys<'a> {
+    Expression(StatisticsExpression<'a>),
+    Multivariate {
+        kinds: StatisticsKinds,
+        keys: &'a [StatisticsKey<'a>],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreateStatistics<'a> {
+    pub name: StatisticsName<'a>,
+    pub keys: StatisticsKeys<'a>,
+    pub table: QualName<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatisticsTarget {
+    Default,
+    Value(u16),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterStatisticsAction<'a> {
+    Owner(&'a str),
+    Rename(&'a str),
+    SetSchema(&'a str),
+    SetTarget(StatisticsTarget),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

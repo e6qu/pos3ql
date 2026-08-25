@@ -111,8 +111,6 @@ pub(crate) const MAX_PAYLOAD: usize = BLOCK_SIZE - HEADER_LEN;
 pub(crate) enum BlockType {
     /// Sorted rows: the leaf of an SST.
     SstData = 1,
-    /// The sparse key index of an SST.
-    SstIndex = 2,
     /// An SST's bloom filter.
     SstFilter = 3,
     /// One record of the manifest log.
@@ -123,10 +121,6 @@ pub(crate) enum BlockType {
     /// itself included last as the index/filter are known by then) — what
     /// garbage collection walks instead of the data blocks themselves.
     SstRoster = 6,
-    /// A sorted-row data block whose payload is LZ4-block-compressed (the
-    /// hand-rolled [`lz4`]); the writer keeps whichever of raw/compressed
-    /// is smaller, so both types coexist in one SST.
-    SstDataLz4 = 7,
     /// Commit-LSN-versioned sorted rows.
     SstDataV2 = 8,
     /// LZ4-compressed commit-LSN-versioned sorted rows.
@@ -137,8 +131,6 @@ pub(crate) enum BlockType {
     ValueIndexData = 11,
     /// Complete immutable-block roster for one secondary-index generation.
     ValueIndexRoster = 12,
-    /// Commit-LSN-versioned rows laid out as one self-describing PAX group.
-    SstDataPaxV1 = 13,
     /// Immutable container holding several independently checksummed PAX data
     /// blocks. SST index entries name their byte extents inside this object.
     SstPackedContainerV1 = 14,
@@ -153,18 +145,15 @@ impl BlockType {
     fn from_code(code: u8) -> Option<Self> {
         Some(match code {
             1 => BlockType::SstData,
-            2 => BlockType::SstIndex,
             3 => BlockType::SstFilter,
             4 => BlockType::ManifestLog,
             5 => BlockType::WalSegment,
             6 => BlockType::SstRoster,
-            7 => BlockType::SstDataLz4,
             8 => BlockType::SstDataV2,
             9 => BlockType::SstDataV2Lz4,
             10 => BlockType::SstIndexV2,
             11 => BlockType::ValueIndexData,
             12 => BlockType::ValueIndexRoster,
-            13 => BlockType::SstDataPaxV1,
             14 => BlockType::SstPackedContainerV1,
             15 => BlockType::SstDataPaxV2,
             16 => BlockType::SstDataPaxColumnV1,
@@ -558,15 +547,12 @@ mod tests {
     fn round_trips_every_block_type() {
         for (i, t) in [
             BlockType::SstData,
-            BlockType::SstIndex,
             BlockType::SstFilter,
             BlockType::ManifestLog,
             BlockType::WalSegment,
             BlockType::SstRoster,
-            BlockType::SstDataLz4,
             BlockType::SstDataV2,
             BlockType::SstDataV2Lz4,
-            BlockType::SstDataPaxV1,
             BlockType::SstPackedContainerV1,
             BlockType::SstDataPaxV2,
             BlockType::SstDataPaxColumnV1,
@@ -672,6 +658,21 @@ mod tests {
             decode(&buffer[..n], true).err(),
             Some(BlockError::UnknownType)
         );
+    }
+
+    #[test]
+    fn obsolete_sst_block_types_are_refused() {
+        for code in [2, 7, 13] {
+            let mut buffer = [0u8; BLOCK_SIZE];
+            let (_, n) = encode(b"payload", BlockType::SstData, 1, &mut buffer).unwrap();
+            buffer[4] = code;
+            let checksum = crc32c(&buffer[4..n]);
+            buffer[0..4].copy_from_slice(&checksum.to_le_bytes());
+            assert_eq!(
+                decode(&buffer[..n], true).err(),
+                Some(BlockError::UnknownType)
+            );
+        }
     }
 
     #[test]

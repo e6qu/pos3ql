@@ -1593,9 +1593,8 @@ pub struct RowLoc {
 pub struct RowState {
     pub committed: Option<RowHome>,
     /// Commit LSN of `committed`, or of the deletion when `committed` is
-    /// absent but the entry shadows an older SST row. Zero means the image
-    /// predates LSN-versioned row metadata (legacy checkpoint/cold start) and
-    /// is therefore visible to every later snapshot.
+    /// absent but the entry shadows an older SST row. Zero means no committed
+    /// image has been installed.
     pub committed_lsn: u64,
     /// Older committed images retained while a repeatable-read snapshot can
     /// still see them. Their bytes remain in the heap or in immutable SST
@@ -1615,7 +1614,7 @@ pub enum RowHome {
     Spilled {
         len: u32,
         sst: u8,
-        /// Exact immutable version to fetch. Legacy rowid-only SSTs use zero.
+        /// Exact immutable version to fetch.
         commit_lsn: u64,
     },
 }
@@ -2012,35 +2011,6 @@ impl ColumnStatistics {
     };
 }
 
-/// Distinctness information for one composite value-index key. NULL-bearing
-/// rows are counted separately because SQL equality cannot match them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MultiColumnStatistics {
-    pub(crate) valid: bool,
-    pub(crate) columns: [u16; MAX_INDEX_COLS],
-    pub(crate) n_columns: u8,
-    pub(crate) non_null_rows: u64,
-    pub(crate) distinct_values: u64,
-}
-
-impl MultiColumnStatistics {
-    pub(crate) const EMPTY: Self = Self {
-        valid: false,
-        columns: [0; MAX_INDEX_COLS],
-        n_columns: 0,
-        non_null_rows: 0,
-        distinct_values: 0,
-    };
-
-    pub(crate) fn covers(&self, columns: &[usize]) -> bool {
-        self.valid
-            && self.n_columns as usize == columns.len()
-            && self.columns[..columns.len()]
-                .iter()
-                .all(|column| columns.contains(&usize::from(*column)))
-    }
-}
-
 /// Table cardinality and width statistics used by the storage-aware planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TableStatistics {
@@ -2049,7 +2019,6 @@ pub(crate) struct TableStatistics {
     pub(crate) average_row_width: u32,
     pub(crate) analyzed_generation: u64,
     pub(crate) columns: [ColumnStatistics; MAX_COLUMNS],
-    pub(crate) multi_columns: [MultiColumnStatistics; MAX_MULTICOLUMN_STATISTICS],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2065,7 +2034,6 @@ impl TableStatistics {
         average_row_width: 0,
         analyzed_generation: 0,
         columns: [ColumnStatistics::EMPTY; MAX_COLUMNS],
-        multi_columns: [MultiColumnStatistics::EMPTY; MAX_MULTICOLUMN_STATISTICS],
     };
 }
 
@@ -2082,9 +2050,187 @@ pub(crate) const MAX_TOMBSTONES: usize = 1024;
 /// Exceeding it at DDL is a loud error.
 pub(crate) const MAX_VALUE_ENFORCERS: usize = 16;
 
-/// Composite statistics are collected only for the bounded composite keys the
-/// planner can actually seek through the provider-neutral value-index path.
-pub(crate) const MAX_MULTICOLUMN_STATISTICS: usize = MAX_VALUE_ENFORCERS;
+/// Extended-statistics objects and their computed values are startup-bounded.
+/// PostgreSQL accepts more objects/keys/MCV entries; crossing one of these
+/// envelopes is an explicit capacity error rather than an incomplete object.
+pub(crate) const MAX_EXTENDED_STATISTICS_PER_TABLE: usize = 8;
+pub(crate) const MAX_EXTENDED_STATISTICS_KEYS: usize = 8;
+pub(crate) const MAX_EXTENDED_STATISTICS_MCV: usize = 100;
+pub(crate) const EXTENDED_STATISTICS_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
+pub(crate) const EXTENDED_STATISTICS_MCV_TEXT_MAX: usize = 128;
+
+pub(crate) fn extended_statistics_expression(
+    source: &str,
+) -> Result<StackStr<EXTENDED_STATISTICS_EXPRESSION_MAX>, SqlError> {
+    let expression = StackStr::from_str(source);
+    if expression.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "statistics expression exceeds {} bytes",
+            EXTENDED_STATISTICS_EXPRESSION_MAX
+        ));
+    }
+    Ok(expression)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Expressions stay inline because runtime catalog storage cannot allocate.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ExtendedStatisticsKey {
+    Column(SqlName),
+    Expression(StackStr<EXTENDED_STATISTICS_EXPRESSION_MAX>),
+}
+
+impl ExtendedStatisticsKey {
+    const EMPTY: Self = Self::Column(SqlName::EMPTY);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExtendedStatisticsMcv {
+    pub(crate) valid: bool,
+    pub(crate) hash: u64,
+    pub(crate) count: u64,
+    pub(crate) values: StackStr<EXTENDED_STATISTICS_MCV_TEXT_MAX>,
+}
+
+impl ExtendedStatisticsMcv {
+    pub(crate) const EMPTY: Self = Self {
+        valid: false,
+        hash: 0,
+        count: 0,
+        values: StackStr::new(),
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExtendedStatisticsData {
+    pub(crate) valid: bool,
+    pub(crate) inherited: bool,
+    pub(crate) analyzed_generation: u64,
+    pub(crate) rows: u64,
+    pub(crate) non_null_rows: u64,
+    pub(crate) distinct_values: u64,
+    /// Pairwise functional-dependency strengths in millionths. Entry i,j is
+    /// the degree to which key i determines key j; diagonal entries are zero.
+    pub(crate) dependencies_ppm: [u32; MAX_EXTENDED_STATISTICS_KEYS * MAX_EXTENDED_STATISTICS_KEYS],
+    pub(crate) expression_statistics: [ColumnStatistics; MAX_EXTENDED_STATISTICS_KEYS],
+    pub(crate) mcv: [ExtendedStatisticsMcv; MAX_EXTENDED_STATISTICS_MCV],
+    pub(crate) n_mcv: u16,
+}
+
+impl ExtendedStatisticsData {
+    pub(crate) const EMPTY: Self = Self {
+        valid: false,
+        inherited: false,
+        analyzed_generation: 0,
+        rows: 0,
+        non_null_rows: 0,
+        distinct_values: 0,
+        dependencies_ppm: [0; MAX_EXTENDED_STATISTICS_KEYS * MAX_EXTENDED_STATISTICS_KEYS],
+        expression_statistics: [ColumnStatistics::EMPTY; MAX_EXTENDED_STATISTICS_KEYS],
+        mcv: [ExtendedStatisticsMcv::EMPTY; MAX_EXTENDED_STATISTICS_MCV],
+        n_mcv: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExtendedStatisticsMutableDefinition {
+    pub(crate) schema: SqlName,
+    pub(crate) name: SqlName,
+    pub(crate) target: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingExtendedStatisticsDefinition {
+    pub(crate) txid: u32,
+    pub(crate) definition: ExtendedStatisticsMutableDefinition,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingExtendedStatisticsKeys {
+    pub(crate) txid: u32,
+    pub(crate) keys: [ExtendedStatisticsKey; MAX_EXTENDED_STATISTICS_KEYS],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingExtendedStatisticsDataSlot {
+    used: bool,
+    data: ExtendedStatisticsData,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExtendedStatisticsDef {
+    pub(crate) created_at: u64,
+    pub(crate) table: u16,
+    pub(crate) mutable: ExtendedStatisticsMutableDefinition,
+    pub(crate) pending_definition: Option<PendingExtendedStatisticsDefinition>,
+    pub(crate) pending_keys: Option<PendingExtendedStatisticsKeys>,
+    pub(crate) ownership: Ownership,
+    pub(crate) keys: [ExtendedStatisticsKey; MAX_EXTENDED_STATISTICS_KEYS],
+    pub(crate) n_keys: u8,
+    pub(crate) kinds: crate::sql::ast::StatisticsKinds,
+    pub(crate) expression_only: bool,
+    pub(crate) data: ExtendedStatisticsData,
+    pending_data_slots: [u32; MAX_PENDING_TABLE_DEFS],
+    n_pending_data: u8,
+    pending_data_txid: Option<u32>,
+    pub(crate) ddl_state: CatalogDdlState,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExtendedStatisticsSpec {
+    pub(crate) created_at: u64,
+    pub(crate) schema: SqlName,
+    pub(crate) name: SqlName,
+    pub(crate) table: u16,
+    pub(crate) target: Option<u16>,
+    pub(crate) keys: [ExtendedStatisticsKey; MAX_EXTENDED_STATISTICS_KEYS],
+    pub(crate) n_keys: u8,
+    pub(crate) kinds: crate::sql::ast::StatisticsKinds,
+    pub(crate) expression_only: bool,
+}
+
+impl ExtendedStatisticsDef {
+    const EMPTY: Self = Self {
+        created_at: 0,
+        table: u16::MAX,
+        mutable: ExtendedStatisticsMutableDefinition {
+            schema: SqlName::EMPTY,
+            name: SqlName::EMPTY,
+            target: None,
+        },
+        pending_definition: None,
+        pending_keys: None,
+        ownership: Ownership::BOOTSTRAP,
+        keys: [ExtendedStatisticsKey::EMPTY; MAX_EXTENDED_STATISTICS_KEYS],
+        n_keys: 0,
+        kinds: crate::sql::ast::StatisticsKinds::EXPRESSION,
+        expression_only: false,
+        data: ExtendedStatisticsData::EMPTY,
+        pending_data_slots: [u32::MAX; MAX_PENDING_TABLE_DEFS],
+        n_pending_data: 0,
+        pending_data_txid: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> ExtendedStatisticsMutableDefinition {
+        self.pending_definition
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.mutable, |pending| pending.definition)
+    }
+
+    pub(crate) fn keys_for(&self, txid: u32) -> &[ExtendedStatisticsKey] {
+        let keys = match &self.pending_keys {
+            Some(pending) if pending.txid == txid => &pending.keys,
+            _ => &self.keys,
+        };
+        &keys[..usize::from(self.n_keys)]
+    }
+}
 
 /// A table's binding of one indexed tuple to its value cache: the key columns
 /// it covers and the pool slot holding the `value_hash → rowid` map. Constraint
@@ -2186,6 +2332,17 @@ impl CatalogDdlState {
 /// The maximum number of ALTER TABLE commands one transaction may apply to a
 /// single table. This is a static-memory bound, not an accept-and-ignore limit.
 pub(crate) const MAX_PENDING_TABLE_DEFS: usize = 8;
+pub(crate) const MAX_PENDING_STATISTICS_PER_TXN: usize = 64;
+
+fn pending_extended_statistics_capacity(config: &Config) -> usize {
+    let object_bound = config
+        .max_tables
+        .saturating_mul(MAX_EXTENDED_STATISTICS_PER_TABLE)
+        .saturating_mul(MAX_PENDING_TABLE_DEFS);
+    let transaction_bound =
+        (config.max_connections as usize).saturating_mul(MAX_PENDING_STATISTICS_PER_TXN);
+    object_bound.min(transaction_bound)
+}
 
 #[derive(Debug, Clone, Copy)]
 struct PendingTableDef {
@@ -4921,6 +5078,7 @@ pub(crate) enum AccessClass {
     Routine = 8,
     Composite = 9,
     Tablespace = 10,
+    Statistics = 11,
 }
 
 /// Object classes addressable by ALTER DEFAULT PRIVILEGES.
@@ -4979,6 +5137,7 @@ impl AccessClass {
             8 => Self::Routine,
             9 => Self::Composite,
             10 => Self::Tablespace,
+            11 => Self::Statistics,
             _ => return None,
         })
     }
@@ -5477,6 +5636,8 @@ pub struct Storage {
     routines: FixedVec<RoutineDef>,
     triggers: FixedVec<TriggerDef>,
     policies: FixedVec<PolicyDef>,
+    extended_statistics: FixedVec<ExtendedStatisticsDef>,
+    pending_extended_statistics_data: FixedVec<PendingExtendedStatisticsDataSlot>,
     publications: FixedVec<PublicationDef>,
     replication_slots: FixedVec<ReplicationSlotDef>,
     subscriptions: FixedVec<SubscriptionDef>,
@@ -5796,8 +5957,6 @@ struct MemberCursor {
     raw_row: usize,
     head_raw_row: usize,
     pax_layout: Option<crate::store::PaxLayout>,
-    pax_value_cursors: [usize; MAX_COLUMNS],
-    head_pax_values: [Option<(usize, usize)>; MAX_COLUMNS],
     loaded_type: Option<crate::store::BlockType>,
     prefetched_leaf: Option<(usize, crate::store::BlockId)>,
     prefetched_data: Option<(usize, crate::store::DataBlockRef)>,
@@ -6109,6 +6268,7 @@ impl Storage {
                     + size_of::<RoutineDef>()
                     + size_of::<TriggerDef>()
                     + MAX_POLICIES_PER_TABLE * size_of::<PolicyDef>()
+                    + MAX_EXTENDED_STATISTICS_PER_TABLE * size_of::<ExtendedStatisticsDef>()
                     + size_of::<PublicationDef>()
                     + size_of::<StoredQueryDependencies>()
                     + size_of::<MatviewDef>()
@@ -6121,6 +6281,8 @@ impl Storage {
                 * size_of::<SubscriptionRelation>()
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableDefSlot>()
             + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableStatisticsSlot>()
+            + pending_extended_statistics_capacity(config)
+                * size_of::<PendingExtendedStatisticsDataSlot>()
             + MAX_SCHEMAS * size_of::<SchemaDef>()
             + MAX_ROLES * size_of::<RoleDef>()
             + MAX_ROLE_MEMBERSHIPS * size_of::<RoleMembership>()
@@ -6242,6 +6404,19 @@ impl Storage {
                 .push(PolicyDef::EMPTY)
                 .expect("sized to policy capacity");
         }
+        let extended_statistics_capacity = config.max_tables * MAX_EXTENDED_STATISTICS_PER_TABLE;
+        let mut extended_statistics =
+            FixedVec::new(budget, "extended_statistics", extended_statistics_capacity)?;
+        for _ in 0..extended_statistics_capacity {
+            extended_statistics
+                .push(ExtendedStatisticsDef::EMPTY)
+                .expect("sized to extended statistics capacity");
+        }
+        let pending_extended_statistics_data = FixedVec::new(
+            budget,
+            "pending_extended_statistics_data",
+            pending_extended_statistics_capacity(config),
+        )?;
         let view_dependencies =
             stored_query_dependency_slots(budget, "view_dependencies", config.max_tables)?;
         let mut publications = FixedVec::new(budget, "publications", config.max_tables)?;
@@ -6535,6 +6710,8 @@ impl Storage {
             routines,
             triggers,
             policies,
+            extended_statistics,
+            pending_extended_statistics_data,
             publications,
             replication_slots,
             subscriptions,
@@ -6710,6 +6887,7 @@ impl Storage {
             AccessClass::Routine => &self.routines[slot].ownership,
             AccessClass::Composite => &self.composites[slot].ownership,
             AccessClass::Tablespace => &self.tablespaces[slot].ownership,
+            AccessClass::Statistics => &self.extended_statistics[slot].ownership,
         }
     }
 
@@ -6727,6 +6905,7 @@ impl Storage {
             AccessClass::Routine => &mut self.routines[slot].ownership,
             AccessClass::Composite => &mut self.composites[slot].ownership,
             AccessClass::Tablespace => &mut self.tablespaces[slot].ownership,
+            AccessClass::Statistics => &mut self.extended_statistics[slot].ownership,
         }
     }
 
@@ -6799,6 +6978,7 @@ impl Storage {
             }),
             AccessClass::Composite => self.composite_slot(schema, name, txid),
             AccessClass::Tablespace => self.tablespace_slot(name, txid),
+            AccessClass::Statistics => self.extended_statistics_slot(schema, name, txid),
         }?;
         u16::try_from(slot)
             .ok()
@@ -6854,6 +7034,10 @@ impl Storage {
                 (definition.schema, definition.name)
             }
             AccessClass::Tablespace => (SqlName::EMPTY, self.tablespaces[slot].name_for(txid)),
+            AccessClass::Statistics => {
+                let definition = self.extended_statistics[slot].definition_for(txid);
+                (definition.schema, definition.name)
+            }
         }
     }
 
@@ -6873,6 +7057,9 @@ impl Storage {
             AccessClass::Routine => self.routines[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Composite => self.composites[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Tablespace => self.tablespaces[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Statistics => {
+                self.extended_statistics[slot].ddl_state == CatalogDdlState::Present
+            }
         }
     }
 
@@ -6890,6 +7077,7 @@ impl Storage {
             AccessClass::Routine => self.routines[slot].visible_to(txid),
             AccessClass::Composite => self.composites[slot].visible_to(txid),
             AccessClass::Tablespace => self.tablespaces[slot].visible_to(txid),
+            AccessClass::Statistics => self.extended_statistics[slot].visible_to(txid),
         }
     }
 
@@ -6906,6 +7094,7 @@ impl Storage {
             AccessClass::Routine => self.routines.len(),
             AccessClass::Composite => self.composites.len(),
             AccessClass::Tablespace => self.tablespaces.len(),
+            AccessClass::Statistics => self.extended_statistics.len(),
         }
     }
 
@@ -9064,8 +9253,6 @@ impl Storage {
             raw_row: 0,
             head_raw_row: 0,
             pax_layout: None,
-            pax_value_cursors: [0; MAX_COLUMNS],
-            head_pax_values: [None; MAX_COLUMNS],
             loaded_type: None,
             prefetched_leaf: None,
             prefetched_data: None,
@@ -9197,8 +9384,6 @@ impl Storage {
             raw_row: 0,
             head_raw_row: 0,
             pax_layout: None,
-            pax_value_cursors: [0; MAX_COLUMNS],
-            head_pax_values: [None; MAX_COLUMNS],
             loaded_type: None,
             prefetched_leaf: None,
             prefetched_data: None,
@@ -9247,8 +9432,6 @@ impl Storage {
                     cursor.loaded_len = 0;
                     cursor.loaded_type = None;
                     cursor.pax_layout = None;
-                    cursor.pax_value_cursors = [0; MAX_COLUMNS];
-                    cursor.head_pax_values = [None; MAX_COLUMNS];
                     if cursor.head.is_some() {
                         cursor.raw_row = cursor.head_raw_row;
                         cursor.head = None;
@@ -9295,102 +9478,14 @@ impl Storage {
                     )
                 })?;
                 let representation = if cursor.loaded_type
-                    == Some(crate::store::BlockType::SstDataPaxV1)
+                    == Some(crate::store::BlockType::SstDataPaxV2)
                 {
-                    let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "PAX block has no validated layout"
-                        )
-                    })?;
-                    let mut schema = [ColType::Bool; MAX_COLUMNS];
-                    table.def.schema(&mut schema);
-                    // PAX payload slices borrow the resident block, while the
-                    // executor can retain a batch row after this cursor moves
-                    // on. Pack only demanded physical values into statement
-                    // storage, then decode that one stable row.
-                    let header_len = 2 + layout.columns().div_ceil(8);
-                    let mut full_len = header_len;
-                    let mut packed_len = header_len;
-                    for column in 0..layout.columns() {
-                        let Some((start, end)) = cursor.head_pax_values[column] else {
-                            continue;
-                        };
-                        let value_len = end.checked_sub(start).ok_or_else(|| {
-                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX value span is inverted")
-                        })?;
-                        full_len = full_len.checked_add(value_len).ok_or_else(|| {
-                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX row length overflows")
-                        })?;
-                        if decoded_columns.is_none_or(|columns| columns[column]) {
-                            packed_len = packed_len.checked_add(value_len).ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::INTERNAL_ERROR,
-                                    "PAX packed row length overflows"
-                                )
-                            })?;
-                        }
-                    }
-                    if full_len != len as usize {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "PAX selected row length does not match its cursor header"
-                        ));
-                    }
-                    let encoded = arena.alloc_slice_with(packed_len, |_| 0u8).map_err(|_| {
-                        sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "spilled PAX rows exceed the statement arena; raise work_arena_bytes"
-                        )
-                    })?;
-                    encoded[..2].copy_from_slice(&(layout.columns() as u16).to_le_bytes());
-                    encoded[2..2 + layout.columns().div_ceil(8)].fill(0);
-                    let values = arena
-                        .alloc_slice_with(layout.columns(), |_| Datum::Null)
-                        .map_err(|_| {
-                            sql_err!(
-                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                "spilled PAX values exceed the statement arena; raise work_arena_bytes"
-                            )
-                        })?;
-                    let mut copied = header_len;
-                    for column in 0..layout.columns() {
-                        let Some((start, end)) = cursor.head_pax_values[column] else {
-                            encoded[2 + column / 8] |= 1 << (column % 8);
-                            continue;
-                        };
-                        if decoded_columns.is_some_and(|columns| !columns[column]) {
-                            encoded[2 + column / 8] |= 1 << (column % 8);
-                            continue;
-                        }
-                        copied = copied.checked_add(end - start).ok_or_else(|| {
-                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX packed row length overflows")
-                        })?;
-                        encoded[copied - (end - start)..copied].copy_from_slice(
-                            &context.member_raw_blocks[member as usize][start..end],
-                        );
-                    }
-                    if copied != packed_len {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "PAX packed row length does not match selected value spans"
-                        ));
-                    }
-                    rowenc::decode(encoded, &schema[..layout.columns()], values)?;
-                    SpilledRowRepresentation::Values(&*values)
-                } else if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV2) {
                     let layout = cursor.pax_layout.ok_or_else(|| {
                         sql_err!(
                             sqlstate::INTERNAL_ERROR,
                             "PAX descriptor has no validated layout"
                         )
                     })?;
-                    if !layout.external_columns() {
-                        return Err(sql_err!(
-                            sqlstate::INTERNAL_ERROR,
-                            "PAX descriptor does not name external columns"
-                        ));
-                    }
                     let owner = (member as usize, cursor.ordinal);
                     if context.pax_values_owner != Some(owner) {
                         let ScanContext {
@@ -9496,14 +9591,12 @@ impl Storage {
                             "spilled scan rows exceed the statement arena; raise work_arena_bytes"
                         )
                     })?;
-                    let handle = table.spill_ssts[member as usize].expect("cursor member exists");
                     let (copied_key, copied_tombstone, copied) = {
                         let mut blocks = spill.blocks.borrow_mut();
                         crate::store::copy_block_entry_at(
                             &mut *blocks,
                             &context.member_blocks[member as usize][..cursor.loaded_len],
                             cursor.head_offset,
-                            handle.versioned,
                             output,
                         )
                         .map_err(spill_read_error)?
@@ -9689,7 +9782,6 @@ impl Storage {
                     &mut *blocks,
                     &leaf,
                     &mut context.index_buf,
-                    handle.versioned,
                     handle.packed,
                 )
                 .map_err(spill_read_error)?
@@ -9750,10 +9842,7 @@ impl Storage {
                     &mut context.member_blocks[member],
                 )
                 .map_err(spill_read_error)?;
-                let loaded_len = if matches!(
-                    loaded_type,
-                    crate::store::BlockType::SstDataPaxV1 | crate::store::BlockType::SstDataPaxV2
-                ) {
+                let loaded_len = if loaded_type == crate::store::BlockType::SstDataPaxV2 {
                     0
                 } else {
                     crate::store::decode_data_block(
@@ -9766,30 +9855,20 @@ impl Storage {
                 cursor.loaded_len = loaded_len;
                 cursor.raw_len = raw_len;
                 cursor.raw_row = 0;
-                cursor.pax_layout = matches!(
-                    loaded_type,
-                    crate::store::BlockType::SstDataPaxV1 | crate::store::BlockType::SstDataPaxV2
-                )
-                .then(|| crate::store::pax_layout(&context.member_raw_blocks[member][..raw_len]))
-                .transpose()
-                .map_err(spill_read_error)?;
+                cursor.pax_layout = (loaded_type == crate::store::BlockType::SstDataPaxV2)
+                    .then(|| {
+                        crate::store::pax_layout(&context.member_raw_blocks[member][..raw_len])
+                    })
+                    .transpose()
+                    .map_err(spill_read_error)?;
                 if cursor.pax_layout.is_some() && cursor.head.is_some() {
                     cursor.raw_row = resume_raw_row;
                 }
-                cursor.pax_value_cursors = cursor
-                    .pax_layout
-                    .as_ref()
-                    .map_or([0; MAX_COLUMNS], crate::store::PaxLayout::column_starts);
-                cursor.head_pax_values = [None; MAX_COLUMNS];
                 cursor.loaded_type = Some(loaded_type);
                 cursor.loaded = Some(cursor.ordinal);
                 cursor.offset = 0;
             }
-            if matches!(
-                cursor.loaded_type,
-                Some(crate::store::BlockType::SstDataPaxV1)
-                    | Some(crate::store::BlockType::SstDataPaxV2)
-            ) {
+            if cursor.loaded_type == Some(crate::store::BlockType::SstDataPaxV2) {
                 let layout = cursor.pax_layout.as_ref().ok_or_else(|| {
                     sql_err!(
                         sqlstate::INTERNAL_ERROR,
@@ -9804,38 +9883,12 @@ impl Storage {
                 let (key, tombstone) = layout
                     .row_key(&context.member_raw_blocks[member][..cursor.raw_len], row)
                     .map_err(spill_read_error)?;
-                if !layout.external_columns() {
-                    layout
-                        .advance_row_values(
-                            &context.member_raw_blocks[member][..cursor.raw_len],
-                            row,
-                            &mut cursor.pax_value_cursors,
-                            &mut cursor.head_pax_values,
-                        )
-                        .map_err(spill_read_error)?;
-                }
                 let len = if tombstone {
                     0
-                } else if layout.external_columns() {
+                } else {
                     layout
                         .row_len(&context.member_raw_blocks[member][..cursor.raw_len], row)
                         .map_err(spill_read_error)?
-                } else {
-                    let column_count = layout.columns();
-                    let row_len = cursor
-                        .head_pax_values
-                        .iter()
-                        .filter_map(|value| *value)
-                        .take(column_count)
-                        .try_fold(2 + column_count.div_ceil(8), |total, (start, end)| {
-                            total.checked_add(end - start)
-                        })
-                        .ok_or_else(|| {
-                            sql_err!(sqlstate::INTERNAL_ERROR, "PAX row length overflows")
-                        })?;
-                    u32::try_from(row_len).map_err(|_| {
-                        sql_err!(sqlstate::INTERNAL_ERROR, "PAX row exceeds SST entry size")
-                    })?
                 };
                 cursor.head_raw_row = row;
                 cursor.raw_row += 1;
@@ -9853,7 +9906,6 @@ impl Storage {
             match crate::store::block_keys_at(
                 &context.member_blocks[member][..cursor.loaded_len],
                 head_offset,
-                handle.versioned,
             ) {
                 Some((key, tombstone, len, next)) => {
                     cursor.offset = next;
@@ -10108,28 +10160,6 @@ impl Storage {
         let mut widths = [0u64; MAX_COLUMNS];
         let mut non_nulls = [0u64; MAX_COLUMNS];
         let mut registers = [[0u8; REGISTERS]; MAX_COLUMNS];
-        let mut multi_columns = [[0u16; MAX_INDEX_COLS]; MAX_MULTICOLUMN_STATISTICS];
-        let mut multi_widths = [0usize; MAX_MULTICOLUMN_STATISTICS];
-        let mut multi_refresh = [false; MAX_MULTICOLUMN_STATISTICS];
-        let mut multi_non_nulls = [0u64; MAX_MULTICOLUMN_STATISTICS];
-        let mut multi_registers = [[0u8; REGISTERS]; MAX_MULTICOLUMN_STATISTICS];
-        let mut n_multi = 0usize;
-        for binding in 0..self.tables[table_slot].n_enforcers {
-            let enforcer = self.tables[table_slot].enforcers[binding].expect("enforcer exists");
-            if enforcer.n_cols < 2 {
-                continue;
-            }
-            let refresh = selected_columns.is_empty()
-                || enforcer
-                    .columns()
-                    .iter()
-                    .all(|column| selected[*column as usize]);
-            let slot = n_multi;
-            multi_columns[slot][..enforcer.n_cols].copy_from_slice(enforcer.columns());
-            multi_widths[slot] = enforcer.n_cols;
-            multi_refresh[slot] = refresh;
-            n_multi += 1;
-        }
         self.for_each_row_state(table_slot, &mut |rowid, state| {
             let Some(home) = self.visible_row_home(table_slot, rowid, state, txid)? else {
                 return Ok(core::ops::ControlFlow::Continue(()));
@@ -10157,20 +10187,6 @@ impl Storage {
                     widths[column] = widths[column].saturating_add(width as u64);
                     let index = [column as u16];
                     add_distinct(&mut registers[column], hash_key(&values, &index));
-                }
-                for multi in 0..n_multi {
-                    if !multi_refresh[multi]
-                        || multi_columns[multi][..multi_widths[multi]]
-                            .iter()
-                            .any(|column| values[*column as usize].is_null())
-                    {
-                        continue;
-                    }
-                    multi_non_nulls[multi] = multi_non_nulls[multi].saturating_add(1);
-                    add_distinct(
-                        &mut multi_registers[multi],
-                        hash_key(&values, &multi_columns[multi][..multi_widths[multi]]),
-                    );
                 }
                 Ok(())
             })?;
@@ -10212,23 +10228,6 @@ impl Storage {
                     .unwrap_or(0)
                     .min(u64::from(u32::MAX)) as u32,
             };
-        }
-        for multi in 0..n_multi {
-            if !multi_refresh[multi] {
-                continue;
-            }
-            let distinct_values =
-                distinct_estimate(&multi_registers[multi]).min(multi_non_nulls[multi]);
-            statistics.multi_columns[multi] = MultiColumnStatistics {
-                valid: rows != 0,
-                columns: multi_columns[multi],
-                n_columns: multi_widths[multi] as u8,
-                non_null_rows: multi_non_nulls[multi],
-                distinct_values,
-            };
-        }
-        for multi in n_multi..statistics.multi_columns.len() {
-            statistics.multi_columns[multi] = MultiColumnStatistics::EMPTY;
         }
         self.write_table_statistics(table_slot, txid, statistics)?;
         // PostgreSQL updates pg_class's relation statistics in place:
@@ -12010,28 +12009,6 @@ impl Storage {
             self.tables[table_index].n_enforcers = w + 1;
         }
         self.populate_enforcers(table_index)?;
-        // A dropped or reshaped composite key must not leave a planner-visible
-        // joint statistic behind. Pending CREATE INDEX ownership is private,
-        // so only reconcile committed/startup cache shapes here.
-        if txid.is_none() {
-            let mut changed = false;
-            for statistics in &mut self.tables[table_index].statistics.multi_columns {
-                if statistics.valid
-                    && !want[..n_want].iter().any(|(columns, n_columns)| {
-                        *n_columns == statistics.n_columns as usize
-                            && columns[..*n_columns]
-                                == statistics.columns[..statistics.n_columns as usize]
-                    })
-                {
-                    *statistics = MultiColumnStatistics::EMPTY;
-                    changed = true;
-                }
-            }
-            if changed {
-                self.tables[table_index].statistics_dirty = true;
-                self.tables[table_index].statistics_wal_dirty = true;
-            }
-        }
         Ok(())
     }
 
@@ -18177,6 +18154,462 @@ impl Storage {
         Ok(())
     }
 
+    pub(crate) fn extended_statistics_count(&self) -> usize {
+        self.extended_statistics.len()
+    }
+
+    pub(crate) fn extended_statistics(&self, slot: usize) -> &ExtendedStatisticsDef {
+        &self.extended_statistics[slot]
+    }
+
+    pub(crate) fn extended_statistics_visible(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &ExtendedStatisticsDef)> {
+        self.extended_statistics
+            .iter()
+            .enumerate()
+            .filter(move |(_, statistics)| statistics.visible_to(txid))
+    }
+
+    pub(crate) fn extended_statistics_for_table(
+        &self,
+        table: usize,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &ExtendedStatisticsDef)> {
+        self.extended_statistics_visible(txid)
+            .filter(move |(_, statistics)| usize::from(statistics.table) == table)
+    }
+
+    pub(crate) fn extended_statistics_slot(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        self.extended_statistics.iter().position(|statistics| {
+            let definition = statistics.definition_for(txid);
+            statistics.visible_to(txid)
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name
+        })
+    }
+
+    pub(crate) fn extended_statistics_slot_on_path(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        if let Some(schema) = schema {
+            return self.extended_statistics_slot(schema, name, txid);
+        }
+        self.path.entries().iter().find_map(|entry| match entry {
+            PathEntry::Schema(slot) => self.extended_statistics_slot(
+                self.schemas[*slot as usize].name.as_str(),
+                name,
+                txid,
+            ),
+            PathEntry::Catalog => None,
+        })
+    }
+
+    pub(crate) fn create_extended_statistics(
+        &mut self,
+        spec: ExtendedStatisticsSpec,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        self.require_schema_create(spec.schema.as_str(), txid)?;
+        if usize::from(spec.table) >= self.tables.len()
+            || !self.tables[usize::from(spec.table)].visible_to(txid)
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "statistics relation does not exist"
+            ));
+        }
+        if spec.n_keys == 0 || usize::from(spec.n_keys) > MAX_EXTENDED_STATISTICS_KEYS {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "invalid extended statistics key count"
+            ));
+        }
+        if let Some(blocker) = self.extended_statistics.iter().find_map(|statistics| {
+            let definition = statistics.definition_for(txid);
+            (definition.schema == spec.schema && definition.name == spec.name)
+                .then_some(statistics.ddl_state.pending_txid()?)
+                .filter(|owner| *owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
+        }
+        if self
+            .extended_statistics_slot(spec.schema.as_str(), spec.name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "statistics object \"{}\" already exists",
+                spec.name.as_str()
+            ));
+        }
+        if self
+            .extended_statistics_for_table(usize::from(spec.table), txid)
+            .count()
+            == MAX_EXTENDED_STATISTICS_PER_TABLE
+        {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "relation has too many statistics objects (limit {})",
+                MAX_EXTENDED_STATISTICS_PER_TABLE
+            ));
+        }
+        let Some(slot) = self
+            .extended_statistics
+            .iter()
+            .position(|statistics| statistics.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many statistics objects (limit {})",
+                self.extended_statistics.len()
+            ));
+        };
+        let created_at = if spec.created_at == 0 {
+            self.catalog_seq = self.catalog_seq.saturating_add(1);
+            self.catalog_seq
+        } else {
+            self.catalog_seq = self.catalog_seq.max(spec.created_at);
+            spec.created_at
+        };
+        self.extended_statistics[slot] = ExtendedStatisticsDef {
+            created_at,
+            table: spec.table,
+            mutable: ExtendedStatisticsMutableDefinition {
+                schema: spec.schema,
+                name: spec.name,
+                target: spec.target,
+            },
+            pending_definition: None,
+            pending_keys: None,
+            ownership: self.initial_ownership(txid),
+            keys: spec.keys,
+            n_keys: spec.n_keys,
+            kinds: spec.kinds,
+            expression_only: spec.expression_only,
+            data: ExtendedStatisticsData::EMPTY,
+            pending_data_slots: [u32::MAX; MAX_PENDING_TABLE_DEFS],
+            n_pending_data: 0,
+            pending_data_txid: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn alter_extended_statistics(
+        &mut self,
+        slot: usize,
+        definition: ExtendedStatisticsMutableDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingExtendedStatisticsDefinition>, SqlError> {
+        if let Some(other) = self.extended_statistics_slot(
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            txid,
+        ) && other != slot
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "statistics object \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
+        let statistics = &mut self.extended_statistics[slot];
+        if let Some(pending) = statistics.pending_definition
+            && pending.txid != txid
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "statistics object \"{}\" is being altered by another transaction",
+                statistics.mutable.name.as_str()
+            ));
+        }
+        let prior = statistics.pending_definition;
+        statistics.pending_definition =
+            Some(PendingExtendedStatisticsDefinition { txid, definition });
+        Ok(prior)
+    }
+
+    pub(crate) fn alter_extended_statistics_keys(
+        &mut self,
+        slot: usize,
+        keys: [ExtendedStatisticsKey; MAX_EXTENDED_STATISTICS_KEYS],
+        txid: u32,
+    ) -> Result<Option<PendingExtendedStatisticsKeys>, SqlError> {
+        let statistics = &mut self.extended_statistics[slot];
+        if let Some(pending) = statistics.pending_keys
+            && pending.txid != txid
+        {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "statistics object \"{}\" is being altered by another transaction",
+                statistics.mutable.name.as_str()
+            ));
+        }
+        let prior = statistics.pending_keys;
+        statistics.pending_keys = Some(PendingExtendedStatisticsKeys { txid, keys });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_extended_statistics_create(&mut self, slot: usize) {
+        self.extended_statistics[slot].ddl_state =
+            self.extended_statistics[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_extended_statistics_create(&mut self, slot: usize) {
+        self.clear_pending_extended_statistics_data(slot);
+        self.extended_statistics[slot].pending_keys = None;
+        self.extended_statistics[slot].ddl_state =
+            self.extended_statistics[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_extended_statistics_alter(&mut self, slot: usize, txid: u32) {
+        let statistics = &mut self.extended_statistics[slot];
+        if let Some(pending) = statistics.pending_definition
+            && pending.txid == txid
+        {
+            statistics.mutable = pending.definition;
+            statistics.pending_definition = None;
+        }
+        if let Some(pending) = statistics.pending_keys
+            && pending.txid == txid
+        {
+            statistics.keys = pending.keys;
+            statistics.pending_keys = None;
+        }
+    }
+
+    pub(crate) fn rollback_extended_statistics_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingExtendedStatisticsDefinition>,
+    ) {
+        self.extended_statistics[slot].pending_definition = prior;
+    }
+
+    pub(crate) fn rollback_extended_statistics_keys(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingExtendedStatisticsKeys>,
+    ) {
+        self.extended_statistics[slot].pending_keys = prior;
+    }
+
+    pub(crate) fn drop_extended_statistics(&mut self, slot: usize, txid: u32) {
+        self.extended_statistics[slot].ddl_state =
+            self.extended_statistics[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_extended_statistics_drop(&mut self, slot: usize) {
+        self.clear_pending_extended_statistics_data(slot);
+        self.extended_statistics[slot].data = ExtendedStatisticsData::EMPTY;
+        self.extended_statistics[slot].pending_definition = None;
+        self.extended_statistics[slot].pending_keys = None;
+        self.extended_statistics[slot].ddl_state =
+            self.extended_statistics[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_extended_statistics_drop(&mut self, slot: usize, txid: u32) {
+        self.extended_statistics[slot].ddl_state =
+            self.extended_statistics[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn extended_statistics_data(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> ExtendedStatisticsData {
+        let statistics = &self.extended_statistics[slot];
+        if statistics.pending_data_txid == Some(txid)
+            && let Some(position) = statistics.n_pending_data.checked_sub(1)
+        {
+            let pending = statistics.pending_data_slots[position as usize] as usize;
+            return self.pending_extended_statistics_data[pending].data;
+        }
+        statistics.data
+    }
+
+    pub(crate) fn pending_extended_statistics_data_for(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> Option<ExtendedStatisticsData> {
+        (self.extended_statistics[slot].pending_data_txid == Some(txid))
+            .then(|| self.extended_statistics_data(slot, txid))
+    }
+
+    pub(crate) fn write_extended_statistics_data(
+        &mut self,
+        slot: usize,
+        txid: u32,
+        data: ExtendedStatisticsData,
+    ) -> Result<(), SqlError> {
+        let statistics = &self.extended_statistics[slot];
+        if let Some(owner) = statistics.pending_data_txid
+            && owner != txid
+        {
+            return Err(sql_err!(
+                sqlstate::SERIALIZATION_FAILURE,
+                "could not serialize ANALYZE of statistics object \"{}\"",
+                statistics.definition_for(txid).name.as_str()
+            ));
+        }
+        if statistics.n_pending_data as usize == MAX_PENDING_TABLE_DEFS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "one transaction analyzes statistics object more than {} times",
+                MAX_PENDING_TABLE_DEFS
+            ));
+        }
+        let pending = match self
+            .pending_extended_statistics_data
+            .iter()
+            .position(|entry| !entry.used)
+        {
+            Some(pending) => {
+                self.pending_extended_statistics_data[pending] =
+                    PendingExtendedStatisticsDataSlot { used: true, data };
+                pending
+            }
+            None => {
+                let pending = self.pending_extended_statistics_data.len();
+                self.pending_extended_statistics_data
+                    .push(PendingExtendedStatisticsDataSlot { used: true, data })
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "pending extended-statistics pool is exhausted"
+                        )
+                    })?;
+                pending
+            }
+        };
+        let statistics = &mut self.extended_statistics[slot];
+        let position = statistics.n_pending_data as usize;
+        statistics.pending_data_slots[position] = pending as u32;
+        statistics.n_pending_data += 1;
+        statistics.pending_data_txid = Some(txid);
+        Ok(())
+    }
+
+    pub(crate) fn rollback_extended_statistics_data(&mut self, slot: usize, txid: u32) {
+        let statistics = &mut self.extended_statistics[slot];
+        if statistics.pending_data_txid != Some(txid) {
+            return;
+        }
+        let Some(position) = statistics.n_pending_data.checked_sub(1) else {
+            return;
+        };
+        let pending = statistics.pending_data_slots[position as usize] as usize;
+        self.pending_extended_statistics_data[pending].used = false;
+        statistics.pending_data_slots[position as usize] = u32::MAX;
+        statistics.n_pending_data = position;
+        if position == 0 {
+            statistics.pending_data_txid = None;
+        }
+    }
+
+    fn clear_pending_extended_statistics_data(&mut self, slot: usize) {
+        let statistics = &mut self.extended_statistics[slot];
+        for position in 0..statistics.n_pending_data as usize {
+            let pending = statistics.pending_data_slots[position] as usize;
+            self.pending_extended_statistics_data[pending].used = false;
+            statistics.pending_data_slots[position] = u32::MAX;
+        }
+        statistics.n_pending_data = 0;
+        statistics.pending_data_txid = None;
+    }
+
+    pub(crate) fn commit_extended_statistics_data(&mut self, slot: usize, txid: u32) {
+        let data = self.extended_statistics_data(slot, txid);
+        if self.extended_statistics[slot].pending_data_txid != Some(txid) {
+            return;
+        }
+        self.extended_statistics[slot].data = data;
+        self.clear_pending_extended_statistics_data(slot);
+    }
+
+    pub(crate) fn install_extended_statistics_data(
+        &mut self,
+        slot: usize,
+        data: ExtendedStatisticsData,
+    ) {
+        self.clear_pending_extended_statistics_data(slot);
+        self.extended_statistics[slot].data = data;
+    }
+
+    pub(crate) fn replay_extended_statistics(
+        &mut self,
+        spec: ExtendedStatisticsSpec,
+    ) -> Result<usize, SqlError> {
+        if let Some(slot) = self.extended_statistics.iter().position(|statistics| {
+            statistics.ddl_state != CatalogDdlState::Absent
+                && statistics.created_at == spec.created_at
+        }) {
+            if self
+                .extended_statistics
+                .iter()
+                .enumerate()
+                .any(|(other, statistics)| {
+                    other != slot
+                        && statistics.ddl_state != CatalogDdlState::Absent
+                        && statistics.mutable.schema == spec.schema
+                        && statistics.mutable.name == spec.name
+                })
+            {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "journal replays duplicate statistics object \"{}\"",
+                    spec.name.as_str()
+                ));
+            }
+            let statistics = &mut self.extended_statistics[slot];
+            statistics.table = spec.table;
+            statistics.mutable = ExtendedStatisticsMutableDefinition {
+                schema: spec.schema,
+                name: spec.name,
+                target: spec.target,
+            };
+            statistics.pending_definition = None;
+            statistics.pending_keys = None;
+            statistics.keys = spec.keys;
+            statistics.n_keys = spec.n_keys;
+            statistics.kinds = spec.kinds;
+            statistics.expression_only = spec.expression_only;
+            statistics.ddl_state = CatalogDdlState::Present;
+            return Ok(slot);
+        }
+        let slot = self.create_extended_statistics(spec, 0)?;
+        self.commit_extended_statistics_create(slot);
+        Ok(slot)
+    }
+
+    pub(crate) fn replay_drop_extended_statistics(
+        &mut self,
+        schema: &str,
+        name: &str,
+    ) -> Result<(), SqlError> {
+        let Some(slot) = self.extended_statistics_slot(schema, name, 0) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "journal drops unknown statistics object \"{}\"",
+                name
+            ));
+        };
+        self.drop_extended_statistics(slot, 0);
+        self.commit_extended_statistics_drop(slot);
+        Ok(())
+    }
+
     pub fn index_exists(&self, schema: &str, name: &str, txid: u32) -> bool {
         self.index_slot(schema, name, txid).is_some()
     }
@@ -19445,6 +19878,7 @@ mod tests {
             AccessClass::Index,
             AccessClass::Routine,
             AccessClass::Composite,
+            AccessClass::Statistics,
         ] {
             assert_eq!(AccessClass::from_u8(class as u8), Some(class));
         }

@@ -14,11 +14,11 @@ use crate::sql::eval::SqlError;
 use crate::sql::types::{BtreeOperatorClass, ColType};
 use crate::sql_err;
 use crate::storage::{
-    CheckConstraint, ColumnDefault, ColumnMeta, ColumnStatistics, DependencyClass, FkAction,
-    ForeignKey, MAX_COLUMNS, MAX_INDEX_COLS, MAX_MULTICOLUMN_STATISTICS, MultiColumnStatistics,
-    OwnedDatum, PartitionBound, PartitionBoundValue, PartitionDef, PartitionStrategy,
-    RoleAttributes, SerializedStoredQueryDependency, SqlName, StoredDependencyIdentity,
-    StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
+    CheckConstraint, ColumnDefault, ColumnMeta, ColumnStatistics, DependencyClass,
+    ExtendedStatisticsData, ExtendedStatisticsMcv, FkAction, ForeignKey, MAX_COLUMNS,
+    MAX_INDEX_COLS, OwnedDatum, PartitionBound, PartitionBoundValue, PartitionDef,
+    PartitionStrategy, RoleAttributes, SerializedStoredQueryDependency, SqlName,
+    StoredDependencyIdentity, StoredQueryDependencies, TableDef, TableStatistics, UniqueKey,
 };
 use crate::util::StackStr;
 
@@ -50,7 +50,7 @@ impl CommittedBatch {
         self.start
     }
 }
-const TABLE_STATISTICS_V2: u8 = u8::MAX;
+const TABLE_STATISTICS_V3: u8 = u8::MAX - 1;
 
 const KIND_CREATE: u8 = 1;
 const KIND_DROP: u8 = 2;
@@ -121,6 +121,9 @@ const KIND_ALTER_INDEX_DEFINITION: u8 = 71;
 const KIND_CREATE_TABLESPACE: u8 = 72;
 const KIND_ALTER_TABLESPACE: u8 = 73;
 const KIND_DROP_TABLESPACE: u8 = 74;
+const KIND_SET_EXTENDED_STATISTICS: u8 = 75;
+const KIND_DROP_EXTENDED_STATISTICS: u8 = 76;
+const KIND_ANALYZE_EXTENDED_STATISTICS: u8 = 77;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -128,7 +131,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DROP_POLICY;
+const LAST_KIND: u8 = KIND_ANALYZE_EXTENDED_STATISTICS;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -242,19 +245,12 @@ impl WalTableStatistics<'_> {
                     + 4
                     + 8
                     + 1
-                    + 1
                     + statistics
                         .columns
                         .iter()
                         .filter(|column| column.valid)
                         .count()
                         * (1 + 4 + 8 + 4 + 4)
-                    + statistics
-                        .multi_columns
-                        .iter()
-                        .filter(|statistics| statistics.valid)
-                        .map(|statistics| 1 + statistics.n_columns as usize * 2 + 8 + 8)
-                        .sum::<usize>()
             }
             Self::Encoded(bytes) => bytes.len(),
         }
@@ -268,17 +264,11 @@ impl WalTableStatistics<'_> {
                     .iter()
                     .filter(|column| column.valid)
                     .count();
-                let valid_multi_columns = statistics
-                    .multi_columns
-                    .iter()
-                    .filter(|statistics| statistics.valid)
-                    .count();
-                let mut ok = buffer.append(&[TABLE_STATISTICS_V2])
+                let mut ok = buffer.append(&[TABLE_STATISTICS_V3])
                     && buffer.append(&statistics.rows.to_le_bytes())
                     && buffer.append(&statistics.average_row_width.to_le_bytes())
                     && buffer.append(&statistics.analyzed_generation.to_le_bytes())
-                    && buffer.append(&[valid_columns as u8])
-                    && buffer.append(&[valid_multi_columns as u8]);
+                    && buffer.append(&[valid_columns as u8]);
                 for (index, column) in statistics.columns.iter().enumerate() {
                     if !column.valid {
                         continue;
@@ -288,18 +278,6 @@ impl WalTableStatistics<'_> {
                         && buffer.append(&column.distinct_values.to_le_bytes())
                         && buffer.append(&column.distinct_fraction_ppm.to_le_bytes())
                         && buffer.append(&column.average_width.to_le_bytes());
-                }
-                for multi in statistics
-                    .multi_columns
-                    .iter()
-                    .filter(|statistics| statistics.valid)
-                {
-                    ok &= buffer.append(&[multi.n_columns]);
-                    for column in &multi.columns[..multi.n_columns as usize] {
-                        ok &= buffer.append(&column.to_le_bytes());
-                    }
-                    ok &= buffer.append(&multi.non_null_rows.to_le_bytes())
-                        && buffer.append(&multi.distinct_values.to_le_bytes());
                 }
                 ok
             }
@@ -314,6 +292,83 @@ impl WalTableStatistics<'_> {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "corrupt table statistics in journal"
+                )
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalExtendedStatisticsKey<'a> {
+    Column(&'a str),
+    Expression(&'a str),
+}
+
+impl WalExtendedStatisticsKey<'_> {
+    pub(crate) const EMPTY: Self = Self::Column("");
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WalExtendedStatisticsData<'a> {
+    Captured(&'a ExtendedStatisticsData),
+    Encoded(&'a [u8]),
+}
+
+impl WalExtendedStatisticsData<'_> {
+    fn encoded_len(self) -> usize {
+        match self {
+            Self::Captured(data) => {
+                2 + 8 * 4
+                    + data.dependencies_ppm.len() * 4
+                    + data.expression_statistics.len() * (1 + 4 + 8 + 4 + 4)
+                    + 2
+                    + data.mcv[..usize::from(data.n_mcv)]
+                        .iter()
+                        .map(|entry| 8 + 8 + 2 + entry.values.as_str().len())
+                        .sum::<usize>()
+            }
+            Self::Encoded(bytes) => bytes.len(),
+        }
+    }
+
+    fn append(self, buffer: &mut FixedBuf) -> bool {
+        match self {
+            Self::Captured(data) => {
+                let mut ok = buffer.append(&[u8::from(data.valid), u8::from(data.inherited)])
+                    && buffer.append(&data.analyzed_generation.to_le_bytes())
+                    && buffer.append(&data.rows.to_le_bytes())
+                    && buffer.append(&data.non_null_rows.to_le_bytes())
+                    && buffer.append(&data.distinct_values.to_le_bytes());
+                for strength in data.dependencies_ppm {
+                    ok &= buffer.append(&strength.to_le_bytes());
+                }
+                for column in data.expression_statistics {
+                    ok &= buffer.append(&[u8::from(column.valid)])
+                        && buffer.append(&column.null_fraction_ppm.to_le_bytes())
+                        && buffer.append(&column.distinct_values.to_le_bytes())
+                        && buffer.append(&column.distinct_fraction_ppm.to_le_bytes())
+                        && buffer.append(&column.average_width.to_le_bytes());
+                }
+                ok &= buffer.append(&data.n_mcv.to_le_bytes());
+                for entry in &data.mcv[..usize::from(data.n_mcv)] {
+                    ok &= buffer.append(&entry.hash.to_le_bytes())
+                        && buffer.append(&entry.count.to_le_bytes())
+                        && buffer.append(&(entry.values.as_str().len() as u16).to_le_bytes())
+                        && buffer.append(entry.values.as_str().as_bytes());
+                }
+                ok
+            }
+            Self::Encoded(bytes) => buffer.append(bytes),
+        }
+    }
+
+    pub(crate) fn materialize(self) -> Result<ExtendedStatisticsData, SqlError> {
+        match self {
+            Self::Captured(data) => Ok(*data),
+            Self::Encoded(bytes) => decode_extended_statistics_data(bytes).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt extended statistics in journal"
                 )
             }),
         }
@@ -803,6 +858,29 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         table: &'a str,
         statistics: WalTableStatistics<'a>,
+    },
+    /// Complete catalog image for CREATE and every ALTER. Names identify the
+    /// table during cold replay; keys are already parsed into durable forms.
+    SetExtendedStatistics {
+        created_at: u64,
+        schema: &'a str,
+        name: &'a str,
+        table_schema: &'a str,
+        table: &'a str,
+        target: Option<u16>,
+        kinds: u8,
+        expression_only: bool,
+        keys: [WalExtendedStatisticsKey<'a>; crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
+        key_count: usize,
+    },
+    DropExtendedStatistics {
+        schema: &'a str,
+        name: &'a str,
+    },
+    AnalyzeExtendedStatistics {
+        schema: &'a str,
+        name: &'a str,
+        statistics: WalExtendedStatisticsData<'a>,
     },
     /// Absolute role definition, shared by CREATE and ALTER so replay is
     /// idempotent and a manifest/WAL handoff cannot expose a partial option set.
@@ -1546,6 +1624,9 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AlterRoutineIdentity { .. } => KIND_ALTER_ROUTINE_IDENTITY,
         WalOp::AlterDomainIdentity { .. } => KIND_ALTER_DOMAIN_IDENTITY,
         WalOp::Analyze { .. } => KIND_ANALYZE,
+        WalOp::SetExtendedStatistics { .. } => KIND_SET_EXTENDED_STATISTICS,
+        WalOp::DropExtendedStatistics { .. } => KIND_DROP_EXTENDED_STATISTICS,
+        WalOp::AnalyzeExtendedStatistics { .. } => KIND_ANALYZE_EXTENDED_STATISTICS,
         WalOp::UpsertRole { .. } => KIND_UPSERT_ROLE,
         WalOp::DropRole { .. } => KIND_DROP_ROLE,
         WalOp::UpsertRoleMembership { .. } => KIND_UPSERT_ROLE_MEMBERSHIP,
@@ -2157,6 +2238,43 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             statistics,
         } => 1 + table.len() + 1 + schema.len() + statistics.encoded_len(),
+        WalOp::SetExtendedStatistics {
+            schema,
+            name,
+            table_schema,
+            table,
+            keys,
+            key_count,
+            ..
+        } => {
+            8 + 1
+                + schema.len()
+                + 1
+                + name.len()
+                + 1
+                + table_schema.len()
+                + 1
+                + table.len()
+                + 2
+                + 1
+                + 1
+                + 1
+                + keys[..*key_count]
+                    .iter()
+                    .map(|key| match key {
+                        WalExtendedStatisticsKey::Column(column) => 1 + 1 + column.len(),
+                        WalExtendedStatisticsKey::Expression(expression) => {
+                            1 + 2 + expression.len()
+                        }
+                    })
+                    .sum::<usize>()
+        }
+        WalOp::DropExtendedStatistics { schema, name } => 1 + schema.len() + 1 + name.len(),
+        WalOp::AnalyzeExtendedStatistics {
+            schema,
+            name,
+            statistics,
+        } => 1 + schema.len() + 1 + name.len() + statistics.encoded_len(),
         WalOp::UpsertRole { name, attributes } => {
             1 + name.len() + 2 + 4 + 16 + 32 + 32 + 4 + 1 + attributes.valid_until.as_str().len()
         }
@@ -3337,6 +3455,50 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             table,
             statistics,
         } => name_bytes(buffer, table) && name_bytes(buffer, schema) && statistics.append(buffer),
+        WalOp::SetExtendedStatistics {
+            created_at,
+            schema,
+            name,
+            table_schema,
+            table,
+            target,
+            kinds,
+            expression_only,
+            keys,
+            key_count,
+        } => {
+            let mut ok = *key_count <= crate::storage::MAX_EXTENDED_STATISTICS_KEYS
+                && buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && name_bytes(buffer, table_schema)
+                && name_bytes(buffer, table)
+                && buffer.append(&target.map_or(-1i16, |value| value as i16).to_le_bytes())
+                && buffer.append(&[*kinds, u8::from(*expression_only), *key_count as u8]);
+            for key in &keys[..*key_count] {
+                ok &= match key {
+                    WalExtendedStatisticsKey::Column(column) => {
+                        buffer.append(&[0]) && name_bytes(buffer, column)
+                    }
+                    WalExtendedStatisticsKey::Expression(expression) => {
+                        buffer.append(&[1])
+                            && u16::try_from(expression.len()).ok().is_some_and(|length| {
+                                buffer.append(&length.to_le_bytes())
+                                    && buffer.append(expression.as_bytes())
+                            })
+                    }
+                };
+            }
+            ok
+        }
+        WalOp::DropExtendedStatistics { schema, name } => {
+            name_bytes(buffer, schema) && name_bytes(buffer, name)
+        }
+        WalOp::AnalyzeExtendedStatistics {
+            schema,
+            name,
+            statistics,
+        } => name_bytes(buffer, schema) && name_bytes(buffer, name) && statistics.append(buffer),
         WalOp::CreateTrigger {
             name,
             target,
@@ -3553,11 +3715,10 @@ fn decode_stored_query_dependencies(payload: &[u8]) -> Option<StoredQueryDepende
 }
 
 fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
-    let mut at = 0usize;
-    let version_two = payload.first().copied() == Some(TABLE_STATISTICS_V2);
-    if version_two {
-        at += 1;
+    if payload.first().copied() != Some(TABLE_STATISTICS_V3) {
+        return None;
     }
+    let mut at = 1usize;
     let rows = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
     at += 8;
     let average_row_width = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
@@ -3569,23 +3730,12 @@ fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
     if count > MAX_COLUMNS {
         return None;
     }
-    let multi_count = if version_two {
-        let count = *payload.get(at)? as usize;
-        at += 1;
-        if count > MAX_MULTICOLUMN_STATISTICS {
-            return None;
-        }
-        count
-    } else {
-        0
-    };
     let mut statistics = TableStatistics {
         valid: true,
         rows,
         average_row_width,
         analyzed_generation,
         columns: [ColumnStatistics::EMPTY; MAX_COLUMNS],
-        multi_columns: [MultiColumnStatistics::EMPTY; MAX_MULTICOLUMN_STATISTICS],
     };
     for _ in 0..count {
         let column = *payload.get(at)? as usize;
@@ -3615,42 +3765,103 @@ fn decode_table_statistics(payload: &[u8]) -> Option<TableStatistics> {
             average_width,
         };
     }
-    for multi_index in 0..multi_count {
-        let n_columns = *payload.get(at)? as usize;
+    (at == payload.len()).then_some(statistics)
+}
+
+fn decode_extended_statistics_data(payload: &[u8]) -> Option<ExtendedStatisticsData> {
+    let mut at = 0usize;
+    let valid = match *payload.get(at)? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    at += 1;
+    let inherited = match *payload.get(at)? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    at += 1;
+    let take_u64 = |at: &mut usize| {
+        let value = u64::from_le_bytes(payload.get(*at..*at + 8)?.try_into().ok()?);
+        *at += 8;
+        Some(value)
+    };
+    let analyzed_generation = take_u64(&mut at)?;
+    let rows = take_u64(&mut at)?;
+    let non_null_rows = take_u64(&mut at)?;
+    let distinct_values = take_u64(&mut at)?;
+    let mut data = ExtendedStatisticsData {
+        valid,
+        inherited,
+        analyzed_generation,
+        rows,
+        non_null_rows,
+        distinct_values,
+        dependencies_ppm: [0; crate::storage::MAX_EXTENDED_STATISTICS_KEYS
+            * crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
+        expression_statistics: [ColumnStatistics::EMPTY;
+            crate::storage::MAX_EXTENDED_STATISTICS_KEYS],
+        mcv: [ExtendedStatisticsMcv::EMPTY; crate::storage::MAX_EXTENDED_STATISTICS_MCV],
+        n_mcv: 0,
+    };
+    for strength in &mut data.dependencies_ppm {
+        *strength = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        if *strength > 1_000_000 {
+            return None;
+        }
+    }
+    for column in &mut data.expression_statistics {
+        let column_valid = match *payload.get(at)? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
         at += 1;
-        if !(2..=MAX_INDEX_COLS).contains(&n_columns) {
+        let null_fraction_ppm = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        let column_distinct = take_u64(&mut at)?;
+        let distinct_fraction_ppm = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        let average_width = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        if null_fraction_ppm > 1_000_000 || distinct_fraction_ppm > 1_000_000 {
             return None;
         }
-        let mut columns = [0u16; MAX_INDEX_COLS];
-        for column in &mut columns[..n_columns] {
-            *column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
-            at += 2;
-            if usize::from(*column) >= MAX_COLUMNS {
-                return None;
-            }
-        }
-        let non_null_rows = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-        at += 8;
-        let distinct_values = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
-        at += 8;
-        if statistics.multi_columns[..multi_index]
-            .iter()
-            .any(|existing| {
-                existing.n_columns as usize == n_columns
-                    && existing.columns[..n_columns] == columns[..n_columns]
-            })
-        {
-            return None;
-        }
-        statistics.multi_columns[multi_index] = MultiColumnStatistics {
-            valid: true,
-            columns,
-            n_columns: n_columns as u8,
-            non_null_rows,
-            distinct_values,
+        *column = ColumnStatistics {
+            valid: column_valid,
+            null_fraction_ppm,
+            distinct_values: column_distinct,
+            distinct_fraction_ppm,
+            average_width,
         };
     }
-    (at == payload.len()).then_some(statistics)
+    let n_mcv = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+    at += 2;
+    if n_mcv > crate::storage::MAX_EXTENDED_STATISTICS_MCV {
+        return None;
+    }
+    for entry in &mut data.mcv[..n_mcv] {
+        let hash = take_u64(&mut at)?;
+        let count = take_u64(&mut at)?;
+        let length = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+        at += 2;
+        let value = core::str::from_utf8(payload.get(at..at + length)?).ok()?;
+        at += length;
+        let values = StackStr::from_str(value);
+        if values.is_truncated() {
+            return None;
+        }
+        *entry = ExtendedStatisticsMcv {
+            valid: true,
+            hash,
+            count,
+            values,
+        };
+    }
+    data.n_mcv = n_mcv as u16;
+    (at == payload.len()).then_some(data)
 }
 
 fn decode_subscription_behavior(
@@ -5537,6 +5748,90 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 table,
                 statistics: WalTableStatistics::Encoded(encoded),
+            })
+        }
+        KIND_SET_EXTENDED_STATISTICS => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let table_schema = take_name(&mut at)?;
+            let table = take_name(&mut at)?;
+            let target_raw = i16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let target = match target_raw {
+                -1 => None,
+                0..=10_000 => Some(target_raw as u16),
+                _ => return None,
+            };
+            let kinds = *payload.get(at)?;
+            at += 1;
+            let expression_only = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            if (expression_only && kinds != 0)
+                || (!expression_only
+                    && crate::sql::ast::StatisticsKinds::from_code(kinds).is_none())
+            {
+                return None;
+            }
+            let key_count = *payload.get(at)? as usize;
+            at += 1;
+            if key_count == 0 || key_count > crate::storage::MAX_EXTENDED_STATISTICS_KEYS {
+                return None;
+            }
+            let mut keys =
+                [WalExtendedStatisticsKey::EMPTY; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+            for key in &mut keys[..key_count] {
+                *key = match *payload.get(at)? {
+                    0 => {
+                        at += 1;
+                        let column = take_name(&mut at)?;
+                        WalExtendedStatisticsKey::Column(column)
+                    }
+                    1 => {
+                        at += 1;
+                        let length =
+                            u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                        at += 2;
+                        let expression =
+                            core::str::from_utf8(payload.get(at..at + length)?).ok()?;
+                        at += length;
+                        WalExtendedStatisticsKey::Expression(expression)
+                    }
+                    _ => return None,
+                };
+            }
+            (at == payload.len()).then_some(WalOp::SetExtendedStatistics {
+                created_at,
+                schema,
+                name,
+                table_schema,
+                table,
+                target,
+                kinds,
+                expression_only,
+                keys,
+                key_count,
+            })
+        }
+        KIND_DROP_EXTENDED_STATISTICS => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropExtendedStatistics { schema, name })
+        }
+        KIND_ANALYZE_EXTENDED_STATISTICS => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let encoded = payload.get(at..)?;
+            decode_extended_statistics_data(encoded)?;
+            Some(WalOp::AnalyzeExtendedStatistics {
+                schema,
+                name,
+                statistics: WalExtendedStatisticsData::Encoded(encoded),
             })
         }
         KIND_UPSERT_ROLE => {

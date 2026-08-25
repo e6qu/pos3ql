@@ -16,10 +16,9 @@
 //! That is the whole point of the sparse index: lookup cost stays bounded as
 //! the table grows, and the index is cacheable alongside the data.
 //!
-//! Current SSTs key versions by `(rowid, commit_lsn)`: row identities ascend,
-//! and versions of one row descend by commit LSN so a snapshot lookup finds
-//! the newest admissible image first. The reader also accepts the original
-//! rowid-only block format; the next checkpoint rewrites those legacy SSTs.
+//! SSTs key versions by `(rowid, commit_lsn)`: row identities ascend, and
+//! versions of one row descend by commit LSN so a snapshot lookup finds the
+//! newest admissible image first.
 
 use crate::mem::arena::Arena;
 use crate::sql::types::ColType;
@@ -39,8 +38,6 @@ pub(crate) struct SstHandle {
     /// chain, filter, index), so garbage collection can enumerate an SST by
     /// reading one block instead of all of them.
     pub(crate) roster: BlockId,
-    /// False for manifests written before commit-LSN keys were introduced.
-    pub(crate) versioned: bool,
     /// Data entries name verified extents in immutable packed containers.
     /// False retains the direct content-addressed data-block format.
     pub(crate) packed: bool,
@@ -120,13 +117,11 @@ impl PartialOrd for SstKey {
     }
 }
 
-/// Legacy: `rowid` u64 | `len` u32. Versioned: `rowid` u64 |
-/// `commit_lsn` u64 | `len` u32. The row bytes follow.
+/// `rowid` u64 | `commit_lsn` u64 | `len` u32. The row bytes follow.
 /// `len`'s high bit marks a *chained* entry: a row too large for one block,
 /// whose payload continues in overflow blocks. The masked low bits are the
 /// row's total length; the entry body is then `n_chunks` u16, the overflow
 /// blocks' identities, and the head chunk inline.
-const LEGACY_ENTRY_HEADER: usize = 12;
 const VERSIONED_ENTRY_HEADER: usize = 20;
 /// Largest row an execution cursor can read without following an overflow
 /// chain. External runs enforce this before handing a row to the writer.
@@ -149,7 +144,6 @@ pub(crate) const MAX_ASSEMBLED: usize =
 /// this caps a single row at about 4 MiB — far above anything the engine's
 /// arenas admit — and exceeding it is a loud error, never truncation.
 const MAX_CHAIN: usize = 16;
-const PAX_MAGIC: u32 = 0x3158_4150;
 const PAX_V2_MAGIC: u32 = 0x3258_4150;
 const PAX_COLUMN_MAGIC: u32 = 0x3143_4150;
 const PAX_ROW_HEADER: usize = 8 + 8 + 4;
@@ -159,7 +153,6 @@ const PACKED_DATA_REF_BYTES: usize = 32 + 4 + 4 + 32;
 /// one ranged object can carry several independently cacheable groups.
 const PACKED_PAX_TARGET: usize = MAX_PAYLOAD / 2;
 
-const LEGACY_INDEX_ENTRY: usize = 8 + 32;
 const VERSIONED_INDEX_ENTRY: usize = 16 + 32;
 const PACKED_VERSIONED_INDEX_ENTRY: usize = 16 + 32 + 4 + 4 + 32;
 
@@ -261,7 +254,6 @@ const MAX_LEAVES: usize = 4096;
 /// Unambiguous: a leaf's count is at most `MAX_DATA_BLOCKS` (~6.5k).
 pub(crate) const INDEX_ROOT_MAGIC: u32 = 0xFFFF_FFFF;
 
-const LEGACY_ROOT_ENTRY: usize = 8 + 4 + 32;
 const VERSIONED_ROOT_ENTRY: usize = 16 + 4 + 32;
 
 impl SstWriter {
@@ -606,7 +598,6 @@ impl SstWriter {
         let mut payload_bytes = [0usize; MAX_COLUMNS];
         let entries = DataBlock {
             bytes: &self.pending[..self.pending_len],
-            versioned: true,
         };
         for entry in entries {
             if entry.is_chained() || rows == u16::MAX as usize {
@@ -649,7 +640,6 @@ impl SstWriter {
             let mut at = 8usize;
             for entry in (DataBlock {
                 bytes: &self.pending[..self.pending_len],
-                versioned: true,
             }) {
                 if entry.tombstone {
                     continue;
@@ -733,7 +723,6 @@ impl SstWriter {
         output[bitmap_base..refs_base].fill(0);
         for (row, entry) in (DataBlock {
             bytes: &self.pending[..self.pending_len],
-            versioned: true,
         })
         .enumerate()
         {
@@ -906,7 +895,6 @@ impl SstWriter {
             index,
             filter,
             roster,
-            versioned: true,
             packed: self.pax_enabled,
         }))
     }
@@ -1009,10 +997,7 @@ impl SstCursor {
 
             let remaining = &data[self.offset..self.data_len];
             let before = remaining.len();
-            let mut entries = DataBlock {
-                bytes: remaining,
-                versioned: self.handle.versioned,
-            };
+            let mut entries = DataBlock { bytes: remaining };
             let Some(entry) = entries.next() else {
                 return Err(SstError::Store(StoreError::Corrupt(
                     super::BlockError::Truncated,
@@ -1061,13 +1046,8 @@ impl SstCursor {
         let Some((ordinal, leaf)) = self.prefetched_leaf else {
             return Ok(());
         };
-        let Some(reference) = take_prefetched_index_first_data(
-            store,
-            &leaf,
-            index,
-            self.handle.versioned,
-            self.handle.packed,
-        )?
+        let Some(reference) =
+            take_prefetched_index_first_data(store, &leaf, index, self.handle.packed)?
         else {
             return Ok(());
         };
@@ -1178,7 +1158,7 @@ pub(crate) fn decode_data_block(
     output: &mut [u8],
 ) -> Result<usize, SstError> {
     match block_type {
-        BlockType::SstData | BlockType::SstDataV2 => {
+        BlockType::SstDataV2 => {
             if output.len() < input.len() {
                 return Err(SstError::Store(StoreError::Corrupt(
                     super::BlockError::Payload,
@@ -1187,11 +1167,9 @@ pub(crate) fn decode_data_block(
             output[..input.len()].copy_from_slice(input);
             Ok(input.len())
         }
-        BlockType::SstDataLz4 | BlockType::SstDataV2Lz4 => super::lz4::decompress(input, output)
-            .ok_or(SstError::Store(StoreError::Corrupt(
-                super::BlockError::Payload,
-            ))),
-        BlockType::SstDataPaxV1 => decode_pax(input, output),
+        BlockType::SstDataV2Lz4 => super::lz4::decompress(input, output).ok_or(SstError::Store(
+            StoreError::Corrupt(super::BlockError::Payload),
+        )),
         _ => Err(SstError::Store(StoreError::Corrupt(
             super::BlockError::UnknownType,
         ))),
@@ -1208,11 +1186,8 @@ pub(crate) fn read_data_block_raw(
 ) -> Result<(usize, BlockType), SstError> {
     let (n, block_type) = store.get(id, buf)?;
     match block_type {
-        BlockType::SstData
-        | BlockType::SstDataV2
-        | BlockType::SstDataLz4
+        BlockType::SstDataV2
         | BlockType::SstDataV2Lz4
-        | BlockType::SstDataPaxV1
         | BlockType::SstDataPaxV2
         | BlockType::SstDataPaxColumnV1 => Ok((n, block_type)),
         _ => Err(SstError::Store(StoreError::Corrupt(
@@ -1256,10 +1231,7 @@ pub(crate) struct PaxLayout {
     bitmap_base: usize,
     bitmap_bytes: usize,
     schema: [ColType; MAX_COLUMNS],
-    starts: [usize; MAX_COLUMNS],
-    ends: [usize; MAX_COLUMNS],
     refs_base: usize,
-    external: bool,
 }
 
 impl PaxLayout {
@@ -1271,12 +1243,8 @@ impl PaxLayout {
         self.columns
     }
 
-    pub(crate) fn external_columns(&self) -> bool {
-        self.external
-    }
-
     pub(crate) fn column_ref(&self, input: &[u8], column: usize) -> Result<DataBlockRef, SstError> {
-        if !self.external || column >= self.columns {
+        if column >= self.columns {
             return Err(SstError::Store(StoreError::Corrupt(
                 super::BlockError::Payload,
             )));
@@ -1296,7 +1264,7 @@ impl PaxLayout {
     }
 
     pub(crate) fn row_len(&self, input: &[u8], row: usize) -> Result<u32, SstError> {
-        if !self.external || row >= self.rows {
+        if row >= self.rows {
             return Err(SstError::Store(StoreError::Corrupt(
                 super::BlockError::Payload,
             )));
@@ -1320,98 +1288,6 @@ impl PaxLayout {
         Ok((SstKey::at(rowid, commit_lsn), flags & TOMB_FLAG != 0))
     }
 
-    pub(crate) fn column_starts(&self) -> [usize; MAX_COLUMNS] {
-        self.starts
-    }
-
-    pub(crate) fn advance_row_values(
-        &self,
-        input: &[u8],
-        row: usize,
-        cursors: &mut [usize; MAX_COLUMNS],
-        out: &mut [Option<(usize, usize)>; MAX_COLUMNS],
-    ) -> Result<(), SstError> {
-        if self.external {
-            return Err(SstError::Store(StoreError::Corrupt(
-                super::BlockError::Payload,
-            )));
-        }
-        let (_, tombstone) = self.row_key(input, row)?;
-        out.fill(None);
-        if tombstone {
-            return Ok(());
-        }
-        for column in 0..self.columns {
-            if self.column_is_null(input, row, column)? {
-                continue;
-            }
-            let length = rowenc::encoded_value_len(
-                &input[cursors[column]..self.ends[column]],
-                self.schema[column],
-            )
-            .map_err(|_| SstError::Store(StoreError::Corrupt(super::BlockError::Payload)))?;
-            let end =
-                cursors[column]
-                    .checked_add(length)
-                    .ok_or(SstError::Store(StoreError::Corrupt(
-                        super::BlockError::Payload,
-                    )))?;
-            if end > self.ends[column] {
-                return Err(SstError::Store(StoreError::Corrupt(
-                    super::BlockError::Payload,
-                )));
-            }
-            out[column] = Some((cursors[column], end));
-            cursors[column] = end;
-        }
-        Ok(())
-    }
-
-    /// Rebuilds one canonical row from the already-validated PAX value spans.
-    /// The caller supplies the exact spans yielded by [`Self::advance_row_values`]
-    /// for this row, so a merge cursor need not reassemble every row in a block.
-    #[cfg(test)]
-    pub(crate) fn copy_row(
-        &self,
-        input: &[u8],
-        row: usize,
-        values: &[Option<(usize, usize)>; MAX_COLUMNS],
-        output: &mut [u8],
-    ) -> Result<usize, SstError> {
-        let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
-        if self.external {
-            return Err(corrupt());
-        }
-        let (_, tombstone) = self.row_key(input, row)?;
-        if tombstone {
-            return Err(corrupt());
-        }
-        let bitmap_bytes = self.columns.div_ceil(8);
-        let mut written = 2usize.checked_add(bitmap_bytes).ok_or_else(corrupt)?;
-        if output.len() < written {
-            return Err(corrupt());
-        }
-        output[..2].copy_from_slice(&(self.columns as u16).to_le_bytes());
-        output[2..written].fill(0);
-        for column in 0..self.columns {
-            if self.column_is_null(input, row, column)? {
-                output[2 + column / 8] |= 1 << (column % 8);
-                continue;
-            }
-            let Some((start, end)) = values[column] else {
-                return Err(corrupt());
-            };
-            let bytes = input.get(start..end).ok_or_else(corrupt)?;
-            let next = written.checked_add(bytes.len()).ok_or_else(corrupt)?;
-            if next > output.len() {
-                return Err(corrupt());
-            }
-            output[written..next].copy_from_slice(bytes);
-            written = next;
-        }
-        Ok(written)
-    }
-
     pub(crate) fn column_is_null(
         &self,
         input: &[u8],
@@ -1432,20 +1308,15 @@ pub(crate) fn pax_layout(input: &[u8]) -> Result<PaxLayout, SstError> {
         return Err(corrupt());
     }
     let magic = u32::from_le_bytes(input[..4].try_into().unwrap());
-    if magic != PAX_MAGIC && magic != PAX_V2_MAGIC {
+    if magic != PAX_V2_MAGIC {
         return Err(corrupt());
     }
-    let external = magic == PAX_V2_MAGIC;
     let rows = u16::from_le_bytes(input[4..6].try_into().unwrap()) as usize;
     let columns = u16::from_le_bytes(input[6..8].try_into().unwrap()) as usize;
     if columns > MAX_COLUMNS {
         return Err(corrupt());
     }
-    let row_header = if external {
-        PAX_V2_ROW_HEADER
-    } else {
-        PAX_ROW_HEADER
-    };
+    let row_header = PAX_V2_ROW_HEADER;
     let bitmap_bytes = rows.div_ceil(8);
     let row_base = 8usize.checked_add(columns).ok_or_else(corrupt)?;
     let bitmap_base = row_base
@@ -1461,74 +1332,31 @@ pub(crate) fn pax_layout(input: &[u8]) -> Result<PaxLayout, SstError> {
     for column in 0..columns {
         schema[column] = ColType::from_code(input[8 + column]).ok_or_else(corrupt)?;
     }
-    let mut starts = [0usize; MAX_COLUMNS];
-    let mut ends = [0usize; MAX_COLUMNS];
-    if external {
-        let refs_end = values_base
-            .checked_add(
-                columns
-                    .checked_mul(PACKED_DATA_REF_BYTES)
-                    .ok_or_else(corrupt)?,
-            )
-            .ok_or_else(corrupt)?;
-        if refs_end != input.len() {
+    let refs_end = values_base
+        .checked_add(
+            columns
+                .checked_mul(PACKED_DATA_REF_BYTES)
+                .ok_or_else(corrupt)?,
+        )
+        .ok_or_else(corrupt)?;
+    if refs_end != input.len() {
+        return Err(corrupt());
+    }
+    for row in 0..rows {
+        let flags_at = row_base + row * row_header + 16;
+        let flags = u32::from_le_bytes(input[flags_at..flags_at + 4].try_into().unwrap());
+        if flags & !TOMB_FLAG != 0 {
             return Err(corrupt());
         }
-        for row in 0..rows {
-            let flags_at = row_base + row * row_header + 16;
-            let flags = u32::from_le_bytes(input[flags_at..flags_at + 4].try_into().unwrap());
-            if flags & !TOMB_FLAG != 0 {
+        let len_at = flags_at + 4;
+        let len = u32::from_le_bytes(input[len_at..len_at + 4].try_into().unwrap());
+        if flags & TOMB_FLAG != 0 {
+            if len != 0 {
                 return Err(corrupt());
             }
-            let len_at = flags_at + 4;
-            let len = u32::from_le_bytes(input[len_at..len_at + 4].try_into().unwrap());
-            if flags & TOMB_FLAG != 0 {
-                if len != 0 {
-                    return Err(corrupt());
-                }
-            } else if !(2 + columns.div_ceil(8)..=MAX_INLINE_ROW).contains(&(len as usize)) {
-                return Err(corrupt());
-            }
+        } else if !(2 + columns.div_ceil(8)..=MAX_INLINE_ROW).contains(&(len as usize)) {
+            return Err(corrupt());
         }
-        return Ok(PaxLayout {
-            rows,
-            columns,
-            row_base,
-            row_header,
-            bitmap_base,
-            bitmap_bytes,
-            schema,
-            starts,
-            ends,
-            refs_base: values_base,
-            external,
-        });
-    }
-    let mut at = values_base;
-    for column in 0..columns {
-        starts[column] = at;
-        for row in 0..rows {
-            let flags_at = row_base + row * row_header + 16;
-            let flags = u32::from_le_bytes(input[flags_at..flags_at + 4].try_into().unwrap());
-            if flags & !TOMB_FLAG != 0 {
-                return Err(corrupt());
-            }
-            if flags & TOMB_FLAG != 0
-                || input[bitmap_base + column * bitmap_bytes + row / 8] & (1 << (row % 8)) != 0
-            {
-                continue;
-            }
-            let length =
-                rowenc::encoded_value_len(&input[at..], schema[column]).map_err(|_| corrupt())?;
-            at = at.checked_add(length).ok_or_else(corrupt)?;
-            if at > input.len() {
-                return Err(corrupt());
-            }
-        }
-        ends[column] = at;
-    }
-    if at != input.len() {
-        return Err(corrupt());
     }
     Ok(PaxLayout {
         rows,
@@ -1538,10 +1366,7 @@ pub(crate) fn pax_layout(input: &[u8]) -> Result<PaxLayout, SstError> {
         bitmap_base,
         bitmap_bytes,
         schema,
-        starts,
-        ends,
-        refs_base: 0,
-        external,
+        refs_base: values_base,
     })
 }
 
@@ -1554,9 +1379,6 @@ fn decode_pax_v2(
 ) -> Result<usize, SstError> {
     let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
     let layout = pax_layout(input)?;
-    if !layout.external_columns() {
-        return Err(corrupt());
-    }
     let mut extents = [None; MAX_COLUMNS];
     let mut extent_len = 0usize;
     for (column, extent) in extents.iter_mut().enumerate().take(layout.columns()) {
@@ -1631,7 +1453,7 @@ pub(crate) fn copy_pax_v2_row_demand(
 ) -> Result<usize, SstError> {
     let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
     let (_, tombstone) = layout.row_key(input, row)?;
-    if !layout.external_columns() || tombstone {
+    if tombstone {
         return Err(corrupt());
     }
     let bitmap_bytes = layout.columns().div_ceil(8);
@@ -1705,7 +1527,7 @@ pub(crate) fn copy_pax_v2_row_from_extents(
 ) -> Result<usize, SstError> {
     let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
     let (_, tombstone) = layout.row_key(input, row)?;
-    if !layout.external_columns() || tombstone {
+    if tombstone {
         return Err(corrupt());
     }
     let bitmap_bytes = layout.columns().div_ceil(8);
@@ -1762,69 +1584,6 @@ pub(crate) fn copy_pax_v2_row_from_extents(
     Ok(written)
 }
 
-fn decode_pax(input: &[u8], output: &mut [u8]) -> Result<usize, SstError> {
-    let corrupt = || SstError::Store(StoreError::Corrupt(super::BlockError::Payload));
-    let layout = pax_layout(input)?;
-    let rows = layout.rows;
-    let columns = layout.columns;
-    let schema = layout.schema;
-    let ends = layout.ends;
-    let mut cursors = layout.starts;
-    let row_bitmap = columns.div_ceil(8);
-    let mut written = 0usize;
-    for row in 0..rows {
-        let (key, tombstone) = layout.row_key(input, row)?;
-        let header_end = written
-            .checked_add(VERSIONED_ENTRY_HEADER)
-            .ok_or_else(corrupt)?;
-        if header_end > output.len() {
-            return Err(corrupt());
-        }
-        output[written..written + 8].copy_from_slice(&key.rowid.to_le_bytes());
-        output[written + 8..written + 16].copy_from_slice(&key.commit_lsn.to_le_bytes());
-        written = header_end;
-        if tombstone {
-            output[written - 4..written].copy_from_slice(&TOMB_FLAG.to_le_bytes());
-            continue;
-        }
-        let row_start = written;
-        let row_header = written.checked_add(2 + row_bitmap).ok_or_else(corrupt)?;
-        if row_header > output.len() {
-            return Err(corrupt());
-        }
-        output[written..written + 2].copy_from_slice(&(columns as u16).to_le_bytes());
-        output[written + 2..row_header].fill(0);
-        written = row_header;
-        for column in 0..columns {
-            let is_null = layout.column_is_null(input, row, column)?;
-            if is_null {
-                output[row_start + 2 + column / 8] |= 1 << (column % 8);
-                continue;
-            }
-            let length =
-                rowenc::encoded_value_len(&input[cursors[column]..ends[column]], schema[column])
-                    .map_err(|_| corrupt())?;
-            let end = written.checked_add(length).ok_or_else(corrupt)?;
-            if end > output.len() {
-                return Err(corrupt());
-            }
-            output[written..end].copy_from_slice(&input[cursors[column]..cursors[column] + length]);
-            cursors[column] += length;
-            written = end;
-        }
-        let length = written - row_start;
-        if length > u32::MAX as usize {
-            return Err(corrupt());
-        }
-        output[row_start - VERSIONED_ENTRY_HEADER + 16..row_start - VERSIONED_ENTRY_HEADER + 20]
-            .copy_from_slice(&(length as u32).to_le_bytes());
-    }
-    if cursors[..columns] != ends[..columns] {
-        return Err(corrupt());
-    }
-    Ok(written)
-}
-
 /// Starts a read whose bytes a sequential scan will need next. The store
 /// retains ownership of a completed body until the demand read consumes it.
 pub(crate) fn prefetch_data_block(
@@ -1864,7 +1623,6 @@ fn prefetch_data_window(
     index: &[u8],
     first: usize,
     count: usize,
-    versioned: bool,
     packed: bool,
 ) -> Result<(), SstError> {
     if packed || !store.async_gets_enabled() {
@@ -1877,7 +1635,7 @@ fn prefetch_data_window(
     let end = first.saturating_add(slots - 1).min(count);
     for entry in first..end {
         match store
-            .prefetch(&block_ref_at(index, entry, versioned, false).id())
+            .prefetch(&block_ref_at(index, entry, false).id())
             .map_err(SstError::Store)?
         {
             super::PrefetchState::Scheduled | super::PrefetchState::Reused => {}
@@ -1896,14 +1654,13 @@ pub(crate) fn take_prefetched_index_first_data(
     store: &mut dyn BlockStore,
     id: &BlockId,
     into: &mut [u8],
-    versioned: bool,
     packed: bool,
 ) -> Result<Option<DataBlockRef>, SstError> {
     let Some((_, block_type)) = store.take_prefetch(id, into)? else {
         return Ok(None);
     };
-    validate_index_type(block_type, versioned)?;
-    Ok(Some(block_ref_at(into, 0, versioned, packed)))
+    validate_index_type(block_type)?;
+    Ok(Some(block_ref_at(into, 0, packed)))
 }
 
 impl<'a> SstReader<'a> {
@@ -2036,18 +1793,12 @@ impl<'a> SstReader<'a> {
         if !bloom::maybe_contains(&self.index_scratch[..filter_len], rowid) {
             return Ok(None);
         }
-        let target = SstKey::at(rowid, if handle.versioned { snapshot } else { 0 });
+        let target = SstKey::at(rowid, snapshot);
         let count = self.load_covering_leaf(store, handle, target)?;
-        let Some(entry) = block_containing(
-            self.index_scratch,
-            count,
-            target,
-            handle.versioned,
-            handle.packed,
-        ) else {
+        let Some(entry) = block_containing(self.index_scratch, count, target, handle.packed) else {
             return Ok(None);
         };
-        let block_ref = block_ref_at(self.index_scratch, entry, handle.versioned, handle.packed);
+        let block_ref = block_ref_at(self.index_scratch, entry, handle.packed);
 
         // Scan the one data block for the row. The block is small and bounded,
         // so a linear scan of it is the read the sparse index traded for not
@@ -2055,7 +1806,6 @@ impl<'a> SstReader<'a> {
         let data_len = self.load_data_block(store, block_ref)?;
         for entry in (DataBlock {
             bytes: &self.decoded_scratch[..data_len],
-            versioned: handle.versioned,
         }) {
             if entry.key.rowid == rowid && entry.key.commit_lsn <= snapshot {
                 if entry.tombstone {
@@ -2112,22 +1862,15 @@ impl<'a> SstReader<'a> {
         if !bloom::maybe_contains(&self.index_scratch[..filter_len], rowid) {
             return Ok(None);
         }
-        let target = SstKey::at(rowid, if handle.versioned { snapshot } else { 0 });
+        let target = SstKey::at(rowid, snapshot);
         let count = self.load_covering_leaf(store, handle, target)?;
-        let Some(entry) = block_containing(
-            self.index_scratch,
-            count,
-            target,
-            handle.versioned,
-            handle.packed,
-        ) else {
+        let Some(entry) = block_containing(self.index_scratch, count, target, handle.packed) else {
             return Ok(None);
         };
-        let block_ref = block_ref_at(self.index_scratch, entry, handle.versioned, handle.packed);
+        let block_ref = block_ref_at(self.index_scratch, entry, handle.packed);
         let data_len = self.load_data_block(store, block_ref)?;
         for entry in (DataBlock {
             bytes: &self.decoded_scratch[..data_len],
-            versioned: handle.versioned,
         }) {
             if entry.key.rowid == rowid && entry.key.commit_lsn <= snapshot {
                 return Ok(Some(SstProbe {
@@ -2174,30 +1917,17 @@ impl<'a> SstReader<'a> {
             // The block `lo` falls in, or — when `lo` precedes every key — the
             // first block, since the range may still cover it from the left.
             let start = if leaf_ordinal == start_leaf {
-                block_containing(
-                    self.index_scratch,
-                    count,
-                    start_key,
-                    handle.versioned,
-                    handle.packed,
-                )
-                .unwrap_or(0)
+                block_containing(self.index_scratch, count, start_key, handle.packed).unwrap_or(0)
             } else {
                 0
             };
             for entry_index in start..count {
-                let block_ref = block_ref_at(
-                    self.index_scratch,
-                    entry_index,
-                    handle.versioned,
-                    handle.packed,
-                );
+                let block_ref = block_ref_at(self.index_scratch, entry_index, handle.packed);
                 prefetch_data_window(
                     store,
                     self.index_scratch,
                     entry_index + 1,
                     count,
-                    handle.versioned,
                     handle.packed,
                 )?;
                 let data_len = self.load_data_block(store, block_ref)?;
@@ -2208,7 +1938,6 @@ impl<'a> SstReader<'a> {
                 let mut chained: Option<(u64, usize)> = None;
                 for entry in (DataBlock {
                     bytes: &self.decoded_scratch[..data_len],
-                    versioned: handle.versioned,
                 }) {
                     if entry.key.rowid > hi {
                         ran_past = true;
@@ -2260,37 +1989,23 @@ impl<'a> SstReader<'a> {
                 return Ok(None); // the SST is exhausted
             };
             let start = if leaf_ordinal == start_leaf {
-                block_containing(
-                    self.index_scratch,
-                    count,
-                    lo,
-                    handle.versioned,
-                    handle.packed,
-                )
-                .unwrap_or(0)
+                block_containing(self.index_scratch, count, lo, handle.packed).unwrap_or(0)
             } else {
                 0
             };
             let end = (start + budget).min(count);
             for entry_index in start..end {
-                let block_ref = block_ref_at(
-                    self.index_scratch,
-                    entry_index,
-                    handle.versioned,
-                    handle.packed,
-                );
+                let block_ref = block_ref_at(self.index_scratch, entry_index, handle.packed);
                 prefetch_data_window(
                     store,
                     self.index_scratch,
                     entry_index + 1,
                     end,
-                    handle.versioned,
                     handle.packed,
                 )?;
                 let data_len = self.load_data_block(store, block_ref)?;
                 for entry in (DataBlock {
                     bytes: &self.decoded_scratch[..data_len],
-                    versioned: handle.versioned,
                 }) {
                     if entry.key >= lo {
                         emit(entry.key, entry.tombstone);
@@ -2324,7 +2039,7 @@ impl<'a> SstReader<'a> {
         handle: &SstHandle,
         ordinal: usize,
     ) -> Result<Option<usize>, SstError> {
-        load_index(store, &handle.index, self.index_scratch, handle.versioned)?;
+        load_index(store, &handle.index, self.index_scratch)?;
         let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
         if head != INDEX_ROOT_MAGIC {
             return Ok((ordinal == 0).then_some(head as usize));
@@ -2333,12 +2048,12 @@ impl<'a> SstReader<'a> {
         if ordinal >= leaves {
             return Ok(None);
         }
-        let entry_size = root_entry_size(handle.versioned);
-        let key_bytes = key_size(handle.versioned);
+        let entry_size = VERSIONED_ROOT_ENTRY;
+        let key_bytes = 16;
         let at = 8 + ordinal * entry_size;
         let mut id = [0u8; 32];
         id.copy_from_slice(&self.index_scratch[at + key_bytes + 4..at + entry_size]);
-        load_index(store, &BlockId(id), self.index_scratch, handle.versioned)?;
+        load_index(store, &BlockId(id), self.index_scratch)?;
         Ok(Some(
             u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap()) as usize,
         ))
@@ -2352,13 +2067,13 @@ impl<'a> SstReader<'a> {
         handle: &SstHandle,
         key: SstKey,
     ) -> Result<usize, SstError> {
-        load_index(store, &handle.index, self.index_scratch, handle.versioned)?;
+        load_index(store, &handle.index, self.index_scratch)?;
         let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
         if head != INDEX_ROOT_MAGIC {
             return Ok(0);
         }
         let leaves = u32::from_le_bytes(self.index_scratch[4..8].try_into().unwrap()) as usize;
-        Ok(root_leaf_containing(self.index_scratch, leaves, key, handle.versioned).unwrap_or(0))
+        Ok(root_leaf_containing(self.index_scratch, leaves, key).unwrap_or(0))
     }
 
     /// Loads the leaf covering `rowid` and returns its entry count — after
@@ -2370,7 +2085,7 @@ impl<'a> SstReader<'a> {
         handle: &SstHandle,
         key: SstKey,
     ) -> Result<usize, SstError> {
-        load_index(store, &handle.index, self.index_scratch, handle.versioned)?;
+        load_index(store, &handle.index, self.index_scratch)?;
         let head = u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap());
         if head != INDEX_ROOT_MAGIC {
             // The single-block shape: the root is its own covering leaf, and
@@ -2378,25 +2093,24 @@ impl<'a> SstReader<'a> {
             return Ok(head as usize);
         }
         let leaves = u32::from_le_bytes(self.index_scratch[4..8].try_into().unwrap()) as usize;
-        let leaf =
-            root_leaf_containing(self.index_scratch, leaves, key, handle.versioned).unwrap_or(0);
-        let entry_size = root_entry_size(handle.versioned);
-        let key_bytes = key_size(handle.versioned);
+        let leaf = root_leaf_containing(self.index_scratch, leaves, key).unwrap_or(0);
+        let entry_size = VERSIONED_ROOT_ENTRY;
+        let key_bytes = 16;
         let at = 8 + leaf * entry_size;
         let mut id = [0u8; 32];
         id.copy_from_slice(&self.index_scratch[at + key_bytes + 4..at + entry_size]);
-        load_index(store, &BlockId(id), self.index_scratch, handle.versioned)?;
+        load_index(store, &BlockId(id), self.index_scratch)?;
         Ok(u32::from_le_bytes(self.index_scratch[0..4].try_into().unwrap()) as usize)
     }
 }
 
 /// The root entry (last one whose first key does not exceed `key`) in a
 /// fetched two-level root. `None` when `key` precedes every leaf.
-fn root_leaf_containing(root: &[u8], leaves: usize, key: SstKey, versioned: bool) -> Option<usize> {
-    let entry_size = root_entry_size(versioned);
+fn root_leaf_containing(root: &[u8], leaves: usize, key: SstKey) -> Option<usize> {
+    let entry_size = VERSIONED_ROOT_ENTRY;
     let first_key = |i: usize| {
         let at = 8 + i * entry_size;
-        read_key(&root[at..], versioned)
+        read_key(&root[at..])
     };
     if leaves == 0 || key < first_key(0) {
         return None;
@@ -2454,29 +2168,20 @@ pub(crate) fn locate_data_block_with_next(
     buf: &mut [u8],
     ordinal: usize,
 ) -> Result<Option<(DataBlockRef, Option<DataBlockLookahead>)>, SstError> {
-    load_index(store, &handle.index, buf, handle.versioned)?;
+    load_index(store, &handle.index, buf)?;
     let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if head != INDEX_ROOT_MAGIC {
         let count = head as usize;
         if ordinal >= count {
             return Ok(None);
         }
-        let next = (ordinal + 1 < count).then(|| {
-            DataBlockLookahead::Data(block_ref_at(
-                buf,
-                ordinal + 1,
-                handle.versioned,
-                handle.packed,
-            ))
-        });
-        return Ok(Some((
-            block_ref_at(buf, ordinal, handle.versioned, handle.packed),
-            next,
-        )));
+        let next = (ordinal + 1 < count)
+            .then(|| DataBlockLookahead::Data(block_ref_at(buf, ordinal + 1, handle.packed)));
+        return Ok(Some((block_ref_at(buf, ordinal, handle.packed), next)));
     }
     let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-    let entry_size = root_entry_size(handle.versioned);
-    let key_bytes = key_size(handle.versioned);
+    let entry_size = VERSIONED_ROOT_ENTRY;
+    let key_bytes = 16;
     let mut remaining = ordinal;
     for leaf in 0..leaves {
         let at = 8 + leaf * entry_size;
@@ -2491,21 +2196,17 @@ pub(crate) fn locate_data_block_with_next(
             });
             let mut id = [0u8; 32];
             id.copy_from_slice(&buf[at + key_bytes + 4..at + entry_size]);
-            load_index(store, &BlockId(id), buf, handle.versioned)?;
+            load_index(store, &BlockId(id), buf)?;
             let next = if remaining + 1 < count {
                 Some(DataBlockLookahead::Data(block_ref_at(
                     buf,
                     remaining + 1,
-                    handle.versioned,
                     handle.packed,
                 )))
             } else {
                 next_leaf.map(DataBlockLookahead::Leaf)
             };
-            return Ok(Some((
-                block_ref_at(buf, remaining, handle.versioned, handle.packed),
-                next,
-            )));
+            return Ok(Some((block_ref_at(buf, remaining, handle.packed), next)));
         }
         remaining -= count;
     }
@@ -2518,14 +2219,14 @@ pub(crate) fn data_block_total(
     handle: &SstHandle,
     buf: &mut [u8],
 ) -> Result<usize, SstError> {
-    load_index(store, &handle.index, buf, handle.versioned)?;
+    load_index(store, &handle.index, buf)?;
     let head = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     if head != INDEX_ROOT_MAGIC {
         return Ok(head as usize);
     }
     let leaves = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
-    let entry_size = root_entry_size(handle.versioned);
-    let key_bytes = key_size(handle.versioned);
+    let entry_size = VERSIONED_ROOT_ENTRY;
+    let key_bytes = 16;
     let mut total = 0usize;
     for leaf in 0..leaves {
         let at = 8 + leaf * entry_size;
@@ -2538,17 +2239,11 @@ pub(crate) fn data_block_total(
 /// Binary-searches the sparse index for the last block whose first key does not
 /// exceed `key` — the only data block `key` can be in. `None` when the index is
 /// empty or `key` precedes every block's first key.
-fn block_containing(
-    index: &[u8],
-    count: usize,
-    key: SstKey,
-    versioned: bool,
-    packed: bool,
-) -> Option<usize> {
-    let entry_size = index_entry_size(versioned, packed);
+fn block_containing(index: &[u8], count: usize, key: SstKey, packed: bool) -> Option<usize> {
+    let entry_size = index_entry_size(packed);
     let first_key = |i: usize| {
         let at = 4 + i * entry_size;
-        read_key(&index[at..], versioned)
+        read_key(&index[at..])
     };
     if count == 0 {
         return None;
@@ -2579,26 +2274,17 @@ fn block_containing(
 }
 
 /// The block identity stored in index entry `i`.
-fn block_ref_at(index: &[u8], i: usize, versioned: bool, packed: bool) -> DataBlockRef {
-    let entry_size = index_entry_size(versioned, packed);
-    let key_bytes = key_size(versioned);
+fn block_ref_at(index: &[u8], i: usize, packed: bool) -> DataBlockRef {
+    let entry_size = index_entry_size(packed);
     let at = 4 + i * entry_size;
-    read_data_ref(&index[at + key_bytes..at + entry_size], packed)
+    read_data_ref(&index[at + 16..at + entry_size], packed)
 }
 
-fn key_size(versioned: bool) -> usize {
-    if versioned { 16 } else { 8 }
-}
-
-fn index_entry_size(versioned: bool, packed: bool) -> usize {
-    if versioned {
-        if packed {
-            PACKED_VERSIONED_INDEX_ENTRY
-        } else {
-            VERSIONED_INDEX_ENTRY
-        }
+fn index_entry_size(packed: bool) -> usize {
+    if packed {
+        PACKED_VERSIONED_INDEX_ENTRY
     } else {
-        LEGACY_INDEX_ENTRY
+        VERSIONED_INDEX_ENTRY
     }
 }
 
@@ -2649,26 +2335,14 @@ fn read_data_ref(bytes: &[u8], packed: bool) -> DataBlockRef {
     }
 }
 
-fn root_entry_size(versioned: bool) -> usize {
-    if versioned {
-        VERSIONED_ROOT_ENTRY
-    } else {
-        LEGACY_ROOT_ENTRY
-    }
-}
-
 fn write_key(key: SstKey, into: &mut [u8]) {
     into[0..8].copy_from_slice(&key.rowid.to_le_bytes());
     into[8..16].copy_from_slice(&key.commit_lsn.to_le_bytes());
 }
 
-fn read_key(bytes: &[u8], versioned: bool) -> SstKey {
+fn read_key(bytes: &[u8]) -> SstKey {
     let rowid = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let commit_lsn = if versioned {
-        u64::from_le_bytes(bytes[8..16].try_into().unwrap())
-    } else {
-        0
-    };
+    let commit_lsn = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
     SstKey::at(rowid, commit_lsn)
 }
 
@@ -2676,20 +2350,14 @@ fn load_index(
     store: &mut dyn BlockStore,
     id: &BlockId,
     into: &mut [u8],
-    versioned: bool,
 ) -> Result<usize, SstError> {
     let (length, block_type) = store.get(id, into)?;
-    validate_index_type(block_type, versioned)?;
+    validate_index_type(block_type)?;
     Ok(length)
 }
 
-fn validate_index_type(block_type: BlockType, versioned: bool) -> Result<(), SstError> {
-    let expected = if versioned {
-        BlockType::SstIndexV2
-    } else {
-        BlockType::SstIndex
-    };
-    if block_type != expected {
+fn validate_index_type(block_type: BlockType) -> Result<(), SstError> {
+    if block_type != BlockType::SstIndexV2 {
         return Err(SstError::Store(StoreError::Corrupt(
             super::BlockError::UnknownType,
         )));
@@ -2720,7 +2388,6 @@ impl DataEntry<'_> {
 /// well-formed block — ends iteration rather than reading past the payload.
 struct DataBlock<'a> {
     bytes: &'a [u8],
-    versioned: bool,
 }
 
 impl<'a> Iterator for DataBlock<'a> {
@@ -2728,23 +2395,14 @@ impl<'a> Iterator for DataBlock<'a> {
 
     fn next(&mut self) -> Option<DataEntry<'a>> {
         let data = self.bytes;
-        let header = if self.versioned {
-            VERSIONED_ENTRY_HEADER
-        } else {
-            LEGACY_ENTRY_HEADER
-        };
+        let header = VERSIONED_ENTRY_HEADER;
         if data.len() < header {
             return None;
         }
         let rowid = u64::from_le_bytes(data[0..8].try_into().unwrap());
-        let commit_lsn = if self.versioned {
-            u64::from_le_bytes(data[8..16].try_into().unwrap())
-        } else {
-            0
-        };
+        let commit_lsn = u64::from_le_bytes(data[8..16].try_into().unwrap());
         let key = SstKey::at(rowid, commit_lsn);
-        let length_at = if self.versioned { 16 } else { 8 };
-        let raw_len = u32::from_le_bytes(data[length_at..length_at + 4].try_into().unwrap());
+        let raw_len = u32::from_le_bytes(data[16..20].try_into().unwrap());
         if raw_len & TOMB_FLAG != 0 {
             self.bytes = &data[header..];
             return Some(DataEntry {
@@ -2797,20 +2455,13 @@ impl<'a> Iterator for DataBlock<'a> {
 /// block's entries without copying row bytes — how the row-map overlay's
 /// merged enumeration walks keys. `at` is the previous step's returned
 /// offset (0 to start); `None` is the block's end.
-pub(crate) fn block_keys_at(
-    block: &[u8],
-    at: usize,
-    versioned: bool,
-) -> Option<(SstKey, bool, u32, usize)> {
+pub(crate) fn block_keys_at(block: &[u8], at: usize) -> Option<(SstKey, bool, u32, usize)> {
     if at >= block.len() {
         return None;
     }
     let remaining = &block[at..];
     let before = remaining.len();
-    let mut entries = DataBlock {
-        bytes: remaining,
-        versioned,
-    };
+    let mut entries = DataBlock { bytes: remaining };
     let entry = entries.next()?;
     let consumed = before - entries.bytes.len();
     Some((
@@ -2830,16 +2481,12 @@ pub(crate) fn copy_block_entry_at(
     store: &mut dyn BlockStore,
     block: &[u8],
     at: usize,
-    versioned: bool,
     out: &mut [u8],
 ) -> Result<(SstKey, bool, usize), SstError> {
     let remaining = block.get(at..).ok_or(SstError::Store(StoreError::Corrupt(
         super::BlockError::Truncated,
     )))?;
-    let mut entries = DataBlock {
-        bytes: remaining,
-        versioned,
-    };
+    let mut entries = DataBlock { bytes: remaining };
     let entry = entries.next().ok_or(SstError::Store(StoreError::Corrupt(
         super::BlockError::Truncated,
     )))?;
@@ -3034,7 +2681,6 @@ mod tests {
             read_data_block_raw_ref(&mut store, reference, &mut raw, &mut scratch).unwrap();
         assert_eq!(kind, BlockType::SstDataPaxV2);
         let layout = pax_layout(&raw[..length]).unwrap();
-        assert!(layout.external_columns());
         let mut oversized_row = raw[..length].to_vec();
         let row_length = 8 + layout.columns() + PAX_ROW_HEADER;
         oversized_row[row_length..row_length + 4]
@@ -3047,13 +2693,7 @@ mod tests {
             layout.column_ref(&raw[..length], 0).unwrap(),
             layout.column_ref(&raw[..length], 1).unwrap()
         );
-        let spans = [None; MAX_COLUMNS];
         let mut output = [0; MAX_PAYLOAD];
-        assert!(
-            layout
-                .copy_row(&raw[..length], 0, &spans, &mut output)
-                .is_err()
-        );
         let copied = copy_pax_v2_row_demand(
             &mut store,
             &layout,
@@ -3326,46 +2966,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn legacy_rowid_only_ssts_remain_readable() {
-        let (_budget, mut store) = store();
-        let rowid = 42u64;
-        let row = b"legacy";
-        let mut data = [0u8; LEGACY_ENTRY_HEADER + 6];
-        data[0..8].copy_from_slice(&rowid.to_le_bytes());
-        data[8..12].copy_from_slice(&(row.len() as u32).to_le_bytes());
-        data[12..].copy_from_slice(row);
-        let data_id = store.put(&data, BlockType::SstData, 0).unwrap();
-
-        let mut index = [0u8; 4 + LEGACY_INDEX_ENTRY];
-        index[0..4].copy_from_slice(&1u32.to_le_bytes());
-        index[4..12].copy_from_slice(&rowid.to_le_bytes());
-        index[12..].copy_from_slice(&data_id.0);
-        let index_id = store.put(&index, BlockType::SstIndex, 0).unwrap();
-
-        let mut filter = vec![0u8; FILTER_TIERS[0]];
-        bloom::insert(&mut filter, rowid);
-        let filter_id = store.put(&filter, BlockType::SstFilter, 0).unwrap();
-        let roster_id = store.put(&data_id.0, BlockType::SstRoster, 0).unwrap();
-        let handle = SstHandle {
-            index: index_id,
-            filter: filter_id,
-            roster: roster_id,
-            versioned: false,
-            packed: false,
-        };
-
-        let arena = arena();
-        let mut reader = SstReader::new(&arena).unwrap();
-        let mut out = [0u8; 32];
-        let probe = reader
-            .get_at(&mut store, &handle, rowid, 1, &mut out)
-            .unwrap()
-            .unwrap();
-        assert_eq!(probe.key, SstKey::at(rowid, 0));
-        assert_eq!(&out[..probe.len.unwrap() as usize], row);
     }
 
     #[test]
@@ -3774,7 +3374,7 @@ mod tests {
         second_leaf.copy_from_slice(&buf[second_leaf_at + 20..second_leaf_at + 52]);
         let second_leaf = BlockId(second_leaf);
         s.get(&second_leaf, &mut buf).unwrap();
-        let second_leaf_first_data = block_ref_at(&buf, 0, true, false).id();
+        let second_leaf_first_data = block_ref_at(&buf, 0, false).id();
         let mut lookahead = LookaheadStore {
             inner: s,
             requested: Vec::new(),

@@ -726,6 +726,27 @@ pub trait CatalogAccess {
     ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
+    fn statistics_columns<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    fn statistics_definition<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    fn statistics_expressions<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        Ok(None)
+    }
     /// Whether this OID names a collation visible to the current query.
     fn collation_is_visible(&self, oid: i32) -> Option<bool>;
     fn tablespace_location<'a>(

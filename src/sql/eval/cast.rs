@@ -52,9 +52,13 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::OidVector(_) => v,
             _ => return Err(cast_unsupported(&v, "oidvector")),
         },
-        ColType::PgNodeTree => match v {
+        ColType::PgNodeTree
+        | ColType::PgNdistinct
+        | ColType::PgDependencies
+        | ColType::PgMcvList
+        | ColType::PgStatisticArray => match v {
             Datum::Text(_) => v,
-            _ => return Err(cast_unsupported(&v, "pg_node_tree")),
+            _ => return Err(cast_unsupported(&v, target.name())),
         },
         ColType::Regtype => match v {
             Datum::Regtype { .. } => v,

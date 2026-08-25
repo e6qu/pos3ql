@@ -7,6 +7,228 @@
 use super::*;
 
 #[test]
+fn extended_statistics_are_typed_transactional_catalog_objects() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE statistics_source(a integer, b integer, label text); \
+         INSERT INTO statistics_source \
+           SELECT value, value, 'group-' || value::text FROM generate_series(1, 20) value; \
+         CREATE STATISTICS source_ab (ndistinct, dependencies, mcv) \
+           ON a, b FROM statistics_source; \
+         CREATE STATISTICS ON (lower(label)) FROM statistics_source; \
+         ALTER STATISTICS source_ab SET STATISTICS 12; \
+         ANALYZE statistics_source; \
+         SELECT stxname, stxstattarget, stxkind, stxkeys \
+           FROM pg_statistic_ext ORDER BY stxname; \
+         SELECT pg_get_statisticsobjdef_columns(oid) FROM pg_statistic_ext \
+           WHERE stxname = 'source_ab'; \
+         SELECT count(*) FROM pg_statistic_ext_data;",
+    );
+    let rows = data_rows(&output);
+    assert!(
+        rows.iter().any(|row| row.starts_with("source_ab|12|")),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(rows.last().map(String::as_str), Some("2"));
+
+    let stored_data = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT stxdmcv::text FROM pg_statistic_ext_data d \
+           JOIN pg_statistic_ext e ON e.oid=d.stxoid WHERE e.stxname='source_ab'; \
+         SELECT stxdexpr::text FROM pg_statistic_ext_data d \
+           JOIN pg_statistic_ext e ON e.oid=d.stxoid \
+           WHERE e.stxname='statistics_source_lower_stat'",
+    ));
+    assert!(stored_data[0].starts_with("\\xc251a6e1"), "{stored_data:?}");
+    assert!(
+        stored_data[1].starts_with("{\"(0,0,f,0,"),
+        "{stored_data:?}"
+    );
+
+    let definitions = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_get_statisticsobjdef(oid), \
+                pg_get_statisticsobjdef_expressions(oid)::text \
+           FROM pg_statistic_ext ORDER BY stxname",
+    );
+    assert_eq!(
+        data_rows(&definitions),
+        [
+            "CREATE STATISTICS public.source_ab ON a, b FROM statistics_source|NULL",
+            "CREATE STATISTICS public.statistics_source_lower_stat ON lower(label) FROM statistics_source|{lower(label)}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&definitions)
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER STATISTICS source_ab RENAME TO rolled_back; \
+         DROP STATISTICS statistics_source_lower_stat; ROLLBACK; \
+         SELECT stxname FROM pg_statistic_ext ORDER BY stxname; \
+         DROP STATISTICS source_ab, statistics_source_lower_stat; \
+         SELECT count(*) FROM pg_statistic_ext;",
+    );
+    assert_eq!(data_rows(&output).last().map(String::as_str), Some("0"));
+}
+
+#[test]
+fn extended_statistics_mcv_includes_null_combinations_and_empty_analyze_has_no_data() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE statistics_nulls(a integer, b text); \
+         CREATE STATISTICS statistics_nulls_ab (ndistinct, dependencies, mcv) \
+           ON a, b FROM statistics_nulls; \
+         ANALYZE statistics_nulls; \
+         SELECT count(*) FROM pg_statistic_ext_data; \
+         INSERT INTO statistics_nulls VALUES (NULL,NULL),(NULL,NULL),(1,NULL); \
+         ANALYZE statistics_nulls; \
+         SELECT stxdmcv IS NOT NULL FROM pg_statistic_ext_data d \
+           JOIN pg_statistic_ext e ON e.oid=d.stxoid \
+           WHERE e.stxname='statistics_nulls_ab'",
+    );
+    assert_eq!(data_rows(&output), ["0", "t"]);
+}
+
+#[test]
+fn extended_statistics_drive_plans_and_follow_schema_evolution() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE correlated_statistics(a integer, b integer, label text); \
+         CREATE STATISTICS correlated_ab (ndistinct, dependencies, mcv) \
+           ON a, b FROM correlated_statistics; \
+         CREATE STATISTICS correlated_label ON (lower(label)) FROM correlated_statistics",
+    );
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO correlated_statistics \
+           SELECT value % 10, value % 10, value::text \
+             FROM generate_series(1, 100) value",
+    );
+    assert!(
+        !String::from_utf8_lossy(&inserted).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&inserted)
+    );
+    let analyzed = run_with(&mut engine, &mut budget, "ANALYZE correlated_statistics");
+    assert!(
+        !String::from_utf8_lossy(&analyzed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&analyzed)
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let explained = run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN SELECT * FROM correlated_statistics WHERE a = 1 AND b = 1",
+    );
+    assert!(
+        data_rows(&explained)
+            .iter()
+            .any(|line| line.contains("rows=10")),
+        "{}",
+        String::from_utf8_lossy(&explained)
+    );
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER TABLE correlated_statistics RENAME COLUMN a TO renamed_a; \
+         SELECT pg_get_statisticsobjdef_columns(oid) FROM pg_statistic_ext \
+           WHERE stxname = 'correlated_ab'; ROLLBACK; \
+         SELECT pg_get_statisticsobjdef_columns(oid) FROM pg_statistic_ext \
+           WHERE stxname = 'correlated_ab';",
+    );
+    let rows = data_rows(&rolled_back);
+    assert!(
+        rows.iter().any(|row| row.starts_with("renamed_a, b")),
+        "{rows:?}"
+    );
+    assert_eq!(rows.last().map(String::as_str), Some("a, b"));
+
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE correlated_statistics DROP COLUMN a; \
+         SELECT stxname FROM pg_statistic_ext ORDER BY stxname; \
+         CREATE SCHEMA statistics_archive; \
+         ALTER STATISTICS correlated_label SET SCHEMA statistics_archive; \
+         ALTER STATISTICS statistics_archive.correlated_label SET STATISTICS 0; \
+         ANALYZE correlated_statistics; \
+         SELECT count(*) FROM pg_statistic_ext_data d JOIN pg_statistic_ext e \
+           ON e.oid = d.stxoid WHERE e.stxname = 'correlated_label';",
+    );
+    let rows = data_rows(&dropped);
+    assert!(rows.iter().any(|row| row == "correlated_label"), "{rows:?}");
+    assert!(!rows.iter().any(|row| row == "correlated_ab"), "{rows:?}");
+    assert_eq!(rows.last().map(String::as_str), Some("0"));
+}
+
+#[test]
+fn extended_statistics_cover_partition_inheritance_and_owned_object_lifecycle() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE statistics_owner; \
+         CREATE ROLE statistics_successor; \
+         GRANT CREATE ON SCHEMA public TO statistics_owner, statistics_successor; \
+         SET ROLE statistics_owner; \
+         CREATE TABLE statistics_partition_root(a integer, b integer) \
+           PARTITION BY RANGE (a); \
+         CREATE TABLE statistics_partition_leaf \
+           PARTITION OF statistics_partition_root FOR VALUES FROM (0) TO (100); \
+         CREATE STATISTICS statistics_partition_root_ab \
+           (ndistinct, dependencies, mcv) ON a, b FROM statistics_partition_root; \
+         CREATE STATISTICS statistics_partition_leaf_ab \
+           (ndistinct, dependencies) ON a, b FROM statistics_partition_leaf; \
+         INSERT INTO statistics_partition_root VALUES (1, 1), (2, 2); \
+         ANALYZE statistics_partition_root; \
+         ANALYZE statistics_partition_leaf; \
+         RESET ROLE; \
+         SELECT e.stxname, e.stxkeys::text, pg_typeof(e.stxkind)::text, d.stxdinherit \
+           FROM pg_statistic_ext e JOIN pg_statistic_ext_data d ON d.stxoid=e.oid \
+           WHERE e.stxname LIKE 'statistics_partition_%' ORDER BY e.stxname; \
+         REASSIGN OWNED BY statistics_owner TO statistics_successor; \
+         SELECT DISTINCT pg_get_userbyid(stxowner) FROM pg_statistic_ext \
+           WHERE stxname LIKE 'statistics_partition_%'; \
+         DROP OWNED BY statistics_successor CASCADE; \
+         SELECT count(*) FROM pg_statistic_ext \
+           WHERE stxname LIKE 'statistics_partition_%';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "statistics_partition_leaf_ab|1 2|\"char\"[]|f",
+            "statistics_partition_root_ab|1 2|\"char\"[]|t",
+            "statistics_successor",
+            "0",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn result_description_decodes_the_complete_builtin_array_inventory() {
     for element in crate::sql::types::ArrElem::BUILTIN {
         assert_eq!(
@@ -2671,7 +2893,7 @@ fn update_and_delete() {
 fn database_default_collation_is_bounded_and_never_substitutes_byte_ordering() {
     let mut config = test_config("database-default-collation");
     config.collation_scratch_bytes = 2;
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 27);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     run_with(&mut engine, &mut budget, "CREATE TABLE t (value text)");
     run_with(
@@ -9179,6 +9401,21 @@ fn expandarray_and_composite_field_access() {
     ));
     r2.sort();
     assert_eq!(r2, ["1", "2"], "multi-col expand: {r2:?}");
+    let derived_output = run_with_txn_bytes(
+        &mut e,
+        &mut b,
+        &mut t,
+        "SELECT (result.keys).x, (result.keys).n \
+         FROM (SELECT information_schema._pg_expandarray(ARRAY[7,8,9]) AS keys) result \
+         ORDER BY 2",
+    );
+    let derived = data_rows(&derived_output);
+    assert_eq!(
+        derived,
+        ["7|1", "8|2", "9|3"],
+        "{}",
+        String::from_utf8_lossy(&derived_output)
+    );
 }
 
 #[test]
@@ -18260,34 +18497,26 @@ fn vacuum_and_analyze() {
     assert_eq!(statistics.columns[1].distinct_values, 2);
     assert_eq!(statistics.columns[0].null_fraction_ppm, 0);
     assert!(statistics.average_row_width > 0);
-    run_with(&mut e, &mut b, "CREATE INDEX vt_ab ON vt (a, b)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE STATISTICS vt_ab_stats (ndistinct) ON a, b FROM vt",
+    );
     run_with(&mut e, &mut b, "ANALYZE vt");
-    let statistics = e.storage.table_statistics(slot, 0);
-    let composite = statistics
-        .multi_columns
-        .iter()
-        .find(|statistics| statistics.covers(&[0, 1]))
-        .expect("ANALYZE records the composite value-index key");
+    let statistics_slot = e
+        .storage
+        .extended_statistics_slot("public", "vt_ab_stats", 0)
+        .unwrap();
+    let composite = e.storage.extended_statistics_data(statistics_slot, 0);
     assert_eq!(composite.non_null_rows, 2);
     assert_eq!(composite.distinct_values, 2);
-    // Targeted analysis which does not cover every key column preserves the
-    // current joint statistic instead of manufacturing a partial key image.
     run_with(&mut e, &mut b, "ANALYZE vt (a)");
+    assert!(e.storage.extended_statistics_data(statistics_slot, 0).valid);
+    run_with(&mut e, &mut b, "DROP STATISTICS vt_ab_stats");
     assert!(
         e.storage
-            .table_statistics(slot, 0)
-            .multi_columns
-            .iter()
-            .any(|statistics| statistics.covers(&[0, 1]))
-    );
-    run_with(&mut e, &mut b, "DROP INDEX vt_ab");
-    assert!(
-        !e.storage
-            .table_statistics(slot, 0)
-            .multi_columns
-            .iter()
-            .any(|statistics| statistics.valid),
-        "dropping a composite access path invalidates its joint statistic"
+            .extended_statistics_slot("public", "vt_ab_stats", 0)
+            .is_none()
     );
     let catalog = run_with(
         &mut e,
@@ -18460,7 +18689,8 @@ fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics_body()
             &mut engine,
             &mut budget,
             "CREATE TABLE durable_composite_statistics (a int, b int); \
-             CREATE INDEX durable_composite_statistics_ab ON durable_composite_statistics (a, b); \
+             CREATE STATISTICS durable_composite_statistics_ab (ndistinct) \
+               ON a, b FROM durable_composite_statistics; \
              INSERT INTO durable_composite_statistics VALUES (1, 10), (1, 20), (NULL, 30); \
              ANALYZE durable_composite_statistics",
         );
@@ -18491,16 +18721,16 @@ fn analyze_statistics_recover_from_wal_with_postgresql_rollback_semantics_body()
         ["1|-1"],
         "targeted ANALYZE preserves an untouched estimate even when it exceeds the new row estimate"
     );
-    let composite_slot = engine
+    let _composite_table = engine
         .storage
         .find_table("public", "durable_composite_statistics")
         .unwrap();
-    let composite_statistics = engine.storage.table_statistics(composite_slot, 0);
-    let composite = composite_statistics
-        .multi_columns
-        .iter()
-        .find(|statistics| statistics.covers(&[0, 1]))
-        .expect("WAL recovery retains composite statistics");
+    let composite_slot = engine
+        .storage
+        .extended_statistics_slot("public", "durable_composite_statistics_ab", 0)
+        .expect("WAL recovery retains the statistics definition");
+    let composite = engine.storage.extended_statistics_data(composite_slot, 0);
+    assert!(composite.valid);
     assert_eq!(composite.non_null_rows, 2);
     assert_eq!(composite.distinct_values, 2);
     drop(engine);
@@ -18749,6 +18979,8 @@ fn explain_uses_joint_statistics_for_correlated_composite_equalities() {
          INSERT INTO correlated_statistics \
            SELECT g % 10, g % 10 FROM generate_series(1, 1000) AS g; \
          CREATE INDEX correlated_statistics_ab ON correlated_statistics (a, b); \
+         CREATE STATISTICS correlated_statistics_ab_stats \
+           (ndistinct, dependencies, mcv) ON a, b FROM correlated_statistics; \
          ANALYZE correlated_statistics",
     );
     assert!(
@@ -29190,6 +29422,13 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
         &mut writer,
         "CREATE INDEX snapshot_rows_id_value ON snapshot_rows (id, value)",
     );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut writer,
+        "CREATE STATISTICS snapshot_rows_id_value_stats (ndistinct) \
+           ON id, value FROM snapshot_rows",
+    );
     assert!(engine.checkpoint().unwrap());
     run_txn(
         &mut engine,
@@ -29284,11 +29523,14 @@ fn object_store_checkpoint_preserves_snapshot_and_survives_cold_cache() {
     assert!(restarted_statistics.valid);
     assert_eq!(restarted_statistics.rows, 2);
     assert_eq!(restarted_statistics.columns[0].distinct_values, 2);
-    let composite = restarted_statistics
-        .multi_columns
-        .iter()
-        .find(|statistics| statistics.covers(&[0, 1]))
-        .expect("manifest recovery retains composite statistics");
+    let composite_slot = restarted
+        .storage
+        .extended_statistics_slot("public", "snapshot_rows_id_value_stats", 0)
+        .expect("manifest recovery retains extended statistics");
+    let composite = restarted
+        .storage
+        .extended_statistics_data(composite_slot, 0);
+    assert!(composite.valid);
     assert_eq!(composite.non_null_rows, 2);
     assert_eq!(composite.distinct_values, 2);
     assert!(

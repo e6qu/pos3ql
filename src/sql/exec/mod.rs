@@ -2522,6 +2522,36 @@ pub fn drop_table(
                         Err(error) => return sql_fail(error),
                     }
                 }
+                let mut statistics_slots =
+                    [usize::MAX; crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
+                let mut statistics_count = 0usize;
+                for (slot, _) in storage.extended_statistics_for_table(index, txn.txid) {
+                    statistics_slots[statistics_count] = slot;
+                    statistics_count += 1;
+                }
+                for statistics_slot in statistics_slots[..statistics_count].iter().copied() {
+                    let definition = storage
+                        .extended_statistics(statistics_slot)
+                        .definition_for(txn.txid);
+                    let lsn = storage.bump_lsn();
+                    if let Err(error) = wal.stage(
+                        txn.txid,
+                        lsn,
+                        &WalOp::DropExtendedStatistics {
+                            schema: definition.schema.as_str(),
+                            name: definition.name.as_str(),
+                        },
+                    ) {
+                        return sql_fail(error);
+                    }
+                    storage.drop_extended_statistics(statistics_slot, txn.txid);
+                    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(
+                        statistics_slot as u32,
+                    )) {
+                        storage.rollback_extended_statistics_drop(statistics_slot, txn.txid);
+                        return sql_fail(error);
+                    }
+                }
                 let lsn = storage.bump_lsn();
                 if let Err(e) = wal.stage(
                     txn.txid,
@@ -2759,6 +2789,7 @@ pub fn alter_owner(
         AlterOwnerKind::View => ("view", "ALTER VIEW"),
         AlterOwnerKind::MaterializedView => ("materialized view", "ALTER MATERIALIZED VIEW"),
         AlterOwnerKind::Sequence => ("sequence", "ALTER SEQUENCE"),
+        AlterOwnerKind::Statistics => ("statistics object", "ALTER STATISTICS"),
     };
     let relation = || storage.resolve_relation(name.schema, name.name, txn.txid);
     let object = match kind {
@@ -2874,6 +2905,12 @@ pub fn alter_owner(
             Ok(None) => None,
             Err(error) => return sql_fail(error),
         },
+        AlterOwnerKind::Statistics => storage
+            .extended_statistics_slot_on_path(name.schema, name.name, txn.txid)
+            .map(|slot| AccessObject {
+                class: AccessClass::Statistics,
+                slot: slot as u16,
+            }),
     };
     let Some(object) = object else {
         if if_exists {
@@ -2898,6 +2935,11 @@ pub fn alter_owner(
                 )
             }
             AlterOwnerKind::Sequence => undefined_kind("sequence", name.name),
+            AlterOwnerKind::Statistics => sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "statistics object \"{}\" does not exist",
+                name.name
+            ),
             _ => undefined_qual(name),
         });
     };
@@ -3891,6 +3933,7 @@ fn privilege_mask(
         AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
         AccessClass::Composite => PrivilegeSet::TYPE_ALL,
         AccessClass::Tablespace => PrivilegeSet::CREATE,
+        AccessClass::Statistics => PrivilegeSet::NONE,
     };
     let mut result = PrivilegeSet::NONE;
     for privilege in privileges {
@@ -4153,6 +4196,7 @@ fn apply_default_privileges_to_new_object(
         AccessClass::Routine => DefaultPrivilegeClass::Function,
         AccessClass::Composite => DefaultPrivilegeClass::Type,
         AccessClass::Tablespace => return Ok(()),
+        AccessClass::Statistics => return Ok(()),
     };
     let owner = storage.object_owner(object, txn.txid) as u16;
     let schema = if object.class == AccessClass::Schema {
@@ -4307,8 +4351,10 @@ pub fn reassign_owned(
         AccessClass::Schema,
         AccessClass::Domain,
         AccessClass::Enum,
+        AccessClass::Composite,
         AccessClass::Index,
         AccessClass::Routine,
+        AccessClass::Statistics,
     ];
     let mut changes = 0usize;
     for class in classes {
@@ -4533,6 +4579,8 @@ pub fn drop_owned(
     if storage.table_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage.view_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage.matview_count() > MAX_DEPENDENT_STORED_QUERIES
+        || storage.extended_statistics_count()
+            > MAX_DEPENDENT_STORED_QUERIES * crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE
     {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -4548,6 +4596,8 @@ pub fn drop_owned(
     let mut enums = [false; MAX_ENUMS];
     let mut composites = [false; crate::storage::MAX_COMPOSITES];
     let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let mut statistics =
+        [false; MAX_DEPENDENT_STORED_QUERIES * crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
     let mut schemas = [false; MAX_SCHEMAS];
     for (class, selected) in [
         (AccessClass::Table, &mut tables[..]),
@@ -4558,6 +4608,7 @@ pub fn drop_owned(
         (AccessClass::Enum, &mut enums[..]),
         (AccessClass::Composite, &mut composites[..]),
         (AccessClass::Routine, &mut routines[..]),
+        (AccessClass::Statistics, &mut statistics[..]),
         (AccessClass::Schema, &mut schemas[..]),
     ] {
         for (slot, selected) in selected
@@ -4679,6 +4730,46 @@ pub fn drop_owned(
         return sql_fail(error);
     }
 
+    for (slot, selected) in statistics
+        .iter()
+        .copied()
+        .enumerate()
+        .take(storage.extended_statistics_count())
+        .rev()
+    {
+        let object = AccessObject {
+            class: AccessClass::Statistics,
+            slot: slot as u16,
+        };
+        if !selected || !storage.access_object_visible_to(object, txn.txid) {
+            continue;
+        }
+        let (schema, name) = storage.access_object_name_to(object, txn.txid);
+        let owner = storage.role_name(storage.object_owner(object, txn.txid), txn.txid);
+        let qualified = QualName {
+            schema: Some(schema.as_str()),
+            name: name.as_str(),
+        };
+        let outcome = run_as_role(owner, || {
+            responder.without_command_complete(|responder| {
+                drop_statistics(
+                    storage,
+                    wal,
+                    txn,
+                    core::slice::from_ref(&qualified),
+                    false,
+                    cascade,
+                    responder,
+                )
+            })
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return sql_fail(error),
+            Err(error) => return Err(error),
+        }
+    }
+
     // A CASCADE of an owned schema removes every contained object, including
     // objects owned by another role. RESTRICT postpones schemas until their
     // owned contents have been removed and lets the ordinary dependency
@@ -4749,6 +4840,13 @@ pub fn drop_owned(
             continue;
         }
         let definition = *storage.table_def(slot, txn.txid);
+        if definition
+            .partition
+            .attachment
+            .is_some_and(|attachment| tables[usize::from(attachment.parent)])
+        {
+            continue;
+        }
         if storage
             .matview_slot(
                 definition.schema.as_str(),
@@ -5526,6 +5624,7 @@ enum SchemaObject {
     Sequence(usize),
     Domain(usize),
     Enum(usize),
+    Statistics(usize),
     Policy {
         slot: usize,
         root_schema: SqlName,
@@ -5682,6 +5781,14 @@ pub fn drop_schema(
             && let Err(e) = push(SchemaObject::Enum(enumeration), &mut n_objects)
         {
             return sql_fail(e);
+        }
+    }
+    for (statistics, definition) in storage.extended_statistics_visible(txn.txid) {
+        let mutable = definition.definition_for(txn.txid);
+        if in_listed(storage, mutable.schema.as_str())
+            && let Err(error) = push(SchemaObject::Statistics(statistics), &mut n_objects)
+        {
+            return sql_fail(error);
         }
     }
     if cascade {
@@ -6047,6 +6154,15 @@ pub fn drop_schema(
                     0,
                 )
             }
+            SchemaObject::Statistics(statistics) => {
+                let definition = storage.extended_statistics(*statistics);
+                let mutable = definition.definition_for(txn.txid);
+                (
+                    schema_rank(storage, mutable.schema.as_str()),
+                    definition.created_at,
+                    0,
+                )
+            }
             SchemaObject::Policy {
                 slot, root_schema, ..
             } => {
@@ -6121,6 +6237,13 @@ pub fn drop_schema(
                 let _ = write!(out, "type ");
                 write_rel(out, &enumeration.schema, &enumeration.name);
             }
+            SchemaObject::Statistics(statistics) => {
+                let definition = storage
+                    .extended_statistics(*statistics)
+                    .definition_for(txn.txid);
+                let _ = write!(out, "statistics object ");
+                write_rel(out, &definition.schema, &definition.name);
+            }
             SchemaObject::Policy { slot, .. } => {
                 let policy = storage.policy(*slot);
                 let table = storage.table_def(usize::from(policy.table), txn.txid);
@@ -6153,6 +6276,12 @@ pub fn drop_schema(
                 }
                 SchemaObject::Domain(domain) => storage.domain(*domain).schema,
                 SchemaObject::Enum(enumeration) => storage.enum_for(*enumeration, txn.txid).schema,
+                SchemaObject::Statistics(statistics) => {
+                    storage
+                        .extended_statistics(*statistics)
+                        .definition_for(txn.txid)
+                        .schema
+                }
                 SchemaObject::Policy { root_schema, .. } => *root_schema,
                 SchemaObject::InboundFk { table, fk_index } => {
                     storage.table_def(*table, txn.txid).fkeys[*fk_index].parent_schema
@@ -6495,6 +6624,29 @@ pub fn drop_schema(
                     }
                     Ok(None) => {}
                     Err(error) => return sql_fail(error),
+                }
+            }
+            SchemaObject::Statistics(statistics) => {
+                let definition = storage
+                    .extended_statistics(*statistics)
+                    .definition_for(txn.txid);
+                let lsn = storage.bump_lsn();
+                if let Err(error) = wal.stage(
+                    txn.txid,
+                    lsn,
+                    &WalOp::DropExtendedStatistics {
+                        schema: definition.schema.as_str(),
+                        name: definition.name.as_str(),
+                    },
+                ) {
+                    return sql_fail(error);
+                }
+                storage.drop_extended_statistics(*statistics, txn.txid);
+                if let Err(error) =
+                    txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(*statistics as u32))
+                {
+                    storage.rollback_extended_statistics_drop(*statistics, txn.txid);
+                    return sql_fail(error);
                 }
             }
             SchemaObject::Policy { slot, .. } => {
@@ -11279,10 +11431,14 @@ fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>,
             .restore_pending(table as usize, rowid, context.txn.txid, prior);
     }
     for at in (savepoint.statistics_mark..context.txn.statistics_undo().len()).rev() {
-        let undo = context.txn.statistics_undo()[at];
-        context
-            .storage
-            .rollback_table_statistics(undo.table as usize, context.txn.txid);
+        match context.txn.statistics_undo()[at] {
+            super::txn::StatisticsUndo::Table(table) => context
+                .storage
+                .rollback_table_statistics(table as usize, context.txn.txid),
+            super::txn::StatisticsUndo::Extended(statistics) => context
+                .storage
+                .rollback_extended_statistics_data(statistics as usize, context.txn.txid),
+        }
     }
     context.txn.rewind_touched(savepoint.touched_mark);
     context.txn.rewind_truncates(savepoint.truncate_mark);
@@ -19111,6 +19267,7 @@ fn apply_column_drop_dependencies(
     column: usize,
     column_name: SqlName,
     cascade: bool,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
     let (views, matviews) = stored_query_dependent_closure(storage, txn.txid, |dependency| {
@@ -19121,11 +19278,53 @@ fn apply_column_drop_dependencies(
     let policy_root = PolicyDependencySelection::TableColumn { table, column };
     let has_policy_dependents =
         policy_dependents_exist(storage, txn.txid, policy_root, &views, &matviews);
+    let table_definition = *storage.table_def(table, txn.txid);
+    let mut selected_statistics = [usize::MAX; crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
+    let mut selected_statistics_count = 0usize;
+    for (slot, statistics) in storage.extended_statistics_for_table(table, txn.txid) {
+        let mut depends = false;
+        for key in statistics.keys_for(txn.txid) {
+            match key {
+                crate::storage::ExtendedStatisticsKey::Column(name) => {
+                    depends |= *name == column_name;
+                }
+                crate::storage::ExtendedStatisticsKey::Expression(source) => {
+                    let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+                    depends |= check_referenced_columns(expression, &table_definition)?
+                        & (1u64 << column)
+                        != 0;
+                }
+            }
+        }
+        if depends {
+            selected_statistics[selected_statistics_count] = slot;
+            selected_statistics_count += 1;
+        }
+    }
+    for slot in selected_statistics[..selected_statistics_count]
+        .iter()
+        .copied()
+    {
+        let definition = storage.extended_statistics(slot).definition_for(txn.txid);
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropExtendedStatistics {
+                schema: definition.schema.as_str(),
+                name: definition.name.as_str(),
+            },
+        )?;
+        storage.drop_extended_statistics(slot, txn.txid);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(slot as u32)) {
+            storage.rollback_extended_statistics_drop(slot, txn.txid);
+            return Err(error);
+        }
+    }
     if !has_stored_dependents && !has_policy_dependents {
         return Ok(());
     }
 
-    let table_definition = *storage.table_def(table, txn.txid);
     let mut suffix = crate::util::StackStr::<192>::new();
     use core::fmt::Write as _;
     let _ = write!(suffix, " column {}", column_name.as_str());
@@ -20449,6 +20648,79 @@ fn rewrite_table_policy_column_references(
             prior,
         }) {
             storage.rollback_policy_alter(slot, prior);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_table_statistics_column_references(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    original: &TableDef,
+    renames: &[(SqlName, SqlName)],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if renames.is_empty() {
+        return Ok(());
+    }
+    let mut slots = [usize::MAX; crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
+    let mut count = 0usize;
+    for (slot, _) in storage.extended_statistics_for_table(table, txn.txid) {
+        slots[count] = slot;
+        count += 1;
+    }
+    for slot in slots[..count].iter().copied() {
+        let statistics = *storage.extended_statistics(slot);
+        let mut keys = [crate::storage::ExtendedStatisticsKey::Column(SqlName::EMPTY);
+            crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+        keys[..statistics.keys_for(txn.txid).len()].copy_from_slice(statistics.keys_for(txn.txid));
+        let mut shape = *original;
+        let mut changed = false;
+        for &(from, to) in renames {
+            let Some(column) = shape.column_index(from.as_str()) else {
+                continue;
+            };
+            let mut renamed = shape;
+            renamed.columns[column].name = to;
+            let rename = CompositeFieldRename { from, to };
+            for key in &mut keys[..usize::from(statistics.n_keys)] {
+                match key {
+                    crate::storage::ExtendedStatisticsKey::Column(name) if *name == from => {
+                        *name = to;
+                        changed = true;
+                    }
+                    crate::storage::ExtendedStatisticsKey::Expression(source) => {
+                        let rewritten = rewrite_table_column_reference(
+                            source.as_str(),
+                            &shape,
+                            &renamed,
+                            rename,
+                            arena,
+                        )?;
+                        changed |= rewritten != *source;
+                        *source = rewritten;
+                    }
+                    crate::storage::ExtendedStatisticsKey::Column(_) => {}
+                }
+            }
+            shape = renamed;
+        }
+        if !changed {
+            continue;
+        }
+        let prior = storage.alter_extended_statistics_keys(slot, keys, txn.txid)?;
+        if let Err(error) = stage_extended_statistics_definition(storage, wal, txn, slot) {
+            storage.rollback_extended_statistics_keys(slot, prior);
+            return Err(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsKeysAltered {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_extended_statistics_keys(slot, prior);
             return Err(error);
         }
     }
@@ -21833,6 +22105,748 @@ fn generated_index_name(
         sqlstate::PROGRAM_LIMIT_EXCEEDED,
         "cannot generate a unique index name"
     ))
+}
+
+fn generated_statistics_name(
+    storage: &Storage,
+    table: &TableDef,
+    keys: &[crate::sql::ast::StatisticsKey<'_>],
+    txid: u32,
+) -> Result<SqlName, SqlError> {
+    use core::fmt::Write as _;
+    for ordinal in 0..=storage.extended_statistics_count() {
+        let mut name = StackStr::<64>::new();
+        let _ = name.write_str(table.name.as_str());
+        for key in keys {
+            let component = match key {
+                crate::sql::ast::StatisticsKey::Column(column) => *column,
+                crate::sql::ast::StatisticsKey::Expression(expression) => {
+                    match expression.expression {
+                        Expr::Column { name, .. } | Expr::Call { name, .. } => *name,
+                        _ => "expr",
+                    }
+                }
+            };
+            let _ = write!(name, "_{}", component);
+        }
+        let _ = name.write_str("_stat");
+        if ordinal != 0 {
+            let _ = write!(name, "{}", ordinal);
+        }
+        if name.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "generated statistics name is too long"
+            ));
+        }
+        if storage
+            .extended_statistics_slot(table.schema.as_str(), name.as_str(), txid)
+            .is_none()
+        {
+            return SqlName::parse(name.as_str());
+        }
+    }
+    Err(sql_err!(
+        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+        "cannot generate a unique statistics name"
+    ))
+}
+
+pub fn create_statistics(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &crate::sql::ast::CreateStatistics<'_>,
+    _arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::sql::ast::{StatisticsKey, StatisticsKeys, StatisticsName};
+    use crate::storage::{
+        ExtendedStatisticsKey, ExtendedStatisticsSpec, MAX_EXTENDED_STATISTICS_KEYS,
+    };
+
+    let table = match resolve_dml_table(storage, &command.table, txn.txid) {
+        Ok(table) => table,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(
+        storage.table_access_object(table, txn.txid),
+        txn.txid,
+        "table",
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = storage.lock_table(
+        txn.txid,
+        table,
+        crate::sql::ast::TableLockMode::ShareUpdateExclusive,
+        false,
+    ) {
+        return sql_fail(error);
+    }
+    let table_definition = *storage.table_def(table, txn.txid);
+    let (kinds, expression_only) = match command.keys {
+        StatisticsKeys::Expression(_) => (crate::sql::ast::StatisticsKinds::EXPRESSION, true),
+        StatisticsKeys::Multivariate { kinds, .. } => (kinds, false),
+    };
+    // Normalize both grammar forms into the same bounded local array.
+    let mut parsed_keys = [StatisticsKey::Column(""); MAX_EXTENDED_STATISTICS_KEYS];
+    let key_count = match command.keys {
+        StatisticsKeys::Expression(expression) => {
+            parsed_keys[0] = StatisticsKey::Expression(expression);
+            1
+        }
+        StatisticsKeys::Multivariate { keys, .. } => {
+            parsed_keys[..keys.len()].copy_from_slice(keys);
+            keys.len()
+        }
+    };
+    let keys = &parsed_keys[..key_count];
+    let (schema, name, if_not_exists) = match command.name {
+        StatisticsName::Generated => {
+            let name = match generated_statistics_name(storage, &table_definition, keys, txn.txid) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (table_definition.schema, name, false)
+        }
+        StatisticsName::Explicit {
+            name,
+            if_not_exists,
+        } => {
+            let schema = match storage.creation_schema(name.schema, name.name, txn.txid) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+            let name = match SqlName::parse(name.name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (schema, name, if_not_exists)
+        }
+    };
+    if storage
+        .extended_statistics_slot(schema.as_str(), name.as_str(), txn.txid)
+        .is_some()
+    {
+        if if_not_exists {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    160,
+                    "statistics object \"{}\" already exists, skipping",
+                    name.as_str()
+                )
+                .as_str(),
+            )?;
+            responder.command_complete("CREATE STATISTICS")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "statistics object \"{}\" already exists",
+            name.as_str()
+        ));
+    }
+    let mut stored_keys =
+        [ExtendedStatisticsKey::Column(SqlName::EMPTY); MAX_EXTENDED_STATISTICS_KEYS];
+    for (position, key) in keys.iter().enumerate() {
+        stored_keys[position] = match key {
+            StatisticsKey::Column(column) => {
+                let Some(column) = table_definition.column_index(column) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        column
+                    ));
+                };
+                ExtendedStatisticsKey::Column(table_definition.columns()[column].name)
+            }
+            StatisticsKey::Expression(expression) => {
+                if expression.expression.contains_subquery() {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "cannot use subquery in statistics expression"
+                    ));
+                }
+                if let Some(function) = expression.expression.contains_nonimmutable_function() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "functions in statistics expression must be marked IMMUTABLE (uses {}())",
+                        function
+                    ));
+                }
+                if let Err(error) = infer_type_pub(expression.expression, Some(&table_definition)) {
+                    return sql_fail(error);
+                }
+                match crate::storage::extended_statistics_expression(expression.source) {
+                    Ok(expression) => ExtendedStatisticsKey::Expression(expression),
+                    Err(error) => return sql_fail(error),
+                }
+            }
+        };
+        if stored_keys[..position].contains(&stored_keys[position]) {
+            return sql_fail(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "duplicate column or expression in statistics definition"
+            ));
+        }
+    }
+    let slot = match storage.create_extended_statistics(
+        ExtendedStatisticsSpec {
+            created_at: 0,
+            schema,
+            name,
+            table: table as u16,
+            target: None,
+            keys: stored_keys,
+            n_keys: key_count as u8,
+            kinds,
+            expression_only,
+        },
+        txn.txid,
+    ) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = stage_extended_statistics_definition(storage, wal, txn, slot) {
+        storage.rollback_extended_statistics_create(slot);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsCreated(slot as u32)) {
+        storage.rollback_extended_statistics_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE STATISTICS")?;
+    sql_ok()
+}
+
+pub fn alter_statistics(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &QualName<'_>,
+    action: crate::sql::ast::AlterStatisticsAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    if let crate::sql::ast::AlterStatisticsAction::Owner(role) = action {
+        return alter_owner(
+            storage,
+            txn,
+            crate::sql::ast::AlterOwnerKind::Statistics,
+            name,
+            role,
+            false,
+            responder,
+        );
+    }
+    let Some(slot) = storage.extended_statistics_slot_on_path(name.schema, name.name, txn.txid)
+    else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "statistics object \"{}\" does not exist",
+            name.name
+        ));
+    };
+    let object = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::Statistics,
+        slot: slot as u16,
+    };
+    if let Err(error) = storage.require_owner(object, txn.txid, "statistics object") {
+        return sql_fail(error);
+    }
+    let mut definition = storage.extended_statistics(slot).definition_for(txn.txid);
+    match action {
+        crate::sql::ast::AlterStatisticsAction::Rename(name) => {
+            definition.name = match SqlName::parse(name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        crate::sql::ast::AlterStatisticsAction::SetSchema(schema) => {
+            if storage.find_schema_visible(schema, txn.txid).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
+                ));
+            }
+            if let Err(error) = storage.require_schema_create(schema, txn.txid) {
+                return sql_fail(error);
+            }
+            definition.schema = match SqlName::parse(schema) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        crate::sql::ast::AlterStatisticsAction::SetTarget(target) => {
+            definition.target = match target {
+                crate::sql::ast::StatisticsTarget::Default => None,
+                crate::sql::ast::StatisticsTarget::Value(target) => Some(target),
+            };
+        }
+        crate::sql::ast::AlterStatisticsAction::Owner(_) => unreachable!(),
+    }
+    let prior = match storage.alter_extended_statistics(slot, definition, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = stage_extended_statistics_definition(storage, wal, txn, slot) {
+        storage.rollback_extended_statistics_alter(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_extended_statistics_alter(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER STATISTICS")?;
+    sql_ok()
+}
+
+pub fn drop_statistics(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[QualName<'_>],
+    if_exists: bool,
+    _cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        let Some(slot) = storage.extended_statistics_slot_on_path(name.schema, name.name, txn.txid)
+        else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        160,
+                        "statistics object \"{}\" does not exist, skipping",
+                        name.name
+                    )
+                    .as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "statistics object \"{}\" does not exist",
+                name.name
+            ));
+        };
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Statistics,
+            slot: slot as u16,
+        };
+        if let Err(error) = storage.require_owner(object, txn.txid, "statistics object") {
+            return sql_fail(error);
+        }
+        storage.drop_extended_statistics(slot, txn.txid);
+        let definition = storage.extended_statistics(slot).definition_for(txn.txid);
+        let lsn = storage.lsn() + 1;
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &crate::wal::WalOp::DropExtendedStatistics {
+                schema: definition.schema.as_str(),
+                name: definition.name.as_str(),
+            },
+        ) {
+            storage.rollback_extended_statistics_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+        storage.set_lsn(lsn);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsDropped(slot as u32)) {
+            storage.rollback_extended_statistics_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("DROP STATISTICS")?;
+    sql_ok()
+}
+
+fn stage_extended_statistics_definition(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &TxnState,
+    slot: usize,
+) -> Result<(), SqlError> {
+    let statistics = *storage.extended_statistics(slot);
+    let mutable = statistics.definition_for(txn.txid);
+    let table = *storage.table_def(usize::from(statistics.table), txn.txid);
+    let mut keys =
+        [crate::wal::WalExtendedStatisticsKey::EMPTY; crate::storage::MAX_EXTENDED_STATISTICS_KEYS];
+    for (position, key) in statistics.keys_for(txn.txid).iter().enumerate() {
+        keys[position] = match key {
+            crate::storage::ExtendedStatisticsKey::Column(column) => {
+                crate::wal::WalExtendedStatisticsKey::Column(column.as_str())
+            }
+            crate::storage::ExtendedStatisticsKey::Expression(expression) => {
+                crate::wal::WalExtendedStatisticsKey::Expression(expression.as_str())
+            }
+        };
+    }
+    let lsn = storage.lsn() + 1;
+    wal.stage(
+        txn.txid,
+        lsn,
+        &crate::wal::WalOp::SetExtendedStatistics {
+            created_at: statistics.created_at,
+            schema: mutable.schema.as_str(),
+            name: mutable.name.as_str(),
+            table_schema: table.schema.as_str(),
+            table: table.name.as_str(),
+            target: mutable.target,
+            kinds: statistics.kinds.code(),
+            expression_only: statistics.expression_only,
+            keys,
+            key_count: statistics.keys_for(txn.txid).len(),
+        },
+    )?;
+    storage.set_lsn(lsn);
+    Ok(())
+}
+
+pub(crate) fn analyze_extended_statistics(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    table: usize,
+    selected_columns: &[usize],
+    arena: &mut Arena,
+) -> Result<(), SqlError> {
+    use crate::storage::{
+        ColumnStatistics, EXTENDED_STATISTICS_MCV_TEXT_MAX, ExtendedStatisticsData,
+        ExtendedStatisticsKey, ExtendedStatisticsMcv, MAX_EXTENDED_STATISTICS_KEYS,
+        MAX_EXTENDED_STATISTICS_MCV,
+    };
+    use core::fmt::Write as _;
+
+    const REGISTERS: usize = 64;
+
+    fn add_distinct(registers: &mut [u8; REGISTERS], hash: u64) {
+        let index = (hash as usize) & (REGISTERS - 1);
+        let tail = hash >> REGISTERS.trailing_zeros();
+        let rank = tail.leading_zeros().saturating_add(1).min(63) as u8;
+        registers[index] = registers[index].max(rank);
+    }
+
+    fn distinct_estimate(registers: &[u8; REGISTERS]) -> u64 {
+        let mut inverse_sum = 0.0f64;
+        let mut zeros = 0usize;
+        for &register in registers {
+            inverse_sum += 2.0f64.powi(-i32::from(register));
+            zeros += usize::from(register == 0);
+        }
+        let count = REGISTERS as f64;
+        let raw = 0.709 * count * count / inverse_sum;
+        let corrected = if raw <= 2.5 * count && zeros > 0 {
+            count * (count / zeros as f64).ln()
+        } else {
+            raw
+        };
+        corrected.round().max(0.0) as u64
+    }
+
+    fn render_mcv_values(
+        values: &[Datum<'_>],
+        arena: &Arena,
+    ) -> Result<StackStr<EXTENDED_STATISTICS_MCV_TEXT_MAX>, SqlError> {
+        let mut rendered = StackStr::<EXTENDED_STATISTICS_MCV_TEXT_MAX>::new();
+        let _ = rendered.write_char('{');
+        for (index, value) in values.iter().copied().enumerate() {
+            if index != 0 {
+                let _ = rendered.write_char(',');
+            }
+            if value.is_null() {
+                let _ = rendered.write_str("NULL");
+                continue;
+            }
+            let text = datum_to_text(value, arena)?;
+            let needs_quotes = text.is_empty()
+                || text.eq_ignore_ascii_case("null")
+                || text
+                    .bytes()
+                    .any(|byte| matches!(byte, b',' | b'{' | b'}' | b'"' | b'\\'));
+            if needs_quotes {
+                let _ = rendered.write_char('"');
+            }
+            for character in text.chars() {
+                if matches!(character, '"' | '\\') {
+                    let _ = rendered.write_char('\\');
+                }
+                let _ = rendered.write_char(character);
+            }
+            if needs_quotes {
+                let _ = rendered.write_char('"');
+            }
+        }
+        let _ = rendered.write_char('}');
+        if rendered.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "extended-statistics MCV value exceeds {} bytes",
+                EXTENDED_STATISTICS_MCV_TEXT_MAX
+            ));
+        }
+        Ok(rendered)
+    }
+
+    let mut definitions = [None; crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
+    let mut definition_count = 0usize;
+    for (slot, definition) in storage.extended_statistics_for_table(table, txn.txid) {
+        definitions[definition_count] = Some((slot, *definition));
+        definition_count += 1;
+    }
+    let table_definition = *storage.table_def(table, txn.txid);
+    for (slot, definition) in definitions[..definition_count].iter().copied().flatten() {
+        if definition.definition_for(txn.txid).target == Some(0) {
+            storage.write_extended_statistics_data(
+                slot,
+                txn.txid,
+                ExtendedStatisticsData::EMPTY,
+            )?;
+            if let Err(error) = txn.record_extended_statistics(slot as u32) {
+                storage.rollback_extended_statistics_data(slot, txn.txid);
+                return Err(error);
+            }
+            continue;
+        }
+        if !selected_columns.is_empty()
+            && definition.keys_for(txn.txid).iter().any(|key| match key {
+                ExtendedStatisticsKey::Column(column) => table_definition
+                    .column_index(column.as_str())
+                    .is_none_or(|column| !selected_columns.contains(&column)),
+                ExtendedStatisticsKey::Expression(_) => true,
+            })
+        {
+            continue;
+        }
+        arena.reset();
+        let mut sql = StackStr::<8192>::new();
+        let _ = sql.write_str("SELECT ");
+        for (index, key) in definition.keys_for(txn.txid).iter().enumerate() {
+            if index != 0 {
+                let _ = sql.write_str(", ");
+            }
+            match key {
+                ExtendedStatisticsKey::Column(column) => {
+                    write_identifier(&mut sql, column.as_str())
+                }
+                ExtendedStatisticsKey::Expression(expression) => {
+                    let _ = sql.write_str(expression.as_str());
+                }
+            }
+        }
+        let _ = sql.write_str(" FROM ");
+        write_identifier(&mut sql, table_definition.schema.as_str());
+        let _ = sql.write_char('.');
+        write_identifier(&mut sql, table_definition.name.as_str());
+        if sql.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "statistics query exceeds its fixed SQL buffer"
+            ));
+        }
+        let query_text = arena.alloc_str(sql.as_str()).map_err(|_| arena_full())?;
+        let statement = super::parser::parse_query(query_text, arena)?;
+        let n_keys = definition.n_keys as usize;
+        let mut rows = 0u64;
+        let mut non_null_rows = 0u64;
+        let mut full_registers = [0u8; REGISTERS];
+        let mut key_registers = [[0u8; REGISTERS]; MAX_EXTENDED_STATISTICS_KEYS];
+        let mut pair_registers =
+            [[[0u8; REGISTERS]; MAX_EXTENDED_STATISTICS_KEYS]; MAX_EXTENDED_STATISTICS_KEYS];
+        let mut nulls = [0u64; MAX_EXTENDED_STATISTICS_KEYS];
+        let mut non_nulls = [0u64; MAX_EXTENDED_STATISTICS_KEYS];
+        let mut widths = [0u64; MAX_EXTENDED_STATISTICS_KEYS];
+        let mut mcv = [ExtendedStatisticsMcv::EMPTY; MAX_EXTENDED_STATISTICS_MCV];
+        let mut n_mcv = 0usize;
+        let indices = [0u16, 1, 2, 3, 4, 5, 6, 7];
+        super::query::select_into_rows_recycling(
+            storage,
+            txn.txid,
+            statement,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+            None,
+            None,
+            &mut |values| {
+                rows = rows.saturating_add(1);
+                let all_non_null = values[..n_keys].iter().all(|value| !value.is_null());
+                for key in 0..n_keys {
+                    let value = values[key];
+                    if value.is_null() {
+                        nulls[key] = nulls[key].saturating_add(1);
+                        continue;
+                    }
+                    non_nulls[key] = non_nulls[key].saturating_add(1);
+                    widths[key] = widths[key].saturating_add(
+                        rowenc::encoded_len(core::slice::from_ref(&value)).saturating_sub(3) as u64,
+                    );
+                    add_distinct(
+                        &mut key_registers[key],
+                        crate::sql::eval::hash_key(values, &indices[key..key + 1]),
+                    );
+                }
+                let full_hash = crate::sql::eval::hash_key(values, &indices[..n_keys]);
+                if all_non_null {
+                    non_null_rows = non_null_rows.saturating_add(1);
+                    add_distinct(&mut full_registers, full_hash);
+                    for (determinant, dependencies) in
+                        pair_registers[..n_keys].iter_mut().enumerate()
+                    {
+                        for (dependent, registers) in dependencies[..n_keys].iter_mut().enumerate()
+                        {
+                            if determinant == dependent {
+                                continue;
+                            }
+                            let pair = [determinant as u16, dependent as u16];
+                            add_distinct(registers, crate::sql::eval::hash_key(values, &pair));
+                        }
+                    }
+                }
+                if !definition.kinds.mcv() {
+                    return Ok(());
+                }
+                let rendered = render_mcv_values(&values[..n_keys], arena)?;
+                if let Some(entry) = mcv[..n_mcv]
+                    .iter_mut()
+                    .find(|entry| entry.hash == full_hash && entry.values == rendered)
+                {
+                    entry.count = entry.count.saturating_add(1);
+                } else if let Some(entry) = mcv[..n_mcv].iter_mut().find(|entry| !entry.valid) {
+                    *entry = ExtendedStatisticsMcv {
+                        valid: true,
+                        hash: full_hash,
+                        count: 1,
+                        values: rendered,
+                    };
+                } else if n_mcv < mcv.len() {
+                    mcv[n_mcv] = ExtendedStatisticsMcv {
+                        valid: true,
+                        hash: full_hash,
+                        count: 1,
+                        values: rendered,
+                    };
+                    n_mcv += 1;
+                } else {
+                    // Misra-Gries selects bounded candidates. A second scan
+                    // below gives those candidates exact frequencies.
+                    for entry in &mut mcv {
+                        entry.count = entry.count.saturating_sub(1);
+                        if entry.count == 0 {
+                            entry.valid = false;
+                        }
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        let mut compacted = 0usize;
+        for index in 0..n_mcv {
+            if mcv[index].valid {
+                mcv[compacted] = mcv[index];
+                compacted += 1;
+            }
+        }
+        n_mcv = compacted;
+        if n_mcv != 0 {
+            for entry in &mut mcv[..n_mcv] {
+                entry.count = 0;
+            }
+            super::query::select_into_rows_recycling(
+                storage,
+                txn.txid,
+                statement,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+                None,
+                None,
+                &mut |values| {
+                    let hash = crate::sql::eval::hash_key(values, &indices[..n_keys]);
+                    if !mcv[..n_mcv].iter().any(|entry| entry.hash == hash) {
+                        return Ok(());
+                    }
+                    let rendered = render_mcv_values(&values[..n_keys], arena)?;
+                    if let Some(entry) = mcv[..n_mcv]
+                        .iter_mut()
+                        .find(|entry| entry.hash == hash && entry.values == rendered)
+                    {
+                        entry.count = entry.count.saturating_add(1);
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        mcv[..n_mcv].sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.hash.cmp(&right.hash))
+        });
+        let target = usize::from(definition.definition_for(txn.txid).target.unwrap_or(100));
+        n_mcv = n_mcv.min(target).min(MAX_EXTENDED_STATISTICS_MCV);
+        if rows == 0 {
+            storage.write_extended_statistics_data(
+                slot,
+                txn.txid,
+                ExtendedStatisticsData::EMPTY,
+            )?;
+            if let Err(error) = txn.record_extended_statistics(slot as u32) {
+                storage.rollback_extended_statistics_data(slot, txn.txid);
+                return Err(error);
+            }
+            continue;
+        }
+        let mut data = ExtendedStatisticsData::EMPTY;
+        data.valid = true;
+        data.inherited = table_definition.partition.is_partitioned();
+        data.analyzed_generation = storage.table(table).generation;
+        data.rows = rows;
+        data.non_null_rows = non_null_rows;
+        data.distinct_values = distinct_estimate(&full_registers).min(non_null_rows);
+        for key in 0..n_keys {
+            data.expression_statistics[key] = ColumnStatistics {
+                valid: rows != 0,
+                null_fraction_ppm: nulls[key]
+                    .saturating_mul(1_000_000)
+                    .checked_div(rows)
+                    .unwrap_or(0)
+                    .min(u64::from(u32::MAX)) as u32,
+                distinct_values: distinct_estimate(&key_registers[key]).min(non_nulls[key]),
+                distinct_fraction_ppm: 0,
+                average_width: widths[key]
+                    .checked_div(non_nulls[key])
+                    .unwrap_or(0)
+                    .min(u64::from(u32::MAX)) as u32,
+            };
+            if definition.kinds.dependencies() {
+                let determinant_distinct = distinct_estimate(&key_registers[key]);
+                for (dependent, registers) in pair_registers[key][..n_keys].iter().enumerate() {
+                    if key == dependent {
+                        continue;
+                    }
+                    let pair_distinct = distinct_estimate(registers);
+                    data.dependencies_ppm[key * MAX_EXTENDED_STATISTICS_KEYS + dependent] =
+                        determinant_distinct
+                            .saturating_mul(1_000_000)
+                            .checked_div(pair_distinct.max(1))
+                            .unwrap_or(0)
+                            .min(1_000_000) as u32;
+                }
+            }
+        }
+        data.mcv[..n_mcv].copy_from_slice(&mcv[..n_mcv]);
+        data.n_mcv = n_mcv as u16;
+        storage.write_extended_statistics_data(slot, txn.txid, data)?;
+        if let Err(error) = txn.record_extended_statistics(slot as u32) {
+            storage.rollback_extended_statistics_data(slot, txn.txid);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -25772,6 +26786,10 @@ fn decode_binary_field_with_context<'a>(
         ColType::Int2Vector => decode_binary_int2vector(bytes, arena),
         ColType::OidVector => decode_binary_oidvector(bytes, arena),
         ColType::PgNodeTree => Ok(Datum::Text(core::str::from_utf8(bytes).map_err(|_| bad())?)),
+        ColType::PgNdistinct
+        | ColType::PgDependencies
+        | ColType::PgMcvList
+        | ColType::PgStatisticArray => Err(bad()),
         ColType::Int4 => via(oids::INT4),
         ColType::Oid => via(oids::OID),
         ColType::Regtype => {
@@ -33531,6 +34549,7 @@ fn alter_table_inner(
                         original_index,
                         original_column,
                         *cascade,
+                        arena,
                         responder,
                     )
                 {
@@ -34520,6 +35539,17 @@ fn alter_table_inner(
         return sql_fail(error);
     }
     if let Err(error) = rewrite_table_policy_column_references(
+        storage,
+        wal,
+        txn,
+        table_index,
+        &def,
+        &column_renames[..n_column_renames],
+        arena,
+    ) {
+        return sql_fail(error);
+    }
+    if let Err(error) = rewrite_table_statistics_column_references(
         storage,
         wal,
         txn,

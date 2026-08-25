@@ -200,6 +200,16 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingPolicyDefinition>,
     },
+    StatisticsCreated(u32),
+    StatisticsDropped(u32),
+    StatisticsAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingExtendedStatisticsDefinition>,
+    },
+    StatisticsKeysAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingExtendedStatisticsKeys>,
+    },
     RoutineIdentityAltered {
         slot: u32,
         prior: Option<crate::storage::PendingRoutineIdentity>,
@@ -355,7 +365,7 @@ pub(crate) enum DdlUndo {
 /// Sized for a DROP SCHEMA CASCADE closure: every contained table, view and
 /// transaction-versioned inbound foreign key takes one undo entry.
 pub const MAX_TXN_DDL: usize = 64;
-pub const MAX_TXN_ANALYZE: usize = 64;
+pub const MAX_TXN_ANALYZE: usize = crate::storage::MAX_PENDING_STATISTICS_PER_TXN;
 const SUBSCRIPTION_ADVANCES_PER_TXN: usize = 1;
 pub const MAX_DEFERRED_CONSTRAINTS: usize = 128;
 
@@ -397,8 +407,9 @@ enum ConstraintLifecycle {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct StatisticsUndo {
-    pub(crate) table: u32,
+pub(crate) enum StatisticsUndo {
+    Table(u32),
+    Extended(u32),
 }
 
 impl TxnState {
@@ -1061,7 +1072,19 @@ impl TxnState {
 
     pub(crate) fn record_statistics(&mut self, table: u32) -> Result<(), SqlError> {
         self.statistics_undo
-            .push(StatisticsUndo { table })
+            .push(StatisticsUndo::Table(table))
+            .map_err(|_| {
+                sql_err!(
+                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "more than {} ANALYZE targets in one transaction",
+                    MAX_TXN_ANALYZE
+                )
+            })
+    }
+
+    pub(crate) fn record_extended_statistics(&mut self, slot: u32) -> Result<(), SqlError> {
+        self.statistics_undo
+            .push(StatisticsUndo::Extended(slot))
             .map_err(|_| {
                 sql_err!(
                     crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,

@@ -345,6 +345,10 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Int2Vector
         | ColType::OidVector
         | ColType::PgNodeTree
+        | ColType::PgNdistinct
+        | ColType::PgDependencies
+        | ColType::PgMcvList
+        | ColType::PgStatisticArray
         | ColType::Record => {
             return Err(corrupt());
         }
@@ -707,6 +711,10 @@ pub(crate) fn decode<'a>(
                     text,
                 };
             }
+            ColType::PgNdistinct
+            | ColType::PgDependencies
+            | ColType::PgMcvList
+            | ColType::PgStatisticArray => return Err(corrupt()),
         }
     }
     Ok(())

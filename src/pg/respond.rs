@@ -1050,9 +1050,9 @@ impl<'b> Responder<'b> {
                             m.i32(count as i32);
                             m.i32(0);
                         }
-                        for bytes in raw.chunks_exact(2) {
+                        for bytes in raw.as_chunks::<2>().0 {
                             m.i32(2);
-                            m.bytes(&i16::from_le_bytes([bytes[0], bytes[1]]).to_be_bytes());
+                            m.bytes(&i16::from_le_bytes(*bytes).to_be_bytes());
                         }
                     });
                 }
@@ -1066,9 +1066,9 @@ impl<'b> Responder<'b> {
                             m.i32(count as i32);
                             m.i32(0);
                         }
-                        for bytes in raw.chunks_exact(4) {
+                        for bytes in raw.as_chunks::<4>().0 {
                             m.i32(4);
-                            m.bytes(&u32::from_le_bytes(bytes.try_into().unwrap()).to_be_bytes());
+                            m.bytes(&u32::from_le_bytes(*bytes).to_be_bytes());
                         }
                     });
                 }

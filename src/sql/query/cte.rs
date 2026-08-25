@@ -2029,8 +2029,7 @@ fn rewrite_stored_type_name<'a>(
     let (bare, array) = type_name
         .strip_suffix("[]")
         .map_or((type_name, false), |bare| (bare, true));
-    let (referenced_schema, referenced_name) =
-        bare.split_once('.').map_or(("", bare), |parts| parts);
+    let (referenced_schema, referenced_name) = bare.split_once('.').unwrap_or(("", bare));
     let Some(dependency) = dependencies.entries().iter().find(|dependency| {
         matches!(
             dependency.class,
@@ -2093,7 +2092,7 @@ fn rewrite_stored_routine_name<'a>(
     context: Subst<'_, 'a, '_>,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let (schema, bare) = name.split_once('.').map_or(("", name), |parts| parts);
+    let (schema, bare) = name.split_once('.').unwrap_or(("", name));
     let Some(dependency) = stored_routine_dependency(schema, bare, context) else {
         return Ok(name);
     };

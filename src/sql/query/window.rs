@@ -566,7 +566,7 @@ fn frame_range<'a>(
                 FrameBound::Preceding(e) => {
                     let k =
                         frame_offset_count(e, scope, rows, offs, p[j], true, arena, params, hooks)?;
-                    group_start(gj as isize - k as isize)?.map_or(0, |x| x) as isize
+                    group_start(gj as isize - k as isize)?.unwrap_or(0) as isize
                 }
                 FrameBound::CurrentRow => peer_start(j)? as isize,
                 FrameBound::Following(e) => {

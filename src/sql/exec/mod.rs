@@ -29145,7 +29145,7 @@ fn decode_binary_int2vector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Dat
                 "int2vector exceeds the statement arena"
             )
         })?;
-    for slot in raw.chunks_exact_mut(2) {
+    for slot in raw.as_chunks_mut::<2>().0 {
         let len = reader.i32().map_err(|_| bad())?;
         if len != 2 {
             return Err(bad());
@@ -29197,7 +29197,7 @@ fn decode_binary_oidvector<'a>(bytes: &'a [u8], arena: &'a Arena) -> Result<Datu
                 "oidvector exceeds the statement arena"
             )
         })?;
-    for slot in raw.chunks_exact_mut(4) {
+    for slot in raw.as_chunks_mut::<4>().0 {
         let len = reader.i32().map_err(|_| bad())?;
         if len != 4 {
             return Err(bad());

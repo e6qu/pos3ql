@@ -5123,6 +5123,9 @@ fn resolve_privilege_objects(
                     RoutineTargetKind::Procedure => {
                         matches!(actual, crate::storage::RoutineKind::Procedure)
                     }
+                    RoutineTargetKind::Aggregate => {
+                        matches!(actual, crate::storage::RoutineKind::Aggregate(_))
+                    }
                     RoutineTargetKind::Either => true,
                 };
                 if !accepted {
@@ -5132,6 +5135,7 @@ fn resolve_privilege_objects(
                         match kind {
                             RoutineTargetKind::Function => "function",
                             RoutineTargetKind::Procedure => "procedure",
+                            RoutineTargetKind::Aggregate => "aggregate",
                             RoutineTargetKind::Either => "routine",
                         },
                         identity.name.name
@@ -14523,6 +14527,15 @@ pub(crate) fn resolve_routine_type(
 ) -> Result<crate::storage::RoutineResult, SqlError> {
     use crate::sql::types::ArrElem;
 
+    if let Some(polymorphic) = crate::storage::PolymorphicType::from_name(written) {
+        return Ok(crate::storage::RoutineResult {
+            ctype: ColType::Text,
+            user_type: Some(crate::storage::UserTypeName {
+                schema: SqlName::parse("pg_catalog").expect("static schema name"),
+                name: SqlName::parse(polymorphic.name()).expect("static pseudo-type name"),
+            }),
+        });
+    }
     if let Some(ctype) = ColType::from_sql_name(written) {
         return Ok(crate::storage::RoutineResult::builtin(ctype));
     }
@@ -14681,6 +14694,12 @@ pub fn create_routine(
                 Ok(result) => result,
                 Err(error) => return sql_fail(error),
             };
+            if result.ctype == ColType::Internal {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "SQL functions cannot return type internal"
+                ));
+            }
             if set_returning {
                 crate::storage::RoutineKind::SetFunction { result }
             } else {
@@ -14752,6 +14771,31 @@ pub fn create_routine(
             ctype,
             user_type: resolved.user_type,
         };
+    }
+    let has_polymorphic_input = |output: crate::storage::PolymorphicType| {
+        arguments[..routine.arguments.len()].iter().any(|argument| {
+            argument
+                .polymorphic_type()
+                .is_some_and(|input| input.compatible_family() == output.compatible_family())
+        })
+    };
+    let undetermined_result = match kind {
+        crate::storage::RoutineKind::Function { result }
+        | crate::storage::RoutineKind::SetFunction { result } => result
+            .polymorphic_type()
+            .filter(|output| !has_polymorphic_input(*output)),
+        crate::storage::RoutineKind::TableFunction => result_columns[..result_column_count]
+            .iter()
+            .find_map(|column| column.polymorphic_type())
+            .filter(|output| !has_polymorphic_input(*output)),
+        _ => None,
+    };
+    if let Some(output) = undetermined_result {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "cannot determine result data type for polymorphic type {}",
+            output.name()
+        ));
     }
     let replaced = storage.routine_slot_by_declared_signature(
         schema.as_str(),
@@ -14847,6 +14891,9 @@ pub fn create_routine(
                 return sql_fail(sql_err!(sqlstate::SYNTAX_ERROR, "procedure body is empty"));
             }
         }
+        crate::storage::RoutineKind::Aggregate(_) => {
+            unreachable!("CREATE ROUTINE cannot construct an aggregate")
+        }
     }
     let body = StackStr::<ROUTINE_SQL_MAX>::from_str(routine.body);
     if body.is_truncated() {
@@ -14856,6 +14903,21 @@ pub fn create_routine(
             ROUTINE_SQL_MAX
         ));
     }
+    let attributes = crate::storage::RoutineAttributes {
+        strict: routine.attributes.strict,
+        volatility: match routine.attributes.volatility {
+            super::ast::RoutineVolatility::Immutable => {
+                crate::storage::RoutineVolatility::Immutable
+            }
+            super::ast::RoutineVolatility::Stable => crate::storage::RoutineVolatility::Stable,
+            super::ast::RoutineVolatility::Volatile => crate::storage::RoutineVolatility::Volatile,
+        },
+        parallel: match routine.attributes.parallel {
+            super::ast::RoutineParallel::Safe => crate::storage::RoutineParallel::Safe,
+            super::ast::RoutineParallel::Restricted => crate::storage::RoutineParallel::Restricted,
+            super::ast::RoutineParallel::Unsafe => crate::storage::RoutineParallel::Unsafe,
+        },
+    };
     let slot = match replaced {
         Some(slot) => {
             let pending = crate::storage::PendingRoutineDefinition {
@@ -14865,6 +14927,7 @@ pub fn create_routine(
                 kind,
                 result_columns,
                 result_column_count,
+                attributes,
                 body,
             };
             let prior = match storage.replace_routine(slot, pending) {
@@ -14896,6 +14959,7 @@ pub fn create_routine(
                 kind,
                 result_columns,
                 result_column_count,
+                attributes,
                 body,
             },
             txn.txid,
@@ -14928,15 +14992,848 @@ pub fn create_routine(
         | crate::storage::RoutineKind::TableFunction => "CREATE FUNCTION",
         crate::storage::RoutineKind::Trigger => "CREATE FUNCTION",
         crate::storage::RoutineKind::Procedure => "CREATE PROCEDURE",
+        crate::storage::RoutineKind::Aggregate(_) => {
+            unreachable!("CREATE ROUTINE cannot construct an aggregate")
+        }
     })?;
     sql_ok()
 }
 
+fn aggregate_support_name(name: super::ast::QualName<'_>) -> StackStr<130> {
+    use core::fmt::Write;
+    let mut qualified = StackStr::new();
+    if let Some(schema) = name.schema {
+        let _ = write!(qualified, "{schema}.");
+    }
+    let _ = write!(qualified, "{}", name.name);
+    qualified
+}
+
+fn aggregate_support_function(
+    storage: &Storage,
+    txid: u32,
+    name: super::ast::QualName<'_>,
+    arguments: &[crate::storage::RoutineResult],
+    purpose: &'static str,
+) -> Result<
+    (
+        usize,
+        crate::storage::RoutineDef,
+        crate::storage::RoutineResult,
+    ),
+    SqlError,
+> {
+    let mut argument_oids = [0_i32; MAX_ROUTINE_ARGUMENTS];
+    for (index, argument) in arguments.iter().enumerate() {
+        argument_oids[index] = storage
+            .routine_type_oid(argument.ctype, argument.user_type, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "{} argument type does not exist",
+                    purpose
+                )
+            })?;
+    }
+    let qualified = aggregate_support_name(name);
+    let slot = storage
+        .routine_slot_for_call_oids(qualified.as_str(), &argument_oids[..arguments.len()], txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "{} function {} does not exist with the required argument types",
+                purpose,
+                qualified.as_str()
+            )
+        })?;
+    storage.require_routine_execute(slot, txid)?;
+    let routine = storage.routine_for(slot, txid);
+    let result = match routine.kind {
+        crate::storage::RoutineKind::Function { result } => result,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "{} function {} must be a scalar function",
+                purpose,
+                qualified.as_str()
+            ));
+        }
+    };
+    Ok((slot, routine, result))
+}
+
+fn aggregate_final_modify(
+    value: super::ast::AggregateFinalModify,
+) -> crate::storage::AggregateFinalModify {
+    match value {
+        super::ast::AggregateFinalModify::ReadOnly => {
+            crate::storage::AggregateFinalModify::ReadOnly
+        }
+        super::ast::AggregateFinalModify::Shareable => {
+            crate::storage::AggregateFinalModify::Shareable
+        }
+        super::ast::AggregateFinalModify::ReadWrite => {
+            crate::storage::AggregateFinalModify::ReadWrite
+        }
+    }
+}
+
+fn resolve_aggregate_final(
+    storage: &Storage,
+    txid: u32,
+    final_function: super::ast::AggregateFinal<'_>,
+    state_type: crate::storage::RoutineResult,
+    direct: &[crate::storage::RoutineResult],
+    aggregated: &[crate::storage::RoutineResult],
+) -> Result<
+    (
+        crate::storage::AggregateFinalRoutine,
+        crate::storage::RoutineResult,
+    ),
+    SqlError,
+> {
+    let mut signature = [crate::storage::RoutineResult::TEXT; MAX_ROUTINE_ARGUMENTS];
+    let mut count = 0usize;
+    signature[count] = state_type;
+    count += 1;
+    for argument in direct {
+        if count == signature.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "aggregate final function signature is too large"
+            ));
+        }
+        signature[count] = *argument;
+        count += 1;
+    }
+    if final_function.extra {
+        for argument in aggregated {
+            if count == signature.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "aggregate final function signature is too large"
+                ));
+            }
+            signature[count] = *argument;
+            count += 1;
+        }
+    }
+    let (_, routine, result) = aggregate_support_function(
+        storage,
+        txid,
+        final_function.function,
+        &signature[..count],
+        "final",
+    )?;
+    if final_function.extra && routine.attributes.strict {
+        return Err(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "final function with extra arguments must not be strict"
+        ));
+    }
+    Ok((
+        crate::storage::AggregateFinalRoutine {
+            function_oid: crate::storage::routine_oid(&routine),
+            extra: final_function.extra,
+            modify: aggregate_final_modify(final_function.modify),
+        },
+        result,
+    ))
+}
+
+pub fn create_aggregate(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    aggregate: &super::ast::CreateAggregate<'_>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    use super::ast::AggregateArguments;
+    use crate::storage::{
+        AggregateKind, AggregateMovingRoutine, AggregatePartialRoutine, AggregateRoutine,
+        AggregateSerde,
+    };
+
+    let schema = match storage.creation_schema(aggregate.name.schema, aggregate.name.name, txn.txid)
+    {
+        Ok(schema) => schema,
+        Err(error) => return sql_fail(error),
+    };
+    let name = match SqlName::parse(aggregate.name.name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let (direct_ast, aggregated_ast, kind) = match aggregate.arguments {
+        AggregateArguments::Normal(arguments) => (&[][..], arguments, AggregateKind::Normal),
+        AggregateArguments::OrderedSet {
+            direct,
+            aggregated,
+            hypothetical: false,
+        } => (direct, aggregated, AggregateKind::OrderedSet),
+        AggregateArguments::OrderedSet {
+            direct,
+            aggregated,
+            hypothetical: true,
+        } => (direct, aggregated, AggregateKind::HypotheticalSet),
+    };
+    if !matches!(kind, AggregateKind::Normal)
+        && (aggregate.definition.partial.is_some()
+            || aggregate.definition.moving.is_some()
+            || aggregate.definition.sort_operator.is_some())
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "ordered-set aggregates cannot define partial, moving, or sort-operator behavior"
+        ));
+    }
+    if matches!(kind, AggregateKind::HypotheticalSet)
+        && (direct_ast.len() != aggregated_ast.len()
+            || direct_ast
+                .iter()
+                .zip(aggregated_ast)
+                .any(|(direct, aggregated)| direct.type_name != aggregated.type_name))
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "hypothetical-set direct arguments must match aggregated arguments"
+        ));
+    }
+    let total_arguments = direct_ast.len() + aggregated_ast.len();
+    if total_arguments > MAX_ROUTINE_ARGUMENTS {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many aggregate arguments"
+        ));
+    }
+    let mut arguments = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
+    let mut argument_types = [crate::storage::RoutineResult::TEXT; MAX_ROUTINE_ARGUMENTS];
+    let mut variadic_argument = None;
+    for (index, argument) in direct_ast.iter().chain(aggregated_ast).enumerate() {
+        if argument.variadic {
+            if variadic_argument.is_some() || index + 1 != total_arguments {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "VARIADIC must mark only the last aggregate argument"
+                ));
+            }
+            variadic_argument = Some(index as u8);
+        }
+        let resolved = match resolve_routine_type(storage, txn.txid, argument.type_name) {
+            Ok(resolved) => resolved,
+            Err(error) => return sql_fail(error),
+        };
+        if resolved.ctype.is_pseudo() {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "aggregate argument has pseudo-type {}",
+                argument.type_name
+            ));
+        }
+        let argument_name = match SqlName::parse(argument.name) {
+            Ok(name) => name,
+            Err(error) => return sql_fail(error),
+        };
+        arguments[index] = RoutineArgumentDef {
+            name: argument_name,
+            ctype: resolved.ctype,
+            user_type: resolved.user_type,
+        };
+        argument_types[index] = resolved;
+    }
+    let direct_types = &argument_types[..direct_ast.len()];
+    let aggregated_types = &argument_types[direct_ast.len()..total_arguments];
+    let state_type = match resolve_routine_type(storage, txn.txid, aggregate.definition.state_type)
+    {
+        Ok(result) => result,
+        Err(error) => return sql_fail(error),
+    };
+    if state_type.ctype.is_pseudo() && state_type.ctype != ColType::Internal {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "aggregate transition type {} is not supported",
+            aggregate.definition.state_type
+        ));
+    }
+    let mut transition_signature = [crate::storage::RoutineResult::TEXT; MAX_ROUTINE_ARGUMENTS];
+    if aggregated_types.len() + 1 > transition_signature.len() {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "aggregate transition signature is too large"
+        ));
+    }
+    transition_signature[0] = state_type;
+    transition_signature[1..1 + aggregated_types.len()].copy_from_slice(aggregated_types);
+    let (_, transition, transition_result) = match aggregate_support_function(
+        storage,
+        txn.txid,
+        aggregate.definition.transition,
+        &transition_signature[..1 + aggregated_types.len()],
+        "transition",
+    ) {
+        Ok(function) => function,
+        Err(error) => return sql_fail(error),
+    };
+    if transition_result != state_type {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "transition function must return the aggregate state type"
+        ));
+    }
+    if transition.attributes.strict
+        && aggregate.definition.initial_condition.is_none()
+        && aggregated_types.first() != Some(&state_type)
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "strict transition function with no initial condition requires the transition type to match the first input type"
+        ));
+    }
+    let (final_function, result_type) = match aggregate.definition.final_function {
+        Some(final_function) => match resolve_aggregate_final(
+            storage,
+            txn.txid,
+            final_function,
+            state_type,
+            direct_types,
+            aggregated_types,
+        ) {
+            Ok((function, result)) => (Some(function), result),
+            Err(error) => return sql_fail(error),
+        },
+        None => (None, state_type),
+    };
+    let partial = match aggregate.definition.partial {
+        Some(partial) => {
+            let combine_signature = [state_type, state_type];
+            let (_, combine, combine_result) = match aggregate_support_function(
+                storage,
+                txn.txid,
+                partial.combine,
+                &combine_signature,
+                "combine",
+            ) {
+                Ok(function) => function,
+                Err(error) => return sql_fail(error),
+            };
+            if combine_result != state_type {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "combine function must return the aggregate state type"
+                ));
+            }
+            if state_type.ctype == ColType::Internal && combine.attributes.strict {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "combine function with internal transition type must not be strict"
+                ));
+            }
+            let serde = match (partial.serial, partial.deserial) {
+                (Some(serial), Some(deserial)) => {
+                    if state_type.ctype != ColType::Internal || state_type.user_type.is_some() {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_FUNCTION_DEFINITION,
+                            "serialization functions may be specified only when STYPE is internal"
+                        ));
+                    }
+                    let (_, serial, serial_result) = match aggregate_support_function(
+                        storage,
+                        txn.txid,
+                        serial,
+                        &[state_type],
+                        "serialization",
+                    ) {
+                        Ok(function) => function,
+                        Err(error) => return sql_fail(error),
+                    };
+                    if serial_result.ctype != ColType::Bytea || serial_result.user_type.is_some() {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_FUNCTION_DEFINITION,
+                            "serialization function must return bytea"
+                        ));
+                    }
+                    let bytea = crate::storage::RoutineResult::builtin(ColType::Bytea);
+                    let internal = crate::storage::RoutineResult::builtin(ColType::Internal);
+                    let (_, deserial, deserial_result) = match aggregate_support_function(
+                        storage,
+                        txn.txid,
+                        deserial,
+                        &[bytea, internal],
+                        "deserialization",
+                    ) {
+                        Ok(function) => function,
+                        Err(error) => return sql_fail(error),
+                    };
+                    if deserial_result != state_type {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_FUNCTION_DEFINITION,
+                            "deserialization function must return the aggregate state type"
+                        ));
+                    }
+                    Some(AggregateSerde {
+                        serialize_oid: crate::storage::routine_oid(&serial),
+                        deserialize_oid: crate::storage::routine_oid(&deserial),
+                    })
+                }
+                (None, None) => None,
+                _ => unreachable!("parser constructs complete serialization pairs"),
+            };
+            Some(AggregatePartialRoutine {
+                combine_oid: crate::storage::routine_oid(&combine),
+                combine_strict: combine.attributes.strict,
+                serde,
+            })
+        }
+        None => None,
+    };
+    let moving = match aggregate.definition.moving {
+        Some(moving) => {
+            let moving_state = match resolve_routine_type(storage, txn.txid, moving.state_type) {
+                Ok(result) => result,
+                Err(error) => return sql_fail(error),
+            };
+            if moving_state.ctype.is_pseudo() && moving_state.ctype != ColType::Internal {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "moving aggregate transition type {} is not supported",
+                    moving.state_type
+                ));
+            }
+            let mut signature = [crate::storage::RoutineResult::TEXT; MAX_ROUTINE_ARGUMENTS];
+            if aggregated_types.len() + 1 > signature.len() {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "moving transition signature is too large"
+                ));
+            }
+            signature[0] = moving_state;
+            signature[1..1 + aggregated_types.len()].copy_from_slice(aggregated_types);
+            let (_, transition, transition_result) = match aggregate_support_function(
+                storage,
+                txn.txid,
+                moving.transition,
+                &signature[..1 + aggregated_types.len()],
+                "moving transition",
+            ) {
+                Ok(function) => function,
+                Err(error) => return sql_fail(error),
+            };
+            let (_, inverse, inverse_result) = match aggregate_support_function(
+                storage,
+                txn.txid,
+                moving.inverse,
+                &signature[..1 + aggregated_types.len()],
+                "moving inverse",
+            ) {
+                Ok(function) => function,
+                Err(error) => return sql_fail(error),
+            };
+            if transition_result != moving_state || inverse_result != moving_state {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "moving transition and inverse functions must return the moving state type"
+                ));
+            }
+            if transition.attributes.strict != inverse.attributes.strict {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "moving transition and inverse functions must have the same strictness"
+                ));
+            }
+            if transition.attributes.strict
+                && moving.initial_condition.is_none()
+                && aggregated_types.first() != Some(&moving_state)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "strict moving transition function with no initial condition requires the transition type to match the first input type"
+                ));
+            }
+            let final_function = match moving.final_function {
+                Some(final_function) => match resolve_aggregate_final(
+                    storage,
+                    txn.txid,
+                    final_function,
+                    moving_state,
+                    direct_types,
+                    aggregated_types,
+                ) {
+                    Ok((function, moving_result)) if moving_result == result_type => Some(function),
+                    Ok(_) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_FUNCTION_DEFINITION,
+                            "moving aggregate result type must match aggregate result type"
+                        ));
+                    }
+                    Err(error) => return sql_fail(error),
+                },
+                None if moving_state == result_type => None,
+                None => {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "moving aggregate result type must match aggregate result type"
+                    ));
+                }
+            };
+            let initial_condition = match moving.initial_condition {
+                Some(value) => {
+                    if moving_state.ctype == ColType::Internal
+                        || moving_state.polymorphic_type().is_some()
+                    {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_FUNCTION_DEFINITION,
+                            "moving initial condition cannot be specified for an unresolved transition type"
+                        ));
+                    }
+                    let stored = StackStr::from_str(value);
+                    if stored.is_truncated() {
+                        return sql_fail(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "moving initial condition is too long"
+                        ));
+                    }
+                    if let Err(error) = decode_text_input(
+                        storage,
+                        storage
+                            .routine_type_oid(moving_state.ctype, moving_state.user_type, txn.txid)
+                            .expect("resolved moving state type has an OID"),
+                        value.as_bytes(),
+                        arena,
+                        txn.txid,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    Some(stored)
+                }
+                None => None,
+            };
+            Some(AggregateMovingRoutine {
+                transition_oid: crate::storage::routine_oid(&transition),
+                inverse_oid: crate::storage::routine_oid(&inverse),
+                state_type: moving_state,
+                state_space: moving.state_space,
+                final_function,
+                initial_condition,
+            })
+        }
+        None => None,
+    };
+    let has_polymorphic_input = |output: crate::storage::PolymorphicType| {
+        argument_types[..total_arguments].iter().any(|argument| {
+            argument
+                .polymorphic_type()
+                .is_some_and(|input| input.compatible_family() == output.compatible_family())
+        })
+    };
+    for contract in [state_type, result_type]
+        .into_iter()
+        .chain(moving.iter().map(|moving| moving.state_type))
+    {
+        if let Some(output) = contract.polymorphic_type()
+            && !has_polymorphic_input(output)
+        {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "cannot determine aggregate data type for polymorphic type {}",
+                output.name()
+            ));
+        }
+    }
+    let initial_condition = match aggregate.definition.initial_condition {
+        Some(value) => {
+            if state_type.ctype == ColType::Internal || state_type.polymorphic_type().is_some() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "initial condition cannot be specified for an unresolved transition type"
+                ));
+            }
+            let stored = StackStr::from_str(value);
+            if stored.is_truncated() {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "aggregate initial condition is too long"
+                ));
+            }
+            if let Err(error) = decode_text_input(
+                storage,
+                storage
+                    .routine_type_oid(state_type.ctype, state_type.user_type, txn.txid)
+                    .expect("resolved aggregate state type has an OID"),
+                value.as_bytes(),
+                arena,
+                txn.txid,
+            ) {
+                return sql_fail(error);
+            }
+            Some(stored)
+        }
+        None => None,
+    };
+    if aggregate.definition.sort_operator.is_some()
+        && (total_arguments != 1 || argument_types[0].polymorphic_type().is_some())
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "SORTOP requires a concrete single-argument aggregate"
+        ));
+    }
+    let sort_operator_oid = match aggregate.definition.sort_operator {
+        Some(operator) => match super::catalog::operator_oid_for_types(
+            operator,
+            argument_types[0].ctype,
+            argument_types[0].ctype,
+        ) {
+            Some(oid) => Some(oid),
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator {} does not exist for aggregate input type {}",
+                    operator,
+                    argument_types[0].ctype.name()
+                ));
+            }
+        },
+        None => None,
+    };
+    let parallel = match aggregate.definition.parallel {
+        super::ast::RoutineParallel::Safe => crate::storage::RoutineParallel::Safe,
+        super::ast::RoutineParallel::Restricted => crate::storage::RoutineParallel::Restricted,
+        super::ast::RoutineParallel::Unsafe => crate::storage::RoutineParallel::Unsafe,
+    };
+    let definition = AggregateRoutine {
+        kind,
+        direct_argument_count: direct_ast.len() as u8,
+        variadic_argument,
+        state_type,
+        state_space: aggregate.definition.state_space,
+        result_type,
+        transition_oid: crate::storage::routine_oid(&transition),
+        final_function,
+        partial,
+        moving,
+        initial_condition,
+        sort_operator_oid,
+        parallel,
+    };
+    let kind = crate::storage::RoutineKind::Aggregate(definition);
+    let replaced = storage.routine_slot_by_declared_signature(
+        schema.as_str(),
+        name.as_str(),
+        &arguments[..total_arguments],
+        txn.txid,
+    );
+    if let Some(slot) = replaced {
+        if !aggregate.or_replace {
+            return sql_fail(sql_err!(
+                sqlstate::DUPLICATE_FUNCTION,
+                "aggregate \"{}\" already exists with same argument types",
+                name.as_str()
+            ));
+        }
+        if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
+            return sql_fail(error);
+        }
+        let prior = storage.routine_for(slot, txn.txid);
+        let crate::storage::RoutineKind::Aggregate(prior_definition) = prior.kind else {
+            return sql_fail(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "{} is not an aggregate",
+                name.as_str()
+            ));
+        };
+        if prior_definition.kind != definition.kind
+            || prior_definition.direct_argument_count != definition.direct_argument_count
+        {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "cannot change aggregate kind or number of direct arguments"
+            ));
+        }
+        if prior_definition.result_type != definition.result_type {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "cannot change return type of existing aggregate"
+            ));
+        }
+    }
+    let body = StackStr::new();
+    let slot = match replaced {
+        Some(slot) => {
+            let pending = crate::storage::PendingRoutineDefinition {
+                txid: txn.txid,
+                arguments,
+                argument_count: total_arguments,
+                kind,
+                result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+                result_column_count: 0,
+                attributes: crate::storage::RoutineAttributes::AGGREGATE,
+                body,
+            };
+            let prior = match storage.replace_routine(slot, pending) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let durable = storage.routine_for(slot, txn.txid);
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(durable)) {
+                storage.rollback_routine_replace(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineReplaced {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_routine_replace(slot, prior);
+                return sql_fail(error);
+            }
+            slot
+        }
+        None => match storage.create_routine(
+            RoutineSpec {
+                identity: RoutineIdentity::Allocate,
+                schema,
+                name,
+                arguments,
+                argument_count: total_arguments,
+                kind,
+                result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+                result_column_count: 0,
+                attributes: crate::storage::RoutineAttributes::AGGREGATE,
+                body,
+            },
+            txn.txid,
+        ) {
+            Ok(slot) => slot,
+            Err(error) => return sql_fail(error),
+        },
+    };
+    if replaced.is_none() {
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(*storage.routine(slot)))
+        {
+            storage.rollback_routine_create(slot);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineCreated(slot as u32)) {
+            storage.rollback_routine_create(slot);
+            return sql_fail(error);
+        }
+        if let Err(error) = apply_default_privileges_to_new_object(
+            storage,
+            txn,
+            Storage::routine_access_object(slot),
+        ) {
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("CREATE AGGREGATE")?;
+    sql_ok()
+}
+
 pub struct DropRoutineCommand<'a> {
-    pub routines: &'a [super::ast::RoutineIdentity<'a>],
+    pub targets: DropRoutineTargets<'a>,
     pub if_exists: bool,
     pub cascade: bool,
     pub kind: crate::sql::ast::RoutineTargetKind,
+}
+
+pub enum DropRoutineTargets<'a> {
+    Routines(&'a [super::ast::RoutineIdentity<'a>]),
+    Aggregates(&'a [super::ast::AggregateIdentity<'a>]),
+}
+
+pub fn alter_aggregate(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    identity: &super::ast::AggregateIdentity<'_>,
+    action: super::ast::AlterRoutineAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let total = identity.direct_argument_types.len() + identity.aggregated_argument_types.len();
+    if total > MAX_ROUTINE_ARGUMENTS {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many aggregate arguments"
+        ));
+    }
+    let mut type_names = [""; MAX_ROUTINE_ARGUMENTS];
+    type_names[..identity.direct_argument_types.len()]
+        .copy_from_slice(identity.direct_argument_types);
+    type_names[identity.direct_argument_types.len()..total]
+        .copy_from_slice(identity.aggregated_argument_types);
+    let arguments = match resolve_routine_signature(storage, txn.txid, &type_names[..total]) {
+        Ok(arguments) => arguments,
+        Err(error) => return sql_fail(error),
+    };
+    let schema = identity.name.schema.unwrap_or("public");
+    let Some(slot) = storage.routine_slot_by_declared_signature(
+        schema,
+        identity.name.name,
+        &arguments[..total],
+        txn.txid,
+    ) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "aggregate \"{}\" does not exist",
+            identity.name.name
+        ));
+    };
+    let crate::storage::RoutineKind::Aggregate(definition) =
+        storage.routine_for(slot, txn.txid).kind
+    else {
+        return sql_fail(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "{} is not an aggregate",
+            identity.name.name
+        ));
+    };
+    let ordered = !matches!(definition.kind, crate::storage::AggregateKind::Normal);
+    if definition.direct_argument_count as usize != identity.direct_argument_types.len()
+        || ordered != identity.ordered_set
+    {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "aggregate \"{}\" does not exist",
+            identity.name.name
+        ));
+    }
+    alter_routine(
+        storage,
+        wal,
+        txn,
+        crate::sql::ast::RoutineTargetKind::Aggregate,
+        &super::ast::RoutineIdentity {
+            name: identity.name,
+            argument_types: &type_names[..total],
+            signature_is_explicit: true,
+        },
+        action,
+        responder,
+    )
+}
+
+pub fn drop_aggregate(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    aggregates: &[super::ast::AggregateIdentity<'_>],
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    drop_routine(
+        storage,
+        wal,
+        txn,
+        DropRoutineCommand {
+            targets: DropRoutineTargets::Aggregates(aggregates),
+            if_exists,
+            cascade,
+            kind: crate::sql::ast::RoutineTargetKind::Aggregate,
+        },
+        responder,
+    )
 }
 
 pub fn alter_routine(
@@ -14966,10 +15863,10 @@ pub fn alter_routine(
         ));
     };
     let routine = *storage.routine(slot);
-    let actual_kind = if matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
-        crate::sql::ast::RoutineTargetKind::Procedure
-    } else {
-        crate::sql::ast::RoutineTargetKind::Function
+    let actual_kind = match routine.kind {
+        crate::storage::RoutineKind::Procedure => crate::sql::ast::RoutineTargetKind::Procedure,
+        crate::storage::RoutineKind::Aggregate(_) => crate::sql::ast::RoutineTargetKind::Aggregate,
+        _ => crate::sql::ast::RoutineTargetKind::Function,
     };
     if kind != crate::sql::ast::RoutineTargetKind::Either && kind != actual_kind {
         return sql_fail(sql_err!(
@@ -15036,6 +15933,7 @@ pub fn alter_routine(
         responder.command_complete(match kind {
             crate::sql::ast::RoutineTargetKind::Function => "ALTER FUNCTION",
             crate::sql::ast::RoutineTargetKind::Procedure => "ALTER PROCEDURE",
+            crate::sql::ast::RoutineTargetKind::Aggregate => "ALTER AGGREGATE",
             crate::sql::ast::RoutineTargetKind::Either => "ALTER ROUTINE",
         })?;
         return sql_ok();
@@ -15110,6 +16008,7 @@ pub fn alter_routine(
     responder.command_complete(match kind {
         crate::sql::ast::RoutineTargetKind::Function => "ALTER FUNCTION",
         crate::sql::ast::RoutineTargetKind::Procedure => "ALTER PROCEDURE",
+        crate::sql::ast::RoutineTargetKind::Aggregate => "ALTER AGGREGATE",
         crate::sql::ast::RoutineTargetKind::Either => "ALTER ROUTINE",
     })?;
     sql_ok()
@@ -15123,27 +16022,67 @@ pub fn drop_routine(
     responder: &mut Responder,
 ) -> Outcome {
     let DropRoutineCommand {
-        routines,
+        targets,
         if_exists,
         cascade,
         kind,
     } = command;
-    for identity in routines {
-        let schema = identity.name.schema.unwrap_or("public");
-        let arguments = match resolve_routine_signature(storage, txn.txid, identity.argument_types)
+    let target_count = match targets {
+        DropRoutineTargets::Routines(routines) => routines.len(),
+        DropRoutineTargets::Aggregates(aggregates) => aggregates.len(),
+    };
+    for target_index in 0..target_count {
+        let mut aggregate_types = [""; MAX_ROUTINE_ARGUMENTS];
+        let (identity_name, argument_types, signature_is_explicit, expected_direct) = match targets
         {
+            DropRoutineTargets::Routines(routines) => {
+                let identity = routines[target_index];
+                (
+                    identity.name,
+                    identity.argument_types,
+                    identity.signature_is_explicit,
+                    None,
+                )
+            }
+            DropRoutineTargets::Aggregates(aggregates) => {
+                let identity = aggregates[target_index];
+                let total =
+                    identity.direct_argument_types.len() + identity.aggregated_argument_types.len();
+                if total > aggregate_types.len() {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many aggregate arguments"
+                    ));
+                }
+                aggregate_types[..identity.direct_argument_types.len()]
+                    .copy_from_slice(identity.direct_argument_types);
+                aggregate_types[identity.direct_argument_types.len()..total]
+                    .copy_from_slice(identity.aggregated_argument_types);
+                (
+                    identity.name,
+                    &aggregate_types[..total],
+                    true,
+                    Some((
+                        identity.direct_argument_types.len() as u8,
+                        identity.ordered_set,
+                    )),
+                )
+            }
+        };
+        let schema = identity_name.schema.unwrap_or("public");
+        let arguments = match resolve_routine_signature(storage, txn.txid, argument_types) {
             Ok(arguments) => arguments,
             Err(error) => return sql_fail(error),
         };
         let slot = match storage.routine_slot_by_declared_signature(
             schema,
-            identity.name.name,
-            &arguments[..identity.argument_types.len()],
+            identity_name.name,
+            &arguments[..argument_types.len()],
             txn.txid,
         ) {
             Some(slot) => Ok(Some(slot)),
-            None if !identity.signature_is_explicit => {
-                storage.routine_slot_by_name_unambiguous(schema, identity.name.name, txn.txid)
+            None if !signature_is_explicit => {
+                storage.routine_slot_by_name_unambiguous(schema, identity_name.name, txn.txid)
             }
             None => Ok(None),
         };
@@ -15153,7 +16092,7 @@ pub fn drop_routine(
                 return sql_fail(sql_err!(
                     sqlstate::AMBIGUOUS_FUNCTION,
                     "function name \"{}\" is not unique",
-                    identity.name.name
+                    identity_name.name
                 ));
             }
             Ok(None) => {
@@ -15162,18 +16101,32 @@ pub fn drop_routine(
                 }
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_FUNCTION,
-                    "function \"{}\" does not exist",
-                    identity.name.name
+                    "{} \"{}\" does not exist",
+                    kind.noun(),
+                    identity_name.name
                 ));
             }
         };
-        let actual_kind = if matches!(
-            storage.routine(slot).kind,
-            crate::storage::RoutineKind::Procedure
-        ) {
-            crate::sql::ast::RoutineTargetKind::Procedure
-        } else {
-            crate::sql::ast::RoutineTargetKind::Function
+        let actual_kind = match storage.routine(slot).kind {
+            crate::storage::RoutineKind::Procedure => crate::sql::ast::RoutineTargetKind::Procedure,
+            crate::storage::RoutineKind::Aggregate(definition) => {
+                if let Some((direct, ordered)) = expected_direct
+                    && (definition.direct_argument_count != direct
+                        || matches!(definition.kind, crate::storage::AggregateKind::Normal)
+                            == ordered)
+                {
+                    if if_exists {
+                        continue;
+                    }
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "aggregate \"{}\" does not exist",
+                        identity_name.name
+                    ));
+                }
+                crate::sql::ast::RoutineTargetKind::Aggregate
+            }
+            _ => crate::sql::ast::RoutineTargetKind::Function,
         };
         if kind != crate::sql::ast::RoutineTargetKind::Either && kind != actual_kind {
             if if_exists {
@@ -15183,7 +16136,7 @@ pub fn drop_routine(
                 sqlstate::UNDEFINED_FUNCTION,
                 "{} \"{}\" does not exist",
                 kind.noun(),
-                identity.name.name
+                identity_name.name
             ));
         }
         if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
@@ -15289,6 +16242,68 @@ pub fn drop_routine(
         {
             return sql_fail(error);
         }
+        let support_oid = crate::storage::routine_oid(&routine);
+        let dependent_aggregate = (0..storage.routine_count()).find(|candidate| {
+            *candidate != slot
+                && storage.routine(*candidate).visible_to(txn.txid)
+                && matches!(
+                    storage.routine_for(*candidate, txn.txid).kind,
+                    crate::storage::RoutineKind::Aggregate(aggregate)
+                        if aggregate.uses_function_oid(support_oid)
+                )
+        });
+        if let Some(dependent) = dependent_aggregate
+            && !cascade
+        {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop function {} because aggregate {} depends on it",
+                routine.name_for(txn.txid).as_str(),
+                storage
+                    .routine_for(dependent, txn.txid)
+                    .name_for(txn.txid)
+                    .as_str()
+            ));
+        }
+        loop {
+            let dependent = (0..storage.routine_count()).find(|candidate| {
+                *candidate != slot
+                    && storage.routine(*candidate).visible_to(txn.txid)
+                    && matches!(
+                        storage.routine_for(*candidate, txn.txid).kind,
+                        crate::storage::RoutineKind::Aggregate(aggregate)
+                            if aggregate.uses_function_oid(support_oid)
+                    )
+            });
+            let Some(dependent) = dependent else {
+                break;
+            };
+            let definition = storage.routine_for(dependent, txn.txid);
+            let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
+            let signature = match encode_routine_signature(definition.arguments(), &mut signature) {
+                Ok(signature) => signature,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::DropRoutine {
+                    schema: definition.schema_for(txn.txid).as_str(),
+                    name: definition.name_for(txn.txid).as_str(),
+                    argument_signature: signature,
+                },
+            ) {
+                return sql_fail(error);
+            }
+            storage.drop_routine(dependent, txn.txid);
+            if let Err(error) =
+                txn.record_ddl(super::txn::DdlUndo::RoutineDropped(dependent as u32))
+            {
+                storage.rollback_routine_drop(dependent, txn.txid);
+                return sql_fail(error);
+            }
+        }
         if storage
             .triggers_with_slots_visible_to(txn.txid)
             .any(|(_, trigger)| usize::from(trigger.function) == slot)
@@ -15370,6 +16385,7 @@ pub fn drop_routine(
     responder.command_complete(match kind {
         crate::sql::ast::RoutineTargetKind::Function => "DROP FUNCTION",
         crate::sql::ast::RoutineTargetKind::Procedure => "DROP PROCEDURE",
+        crate::sql::ast::RoutineTargetKind::Aggregate => "DROP AGGREGATE",
         crate::sql::ast::RoutineTargetKind::Either => "DROP ROUTINE",
     })?;
     sql_ok()
@@ -17271,6 +18287,259 @@ pub fn create_domain(
     sql_ok()
 }
 
+fn routine_result_uses_selected_type(
+    storage: &Storage,
+    txid: u32,
+    result: crate::storage::RoutineResult,
+    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+    selected_composite: Option<usize>,
+) -> bool {
+    let Some(identity) = result.user_type else {
+        return false;
+    };
+    selected_domains
+        .iter()
+        .enumerate()
+        .take(storage.domain_count())
+        .any(|(slot, selected)| {
+            *selected
+                && identity
+                    == crate::storage::UserTypeName {
+                        schema: storage.domain_for(slot, txid).schema,
+                        name: storage.domain_for(slot, txid).name,
+                    }
+        })
+        || selected_enum.is_some_and(|slot| {
+            let definition = storage.enum_for(slot, txid);
+            identity
+                == crate::storage::UserTypeName {
+                    schema: definition.schema,
+                    name: definition.name,
+                }
+        })
+        || selected_composite.is_some_and(|slot| {
+            let definition = storage.composite_for(slot, txid);
+            identity
+                == crate::storage::UserTypeName {
+                    schema: definition.schema,
+                    name: definition.name,
+                }
+        })
+}
+
+fn routine_uses_selected_type(
+    storage: &Storage,
+    txid: u32,
+    routine: crate::storage::RoutineDef,
+    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+    selected_composite: Option<usize>,
+) -> bool {
+    let uses = |ctype, user_type| {
+        routine_result_uses_selected_type(
+            storage,
+            txid,
+            crate::storage::RoutineResult { ctype, user_type },
+            selected_domains,
+            selected_enum,
+            selected_composite,
+        )
+    };
+    if routine
+        .arguments()
+        .iter()
+        .chain(routine.result_columns[..routine.result_column_count].iter())
+        .any(|argument| uses(argument.ctype, argument.user_type))
+    {
+        return true;
+    }
+    match routine.kind {
+        crate::storage::RoutineKind::Function { result }
+        | crate::storage::RoutineKind::SetFunction { result } => routine_result_uses_selected_type(
+            storage,
+            txid,
+            result,
+            selected_domains,
+            selected_enum,
+            selected_composite,
+        ),
+        crate::storage::RoutineKind::Aggregate(aggregate) => {
+            [aggregate.state_type, aggregate.result_type]
+                .into_iter()
+                .chain(aggregate.moving.map(|moving| moving.state_type))
+                .any(|result| {
+                    routine_result_uses_selected_type(
+                        storage,
+                        txid,
+                        result,
+                        selected_domains,
+                        selected_enum,
+                        selected_composite,
+                    )
+                })
+        }
+        crate::storage::RoutineKind::TableFunction
+        | crate::storage::RoutineKind::Trigger
+        | crate::storage::RoutineKind::Procedure => false,
+    }
+}
+
+fn drop_type_dependent_routines(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    selected_domains: &[bool; crate::storage::MAX_DOMAINS],
+    selected_enum: Option<usize>,
+    selected_composite: Option<usize>,
+    cascade: bool,
+) -> Result<(), SqlError> {
+    if storage.routine_count() > MAX_DEPENDENT_STORED_QUERIES {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "type dependency closure exceeds {} routine slots",
+            MAX_DEPENDENT_STORED_QUERIES
+        ));
+    }
+    let mut selected = [false; MAX_DEPENDENT_STORED_QUERIES];
+    for (slot, selected_slot) in selected
+        .iter_mut()
+        .enumerate()
+        .take(storage.routine_count())
+    {
+        let routine = storage.routine_for(slot, txn.txid);
+        *selected_slot = routine.visible_to(txn.txid)
+            && routine_uses_selected_type(
+                storage,
+                txn.txid,
+                routine,
+                selected_domains,
+                selected_enum,
+                selected_composite,
+            );
+    }
+    if !selected.iter().any(|selected| *selected) {
+        return Ok(());
+    }
+    if !cascade {
+        return Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop type because routine objects depend on it"
+        ));
+    }
+
+    loop {
+        let mut changed = false;
+        for slot in 0..storage.routine_count() {
+            if selected[slot] || !storage.routine(slot).visible_to(txn.txid) {
+                continue;
+            }
+            let crate::storage::RoutineKind::Aggregate(aggregate) =
+                storage.routine_for(slot, txn.txid).kind
+            else {
+                continue;
+            };
+            if selected.iter().enumerate().any(|(support_slot, selected)| {
+                *selected
+                    && aggregate.uses_function_oid(crate::storage::routine_oid(
+                        &storage.routine_for(support_slot, txn.txid),
+                    ))
+            }) {
+                selected[slot] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let (views, matviews) = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        dependency.class == crate::storage::DependencyClass::Routine
+            && selected
+                .get(usize::from(dependency.slot))
+                .copied()
+                .unwrap_or(false)
+    })?;
+    for (slot, is_selected) in selected.iter().enumerate().take(storage.routine_count()) {
+        if *is_selected {
+            drop_policy_dependents(
+                storage,
+                wal,
+                txn,
+                PolicyDependencySelection::Catalog {
+                    class: crate::storage::DependencyClass::Routine,
+                    slot,
+                },
+                &views,
+                &matviews,
+            )?;
+        }
+    }
+    drop_selected_stored_queries(storage, wal, txn, &views, &matviews)?;
+
+    loop {
+        let dependency =
+            storage
+                .triggers_with_slots_visible_to(txn.txid)
+                .find_map(|(slot, trigger)| {
+                    selected[usize::from(trigger.function)].then_some((slot, *trigger))
+                });
+        let Some((slot, trigger)) = dependency else {
+            break;
+        };
+        let (target, schema, relation) = match trigger.target {
+            crate::storage::TriggerTarget::Table(slot) => {
+                let table = storage.table_def(usize::from(slot), txn.txid);
+                (
+                    crate::wal::TriggerTargetKind::Table,
+                    table.schema,
+                    table.name,
+                )
+            }
+            crate::storage::TriggerTarget::View(slot) => {
+                let view = storage.view(usize::from(slot));
+                (crate::wal::TriggerTargetKind::View, view.schema, view.name)
+            }
+        };
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropTrigger {
+                name: trigger.name_to(txn.txid).as_str(),
+                target,
+                table_schema: schema.as_str(),
+                table: relation.as_str(),
+            },
+        )?;
+        storage.drop_trigger(slot, txn.txid);
+        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
+    }
+
+    for slot in (0..storage.routine_count()).rev() {
+        if !selected[slot] || !storage.routine(slot).visible_to(txn.txid) {
+            continue;
+        }
+        let routine = storage.routine_for(slot, txn.txid);
+        let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
+        let signature = encode_routine_signature(routine.arguments(), &mut signature)?;
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropRoutine {
+                schema: routine.schema_for(txn.txid).as_str(),
+                name: routine.name_for(txn.txid).as_str(),
+                argument_signature: signature,
+            },
+        )?;
+        storage.drop_routine(slot, txn.txid);
+        txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32))?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn drop_domain(
     storage: &mut Storage,
@@ -17380,6 +18649,7 @@ fn drop_domain_selection(
 ) -> Result<(), SqlError> {
     let selected_count = selected.iter().filter(|&&yes| yes).count();
     if selected_count > 0 || selected_enum.is_some() {
+        drop_type_dependent_routines(storage, wal, txn, selected, selected_enum, None, cascade)?;
         apply_type_drop_to_stored_queries(
             storage,
             wal,
@@ -18487,6 +19757,15 @@ fn drop_composite_type(
         },
         txn.txid,
         "type",
+    )?;
+    drop_type_dependent_routines(
+        storage,
+        wal,
+        txn,
+        &[false; crate::storage::MAX_DOMAINS],
+        None,
+        Some(slot),
+        cascade,
     )?;
 
     let (dependent_views, dependent_matviews) =
@@ -26777,7 +28056,7 @@ fn decode_binary_field_with_context<'a>(
     };
     let via = |oid| crate::pg::conn::decode_binary_param(oid, bytes, arena).map_err(|_| bad());
     match ctype {
-        ColType::Void => Err(bad()),
+        ColType::Void | ColType::Internal => Err(bad()),
         ColType::Bool => via(oids::BOOL),
         ColType::Int2 => {
             let b: [u8; 2] = bytes.try_into().map_err(|_| bad())?;

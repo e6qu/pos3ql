@@ -15,7 +15,7 @@
 # tools/check-pg18-surface.sh passes. Individual fat PRs advance the measured
 # states without pretending that the remaining surface is complete.
 ABORT	complete	05_transactions.sql
-ALTER AGGREGATE	missing	-
+ALTER AGGREGATE	partial	110_user_defined_aggregates.sql (rename, owner, and schema forms; extension dependency remains in the extension gap)
 ALTER COLLATION	missing	-
 ALTER CONVERSION	missing	-
 ALTER DATABASE	missing	-
@@ -68,7 +68,7 @@ COMMIT	complete	05_transactions.sql
 COMMIT PREPARED	missing	-
 COPY	complete	40_copy.sql
 CREATE ACCESS METHOD	missing	-
-CREATE AGGREGATE	missing	-
+CREATE AGGREGATE	complete	110_user_defined_aggregates.sql
 CREATE CAST	missing	-
 CREATE COLLATION	missing	-
 CREATE CONVERSION	missing	-
@@ -115,7 +115,7 @@ DELETE	complete	02_dml_returning.sql
 DISCARD	missing	-
 DO	missing	-
 DROP ACCESS METHOD	missing	-
-DROP AGGREGATE	missing	-
+DROP AGGREGATE	complete	110_user_defined_aggregates.sql
 DROP CAST	missing	-
 DROP COLLATION	missing	-
 DROP CONVERSION	missing	-

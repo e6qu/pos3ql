@@ -2519,6 +2519,97 @@ def test_type_schema_moves_over_raw_wire():
     s.close()
 
 
+def test_user_defined_aggregate_over_named_binary_portal():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE FUNCTION wire_aggregate_state(state bigint, value integer) "
+        "RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 0) + value'; "
+        "CREATE FUNCTION wire_aggregate_final(state bigint) "
+        "RETURNS bigint LANGUAGE SQL AS 'SELECT state * 2'; "
+        "CREATE FUNCTION wire_aggregate_first_state(state anyelement, value anyelement) "
+        "RETURNS anyelement LANGUAGE SQL AS 'SELECT coalesce(state, value)'; "
+        "CREATE AGGREGATE wire_total(integer) "
+        "(SFUNC = wire_aggregate_state, STYPE = bigint, FINALFUNC = wire_aggregate_final); "
+        "CREATE AGGREGATE wire_first(anyelement) "
+        "(SFUNC = wire_aggregate_first_state, STYPE = anyelement)",
+    )
+    check(
+        "raw wire: user-defined aggregate setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_aggregate_statement\x00SELECT wire_total($1)\x00"
+        + struct.pack("!hi", 1, 23),
+    )
+    bind = frontend_message(
+        b"B",
+        b"wire_aggregate_portal\x00wire_aggregate_statement\x00"
+        + struct.pack("!hhh", 1, 1, 1)
+        + struct.pack("!ii", 4, 7)
+        + struct.pack("!hh", 1, 1),
+    )
+    describe = frontend_message(b"D", b"Pwire_aggregate_portal\x00")
+    execute = frontend_message(b"E", b"wire_aggregate_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    messages = []
+    while True:
+        item = read_message(s)
+        messages.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    data = next((payload for kind, payload in messages if kind == b"D"), None)
+    check(
+        "raw wire: aggregate portal preserves bigint binary result metadata",
+        description is not None
+        and row_description_type_oids(description) == [20]
+        and row_description_formats(description) == [1],
+        messages,
+    )
+    check(
+        "raw wire: aggregate portal executes a binary int4 Bind",
+        data == b"\x00\x01\x00\x00\x00\x08" + struct.pack("!q", 14),
+        messages,
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_polymorphic_aggregate_statement\x00SELECT wire_first($1)\x00"
+        + struct.pack("!hi", 1, 23),
+    )
+    bind = frontend_message(
+        b"B",
+        b"wire_polymorphic_aggregate_portal\x00wire_polymorphic_aggregate_statement\x00"
+        + struct.pack("!hhh", 1, 1, 1)
+        + struct.pack("!ii", 4, 9)
+        + struct.pack("!hh", 1, 1),
+    )
+    describe = frontend_message(b"D", b"Pwire_polymorphic_aggregate_portal\x00")
+    execute = frontend_message(b"E", b"wire_polymorphic_aggregate_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    messages = []
+    while True:
+        item = read_message(s)
+        messages.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    data = next((payload for kind, payload in messages if kind == b"D"), None)
+    check(
+        "raw wire: polymorphic aggregate resolves Bind and Result as int4",
+        description is not None
+        and row_description_type_oids(description) == [23]
+        and row_description_formats(description) == [1]
+        and data == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", 9),
+        messages,
+    )
+    s.close()
+
+
 def test_partitioned_tables_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

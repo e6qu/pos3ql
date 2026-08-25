@@ -218,14 +218,24 @@ impl ColTypeResolver for CatalogCols<'_> {
     }
 
     fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<StaticTypeMeta> {
-        let routine = self
+        let result = self
             .storage
-            .function_for_call_oids(name, arguments, self.txid)?;
-        let ctype = routine.kind.function_result()?;
+            .function_for_call_oids(name, arguments, self.txid)
+            .and_then(|routine| match routine.kind {
+                crate::storage::RoutineKind::Function { result }
+                | crate::storage::RoutineKind::SetFunction { result } => Some(result),
+                _ => None,
+            })
+            .or_else(|| {
+                self.storage
+                    .aggregate_for_call_oids(name, arguments, self.txid)
+                    .map(|(_, _, aggregate)| aggregate.result_type)
+            })?;
+        let ctype = result.ctype;
         Some(StaticTypeMeta {
             type_oid: self
                 .storage
-                .routine_function_result_oid(&routine, self.txid)?,
+                .routine_type_oid(result.ctype, result.user_type, self.txid)?,
             ctype,
             type_mod: -1,
             collation: if ctype.is_collatable() {
@@ -626,43 +636,18 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         // A cast keeps its operand's name when the operand is a column or
         // function call (`count(*)::int` → `count`); otherwise it takes the
         // target type's name (`'x'::int` → `int4`), matching PostgreSQL.
-        // A cast keeps the name of what it casts when that names itself — a
-        // column, a function call, an array constructor. It does not chain
-        // through another cast: `'x'::int4range::int4multirange` is named for
-        // the outer type, so forwarding indiscriminately gets it wrong.
+        // A cast chain keeps a name originating in a column or function, but
+        // a name manufactured by an inner cast does not propagate outward.
         Expr::Cast {
             operand, type_name, ..
         } => match operand {
             Expr::Column { .. } | Expr::Call { .. } | Expr::Array(_) | Expr::ArraySubquery(_) => {
                 name_of(operand)
             }
-            // The object-identifier types parse to text storage but title
-            // as themselves (`'int4'::regtype` is a `regtype` column).
-            _ if matches!(
-                ColType::from_sql_name(type_name),
-                Some(ColType::Regtype)
-                    | Some(ColType::Regproc)
-                    | Some(ColType::Regprocedure)
-                    | Some(ColType::Regoper)
-                    | Some(ColType::Regoperator)
-                    | Some(ColType::Regclass)
-                    | Some(ColType::Regnamespace)
-                    | Some(ColType::Regrole)
-            ) =>
-            {
-                ColType::from_sql_name(type_name).map(ColType::name)
+            Expr::Cast { operand, .. } => {
+                cast_source_name(operand).or_else(|| cast_target_name(type_name))
             }
-            _ if type_name.eq_ignore_ascii_case("oid") => Some("oid"),
-            // A cast to an array type titles as the *element*'s internal name
-            // (`'{1}'::int2[]` is an `int2` column), as PostgreSQL has it.
-            _ if type_name.ends_with("[]") => {
-                ColType::from_sql_name(type_name.trim_end_matches("[]"))
-                    .map(ColType::internal_name)
-                    .or_else(|| type_name.trim_end_matches("[]").rsplit('.').next())
-            }
-            _ => ColType::from_sql_name(type_name)
-                .map(ColType::internal_name)
-                .or_else(|| type_name.rsplit('.').next()),
+            _ => cast_target_name(type_name),
         },
         Expr::Collate { operand, .. } => name_of(operand),
         // A desugared CASE (`IS TRUE`, `IS DISTINCT FROM`) is anonymous, as
@@ -681,6 +666,43 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         Expr::Field { field, .. } => Some(field),
         _ => None,
     }
+}
+
+fn cast_source_name<'a>(expression: &Expr<'a>) -> Option<&'a str> {
+    match expression {
+        Expr::Column { .. } | Expr::Call { .. } | Expr::Array(_) | Expr::ArraySubquery(_) => {
+            name_of(expression)
+        }
+        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => cast_source_name(operand),
+        _ => None,
+    }
+}
+
+fn cast_target_name(type_name: &str) -> Option<&str> {
+    if matches!(
+        ColType::from_sql_name(type_name),
+        Some(ColType::Regtype)
+            | Some(ColType::Regproc)
+            | Some(ColType::Regprocedure)
+            | Some(ColType::Regoper)
+            | Some(ColType::Regoperator)
+            | Some(ColType::Regclass)
+            | Some(ColType::Regnamespace)
+            | Some(ColType::Regrole)
+    ) {
+        return ColType::from_sql_name(type_name).map(ColType::name);
+    }
+    if type_name.eq_ignore_ascii_case("oid") {
+        return Some("oid");
+    }
+    if type_name.ends_with("[]") {
+        return ColType::from_sql_name(type_name.trim_end_matches("[]"))
+            .map(ColType::internal_name)
+            .or_else(|| type_name.trim_end_matches("[]").rsplit('.').next());
+    }
+    ColType::from_sql_name(type_name)
+        .map(ColType::internal_name)
+        .or_else(|| type_name.rsplit('.').next())
 }
 
 /// PostgreSQL's output-column name for a SELECT-list expression: `name_of`
@@ -2128,7 +2150,7 @@ pub(crate) fn routine_result_metadata(
     let Expr::Call {
         name,
         args,
-        star: false,
+        order_by,
         ..
     } = expression
     else {
@@ -2141,7 +2163,17 @@ pub(crate) fn routine_result_metadata(
     for (index, argument) in args.iter().enumerate() {
         argument_type_oids[index] = infer_routine_argument_oid(argument, columns).ok()?;
     }
-    columns.routine_result(name, &argument_type_oids[..args.len()])
+    if let Some(result) = columns.routine_result(name, &argument_type_oids[..args.len()]) {
+        return Some(result);
+    }
+    if args.len() + order_by.len() > argument_type_oids.len() {
+        return None;
+    }
+    for (index, ordering) in order_by.iter().enumerate() {
+        argument_type_oids[args.len() + index] =
+            infer_routine_argument_oid(ordering.expression, columns).ok()?;
+    }
+    columns.routine_result(name, &argument_type_oids[..args.len() + order_by.len()])
 }
 
 pub fn infer_type_res(

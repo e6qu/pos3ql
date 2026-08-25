@@ -285,6 +285,10 @@ pub enum Stmt<'a> {
     /// A SQL routine retains its parsed invocation contract and body spelling.
     /// The executor resolves every type before the definition reaches storage.
     CreateRoutine(CreateRoutine<'a>),
+    /// A user-defined aggregate keeps its invocation shape separate from its
+    /// support-function contract. Ordered-set direct arguments are therefore
+    /// never accidentally fed to the transition function.
+    CreateAggregate(CreateAggregate<'a>),
     /// `CALL procedure(args)`: unlike a scalar expression call, this can run a
     /// complete SQL statement body and therefore has its own statement node.
     Call {
@@ -306,12 +310,21 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
+    DropAggregate {
+        aggregates: &'a [AggregateIdentity<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// The shared routine forms retain the written target kind; that makes a
     /// function/procedure mismatch an explicit error rather than a name-only
     /// lookup.
     AlterRoutine {
         kind: RoutineTargetKind,
         routine: RoutineIdentity<'a>,
+        action: AlterRoutineAction<'a>,
+    },
+    AlterAggregate {
+        aggregate: AggregateIdentity<'a>,
         action: AlterRoutineAction<'a>,
     },
     /// DROP VIEW [IF EXISTS] name.
@@ -1250,6 +1263,7 @@ pub enum PrivilegeTarget<'a> {
 pub enum RoutineTargetKind {
     Function,
     Procedure,
+    Aggregate,
     Either,
 }
 
@@ -1258,6 +1272,7 @@ impl RoutineTargetKind {
         match self {
             Self::Function => "function",
             Self::Procedure => "procedure",
+            Self::Aggregate => "aggregate",
             Self::Either => "routine",
         }
     }
@@ -1984,13 +1999,127 @@ pub struct RoutineArgument<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateArgument<'a> {
+    pub name: &'a str,
+    pub type_name: &'a str,
+    pub variadic: bool,
+}
+
+/// The syntactic aggregate kind determines which arguments are accumulated.
+/// Keeping the alternatives distinct prevents ordinary aggregates from
+/// acquiring direct arguments or hypothetical semantics later in execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateArguments<'a> {
+    Normal(&'a [AggregateArgument<'a>]),
+    OrderedSet {
+        direct: &'a [AggregateArgument<'a>],
+        aggregated: &'a [AggregateArgument<'a>],
+        hypothetical: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFinalModify {
+    ReadOnly,
+    Shareable,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineParallel {
+    Safe,
+    Restricted,
+    Unsafe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateFinal<'a> {
+    pub function: QualName<'a>,
+    pub extra: bool,
+    pub modify: AggregateFinalModify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateMoving<'a> {
+    pub transition: QualName<'a>,
+    pub inverse: QualName<'a>,
+    pub state_type: &'a str,
+    pub state_space: Option<u32>,
+    pub final_function: Option<AggregateFinal<'a>>,
+    pub initial_condition: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregatePartial<'a> {
+    pub combine: QualName<'a>,
+    pub serial: Option<QualName<'a>>,
+    pub deserial: Option<QualName<'a>>,
+}
+
+/// A parsed aggregate definition. Required options are non-optional and option
+/// families that must be complete are represented by their own value types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateDefinition<'a> {
+    pub transition: QualName<'a>,
+    pub state_type: &'a str,
+    pub state_space: Option<u32>,
+    pub final_function: Option<AggregateFinal<'a>>,
+    pub partial: Option<AggregatePartial<'a>>,
+    pub moving: Option<AggregateMoving<'a>>,
+    pub initial_condition: Option<&'a str>,
+    pub sort_operator: Option<&'a str>,
+    pub parallel: RoutineParallel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateAggregate<'a> {
+    pub name: QualName<'a>,
+    pub or_replace: bool,
+    pub arguments: AggregateArguments<'a>,
+    pub definition: AggregateDefinition<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateIdentity<'a> {
+    pub name: QualName<'a>,
+    pub direct_argument_types: &'a [&'a str],
+    pub aggregated_argument_types: &'a [&'a str],
+    pub ordered_set: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateRoutine<'a> {
     pub name: QualName<'a>,
     pub or_replace: bool,
     pub arguments: &'a [RoutineArgument<'a>],
     pub kind: RoutineCreateKind<'a>,
     pub language: RoutineLanguage,
+    pub attributes: RoutineAttributes,
     pub body: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutineAttributes {
+    pub strict: bool,
+    pub volatility: RoutineVolatility,
+    pub parallel: RoutineParallel,
+}
+
+impl Default for RoutineAttributes {
+    fn default() -> Self {
+        Self {
+            strict: false,
+            volatility: RoutineVolatility::Volatile,
+            parallel: RoutineParallel::Unsafe,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineVolatility {
+    Immutable,
+    Stable,
+    Volatile,
 }
 
 /// The parser accepts only languages whose execution contract is represented

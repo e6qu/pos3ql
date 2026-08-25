@@ -3417,6 +3417,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("tablespace")? {
             return self.alter_tablespace();
         }
+        if self.eat_ident("aggregate")? {
+            return self.alter_aggregate();
+        }
         if self.eat_ident("function")? {
             return self.alter_routine(crate::sql::ast::RoutineTargetKind::Function);
         }

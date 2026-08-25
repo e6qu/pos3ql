@@ -47,6 +47,19 @@ pub mod oid {
     pub const VOID: i32 = 2278;
     /// PostgreSQL's pseudo-type for trigger function results.
     pub const TRIGGER: i32 = 2279;
+    /// PostgreSQL's opaque server-state pseudo-type.
+    pub const INTERNAL: i32 = 2281;
+    pub const ANYELEMENT: i32 = 2283;
+    pub const ANYNONARRAY: i32 = 2776;
+    pub const ANYENUM: i32 = 3500;
+    pub const ANYRANGE: i32 = 3831;
+    pub const ANYMULTIRANGE: i32 = 4537;
+    pub const ANYARRAY: i32 = 2277;
+    pub const ANYCOMPATIBLE: i32 = 5077;
+    pub const ANYCOMPATIBLEARRAY: i32 = 5078;
+    pub const ANYCOMPATIBLENONARRAY: i32 = 5079;
+    pub const ANYCOMPATIBLERANGE: i32 = 5080;
+    pub const ANYCOMPATIBLEMULTIRANGE: i32 = 4538;
     pub const BIT_ARRAY: i32 = 1561;
     pub const VARBIT_ARRAY: i32 = 1563;
     // Network address types.
@@ -122,6 +135,9 @@ pub enum ColType {
     /// `void` is a routine-result pseudo-type. It is never a stored column or
     /// routine argument; a `void` result is represented by `Datum::Null`.
     Void,
+    /// Opaque aggregate state. It is legal only in routine contracts and is
+    /// never a SQL value or stored column.
+    Internal,
     Bool,
     /// `smallint`/`int2`. A real i16 datum with PostgreSQL's OID 21 and
     /// two-byte binary wire representation.
@@ -304,8 +320,8 @@ impl BtreeOperatorClass {
             Timetz => Self::Timetz,
             Uuid => Self::Uuid,
             Bit { varying: true } => Self::Varbit,
-            Void | Int2Vector | OidVector | PgNodeTree | PgNdistinct | PgDependencies
-            | PgMcvList | PgStatisticArray | Json => return None,
+            Void | Internal | Int2Vector | OidVector | PgNodeTree | PgNdistinct
+            | PgDependencies | PgMcvList | PgStatisticArray | Json => return None,
         })
     }
 
@@ -483,7 +499,7 @@ impl ColType {
 
     /// Pseudo-types describe executor contracts rather than stored values.
     pub const fn is_pseudo(self) -> bool {
-        matches!(self, Self::Void | Self::Record)
+        matches!(self, Self::Void | Self::Internal | Self::Record)
     }
 
     pub const fn is_reg_object(self) -> bool {
@@ -513,6 +529,7 @@ impl ColType {
         }
         Some(match name {
             "void" => Self::Void,
+            "internal" => Self::Internal,
             "bool" | "boolean" => Self::Bool,
             "int" | "int4" | "integer" | "serial" | "serial4" => Self::Int4,
             "smallint" | "int2" | "smallserial" | "serial2" => Self::Int2,
@@ -557,6 +574,7 @@ impl ColType {
     pub fn oid(self) -> i32 {
         match self {
             Self::Void => oid::VOID,
+            Self::Internal => oid::INTERNAL,
             Self::Bool => oid::BOOL,
             Self::Int2 => oid::INT2,
             Self::Int2Vector => oid::INT2VECTOR,
@@ -615,6 +633,7 @@ impl ColType {
         // Scalars.
         let scalar = match type_oid {
             oid::VOID => Some(Self::Void),
+            oid::INTERNAL => Some(Self::Internal),
             oid::BOOL => Some(Self::Bool),
             oid::INT2 => Some(Self::Int2),
             oid::INT2VECTOR => Some(Self::Int2Vector),
@@ -719,7 +738,7 @@ impl ColType {
 
     pub fn typlen(self) -> i16 {
         match self {
-            Self::Void => 4,
+            Self::Void | Self::Internal => 4,
             Self::Bool => 1,
             Self::Int2 => 2,
             Self::Int2Vector
@@ -794,6 +813,7 @@ impl ColType {
     pub fn internal_name(self) -> &'static str {
         match self {
             Self::Void => "void",
+            Self::Internal => "internal",
             Self::Bool => "bool",
             Self::Int2 => "int2",
             Self::Int2Vector => "int2vector",
@@ -860,6 +880,7 @@ impl ColType {
     pub fn name(self) -> &'static str {
         match self {
             Self::Void => "void",
+            Self::Internal => "internal",
             Self::Bool => "boolean",
             Self::Int2 => "smallint",
             Self::Int2Vector => "int2vector",
@@ -920,6 +941,7 @@ impl ColType {
             // Routine definitions persist their result type, including `void`.
             // Row encoding separately rejects pseudo-types.
             Self::Void => 57,
+            Self::Internal => 73,
             Self::Bool => 1,
             Self::Int4 => 2,
             Self::Oid => 56,
@@ -988,6 +1010,7 @@ impl ColType {
         Some(match code {
             1 => Self::Bool,
             57 => Self::Void,
+            73 => Self::Internal,
             2 => Self::Int4,
             56 => Self::Oid,
             58 => Self::Regtype,
@@ -2754,6 +2777,7 @@ mod tests {
         // Every type the binary-parameter path can name by OID round-trips.
         let mut types = vec![
             ColType::Void,
+            ColType::Internal,
             ColType::Bool,
             ColType::Int2,
             ColType::Int2Vector,
@@ -2832,6 +2856,7 @@ mod code_roundtrip_tests {
     fn every_coltype_code_roundtrips() {
         let mut types = vec![
             ColType::Void,
+            ColType::Internal,
             ColType::Bool,
             ColType::Int2,
             ColType::Int2Vector,

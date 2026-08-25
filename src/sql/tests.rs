@@ -3456,6 +3456,19 @@ fn catalog_alias_casts_keep_their_own_result_names() {
 }
 
 #[test]
+fn cast_chains_preserve_names_only_when_the_name_originates_in_an_expression() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT prorettype::regtype::text FROM pg_proc WHERE proname = 'version' LIMIT 1",
+    );
+    assert_eq!(row_description_names(&output), ["prorettype"]);
+    let literal = run_with(&mut engine, &mut budget, "SELECT 'integer'::regtype::text");
+    assert_eq!(row_description_names(&literal), ["text"]);
+}
+
+#[test]
 fn catalog_oid_columns_unify_with_regclass_set_operands() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -11945,7 +11958,7 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
     config.max_tables = 16;
     let answer_oid: i32;
     {
-        let mut budget = Budget::new(1 << 28);
+        let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let mut guc = GucState::new();
         let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
@@ -12542,6 +12555,771 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let missing = run_with(&mut engine, &mut budget, "SELECT answer()");
     assert!(String::from_utf8_lossy(&missing).contains("42883"));
+}
+
+#[test]
+fn user_defined_aggregate_executes_typed_transition_final_and_ordering() {
+    let mut config = test_config("user-defined-aggregate-execution");
+    config.max_tables = 32;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE aggregate_input (g integer, v integer); \
+         INSERT INTO aggregate_input VALUES (1, 3), (1, 1), (1, 2), (1, NULL), (2, 5); \
+         CREATE FUNCTION aggregate_sum_state(state bigint, value integer) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 0) + coalesce(value, 0)'; \
+         CREATE FUNCTION aggregate_double(state bigint) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT state * 2'; \
+         CREATE FUNCTION aggregate_sum_inverse(state bigint, value integer) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT state - coalesce(value, 0)'; \
+         CREATE FUNCTION aggregate_offset(state bigint, direct integer) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT state + direct'; \
+         CREATE FUNCTION aggregate_concat_state(state text, value integer) \
+           RETURNS text LANGUAGE SQL AS 'SELECT concat(state, value)'; \
+         CREATE FUNCTION aggregate_strict_product(state integer, value integer) \
+           RETURNS integer AS 'SELECT state * value' IMMUTABLE STRICT PARALLEL SAFE LANGUAGE SQL; \
+         CREATE FUNCTION aggregate_strict_mismatch(state bigint, value integer) \
+           RETURNS bigint LANGUAGE SQL STRICT AS 'SELECT state + value'; \
+         CREATE FUNCTION aggregate_nonstrict_product_inverse(state integer, value integer) \
+           RETURNS integer LANGUAGE SQL AS 'SELECT state / value'; \
+         CREATE FUNCTION aggregate_strict_final_extra(state bigint, value integer) \
+           RETURNS bigint LANGUAGE SQL STRICT AS 'SELECT state'; \
+         CREATE FUNCTION aggregate_sum_combine(left_state bigint, right_state bigint) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(left_state, 0) + coalesce(right_state, 0)'; \
+         CREATE FUNCTION aggregate_polymorphic_first(state anyelement, value anyelement) \
+           RETURNS anyelement LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_polymorphic_array_first(state anyarray, value anyarray) \
+           RETURNS anyarray LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_compatible_first_state(state anycompatible, value anycompatible) \
+           RETURNS anycompatible LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_tick_state(state bigint) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 0) + 1'; \
+         CREATE AGGREGATE aggregate_sum(integer) ( \
+           SFUNC = aggregate_sum_state, STYPE = bigint, FINALFUNC = aggregate_double, \
+           MSFUNC = aggregate_sum_state, MINVFUNC = aggregate_sum_inverse, MSTYPE = bigint, \
+           MFINALFUNC = aggregate_double \
+         ); \
+         CREATE AGGREGATE aggregate_offset_sum(integer ORDER BY integer) ( \
+           SFUNC = aggregate_sum_state, STYPE = bigint, INITCOND = '0', \
+           FINALFUNC = aggregate_offset \
+         ); \
+         CREATE AGGREGATE ordered_concat(ORDER BY integer) ( \
+           SFUNC = aggregate_concat_state, STYPE = text, INITCOND = '' \
+         ); \
+         CREATE AGGREGATE aggregate_product(integer) ( \
+           SFUNC = aggregate_strict_product, STYPE = integer, PARALLEL = SAFE \
+         ); \
+         CREATE AGGREGATE aggregate_old_total( \
+           BASETYPE = integer, SFUNC = aggregate_sum_state, STYPE = bigint \
+         ); \
+         CREATE AGGREGATE aggregate_old_tick( \
+           BASETYPE = any, SFUNC = aggregate_tick_state, STYPE = bigint, INITCOND = '0' \
+         ); \
+         CREATE AGGREGATE aggregate_first(anyelement) ( \
+           SFUNC = aggregate_polymorphic_first, STYPE = anyelement \
+         ); \
+         CREATE AGGREGATE aggregate_array_first(anyarray) ( \
+           SFUNC = aggregate_polymorphic_array_first, STYPE = anyarray \
+         ); \
+         CREATE AGGREGATE aggregate_compatible_first(anycompatible) ( \
+           SFUNC = aggregate_compatible_first_state, STYPE = anycompatible \
+         ); \
+         CREATE AGGREGATE aggregate_window_unsafe(integer) ( \
+           SFUNC = aggregate_sum_state, STYPE = bigint, FINALFUNC = aggregate_double, \
+           FINALFUNC_MODIFY = READ_WRITE \
+         )",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let state_slot = engine
+        .storage
+        .routine_slot_for_call_oids(
+            "aggregate_sum_state",
+            &[crate::sql::types::oid::INT8, crate::sql::types::oid::INT4],
+            0,
+        )
+        .unwrap();
+    assert!(
+        engine
+            .storage
+            .routine_for_bound_call(
+                state_slot,
+                &[crate::sql::types::oid::TEXT, crate::sql::types::oid::TEXT],
+                0,
+            )
+            .is_none()
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT g, aggregate_sum(v) FROM aggregate_input GROUP BY g ORDER BY g; \
+             SELECT aggregate_sum(v), aggregate_sum(DISTINCT v) FROM aggregate_input"
+        )),
+        ["1|12", "2|10", "22|22"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggregate_old_total(v) FROM aggregate_input"
+        )),
+        ["11"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggregate_old_tick(*) FROM aggregate_input; \
+             SELECT aggregate_first(v), aggregate_first(g::text) FROM aggregate_input; \
+             SELECT aggregate_array_first(ARRAY[v])::text, \
+                    aggregate_compatible_first(v::bigint) FROM aggregate_input"
+        )),
+        ["5", "3|1", "{3}|3"]
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggregate_first(1), aggregate_first('x'::text), \
+                    aggregate_array_first(ARRAY[1])"
+        )),
+        [
+            crate::sql::types::oid::INT4,
+            crate::sql::types::oid::TEXT,
+            crate::sql::types::ColType::Array(crate::sql::types::ArrElem::Int4).oid(),
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT g, aggregate_product(v) FROM aggregate_input GROUP BY g ORDER BY g; \
+             SELECT aggregate_product(v) FROM aggregate_input WHERE false"
+        )),
+        ["1|6", "2|5", "NULL"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggregate_sum(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+               FROM aggregate_input ORDER BY v"
+        )),
+        ["2", "6", "12", "22", "22"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggregate_sum(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+               FROM aggregate_input ORDER BY v"
+        )),
+        ["2", "6", "10", "16", "10"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggregate_offset_sum(10) WITHIN GROUP (ORDER BY v DESC), \
+                    ordered_concat() WITHIN GROUP (ORDER BY v DESC) \
+               FROM aggregate_input; \
+             SELECT aggregate_offset_sum(10) WITHIN GROUP (ORDER BY v) \
+               FROM aggregate_input WHERE false"
+        )),
+        ["21|5321", "10"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT prokind, prorettype FROM pg_proc WHERE proname = 'aggregate_sum'"
+        )),
+        [format!("a|{}", crate::sql::types::oid::INT8)]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggkind, aggnumdirectargs, aggtransfn::oid, aggfinalfn::oid, \
+                    aggtranstype, agginitval \
+               FROM pg_aggregate a JOIN pg_proc p ON p.oid = a.aggfnoid \
+              WHERE p.proname = 'aggregate_sum'"
+        )),
+        [format!(
+            "n|0|{}|{}|{}|NULL",
+            engine
+                .storage
+                .routine_for_call_oids(
+                    "aggregate_sum_state",
+                    &[crate::sql::types::oid::INT8, crate::sql::types::oid::INT4],
+                    0
+                )
+                .map(|routine| crate::storage::routine_oid(&routine))
+                .unwrap(),
+            engine
+                .storage
+                .routine_for_call_oids("aggregate_double", &[crate::sql::types::oid::INT8], 0)
+                .map(|routine| crate::storage::routine_oid(&routine))
+                .unwrap(),
+            crate::sql::types::oid::INT8,
+        )]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT proisstrict, provolatile, proparallel FROM pg_proc \
+              WHERE proname = 'aggregate_strict_product'"
+        )),
+        ["t|i|s"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT p.proname, p.prorettype::regtype::text, \
+                    a.aggtranstype::regtype::text \
+               FROM pg_proc p JOIN pg_aggregate a ON a.aggfnoid = p.oid \
+              WHERE p.proname IN ('aggregate_first', 'aggregate_array_first', \
+                                  'aggregate_compatible_first') ORDER BY p.proname"
+        )),
+        [
+            "aggregate_array_first|anyarray|anyarray",
+            "aggregate_compatible_first|anycompatible|anycompatible",
+            "aggregate_first|anyelement|anyelement",
+        ]
+    );
+    let undetermined_function = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION aggregate_invalid_polymorphic_result() RETURNS anyelement \
+           LANGUAGE SQL AS 'SELECT NULL'",
+    );
+    assert!(String::from_utf8_lossy(&undetermined_function).contains("42P13"));
+    let missing_old_base_type = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE AGGREGATE aggregate_missing_base_type( \
+           SFUNC = aggregate_tick_state, STYPE = bigint, INITCOND = '0' \
+         )",
+    );
+    assert!(String::from_utf8_lossy(&missing_old_base_type).contains("42P13"));
+    let polymorphic_state = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION aggregate_polymorphic_concrete_state(state anyelement, value integer) \
+           RETURNS anyelement LANGUAGE SQL AS 'SELECT state'; \
+         CREATE AGGREGATE aggregate_invalid_polymorphic_state(integer) ( \
+           SFUNC = aggregate_polymorphic_concrete_state, STYPE = anyelement \
+         )",
+    );
+    assert!(String::from_utf8_lossy(&polymorphic_state).contains("42P13"));
+    let invalid_strict = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE AGGREGATE invalid_strict_sum(integer) ( \
+           SFUNC = aggregate_strict_mismatch, STYPE = bigint \
+         )",
+    );
+    assert!(String::from_utf8_lossy(&invalid_strict).contains("42P13"));
+    let invalid_serde = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE AGGREGATE invalid_serialized_sum(integer) ( \
+           SFUNC = aggregate_sum_state, STYPE = bigint, \
+           COMBINEFUNC = aggregate_sum_combine, \
+           SERIALFUNC = missing_serialize, DESERIALFUNC = missing_deserialize \
+         )",
+    );
+    assert!(String::from_utf8_lossy(&invalid_serde).contains("42P13"));
+    let invalid_moving_strictness = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE AGGREGATE aggregate_invalid_moving_strictness(integer) ( \
+           SFUNC = aggregate_strict_product, STYPE = integer, \
+           MSFUNC = aggregate_strict_product, \
+           MINVFUNC = aggregate_nonstrict_product_inverse, MSTYPE = integer \
+         )",
+    );
+    assert!(String::from_utf8_lossy(&invalid_moving_strictness).contains("42P13"));
+    let invalid_final_extra = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE AGGREGATE aggregate_invalid_final_extra(integer) ( \
+           SFUNC = aggregate_sum_state, STYPE = bigint, \
+           FINALFUNC = aggregate_strict_final_extra, FINALFUNC_EXTRA \
+         )",
+    );
+    assert!(String::from_utf8_lossy(&invalid_final_extra).contains("42P13"));
+    let unsafe_window = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT aggregate_window_unsafe(v) OVER () FROM aggregate_input",
+    );
+    assert!(String::from_utf8_lossy(&unsafe_window).contains("0A000"));
+    let changed_result = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE OR REPLACE AGGREGATE aggregate_sum(integer) ( \
+           SFUNC = aggregate_concat_state, STYPE = text, INITCOND = '' \
+         )",
+    );
+    assert!(String::from_utf8_lossy(&changed_result).contains("42P13"));
+    let changed_kind = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE OR REPLACE AGGREGATE aggregate_sum(ORDER BY integer) ( \
+           SFUNC = aggregate_sum_state, STYPE = bigint \
+         )",
+    );
+    assert!(String::from_utf8_lossy(&changed_kind).contains("42P13"));
+    let altered = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER AGGREGATE aggregate_sum(integer) RENAME TO aggregate_total; \
+         SELECT aggregate_total(v) FROM aggregate_input; \
+         DROP AGGREGATE aggregate_total(integer)",
+    );
+    assert_eq!(
+        data_rows(&altered),
+        ["22"],
+        "{}",
+        String::from_utf8_lossy(&altered)
+    );
+}
+
+#[test]
+fn user_defined_aggregate_survives_wal_and_checkpoint_recovery() {
+    let mut config = test_config("user_aggregate_recovery");
+    config.max_tables = 16;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("user-aggregate-recovery-{}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE aggregate_recovery_input (value integer); \
+             INSERT INTO aggregate_recovery_input VALUES (2), (4), (8); \
+             CREATE FUNCTION aggregate_recovery_state(state bigint, value integer) \
+               RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 1) * value'; \
+             CREATE FUNCTION aggregate_recovery_concat(state text, value integer) \
+               RETURNS text LANGUAGE SQL AS 'SELECT concat(state, value)'; \
+             CREATE FUNCTION aggregate_recovery_combine(left_state text, right_state text) \
+               RETURNS text LANGUAGE SQL AS 'SELECT concat(left_state, right_state)'; \
+             CREATE FUNCTION aggregate_recovery_first(state anyelement, value anyelement) \
+               RETURNS anyelement LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+             CREATE AGGREGATE aggregate_product(integer) ( \
+               SFUNC = aggregate_recovery_state, STYPE = bigint \
+             ); \
+             CREATE AGGREGATE aggregate_serial_concat(integer) ( \
+               SFUNC = aggregate_recovery_concat, STYPE = text, INITCOND = '', \
+               COMBINEFUNC = aggregate_recovery_combine \
+             ); \
+             CREATE AGGREGATE aggregate_recovery_first(anyelement) ( \
+               SFUNC = aggregate_recovery_first, STYPE = anyelement \
+             )",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        let aggregate_slot = engine
+            .storage
+            .routine_slot_by_signature("public", "aggregate_product", &[ColType::Int4], 0)
+            .unwrap();
+        let crate::storage::RoutineKind::Aggregate(aggregate) =
+            engine.storage.routine(aggregate_slot).kind
+        else {
+            panic!("created routine is not an aggregate")
+        };
+        let encoded = aggregate.encode_wire();
+        assert_eq!(
+            crate::storage::AggregateRoutine::decode_wire(encoded.as_str()),
+            Some(aggregate),
+            "{}",
+            encoded.as_str()
+        );
+        engine.commit_wal().unwrap();
+    }
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut recovered = Engine::new(&config, &mut budget).unwrap();
+        let aggregate_slot = recovered
+            .storage
+            .routine_slot_by_signature("public", "aggregate_product", &[ColType::Int4], 0)
+            .expect("aggregate recovered from WAL");
+        assert!(matches!(
+            recovered.storage.routine(aggregate_slot).kind,
+            crate::storage::RoutineKind::Aggregate(_)
+        ));
+        let result = run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT aggregate_product(value), aggregate_serial_concat(value), \
+                    aggregate_recovery_first(value) \
+               FROM aggregate_recovery_input",
+        );
+        assert_eq!(
+            data_rows(&result),
+            ["64|248|2"],
+            "{}",
+            String::from_utf8_lossy(&result)
+        );
+        let replaced = run_with(
+            &mut recovered,
+            &mut budget,
+            "CREATE OR REPLACE AGGREGATE aggregate_product(integer) ( \
+               SFUNC = aggregate_recovery_state, STYPE = bigint, INITCOND = '2' \
+             ); \
+             SELECT aggregate_product(value) FROM aggregate_recovery_input",
+        );
+        assert_eq!(data_rows(&replaced), ["128"]);
+        assert!(recovered.checkpoint().unwrap());
+    }
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut recovered = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(
+                &mut recovered,
+                &mut budget,
+                "SELECT aggregate_product(value), aggregate_serial_concat(value), \
+                        aggregate_recovery_first(value), \
+                        aggkind, aggtranstype \
+                   FROM aggregate_recovery_input, pg_aggregate a \
+                   JOIN pg_proc p ON p.oid = a.aggfnoid \
+                  WHERE p.proname = 'aggregate_product' \
+                  GROUP BY aggkind, aggtranstype"
+            )),
+            [format!("128|248|2|n|{}", crate::sql::types::oid::INT8)]
+        );
+    }
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn user_defined_aggregate_resolves_every_postgresql_polymorphic_family() {
+    let mut config = test_config("user-defined-aggregate-polymorphic-families");
+    config.max_tables = 32;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE aggregate_polymorphic_mood AS ENUM ('low', 'high'); \
+         CREATE FUNCTION aggregate_anynonarray_state(state anynonarray, value anynonarray) \
+           RETURNS anynonarray LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_anyenum_state(state anyenum, value anyenum) \
+           RETURNS anyenum LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_anyrange_state(state anyrange, value anyrange) \
+           RETURNS anyrange LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_anymultirange_state(state anymultirange, value anymultirange) \
+           RETURNS anymultirange LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_anycompatiblearray_state( \
+           state anycompatiblearray, value anycompatiblearray) \
+           RETURNS anycompatiblearray LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_anycompatiblenonarray_state( \
+           state anycompatiblenonarray, value anycompatiblenonarray) \
+           RETURNS anycompatiblenonarray LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_anycompatiblerange_state( \
+           state anycompatiblerange, value anycompatiblerange) \
+           RETURNS anycompatiblerange LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_anycompatiblemultirange_state( \
+           state anycompatiblemultirange, value anycompatiblemultirange) \
+           RETURNS anycompatiblemultirange LANGUAGE SQL AS 'SELECT coalesce(state, value)'; \
+         CREATE FUNCTION aggregate_compatible_pair_state( \
+           state anycompatible, left_value anycompatible, right_value anycompatible) \
+           RETURNS anycompatible LANGUAGE SQL \
+           AS 'SELECT coalesce(state, left_value, right_value)'; \
+         CREATE AGGREGATE aggregate_anynonarray(anynonarray) ( \
+           SFUNC = aggregate_anynonarray_state, STYPE = anynonarray); \
+         CREATE AGGREGATE aggregate_anyenum(anyenum) ( \
+           SFUNC = aggregate_anyenum_state, STYPE = anyenum); \
+         CREATE AGGREGATE aggregate_anyrange(anyrange) ( \
+           SFUNC = aggregate_anyrange_state, STYPE = anyrange); \
+         CREATE AGGREGATE aggregate_anymultirange(anymultirange) ( \
+           SFUNC = aggregate_anymultirange_state, STYPE = anymultirange); \
+         CREATE AGGREGATE aggregate_anycompatiblearray(anycompatiblearray) ( \
+           SFUNC = aggregate_anycompatiblearray_state, STYPE = anycompatiblearray); \
+         CREATE AGGREGATE aggregate_anycompatiblenonarray(anycompatiblenonarray) ( \
+           SFUNC = aggregate_anycompatiblenonarray_state, STYPE = anycompatiblenonarray); \
+         CREATE AGGREGATE aggregate_anycompatiblerange(anycompatiblerange) ( \
+           SFUNC = aggregate_anycompatiblerange_state, STYPE = anycompatiblerange); \
+         CREATE AGGREGATE aggregate_anycompatiblemultirange(anycompatiblemultirange) ( \
+           SFUNC = aggregate_anycompatiblemultirange_state, \
+           STYPE = anycompatiblemultirange); \
+         CREATE AGGREGATE aggregate_compatible_pair(anycompatible, anycompatible) ( \
+           SFUNC = aggregate_compatible_pair_state, STYPE = anycompatible)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggregate_anynonarray(value) \
+               FROM (VALUES (2::bigint), (3::bigint)) input(value); \
+             SELECT aggregate_anyenum(value)::text \
+               FROM (VALUES ('low'::aggregate_polymorphic_mood), \
+                            ('high'::aggregate_polymorphic_mood)) input(value); \
+             SELECT aggregate_anyrange(value)::text \
+               FROM (VALUES ('[1,3)'::int4range), ('[5,7)'::int4range)) input(value); \
+             SELECT aggregate_anymultirange(value)::text \
+               FROM (VALUES ('{[1,3)}'::int4multirange), \
+                            ('{[5,7)}'::int4multirange)) input(value); \
+             SELECT aggregate_anycompatiblearray(value)::text \
+               FROM (VALUES (ARRAY[1,2]), (ARRAY[3,4])) input(value); \
+             SELECT aggregate_anycompatiblenonarray(value) \
+               FROM (VALUES (2::bigint), (3::bigint)) input(value); \
+             SELECT aggregate_anycompatiblerange(value)::text \
+               FROM (VALUES ('[1,3)'::int4range), ('[5,7)'::int4range)) input(value); \
+             SELECT aggregate_anycompatiblemultirange(value)::text \
+               FROM (VALUES ('{[1,3)}'::int4multirange), \
+                            ('{[5,7)}'::int4multirange)) input(value); \
+             SELECT aggregate_compatible_pair(left_value, right_value), \
+                    pg_typeof(aggregate_compatible_pair(left_value, right_value)) \
+               FROM (VALUES (2::integer, 3::bigint), \
+                            (4::integer, 5::bigint)) input(left_value, right_value)"
+        )),
+        [
+            "2", "low", "[1,3)", "{[1,3)}", "{1,2}", "2", "[1,3)", "{[1,3)}", "2|bigint",
+        ]
+    );
+}
+
+#[test]
+fn user_defined_aggregate_combines_bounded_spill_partitions() {
+    let mut config = test_config("user-defined-aggregate-partial-spill");
+    config.max_tables = 16;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("user-aggregate-spill-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE aggregate_spill_input (group_id integer, value integer); \
+         INSERT INTO aggregate_spill_input \
+           SELECT value % 3, 1 FROM generate_series(1, 600) AS series(value); \
+         CREATE FUNCTION aggregate_spill_state(state bigint, value integer) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 0) + value'; \
+         CREATE FUNCTION aggregate_spill_combine(left_state bigint, right_state bigint) \
+           RETURNS bigint LANGUAGE SQL \
+           AS 'SELECT coalesce(left_state, 0) + coalesce(right_state, 0)'; \
+         CREATE AGGREGATE aggregate_spill_total(integer) ( \
+           SFUNC = aggregate_spill_state, STYPE = bigint, INITCOND = '0', \
+           COMBINEFUNC = aggregate_spill_combine, PARALLEL = SAFE); \
+         SELECT group_id, aggregate_spill_total(value) \
+           FROM aggregate_spill_input GROUP BY group_id ORDER BY group_id; \
+         SELECT aggregate_spill_total(value) FROM aggregate_spill_input",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0|200", "1|200", "2|200", "600"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn user_defined_aggregate_ownership_privileges_and_dependencies_are_typed() {
+    let mut config = test_config("user-defined-aggregate-dependencies");
+    config.max_tables = 32;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE aggregate_owner; \
+         CREATE ROLE aggregate_reader; \
+         GRANT CREATE ON SCHEMA public TO aggregate_owner; \
+         CREATE SCHEMA aggregate_target; \
+         CREATE FUNCTION protected_aggregate_state(state bigint, value integer) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 0) + value'; \
+         REVOKE EXECUTE ON FUNCTION protected_aggregate_state(bigint, integer) FROM PUBLIC",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE aggregate_owner; \
+         CREATE AGGREGATE protected_total(integer) ( \
+           SFUNC = protected_aggregate_state, STYPE = bigint, INITCOND = '0' \
+         )",
+    );
+    assert!(String::from_utf8_lossy(&denied).contains("42501"));
+    let lifecycle = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; \
+         GRANT EXECUTE ON FUNCTION protected_aggregate_state(bigint, integer) TO aggregate_owner; \
+         SET ROLE aggregate_owner; \
+         CREATE AGGREGATE protected_total(integer) ( \
+           SFUNC = protected_aggregate_state, STYPE = bigint, INITCOND = '0' \
+         ); \
+         RESET ROLE; \
+         ALTER AGGREGATE protected_total(integer) OWNER TO postgres; \
+         ALTER AGGREGATE protected_total(integer) SET SCHEMA aggregate_target; \
+         ALTER AGGREGATE aggregate_target.protected_total(integer) RENAME TO moved_total; \
+         SELECT aggregate_target.moved_total(value) FROM (VALUES (2), (3)) input(value); \
+         SELECT namespace.nspname, pg_get_userbyid(proc.proowner), \
+                proc.oid::regprocedure::text, pg_get_function_result(proc.oid) \
+           FROM pg_proc proc JOIN pg_namespace namespace ON namespace.oid = proc.pronamespace \
+          WHERE proc.proname = 'moved_total'",
+    );
+    assert_eq!(
+        data_rows(&lifecycle),
+        ["5", "aggregate_target|postgres|moved_total(integer)|bigint"],
+        "{}",
+        String::from_utf8_lossy(&lifecycle)
+    );
+    let replaced = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE OR REPLACE AGGREGATE aggregate_target.moved_total(integer) ( \
+           SFUNC = protected_aggregate_state, STYPE = bigint, INITCOND = '10' \
+         ); \
+         SELECT aggregate_target.moved_total(value) FROM (VALUES (2), (3)) input(value)",
+    );
+    assert_eq!(
+        data_rows(&replaced),
+        ["15"],
+        "{}",
+        String::from_utf8_lossy(&replaced)
+    );
+    let denied_call = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE EXECUTE ON ROUTINE aggregate_target.moved_total(integer) FROM PUBLIC; \
+         SET ROLE aggregate_reader; \
+         SELECT aggregate_target.moved_total(value) FROM (VALUES (2), (3)) input(value)",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_call).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&denied_call)
+    );
+    let granted_call = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; \
+         GRANT EXECUTE ON ROUTINE aggregate_target.moved_total(integer) TO aggregate_reader; \
+         SET ROLE aggregate_reader; \
+         SELECT aggregate_target.moved_total(value) FROM (VALUES (2), (3)) input(value); \
+         RESET ROLE",
+    );
+    assert_eq!(
+        data_rows(&granted_call),
+        ["15"],
+        "{}",
+        String::from_utf8_lossy(&granted_call)
+    );
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION protected_aggregate_state(bigint, integer)",
+    );
+    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let cascade = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION protected_aggregate_state(bigint, integer) CASCADE; \
+         SELECT count(*) FROM pg_proc WHERE proname = 'moved_total'",
+    );
+    assert_eq!(data_rows(&cascade), ["0"]);
+}
+
+#[test]
+fn user_defined_aggregate_type_dependencies_restrict_and_cascade_without_dangling_routines() {
+    let mut config = test_config("user-defined-aggregate-type-dependencies");
+    config.max_tables = 32;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN aggregate_domain AS integer; \
+         CREATE DOMAIN aggregate_state_domain AS bigint; \
+         CREATE FUNCTION aggregate_domain_state(state bigint, value aggregate_domain) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 0) + value'; \
+         CREATE AGGREGATE aggregate_domain_total(aggregate_domain) ( \
+           SFUNC = aggregate_domain_state, STYPE = bigint, INITCOND = '0' \
+         ); \
+         CREATE FUNCTION aggregate_typed_state(state aggregate_state_domain, value integer) \
+           RETURNS aggregate_state_domain LANGUAGE SQL \
+           AS 'SELECT (coalesce(state, 0) + value)::aggregate_state_domain'; \
+         CREATE AGGREGATE aggregate_typed_total(integer) ( \
+           SFUNC = aggregate_typed_state, STYPE = aggregate_state_domain, INITCOND = '0' \
+         ); \
+         CREATE TYPE aggregate_payload AS (value integer); \
+         CREATE FUNCTION aggregate_payload_marker(value aggregate_payload) \
+           RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT aggregate_typed_total(value), p.prorettype = t.oid \
+               FROM (VALUES (2), (3)) input(value), pg_proc p, pg_type t \
+              WHERE p.proname = 'aggregate_typed_total' \
+                AND t.typname = 'aggregate_state_domain' \
+              GROUP BY p.prorettype, t.oid"
+        )),
+        ["5|t"]
+    );
+    let domain_restrict = run_with(&mut engine, &mut budget, "DROP DOMAIN aggregate_domain");
+    assert!(String::from_utf8_lossy(&domain_restrict).contains("2BP01"));
+    let composite_restrict = run_with(&mut engine, &mut budget, "DROP TYPE aggregate_payload");
+    assert!(String::from_utf8_lossy(&composite_restrict).contains("2BP01"));
+    let state_restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP DOMAIN aggregate_state_domain",
+    );
+    assert!(String::from_utf8_lossy(&state_restrict).contains("2BP01"));
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP DOMAIN aggregate_domain CASCADE; \
+         DROP TYPE aggregate_payload CASCADE; \
+         DROP DOMAIN aggregate_state_domain CASCADE; \
+         SELECT count(*) FROM pg_proc \
+          WHERE proname IN ('aggregate_domain_state', 'aggregate_domain_total', \
+                            'aggregate_typed_state', 'aggregate_typed_total', \
+                            'aggregate_payload_marker')",
+    );
+    assert_eq!(
+        data_rows(&dropped),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
 }
 
 #[test]

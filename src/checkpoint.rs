@@ -2130,6 +2130,29 @@ impl Checkpointer {
                             })
                         };
                     }
+                    let attributes = crate::storage::RoutineAttributes {
+                        strict: match parse_field::<u8>(words.next(), "routine strictness")? {
+                            0 => false,
+                            1 => true,
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "invalid routine strictness",
+                                ));
+                            }
+                        },
+                        volatility: crate::storage::RoutineVolatility::from_code(parse_field(
+                            words.next(),
+                            "routine volatility",
+                        )?)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid routine volatility"))?,
+                        parallel: crate::storage::RoutineParallel::from_code(parse_field(
+                            words.next(),
+                            "routine parallel safety",
+                        )?)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid routine parallel safety",
+                        ))?,
+                    };
                     let mut result_columns = [crate::storage::RoutineArgumentDef::EMPTY;
                         crate::storage::MAX_ROUTINE_ARGUMENTS];
                     let mut result_column_count = 0;
@@ -2155,8 +2178,8 @@ impl Checkpointer {
                             .ok_or(CheckpointSetupError::Corrupt("invalid routine result type"))?,
                         user_type: result_user_type,
                     };
+                    let code: u8 = parse_field(Some(kind_code), "routine kind")?;
                     let kind = {
-                        let code: u8 = parse_field(Some(kind_code), "routine kind")?;
                         if code == 3 {
                             result_column_count =
                                 parse_field(words.next(), "routine result column count")?;
@@ -2199,6 +2222,18 @@ impl Checkpointer {
                                 ));
                             }
                             crate::storage::RoutineKind::TableFunction
+                        } else if code == 5 {
+                            let aggregate =
+                                crate::storage::AggregateRoutine::decode_wire(body.as_str())
+                                    .ok_or(CheckpointSetupError::Corrupt(
+                                        "invalid aggregate definition",
+                                    ))?;
+                            if words.next().is_some() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "malformed aggregate record",
+                                ));
+                            }
+                            crate::storage::RoutineKind::Aggregate(aggregate)
                         } else {
                             let kind = crate::storage::RoutineKind::from_wire_code(code, result)
                                 .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?;
@@ -2232,7 +2267,8 @@ impl Checkpointer {
                                 kind,
                                 result_columns,
                                 result_column_count,
-                                body,
+                                attributes,
+                                body: if code == 5 { StackStr::new() } else { body },
                             },
                             0,
                         )
@@ -4414,7 +4450,14 @@ impl Checkpointer {
             for byte in routine.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
             }
-            for byte in routine.body.as_str().as_bytes() {
+            let aggregate_body = match routine.kind {
+                crate::storage::RoutineKind::Aggregate(aggregate) => Some(aggregate.encode_wire()),
+                _ => None,
+            };
+            let serialized_body = aggregate_body
+                .as_ref()
+                .map_or(routine.body.as_str(), |body| body.as_str());
+            for byte in serialized_body.as_bytes() {
                 let _ = write!(body, "{byte:02x}");
             }
             let mut arguments = StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 396 }>::new();
@@ -4476,6 +4519,9 @@ impl Checkpointer {
             let result_identity = match routine.kind {
                 crate::storage::RoutineKind::Function { result }
                 | crate::storage::RoutineKind::SetFunction { result } => result.user_type,
+                crate::storage::RoutineKind::Aggregate(aggregate) => {
+                    aggregate.result_type.user_type
+                }
                 _ => None,
             };
             let mut result_schema = StackStr::<130>::new();
@@ -4494,12 +4540,15 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rtn {} {} {} {} {} {} {}{} {} {} {}{}",
+                    "rtn {} {} {} {} {} {} {}{} {} {} {} {} {} {}{}",
                     routine.created_at,
                     owner.as_str(),
                     match routine.kind {
                         crate::storage::RoutineKind::Function { result }
                         | crate::storage::RoutineKind::SetFunction { result } => result.ctype,
+                        crate::storage::RoutineKind::Aggregate(aggregate) => {
+                            aggregate.result_type.ctype
+                        }
                         crate::storage::RoutineKind::TableFunction
                         | crate::storage::RoutineKind::Trigger
                         | crate::storage::RoutineKind::Procedure => ColType::Text,
@@ -4510,6 +4559,9 @@ impl Checkpointer {
                     name.as_str(),
                     body.as_str(),
                     arguments.as_str(),
+                    u8::from(routine.attributes.strict),
+                    routine.attributes.volatility.code(),
+                    routine.attributes.parallel.code(),
                     routine.kind.wire_code(),
                     result_schema.as_str(),
                     result_name.as_str(),

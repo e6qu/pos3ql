@@ -689,6 +689,18 @@ pub trait CatalogAccess {
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
     }
+    /// Executes a support function already bound to a durable catalog object.
+    /// Aggregate definitions use this boundary so a later rename cannot turn
+    /// a validated dependency into an unresolved text lookup.
+    fn call_routine_oid<'a>(
+        &self,
+        _oid: i32,
+        _arguments: &[Datum<'a>],
+        _argument_type_oids: &[i32],
+        _arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        Ok(None)
+    }
     /// The declared result identity of a catalog routine. This is separate
     /// from execution because a domain result shares its base datum layout.
     fn routine_result_oid(&self, _name: &str, _argument_type_oids: &[i32]) -> Option<i32> {
@@ -5256,6 +5268,17 @@ fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
         oid::REGTYPE => "regtype",
         oid::REGNAMESPACE => "regnamespace",
         oid::REGROLE => "regrole",
+        oid::ANYELEMENT => "anyelement",
+        oid::ANYARRAY => "anyarray",
+        oid::ANYNONARRAY => "anynonarray",
+        oid::ANYENUM => "anyenum",
+        oid::ANYRANGE => "anyrange",
+        oid::ANYMULTIRANGE => "anymultirange",
+        oid::ANYCOMPATIBLE => "anycompatible",
+        oid::ANYCOMPATIBLEARRAY => "anycompatiblearray",
+        oid::ANYCOMPATIBLENONARRAY => "anycompatiblenonarray",
+        oid::ANYCOMPATIBLERANGE => "anycompatiblerange",
+        oid::ANYCOMPATIBLEMULTIRANGE => "anycompatiblemultirange",
         _ => return None,
     })
 }
@@ -5314,8 +5337,25 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
         "time with time zone" | "timetz" => "time with time zone",
         // Identifier/object types render as themselves.
         "oid" => "oid",
-        s @ ("regtype" | "regclass" | "regproc" | "regprocedure" | "regrole" | "regnamespace"
-        | "regoper" | "regoperator") => match s {
+        s @ ("regtype"
+        | "regclass"
+        | "regproc"
+        | "regprocedure"
+        | "regrole"
+        | "regnamespace"
+        | "regoper"
+        | "regoperator"
+        | "anyelement"
+        | "anyarray"
+        | "anynonarray"
+        | "anyenum"
+        | "anyrange"
+        | "anymultirange"
+        | "anycompatible"
+        | "anycompatiblearray"
+        | "anycompatiblenonarray"
+        | "anycompatiblerange"
+        | "anycompatiblemultirange") => match s {
             "regtype" => "regtype",
             "regclass" => "regclass",
             "regproc" => "regproc",
@@ -5324,6 +5364,17 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
             "regnamespace" => "regnamespace",
             "regoper" => "regoper",
             "regoperator" => "regoperator",
+            "anyelement" => "anyelement",
+            "anyarray" => "anyarray",
+            "anynonarray" => "anynonarray",
+            "anyenum" => "anyenum",
+            "anyrange" => "anyrange",
+            "anymultirange" => "anymultirange",
+            "anycompatible" => "anycompatible",
+            "anycompatiblearray" => "anycompatiblearray",
+            "anycompatiblenonarray" => "anycompatiblenonarray",
+            "anycompatiblerange" => "anycompatiblerange",
+            "anycompatiblemultirange" => "anycompatiblemultirange",
             _ => unreachable!(),
         },
         other => match ColType::from_sql_name(other) {
@@ -5344,6 +5395,17 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
         "regnamespace" => crate::sql::types::oid::REGNAMESPACE,
         "regoper" => crate::sql::types::oid::REGOPER,
         "regoperator" => crate::sql::types::oid::REGOPERATOR,
+        "anyelement" => crate::sql::types::oid::ANYELEMENT,
+        "anyarray" => crate::sql::types::oid::ANYARRAY,
+        "anynonarray" => crate::sql::types::oid::ANYNONARRAY,
+        "anyenum" => crate::sql::types::oid::ANYENUM,
+        "anyrange" => crate::sql::types::oid::ANYRANGE,
+        "anymultirange" => crate::sql::types::oid::ANYMULTIRANGE,
+        "anycompatible" => crate::sql::types::oid::ANYCOMPATIBLE,
+        "anycompatiblearray" => crate::sql::types::oid::ANYCOMPATIBLEARRAY,
+        "anycompatiblenonarray" => crate::sql::types::oid::ANYCOMPATIBLENONARRAY,
+        "anycompatiblerange" => crate::sql::types::oid::ANYCOMPATIBLERANGE,
+        "anycompatiblemultirange" => crate::sql::types::oid::ANYCOMPATIBLEMULTIRANGE,
         _ => ColType::from_sql_name(canonical)
             .expect("canonical type")
             .oid(),

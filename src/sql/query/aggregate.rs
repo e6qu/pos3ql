@@ -83,7 +83,7 @@ pub(crate) fn fold_aggregates<'a>(
 ) -> Result<&'a mut [Datum<'a>], SqlError> {
     let mut states = [AggState::default(); MAX_AGGS];
     for (i, (_, node)) in agg_nodes.iter().enumerate() {
-        states[i].init(node)?;
+        states[i].init(node, storage, txid, &super::ScopeCols(scope), arena)?;
     }
     let recycling_safe = states[..agg_nodes.len()]
         .iter()
@@ -149,6 +149,19 @@ pub(crate) fn fold_aggregates<'a>(
 #[derive(Clone, Copy)]
 pub(crate) struct AggState<'a> {
     kind: AggKind,
+    custom: Option<crate::storage::AggregateRoutine>,
+    custom_moving: bool,
+    custom_state_initialized: bool,
+    custom_transition_strict: bool,
+    custom_inverse_strict: bool,
+    custom_direct_initialized: bool,
+    custom_direct: [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    custom_argument_count: u8,
+    custom_sort_offset: u8,
+    custom_state_oid: i32,
+    custom_moving_state_oid: i32,
+    custom_direct_oids: [i32; crate::storage::MAX_ROUTINE_ARGUMENTS],
+    custom_argument_oids: [i32; crate::storage::MAX_ROUTINE_ARGUMENTS],
     star: bool,
     count: u64,
     sum_int: i128,
@@ -205,6 +218,7 @@ fn compare_ordered_aggregate_rows(
     left: &[u8],
     right: &[u8],
     specification: &[crate::sql::ast::OrderBy<'_>],
+    key_offset: usize,
     collations: &[Collation],
     catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     comparison_error: &mut Option<SqlError>,
@@ -212,8 +226,8 @@ fn compare_ordered_aggregate_rows(
     use core::cmp::Ordering;
 
     for (index, ordering) in specification.iter().enumerate() {
-        let left_key = crate::sql::exec::decode_projected_pub(left, 1 + index);
-        let right_key = crate::sql::exec::decode_projected_pub(right, 1 + index);
+        let left_key = crate::sql::exec::decode_projected_pub(left, key_offset + index);
+        let right_key = crate::sql::exec::decode_projected_pub(right, key_offset + index);
         let result = match (left_key.is_null(), right_key.is_null()) {
             (true, true) => Ordering::Equal,
             (true, false) => {
@@ -254,6 +268,40 @@ fn compare_ordered_aggregate_rows(
         }
     }
     Ordering::Equal
+}
+
+fn compare_custom_aggregate_rows(
+    left: &[u8],
+    right: &[u8],
+    columns: usize,
+    collations: &[Collation],
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    comparison_error: &mut Option<SqlError>,
+) -> core::cmp::Ordering {
+    for (index, &collation) in collations.iter().take(columns).enumerate() {
+        let left = crate::sql::exec::decode_projected_pub(left, index);
+        let right = crate::sql::exec::decode_projected_pub(right, index);
+        let ordering = match (left.is_null(), right.is_null()) {
+            (true, true) => core::cmp::Ordering::Equal,
+            (true, false) => core::cmp::Ordering::Greater,
+            (false, true) => core::cmp::Ordering::Less,
+            (false, false) => {
+                match compare_datums_with_catalog(collation, catalog, &left, &right) {
+                    Ok(ordering) => ordering,
+                    Err(error) => {
+                        if comparison_error.is_none() {
+                            *comparison_error = Some(error);
+                        }
+                        core::cmp::Ordering::Equal
+                    }
+                }
+            }
+        };
+        if !ordering.is_eq() {
+            return ordering;
+        }
+    }
+    core::cmp::Ordering::Equal
 }
 
 /// The most general numeric class seen among an aggregate's inputs, driving
@@ -357,6 +405,19 @@ impl Default for AggState<'_> {
     fn default() -> Self {
         Self {
             kind: AggKind::Count,
+            custom: None,
+            custom_moving: false,
+            custom_state_initialized: false,
+            custom_transition_strict: false,
+            custom_inverse_strict: false,
+            custom_direct_initialized: false,
+            custom_direct: [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            custom_argument_count: 0,
+            custom_sort_offset: 0,
+            custom_state_oid: 0,
+            custom_moving_state_oid: 0,
+            custom_direct_oids: [0; crate::storage::MAX_ROUTINE_ARGUMENTS],
+            custom_argument_oids: [0; crate::storage::MAX_ROUTINE_ARGUMENTS],
             star: false,
             count: 0,
             sum_int: 0,
@@ -406,26 +467,298 @@ fn agg_f64(d: &Datum) -> Option<f64> {
 }
 
 impl<'a> AggState<'a> {
+    pub(crate) fn initialize_custom_direct(
+        &mut self,
+        node: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        row: &impl ColumnLookup<'a>,
+        hooks: &EvalHooks<'_, 'a>,
+    ) -> Result<(), SqlError> {
+        let Some(aggregate) = self.custom else {
+            return Ok(());
+        };
+        if self.custom_direct_initialized || aggregate.direct_argument_count == 0 {
+            return Ok(());
+        }
+        let Expr::Call { args, .. } = node else {
+            unreachable!("aggregate state belongs to a call")
+        };
+        for (index, expression) in args
+            .iter()
+            .take(usize::from(aggregate.direct_argument_count))
+            .enumerate()
+        {
+            self.custom_direct[index] = eval_full(expression, arena, params, row, hooks)?;
+        }
+        self.custom_direct_initialized = true;
+        Ok(())
+    }
+
+    pub(crate) fn supports_partial(&self) -> bool {
+        self.custom.is_some_and(|aggregate| {
+            matches!(aggregate.kind, crate::storage::AggregateKind::Normal)
+                && aggregate.partial.is_some()
+                && !self.distinct
+                && !self.ordered
+        })
+    }
+
+    pub(crate) fn combine_partial(
+        &mut self,
+        partial_state: &Self,
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<(), SqlError> {
+        let aggregate = self.custom.expect("partial aggregate is catalog-defined");
+        let partial = aggregate
+            .partial
+            .expect("partial aggregate contract selected");
+        let Some(catalog) = catalog else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "aggregate combine-function catalog is unavailable"
+            ));
+        };
+        let mut incoming = partial_state.best.unwrap_or(Datum::Null);
+        if let Some(serde) = partial.serde
+            && !incoming.is_null()
+        {
+            let serialized = catalog
+                .call_routine_oid(
+                    serde.serialize_oid,
+                    &[incoming],
+                    &[self.custom_state_oid],
+                    arena,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "aggregate serialization function no longer exists"
+                    )
+                })?;
+            incoming = catalog
+                .call_routine_oid(
+                    serde.deserialize_oid,
+                    &[serialized, Datum::Null],
+                    &[
+                        crate::sql::types::oid::BYTEA,
+                        crate::sql::types::oid::INTERNAL,
+                    ],
+                    arena,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "aggregate deserialization function no longer exists"
+                    )
+                })?;
+            if incoming.is_null() {
+                return Err(sql_err!(
+                    sqlstate::NULL_VALUE_NOT_ALLOWED,
+                    "aggregate deserialization function returned null state"
+                ));
+            }
+        }
+        let current = self.best.unwrap_or(Datum::Null);
+        if partial.combine_strict {
+            if incoming.is_null() {
+                return Ok(());
+            }
+            if current.is_null() {
+                self.best = Some(incoming);
+                self.custom_state_initialized = true;
+                return Ok(());
+            }
+        }
+        self.best = Some(
+            catalog
+                .call_routine_oid(
+                    partial.combine_oid,
+                    &[current, incoming],
+                    &[self.custom_state_oid, self.custom_state_oid],
+                    arena,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "aggregate combine function no longer exists"
+                    )
+                })?,
+        );
+        self.custom_state_initialized = true;
+        Ok(())
+    }
+
     pub(crate) fn recycling_safe(&self) -> bool {
         // Only count(x)/count(*) retain no per-row arena state. count(DISTINCT
         // …) buffers argument values in the arena, which a recycling scan
         // reclaims after each row — every other aggregate buffers or folds
         // arena-backed values the same way.
-        matches!(self.kind, AggKind::Count) && !self.distinct
+        self.custom.is_none() && matches!(self.kind, AggKind::Count) && !self.distinct
     }
 
-    pub(crate) fn init(&mut self, node: &'a Expr<'a>) -> Result<(), SqlError> {
+    pub(crate) fn init(
+        &mut self,
+        node: &'a Expr<'a>,
+        storage: &Storage,
+        txid: u32,
+        columns: &dyn crate::sql::exec::ColTypeResolver,
+        arena: &'a Arena,
+    ) -> Result<(), SqlError> {
         let Expr::Call {
             name,
             star,
             distinct,
             order_by,
             args,
+            over,
             ..
         } = node
         else {
             return Err(sql_err!(sqlstate::GROUPING_ERROR, "not an aggregate"));
         };
+        let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if args.len() <= argument_oids.len() {
+            let mut inferred = true;
+            for (index, argument) in args.iter().enumerate() {
+                match crate::sql::exec::infer_routine_argument_oid(argument, columns) {
+                    Ok(oid) => argument_oids[index] = oid,
+                    Err(_) => inferred = false,
+                }
+            }
+            if inferred
+                && let Some((slot, _, aggregate)) =
+                    storage.aggregate_for_call_oids(name, &argument_oids[..args.len()], txid)
+            {
+                storage.require_routine_execute(slot, txid)?;
+                if !matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "ordered-set aggregate {} requires WITHIN GROUP",
+                        name
+                    ));
+                }
+                self.custom = Some(aggregate);
+            }
+        }
+        if self.custom.is_none()
+            && !order_by.is_empty()
+            && args.len() + order_by.len() <= argument_oids.len()
+        {
+            let mut inferred = true;
+            for (index, ordering) in order_by.iter().enumerate() {
+                match crate::sql::exec::infer_routine_argument_oid(ordering.expression, columns) {
+                    Ok(oid) => argument_oids[args.len() + index] = oid,
+                    Err(_) => inferred = false,
+                }
+            }
+            if inferred
+                && let Some((slot, _, aggregate)) = storage.aggregate_for_call_oids(
+                    name,
+                    &argument_oids[..args.len() + order_by.len()],
+                    txid,
+                )
+            {
+                storage.require_routine_execute(slot, txid)?;
+                if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "aggregate {} is not an ordered-set aggregate",
+                        name
+                    ));
+                }
+                self.custom = Some(aggregate);
+            }
+        }
+        if let Some(aggregate) = self.custom {
+            self.custom_state_oid = storage
+                .routine_type_oid(
+                    aggregate.state_type.ctype,
+                    aggregate.state_type.user_type,
+                    txid,
+                )
+                .expect("resolved aggregate state type has an OID");
+            self.custom_moving_state_oid =
+                aggregate.moving.map_or(self.custom_state_oid, |moving| {
+                    storage
+                        .routine_type_oid(
+                            moving.state_type.ctype,
+                            moving.state_type.user_type,
+                            txid,
+                        )
+                        .expect("resolved moving aggregate state type has an OID")
+                });
+            let direct_count = usize::from(aggregate.direct_argument_count);
+            self.custom_direct_oids[..direct_count].copy_from_slice(&argument_oids[..direct_count]);
+            let aggregated_count =
+                if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+                    args.len()
+                } else {
+                    order_by.len()
+                };
+            self.custom_argument_oids[..aggregated_count]
+                .copy_from_slice(&argument_oids[direct_count..direct_count + aggregated_count]);
+            if over.is_some()
+                && (aggregate.final_function.is_some_and(|final_function| {
+                    final_function.modify != crate::storage::AggregateFinalModify::ReadOnly
+                }) || aggregate.moving.is_some_and(|moving| {
+                    moving.final_function.is_some_and(|final_function| {
+                        final_function.modify != crate::storage::AggregateFinalModify::ReadOnly
+                    })
+                }))
+            {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "aggregate function {} does not support use as a window function",
+                    name
+                ));
+            }
+            let transition_slot = storage
+                .routine_slot_by_oid(aggregate.transition_oid, txid)
+                .expect("aggregate transition dependency remains catalog-visible");
+            self.custom_transition_strict =
+                storage.routine_for(transition_slot, txid).attributes.strict;
+            self.star = *star;
+            self.distinct = *distinct;
+            if *star && !args.is_empty() {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "aggregate star form cannot have arguments"
+                ));
+            }
+            if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+                self.custom_argument_count = args.len() as u8;
+                self.custom_sort_offset = args.len() as u8;
+                self.ordered = !order_by.is_empty() || *distinct;
+            } else {
+                self.custom_argument_count = order_by.len() as u8;
+                self.custom_sort_offset = 0;
+                self.ordered = true;
+            }
+            self.ord_spec = order_by;
+            if let Some(initial) = aggregate.initial_condition {
+                let initial = arena
+                    .alloc_str(initial.as_str())
+                    .map_err(|_| arena_full())?;
+                let oid = storage
+                    .routine_type_oid(
+                        aggregate.state_type.ctype,
+                        aggregate.state_type.user_type,
+                        txid,
+                    )
+                    .expect("aggregate state type remains catalog-resolved");
+                self.best = Some(crate::sql::exec::decode_text_input(
+                    storage,
+                    oid,
+                    initial.as_bytes(),
+                    arena,
+                    txid,
+                )?);
+                self.custom_state_initialized = true;
+            }
+            return Ok(());
+        }
         self.kind = match *name {
             "count" => AggKind::Count,
             "sum" => AggKind::Sum,
@@ -499,6 +832,122 @@ impl<'a> AggState<'a> {
         Ok(())
     }
 
+    pub(crate) fn init_moving(
+        &mut self,
+        node: &'a Expr<'a>,
+        storage: &Storage,
+        txid: u32,
+        columns: &dyn crate::sql::exec::ColTypeResolver,
+        arena: &'a Arena,
+    ) -> Result<bool, SqlError> {
+        self.init(node, storage, txid, columns, arena)?;
+        let Some(aggregate) = self.custom else {
+            return Ok(false);
+        };
+        let Some(moving) = aggregate.moving else {
+            return Ok(false);
+        };
+        if !matches!(aggregate.kind, crate::storage::AggregateKind::Normal)
+            || self.distinct
+            || !self.ord_spec.is_empty()
+        {
+            return Ok(false);
+        }
+        self.custom_moving = true;
+        self.best = None;
+        self.custom_state_initialized = false;
+        let transition_slot = storage
+            .routine_slot_by_oid(moving.transition_oid, txid)
+            .expect("moving transition dependency remains catalog-visible");
+        self.custom_transition_strict =
+            storage.routine_for(transition_slot, txid).attributes.strict;
+        let inverse_slot = storage
+            .routine_slot_by_oid(moving.inverse_oid, txid)
+            .expect("moving inverse dependency remains catalog-visible");
+        self.custom_inverse_strict = storage.routine_for(inverse_slot, txid).attributes.strict;
+        if let Some(initial) = moving.initial_condition {
+            let initial = arena
+                .alloc_str(initial.as_str())
+                .map_err(|_| arena_full())?;
+            let oid = storage
+                .routine_type_oid(moving.state_type.ctype, moving.state_type.user_type, txid)
+                .expect("moving aggregate state type remains catalog-resolved");
+            self.best = Some(crate::sql::exec::decode_text_input(
+                storage,
+                oid,
+                initial.as_bytes(),
+                arena,
+                txid,
+            )?);
+            self.custom_state_initialized = true;
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn remove_moving(
+        &mut self,
+        node: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        row: &impl ColumnLookup<'a>,
+        hooks: &EvalHooks<'_, 'a>,
+    ) -> Result<bool, SqlError> {
+        let Expr::Call { args, filter, .. } = node else {
+            unreachable!("moving aggregate state belongs to a call")
+        };
+        if let Some(condition) = filter
+            && !matches!(
+                eval_full(condition, arena, params, row, hooks)?,
+                Datum::Bool(true)
+            )
+        {
+            return Ok(true);
+        }
+        let aggregate = self.custom.expect("moving aggregate is catalog-defined");
+        let moving = aggregate
+            .moving
+            .expect("moving aggregate contract selected");
+        let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (index, expression) in args.iter().enumerate() {
+            values[index] = eval_full(expression, arena, params, row, hooks)?;
+        }
+        if self.custom_inverse_strict && values[..args.len()].iter().any(Datum::is_null) {
+            return Ok(true);
+        }
+        let catalog = hooks.catalog.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "aggregate inverse-function catalog is unavailable"
+            )
+        })?;
+        let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_type_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        arguments[0] = self.best.unwrap_or(Datum::Null);
+        arguments[1..1 + args.len()].copy_from_slice(&values[..args.len()]);
+        argument_type_oids[0] = self.custom_moving_state_oid;
+        argument_type_oids[1..1 + args.len()]
+            .copy_from_slice(&self.custom_argument_oids[..args.len()]);
+        let state = catalog
+            .call_routine_oid(
+                moving.inverse_oid,
+                &arguments[..1 + args.len()],
+                &argument_type_oids[..1 + args.len()],
+                arena,
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "aggregate moving inverse function no longer exists"
+                )
+            })?;
+        if state.is_null() {
+            return Ok(false);
+        }
+        self.best = Some(state);
+        self.custom_state_initialized = true;
+        Ok(true)
+    }
+
     pub(crate) fn update(
         &mut self,
         node: &Expr<'a>,
@@ -518,6 +967,9 @@ impl<'a> AggState<'a> {
             )
         {
             return Ok(());
+        }
+        if self.custom.is_some() {
+            return self.update_custom(node, arena, params, row, hooks);
         }
         if self.star {
             self.count += 1;
@@ -670,6 +1122,142 @@ impl<'a> AggState<'a> {
         }
         self.count += 1;
         self.accumulate(v, arena, hooks.catalog)
+    }
+
+    fn update_custom(
+        &mut self,
+        node: &Expr<'a>,
+        arena: &'a Arena,
+        params: &[Datum<'a>],
+        row: &impl ColumnLookup<'a>,
+        hooks: &EvalHooks<'_, 'a>,
+    ) -> Result<(), SqlError> {
+        let aggregate = self.custom.expect("custom aggregate selected at init");
+        let Expr::Call {
+            args,
+            order_by,
+            distinct,
+            ..
+        } = node
+        else {
+            unreachable!("aggregate state belongs to a call")
+        };
+        self.initialize_custom_direct(node, arena, params, row, hooks)?;
+        let mut ordered_expressions = [&Expr::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let (transition_expressions, sort_spec): (&[&Expr<'a>], &[crate::sql::ast::OrderBy<'a>]) =
+            if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+                (args, order_by)
+            } else {
+                // WITHIN GROUP's ordering expressions are the transition
+                // arguments and define their required input order.
+                for (index, ordering) in order_by.iter().enumerate() {
+                    ordered_expressions[index] = ordering.expression;
+                }
+                (&ordered_expressions[..order_by.len()], order_by)
+            };
+        let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        for (index, expression) in transition_expressions.iter().enumerate() {
+            values[index] = eval_full(expression, arena, params, row, hooks)?;
+            self.ord_collations[index] = resolved_expression_collation(expression, row)?;
+        }
+        if self.ordered || *distinct {
+            let mut tuple = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS * 2];
+            tuple[..transition_expressions.len()]
+                .copy_from_slice(&values[..transition_expressions.len()]);
+            if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+                for (index, ordering) in sort_spec.iter().enumerate() {
+                    tuple[transition_expressions.len() + index] =
+                        eval_full(ordering.expression, arena, params, row, hooks)?;
+                    self.ord_collations[transition_expressions.len() + index] =
+                        resolved_expression_collation(ordering.expression, row)?;
+                }
+            }
+            let encoded = crate::sql::exec::encode_projected_pub(
+                &tuple[..transition_expressions.len()
+                    + if matches!(aggregate.kind, crate::storage::AggregateKind::Normal) {
+                        sort_spec.len()
+                    } else {
+                        0
+                    }],
+                arena,
+            )?;
+            self.push_ordered(encoded, arena)?;
+            self.count += 1;
+            return Ok(());
+        }
+        self.apply_custom_transition(
+            if self.custom_moving {
+                aggregate
+                    .moving
+                    .expect("moving aggregate contract selected")
+                    .transition_oid
+            } else {
+                aggregate.transition_oid
+            },
+            &values[..transition_expressions.len()],
+            arena,
+            hooks.catalog,
+        )?;
+        self.count += 1;
+        Ok(())
+    }
+
+    fn apply_custom_transition(
+        &mut self,
+        transition_oid: i32,
+        values: &[Datum<'a>],
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<(), SqlError> {
+        if self.custom_transition_strict {
+            if values.iter().any(Datum::is_null) {
+                return Ok(());
+            }
+            if !self.custom_state_initialized {
+                self.best = values.first().copied();
+                self.custom_state_initialized = true;
+                return Ok(());
+            }
+        }
+        let catalog = catalog.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "aggregate support-function catalog is unavailable"
+            )
+        })?;
+        let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_type_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        arguments[0] = self.best.unwrap_or(Datum::Null);
+        arguments[1..1 + values.len()].copy_from_slice(values);
+        argument_type_oids[0] = if self.custom_moving {
+            self.custom_moving_state_oid
+        } else {
+            self.custom_state_oid
+        };
+        argument_type_oids[1..1 + values.len()]
+            .copy_from_slice(&self.custom_argument_oids[..values.len()]);
+        let state = catalog
+            .call_routine_oid(
+                transition_oid,
+                &arguments[..1 + values.len()],
+                &argument_type_oids[..1 + values.len()],
+                arena,
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "aggregate transition function no longer exists"
+                )
+            })?;
+        if self.custom_moving && state.is_null() {
+            return Err(sql_err!(
+                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                "moving aggregate transition function returned null state"
+            ));
+        }
+        self.best = Some(state);
+        self.custom_state_initialized = true;
+        Ok(())
     }
 
     /// Fold one non-null value into the running aggregate (the type-specific
@@ -1180,6 +1768,7 @@ impl<'a> AggState<'a> {
                 left,
                 right,
                 spec,
+                1,
                 &self.ord_collations[..spec.len()],
                 catalog,
                 &mut cmp_err,
@@ -1209,6 +1798,9 @@ impl<'a> AggState<'a> {
         catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
     ) -> Result<Datum<'a>, SqlError> {
         use crate::sql::numeric::{self as num, Numeric};
+        if self.custom.is_some() {
+            return self.finish_custom(arena, catalog);
+        }
         // Ordered-set aggregates reduce their buffered values directly.
         if matches!(
             self.kind,
@@ -1364,6 +1956,139 @@ impl<'a> AggState<'a> {
         })
     }
 
+    fn finish_custom(
+        &mut self,
+        arena: &'a Arena,
+        catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
+    ) -> Result<Datum<'a>, SqlError> {
+        let aggregate = self.custom.expect("custom aggregate selected at init");
+        if self.ord_len > 0 {
+            let rows = unsafe { core::slice::from_raw_parts_mut(self.ord, self.ord_len) };
+            let argument_count = usize::from(self.custom_argument_count);
+            let mut comparison_error = None;
+            if self.ord_spec.is_empty() {
+                rows.sort_unstable_by(|left, right| {
+                    compare_custom_aggregate_rows(
+                        left,
+                        right,
+                        argument_count,
+                        &self.ord_collations[..argument_count],
+                        catalog,
+                        &mut comparison_error,
+                    )
+                });
+            } else {
+                let offset = usize::from(self.custom_sort_offset);
+                rows.sort_unstable_by(|left, right| {
+                    compare_ordered_aggregate_rows(
+                        left,
+                        right,
+                        self.ord_spec,
+                        offset,
+                        &self.ord_collations[offset..offset + self.ord_spec.len()],
+                        catalog,
+                        &mut comparison_error,
+                    )
+                });
+            }
+            if let Some(error) = comparison_error {
+                return Err(error);
+            }
+            let mut previous: Option<&[u8]> = None;
+            for &row in rows.iter() {
+                if self.distinct
+                    && let Some(prior) = previous
+                {
+                    let mut comparison_error = None;
+                    let equal = compare_custom_aggregate_rows(
+                        prior,
+                        row,
+                        argument_count,
+                        &self.ord_collations[..argument_count],
+                        catalog,
+                        &mut comparison_error,
+                    )
+                    .is_eq();
+                    if let Some(error) = comparison_error {
+                        return Err(error);
+                    }
+                    if equal {
+                        continue;
+                    }
+                }
+                let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                for (index, value) in values.iter_mut().enumerate().take(argument_count) {
+                    *value = crate::sql::exec::decode_projected_pub(row, index);
+                }
+                self.apply_custom_transition(
+                    aggregate.transition_oid,
+                    &values[..argument_count],
+                    arena,
+                    catalog,
+                )?;
+                previous = Some(row);
+            }
+        }
+        let state = self.best.unwrap_or(Datum::Null);
+        let final_function = if self.custom_moving {
+            aggregate
+                .moving
+                .expect("moving aggregate contract selected")
+                .final_function
+        } else {
+            aggregate.final_function
+        };
+        let Some(final_function) = final_function else {
+            return Ok(state);
+        };
+        let catalog = catalog.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "aggregate final-function catalog is unavailable"
+            )
+        })?;
+        let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_type_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut count = 0usize;
+        arguments[count] = state;
+        argument_type_oids[count] = if self.custom_moving {
+            self.custom_moving_state_oid
+        } else {
+            self.custom_state_oid
+        };
+        count += 1;
+        for (index, value) in self
+            .custom_direct
+            .iter()
+            .take(usize::from(aggregate.direct_argument_count))
+            .enumerate()
+        {
+            arguments[count] = *value;
+            argument_type_oids[count] = self.custom_direct_oids[index];
+            count += 1;
+        }
+        if final_function.extra {
+            argument_type_oids[count..count + usize::from(self.custom_argument_count)]
+                .copy_from_slice(
+                    &self.custom_argument_oids[..usize::from(self.custom_argument_count)],
+                );
+            count += usize::from(self.custom_argument_count);
+        }
+        catalog
+            .call_routine_oid(
+                final_function.function_oid,
+                &arguments[..count],
+                &argument_type_oids[..count],
+                arena,
+            )?
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "aggregate final function no longer exists"
+                )
+            })
+    }
+
     /// Builds the `array_agg` result: the buffered values in ORDER BY order
     /// (or scan order), DISTINCT-deduped if requested. Zero rows → NULL (as
     /// PostgreSQL). The element type comes from the first non-null value.
@@ -1452,6 +2177,7 @@ impl<'a> AggState<'a> {
                     left,
                     right,
                     spec,
+                    1,
                     &self.ord_collations[..spec.len()],
                     catalog,
                     &mut cmp_err,

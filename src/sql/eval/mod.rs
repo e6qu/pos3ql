@@ -728,6 +728,13 @@ pub trait CatalogAccess {
     }
     /// Whether this OID names a collation visible to the current query.
     fn collation_is_visible(&self, oid: i32) -> Option<bool>;
+    fn tablespace_location<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
     /// Whether this OID names a relation eligible for a publication.
     fn relation_is_publishable(&self, oid: i32) -> Option<bool>;
     /// The index definition for this OID: `col == 0` gives the whole
@@ -3274,6 +3281,11 @@ fn call<'a>(
                     .nth(k - 1)
                     .map(|bytes| Datum::Int4(i16::from_le_bytes([bytes[0], bytes[1]]) as i32))
                     .unwrap_or(Datum::Null),
+                Datum::OidVector(raw) => raw
+                    .chunks_exact(4)
+                    .nth(k - 1)
+                    .map(|bytes| Datum::Oid(u32::from_le_bytes(bytes.try_into().unwrap())))
+                    .unwrap_or(Datum::Null),
                 Datum::Null => return Ok(Datum::Null),
                 _ => return Err(type_mismatch("_pg_expandarray requires an array", &a)),
             };
@@ -5373,6 +5385,7 @@ fn type_name_of(d: &Datum) -> &'static str {
     match d {
         Datum::Array { element, .. } => element.array_name(),
         Datum::Int2Vector(_) => "int2vector",
+        Datum::OidVector(_) => "oidvector",
         Datum::Null => "unknown",
         Datum::Bool(_) => "boolean",
         Datum::Int2(_) => "smallint",

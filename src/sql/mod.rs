@@ -393,6 +393,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DropType { .. }
         | Stmt::CreateIndex { .. }
         | Stmt::AlterIndex { .. }
+        | Stmt::AlterIndexesTablespace { .. }
         | Stmt::DropIndex { .. }
         | Stmt::Reindex { .. }
         | Stmt::Checkpoint
@@ -414,6 +415,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterDefaultPrivileges { .. }
         | Stmt::ReassignOwned { .. }
         | Stmt::DropOwned { .. } => true,
+        Stmt::CreateTablespace { .. }
+        | Stmt::AlterTablespace { .. }
+        | Stmt::DropTablespace { .. } => true,
     }
 }
 
@@ -3355,6 +3359,18 @@ impl Engine {
                 DdlUndo::IndexRenamed { slot, .. } => {
                     self.storage.commit_index_rename(*slot as usize, txn.txid)
                 }
+                DdlUndo::IndexAltered { slot, .. } => self
+                    .storage
+                    .commit_index_definition(*slot as usize, txn.txid),
+                DdlUndo::TablespaceCreated(slot) => {
+                    self.storage.commit_tablespace_create(*slot as usize)
+                }
+                DdlUndo::TablespaceAltered { slot, .. } => self
+                    .storage
+                    .commit_tablespace_alter(*slot as usize, txn.txid),
+                DdlUndo::TablespaceDropped(slot) => {
+                    self.storage.commit_tablespace_drop(*slot as usize)
+                }
                 // The reset already happened in place; committing keeps it.
                 DdlUndo::SequenceReset { .. } | DdlUndo::OwnedSequenceReset { .. } => {}
                 DdlUndo::SchemaCreated(slot) => {
@@ -3576,6 +3592,28 @@ impl Engine {
             }
             DdlUndo::IndexRenamed { slot, prior } => {
                 self.storage.rollback_index_rename(slot as usize, prior)
+            }
+            DdlUndo::IndexAltered { slot, prior } => {
+                self.storage.rollback_index_definition(slot as usize, prior)
+            }
+            DdlUndo::TablespaceCreated(slot) => {
+                self.storage.rollback_tablespace_create(slot as usize)
+            }
+            DdlUndo::TablespaceAltered {
+                slot,
+                prior_definition,
+                prior_owner,
+            } => {
+                let object = crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Tablespace,
+                    slot: slot as u16,
+                };
+                self.storage
+                    .rollback_tablespace_alter(slot as usize, prior_definition);
+                self.storage.restore_object_owner(object, prior_owner);
+            }
+            DdlUndo::TablespaceDropped(slot) => {
+                self.storage.rollback_tablespace_drop(slot as usize, txid)
             }
             DdlUndo::SequenceReset {
                 table,
@@ -7174,27 +7212,45 @@ impl Engine {
             Stmt::CreateIndex {
                 name,
                 table,
+                build,
+                scope,
+                if_not_exists,
                 columns,
                 include_columns,
                 nulls_not_distinct,
                 predicate,
                 predicate_text,
+                options,
+                tablespace,
                 unique,
-            } => exec::create_index(
-                &mut self.storage,
-                &mut self.wal,
-                txn,
-                name,
-                table,
-                columns,
-                include_columns,
-                *nulls_not_distinct,
-                *predicate,
-                *predicate_text,
-                arena,
-                *unique,
-                responder,
-            ),
+            } => {
+                let default_tablespace = guc.default_tablespace();
+                exec::create_index(
+                    &mut self.storage,
+                    &mut self.wal,
+                    txn,
+                    exec::CreateIndexCommand {
+                        name: *name,
+                        table: *table,
+                        build: *build,
+                        scope: *scope,
+                        if_not_exists: *if_not_exists,
+                        columns,
+                        include_columns,
+                        nulls_not_distinct: *nulls_not_distinct,
+                        predicate: *predicate,
+                        predicate_text: *predicate_text,
+                        options: *options,
+                        tablespace: (*tablespace).or_else(|| {
+                            (!default_tablespace.as_str().is_empty())
+                                .then_some(default_tablespace.as_str())
+                        }),
+                        unique: *unique,
+                    },
+                    arena,
+                    responder,
+                )
+            }
             Stmt::AlterIndex {
                 name,
                 if_exists,
@@ -7208,24 +7264,84 @@ impl Engine {
                 *action,
                 responder,
             ),
-            Stmt::DropIndex { names, if_exists } => exec::drop_index(
+            Stmt::AlterIndexesTablespace {
+                source,
+                owners,
+                target,
+                nowait,
+            } => exec::alter_indexes_tablespace(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
+                exec::AlterIndexesTablespaceCommand {
+                    source,
+                    owners,
+                    target,
+                    nowait: *nowait,
+                },
+                responder,
+            ),
+            Stmt::DropIndex {
                 names,
-                *if_exists,
+                if_exists,
+                build,
+                cascade,
+            } => exec::drop_index(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                exec::DropIndexCommand {
+                    names,
+                    if_exists: *if_exists,
+                    build: *build,
+                    cascade: *cascade,
+                },
                 responder,
             ),
             Stmt::Reindex {
                 target,
                 name,
-                concurrently,
+                options,
             } => exec::reindex(
                 &mut self.storage,
+                &mut self.wal,
                 txn,
                 *target,
+                *name,
+                *options,
+                responder,
+            ),
+            Stmt::CreateTablespace {
                 name,
-                *concurrently,
+                owner,
+                location,
+                options,
+            } => exec::create_tablespace(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                exec::CreateTablespaceCommand {
+                    name,
+                    owner: *owner,
+                    location,
+                    options: *options,
+                },
+                responder,
+            ),
+            Stmt::AlterTablespace { name, action } => exec::alter_tablespace(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *action,
+                responder,
+            ),
+            Stmt::DropTablespace { name, if_exists } => exec::drop_tablespace(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *if_exists,
                 responder,
             ),
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
@@ -7944,6 +8060,21 @@ impl Engine {
                 }
                 match guc.set(name, value, *local) {
                     Ok(()) => {
+                        if name.eq_ignore_ascii_case("default_tablespace") {
+                            let tablespace = guc.default_tablespace();
+                            let name = tablespace.as_str();
+                            if !name.is_empty()
+                                && !name.eq_ignore_ascii_case("pg_default")
+                                && !name.eq_ignore_ascii_case("pg_global")
+                                && self.storage.tablespace_slot(name, txn.txid).is_none()
+                            {
+                                return Ok(Err(sql_err!(
+                                    sqlstate::INVALID_PARAMETER_VALUE,
+                                    "invalid value for parameter \"default_tablespace\": \"{}\": tablespace does not exist",
+                                    name
+                                )));
+                            }
+                        }
                         responder.command_complete("SET")?;
                         Ok(Ok(()))
                     }
@@ -8489,20 +8620,30 @@ fn requalify_schema_element<'a>(
         ast::CreateSchemaElement::Index {
             name,
             table,
+            build,
+            scope,
+            if_not_exists,
             columns,
             include_columns,
             nulls_not_distinct,
             predicate,
             predicate_text,
+            options,
+            tablespace,
             unique,
         } => Stmt::CreateIndex {
-            name,
+            name: *name,
             table: requalify(*table)?,
+            build: *build,
+            scope: *scope,
+            if_not_exists: *if_not_exists,
             columns,
             include_columns,
             nulls_not_distinct: *nulls_not_distinct,
             predicate: *predicate,
             predicate_text: *predicate_text,
+            options: *options,
+            tablespace: *tablespace,
             unique: *unique,
         },
         ast::CreateSchemaElement::Sequence {
@@ -9691,11 +9832,15 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             )?;
         }
         WalOp::CreateIndex {
+            created_at,
             schema,
             name,
             table,
             columns,
             include_columns,
+            collations,
+            explicit_collations,
+            operator_classes,
             descending,
             nulls_first,
             n_cols,
@@ -9704,6 +9849,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             predicate,
             expressions,
             unique,
+            definition,
         } => {
             let mut stored_expressions = [None; crate::storage::MAX_INDEX_COLS];
             for (index, expression) in expressions.into_iter().enumerate() {
@@ -9713,6 +9859,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             }
             let slot = storage.create_index(
                 crate::storage::IndexDef {
+                    created_at,
                     schema: crate::storage::SqlName::parse(schema)?,
                     name: crate::storage::SqlName::parse(name)?,
                     pending_name: None,
@@ -9721,6 +9868,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     columns,
                     expressions: stored_expressions,
                     include_columns,
+                    collations,
+                    explicit_collations,
+                    operator_classes,
                     descending,
                     nulls_first,
                     n_cols,
@@ -9730,11 +9880,92 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                         .map(crate::storage::index_predicate_stackstr)
                         .transpose()?,
                     unique,
+                    mutable: definition,
+                    pending_definition: None,
                     ddl_state: crate::storage::CatalogDdlState::Present,
                 },
                 0,
             )?;
             storage.commit_index_create(slot);
+        }
+        WalOp::AlterIndexDefinition {
+            schema,
+            name,
+            definition,
+        } => {
+            let slot = storage.index_slot(schema, name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "index \"{}\" for WAL definition change does not exist",
+                    name
+                )
+            })?;
+            storage.alter_index_definition(slot, definition, 0)?;
+            storage.commit_index_definition(slot, 0);
+        }
+        WalOp::CreateTablespace {
+            created_at,
+            name,
+            location,
+            options,
+            owner,
+        } => {
+            let location = crate::util::StackStr::from_str(location);
+            if location.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "tablespace location is too long"
+                ));
+            }
+            let slot = storage.create_tablespace(
+                created_at,
+                crate::storage::SqlName::parse(name)?,
+                location,
+                options,
+                owner,
+                0,
+            )?;
+            storage.commit_tablespace_create(slot);
+        }
+        WalOp::AlterTablespace {
+            name,
+            new_name,
+            options,
+            owner,
+        } => {
+            let slot = storage.tablespace_slot(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "tablespace \"{}\" does not exist",
+                    name
+                )
+            })?;
+            storage.alter_tablespace_definition(
+                slot,
+                crate::storage::SqlName::parse(new_name)?,
+                options,
+                0,
+            )?;
+            storage.set_object_owner(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Tablespace,
+                    slot: slot as u16,
+                },
+                usize::from(owner),
+                0,
+            );
+            storage.commit_tablespace_alter(slot, 0);
+        }
+        WalOp::DropTablespace { name } => {
+            let slot = storage.tablespace_slot(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "tablespace \"{}\" does not exist",
+                    name
+                )
+            })?;
+            storage.drop_tablespace(slot, 0)?;
+            storage.commit_tablespace_drop(slot);
         }
         WalOp::DropIndex { schema, name } => {
             if let Some(slot) = storage.drop_index(schema, name, 0)? {

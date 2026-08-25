@@ -126,13 +126,18 @@ pub enum CreateSchemaElement<'a> {
         sql: &'a str,
     },
     Index {
-        name: &'a str,
+        name: Option<&'a str>,
         table: QualName<'a>,
+        build: IndexBuildMode,
+        scope: IndexTargetScope,
+        if_not_exists: bool,
         columns: &'a [IndexColumn<'a>],
         include_columns: &'a [&'a str],
         nulls_not_distinct: bool,
         predicate: Option<&'a Expr<'a>>,
         predicate_text: Option<&'a str>,
+        options: IndexStorageOptions,
+        tablespace: Option<&'a str>,
         unique: bool,
     },
     Sequence {
@@ -455,10 +460,13 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
-    /// CREATE [UNIQUE] INDEX name ON table (col [ASC|DESC] [NULLS ...], ...).
+    /// CREATE INDEX with every syntax default resolved at the parse boundary.
     CreateIndex {
-        name: &'a str,
+        name: Option<&'a str>,
         table: QualName<'a>,
+        build: IndexBuildMode,
+        scope: IndexTargetScope,
+        if_not_exists: bool,
         columns: &'a [IndexColumn<'a>],
         /// Non-key covering columns. A distinct AST field makes it impossible
         /// for execution to accidentally use them for ordering or uniqueness.
@@ -472,6 +480,8 @@ pub enum Stmt<'a> {
         /// Exact source retained for WAL and checkpoints; it is parsed again
         /// only at the catalog boundary that evaluates a row.
         predicate_text: Option<&'a str>,
+        options: IndexStorageOptions,
+        tablespace: Option<&'a str>,
         unique: bool,
     },
     /// ALTER INDEX [IF EXISTS] name RENAME TO new_name.
@@ -480,17 +490,25 @@ pub enum Stmt<'a> {
         if_exists: bool,
         action: AlterIndexAction<'a>,
     },
-    /// DROP INDEX [IF EXISTS] name.
+    /// ALTER INDEX ALL IN TABLESPACE ... SET TABLESPACE ... .
+    AlterIndexesTablespace {
+        source: &'a str,
+        owners: &'a [&'a str],
+        target: &'a str,
+        nowait: bool,
+    },
+    /// DROP INDEX [CONCURRENTLY] [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
     DropIndex {
         names: &'a [QualName<'a>],
         if_exists: bool,
+        build: IndexBuildMode,
+        cascade: bool,
     },
-    /// REINDEX INDEX/TABLE name. The target kind is typed at parse time so an
-    /// executor cannot silently treat an index rebuild as a table rebuild.
+    /// REINDEX. Target class and options are complete typed parse states.
     Reindex {
         target: ReindexTarget,
-        name: QualName<'a>,
-        concurrently: bool,
+        name: Option<QualName<'a>>,
+        options: ReindexOptions<'a>,
     },
     /// SET [LOCAL] name {=|TO} value. `value` is the raw source text of the
     /// value (quotes included); the session GUC store validates and applies it.
@@ -561,6 +579,20 @@ pub enum Stmt<'a> {
         names: &'a [&'a str],
         if_exists: bool,
         cascade: bool,
+    },
+    CreateTablespace {
+        name: &'a str,
+        owner: Option<&'a str>,
+        location: &'a str,
+        options: TablespaceOptions,
+    },
+    AlterTablespace {
+        name: &'a str,
+        action: AlterTablespaceAction<'a>,
+    },
+    DropTablespace {
+        name: &'a str,
+        if_exists: bool,
     },
     /// DECLARE name [BINARY] [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR select.
     /// `sql` is the raw SELECT text, materialized at DECLARE.
@@ -686,6 +718,119 @@ pub struct CompositeField<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlterIndexAction<'a> {
     Rename(&'a str),
+    SetTablespace(&'a str),
+    SetOptions(IndexStorageOptions),
+    ResetOptions(IndexStorageOptionNames),
+    SetStatistics { column: u16, target: i16 },
+    AttachPartition(QualName<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TablespaceCost(u64);
+
+impl TablespaceCost {
+    pub fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && value >= 0.0).then_some(Self(value.to_bits()))
+    }
+
+    pub fn from_bits(bits: u64) -> Option<Self> {
+        Self::new(f64::from_bits(bits))
+    }
+
+    pub fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub fn value(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TablespaceOptions {
+    pub random_page_cost: Option<TablespaceCost>,
+    pub seq_page_cost: Option<TablespaceCost>,
+    pub effective_io_concurrency: Option<i32>,
+    pub maintenance_io_concurrency: Option<i32>,
+}
+
+impl TablespaceOptions {
+    pub const DEFAULT: Self = Self {
+        random_page_cost: None,
+        seq_page_cost: None,
+        effective_io_concurrency: None,
+        maintenance_io_concurrency: None,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TablespaceOptionNames {
+    pub random_page_cost: bool,
+    pub seq_page_cost: bool,
+    pub effective_io_concurrency: bool,
+    pub maintenance_io_concurrency: bool,
+}
+
+impl TablespaceOptionNames {
+    pub const EMPTY: Self = Self {
+        random_page_cost: false,
+        seq_page_cost: false,
+        effective_io_concurrency: false,
+        maintenance_io_concurrency: false,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterTablespaceAction<'a> {
+    Rename(&'a str),
+    SetOwner(&'a str),
+    SetOptions(TablespaceOptions),
+    ResetOptions(TablespaceOptionNames),
+}
+
+/// PostgreSQL's blocking and concurrent index lifecycle paths have different
+/// transaction and lock contracts. They cannot be inferred from an optional
+/// keyword after parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexBuildMode {
+    Blocking,
+    Concurrent,
+}
+
+/// Whether CREATE INDEX recursively creates indexes for partitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexTargetScope {
+    Recurse,
+    Only,
+}
+
+/// B-tree relation options supported by every accepted index definition.
+/// `None` means PostgreSQL's default, not an executor-selected fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexStorageOptions {
+    pub fillfactor: Option<u8>,
+    pub deduplicate_items: Option<bool>,
+}
+
+impl IndexStorageOptions {
+    pub const DEFAULT: Self = Self {
+        fillfactor: None,
+        deduplicate_items: None,
+    };
+}
+
+/// ALTER INDEX RESET names. A bit is present only when the option was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexStorageOptionNames {
+    pub fillfactor: bool,
+    pub deduplicate_items: bool,
+}
+
+impl IndexStorageOptionNames {
+    pub const EMPTY: Self = Self {
+        fillfactor: false,
+        deduplicate_items: false,
+    };
 }
 
 /// Row-change operations a publication emits through logical replication.
@@ -1067,6 +1212,7 @@ pub enum PrivilegeObjectKind {
     Table,
     Sequence,
     Schema,
+    Tablespace,
     Type,
     AllTablesInSchema,
     AllSequencesInSchema,
@@ -1171,6 +1317,8 @@ pub struct IndexColumn<'a> {
     pub column: Option<&'a str>,
     pub expression: &'a Expr<'a>,
     pub expression_text: &'a str,
+    pub collation: Option<Collation>,
+    pub operator_class: Option<QualName<'a>>,
     pub descending: bool,
     pub nulls_first: bool,
 }
@@ -1182,6 +1330,15 @@ pub enum ReindexTarget {
     Index,
     Table,
     Schema,
+    Database,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReindexOptions<'a> {
+    pub build: IndexBuildMode,
+    pub tablespace: Option<&'a str>,
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1234,6 +1391,8 @@ pub enum CommentTarget<'a> {
     },
     /// SCHEMA name.
     Schema(&'a str),
+    /// TABLESPACE name.
+    Tablespace(&'a str),
     /// TYPE name, or DOMAIN name when `domain_only` requires that kind.
     Type { name: &'a str, domain_only: bool },
 }

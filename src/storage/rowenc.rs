@@ -24,7 +24,9 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
                 unreachable!("record cannot be a stored column value")
             }
             Datum::CompositeText { text, .. } => 5 + text.len(),
-            Datum::Int2Vector(_) => unreachable!("int2vector cannot be a stored column value"),
+            Datum::Int2Vector(_) | Datum::OidVector(_) => {
+                unreachable!("catalog vectors cannot be stored column values")
+            }
             Datum::Regtype { name, .. } => 8 + name.len(),
             Datum::RegObject { name, .. } => 12 + name.len(),
             Datum::Null => 0,
@@ -91,7 +93,9 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[5..5 + text.len()].copy_from_slice(text.as_bytes());
                 take = 5 + text.len();
             }
-            Datum::Int2Vector(_) => unreachable!("int2vector cannot be a stored column value"),
+            Datum::Int2Vector(_) | Datum::OidVector(_) => {
+                unreachable!("catalog vectors cannot be stored column values")
+            }
             Datum::Regtype {
                 referenced_oid,
                 name,
@@ -337,7 +341,11 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             let length = bytes.get(8..12).ok_or_else(corrupt)?;
             Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
-        ColType::Void | ColType::Int2Vector | ColType::PgNodeTree | ColType::Record => {
+        ColType::Void
+        | ColType::Int2Vector
+        | ColType::OidVector
+        | ColType::PgNodeTree
+        | ColType::Record => {
             return Err(corrupt());
         }
         ColType::Composite(_) => {
@@ -386,6 +394,12 @@ pub(crate) fn decode<'a>(
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "int2vector cannot be decoded as a stored column"
+                ));
+            }
+            ColType::OidVector => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "oidvector cannot be decoded as a stored column"
                 ));
             }
             ColType::PgNodeTree => {

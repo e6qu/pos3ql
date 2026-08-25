@@ -2918,6 +2918,8 @@ impl<'a> Parser<'a> {
             PrivilegeObjectKind::Sequence
         } else if self.eat_ident("schema")? {
             PrivilegeObjectKind::Schema
+        } else if self.eat_ident("tablespace")? {
+            PrivilegeObjectKind::Tablespace
         } else if self.eat_ident("type")? || self.eat_ident("domain")? {
             PrivilegeObjectKind::Type
         } else {
@@ -2933,6 +2935,7 @@ impl<'a> Parser<'a> {
             names[count] = if matches!(
                 kind,
                 PrivilegeObjectKind::Schema
+                    | PrivilegeObjectKind::Tablespace
                     | PrivilegeObjectKind::AllTablesInSchema
                     | PrivilegeObjectKind::AllSequencesInSchema
                     | PrivilegeObjectKind::AllFunctionsInSchema
@@ -3062,13 +3065,60 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `REINDEX [ ( options ) ] { INDEX | TABLE } [ CONCURRENTLY ] name`.
-    /// The supported target is parsed before execution; unsupported global
-    /// target classes remain loud syntax errors instead of aliases.
+    /// `REINDEX [ ( options ) ] target [ CONCURRENTLY ] [ name ]`.
     fn reindex(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("reindex")?;
+        let mut build = IndexBuildMode::Blocking;
+        let mut saw_concurrently = false;
+        let mut tablespace = None;
+        let mut verbose = false;
+        let mut saw_verbose = false;
         if self.eat_op("(")? {
-            return Err(self.err_here("REINDEX options are not implemented"));
+            loop {
+                let option = self.any_ident("REINDEX option")?;
+                if option.eq_ignore_ascii_case("concurrently") {
+                    if core::mem::replace(&mut saw_concurrently, true) {
+                        return Err(self.err_here("REINDEX option specified more than once"));
+                    }
+                    let value = if self.peeked == Tok::Op(",") || self.peeked == Tok::Op(")") {
+                        true
+                    } else {
+                        let _ = self.eat_op("=")?;
+                        self.role_option_boolean()?
+                    };
+                    build = if value {
+                        IndexBuildMode::Concurrent
+                    } else {
+                        IndexBuildMode::Blocking
+                    };
+                } else if option.eq_ignore_ascii_case("verbose") {
+                    if core::mem::replace(&mut saw_verbose, true) {
+                        return Err(self.err_here("REINDEX option specified more than once"));
+                    }
+                    verbose = if self.peeked == Tok::Op(",") || self.peeked == Tok::Op(")") {
+                        true
+                    } else {
+                        let _ = self.eat_op("=")?;
+                        self.role_option_boolean()?
+                    };
+                } else if option.eq_ignore_ascii_case("tablespace") {
+                    if tablespace.is_some() {
+                        return Err(self.err_here("REINDEX option specified more than once"));
+                    }
+                    let _ = self.eat_op("=")?;
+                    tablespace = Some(self.any_ident("tablespace name")?);
+                } else {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(96, "unrecognized REINDEX option \"{}\"", option),
+                        sqlstate: sqlstate::SYNTAX_ERROR,
+                    });
+                }
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
         }
         let target = if self.eat_ident("index")? {
             ReindexTarget::Index
@@ -3076,14 +3126,36 @@ impl<'a> Parser<'a> {
             ReindexTarget::Table
         } else if self.eat_ident("schema")? {
             ReindexTarget::Schema
+        } else if self.eat_ident("database")? {
+            ReindexTarget::Database
+        } else if self.eat_ident("system")? {
+            ReindexTarget::System
         } else {
-            return Err(self.err_here("REINDEX supports INDEX, TABLE or SCHEMA"));
+            return Err(self.err_here("expected INDEX, TABLE, SCHEMA, DATABASE, or SYSTEM"));
         };
-        let concurrently = self.eat_ident("concurrently")?;
+        if self.eat_ident("concurrently")? {
+            if saw_concurrently {
+                return Err(self.err_here("CONCURRENTLY specified more than once"));
+            }
+            build = IndexBuildMode::Concurrent;
+        }
+        let name = if matches!(target, ReindexTarget::Database | ReindexTarget::System)
+            && matches!(self.peeked, Tok::Op(";") | Tok::Eof)
+        {
+            None
+        } else if matches!(target, ReindexTarget::Database | ReindexTarget::System) {
+            Some(QualName::bare(self.any_ident("database name")?))
+        } else {
+            Some(self.qual_name("reindex target")?)
+        };
         Ok(Stmt::Reindex {
             target,
-            name: self.qual_name("reindex target")?,
-            concurrently,
+            name,
+            options: ReindexOptions {
+                build,
+                tablespace,
+                verbose,
+            },
         })
     }
 
@@ -3338,6 +3410,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("index")? {
             return self.alter_index();
+        }
+        if self.eat_ident("tablespace")? {
+            return self.alter_tablespace();
         }
         if self.eat_ident("function")? {
             return self.alter_routine(crate::sql::ast::RoutineTargetKind::Function);
@@ -4373,6 +4448,8 @@ impl<'a> Parser<'a> {
             }
         } else if self.eat_ident("schema")? {
             CommentTarget::Schema(self.col_ident("schema name")?)
+        } else if self.eat_ident("tablespace")? {
+            CommentTarget::Tablespace(self.col_ident("tablespace name")?)
         } else if self.eat_ident("type")? {
             CommentTarget::Type {
                 name: self.comment_type_name()?,
@@ -4405,7 +4482,7 @@ impl<'a> Parser<'a> {
             }
         } else {
             return Err(self.err_here(
-                "COMMENT ON supports TABLE, VIEW, MATERIALIZED VIEW, INDEX, SEQUENCE, SCHEMA, TYPE, DOMAIN, or COLUMN",
+                "COMMENT ON supports TABLE, VIEW, MATERIALIZED VIEW, INDEX, SEQUENCE, SCHEMA, TABLESPACE, TYPE, DOMAIN, or COLUMN",
             ));
         };
         self.expect_ident("is")?;
@@ -5651,6 +5728,100 @@ mod tests {
                     action,
                     crate::sql::ast::AlterIndexAction::Rename("new_index")
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn index_and_tablespace_lifecycle_is_typed_without_allocation() {
+        with_parser(
+            "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS value_idx ON ONLY public.items \
+             (id DESC NULLS LAST, value COLLATE \"C\" text_ops) INCLUDE (payload) \
+             NULLS NOT DISTINCT WITH (fillfactor=80, deduplicate_items=off) \
+             TABLESPACE fast WHERE id > 0; \
+             ALTER INDEX value_idx ATTACH PARTITION value_idx_p0; \
+             REINDEX (VERBOSE, TABLESPACE fast, CONCURRENTLY) INDEX value_idx; \
+             DROP INDEX CONCURRENTLY IF EXISTS value_idx; \
+             CREATE TABLESPACE fast OWNER postgres LOCATION '/object-prefix/fast' \
+             WITH (random_page_cost=0, seq_page_cost=1e300, effective_io_concurrency=8); \
+             ALTER TABLESPACE fast RESET (random_page_cost, effective_io_concurrency); \
+             GRANT CREATE ON TABLESPACE fast TO PUBLIC; \
+             COMMENT ON TABLESPACE fast IS 'placement'; \
+             DROP TABLESPACE IF EXISTS fast",
+            |parser| {
+                let Some(Stmt::CreateIndex {
+                    build,
+                    scope,
+                    if_not_exists,
+                    columns,
+                    include_columns,
+                    nulls_not_distinct,
+                    options,
+                    tablespace,
+                    unique,
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("CREATE INDEX did not produce a typed index command")
+                };
+                assert_eq!(build, IndexBuildMode::Concurrent);
+                assert_eq!(scope, IndexTargetScope::Only);
+                assert!(if_not_exists && nulls_not_distinct && unique);
+                assert_eq!(columns.len(), 2);
+                assert_eq!(include_columns, ["payload"]);
+                assert_eq!(options.fillfactor, Some(80));
+                assert_eq!(tablespace, Some("fast"));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterIndex {
+                        action: AlterIndexAction::AttachPartition(_),
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Reindex { .. })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::DropIndex {
+                        build: IndexBuildMode::Concurrent,
+                        ..
+                    })
+                ));
+                let Some(Stmt::CreateTablespace { options, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("CREATE TABLESPACE did not produce typed options")
+                };
+                assert_eq!(options.random_page_cost.unwrap().value(), 0.0);
+                assert_eq!(options.seq_page_cost.unwrap().value(), 1e300);
+                assert_eq!(options.effective_io_concurrency, Some(8));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterTablespace {
+                        action: AlterTablespaceAction::ResetOptions(_),
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::GrantPrivileges { .. })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: CommentTarget::Tablespace("fast"),
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::DropTablespace {
+                        name: "fast",
+                        if_exists: true
+                    })
+                ));
+                assert!(parser.next_stmt().unwrap().is_none());
             },
         );
     }

@@ -2023,6 +2023,7 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
             raw: crate::sql::array::EMPTY,
         },
         ColType::Int2Vector => Datum::Int2Vector(&[]),
+        ColType::OidVector => Datum::OidVector(&[]),
         ColType::Float4 => Datum::Float4(0.0),
         ColType::Float8 => Datum::Float8(0.0),
         ColType::Date => Datum::Date(0),

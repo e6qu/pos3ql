@@ -37,6 +37,7 @@ const PG_NAMESPACE_OID: i32 = 2615;
 const PG_TYPE_OID: i32 = 1247;
 const PG_PROC_OID: i32 = 1255;
 const PG_COLLATION_OID: i32 = 3456;
+const PG_TABLESPACE_OID: i32 = 1213;
 
 #[derive(Clone, Copy)]
 struct IntrinsicRoutine {
@@ -459,6 +460,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_foreign_server"
                 | "pg_partitioned_table"
                 | "pg_description"
+                | "pg_shdescription"
                 | "pg_seclabels"
                 | "pg_shseclabel"
                 | "pg_largeobject_metadata"
@@ -978,37 +980,11 @@ pub fn synthesize<'a>(
             arena,
         ),
         (false, "pg_depend") => pg_depend(storage, txid, arena),
-        (false, "pg_tablespace") => {
-            let def = def_of(
-                "pg_tablespace",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("spcname", ColType::Name),
-                    ("spcowner", ColType::Int4),
-                    ("spcacl", ColType::Array(super::types::ArrElem::Text)),
-                    ("spcoptions", ColType::Array(super::types::ArrElem::Text)),
-                ],
-            );
-            finish(
-                def,
-                &[row(
-                    &[
-                        Datum::Int4(1213),
-                        Datum::Int4(1663),
-                        text("pg_default", arena)?,
-                        Datum::Int4(10),
-                        Datum::Null,
-                        Datum::Null,
-                    ],
-                    arena,
-                )?],
-                arena,
-            )
-        }
+        (false, "pg_tablespace") => pg_tablespace(storage, txid, arena),
         (false, "pg_roles") => pg_roles(storage, txid, arena),
         (false, "pg_authid") => pg_authid(storage, txid, arena),
         (false, "pg_description") => pg_description(storage, txid, arena),
+        (false, "pg_shdescription") => pg_shdescription(storage, txid, arena),
         (false, "pg_seclabels") => finish(
             def_of(
                 "pg_seclabels",
@@ -1295,6 +1271,7 @@ fn acl<'a>(
         crate::storage::AccessClass::Index => crate::storage::PrivilegeSet::NONE,
         crate::storage::AccessClass::Routine => crate::storage::PrivilegeSet::FUNCTION_ALL,
         crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
+        crate::storage::AccessClass::Tablespace => crate::storage::PrivilegeSet::CREATE,
     };
     let render = |grantee: &str,
                   grantor: &str,
@@ -1578,9 +1555,15 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
 /// Index relations get OIDs from a separate range so they never collide with
 /// table OIDs; `pos` is the index's position within its table's index list.
 const FIRST_INDEX_OID: i32 = 90_000;
+const FIRST_EXPLICIT_INDEX_OID: i32 = 190_000;
 const MAX_INDEXES_PER_TABLE: i32 = 64;
 fn index_oid(slot: usize, pos: usize) -> i32 {
     FIRST_INDEX_OID + slot as i32 * MAX_INDEXES_PER_TABLE + pos as i32
+}
+
+fn explicit_index_oid(index: &crate::storage::IndexDef) -> i32 {
+    FIRST_EXPLICIT_INDEX_OID
+        + i32::try_from(index.created_at).unwrap_or(i32::MAX - FIRST_EXPLICIT_INDEX_OID)
 }
 
 /// Sequence relations get OIDs from their own range, above the index range.
@@ -1650,6 +1633,10 @@ struct IdxInfo {
     columns: [u16; crate::storage::MAX_INDEX_COLS],
     expression_keys: [bool; crate::storage::MAX_INDEX_COLS],
     include_columns: [u16; crate::storage::MAX_INDEX_COLS],
+    collations: [crate::sql::ast::Collation; crate::storage::MAX_INDEX_COLS],
+    explicit_collations: [bool; crate::storage::MAX_INDEX_COLS],
+    operator_classes:
+        [Option<crate::sql::types::BtreeOperatorClass>; crate::storage::MAX_INDEX_COLS],
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
@@ -1662,6 +1649,7 @@ struct IdxInfo {
     is_exclusion: bool,
     timing: crate::storage::ConstraintTiming,
     constraint_parent_oid: i32,
+    explicit_definition: Option<crate::storage::IndexMutableDefinition>,
 }
 
 fn parent_constraint_oid(
@@ -1758,6 +1746,9 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 columns: c,
                 expression_keys,
                 include_columns: included,
+                collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+                explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
+                operator_classes: [None; crate::storage::MAX_INDEX_COLS],
                 descending,
                 nulls_first,
                 n_cols: columns.len(),
@@ -1774,6 +1765,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 } else {
                     0
                 },
+                explicit_definition: None,
             };
             pos += 1;
             info
@@ -1857,7 +1849,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         }
         // Explicit CREATE INDEX on this table.
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
-            visit(mk(
+            let mut info = mk(
                 &index.columns[..index.n_cols],
                 index.expressions.map(|expression| expression.is_some()),
                 &index.include_columns[..index.n_include_cols],
@@ -1871,7 +1863,13 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 false,
                 crate::storage::ConstraintTiming::NotDeferrable,
                 stack_str_64(index.name_for(txid).as_str()),
-            ));
+            );
+            info.oid = explicit_index_oid(index);
+            info.collations = index.collations;
+            info.explicit_collations = index.explicit_collations;
+            info.operator_classes = index.operator_classes;
+            info.explicit_definition = Some(index.mutable_for(txid));
+            visit(info);
         }
     }
 }
@@ -1885,6 +1883,9 @@ fn empty_index() -> IdxInfo {
         columns: [0; crate::storage::MAX_INDEX_COLS],
         expression_keys: [false; crate::storage::MAX_INDEX_COLS],
         include_columns: [0; crate::storage::MAX_INDEX_COLS],
+        collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
+        explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
+        operator_classes: [None; crate::storage::MAX_INDEX_COLS],
         descending: [false; crate::storage::MAX_INDEX_COLS],
         nulls_first: [false; crate::storage::MAX_INDEX_COLS],
         n_cols: 0,
@@ -1897,6 +1898,7 @@ fn empty_index() -> IdxInfo {
         is_exclusion: false,
         timing: crate::storage::ConstraintTiming::NotDeferrable,
         constraint_parent_oid: 0,
+        explicit_definition: None,
     }
 }
 
@@ -2837,6 +2839,7 @@ fn pg_description<'a>(
                 Some(oid) => (oid, PG_TYPE_OID),
                 None => continue,
             },
+            crate::storage::CommentClass::Tablespace => continue,
         };
         out[n] = row(
             &[
@@ -2850,6 +2853,44 @@ fn pg_description<'a>(
         n += 1;
     }
     finish(def, &out[..n], arena)
+}
+
+fn pg_shdescription<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_shdescription",
+        &[
+            ("objoid", ColType::Int4),
+            ("classoid", ColType::Int4),
+            ("description", ColType::Text),
+        ],
+    );
+    let mut rows: [&[Datum]; crate::storage::MAX_COMMENTS] = [&[]; crate::storage::MAX_COMMENTS];
+    let mut count = 0;
+    for (class, _, name, subid, description) in storage.comments_visible(txid) {
+        if class != crate::storage::CommentClass::Tablespace || subid != 0 {
+            continue;
+        }
+        let Some((_, tablespace)) = storage
+            .tablespaces_visible_to(txid)
+            .find(|(_, tablespace)| tablespace.name_for(txid).as_str() == name)
+        else {
+            continue;
+        };
+        rows[count] = row(
+            &[
+                Datum::Int4(tablespace_oid(*tablespace)),
+                Datum::Int4(PG_TABLESPACE_OID),
+                text(description, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(def, &rows[..count], arena)
 }
 
 /// The `pg_class` OID of a relation named `name` in `schema`: an ordinary
@@ -3101,6 +3142,14 @@ pub fn comment_text_for<'a>(
                 class == crate::storage::CommentClass::Type
                     && subid == 0
                     && type_oid_of(storage, schema, name, txid) == Some(oid)
+            }
+            "pg_tablespace" => {
+                class == crate::storage::CommentClass::Tablespace
+                    && subid == 0
+                    && storage.tablespaces_visible_to(txid).any(|(_, tablespace)| {
+                        tablespace.name_for(txid).as_str() == name
+                            && tablespace_oid(*tablespace) == oid
+                    })
             }
             _ => {
                 class == crate::storage::CommentClass::Relation
@@ -3591,6 +3640,52 @@ fn fk_action_suffix(a: crate::storage::FkAction, event: &str) -> &'static str {
 }
 
 /// The complete `CREATE INDEX` statement returned by `pg_get_indexdef`.
+fn write_index_key_metadata(out: &mut impl core::fmt::Write, info: &IdxInfo, position: usize) {
+    if info.explicit_collations[position] {
+        let _ = out.write_str(" COLLATE ");
+        write_identifier(out, info.collations[position].name());
+    }
+}
+
+fn write_index_target(out: &mut impl core::fmt::Write, table: &TableDef, info: &IdxInfo) {
+    let _ = out.write_str(" ON ");
+    if info
+        .explicit_definition
+        .is_some_and(|definition| definition.kind.is_partitioned())
+    {
+        let _ = out.write_str("ONLY ");
+    }
+    write_identifier(out, table.schema.as_str());
+    let _ = out.write_char('.');
+    write_identifier(out, table.name.as_str());
+}
+
+fn write_index_storage_options(
+    out: &mut impl core::fmt::Write,
+    definition: Option<crate::storage::IndexMutableDefinition>,
+) {
+    let Some(definition) = definition else {
+        return;
+    };
+    if definition.options.fillfactor.is_none() && definition.options.deduplicate_items.is_none() {
+        return;
+    }
+    let _ = out.write_str(" WITH (");
+    let mut separator = "";
+    if let Some(fillfactor) = definition.options.fillfactor {
+        let _ = write!(out, "fillfactor='{fillfactor}'");
+        separator = ", ";
+    }
+    if let Some(deduplicate) = definition.options.deduplicate_items {
+        let _ = write!(
+            out,
+            "{separator}deduplicate_items={}",
+            if deduplicate { "on" } else { "off" }
+        );
+    }
+    let _ = out.write_str(")");
+}
+
 pub fn index_def_text<'a>(
     storage: &Storage,
     txid: u32,
@@ -3625,10 +3720,7 @@ pub fn index_def_text<'a>(
             if info.is_unique { "UNIQUE " } else { "" }
         );
         write_identifier(&mut s, info.name.as_str());
-        let _ = s.write_str(" ON ");
-        write_identifier(&mut s, def.schema.as_str());
-        let _ = s.write_char('.');
-        write_identifier(&mut s, def.name.as_str());
+        write_index_target(&mut s, def, info);
         let _ = s.write_str(if info.is_exclusion {
             " USING gist ("
         } else {
@@ -3643,6 +3735,7 @@ pub fn index_def_text<'a>(
             } else {
                 write_identifier(&mut s, col_name(k));
             }
+            write_index_key_metadata(&mut s, info, k);
             if info.descending[k] {
                 let _ = s.write_str(" DESC");
             }
@@ -3673,6 +3766,7 @@ pub fn index_def_text<'a>(
         if info.nulls_not_distinct {
             let _ = s.write_str(" NULLS NOT DISTINCT");
         }
+        write_index_storage_options(&mut s, info.explicit_definition);
         if let Some(predicate) = info.predicate {
             let _ = write!(s, " WHERE {}", predicate.as_str());
         }
@@ -4581,7 +4675,12 @@ fn pg_inherits<'a>(
     let indexes = collect_indexes(storage, txid, arena)?;
     let inherited_indexes = indexes
         .iter()
-        .filter(|index| index.constraint_parent_oid != 0)
+        .filter(|index| {
+            index.constraint_parent_oid != 0
+                || index
+                    .explicit_definition
+                    .is_some_and(|definition| definition.parent.is_some())
+        })
         .count();
     let rows = arena
         .alloc_slice_with(storage.table_count() + inherited_indexes, |_| {
@@ -4610,13 +4709,21 @@ fn pg_inherits<'a>(
         n += 1;
     }
     for index in indexes {
-        if index.constraint_parent_oid == 0 {
+        let parent_oid = if index.constraint_parent_oid != 0 {
+            index.constraint_parent_oid - 500_000
+        } else if let Some(parent) = index
+            .explicit_definition
+            .and_then(|definition| definition.parent)
+            .and_then(|slot| storage.index_visible_to(usize::from(slot), txid))
+        {
+            explicit_index_oid(&parent)
+        } else {
             continue;
-        }
+        };
         rows[n] = row(
             &[
                 Datum::Int4(index.oid),
-                Datum::Int4(index.constraint_parent_oid - 500_000),
+                Datum::Int4(parent_oid),
                 Datum::Int4(1),
                 Datum::Bool(false),
             ],
@@ -4896,8 +5003,18 @@ fn pg_class<'a>(
                     storage,
                     storage.table_def(info.table_slot, txid).schema.as_str(),
                 )),
-                text("i", arena)?, // relkind: index
-                Datum::Int4(info.n_cols as i32),
+                text(
+                    if info
+                        .explicit_definition
+                        .is_some_and(|definition| definition.kind.is_partitioned())
+                    {
+                        "I"
+                    } else {
+                        "i"
+                    },
+                    arena,
+                )?,
+                Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Float8(0.0),
                 Datum::Int4(0), // relpages
                 Datum::Int4(if info.is_exclusion { 783 } else { 403 }),
@@ -4913,8 +5030,13 @@ fn pg_class<'a>(
                 Datum::Bool(false),
                 Datum::Bool(false),
                 Datum::Bool(false),
-                Datum::Bool(false),
-                Datum::Int4(0),
+                Datum::Bool(
+                    info.explicit_definition
+                        .is_some_and(|definition| definition.parent.is_some()),
+                ),
+                Datum::Int4(info.explicit_definition.map_or(0, |definition| {
+                    catalog_tablespace_oid(storage, definition.tablespace, txid)
+                })),
                 Datum::Int4(0),
                 Datum::Int4(0),
                 text("p", arena)?,
@@ -4926,7 +5048,7 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Null,
+                index_reloptions(info.explicit_definition, arena)?,
                 Datum::Bool(true),
                 Datum::Null,
             ],
@@ -5065,6 +5187,168 @@ fn pg_class<'a>(
         n += 1;
     }
     finish(def, &out[..n], arena)
+}
+
+fn tablespace_oid(tablespace: crate::storage::TablespaceDef) -> i32 {
+    210_000 + i32::try_from(tablespace.created_at).unwrap_or(i32::MAX - 210_000)
+}
+
+fn catalog_tablespace_oid(storage: &Storage, id: u16, txid: u32) -> i32 {
+    match id {
+        0 => 0,
+        1 => 1664,
+        _ => storage.tablespace_by_id(id, txid).map_or(0, tablespace_oid),
+    }
+}
+
+fn tablespace_options<'a>(
+    options: crate::storage::TablespaceOptions,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; 4];
+    let mut count = 0;
+    let mut cost = |name: &str,
+                    value: Option<crate::sql::ast::TablespaceCost>|
+     -> Result<(), SqlError> {
+        if let Some(value) = value {
+            let rendered = stack_format!(64, "{name}={}", super::types::PgFloat8(value.value()));
+            values[count] = text(rendered.as_str(), arena)?;
+            count += 1;
+        }
+        Ok(())
+    };
+    cost("random_page_cost", options.random_page_cost)?;
+    cost("seq_page_cost", options.seq_page_cost)?;
+    for (name, value) in [
+        ("effective_io_concurrency", options.effective_io_concurrency),
+        (
+            "maintenance_io_concurrency",
+            options.maintenance_io_concurrency,
+        ),
+    ] {
+        if let Some(value) = value {
+            values[count] = text(stack_format!(64, "{name}={value}").as_str(), arena)?;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        Ok(Datum::Null)
+    } else {
+        Ok(Datum::Array {
+            element: super::types::ArrElem::Text,
+            raw: super::array::build(&values[..count], arena)?,
+        })
+    }
+}
+
+fn pg_tablespace<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_tablespace",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("spcname", ColType::Name),
+            ("spcowner", ColType::Int4),
+            ("spcacl", ColType::Array(super::types::ArrElem::Text)),
+            ("spcoptions", ColType::Array(super::types::ArrElem::Text)),
+        ],
+    );
+    let mut rows: [&[Datum]; crate::storage::MAX_TABLESPACES + 2] =
+        [&[]; crate::storage::MAX_TABLESPACES + 2];
+    for (position, (oid, name)) in [(1663, "pg_default"), (1664, "pg_global")]
+        .into_iter()
+        .enumerate()
+    {
+        rows[position] = row(
+            &[
+                Datum::Int4(1213),
+                Datum::Int4(oid),
+                text(name, arena)?,
+                Datum::Int4(10),
+                Datum::Null,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+    }
+    let mut count = 2;
+    for (slot, tablespace) in storage.tablespaces_visible_to(txid) {
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Tablespace,
+            slot: slot as u16,
+        };
+        rows[count] = row(
+            &[
+                Datum::Int4(1213),
+                Datum::Int4(tablespace_oid(*tablespace)),
+                text(tablespace.name_for(txid).as_str(), arena)?,
+                Datum::Int4(Storage::role_oid(storage.object_owner(object, txid))),
+                acl(storage, object, txid, arena)?,
+                tablespace_options(tablespace.options_for(txid), arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(def, &rows[..count], arena)
+}
+
+pub(crate) fn tablespace_location_by_oid<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    if oid == 1663 || oid == 1664 {
+        return Ok(Some(""));
+    }
+    for (_, tablespace) in storage.tablespaces_visible_to(txid) {
+        if tablespace_oid(*tablespace) == oid {
+            return arena
+                .alloc_str(tablespace.location.as_str())
+                .map(Some)
+                .map_err(|_| arena_full());
+        }
+    }
+    Ok(None)
+}
+
+fn index_reloptions<'a>(
+    definition: Option<crate::storage::IndexMutableDefinition>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let Some(definition) = definition else {
+        return Ok(Datum::Null);
+    };
+    let mut values = [Datum::Null; 2];
+    let mut count = 0;
+    if let Some(fillfactor) = definition.options.fillfactor {
+        values[count] = text(stack_format!(32, "fillfactor={fillfactor}").as_str(), arena)?;
+        count += 1;
+    }
+    if let Some(deduplicate) = definition.options.deduplicate_items {
+        values[count] = text(
+            if deduplicate {
+                "deduplicate_items=on"
+            } else {
+                "deduplicate_items=off"
+            },
+            arena,
+        )?;
+        count += 1;
+    }
+    if count == 0 {
+        Ok(Datum::Null)
+    } else {
+        Ok(Datum::Array {
+            element: super::types::ArrElem::Text,
+            raw: super::array::build(&values[..count], arena)?,
+        })
+    }
 }
 
 fn pg_constraint<'a>(
@@ -5730,6 +6014,7 @@ fn pg_index<'a>(
             ("indisprimary", ColType::Bool),
             ("indisunique", ColType::Bool),
             ("indisclustered", ColType::Bool),
+            ("indischeckxmin", ColType::Bool),
             ("indisvalid", ColType::Bool),
             ("indimmediate", ColType::Bool),
             ("indisreplident", ColType::Bool),
@@ -5740,9 +6025,10 @@ fn pg_index<'a>(
             ("indoption", ColType::Array(super::types::ArrElem::Int4)),
             ("indpred", ColType::Text),
             ("indisready", ColType::Bool),
+            ("indislive", ColType::Bool),
             ("indexprs", ColType::Text),
             ("indcollation", ColType::Array(super::types::ArrElem::Int4)),
-            ("indclass", ColType::Array(super::types::ArrElem::Int4)),
+            ("indclass", ColType::OidVector),
         ],
     );
     let indexes = collect_indexes(storage, txid, arena)?;
@@ -5753,7 +6039,6 @@ fn pg_index<'a>(
     for info in indexes {
         // indkey is the 1-based attribute numbers as an int2vector-like array;
         // indoption is one flag per column (0 = default ascending).
-        let zeros = [0u16; crate::storage::MAX_INDEX_COLS];
         let mut attributes = [0u16; crate::storage::MAX_INDEX_COLS * 2];
         attributes[..info.n_cols].copy_from_slice(&info.columns[..info.n_cols]);
         for (position, attribute) in attributes.iter_mut().enumerate().take(info.n_cols) {
@@ -5772,18 +6057,23 @@ fn pg_index<'a>(
                 Datum::Bool(info.is_primary),
                 Datum::Bool(info.is_unique),
                 Datum::Bool(false), // indisclustered
-                Datum::Bool(true),  // indisvalid
+                Datum::Bool(false), // indischeckxmin
+                Datum::Bool(
+                    info.explicit_definition
+                        .is_none_or(|definition| definition.kind.valid()),
+                ),
                 Datum::Bool(!info.timing.is_deferrable()),
                 Datum::Bool(false), // indisreplident
                 Datum::Bool(info.nulls_not_distinct),
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Int4(info.n_cols as i32),
                 int2vector(&attributes[..info.n_cols + info.n_include_cols], arena)?,
-                option_array(&zeros[..info.n_cols], arena)?,
+                index_options(info, arena)?,
                 match info.predicate {
                     Some(predicate) => text(predicate.as_str(), arena)?,
                     None => Datum::Null,
                 },
+                Datum::Bool(true),
                 Datum::Bool(true),
                 match (0..info.n_cols)
                     .find_map(|position| index_expression_source(storage, info, position, txid))
@@ -5792,7 +6082,7 @@ fn pg_index<'a>(
                     None => Datum::Null,
                 },
                 index_collations(storage, info, txid, arena)?,
-                empty_int_array(arena)?,
+                index_operator_classes(storage, info, txid, arena)?,
             ],
             arena,
         )?;
@@ -5802,14 +6092,16 @@ fn pg_index<'a>(
 }
 
 /// An index-option array (one 0-flag per column) for `pg_index.indoption`.
-fn option_array<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+fn index_options<'a>(info: &IdxInfo, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
     let mut vals = [Datum::Null; crate::storage::MAX_INDEX_COLS];
-    for (i, _) in columns.iter().enumerate() {
-        vals[i] = Datum::Int4(0);
+    for (position, value) in vals.iter_mut().enumerate().take(info.n_cols) {
+        *value = Datum::Int4(
+            i32::from(info.descending[position]) | (i32::from(info.nulls_first[position]) << 1),
+        );
     }
     Ok(Datum::Array {
         element: super::types::ArrElem::Int4,
-        raw: super::array::build(&vals[..columns.len()], arena)?,
+        raw: super::array::build(&vals[..info.n_cols], arena)?,
     })
 }
 
@@ -5822,7 +6114,9 @@ fn index_collations<'a>(
     let mut values = [Datum::Null; crate::storage::MAX_INDEX_COLS];
     let table = storage.table_def(info.table_slot, txid);
     for (position, value) in values.iter_mut().enumerate().take(info.n_cols) {
-        let collation = if info.expression_keys[position] {
+        let collation = if info.explicit_definition.is_some() {
+            info.collations[position]
+        } else if info.expression_keys[position] {
             let source = index_expression_source(storage, info, position, txid)
                 .expect("expression index has source");
             let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
@@ -5836,6 +6130,36 @@ fn index_collations<'a>(
         element: super::types::ArrElem::Int4,
         raw: super::array::build(&values[..info.n_cols], arena)?,
     })
+}
+
+fn index_operator_classes<'a>(
+    storage: &Storage,
+    info: &IdxInfo,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let table = storage.table_def(info.table_slot, txid);
+    let mut values = [0i32; crate::storage::MAX_INDEX_COLS];
+    for (position, value) in values.iter_mut().enumerate().take(info.n_cols) {
+        *value = if let Some(operator_class) = info.operator_classes[position] {
+            operator_class.oid()
+        } else if info.expression_keys[position] {
+            let source = index_expression_source(storage, info, position, txid)
+                .expect("expression index has source");
+            let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+            let (oid, _) = super::exec::infer_type_pub(expression, Some(table))?;
+            super::exec::catalog_column_type(storage, txid, oid)
+                .map(|(ctype, _)| ctype)
+                .and_then(crate::sql::types::BtreeOperatorClass::for_type)
+                .map_or(0, crate::sql::types::BtreeOperatorClass::oid)
+        } else {
+            crate::sql::types::BtreeOperatorClass::for_type(
+                table.columns()[info.columns[position] as usize].ctype,
+            )
+            .map_or(0, crate::sql::types::BtreeOperatorClass::oid)
+        };
+    }
+    oidvector(&values[..info.n_cols], arena)
 }
 
 /// Type and collation lookup for a stored table definition.  Catalog
@@ -5883,6 +6207,16 @@ fn int2vector<'a>(columns: &[u16], arena: &'a Arena) -> Result<Datum<'a>, SqlErr
         raw[index * 2..index * 2 + 2].copy_from_slice(&attribute_number.to_le_bytes());
     }
     Ok(Datum::Int2Vector(raw))
+}
+
+fn oidvector<'a>(oids: &[i32], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let raw = arena
+        .alloc_slice_with(oids.len() * 4, |_| 0u8)
+        .map_err(|_| arena_full())?;
+    for (index, oid) in oids.iter().enumerate() {
+        raw[index * 4..index * 4 + 4].copy_from_slice(&oid.to_le_bytes());
+    }
+    Ok(Datum::OidVector(raw))
 }
 
 fn catalog_column_type_oid(
@@ -6057,39 +6391,75 @@ fn pg_attribute<'a>(
     let indexes = collect_indexes(storage, txid, arena)?;
     for info in indexes {
         let table = storage.table_def(info.table_slot, txid);
-        for (attribute, &column_index) in info.columns[..info.n_cols].iter().enumerate() {
+        for attribute in 0..info.n_cols + info.n_include_cols {
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attribute"));
             }
-            let column = &table.columns()[column_index as usize];
-            out[n] = row(
-                &[
-                    Datum::Int4(info.oid),
-                    text(column.name.as_str(), arena)?,
-                    Datum::Int4(catalog_column_type_oid(storage, column, txid)?),
-                    Datum::Int4(attribute as i32 + 1),
-                    Datum::Bool(false),
-                    Datum::Int4(i32::from(column.ctype.typlen())),
-                    Datum::Int4(column.type_mod),
-                    Datum::Bool(false),
-                    Datum::Int4(0),
-                    text("", arena)?,
-                    text("", arena)?,
-                    text(if column.ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
-                    text("", arena)?,
-                    Datum::Int4(-1),
-                    Datum::Bool(false),
-                    Datum::Int4(attribute as i32 + 1),
-                    text("i", arena)?,
-                    Datum::Bool(true),
-                    Datum::Null,
-                    Datum::Null,
-                    Datum::Bool(false),
-                    Datum::Null,
-                    Datum::Null,
-                ],
-                arena,
-            )?;
+            let expression = (attribute < info.n_cols && info.expression_keys[attribute])
+                .then(|| index_expression_source(storage, info, attribute, txid))
+                .flatten();
+            let (name, ctype, type_oid, type_mod, collation) = if let Some(source) = expression {
+                let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
+                let expression = crate::sql::parser::parse_expr(source, arena)?;
+                let (type_oid, type_mod) = super::exec::infer_type_pub(expression, Some(table))?;
+                let ctype = ColType::from_oid(type_oid).unwrap_or(ColType::Text);
+                (
+                    super::exec::derived_name(expression),
+                    ctype,
+                    type_oid,
+                    i32::from(type_mod),
+                    info.collations[attribute],
+                )
+            } else {
+                let column_index = if attribute < info.n_cols {
+                    info.columns[attribute]
+                } else {
+                    info.include_columns[attribute - info.n_cols]
+                };
+                let column = &table.columns()[column_index as usize];
+                (
+                    column.name.as_str(),
+                    column.ctype,
+                    catalog_column_type_oid(storage, column, txid)?,
+                    column.type_mod,
+                    column.collation,
+                )
+            };
+            out[n] =
+                row(
+                    &[
+                        Datum::Int4(info.oid),
+                        text(name, arena)?,
+                        Datum::Int4(type_oid),
+                        Datum::Int4(attribute as i32 + 1),
+                        Datum::Bool(false),
+                        Datum::Int4(i32::from(ctype.typlen())),
+                        Datum::Int4(type_mod),
+                        Datum::Bool(false),
+                        Datum::Int4(collation.oid()),
+                        text("", arena)?,
+                        text("", arena)?,
+                        text(if ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
+                        text("", arena)?,
+                        if expression.is_some() {
+                            Datum::Int4(info.explicit_definition.map_or(-1, |definition| {
+                                i32::from(definition.statistics[attribute])
+                            }))
+                        } else {
+                            Datum::Null
+                        },
+                        Datum::Bool(false),
+                        Datum::Int4(attribute as i32 + 1),
+                        text("i", arena)?,
+                        Datum::Bool(true),
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Bool(false),
+                        Datum::Null,
+                        Datum::Null,
+                    ],
+                    arena,
+                )?;
             n += 1;
         }
     }
@@ -6608,6 +6978,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Bool,
         ColType::Int2,
         ColType::Int2Vector,
+        ColType::OidVector,
         ColType::Int4,
         ColType::Oid,
         ColType::Regtype,
@@ -7223,10 +7594,7 @@ fn pg_indexes<'a>(
                 if info.is_unique { "UNIQUE " } else { "" },
             );
             write_identifier(&mut indexdef, info.name.as_str());
-            let _ = indexdef.write_str(" ON ");
-            write_identifier(&mut indexdef, table_def.schema.as_str());
-            let _ = indexdef.write_char('.');
-            write_identifier(&mut indexdef, table_def.name.as_str());
+            write_index_target(&mut indexdef, table_def, info);
             let _ = indexdef.write_str(if info.is_exclusion {
                 " USING gist ("
             } else {
@@ -7244,6 +7612,7 @@ fn pg_indexes<'a>(
                         table_def.columns()[info.columns[k] as usize].name.as_str(),
                     );
                 }
+                write_index_key_metadata(&mut indexdef, info, k);
                 if info.descending[k] {
                     let _ = indexdef.write_str(" DESC");
                 }
@@ -7274,6 +7643,7 @@ fn pg_indexes<'a>(
             if info.nulls_not_distinct {
                 let _ = indexdef.write_str(" NULLS NOT DISTINCT");
             }
+            write_index_storage_options(&mut indexdef, info.explicit_definition);
             if let Some(predicate) = info.predicate {
                 let _ = write!(indexdef, " WHERE {}", predicate.as_str());
             }
@@ -7293,7 +7663,14 @@ fn pg_indexes<'a>(
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
-                Datum::Null,
+                match info.explicit_definition.and_then(|definition| {
+                    (definition.tablespace != 0)
+                        .then(|| storage.tablespace_name(definition.tablespace, txid))
+                        .flatten()
+                }) {
+                    Some(name) => text(name.as_str(), arena)?,
+                    None => Datum::Null,
+                },
                 text(
                     alloc_rendered(&indexdef, "index definition is too long", arena)?,
                     arena,

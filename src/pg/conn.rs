@@ -3913,6 +3913,7 @@ pub(crate) fn decode_binary_param<'a>(
             Some(
                 ctype @ (crate::sql::types::ColType::Array(_)
                 | crate::sql::types::ColType::Int2Vector
+                | crate::sql::types::ColType::OidVector
                 | crate::sql::types::ColType::Range(_)
                 | crate::sql::types::ColType::Multirange(_)
                 | crate::sql::types::ColType::Bit { .. }),
@@ -4197,6 +4198,25 @@ mod tests {
             decode_binary_param(crate::sql::types::oid::INT2VECTOR, &bytes, &arena)
                 .expect("int2vector decodes"),
             Datum::Int2Vector(&[1, 0, 2, 0])
+        );
+    }
+
+    #[test]
+    fn binary_oidvector_uses_postgresql_array_representation() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "binary oidvector test", 64).expect("test arena");
+        let bytes = [
+            0, 0, 0, 1, // dimensions
+            0, 0, 0, 0, // no nulls
+            0, 0, 0, 26, // oid element OID
+            0, 0, 0, 1, // length
+            0, 0, 0, 0, // lower bound
+            0, 0, 0, 4, 0, 0, 12, 54, // element
+        ];
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::OIDVECTOR, &bytes, &arena)
+                .expect("oidvector decodes"),
+            Datum::OidVector(&[54, 12, 0, 0])
         );
     }
 

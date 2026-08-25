@@ -291,6 +291,17 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingIndexName>,
     },
+    IndexAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingIndexDefinition>,
+    },
+    TablespaceCreated(u32),
+    TablespaceAltered {
+        slot: u32,
+        prior_definition: Option<crate::storage::PendingTablespaceDefinition>,
+        prior_owner: Option<crate::storage::PendingOwnership>,
+    },
+    TablespaceDropped(u32),
     /// TRUNCATE ... RESTART IDENTITY reset one column's sequence — undo by
     /// restoring the prior counter. (A plain advance is *not* undone: a
     /// rolled-back insert still consumes its number, as PostgreSQL has it.)

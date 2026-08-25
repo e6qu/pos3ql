@@ -7650,8 +7650,8 @@ fn session_gucs_honored_or_rejected_faithfully() {
         "unsupported XML mode"
     );
     assert!(
-        run("SET default_tablespace = fast").contains("0A000"),
-        "unsupported tablespace"
+        run("SET default_tablespace = fast").contains("22023"),
+        "missing tablespace"
     );
     assert!(
         run("SET default_table_access_method = columnar").contains("0A000"),
@@ -11006,7 +11006,7 @@ fn named_timezone_dst_rendering() {
 fn commit_makes_writes_visible_and_durable() {
     std::thread::Builder::new()
         .name("transaction-durability".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(commit_makes_writes_visible_and_durable_on_sized_stack)
         .expect("transaction durability test thread starts")
         .join()
@@ -25671,7 +25671,7 @@ fn reindex_rebuilds_named_index_and_table_cache() {
         &mut budget,
         "REINDEX INDEX CONCURRENTLY reindex_value",
     );
-    assert!(String::from_utf8_lossy(&concurrent).contains("0A000"));
+    assert!(String::from_utf8_lossy(&concurrent).contains("REINDEX"));
     let missing = run_with(
         &mut engine,
         &mut budget,
@@ -28533,15 +28533,15 @@ fn alter_index_rename_is_transactional_durable_and_typed() {
         "IF EXISTS must complete with a notice: {}",
         String::from_utf8_lossy(&missing)
     );
-    let unsupported = run_with(
+    let missing_tablespace = run_with(
         &mut engine,
         &mut budget,
         "ALTER INDEX index_rename_new SET TABLESPACE elsewhere",
     );
     assert!(
-        String::from_utf8_lossy(&unsupported).contains("0A000"),
-        "an unimplemented form must be rejected: {}",
-        String::from_utf8_lossy(&unsupported)
+        String::from_utf8_lossy(&missing_tablespace).contains("42704"),
+        "an absent tablespace must use PostgreSQL's undefined-object error: {}",
+        String::from_utf8_lossy(&missing_tablespace)
     );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
@@ -28563,6 +28563,314 @@ fn alter_index_rename_is_transactional_durable_and_typed() {
         )),
         ["renamed index comment"]
     );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
+    let mut config = test_config("index-lifecycle-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("index-lifecycle-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLESPACE lifecycle_discarded_space LOCATION '/object-prefix/discarded'",
+    );
+    let tablespace = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLESPACE lifecycle_space LOCATION '/object-prefix/lifecycle' \
+         WITH (random_page_cost = 2, effective_io_concurrency = 8)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&tablespace).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&tablespace)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT spcname FROM pg_tablespace WHERE spcname = 'lifecycle_space'",
+        )),
+        ["lifecycle_space"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLESPACE lifecycle_discarded_space",
+    );
+    let tablespace_contract = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE lifecycle_builder; \
+         GRANT CREATE ON TABLESPACE lifecycle_space TO lifecycle_builder; \
+         COMMENT ON TABLESPACE lifecycle_space IS 'index placement namespace'; \
+         SET default_tablespace = lifecycle_space; \
+         CREATE TABLE lifecycle_default_rows (id integer, payload text); \
+         CREATE INDEX lifecycle_default_idx ON lifecycle_default_rows (payload); \
+         RESET default_tablespace",
+    );
+    assert!(
+        !String::from_utf8_lossy(&tablespace_contract).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&tablespace_contract)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE lifecycle_root (id integer, value text, payload text) PARTITION BY RANGE (id); \
+         CREATE TABLE lifecycle_low PARTITION OF lifecycle_root FOR VALUES FROM (0) TO (10); \
+         CREATE TABLE lifecycle_high PARTITION OF lifecycle_root FOR VALUES FROM (10) TO (20); \
+         INSERT INTO lifecycle_root VALUES (1, 'one', 'low'), (11, 'eleven', 'high')",
+    );
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX CONCURRENTLY lifecycle_value_idx ON lifecycle_root \
+           (id, value COLLATE \"C\" text_ops DESC NULLS LAST) INCLUDE (payload) \
+           WITH (fillfactor = 80, deduplicate_items = off) TABLESPACE lifecycle_space \
+           WHERE id >= 0",
+    );
+    assert!(
+        String::from_utf8_lossy(&created).contains("0A000"),
+        "partitioned concurrent create must fail exactly: {}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT spcname FROM pg_tablespace WHERE spcname = 'lifecycle_space'",
+        )),
+        ["lifecycle_space"]
+    );
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX lifecycle_value_idx ON lifecycle_root \
+           (id, value COLLATE \"C\" text_ops DESC NULLS LAST) INCLUDE (payload) \
+           WITH (fillfactor = 80, deduplicate_items = off) TABLESPACE lifecycle_space \
+           WHERE id >= 0",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "recursive index create failed: {}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relname, relkind, relispartition, reloptions \
+             FROM pg_class WHERE relname LIKE 'lifecycle_%_idx' OR relname = 'lifecycle_value_idx' \
+             ORDER BY relname; \
+             SELECT count(*) FROM pg_inherits child \
+             JOIN pg_class relation ON relation.oid = child.inhrelid \
+             WHERE relation.relkind IN ('i', 'I')",
+        )),
+        [
+            "lifecycle_default_idx|i|f|NULL",
+            "lifecycle_high_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_low_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_value_idx|I|f|{fillfactor=80,deduplicate_items=off}",
+            "2",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT tablespace.spcname, tablespace.spcoptions, \
+                    pg_tablespace_location(tablespace.oid) \
+             FROM pg_tablespace tablespace WHERE tablespace.spcname = 'lifecycle_space'; \
+             SELECT tablespace FROM pg_indexes WHERE indexname = 'lifecycle_value_idx'; \
+             SELECT tablespace FROM pg_indexes WHERE indexname = 'lifecycle_default_idx'; \
+             SELECT shobj_description(oid, 'pg_tablespace') FROM pg_tablespace \
+             WHERE spcname = 'lifecycle_space'; \
+             SELECT array_to_string(spcacl, ',') FROM pg_tablespace \
+             WHERE spcname = 'lifecycle_space'; \
+             SELECT count(*) FROM pg_shdescription description JOIN pg_tablespace tablespace \
+             ON tablespace.oid = description.objoid \
+             WHERE tablespace.spcname = 'lifecycle_space'",
+        )),
+        [
+            "lifecycle_space|{random_page_cost=2,effective_io_concurrency=8}|/object-prefix/lifecycle",
+            "lifecycle_space",
+            "lifecycle_space",
+            "index placement namespace",
+            "postgres=C/postgres,lifecycle_builder=C/postgres",
+            "1",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; ALTER TABLESPACE lifecycle_space SET \
+             (random_page_cost = 0, seq_page_cost = 1e300); \
+             SELECT spcoptions FROM pg_tablespace WHERE spcname = 'lifecycle_space'; \
+             ROLLBACK; SELECT spcoptions FROM pg_tablespace WHERE spcname = 'lifecycle_space'",
+        )),
+        [
+            "{random_page_cost=0,seq_page_cost=1e+300,effective_io_concurrency=8}",
+            "{random_page_cost=2,effective_io_concurrency=8}",
+        ]
+    );
+    let invalid_default = run_with(
+        &mut engine,
+        &mut budget,
+        "SET default_tablespace = missing_lifecycle_space",
+    );
+    assert!(String::from_utf8_lossy(&invalid_default).contains("22023"));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLESPACE lifecycle_space SET (seq_page_cost = 1.5); \
+         ALTER TABLESPACE lifecycle_space RENAME TO lifecycle_space_renamed",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'lifecycle_value_idx'; \
+             SELECT indisvalid, indisready, indislive, indcollation, indclass, indoption \
+             FROM pg_index WHERE indexrelid = 'lifecycle_value_idx'::regclass",
+        )),
+        [
+            "CREATE INDEX lifecycle_value_idx ON ONLY public.lifecycle_root USING btree (id, value COLLATE \"C\" DESC NULLS LAST) INCLUDE (payload) WITH (fillfactor='80', deduplicate_items=off) WHERE id >= 0",
+            "t|t|t|{0,950}|1978 3126|{0,1}",
+        ]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX lifecycle_expression_idx ON lifecycle_low ((lower(value))); \
+         ALTER INDEX lifecycle_expression_idx ALTER COLUMN 1 SET STATISTICS 77; \
+         ALTER INDEX lifecycle_expression_idx SET (fillfactor = 70, deduplicate_items = on)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attname, atttypid, attstattarget, attcollation FROM pg_attribute \
+             WHERE attrelid = 'lifecycle_expression_idx'::regclass AND attnum = 1; \
+             SELECT reloptions FROM pg_class WHERE oid = 'lifecycle_expression_idx'::regclass",
+        )),
+        ["lower|25|77|100", "{fillfactor=70,deduplicate_items=on}"]
+    );
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER INDEX lifecycle_expression_idx RESET (fillfactor, deduplicate_items); \
+         SELECT reloptions FROM pg_class WHERE oid = 'lifecycle_expression_idx'::regclass; \
+         ROLLBACK; SELECT reloptions FROM pg_class WHERE oid = 'lifecycle_expression_idx'::regclass",
+    );
+    assert_eq!(
+        data_rows(&rolled_back),
+        ["NULL", "{fillfactor=70,deduplicate_items=on}"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE INDEX lifecycle_only_idx ON ONLY lifecycle_root (id); \
+         CREATE INDEX lifecycle_only_low_idx ON lifecycle_low (id); \
+         CREATE INDEX lifecycle_only_high_idx ON lifecycle_high (id)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = 'lifecycle_only_idx'::regclass; \
+             ALTER INDEX lifecycle_only_idx ATTACH PARTITION lifecycle_only_low_idx; \
+             SELECT indisvalid FROM pg_index WHERE indexrelid = 'lifecycle_only_idx'::regclass; \
+             ALTER INDEX lifecycle_only_idx ATTACH PARTITION lifecycle_only_high_idx; \
+             SELECT indisvalid FROM pg_index WHERE indexrelid = 'lifecycle_only_idx'::regclass",
+        )),
+        ["f", "f", "t"]
+    );
+    let concurrent_transaction = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; REINDEX INDEX CONCURRENTLY lifecycle_expression_idx; ROLLBACK",
+    );
+    assert!(String::from_utf8_lossy(&concurrent_transaction).contains("25001"));
+    let attached_drop = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP INDEX lifecycle_only_low_idx",
+    );
+    assert!(String::from_utf8_lossy(&attached_drop).contains("2BP01"));
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 30);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT relname, relkind, relispartition, reloptions FROM pg_class \
+             WHERE relname IN ('lifecycle_value_idx', 'lifecycle_low_id_idx', \
+                               'lifecycle_high_id_idx', 'lifecycle_expression_idx') \
+             ORDER BY relname; \
+             SELECT attstattarget FROM pg_attribute \
+             WHERE attrelid = 'lifecycle_expression_idx'::regclass AND attnum = 1; \
+             SELECT spcname, spcoptions FROM pg_tablespace \
+             WHERE spcname = 'lifecycle_space_renamed'; \
+             SELECT shobj_description(oid, 'pg_tablespace') FROM pg_tablespace \
+             WHERE spcname = 'lifecycle_space_renamed'; \
+             SELECT array_to_string(spcacl, ',') FROM pg_tablespace \
+             WHERE spcname = 'lifecycle_space_renamed'",
+        )),
+        [
+            "lifecycle_expression_idx|i|f|{fillfactor=70,deduplicate_items=on}",
+            "lifecycle_high_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_low_id_idx|i|t|{fillfactor=80,deduplicate_items=off}",
+            "lifecycle_value_idx|I|f|{fillfactor=80,deduplicate_items=off}",
+            "77",
+            "lifecycle_space_renamed|{random_page_cost=2,seq_page_cost=1.5,effective_io_concurrency=8}",
+            "index placement namespace",
+            "postgres=C/postgres,lifecycle_builder=C/postgres",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT indisvalid FROM pg_index WHERE indexrelid = 'lifecycle_only_idx'::regclass; \
+             SELECT count(*) FROM pg_inherits inheritance \
+             JOIN pg_class parent ON parent.oid = inheritance.inhparent \
+             WHERE parent.relname = 'lifecycle_only_idx'",
+        )),
+        ["t", "2"]
+    );
+    run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "DROP INDEX lifecycle_value_idx",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT count(*) FROM pg_indexes WHERE indexname IN \
+             ('lifecycle_value_idx', 'lifecycle_low_id_idx', 'lifecycle_high_id_idx')",
+        )),
+        ["0"]
+    );
+    let dropped_tablespace = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "DROP INDEX lifecycle_default_idx; DROP TABLESPACE lifecycle_space_renamed",
+    );
+    assert!(String::from_utf8_lossy(&dropped_tablespace).contains("DROP TABLESPACE"));
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 

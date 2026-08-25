@@ -193,6 +193,12 @@ fn binary_value_len(value: &Datum) -> usize {
                 .saturating_add(usize::from(count != 0).saturating_mul(8))
                 .saturating_add(count.saturating_mul(6))
         }
+        Datum::OidVector(raw) => {
+            let count = raw.len() / 4;
+            12usize
+                .saturating_add(usize::from(count != 0).saturating_mul(8))
+                .saturating_add(count.saturating_mul(8))
+        }
         Datum::Array { element, raw } => {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
             let count = shape.element_count();
@@ -1047,6 +1053,22 @@ impl<'b> Responder<'b> {
                         for bytes in raw.chunks_exact(2) {
                             m.i32(2);
                             m.bytes(&i16::from_le_bytes([bytes[0], bytes[1]]).to_be_bytes());
+                        }
+                    });
+                }
+                Datum::OidVector(raw) => {
+                    let count = raw.len() / 4;
+                    m.field(|m| {
+                        m.i32(if count == 0 { 0 } else { 1 });
+                        m.i32(0);
+                        m.i32(crate::sql::types::oid::OID);
+                        if count > 0 {
+                            m.i32(count as i32);
+                            m.i32(0);
+                        }
+                        for bytes in raw.chunks_exact(4) {
+                            m.i32(4);
+                            m.bytes(&u32::from_le_bytes(bytes.try_into().unwrap()).to_be_bytes());
                         }
                     });
                 }

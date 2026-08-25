@@ -2468,11 +2468,79 @@ impl Checkpointer {
                             ))
                         })?;
                 }
+                Some("tsp") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let mut words = line.split_ascii_whitespace();
+                    if words.next() != Some("tsp") {
+                        return Err(CheckpointSetupError::Corrupt("tablespace tag"));
+                    }
+                    let slot: usize = parse_field(words.next(), "tablespace slot")?;
+                    let created_at: u64 = parse_field(words.next(), "tablespace sequence")?;
+                    let owner: u16 = parse_field(words.next(), "tablespace owner")?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("tablespace name missing"))?,
+                    )?;
+                    let location =
+                        decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "tablespace location missing",
+                        ))?)?;
+                    let random: u64 = parse_field(words.next(), "tablespace random cost")?;
+                    let sequential: u64 = parse_field(words.next(), "tablespace seq cost")?;
+                    let effective: i32 = parse_field(words.next(), "tablespace effective io")?;
+                    let maintenance: i32 = parse_field(words.next(), "tablespace maintenance io")?;
+                    if words.next().is_some() || created_at == 0 {
+                        return Err(CheckpointSetupError::Corrupt("invalid tablespace record"));
+                    }
+                    let location = crate::util::StackStr::from_str(&location);
+                    if location.is_truncated() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "tablespace location too long",
+                        ));
+                    }
+                    let cost = |bits| {
+                        if bits == u64::MAX {
+                            Ok(None)
+                        } else {
+                            crate::sql::ast::TablespaceCost::from_bits(bits)
+                                .map(Some)
+                                .ok_or(CheckpointSetupError::Corrupt("invalid tablespace cost"))
+                        }
+                    };
+                    storage
+                        .restore_tablespace(
+                            slot,
+                            created_at,
+                            sql_name(&name)?,
+                            location,
+                            crate::storage::TablespaceOptions {
+                                random_page_cost: cost(random)?,
+                                seq_page_cost: cost(sequential)?,
+                                effective_io_concurrency: (effective != i32::MIN)
+                                    .then_some(effective),
+                                maintenance_io_concurrency: (maintenance != i32::MIN)
+                                    .then_some(maintenance),
+                            },
+                            owner,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest tablespace rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                    storage.commit_tablespace_create(slot);
+                }
                 Some("idx") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let mut words = line.split_ascii_whitespace();
                     if words.next() != Some("idx") {
                         return Err(CheckpointSetupError::Corrupt("idx tag"));
+                    }
+                    let created_at: u64 = parse_field(words.next(), "idx catalog sequence")?;
+                    if created_at == 0 {
+                        return Err(CheckpointSetupError::Corrupt("bad index catalog sequence"));
                     }
                     let unique: u8 = parse_field(words.next(), "idx unique")?;
                     let n_cols: usize = parse_field(words.next(), "idx ncols")?;
@@ -2550,6 +2618,64 @@ impl Checkpointer {
                             );
                         }
                     }
+                    let collation_count: usize = parse_field(words.next(), "idx collation count")?;
+                    if collation_count != n_cols {
+                        return Err(CheckpointSetupError::Corrupt("bad index collation count"));
+                    }
+                    let mut collations =
+                        [crate::sql::ast::Collation::Default; crate::storage::MAX_INDEX_COLS];
+                    let mut explicit_collations = [false; crate::storage::MAX_INDEX_COLS];
+                    for position in 0..n_cols {
+                        let code: u8 = parse_field(words.next(), "idx collation")?;
+                        explicit_collations[position] = code & 0x80 != 0;
+                        collations[position] =
+                            crate::sql::ast::Collation::from_code(code & 0x7f)
+                                .ok_or(CheckpointSetupError::Corrupt("bad index collation"))?;
+                    }
+                    let mut operator_classes = [None; crate::storage::MAX_INDEX_COLS];
+                    for operator_class in operator_classes.iter_mut().take(n_cols) {
+                        let code: u8 = parse_field(words.next(), "idx operator class")?;
+                        *operator_class = if code == 0 {
+                            None
+                        } else {
+                            Some(
+                                crate::sql::types::BtreeOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt("bad index operator class"),
+                                )?,
+                            )
+                        };
+                    }
+                    let tablespace: u16 = parse_field(words.next(), "idx tablespace")?;
+                    let fillfactor = match parse_field(words.next(), "idx fillfactor")? {
+                        0 => None,
+                        value @ 10..=100 => Some(value),
+                        _ => return Err(CheckpointSetupError::Corrupt("bad index fillfactor")),
+                    };
+                    let deduplicate_items = match parse_field(words.next(), "idx deduplicate")? {
+                        0 => None,
+                        1 => Some(false),
+                        2 => Some(true),
+                        _ => return Err(CheckpointSetupError::Corrupt("bad index deduplicate")),
+                    };
+                    let statistics_count: usize =
+                        parse_field(words.next(), "idx statistics count")?;
+                    if statistics_count != n_cols {
+                        return Err(CheckpointSetupError::Corrupt("bad index statistics count"));
+                    }
+                    let mut statistics = [-1; crate::storage::MAX_INDEX_COLS];
+                    for statistic in statistics.iter_mut().take(n_cols) {
+                        *statistic = parse_field(words.next(), "idx statistics")?;
+                        if !(-1..=10_000).contains(statistic) {
+                            return Err(CheckpointSetupError::Corrupt("bad index statistics"));
+                        }
+                    }
+                    let parent: u16 = parse_field(words.next(), "idx parent")?;
+                    let kind = match parse_field(words.next(), "idx kind")? {
+                        0 => crate::storage::IndexKind::Ordinary,
+                        1 => crate::storage::IndexKind::Partitioned { valid: false },
+                        2 => crate::storage::IndexKind::Partitioned { valid: true },
+                        _ => return Err(CheckpointSetupError::Corrupt("bad index kind")),
+                    };
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
@@ -2565,6 +2691,7 @@ impl Checkpointer {
                     let slot = storage
                         .create_index(
                             crate::storage::IndexDef {
+                                created_at,
                                 schema: sql_name(&schema)?,
                                 name: sql_name(&name)?,
                                 pending_name: None,
@@ -2573,6 +2700,9 @@ impl Checkpointer {
                                 columns,
                                 expressions,
                                 include_columns,
+                                collations,
+                                explicit_collations,
+                                operator_classes,
                                 descending,
                                 nulls_first,
                                 n_cols,
@@ -2580,6 +2710,17 @@ impl Checkpointer {
                                 nulls_not_distinct,
                                 predicate,
                                 unique: unique != 0,
+                                mutable: crate::storage::IndexMutableDefinition {
+                                    tablespace,
+                                    options: crate::storage::IndexStorageOptions {
+                                        fillfactor,
+                                        deduplicate_items,
+                                    },
+                                    statistics,
+                                    parent: (parent != u16::MAX).then_some(parent),
+                                    kind,
+                                },
+                                pending_definition: None,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
                             },
                             0,
@@ -4327,9 +4468,38 @@ impl Checkpointer {
                 ),
             )?;
         }
-        // Indexes: `idx <unique> <ncols> <c0..cN> <hex-name> <hex-table>
-        // <hex-schema> <descending-mask> <nulls-first-mask> <hex-predicate|->
-        // <ninclude> <include-cols...> <nulls-not-distinct>`.
+        for (slot, tablespace) in storage.tablespaces_visible_to(0) {
+            use core::fmt::Write;
+            let mut name = StackStr::<130>::new();
+            let mut location = StackStr::<{ crate::storage::TABLESPACE_LOCATION_MAX * 2 }>::new();
+            for byte in tablespace.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            for byte in tablespace.location.as_str().as_bytes() {
+                let _ = write!(location, "{byte:02x}");
+            }
+            let options = tablespace.options;
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "tsp {} {} {} {} {} {} {} {} {}",
+                    slot,
+                    tablespace.created_at,
+                    tablespace.ownership.owner,
+                    name.as_str(),
+                    location.as_str(),
+                    options
+                        .random_page_cost
+                        .map_or(u64::MAX, crate::sql::ast::TablespaceCost::bits),
+                    options
+                        .seq_page_cost
+                        .map_or(u64::MAX, crate::sql::ast::TablespaceCost::bits),
+                    options.effective_io_concurrency.unwrap_or(i32::MIN),
+                    options.maintenance_io_concurrency.unwrap_or(i32::MIN),
+                ),
+            )?;
+        }
+        // Index definitions are complete catalog state, not a cache rebuild hint.
         for index in storage.live_indexes() {
             use core::fmt::Write;
             let mut columns = StackStr::<128>::new();
@@ -4383,10 +4553,39 @@ impl Checkpointer {
                     let _ = write!(encoded_expressions, "{byte:02x}");
                 }
             }
+            let mut collations = StackStr::<64>::new();
+            let mut operator_classes = StackStr::<128>::new();
+            let mut statistics = StackStr::<128>::new();
+            for position in 0..index.n_cols {
+                let code = index.collations[position].code()
+                    | (u8::from(index.explicit_collations[position]) << 7);
+                let _ = write!(collations, " {code}");
+                let _ = operator_classes.write_str(" ");
+                let _ = write!(
+                    operator_classes,
+                    "{}",
+                    index.operator_classes[position]
+                        .map_or(0, crate::sql::types::BtreeOperatorClass::code)
+                );
+                let _ = write!(statistics, " {}", index.mutable.statistics[position]);
+            }
+            let mutable = index.mutable;
+            let fillfactor = mutable.options.fillfactor.unwrap_or(0);
+            let deduplicate = match mutable.options.deduplicate_items {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            };
+            let kind = match mutable.kind {
+                crate::storage::IndexKind::Ordinary => 0,
+                crate::storage::IndexKind::Partitioned { valid: false } => 1,
+                crate::storage::IndexKind::Partitioned { valid: true } => 2,
+            };
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {}{} {} {} {} {} {} {} {} {} {}{}",
+                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{} {} {} {} {}{} {} {}",
+                    index.created_at,
                     u8::from(index.unique),
                     index.n_cols,
                     columns.as_str(),
@@ -4401,6 +4600,16 @@ impl Checkpointer {
                     u8::from(index.nulls_not_distinct),
                     expression_mask,
                     encoded_expressions.as_str(),
+                    index.n_cols,
+                    collations.as_str(),
+                    operator_classes.as_str(),
+                    mutable.tablespace,
+                    fillfactor,
+                    deduplicate,
+                    index.n_cols,
+                    statistics.as_str(),
+                    mutable.parent.unwrap_or(u16::MAX),
+                    kind,
                 ),
             )?;
         }

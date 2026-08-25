@@ -27,7 +27,7 @@ ALTER FOREIGN DATA WRAPPER	missing	-
 ALTER FOREIGN TABLE	missing	-
 ALTER FUNCTION	partial	90_routine_lifecycle.sql
 ALTER GROUP	partial	83_roles_acl.sql
-ALTER INDEX	partial	RENAME TO
+ALTER INDEX	partial	107_index_lifecycle.sql (all modeled forms; extension dependency remains outside the extension gap)
 ALTER LANGUAGE	missing	-
 ALTER LARGE OBJECT	missing	-
 ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql
@@ -47,7 +47,7 @@ ALTER STATISTICS	missing	-
 ALTER SUBSCRIPTION	partial	98_subscription.sql and subscription shard (definition, refresh, initial synchronization)
 ALTER SYSTEM	missing	-
 ALTER TABLE	partial	45_alter_column.sql
-ALTER TABLESPACE	missing	-
+ALTER TABLESPACE	partial	index lifecycle recovery test (provider-neutral placement metadata)
 ALTER TEXT SEARCH CONFIGURATION	missing	-
 ALTER TEXT SEARCH DICTIONARY	missing	-
 ALTER TEXT SEARCH PARSER	missing	-
@@ -80,7 +80,7 @@ CREATE FOREIGN DATA WRAPPER	missing	-
 CREATE FOREIGN TABLE	missing	-
 CREATE FUNCTION	partial	87_sql_routines.sql
 CREATE GROUP	partial	83_roles_acl.sql
-CREATE INDEX	partial	43_indexes.sql
+CREATE INDEX	partial	43_indexes.sql, 107_index_lifecycle.sql, and 108_index_operator_classes.sql
 CREATE LANGUAGE	missing	-
 CREATE MATERIALIZED VIEW	complete	53_materialized_view.sql
 CREATE OPERATOR	missing	-
@@ -98,7 +98,7 @@ CREATE STATISTICS	missing	-
 CREATE SUBSCRIPTION	partial	98_subscription.sql and subscription shard (disabled and managed initial synchronization)
 CREATE TABLE	partial	14_surface.sql
 CREATE TABLE AS	complete	52_create_table_as.sql
-CREATE TABLESPACE	missing	-
+CREATE TABLESPACE	partial	index lifecycle recovery test (provider-neutral placement metadata)
 CREATE TEXT SEARCH CONFIGURATION	missing	-
 CREATE TEXT SEARCH DICTIONARY	missing	-
 CREATE TEXT SEARCH PARSER	missing	-
@@ -146,7 +146,7 @@ DROP SERVER	missing	-
 DROP STATISTICS	missing	-
 DROP SUBSCRIPTION	partial	98_subscription.sql (durable disabled lifecycle)
 DROP TABLE	complete	14_surface.sql
-DROP TABLESPACE	missing	-
+DROP TABLESPACE	partial	index lifecycle recovery test (provider-neutral placement metadata)
 DROP TEXT SEARCH CONFIGURATION	missing	-
 DROP TEXT SEARCH DICTIONARY	missing	-
 DROP TEXT SEARCH PARSER	missing	-
@@ -174,7 +174,7 @@ PREPARE	complete	14_surface.sql
 PREPARE TRANSACTION	missing	-
 REASSIGN OWNED	complete	83_roles_acl.sql
 REFRESH MATERIALIZED VIEW	complete	53_materialized_view.sql
-REINDEX	partial	92_reindex.sql
+REINDEX	partial	92_reindex.sql and 107_index_lifecycle.sql
 RELEASE SAVEPOINT	complete	05_transactions.sql
 RESET	complete	75_guc_mutation.sql
 REVOKE	partial	83_roles_acl.sql

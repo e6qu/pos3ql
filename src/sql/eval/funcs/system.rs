@@ -780,6 +780,24 @@ pub(crate) fn dispatch<'a>(
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }
+            "shobj_description" => {
+                arity(2)?;
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                let catalog_name = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Text(name) => name,
+                    _ => return Ok(Datum::Null),
+                };
+                Ok(cat
+                    .comment(catalog_name, oid, 0, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
+            }
             "pg_get_expr" => {
                 if !(2..=3).contains(&args.len()) {
                     return Err(sql_err!(
@@ -841,8 +859,17 @@ pub(crate) fn dispatch<'a>(
             }
             "pg_tablespace_location" => {
                 arity(1)?;
-                let _ = eval_full(args[0], arena, params, row, hooks)?;
-                Ok(Datum::Text(""))
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                Ok(cat
+                    .tablespace_location(oid, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
             }
             "pg_tablespace_size" => {
                 arity(1)?;
@@ -857,7 +884,7 @@ pub(crate) fn dispatch<'a>(
                     _ => Ok(Datum::Null),
                 }
             }
-            "shobj_description" | "pg_get_statisticsobjdef_columns" => {
+            "pg_get_statisticsobjdef_columns" => {
                 // Definitions/comments we do not reconstruct render as empty/NULL,
                 // as PostgreSQL does for an absent comment.
                 Ok(Datum::Null)
@@ -1101,6 +1128,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Json { jsonb: true, .. } => "jsonb",
                     Datum::Array { element, .. } => element.typeof_name(),
                     Datum::Int2Vector(_) => "int2vector",
+                    Datum::OidVector(_) => "oidvector",
                     Datum::Uuid(_) => "uuid",
                     Datum::Bytea(_) => "bytea",
                     Datum::Numeric(_) => "numeric",

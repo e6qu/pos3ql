@@ -170,7 +170,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::RegObject { name, .. } => 12 + name.len(),
         Datum::Json { text, .. } => 5 + text.len(),
         Datum::Array { raw, .. } => 8 + raw.len(),
-        Datum::Int2Vector(raw) => 4 + raw.len(),
+        Datum::Int2Vector(raw) | Datum::OidVector(raw) => 4 + raw.len(),
         Datum::Bytea(b) => 4 + b.len(),
         Datum::Numeric(nm) => 7 + nm.digits.len(),
         Datum::Range { text, .. } => 5 + text.len(),
@@ -354,6 +354,12 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
         }
         Datum::Int2Vector(raw) => {
             out[0] = 29;
+            out[1..5].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+            out[5..5 + raw.len()].copy_from_slice(raw);
+            5 + raw.len()
+        }
+        Datum::OidVector(raw) => {
+            out[0] = 34;
             out[1..5].copy_from_slice(&(raw.len() as u32).to_le_bytes());
             out[5..5 + raw.len()].copy_from_slice(raw);
             5 + raw.len()
@@ -751,6 +757,10 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
         29 => {
             let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             (Datum::Int2Vector(&bytes[at + 4..at + 4 + len]), 4 + len)
+        }
+        34 => {
+            let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            (Datum::OidVector(&bytes[at + 4..at + 4 + len]), 4 + len)
         }
         32 => {
             let len = u32::from_le_bytes(bytes[at + 2..at + 6].try_into().unwrap()) as usize;

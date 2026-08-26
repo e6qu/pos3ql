@@ -108,6 +108,11 @@ SELECT '['||to_char('-Infinity'::float8, '999')||']';
 SELECT '['||to_char('NaN'::numeric, '999.9')||']';
 SELECT '['||to_char('NaN'::float8, 'RN')||']';
 SELECT '['||to_char('NaN'::numeric, '9V9')||']';
+
+-- to_number reads the format model positionally: skipped tokens cannot leak
+-- later digits into the value, and V scales the parsed numeric.
+SELECT to_number('12abc34', '99L99'), to_number('<123>', '999PR'),
+       to_number('123-', '999MI'), to_number('12', '9V9');
 -- parenthesized set-op branches with ORDER BY/LIMIT; bytea_output escape
 WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL (SELECT n+1 FROM r WHERE n < 3 LIMIT 1)) SELECT * FROM r;
 SELECT 1 UNION ALL (SELECT 2 LIMIT 1);

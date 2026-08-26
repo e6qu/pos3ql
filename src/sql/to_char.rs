@@ -10,7 +10,8 @@
 //! pinned empirically against PostgreSQL 18.4.
 
 use super::eval::SqlError;
-use super::numeric::{Numeric, RoundMode};
+use super::numeric::{self, Numeric, RoundMode};
+use super::types::Interval;
 use crate::mem::arena::Arena;
 use crate::sql::eval::sqlstate;
 use crate::util::StackStr;
@@ -1087,79 +1088,103 @@ fn render_nonfinite<'a>(
 /// decimal point are read from the input, ignoring group separators, currency,
 /// and spaces — matching PostgreSQL.
 pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric<'a>, SqlError> {
-    // Count fractional digit positions in the format; reject input-unsupported
-    // codes loudly.
-    let mut frac = 0usize;
-    let mut seen_point = false;
-    let fb = fmt.as_bytes();
-    let mut i = 0usize;
-    while i < fb.len() {
-        let up = fb[i].to_ascii_uppercase();
-        if i + 1 < fb.len() {
-            let two = [up, fb[i + 1].to_ascii_uppercase()];
-            if &two == b"EE" {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "\"EEEE\" not supported for input"
-                ));
-            }
-            if matches!(&two, b"FM" | b"MI" | b"PL" | b"SG" | b"PR" | b"TH") {
-                i += 2;
-                continue;
-            }
-        }
-        match up {
-            b'9' | b'0' => {
-                if seen_point {
-                    frac += 1;
-                }
-            }
-            b'.' | b'D' => seen_point = true,
-            b'V' => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "\"V\" not supported for input"
-                ));
-            }
-            b'R' => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "\"RN\" not supported for input"
-                ));
-            }
-            _ => {}
-        }
-        i += 1;
+    let model = NumberInputModel::parse(fmt)?;
+    if model.roman {
+        let value = roman_to_integer(input).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_TEXT_REPRESENTATION,
+                "invalid Roman numeral"
+            )
+        })?;
+        return Numeric::parse(stack_format!(16, "{value}").as_str(), arena);
     }
 
-    // Extract sign, digits, and a single decimal point from the input.
-    let mut buffer = [0u8; 512];
-    let mut k = 0usize;
-    let mut neg = false;
-    let mut dot = false;
+    let bytes = input.as_bytes();
+    let mut at = 0usize;
+    let mut out = [0u8; MAX_OUT];
+    let mut olen = 1usize;
     let mut digits = false;
-    buffer[k] = b' '; // placeholder for a sign slot
-    k += 1;
-    for &c in input.as_bytes() {
-        match c {
-            b'0'..=b'9' => {
-                if k >= buffer.len() {
-                    return Err(sql_err!(
-                        sqlstate::INVALID_TEXT_REPRESENTATION,
-                        "value too long for to_number"
-                    ));
+    let mut decimal = false;
+    let mut read_post = 0usize;
+    let mut negative = false;
+
+    for token in &model.tokens[..model.len] {
+        if at >= bytes.len() {
+            break;
+        }
+        match *token {
+            NumberInputToken::Digit | NumberInputToken::Decimal => {
+                if bytes[at] == b' ' {
+                    at += 1;
                 }
-                buffer[k] = c;
-                k += 1;
-                digits = true;
+                if at >= bytes.len() {
+                    break;
+                }
+                if !digits && matches!(bytes[at], b'+' | b'-' | b'<') {
+                    negative = matches!(bytes[at], b'-' | b'<');
+                    at += 1;
+                }
+                if at >= bytes.len() {
+                    break;
+                }
+                if bytes[at].is_ascii_digit() {
+                    if !decimal || read_post < model.post {
+                        if olen >= out.len() {
+                            return Err(sql_err!(
+                                sqlstate::INVALID_TEXT_REPRESENTATION,
+                                "value too long for to_number"
+                            ));
+                        }
+                        out[olen] = bytes[at];
+                        olen += 1;
+                        digits = true;
+                        if decimal {
+                            read_post += 1;
+                        }
+                    }
+                    at += 1;
+                } else if model.decimal && !decimal && bytes[at] == b'.' {
+                    out[olen] = b'.';
+                    olen += 1;
+                    decimal = true;
+                    at += 1;
+                }
+                if at < bytes.len() && matches!(bytes[at], b'+' | b'-') && model.positional_sign {
+                    negative = bytes[at] == b'-';
+                }
             }
-            b'.' if !dot => {
-                dot = true;
-                buffer[k] = b'.';
-                k += 1;
+            NumberInputToken::Comma => {
+                if bytes[at] == b',' {
+                    at += 1;
+                }
             }
-            b'-' => neg = true,
-            _ => {}
+            NumberInputToken::Group => {
+                if bytes[at] == b',' {
+                    at += 1;
+                }
+            }
+            NumberInputToken::Skip(count) => {
+                for _ in 0..count {
+                    if at >= bytes.len() || is_number_data(bytes[at]) {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            NumberInputToken::Sign(kind) => match (kind, bytes[at]) {
+                (InputSign::Minus, b'-') | (InputSign::Either, b'-') => {
+                    negative = true;
+                    at += 1;
+                }
+                (InputSign::Plus, b'+') | (InputSign::Either, b'+') => at += 1,
+                _ if !is_number_data(bytes[at]) => at += 1,
+                _ => {}
+            },
+            NumberInputToken::Bracket => {
+                if bytes[at] == b'>' {
+                    at += 1;
+                }
+            }
         }
     }
     if !digits {
@@ -1169,12 +1194,229 @@ pub fn to_number<'a>(input: &str, fmt: &str, arena: &'a Arena) -> Result<Numeric
             input
         ));
     }
-    if neg {
-        buffer[0] = b'-';
+    if olen > 1 && out[olen - 1] == b'.' {
+        olen -= 1;
     }
-    let start = if neg { 0 } else { 1 };
-    let cleaned = core::str::from_utf8(&buffer[start..k]).expect("ascii");
-    Numeric::parse(cleaned, arena)?.round_scale(frac, RoundMode::HalfAwayZero, arena)
+    out[0] = if negative { b'-' } else { b'+' };
+    let parsed = Numeric::parse(core::str::from_utf8(&out[..olen]).expect("ascii"), arena)?;
+    if model.multi == 0 {
+        parsed.round_scale(read_post, RoundMode::HalfAwayZero, arena)
+    } else {
+        let factor = stack_format!(280, "1{:0<width$}", "", width = model.multi);
+        let divisor = Numeric::parse(factor.as_str(), arena)?;
+        let mut divided = numeric::div(&parsed, &divisor, arena)?;
+        divided.dscale = divided.dscale.max((16 + model.multi) as u16);
+        Ok(divided)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InputSign {
+    Minus,
+    Plus,
+    Either,
+}
+
+#[derive(Clone, Copy)]
+enum NumberInputToken {
+    Digit,
+    Decimal,
+    Comma,
+    Group,
+    Skip(u8),
+    Sign(InputSign),
+    Bracket,
+}
+
+struct NumberInputModel {
+    tokens: [NumberInputToken; MAX_TOKS],
+    len: usize,
+    post: usize,
+    multi: usize,
+    decimal: bool,
+    positional_sign: bool,
+    roman: bool,
+}
+
+impl NumberInputModel {
+    fn parse(fmt: &str) -> Result<Self, SqlError> {
+        let mut model = Self {
+            tokens: [NumberInputToken::Skip(0); MAX_TOKS],
+            len: 0,
+            post: 0,
+            multi: 0,
+            decimal: false,
+            positional_sign: false,
+            roman: false,
+        };
+        let bytes = fmt.as_bytes();
+        let mut at = 0usize;
+        let mut after_decimal = false;
+        let mut after_multi = false;
+        while at < bytes.len() {
+            let up = bytes[at].to_ascii_uppercase();
+            let two = if at + 1 < bytes.len() {
+                [up, bytes[at + 1].to_ascii_uppercase()]
+            } else {
+                [up, 0]
+            };
+            if &two == b"EE" {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "\"EEEE\" not supported for input"
+                ));
+            }
+            if &two == b"FM" {
+                at += 2;
+                continue;
+            }
+            if &two == b"RN" {
+                model.roman = true;
+                at += 2;
+                continue;
+            }
+            let (token, consumed) = match &two {
+                b"MI" => {
+                    model.positional_sign = true;
+                    (NumberInputToken::Sign(InputSign::Minus), 2)
+                }
+                b"PL" => {
+                    model.positional_sign = true;
+                    (NumberInputToken::Sign(InputSign::Plus), 2)
+                }
+                b"SG" => {
+                    model.positional_sign = true;
+                    (NumberInputToken::Sign(InputSign::Either), 2)
+                }
+                b"PR" => (NumberInputToken::Bracket, 2),
+                b"TH" => (NumberInputToken::Skip(2), 2),
+                _ => match up {
+                    b'9' | b'0' => {
+                        if after_decimal {
+                            model.post += 1;
+                        }
+                        if after_multi {
+                            model.multi += 1;
+                        }
+                        (NumberInputToken::Digit, 1)
+                    }
+                    b'.' | b'D' => {
+                        if after_multi {
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "cannot use \"V\" and decimal point together"
+                            ));
+                        }
+                        model.decimal = true;
+                        after_decimal = true;
+                        (NumberInputToken::Decimal, 1)
+                    }
+                    b'V' => {
+                        if after_decimal {
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "cannot use \"V\" and decimal point together"
+                            ));
+                        }
+                        after_multi = true;
+                        at += 1;
+                        continue;
+                    }
+                    b',' => (NumberInputToken::Comma, 1),
+                    b'G' => (NumberInputToken::Group, 1),
+                    b'L' | b'$' => (NumberInputToken::Skip(1), 1),
+                    b'S' => (NumberInputToken::Sign(InputSign::Either), 1),
+                    _ => (NumberInputToken::Skip(1), 1),
+                },
+            };
+            if model.len >= model.tokens.len() {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "to_number format too long"
+                ));
+            }
+            model.tokens[model.len] = token;
+            model.len += 1;
+            at += consumed;
+        }
+        if model.roman
+            && model.tokens[..model.len]
+                .iter()
+                .any(|token| !matches!(token, NumberInputToken::Skip(0)))
+        {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "\"RN\" is incompatible with other formats"
+            ));
+        }
+        Ok(model)
+    }
+}
+
+fn is_number_data(byte: u8) -> bool {
+    byte.is_ascii_digit() || matches!(byte, b'.' | b',' | b'+' | b'-')
+}
+
+fn roman_to_integer(input: &str) -> Option<i32> {
+    const ONES: [&str; 10] = ["", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX"];
+    const TENS: [&str; 10] = ["", "X", "XX", "XXX", "XL", "L", "LX", "LXX", "LXXX", "XC"];
+    const HUNDREDS: [&str; 10] = ["", "C", "CC", "CCC", "CD", "D", "DC", "DCC", "DCCC", "CM"];
+    let roman = input.trim();
+    if roman.is_empty() || roman.len() > 15 {
+        return None;
+    }
+    let value = |byte: u8| match byte.to_ascii_uppercase() {
+        b'I' => 1,
+        b'V' => 5,
+        b'X' => 10,
+        b'L' => 50,
+        b'C' => 100,
+        b'D' => 500,
+        b'M' => 1000,
+        _ => 0,
+    };
+    let bytes = roman.as_bytes();
+    let mut total = 0i32;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let current = value(bytes[at]);
+        if current == 0 {
+            return None;
+        }
+        if at + 1 < bytes.len() && current < value(bytes[at + 1]) {
+            total -= current;
+        } else {
+            total += current;
+        }
+        at += 1;
+    }
+    if !(1..=3999).contains(&total) {
+        return None;
+    }
+    let mut canonical = [0u8; 16];
+    let mut len = 0usize;
+    let emit = |text: &str, out: &mut [u8; 16], len: &mut usize| {
+        for byte in text.bytes() {
+            out[*len] = byte;
+            *len += 1;
+        }
+    };
+    for _ in 0..total / 1000 {
+        emit("M", &mut canonical, &mut len);
+    }
+    emit(
+        HUNDREDS[(total / 100 % 10) as usize],
+        &mut canonical,
+        &mut len,
+    );
+    emit(TENS[(total / 10 % 10) as usize], &mut canonical, &mut len);
+    emit(ONES[(total % 10) as usize], &mut canonical, &mut len);
+    (roman.len() == len
+        && roman
+            .bytes()
+            .zip(canonical[..len].iter().copied())
+            .all(|(left, right)| left.eq_ignore_ascii_case(&right)))
+    .then_some(total)
 }
 
 const MONTH_FULL: [&str; 12] = [
@@ -1256,32 +1498,187 @@ fn era_year(year: i64) -> (i64, bool) {
     }
 }
 
-/// `to_char(timestamp/date, text)` — formats the temporal value `micros`
-/// (microseconds since 2000-01-01) per the format string. Supports the common
-/// field codes; unrecognized letter codes are rejected loudly.
+/// Formats a timestamp without time zone.
 pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
-    use crate::sql::datetime::{PG_EPOCH_DAYS, civil_from_days, day_of_week, days_from_civil};
-    let days = micros.div_euclid(86_400_000_000);
-    let time_of_day = micros.rem_euclid(86_400_000_000);
-    let adays = days + PG_EPOCH_DAYS;
-    let (y, month, d) = civil_from_days(adays);
-    let hh24 = (time_of_day / 3_600_000_000) as u32;
-    let minute = ((time_of_day / 60_000_000) % 60) as u32;
-    let ss = ((time_of_day / 1_000_000) % 60) as u32;
-    let us = (time_of_day % 1_000_000) as u32;
-    let dow = day_of_week(days); // 0=Sun..6=Sat (PG-epoch day count)
-    let doy = (adays - days_from_civil(y, 1, 1) + 1) as u32;
-    let hh12 = if hh24.is_multiple_of(12) {
+    temporal(TemporalFields::timestamp(micros, None), fmt, arena)
+}
+
+/// Formats a timestamp with time zone after projecting it into the session
+/// zone selected by PostgreSQL's overload.
+pub fn timestamptz<'a>(
+    utc_micros: i64,
+    offset_seconds: i32,
+    abbreviation: &str,
+    fmt: &str,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    temporal(
+        TemporalFields::timestamp(
+            utc_micros + i64::from(offset_seconds) * 1_000_000,
+            Some(ZoneFields {
+                offset_seconds,
+                abbreviation,
+            }),
+        ),
+        fmt,
+        arena,
+    )
+}
+
+/// Formats an interval using duration fields rather than inventing a calendar
+/// date. Calendar-only format tokens are rejected with PostgreSQL's error.
+pub fn interval<'a>(value: Interval, fmt: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    temporal(TemporalFields::interval(value), fmt, arena)
+}
+
+/// PostgreSQL implicitly casts `time` to interval for `to_char`; date-only
+/// fields must therefore remain unavailable.
+pub fn time<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str, SqlError> {
+    interval(
+        Interval {
+            months: 0,
+            days: 0,
+            micros,
+        },
+        fmt,
+        arena,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ZoneFields<'a> {
+    offset_seconds: i32,
+    abbreviation: &'a str,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TemporalKind {
+    Timestamp,
+    Interval,
+}
+
+#[derive(Clone, Copy)]
+struct TemporalFields<'a> {
+    kind: TemporalKind,
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    microsecond: i64,
+    days: i64,
+    zone: Option<ZoneFields<'a>>,
+}
+
+impl<'a> TemporalFields<'a> {
+    fn timestamp(micros: i64, zone: Option<ZoneFields<'a>>) -> Self {
+        use crate::sql::datetime::{PG_EPOCH_DAYS, civil_from_days};
+        let days = micros.div_euclid(86_400_000_000);
+        let time = micros.rem_euclid(86_400_000_000);
+        let (year, month, day) = civil_from_days(days + PG_EPOCH_DAYS);
+        Self {
+            kind: TemporalKind::Timestamp,
+            year,
+            month: i64::from(month),
+            day: i64::from(day),
+            hour: time / 3_600_000_000,
+            minute: time / 60_000_000 % 60,
+            second: time / 1_000_000 % 60,
+            microsecond: time % 1_000_000,
+            days,
+            zone,
+        }
+    }
+
+    fn interval(value: Interval) -> Self {
+        let hour = value.micros / 3_600_000_000;
+        let remainder = value.micros % 3_600_000_000;
+        Self {
+            kind: TemporalKind::Interval,
+            year: i64::from(value.months / 12),
+            month: i64::from(value.months % 12),
+            day: i64::from(value.days),
+            hour,
+            minute: remainder / 60_000_000,
+            second: remainder % 60_000_000 / 1_000_000,
+            microsecond: remainder % 1_000_000,
+            days: 0,
+            zone: None,
+        }
+    }
+
+    fn calendar(self) -> Result<(), SqlError> {
+        if self.kind == TemporalKind::Timestamp {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::INVALID_DATETIME_FORMAT,
+                "invalid format specification for an interval value"
+            ))
+        }
+    }
+}
+
+fn temporal<'a>(
+    fields: TemporalFields<'_>,
+    fmt: &str,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    use crate::sql::datetime::{PG_EPOCH_DAYS, day_of_week, days_from_civil};
+    if fmt.len() > MAX_TOKS {
+        return Err(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "to_char format too long"
+        ));
+    }
+    let calendar = fields.kind == TemporalKind::Timestamp;
+    let adays = fields.days + PG_EPOCH_DAYS;
+    let dow = if calendar {
+        day_of_week(fields.days)
+    } else {
+        0
+    };
+    let doy = if calendar {
+        adays - days_from_civil(fields.year, 1, 1) + 1
+    } else {
+        fields.year * 360 + fields.month * 30 + fields.day
+    };
+    let hour_sign = fields.hour.signum();
+    let hour_abs = fields.hour.unsigned_abs() as i64;
+    let hh12_abs = if hour_abs % 12 == 0 {
         12
     } else {
-        hh24 % 12
+        hour_abs % 12
     };
-    let (display_year, bc) = era_year(y);
-    let (iso_year, iso_week, iso_day) = iso_week_date(days);
+    let hh12 = if calendar {
+        hh12_abs
+    } else {
+        hour_sign * hh12_abs
+    };
+    let (display_year, bc) = if calendar {
+        era_year(fields.year)
+    } else {
+        (fields.year, false)
+    };
+    let (iso_year, iso_week, iso_day) = if calendar {
+        iso_week_date(fields.days)
+    } else {
+        (0, 0, 0)
+    };
     let (display_iso_year, _) = era_year(iso_year);
 
-    let mut out = StackStr::<512>::new();
-    let name = |out: &mut StackStr<512>, s: &str, case: Case, pad: usize, fm: bool| {
+    let mut out = StackStr::<2048>::new();
+    let append = |out: &mut StackStr<2048>, text: &str| -> Result<(), SqlError> {
+        out.write_str(text)
+            .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "to_char output too long"))
+    };
+    let name = |out: &mut StackStr<2048>,
+                s: &str,
+                case: Case,
+                pad: usize,
+                fm: bool|
+     -> Result<(), SqlError> {
         let mut buffer = [0u8; 16];
         let n = s.len().min(buffer.len());
         for (i, b) in s.bytes().take(n).enumerate() {
@@ -1291,176 +1688,387 @@ pub fn timestamp<'a>(micros: i64, fmt: &str, arena: &'a Arena) -> Result<&'a str
                 Case::Title => b,
             };
         }
-        let _ = out.write_str(core::str::from_utf8(&buffer[..n]).unwrap_or(""));
+        append(out, core::str::from_utf8(&buffer[..n]).unwrap_or(""))?;
         if !fm {
             for _ in n..pad {
-                let _ = out.write_char(' ');
+                append(out, " ")?;
             }
         }
+        Ok(())
     };
-    let num = |out: &mut StackStr<512>, v: i64, width: usize, fm: bool| {
-        let s = crate::stack_format!(24, "{}", v);
+    let num = |out: &mut StackStr<2048>, v: i64, width: usize, fm: bool| -> Result<(), SqlError> {
+        let negative = v < 0;
+        let s = crate::stack_format!(24, "{}", v.unsigned_abs());
+        if negative {
+            append(out, "-")?;
+        }
         if !fm {
             for _ in s.as_str().len()..width {
-                let _ = out.write_char('0');
+                append(out, "0")?;
             }
         }
-        let _ = out.write_str(s.as_str());
+        append(out, s.as_str())
+    };
+    let comma_year = |out: &mut StackStr<2048>, value: i64, fm: bool| -> Result<(), SqlError> {
+        let text = stack_format!(32, "{}", value.unsigned_abs());
+        if value < 0 {
+            append(out, "-")?;
+        }
+        let width = text.as_str().len().max(4);
+        let mut padded = [b'0'; 32];
+        let start = width - text.as_str().len();
+        padded[start..width].copy_from_slice(text.as_str().as_bytes());
+        let bytes = &padded[..width];
+        for (index, byte) in bytes.iter().enumerate() {
+            if index > 0 && (width - index).is_multiple_of(3) {
+                append(out, ",")?;
+            }
+            append(
+                out,
+                core::str::from_utf8(core::slice::from_ref(byte)).expect("ascii"),
+            )?;
+        }
+        let _ = fm;
+        Ok(())
     };
 
     let fb = fmt.as_bytes();
     let mut i = 0usize;
     while i < fb.len() {
         let mut fm = false;
-        if i + 1 < fb.len()
-            && fb[i].eq_ignore_ascii_case(&b'F')
-            && fb[i + 1].eq_ignore_ascii_case(&b'M')
-        {
-            fm = true;
-            i += 2;
+        loop {
+            if i + 1 < fb.len()
+                && (fb[i..i + 2].eq_ignore_ascii_case(b"FM")
+                    || fb[i..i + 2].eq_ignore_ascii_case(b"TM"))
+            {
+                fm = true;
+                i += 2;
+            } else if i + 1 < fb.len() && fb[i..i + 2].eq_ignore_ascii_case(b"FX") {
+                i += 2;
+            } else {
+                break;
+            }
+        }
+        if i >= fb.len() {
+            break;
+        }
+        if fb[i] == b'"' {
+            i += 1;
+            while i < fb.len() && fb[i] != b'"' {
+                if fb[i] == b'\\' && i + 1 < fb.len() {
+                    i += 1;
+                }
+                let width = fmt[i..]
+                    .chars()
+                    .next()
+                    .expect("format byte index is a character boundary")
+                    .len_utf8();
+                append(&mut out, &fmt[i..i + width])?;
+                i += width;
+            }
+            if i < fb.len() {
+                i += 1;
+            }
+            continue;
         }
         let rest = &fb[i..];
         let m = |w: &[u8]| rest.len() >= w.len() && rest[..w.len()].eq_ignore_ascii_case(w);
+        let mut ordinal = None;
         if m(b"IYYY") {
-            num(&mut out, display_iso_year, 4, fm);
+            fields.calendar()?;
+            num(&mut out, display_iso_year, 4, fm)?;
+            ordinal = Some(display_iso_year);
             i += 4;
+        } else if m(b"IDDD") {
+            fields.calendar()?;
+            let jan4 = days_from_civil(iso_year, 1, 4) - PG_EPOCH_DAYS;
+            let first_monday = jan4 - (iso_week_date(jan4).2 - 1);
+            let value = fields.days - first_monday + 1;
+            num(&mut out, value, 3, fm)?;
+            ordinal = Some(value);
+            i += 4;
+        } else if m(b"Y,YYY") {
+            comma_year(&mut out, display_year, fm)?;
+            ordinal = Some(display_year);
+            i += 5;
         } else if m(b"YYYY") {
-            num(&mut out, display_year, 4, fm);
+            num(&mut out, display_year, 4, fm)?;
+            ordinal = Some(display_year);
             i += 4;
         } else if m(b"HH24") {
-            num(&mut out, hh24 as i64, 2, fm);
+            num(&mut out, fields.hour, 2, fm)?;
+            ordinal = Some(fields.hour);
             i += 4;
         } else if m(b"HH12") {
-            num(&mut out, hh12 as i64, 2, fm);
+            num(&mut out, hh12, 2, fm)?;
+            ordinal = Some(hh12);
             i += 4;
+        } else if m(b"SSSSS") {
+            let value = fields.hour * 3600 + fields.minute * 60 + fields.second;
+            num(&mut out, value, 1, fm)?;
+            ordinal = Some(value);
+            i += 5;
         } else if m(b"SSSS") {
-            num(&mut out, time_of_day / 1_000_000, 1, fm);
+            let value = fields.hour * 3600 + fields.minute * 60 + fields.second;
+            num(&mut out, value, 1, fm)?;
+            ordinal = Some(value);
             i += 4;
         } else if m(b"MONTH") {
+            fields.calendar()?;
             name(
                 &mut out,
-                MONTH_FULL[(month - 1) as usize],
+                MONTH_FULL[(fields.month - 1) as usize],
                 name_case(&rest[..5]),
                 9,
                 fm,
-            );
+            )?;
             i += 5;
         } else if m(b"MON") {
+            fields.calendar()?;
             name(
                 &mut out,
-                MONTH_ABBR[(month - 1) as usize],
+                MONTH_ABBR[(fields.month - 1) as usize],
                 name_case(&rest[..3]),
                 3,
                 fm,
-            );
+            )?;
             i += 3;
         } else if m(b"DAY") {
-            name(&mut out, DAY_FULL[dow], name_case(&rest[..3]), 9, fm);
+            fields.calendar()?;
+            name(&mut out, DAY_FULL[dow], name_case(&rest[..3]), 9, fm)?;
             i += 3;
         } else if m(b"DDD") {
-            num(&mut out, doy as i64, 3, fm);
+            num(&mut out, doy, 3, fm)?;
+            ordinal = Some(doy);
             i += 3;
         } else if m(b"IYY") {
-            num(&mut out, display_iso_year % 1000, 3, fm);
+            fields.calendar()?;
+            num(&mut out, display_iso_year % 1000, 3, fm)?;
+            ordinal = Some(display_iso_year % 1000);
             i += 3;
         } else if m(b"DY") {
-            name(&mut out, DAY_ABBR[dow], name_case(&rest[..2]), 3, fm);
+            fields.calendar()?;
+            name(&mut out, DAY_ABBR[dow], name_case(&rest[..2]), 3, fm)?;
             i += 2;
         } else if m(b"YYY") {
-            num(&mut out, display_year % 1000, 3, fm);
+            let value = display_year % 1000;
+            num(&mut out, value, 3, fm)?;
+            ordinal = Some(value);
             i += 3;
         } else if m(b"IY") {
-            num(&mut out, display_iso_year % 100, 2, fm);
+            fields.calendar()?;
+            let value = display_iso_year % 100;
+            num(&mut out, value, 2, fm)?;
+            ordinal = Some(value);
             i += 2;
         } else if m(b"IW") {
-            num(&mut out, iso_week, 2, fm);
+            fields.calendar()?;
+            num(&mut out, iso_week, 2, fm)?;
+            ordinal = Some(iso_week);
             i += 2;
         } else if m(b"HH") {
-            num(&mut out, hh12 as i64, 2, fm);
+            num(&mut out, hh12, 2, fm)?;
+            ordinal = Some(hh12);
             i += 2;
         } else if m(b"YY") {
-            num(&mut out, display_year % 100, 2, fm);
+            let value = display_year % 100;
+            num(&mut out, value, 2, fm)?;
+            ordinal = Some(value);
             i += 2;
         } else if m(b"MI") {
-            num(&mut out, minute as i64, 2, fm);
+            num(&mut out, fields.minute, 2, fm)?;
+            ordinal = Some(fields.minute);
             i += 2;
         } else if m(b"MM") {
-            num(&mut out, month as i64, 2, fm);
+            num(&mut out, fields.month, 2, fm)?;
+            ordinal = Some(fields.month);
             i += 2;
         } else if m(b"MS") {
-            num(&mut out, (us / 1000) as i64, 3, fm);
+            let value = fields.microsecond / 1000;
+            num(&mut out, value, 3, fm)?;
+            ordinal = Some(value);
             i += 2;
         } else if m(b"US") {
-            num(&mut out, us as i64, 6, fm);
+            num(&mut out, fields.microsecond, 6, fm)?;
+            ordinal = Some(fields.microsecond);
             i += 2;
         } else if m(b"SS") {
-            num(&mut out, ss as i64, 2, fm);
+            num(&mut out, fields.second, 2, fm)?;
+            ordinal = Some(fields.second);
             i += 2;
         } else if m(b"DD") {
-            num(&mut out, d as i64, 2, fm);
+            num(&mut out, fields.day, 2, fm)?;
+            ordinal = Some(fields.day);
             i += 2;
         } else if m(b"WW") {
-            num(&mut out, ((doy - 1) / 7 + 1) as i64, 2, fm);
+            let value = (doy - doy.signum()).div_euclid(7) + doy.signum();
+            num(&mut out, value, 2, fm)?;
+            ordinal = Some(value);
             i += 2;
         } else if m(b"RM") {
+            let month = fields.month.unsigned_abs() as usize;
+            if !(1..=12).contains(&month) {
+                return Err(sql_err!(
+                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                    "date/time field value out of range"
+                ));
+            }
             name(
                 &mut out,
-                MONTH_ROMAN[(month - 1) as usize],
+                MONTH_ROMAN[month - 1],
                 name_case(&rest[..2]),
                 4,
                 fm,
-            );
+            )?;
             i += 2;
         } else if m(b"A.M.") || m(b"P.M.") {
-            let mer = if hh24 < 12 { "A.M." } else { "P.M." };
-            name(&mut out, mer, name_case(&rest[..4]), 0, true);
+            let mer = if hour_abs % 24 < 12 { "A.M." } else { "P.M." };
+            name(&mut out, mer, name_case(&rest[..4]), 0, true)?;
             i += 4;
         } else if m(b"AM") || m(b"PM") {
-            let mer = if hh24 < 12 { "AM" } else { "PM" };
-            name(&mut out, mer, name_case(&rest[..2]), 0, true);
+            let mer = if hour_abs % 24 < 12 { "AM" } else { "PM" };
+            name(&mut out, mer, name_case(&rest[..2]), 0, true)?;
             i += 2;
         } else if m(b"A.D.") || m(b"B.C.") {
+            fields.calendar()?;
             let era = if bc { "B.C." } else { "A.D." };
-            name(&mut out, era, name_case(&rest[..4]), 0, true);
+            name(&mut out, era, name_case(&rest[..4]), 0, true)?;
             i += 4;
         } else if m(b"AD") || m(b"BC") {
+            fields.calendar()?;
             let era = if bc { "BC" } else { "AD" };
-            name(&mut out, era, name_case(&rest[..2]), 0, true);
+            name(&mut out, era, name_case(&rest[..2]), 0, true)?;
             i += 2;
         } else if m(b"CC") {
-            let century = (display_year - 1) / 100 + 1;
-            if bc {
-                let _ = out.write_char('-');
-            }
-            num(&mut out, century, 2, fm);
+            let century = if calendar {
+                let magnitude = (display_year - 1) / 100 + 1;
+                if bc { -magnitude } else { magnitude }
+            } else {
+                display_year / 100
+            };
+            num(&mut out, century, 2, fm)?;
+            ordinal = Some(century);
             i += 2;
         } else if m(b"Q") {
-            num(&mut out, ((month - 1) / 3 + 1) as i64, 1, fm);
+            let value =
+                (fields.month - fields.month.signum()).div_euclid(3) + fields.month.signum();
+            num(&mut out, value, 1, fm)?;
+            ordinal = Some(value);
             i += 1;
         } else if m(b"ID") {
-            num(&mut out, iso_day, 1, fm);
+            fields.calendar()?;
+            num(&mut out, iso_day, 1, fm)?;
+            ordinal = Some(iso_day);
             i += 2;
         } else if m(b"D") {
-            num(&mut out, (dow + 1) as i64, 1, fm);
+            fields.calendar()?;
+            let value = (dow + 1) as i64;
+            num(&mut out, value, 1, fm)?;
+            ordinal = Some(value);
             i += 1;
         } else if m(b"W") {
-            num(&mut out, ((d - 1) / 7 + 1) as i64, 1, fm);
+            let value = (fields.day - fields.day.signum()).div_euclid(7) + fields.day.signum();
+            num(&mut out, value, 1, fm)?;
+            ordinal = Some(value);
             i += 1;
         } else if m(b"I") {
-            num(&mut out, display_iso_year % 10, 1, fm);
+            fields.calendar()?;
+            let value = display_iso_year % 10;
+            num(&mut out, value, 1, fm)?;
+            ordinal = Some(value);
             i += 1;
         } else if m(b"Y") {
-            num(&mut out, display_year % 10, 1, fm);
+            let value = display_year % 10;
+            num(&mut out, value, 1, fm)?;
+            ordinal = Some(value);
             i += 1;
-        } else if rest[0].is_ascii_alphabetic() {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "to_char timestamp code not supported: \"{}\"",
-                rest[0] as char
-            ));
+        } else if rest.len() >= 3
+            && rest[0].eq_ignore_ascii_case(&b'F')
+            && rest[1].eq_ignore_ascii_case(&b'F')
+            && matches!(rest[2], b'1'..=b'6')
+        {
+            let width = usize::from(rest[2] - b'0');
+            let value = fields.microsecond / 10i64.pow((6 - width) as u32);
+            num(&mut out, value, width, fm)?;
+            ordinal = Some(value);
+            i += 3;
+        } else if m(b"TZH") {
+            let offset = fields.zone.map_or(0, |zone| zone.offset_seconds);
+            append(&mut out, if offset < 0 { "-" } else { "+" })?;
+            num(
+                &mut out,
+                i64::from(offset).unsigned_abs() as i64 / 3600,
+                2,
+                false,
+            )?;
+            i += 3;
+        } else if m(b"TZM") {
+            let offset = fields.zone.map_or(0, |zone| zone.offset_seconds);
+            num(
+                &mut out,
+                i64::from(offset).unsigned_abs() as i64 / 60 % 60,
+                2,
+                false,
+            )?;
+            i += 3;
+        } else if m(b"TZ") {
+            fields.calendar()?;
+            if let Some(zone) = fields.zone {
+                name(&mut out, zone.abbreviation, name_case(&rest[..2]), 0, true)?;
+            }
+            i += 2;
+        } else if m(b"OF") {
+            fields.calendar()?;
+            let offset = fields.zone.map_or(0, |zone| zone.offset_seconds);
+            append(&mut out, if offset < 0 { "-" } else { "+" })?;
+            num(
+                &mut out,
+                i64::from(offset).unsigned_abs() as i64 / 3600,
+                2,
+                false,
+            )?;
+            let minute = i64::from(offset).unsigned_abs() as i64 / 60 % 60;
+            if minute != 0 {
+                append(&mut out, ":")?;
+                num(&mut out, minute, 2, false)?;
+            }
+            i += 2;
+        } else if m(b"J") {
+            fields.calendar()?;
+            let value = adays + 2_440_588;
+            num(&mut out, value, 1, fm)?;
+            ordinal = Some(value);
+            i += 1;
         } else {
-            let _ = out.write_char(rest[0] as char);
-            i += 1;
+            let width = fmt[i..]
+                .chars()
+                .next()
+                .expect("format byte index is a character boundary")
+                .len_utf8();
+            append(&mut out, &fmt[i..i + width])?;
+            i += width;
+        }
+        if let Some(value) = ordinal
+            && i + 1 < fb.len()
+            && fb[i..i + 2].eq_ignore_ascii_case(b"TH")
+        {
+            let digits = stack_format!(32, "{}", value.unsigned_abs());
+            let suffix = ordinal_suffix(digits.as_str().as_bytes());
+            if fb[i] == b't' {
+                let lower = stack_format!(
+                    2,
+                    "{}{}",
+                    suffix.as_bytes()[0].to_ascii_lowercase() as char,
+                    suffix.as_bytes()[1].to_ascii_lowercase() as char
+                );
+                append(&mut out, lower.as_str())?;
+            } else {
+                append(&mut out, suffix)?;
+            }
+            i += 2;
+        }
+        if i + 1 < fb.len() && fb[i..i + 2].eq_ignore_ascii_case(b"SP") {
+            i += 2;
         }
     }
     arena
@@ -1518,6 +2126,13 @@ mod tests {
         assert_eq!(tn("12.30", "99.99"), "12.30");
         assert_eq!(tn("42", "99"), "42");
         assert_eq!(tn("12,345", "99G999"), "12345");
+        assert_eq!(tn("12abc34", "99L99"), "12");
+        assert_eq!(tn("<123>", "999PR"), "-123");
+        assert_eq!(tn("123-", "999MI"), "-123");
+        assert_eq!(tn("XII", "RN"), "12");
+        assert_eq!(tn("xiv", "rn"), "14");
+        assert_eq!(tn("12", "9V9"), "1.20000000000000000");
+        assert!(to_number("IIII", "RN", &a).is_err());
         assert!(to_number("abc", "999", &a).is_err());
     }
 
@@ -1536,7 +2151,33 @@ mod tests {
         assert_eq!(tc("Day DY D"), "Saturday  SAT 7");
         assert_eq!(tc("Q WW DDD"), "2 24 167");
         assert_eq!(tc("US"), "123456");
-        assert!(timestamp(micros, "ZZZ", &a).is_err());
+        assert_eq!(tc("ZZZ"), "ZZZ");
+        assert_eq!(
+            tc("FF1|FF2|FF3|FF4|FF5|FF6|SSSSS|Y,YYY|IDDD|J|DDTH|\"X\"YYYY"),
+            "1|12|123|1234|12345|123456|50829|2,024|167|2460477|15TH|X2024"
+        );
+        assert_eq!(tc("TZ|TZH|TZM|OF"), "|+00|00|+00");
+        assert_eq!(tc("YYYY年\"月\"MM"), "2024年月06");
+    }
+
+    #[test]
+    fn interval_formats_match_postgres() {
+        let a = arena();
+        let value = Interval {
+            months: 27,
+            days: 15,
+            micros: 36 * 3_600_000_000 + 7 * 60_000_000 + 5_123_456,
+        };
+        assert_eq!(
+            interval(
+                value,
+                "YYYY|MM|DDD|DD|HH|HH24|MI|SS|MS|US|FF4|SSSSS|W|WW|CC|Q|RM|DDTH",
+                &a,
+            )
+            .unwrap(),
+            "0002|03|825|15|12|36|07|05|123|123456|1234|130025|3|118|00|1|III |15TH"
+        );
+        assert!(interval(value, "DAY", &a).is_err());
     }
 
     #[test]
@@ -1584,5 +2225,28 @@ mod tests {
         assert!(number(&Numeric::parse("5", &a).unwrap(), "S999MI", false, None, &a).is_err());
         assert!(number(&Numeric::parse("5", &a).unwrap(), "9.9V9", false, None, &a).is_err());
         assert!(number(&Numeric::parse("5", &a).unwrap(), "EEEE9", false, None, &a).is_err());
+    }
+
+    #[test]
+    fn format_models_do_not_allocate() {
+        let a = arena();
+        let numeric = Numeric::parse("1234.50", &a).unwrap();
+        let fourteen = Numeric::parse("14", &a).unwrap();
+        let timestamp =
+            crate::sql::datetime::parse_timestamp("2024-06-15 14:07:09.123456", false).unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                number(&numeric, "FM9,999.99", false, None, &a).unwrap(),
+                "1,234.5"
+            );
+            assert_eq!(to_number("XIV", "RN", &a).unwrap(), fourteen);
+            assert_eq!(
+                self::timestamp(timestamp, "YYYY-MM-DD HH24:MI:SS.US", &a).unwrap(),
+                "2024-06-15 14:07:09.123456"
+            );
+            assert!(
+                crate::sql::datetime::parse_formatted("22-24-2nd-Monday", "CC-YY-Wth-DAY").is_ok()
+            );
+        });
     }
 }

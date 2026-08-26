@@ -3126,6 +3126,67 @@ def test_nested_materialized_cte_named_portal():
     s.close()
 
 
+def test_format_models_over_named_portal():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(s, "SET TimeZone='-05:00'")
+    check("raw wire: formatting session setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    query = (
+        "SELECT to_number($1,$2)::text, to_char($3::timestamptz,$4), "
+        "to_char(interval '2 years 3 mons 15 days 36:07:05.123456',$5)"
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_format_statement\x00"
+        + query.encode()
+        + b"\x00"
+        + struct.pack("!hIIIII", 5, 25, 25, 1184, 25, 25),
+    )
+    values = [
+        b"XIV",
+        b"RN",
+        b"2024-02-29 23:07:05.123456-05",
+        b"YYYY-MM-DD HH24:MI:SS.US OF",
+        b"YYYY|MM|DDD|DD|HH24|MI|SS.MS",
+    ]
+    body = b"wire_format_portal\x00wire_format_statement\x00" + struct.pack("!hh", 0, len(values))
+    for value in values:
+        body += struct.pack("!i", len(value)) + value
+    body += struct.pack("!hhhh", 3, 1, 0, 1)
+    bind = frontend_message(b"B", body)
+    describe = frontend_message(b"D", b"Pwire_format_portal\x00")
+    execute = frontend_message(b"E", b"wire_format_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in output if kind == b"T"), None)
+    row = next((payload for kind, payload in output if kind == b"D"), None)
+    check(
+        "raw wire: parsed format models retain text OIDs and requested formats",
+        description is not None
+        and row_description_type_oids(description) == [25, 25, 25]
+        and row_description_formats(description) == [1, 0, 1],
+        output,
+    )
+    check(
+        "raw wire: named portal applies PostgreSQL numeric, zone, and interval models",
+        row is not None
+        and text_row_fields(row)
+        == [
+            "14",
+            "2024-03-01 09:07:05.123456 +05",
+            "0002|03|825|15|36|07|05.123",
+        ],
+        output,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

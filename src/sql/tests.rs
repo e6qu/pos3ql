@@ -9959,6 +9959,22 @@ fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
         copy_data_rows(&copied),
         ["1 day 02:03:04.568\t1 day 02:03:04.5679"]
     );
+    let formatted = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT
+           to_number('12abc34','99L99')::text,
+           to_char(ds,'DD|HH24|MI|SS.MS'),
+           to_char(timestamp '2024-02-29 23:07:05.123456','IYYY-IW-ID|FF6|J|DDTH')
+         FROM interval_ranges)
+         TO STDOUT",
+    );
+    assert_eq!(
+        copy_data_rows(&formatted),
+        ["12\t01|02|03|04.568\t2024-09-4|123456|2460370|29TH"],
+        "{}",
+        String::from_utf8_lossy(&formatted)
+    );
     let copied = run_with(
         &mut engine,
         &mut budget,
@@ -10082,6 +10098,11 @@ fn interval_field_ranges_survive_checkpoint_and_object_store_cold_start() {
              INSERT INTO durable_intervals VALUES
                (1, '2 days 03:04:05.6', '6:07:08.129'),
                (2, '-1 day -02:03:04', '-4:05:06.125');
+             CREATE VIEW durable_interval_formatting AS
+               SELECT id,
+                      to_char(value,'DD|HH24|MI') AS value_format,
+                      to_char(domain_value,'HH24|MI|SS.MS') AS domain_format
+                 FROM durable_intervals;
              CHECKPOINT",
         );
         assert!(
@@ -10120,6 +10141,22 @@ fn interval_field_ranges_survive_checkpoint_and_object_store_cold_start() {
             "SELECT datetime_precision,interval_type FROM information_schema.domains WHERE domain_name='durable_interval'"
         )),
         ["2|HOUR TO SECOND(2)"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT id,value_format,domain_format FROM durable_interval_formatting ORDER BY id"
+        )),
+        ["1|02|03|04|06|07|08.130", "2|-01|-02|-03|-04|-05|-06.-130"]
+    );
+    assert_eq!(
+        copy_data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "COPY (SELECT value_format,domain_format FROM durable_interval_formatting ORDER BY id) TO STDOUT"
+        )),
+        ["02|03|04\t06|07|08.130", "-01|-02|-03\t-04|-05|-06.-130"]
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

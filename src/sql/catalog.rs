@@ -187,7 +187,7 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
-        oid: 2731,
+        oid: 2730,
         name: "pg_get_triggerdef",
         result_oid: 25,
         argument_types: "26 16",
@@ -314,7 +314,115 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 1,
         volatility: "s",
     },
+    IntrinsicRoutine {
+        oid: 1158,
+        name: "to_timestamp",
+        result_oid: 1184,
+        argument_types: "701",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 1768,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "1186 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1770,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "1184 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1772,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "1700 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1773,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "23 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1774,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "20 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1775,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "700 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1776,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "701 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1777,
+        name: "to_number",
+        result_oid: 1700,
+        argument_types: "25 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1778,
+        name: "to_timestamp",
+        result_oid: 1184,
+        argument_types: "25 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1780,
+        name: "to_date",
+        result_oid: 1082,
+        argument_types: "25 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2049,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "1114 25",
+        argument_count: 2,
+        volatility: "s",
+    },
 ];
+
+fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
+    !matches!(routine.oid, 1081 | 2078)
+}
+
+fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
+    match routine.oid {
+        1402 | 1403 | 2078 | 3086 => "u",
+        1641 => "r",
+        _ => "s",
+    }
+}
 
 /// PostgreSQL 18.4 operator OIDs for the evaluator's scalar integer core.
 /// The resolver deliberately exposes only operations the engine evaluates;
@@ -8568,7 +8676,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bpchar("f"),
                 text(routine.argument_types, arena)?,
                 Datum::Bpchar(routine.volatility),
-                Datum::Bpchar("s"),
+                Datum::Bpchar(intrinsic_routine_parallel(*routine)),
                 Datum::Int4(10),
                 Datum::Bool(false),
                 Datum::Null,
@@ -8582,7 +8690,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     arena,
                 )?,
                 text("", arena)?,
-                Datum::Bool(false),
+                Datum::Bool(intrinsic_routine_is_strict(*routine)),
                 Datum::Bool(false),
                 Datum::Null,
                 Datum::Float8(1.0),

@@ -62,6 +62,33 @@ cur.execute("SELECT count(*) FROM drv_deferred")
 assert cur.fetchone() == (1,)
 print("deferred constraint extended protocol ok")
 
+# A named constraint-trigger event completed by SET CONSTRAINTS becomes
+# pending again when the driver rolls back to the savepoint that preceded it.
+cur.execute("CREATE TABLE drv_constraint_trigger_target (id integer PRIMARY KEY)")
+cur.execute("CREATE TABLE drv_constraint_trigger_audit (id integer)")
+cur.execute(
+    "CREATE FUNCTION drv_constraint_trigger_fn() RETURNS trigger LANGUAGE plpgsql AS "
+    "'BEGIN INSERT INTO drv_constraint_trigger_audit VALUES (NEW.id); RETURN NEW; END'"
+)
+cur.execute(
+    "CREATE CONSTRAINT TRIGGER drv_constraint_trigger AFTER INSERT "
+    "ON drv_constraint_trigger_target DEFERRABLE INITIALLY DEFERRED "
+    "FOR EACH ROW EXECUTE FUNCTION drv_constraint_trigger_fn()"
+)
+cur.execute("BEGIN")
+cur.execute("INSERT INTO drv_constraint_trigger_target VALUES (%s)", (7,))
+cur.execute("SAVEPOINT queued_trigger")
+cur.execute("SET CONSTRAINTS drv_constraint_trigger IMMEDIATE")
+cur.execute("SELECT id FROM drv_constraint_trigger_audit")
+assert cur.fetchone() == (7,)
+cur.execute("ROLLBACK TO SAVEPOINT queued_trigger")
+cur.execute("SELECT count(*) FROM drv_constraint_trigger_audit")
+assert cur.fetchone() == (0,)
+cur.execute("COMMIT")
+cur.execute("SELECT id FROM drv_constraint_trigger_audit")
+assert cur.fetchone() == (7,)
+print("constraint trigger savepoint extended protocol ok")
+
 # NULL parameter handling.
 cur.execute("INSERT INTO drv VALUES (%s, %s, %s)", (4, None, 1.0))
 cur.execute("SELECT name IS NULL FROM drv WHERE id = %s", (4,))

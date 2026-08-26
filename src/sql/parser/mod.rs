@@ -3490,7 +3490,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let _ = self.eat_ident("only")?;
+        let only = self.eat_ident("only")?;
         let table = self.qual_name("table name")?;
         if self.peeked == Tok::Ident("owner") {
             return self.alter_owner(AlterOwnerKind::Table, table, if_exists);
@@ -3504,6 +3504,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::AlterTable(AlterTable {
                 table,
                 if_exists,
+                only,
                 actions: self.arena_slice(&[action])?,
             }));
         }
@@ -3525,6 +3526,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::AlterTable(AlterTable {
                 table,
                 if_exists,
+                only,
                 actions: self.arena_slice(&[action])?,
             }));
         }
@@ -3535,6 +3537,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::AlterTable(AlterTable {
                 table,
                 if_exists,
+                only,
                 actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
                     RowLevelSecurityAlteration::Force,
                 )])?,
@@ -3548,6 +3551,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::AlterTable(AlterTable {
                 table,
                 if_exists,
+                only,
                 actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
                     RowLevelSecurityAlteration::NoForce,
                 )])?,
@@ -3560,6 +3564,7 @@ impl<'a> Parser<'a> {
                 return Ok(Stmt::AlterTable(AlterTable {
                     table,
                     if_exists,
+                    only,
                     actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
                         RowLevelSecurityAlteration::Enable,
                     )])?,
@@ -3579,6 +3584,7 @@ impl<'a> Parser<'a> {
                 return Ok(Stmt::AlterTable(AlterTable {
                     table,
                     if_exists,
+                    only,
                     actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
                         RowLevelSecurityAlteration::Disable,
                     )])?,
@@ -3613,6 +3619,7 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::AlterTable(AlterTable {
                 table,
                 if_exists,
+                only,
                 actions: self.arena_slice(&[action])?,
             }));
         }
@@ -3643,6 +3650,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::AlterTable(AlterTable {
             table,
             if_exists,
+            only,
             actions: self.arena_slice(&buffer[..count])?,
         }))
     }
@@ -4475,6 +4483,13 @@ impl<'a> Parser<'a> {
             CommentTarget::Tablespace(self.col_ident("tablespace name")?)
         } else if self.eat_ident("extension")? {
             CommentTarget::Extension(self.col_ident("extension name")?)
+        } else if self.eat_ident("trigger")? {
+            let name = self.col_ident("trigger name")?;
+            self.expect_ident("on")?;
+            CommentTarget::Trigger(crate::sql::ast::TriggerIdentity {
+                name,
+                table: self.qual_name("trigger table")?,
+            })
         } else if self.eat_ident("type")? {
             CommentTarget::Type {
                 name: self.comment_type_name()?,
@@ -5582,22 +5597,24 @@ mod tests {
                 }]
             );
             let Some(Stmt::DropTrigger {
-                triggers,
+                trigger,
                 if_exists,
+                cascade,
             }) = parser.next_stmt().unwrap()
             else {
                 panic!("DROP TRIGGER did not parse")
             };
             assert!(if_exists);
+            assert!(!cascade);
             assert_eq!(
-                triggers,
-                [crate::sql::ast::TriggerIdentity {
+                trigger,
+                crate::sql::ast::TriggerIdentity {
                     name: "audit_change",
                     table: QualName {
                         schema: Some("public"),
                         name: "orders"
                     },
-                }]
+                }
             );
         });
     }
@@ -5658,7 +5675,6 @@ mod tests {
             "CREATE TRIGGER bad BEFORE UPDATE ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
             "CREATE TRIGGER bad AFTER INSERT ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
             "CREATE TRIGGER bad AFTER UPDATE ON orders REFERENCING OLD TABLE AS rows NEW TABLE AS rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
-            "CREATE TRIGGER bad AFTER UPDATE ON orders REFERENCING OLD TABLE AS old_rows FOR EACH ROW EXECUTE FUNCTION f()",
             "CREATE TRIGGER bad AFTER UPDATE OF amount ON orders REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION f()",
         ] {
             let mut budget = Budget::new(1 << 20);

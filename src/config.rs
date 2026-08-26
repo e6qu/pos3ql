@@ -581,7 +581,7 @@ impl Config {
             + self.max_portals * (self.portal_bytes + self.portal_result_bytes)
             + self.max_tables * core::mem::size_of::<crate::storage::SqlName>()
             + crate::sql::cursor::CursorPool::budget_bytes(self)
-            + self.txn_rows * 12;
+            + crate::sql::txn::TxnState::budget_bytes(self.txn_rows);
         MemoryPlan {
             memtable: self.memtable_bytes,
             tables: tables_bytes,
@@ -839,17 +839,13 @@ sql_arena_bytes = 4096
         c.cursor_bytes = 64;
         c.copy_line_bytes = 50;
         let plan = c.memory_plan(500, 250);
-        // 50+100+200+300 + 2*30 + 2*(20+40) + publication selection + cursor pool.
+        // Fixed protocol buffers plus every startup-sized connection pool.
         let cursor_pool = crate::sql::cursor::CursorPool::budget_bytes(&c);
         let publication_selection = c.max_tables * core::mem::size_of::<crate::storage::SqlName>();
-        assert_eq!(
-            plan.connections,
-            (950 + publication_selection + cursor_pool) * 10
-        );
-        assert_eq!(
-            plan.total(),
-            (950 + publication_selection + cursor_pool) * 10 + 1000 + 2000 + 500 + 250
-        );
+        let transaction = crate::sql::txn::TxnState::budget_bytes(c.txn_rows);
+        let per_connection = 830 + publication_selection + cursor_pool + transaction;
+        assert_eq!(plan.connections, per_connection * 10);
+        assert_eq!(plan.total(), per_connection * 10 + 1000 + 2000 + 500 + 250);
     }
 
     #[test]

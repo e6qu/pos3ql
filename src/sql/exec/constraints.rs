@@ -1444,7 +1444,10 @@ pub(crate) fn validate_constraint_obligation(
     txid: u32,
     arena: &Arena,
 ) -> Result<Option<crate::storage::ConstraintTiming>, SqlError> {
-    let table_index = constraint.table as usize;
+    let crate::sql::txn::ConstraintIdentity::Table { table, name, .. } = constraint else {
+        return Ok(None);
+    };
+    let table_index = table as usize;
     if table_index >= storage.table_count() || !storage.table(table_index).visible_to(txid) {
         return Ok(None);
     }
@@ -1455,17 +1458,17 @@ pub(crate) fn validate_constraint_obligation(
     let key = definition
         .uniques()
         .iter()
-        .find(|key| key.name == constraint.name)
+        .find(|key| key.name == name)
         .copied();
     let foreign_key = definition
         .fkeys()
         .iter()
-        .find(|foreign_key| foreign_key.name == constraint.name)
+        .find(|foreign_key| foreign_key.name == name)
         .copied();
     let exclusion = definition
         .exclusions()
         .iter()
-        .find(|exclusion| exclusion.name == constraint.name)
+        .find(|exclusion| exclusion.name == name)
         .copied();
     let timing = key
         .map(|key| key.timing)
@@ -1660,14 +1663,20 @@ pub(crate) fn validate_deferred_constraints(
 ) -> Result<(), SqlError> {
     let mut index = 0;
     while index < txn.deferred_constraints().len() {
+        if txn.deferred_constraint_is_complete(index) {
+            index += 1;
+            continue;
+        }
         let obligation = txn.deferred_constraints()[index];
         let current = txn.current_constraint_identity(obligation.constraint);
         if !txn.constraint_identity_is_current(obligation.constraint) {
-            txn.clear_deferred_constraint(obligation);
+            txn.complete_deferred_constraint(index)?;
+            index += 1;
             continue;
         }
         let Some(timing) = constraint_timing(storage, current, txn.txid) else {
-            txn.clear_deferred_constraint(obligation);
+            txn.complete_deferred_constraint(index)?;
+            index += 1;
             continue;
         };
         if immediate_only
@@ -1678,7 +1687,8 @@ pub(crate) fn validate_deferred_constraints(
             continue;
         }
         validate_constraint_obligation(storage, current, obligation.rowid, txn.txid, arena)?;
-        txn.clear_deferred_constraint(obligation);
+        txn.complete_deferred_constraint(index)?;
+        index += 1;
     }
     Ok(())
 }
@@ -1688,7 +1698,14 @@ pub(crate) fn constraint_timing(
     constraint: crate::sql::txn::ConstraintIdentity,
     txid: u32,
 ) -> Option<crate::storage::ConstraintTiming> {
-    let table_index = constraint.table as usize;
+    let crate::sql::txn::ConstraintIdentity::Table { table, name, .. } = constraint else {
+        let crate::sql::txn::ConstraintIdentity::Trigger { slot, .. } = constraint else {
+            unreachable!()
+        };
+        let trigger = storage.trigger(usize::from(slot));
+        return trigger.visible_to(txid).then(|| trigger.kind.timing());
+    };
+    let table_index = table as usize;
     if table_index >= storage.table_count() || !storage.table(table_index).visible_to(txid) {
         return None;
     }
@@ -1696,20 +1713,20 @@ pub(crate) fn constraint_timing(
     definition
         .uniques()
         .iter()
-        .find(|key| key.name == constraint.name)
+        .find(|key| key.name == name)
         .map(|key| key.timing)
         .or_else(|| {
             definition
                 .fkeys()
                 .iter()
-                .find(|foreign_key| foreign_key.name == constraint.name)
+                .find(|foreign_key| foreign_key.name == name)
                 .map(|foreign_key| foreign_key.timing)
         })
         .or_else(|| {
             definition
                 .exclusions()
                 .iter()
-                .find(|exclusion| exclusion.name == constraint.name)
+                .find(|exclusion| exclusion.name == name)
                 .map(|exclusion| exclusion.timing)
         })
 }
@@ -1771,10 +1788,12 @@ fn named_constraint_timing(
 pub(crate) fn resolve_constraint_name(
     storage: &Storage,
     written: &crate::sql::ast::QualName<'_>,
+    mode: crate::sql::ast::ConstraintMode,
     txid: u32,
     output: &mut [crate::sql::txn::ConstraintIdentity],
 ) -> Result<usize, SqlError> {
-    let mut collect_schema = |schema: &str| -> Result<usize, SqlError> {
+    let mut collect_schema = |schema: &str| -> Result<(bool, usize), SqlError> {
+        let mut found = false;
         let mut count = 0;
         for table in 0..storage.table_count() {
             if !storage.table(table).visible_to(txid) {
@@ -1784,36 +1803,69 @@ pub(crate) fn resolve_constraint_name(
             if definition.schema.as_str() != schema {
                 continue;
             }
-            let Some(timing) = named_constraint_timing(definition, written.name) else {
-                continue;
-            };
-            if !timing.is_deferrable() {
-                return Err(sql_err!(
-                    sqlstate::WRONG_OBJECT_TYPE,
-                    "constraint \"{}\" is not deferrable",
-                    written.name
-                ));
+            if let Some(timing) = named_constraint_timing(definition, written.name) {
+                found = true;
+                if !timing.is_deferrable() && mode == crate::sql::ast::ConstraintMode::Deferred {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "constraint \"{}\" is not deferrable",
+                        written.name
+                    ));
+                }
+                if timing.is_deferrable() {
+                    if count == output.len() {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "SET CONSTRAINTS matches more than {} constraints",
+                            output.len()
+                        ));
+                    }
+                    output[count] = crate::sql::txn::ConstraintIdentity::Table {
+                        table: table as u32,
+                        name: crate::storage::SqlName::parse(written.name)?,
+                        generation: 0,
+                    };
+                    count += 1;
+                }
             }
-            if count == output.len() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "SET CONSTRAINTS matches more than {} constraints",
-                    output.len()
-                ));
+            for (slot, trigger) in storage.triggers_for_table(table, txid) {
+                if trigger.name_to(txid).as_str() != written.name {
+                    continue;
+                }
+                let crate::storage::TriggerKind::Constraint { timing, .. } = trigger.kind else {
+                    continue;
+                };
+                found = true;
+                if !timing.is_deferrable() && mode == crate::sql::ast::ConstraintMode::Deferred {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "constraint \"{}\" is not deferrable",
+                        written.name
+                    ));
+                }
+                if !timing.is_deferrable() {
+                    continue;
+                }
+                if count == output.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "SET CONSTRAINTS matches more than {} constraints",
+                        output.len()
+                    ));
+                }
+                output[count] = crate::sql::txn::ConstraintIdentity::Trigger {
+                    table: table as u32,
+                    slot: slot as u16,
+                };
+                count += 1;
             }
-            output[count] = crate::sql::txn::ConstraintIdentity {
-                table: table as u32,
-                name: crate::storage::SqlName::parse(written.name)?,
-                generation: 0,
-            };
-            count += 1;
         }
-        Ok(count)
+        Ok((found, count))
     };
 
     if let Some(schema) = written.schema {
-        let count = collect_schema(schema)?;
-        if count != 0 {
+        let (found, count) = collect_schema(schema)?;
+        if found {
             return Ok(count);
         }
     } else {
@@ -1822,8 +1874,8 @@ pub(crate) fn resolve_constraint_name(
                 continue;
             };
             let schema = storage.schema_def(*schema_slot as usize).name;
-            let count = collect_schema(schema.as_str())?;
-            if count != 0 {
+            let (found, count) = collect_schema(schema.as_str())?;
+            if found {
                 return Ok(count);
             }
         }

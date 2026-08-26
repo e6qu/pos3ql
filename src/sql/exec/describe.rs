@@ -2651,6 +2651,7 @@ pub fn infer_type_res(
             | "pg_get_constraintdef"
             | "pg_get_partkeydef"
             | "pg_get_functiondef"
+            | "pg_get_triggerdef"
             | "pg_get_function_arguments"
             | "pg_get_function_identity_arguments"
             | "pg_get_function_result"

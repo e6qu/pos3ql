@@ -52,7 +52,7 @@ ALTER TEXT SEARCH CONFIGURATION	missing	-
 ALTER TEXT SEARCH DICTIONARY	missing	-
 ALTER TEXT SEARCH PARSER	missing	-
 ALTER TEXT SEARCH TEMPLATE	missing	-
-ALTER TRIGGER	missing	-
+ALTER TRIGGER	complete	101_trigger_timing.sql
 ALTER TYPE	partial	63_enums.sql
 ALTER USER	partial	83_roles_acl.sql
 ALTER USER MAPPING	missing	-
@@ -104,7 +104,7 @@ CREATE TEXT SEARCH DICTIONARY	missing	-
 CREATE TEXT SEARCH PARSER	missing	-
 CREATE TEXT SEARCH TEMPLATE	missing	-
 CREATE TRANSFORM	missing	-
-CREATE TRIGGER	missing	-
+CREATE TRIGGER	complete	101_trigger_timing.sql
 CREATE TYPE	partial	63_enums.sql
 CREATE USER	partial	83_roles_acl.sql
 CREATE USER MAPPING	missing	-
@@ -152,7 +152,7 @@ DROP TEXT SEARCH DICTIONARY	missing	-
 DROP TEXT SEARCH PARSER	missing	-
 DROP TEXT SEARCH TEMPLATE	missing	-
 DROP TRANSFORM	missing	-
-DROP TRIGGER	missing	-
+DROP TRIGGER	complete	101_trigger_timing.sql
 DROP TYPE	complete	63_enums.sql
 DROP USER	partial	83_roles_acl.sql
 DROP USER MAPPING	missing	-
@@ -186,7 +186,7 @@ SECURITY LABEL	missing	-
 SELECT	complete	14_surface.sql
 SELECT INTO	complete	69_select_into.sql
 SET	partial	75_guc_mutation.sql
-SET CONSTRAINTS	missing	-
+SET CONSTRAINTS	complete	101_trigger_timing.sql
 SET ROLE	complete	83_roles_acl.sql
 SET SESSION AUTHORIZATION	complete	83_roles_acl.sql
 SET TRANSACTION	partial	05_transactions.sql

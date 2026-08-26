@@ -2288,6 +2288,10 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_trigger(storage, line)?;
                 }
+                Some("trgs") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    load_partition_trigger_state(storage, line)?;
+                }
                 Some("pol") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_policy(storage, line)?;
@@ -4895,8 +4899,6 @@ impl Checkpointer {
                 }
             };
             let function = storage.routine(usize::from(trigger.function));
-            let owner = storage.role(trigger.ownership.owner_to(0) as usize).name;
-            let mut howner = StackStr::<130>::new();
             let mut hname = StackStr::<130>::new();
             let mut hschema = StackStr::<130>::new();
             let mut htable = StackStr::<130>::new();
@@ -4904,6 +4906,8 @@ impl Checkpointer {
             let mut hfunction = StackStr::<130>::new();
             let mut hold_table = StackStr::<130>::new();
             let mut hnew_table = StackStr::<130>::new();
+            let mut hreferenced_schema = StackStr::<130>::new();
+            let mut hreferenced_table = StackStr::<130>::new();
             let mut hwhen = StackStr::<{ crate::storage::TRIGGER_WHEN_MAX * 2 }>::new();
             let mut harguments = StackStr::<
                 {
@@ -4911,9 +4915,6 @@ impl Checkpointer {
                         * (2 + crate::storage::TRIGGER_ARGUMENT_BYTES * 2)
                 },
             >::new();
-            for byte in owner.as_str().as_bytes() {
-                let _ = write!(howner, "{byte:02x}");
-            }
             for byte in trigger.name.as_str().as_bytes() {
                 let _ = write!(hname, "{byte:02x}");
             }
@@ -4951,19 +4952,27 @@ impl Checkpointer {
                     let _ = write!(harguments, "{byte:02x}");
                 }
             }
+            if let Some(referenced) = trigger.kind.referenced_table() {
+                let definition = storage.table_def(usize::from(referenced), 0);
+                for byte in definition.schema.as_str().as_bytes() {
+                    let _ = write!(hreferenced_schema, "{byte:02x}");
+                }
+                for byte in definition.name.as_str().as_bytes() {
+                    let _ = write!(hreferenced_table, "{byte:02x}");
+                }
+            }
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "trg {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     trigger.created_at,
                     target_kind,
-                    howner.as_str(),
                     hname.as_str(),
                     hschema.as_str(),
                     htable.as_str(),
                     hfunction_schema.as_str(),
                     hfunction.as_str(),
-                    trigger.timing,
+                    trigger.timing.code(),
                     trigger.level.code(),
                     trigger.events.bits(),
                     trigger.update_columns,
@@ -4983,7 +4992,45 @@ impl Checkpointer {
                         "-"
                     },
                     harguments.as_str(),
+                    u8::from(matches!(
+                        trigger.kind,
+                        crate::storage::TriggerKind::Constraint { .. }
+                    )),
+                    trigger.kind.timing().code(),
+                    if hreferenced_schema.as_str().is_empty() {
+                        "-"
+                    } else {
+                        hreferenced_schema.as_str()
+                    },
+                    if hreferenced_table.as_str().is_empty() {
+                        "-"
+                    } else {
+                        hreferenced_table.as_str()
+                    },
                     trigger.enabled.code(),
+                ),
+            )?;
+        }
+        for (trigger_slot, table_slot, enabled) in storage.partition_trigger_states() {
+            use core::fmt::Write;
+            let trigger = storage.trigger(trigger_slot);
+            let table = storage.table_def(table_slot, 0);
+            let mut schema = StackStr::<130>::new();
+            let mut table_name = StackStr::<130>::new();
+            for byte in table.schema.as_str().as_bytes() {
+                let _ = write!(schema, "{byte:02x}");
+            }
+            for byte in table.name.as_str().as_bytes() {
+                let _ = write!(table_name, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "trgs {} {} {} {}",
+                    trigger.created_at,
+                    schema.as_str(),
+                    table_name.as_str(),
+                    enabled.code(),
                 ),
             )?;
         }
@@ -6888,11 +6935,6 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     }
     let created_at = parse_field(words.next(), "trigger created_at")?;
     let target_kind: u8 = parse_field(words.next(), "trigger target")?;
-    let owner = decode_hex_name(
-        words
-            .next()
-            .ok_or(CheckpointSetupError::Corrupt("trigger owner"))?,
-    )?;
     let name = sql_name(&decode_hex_name(
         words
             .next()
@@ -6918,7 +6960,9 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
             .next()
             .ok_or(CheckpointSetupError::Corrupt("trigger function"))?,
     )?;
-    let timing: u8 = parse_field(words.next(), "trigger timing")?;
+    let timing =
+        crate::sql::ast::TriggerTiming::from_code(parse_field(words.next(), "trigger timing")?)
+            .ok_or(CheckpointSetupError::Corrupt("trigger timing"))?;
     let level =
         crate::sql::ast::TriggerLevel::from_code(parse_field(words.next(), "trigger level")?)
             .ok_or(CheckpointSetupError::Corrupt("trigger level"))?;
@@ -7016,13 +7060,36 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
                 error.message.as_str()
             ))
         })?;
+    let constraint = match parse_field::<u8>(words.next(), "trigger kind")? {
+        0 => false,
+        1 => true,
+        _ => return Err(CheckpointSetupError::Corrupt("trigger kind")),
+    };
+    let constraint_timing = crate::storage::ConstraintTiming::from_code(parse_field::<u8>(
+        words.next(),
+        "constraint trigger timing",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt("constraint trigger timing"))?;
+    let referenced_schema = match words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("trigger referenced schema"))?
+    {
+        "-" => None,
+        value => Some(decode_hex_name(value)?),
+    };
+    let referenced_table = match words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("trigger referenced table"))?
+    {
+        "-" => None,
+        value => Some(decode_hex_name(value)?),
+    };
     let enabled = crate::storage::TriggerEnabled::from_code(parse_field::<u8>(
         words.next(),
         "trigger enabled",
     )?)
     .ok_or(CheckpointSetupError::Corrupt("trigger enabled"))?;
-    if timing > 2
-        || (matches!(level, crate::sql::ast::TriggerLevel::Row) && events.has_truncate())
+    if (matches!(level, crate::sql::ast::TriggerLevel::Row) && events.has_truncate())
         || !transition_tables.is_valid_for(timing, level, events)
         || (!matches!(
             transition_tables,
@@ -7032,11 +7099,6 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     {
         return Err(CheckpointSetupError::Corrupt("malformed trigger record"));
     }
-    let owner = storage
-        .find_role(&owner)
-        .ok_or(CheckpointSetupError::Corrupt(
-            "trigger owner does not exist",
-        ))?;
     let target = match (
         target_kind,
         storage.resolve_relation(Some(&schema), &table_name, 0),
@@ -7053,17 +7115,46 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
             ));
         }
     };
-    if (matches!(target, crate::storage::TriggerTarget::Table(_)) && timing == 2)
-        || (matches!(target, crate::storage::TriggerTarget::View(_))
-            && (timing != 2
-                || !matches!(level, crate::sql::ast::TriggerLevel::Row)
-                || events.has_truncate()
-                || update_columns != 0
-                || !matches!(
-                    transition_tables,
-                    crate::storage::TriggerTransitionTables::None
-                )))
+    let kind = if constraint {
+        let referenced_table = match (referenced_schema.as_deref(), referenced_table.as_deref()) {
+            (Some(schema), Some(table)) => match storage.resolve_relation(Some(schema), table, 0) {
+                Some(crate::storage::ResolvedRelation::Table(slot)) => Some(slot as u16),
+                _ => {
+                    return Err(CheckpointSetupError::Corrupt(
+                        "constraint trigger referenced table does not exist",
+                    ));
+                }
+            },
+            (None, None) => None,
+            _ => {
+                return Err(CheckpointSetupError::Corrupt(
+                    "constraint trigger referenced table is incomplete",
+                ));
+            }
+        };
+        crate::storage::TriggerKind::Constraint {
+            referenced_table,
+            timing: constraint_timing,
+        }
+    } else if constraint_timing != crate::storage::ConstraintTiming::NotDeferrable
+        || referenced_schema.is_some()
+        || referenced_table.is_some()
     {
+        return Err(CheckpointSetupError::Corrupt(
+            "ordinary trigger carries constraint state",
+        ));
+    } else {
+        crate::storage::TriggerKind::Ordinary
+    };
+    if !crate::storage::trigger_shape_is_valid(
+        matches!(target, crate::storage::TriggerTarget::View(_)),
+        matches!(kind, crate::storage::TriggerKind::Constraint { .. }),
+        timing,
+        level,
+        events,
+        update_columns,
+        transition_tables,
+    ) {
         return Err(CheckpointSetupError::Corrupt(
             "invalid trigger relation or timing",
         ));
@@ -7084,10 +7175,10 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     storage
         .restore_trigger(
             created_at,
-            owner as u16,
             crate::storage::TriggerSpec {
                 name,
                 target,
+                kind,
                 function,
                 timing,
                 level,
@@ -7106,6 +7197,73 @@ fn load_trigger(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
             ))
         })?;
     Ok(())
+}
+
+fn load_partition_trigger_state(
+    storage: &mut Storage,
+    line: &str,
+) -> Result<(), CheckpointSetupError> {
+    let mut words = line.split_ascii_whitespace();
+    if words.next() != Some("trgs") {
+        return Err(CheckpointSetupError::Corrupt(
+            "partition trigger state record",
+        ));
+    }
+    let created_at: u64 = parse_field(words.next(), "partition trigger created_at")?;
+    let schema = decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("partition trigger schema"))?,
+    )?;
+    let table_name = decode_hex_name(
+        words
+            .next()
+            .ok_or(CheckpointSetupError::Corrupt("partition trigger table"))?,
+    )?;
+    let enabled = crate::storage::TriggerEnabled::from_code(parse_field::<u8>(
+        words.next(),
+        "partition trigger enabled",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt("partition trigger enabled"))?;
+    if words.next().is_some() {
+        return Err(CheckpointSetupError::Corrupt(
+            "malformed partition trigger state",
+        ));
+    }
+    let trigger = storage
+        .triggers_with_slots_visible_to(0)
+        .find_map(|(slot, trigger)| (trigger.created_at == created_at).then_some((slot, trigger)))
+        .ok_or(CheckpointSetupError::Corrupt(
+            "partition trigger parent does not exist",
+        ))?;
+    let table = match storage.resolve_relation(Some(&schema), &table_name, 0) {
+        Some(crate::storage::ResolvedRelation::Table(table)) => table,
+        _ => {
+            return Err(CheckpointSetupError::Corrupt(
+                "partition trigger table does not exist",
+            ));
+        }
+    };
+    let crate::storage::TriggerTarget::Table(parent) = trigger.1.target else {
+        return Err(CheckpointSetupError::Corrupt(
+            "view trigger has partition state",
+        ));
+    };
+    if !matches!(trigger.1.level, crate::sql::ast::TriggerLevel::Row)
+        || !storage.partition_descends_from(table, usize::from(parent), 0)
+    {
+        return Err(CheckpointSetupError::Corrupt(
+            "partition trigger state targets an unrelated table",
+        ));
+    }
+    storage
+        .restore_partition_trigger_state(trigger.0, table, enabled)
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest partition trigger rejected: {}",
+                error.message.as_str()
+            ))
+        })
 }
 
 fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupError> {

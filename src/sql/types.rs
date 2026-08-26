@@ -83,6 +83,7 @@ pub mod oid {
     pub const UNKNOWN: i32 = 705;
     /// Anonymous composite / record type.
     pub const RECORD: i32 = 2249;
+    pub const RECORD_ARRAY: i32 = 2287;
     pub const REGPROC: i32 = 24;
     pub const REGPROCEDURE: i32 = 2202;
     pub const REGOPER: i32 = 2203;
@@ -678,6 +679,7 @@ impl ColType {
             oid::MACADDR => Some(Self::Macaddr),
             oid::MACADDR8 => Some(Self::Macaddr8),
             oid::RECORD => Some(Self::Record),
+            oid::RECORD_ARRAY => Some(Self::Array(ArrElem::Record)),
             _ => None,
         };
         if scalar.is_some() {
@@ -1062,6 +1064,7 @@ impl ColType {
             c if (MULTIRANGE_CODE_BASE..MULTIRANGE_CODE_BASE + RANGE_KINDS).contains(&c) => {
                 Self::Multirange(RangeKind::from_code(c - MULTIRANGE_CODE_BASE)?)
             }
+            c if c == ARRAY_CODE_BASE + ArrElem::Record.code() => return None,
             c if c >= ARRAY_CODE_BASE => Self::Array(ArrElem::from_code(c - ARRAY_CODE_BASE)?),
             _ => return None,
         })
@@ -1114,6 +1117,9 @@ pub enum ArrElem {
     Regclass,
     Regnamespace,
     Regrole,
+    /// Anonymous records are legal in transient arrays such as recursive CTE
+    /// search paths, but remain invalid as stored table-column types.
+    Record,
     /// One of PostgreSQL's six built-in range types. Keeping the subtype in
     /// the element identity makes `int4range[]` and `numrange[]` distinct
     /// durable and wire types rather than text arrays.
@@ -1253,6 +1259,7 @@ impl ArrElem {
             ArrElem::Regclass => "_regclass",
             ArrElem::Regnamespace => "_regnamespace",
             ArrElem::Regrole => "_regrole",
+            ArrElem::Record => "_record",
             ArrElem::Range(kind) => match kind {
                 RangeKind::Int4 => "_int4range",
                 RangeKind::Int8 => "_int8range",
@@ -1317,6 +1324,7 @@ impl ArrElem {
             ArrElem::Regclass => "regclass[]",
             ArrElem::Regnamespace => "regnamespace[]",
             ArrElem::Regrole => "regrole[]",
+            ArrElem::Record => "record[]",
             ArrElem::Range(kind) => match kind {
                 RangeKind::Int4 => "int4range[]",
                 RangeKind::Int8 => "int8range[]",
@@ -1388,6 +1396,7 @@ impl ArrElem {
                 oid::REGROLE => ArrElem::Regrole,
                 _ => return None,
             },
+            Datum::Record(_) => ArrElem::Record,
             Datum::Range { kind, .. } => ArrElem::Range(*kind),
             Datum::Multirange { kind, .. } => ArrElem::Multirange(*kind),
             Datum::Enum { slot, .. } => ArrElem::Enum(*slot),
@@ -1421,6 +1430,7 @@ impl ArrElem {
             ColType::Regclass => return Some(ArrElem::Regclass),
             ColType::Regnamespace => return Some(ArrElem::Regnamespace),
             ColType::Regrole => return Some(ArrElem::Regrole),
+            ColType::Record => return Some(ArrElem::Record),
             ColType::Range(kind) => return Some(ArrElem::Range(kind)),
             ColType::Multirange(kind) => return Some(ArrElem::Multirange(kind)),
             _ => {}
@@ -1490,6 +1500,7 @@ impl ArrElem {
             ArrElem::Regclass => ColType::Regclass,
             ArrElem::Regnamespace => ColType::Regnamespace,
             ArrElem::Regrole => ColType::Regrole,
+            ArrElem::Record => ColType::Record,
             ArrElem::Range(kind) => ColType::Range(kind),
             ArrElem::Multirange(kind) => ColType::Multirange(kind),
             ArrElem::Enum(slot) => ColType::Enum(slot),
@@ -1550,6 +1561,7 @@ impl ArrElem {
             ArrElem::Regclass => oid::REGCLASS_ARRAY,
             ArrElem::Regnamespace => oid::REGNAMESPACE_ARRAY,
             ArrElem::Regrole => oid::REGROLE_ARRAY,
+            ArrElem::Record => oid::RECORD_ARRAY,
             ArrElem::Range(kind) => kind.array_oid(),
             ArrElem::Multirange(kind) => kind.multirange_array_oid(),
             ArrElem::Enum(slot) => oid::enum_array_oid(slot),
@@ -1608,6 +1620,7 @@ impl ArrElem {
             ArrElem::Regclass => 48,
             ArrElem::Regnamespace => 49,
             ArrElem::Regrole => 50,
+            ArrElem::Record => 128,
             ArrElem::Range(kind) => 51 + kind.code(),
             ArrElem::Multirange(kind) => 57 + kind.code(),
             ArrElem::Enum(slot) => Self::ENUM_CODE_BASE + slot as u8,
@@ -1655,6 +1668,7 @@ impl ArrElem {
             48 => ArrElem::Regclass,
             49 => ArrElem::Regnamespace,
             50 => ArrElem::Regrole,
+            128 => ArrElem::Record,
             51..=56 => ArrElem::Range(RangeKind::from_code(c - 51)?),
             57..=62 => ArrElem::Multirange(RangeKind::from_code(c - 57)?),
             c if (Self::ENUM_CODE_BASE..Self::ENUM_CODE_BASE + crate::storage::MAX_ENUMS as u8)
@@ -2939,6 +2953,17 @@ mod code_roundtrip_tests {
             seen.push((c, t));
         }
         assert_eq!(ColType::from_code(ColType::Record.code()), None);
+        assert_eq!(
+            ColType::from_code(ColType::Array(ArrElem::Record).code()),
+            None
+        );
+        assert_ne!(
+            ColType::Array(ArrElem::Record).code(),
+            ColType::Array(ArrElem::Composite(
+                crate::storage::MAX_COMPOSITES as u16 - 1
+            ))
+            .code()
+        );
         assert_eq!(
             ColType::from_code(ColType::Enum(0).code()),
             Some(ColType::Enum(ColType::ENUM_SLOT_UNRESOLVED))

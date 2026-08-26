@@ -2214,6 +2214,7 @@ pub fn infer_type_res(
         return Ok((result.type_oid, result.ctype.typlen()));
     }
     Ok(match expression {
+        Expr::RecursiveState { ctype, .. } => of(*ctype),
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
         Expr::Param(index) => bound_parameter_type_oid(*index)
             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))

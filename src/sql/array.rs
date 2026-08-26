@@ -178,9 +178,12 @@ pub fn build_shaped<'a>(
     let header = PREFIX + shape.dimension_count() * 6;
     let mut total = header;
     for item in items {
-        total = total
-            .checked_add(4 + rowenc::encoded_len(core::slice::from_ref(item)))
-            .ok_or_else(array_too_large)?;
+        let length = if matches!(item, Datum::Record(_)) {
+            2 + crate::sql::exec::projected_value_len(item)
+        } else {
+            rowenc::encoded_len(core::slice::from_ref(item))
+        };
+        total = total.checked_add(4 + length).ok_or_else(array_too_large)?;
     }
     let out = arena
         .alloc_slice_with(total, |_| 0u8)
@@ -195,10 +198,22 @@ pub fn build_shaped<'a>(
         at += 6;
     }
     for item in items {
-        let length = rowenc::encoded_len(core::slice::from_ref(item));
+        let record = matches!(item, Datum::Record(_));
+        let length = if record {
+            2 + crate::sql::exec::projected_value_len(item)
+        } else {
+            rowenc::encoded_len(core::slice::from_ref(item))
+        };
         out[at..at + 4].copy_from_slice(&(length as u32).to_le_bytes());
         at += 4;
-        rowenc::encode(core::slice::from_ref(item), &mut out[at..at + length]);
+        if record {
+            crate::sql::exec::encode_projected_into(
+                core::slice::from_ref(item),
+                &mut out[at..at + length],
+            )?;
+        } else {
+            rowenc::encode(core::slice::from_ref(item), &mut out[at..at + length]);
+        }
         at += length;
     }
     Ok(out)
@@ -314,6 +329,12 @@ pub fn get<'a>(raw: &'a [u8], element: ArrElem, index: usize) -> Option<Datum<'a
         let length = u32::from_le_bytes(raw.get(at..at + 4)?.try_into().ok()?) as usize;
         at += 4;
         if current == index {
+            if element == ArrElem::Record {
+                return Some(crate::sql::exec::decode_projected_pub(
+                    raw.get(at..at + length)?,
+                    0,
+                ));
+            }
             let mut out = [Datum::Null; 1];
             rowenc::decode(raw.get(at..at + length)?, &schema, &mut out).ok()?;
             return Some(out[0]);
@@ -321,6 +342,33 @@ pub fn get<'a>(raw: &'a [u8], element: ArrElem, index: usize) -> Option<Datum<'a
         at += length;
     }
     None
+}
+
+pub(crate) fn get_record<'a>(
+    raw: &'a [u8],
+    index: usize,
+    arena: &'a Arena,
+) -> Result<Option<Datum<'a>>, SqlError> {
+    let shape = shape(raw).expect("array datum must carry a canonical valid shape");
+    if index >= shape.element_count() {
+        return Ok(None);
+    }
+    let mut at = payload_offset(shape);
+    for current in 0..shape.element_count() {
+        let length = u32::from_le_bytes(
+            raw.get(at..at + 4)
+                .ok_or_else(invalid_shape)?
+                .try_into()
+                .map_err(|_| invalid_shape())?,
+        ) as usize;
+        at += 4;
+        if current == index {
+            let payload = raw.get(at..at + length).ok_or_else(invalid_shape)?;
+            return crate::sql::exec::decode_projected_col_record(payload, 0, arena).map(Some);
+        }
+        at += length;
+    }
+    Ok(None)
 }
 
 pub fn parse_literal<'a>(

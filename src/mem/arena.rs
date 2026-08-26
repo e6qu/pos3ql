@@ -87,6 +87,19 @@ impl Arena {
         }
     }
 
+    pub(crate) fn alloc_atomic_usize(
+        &self,
+        value: usize,
+    ) -> Result<&core::sync::atomic::AtomicUsize, ArenaFull> {
+        let ptr = self
+            .alloc_raw(Layout::new::<core::sync::atomic::AtomicUsize>())?
+            .cast::<core::sync::atomic::AtomicUsize>();
+        unsafe {
+            ptr.write(core::sync::atomic::AtomicUsize::new(value));
+            Ok(&*ptr)
+        }
+    }
+
     #[expect(
         clippy::mut_from_ref,
         reason = "each call returns a disjoint region; reset() takes &mut self, so no returned borrow can outlive rewinding"

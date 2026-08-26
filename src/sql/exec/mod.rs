@@ -14120,8 +14120,7 @@ fn transition_relation<'a>(
             column_names: names,
             column_types: types,
             column_collations: collations,
-            rows,
-            external_run: None,
+            source: crate::sql::ast::MaterializedCteSource::Inline(rows),
         })
         .map(|relation| &*relation)
         .map_err(|_| super::query::arena_full_pub())
@@ -18590,6 +18589,14 @@ pub fn create_table_as(
         } else {
             rename[i]
         };
+        if matches!(ctype, ColType::Record | ColType::Array(ArrElem::Record)) {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                "column \"{}\" has pseudo-type {}",
+                col_name,
+                ctype.internal_name()
+            ));
+        }
         let parsed = match SqlName::parse(col_name) {
             Ok(n) => n,
             Err(e) => return sql_fail(e),
@@ -28018,7 +28025,8 @@ fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlE
         | Expr::BitLit(_)
         | Expr::Param(_)
         | Expr::DefaultMarker
-        | Expr::WholeRow(_) => Ok(()),
+        | Expr::WholeRow(_)
+        | Expr::RecursiveState { .. } => Ok(()),
     }
 }
 
@@ -30950,13 +30958,18 @@ pub(crate) fn binary_field_plan<'a>(
         Datum::Array { element, raw }
             if matches!(
                 element.to_coltype(),
-                crate::sql::types::ColType::Composite(_)
+                crate::sql::types::ColType::Composite(_) | crate::sql::types::ColType::Record
             ) =>
         {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
             let mut values = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
             for (index, value) in values.iter_mut().take(shape.element_count()).enumerate() {
-                *value = match crate::sql::array::get(raw, *element, index) {
+                let decoded = if *element == crate::sql::types::ArrElem::Record {
+                    crate::sql::array::get_record(raw, index, arena)?
+                } else {
+                    crate::sql::array::get(raw, *element, index)
+                };
+                *value = match decoded {
                     Some(Datum::CompositeText {
                         slot,
                         physical_fields,

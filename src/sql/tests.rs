@@ -1483,11 +1483,11 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
     let transaction = TxnState::new(budget, 1024).unwrap();
     let mut responder =
         Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
-    assert!(
-        engine
-            .describe(sql_text, &arena, &transaction, None, &mut responder)
-            .unwrap()
-    );
+    let described = engine
+        .describe(sql_text, &arena, &transaction, None, &mut responder)
+        .unwrap();
+    drop(responder);
+    assert!(described, "{}", String::from_utf8_lossy(buffer.readable()));
     buffer.readable().to_vec()
 }
 
@@ -33915,6 +33915,54 @@ fn common_table_expressions() {
         "{}",
         String::from_utf8_lossy(&recursive)
     );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) \
+             SEARCH DEPTH FIRST BY n SET ord SELECT n, ord, pg_typeof(ord) FROM c ORDER BY ord"
+        )),
+        [
+            "1|{(1)}|record[]",
+            "2|{(1),(2)}|record[]",
+            "3|{(1),(2),(3)}|record[]"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH RECURSIVE c(n) AS (\
+               SELECT 1 UNION ALL SELECT CASE WHEN n = 3 THEN 1 ELSE n + 1 END FROM c\
+             ) CYCLE n SET cyc USING path \
+             SELECT n, cyc, path, pg_typeof(cyc), pg_typeof(path) FROM c"
+        )),
+        [
+            "1|f|{(1)}|boolean|record[]",
+            "2|f|{(1),(2)}|boolean|record[]",
+            "3|f|{(1),(2),(3)}|boolean|record[]",
+            "1|t|{(1),(2),(3),(1)}|boolean|record[]"
+        ]
+    );
+    let breadth = run_with(
+        &mut e,
+        &mut b,
+        "WITH RECURSIVE c(n, label) AS (\
+               SELECT 1, 'a'::text UNION ALL SELECT n + 1, label || 'x' FROM c WHERE n < 3\
+             ) SEARCH BREADTH FIRST BY n, label SET ord \
+               CYCLE n, label SET cyc TO 'Y' DEFAULT 'N' USING path \
+             SELECT n, label, ord, cyc, path, pg_typeof(ord), pg_typeof(cyc) FROM c ORDER BY ord",
+    );
+    assert_eq!(
+        data_rows(&breadth),
+        [
+            "1|a|(0,1,a)|N|{\"(1,a)\"}|record|text",
+            "2|ax|(1,2,ax)|N|{\"(1,a)\",\"(2,ax)\"}|record|text",
+            "3|axx|(2,3,axx)|N|{\"(1,a)\",\"(2,ax)\",\"(3,axx)\"}|record|text"
+        ],
+        "{}",
+        String::from_utf8_lossy(&breadth)
+    );
     // UNION (deduplicating) terminates a cyclic recursion.
     assert_eq!(
         data_rows(&run_with(
@@ -34026,6 +34074,205 @@ fn common_table_expressions() {
         ))
         .contains("42P19")
     );
+}
+
+#[test]
+fn recursive_cte_search_and_cycle() {
+    let (mut e, mut b) = test_engine();
+    let generated_state = run_with(
+        &mut e,
+        &mut b,
+        "WITH RECURSIVE c(n) AS (\
+           SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3 AND c.ord IS NOT NULL\
+         ) SEARCH DEPTH FIRST BY n SET ord SELECT n, ord FROM c ORDER BY n",
+    );
+    assert_eq!(
+        data_rows(&generated_state),
+        ["1|{(1)}", "2|{(1),(2)}", "3|{(1),(2),(3)}"],
+        "{}",
+        String::from_utf8_lossy(&generated_state)
+    );
+
+    let described = describe_with(
+        &mut e,
+        &mut b,
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2) \
+         SEARCH BREADTH FIRST BY n SET ord CYCLE n SET cyc USING path \
+         SELECT n, ord, cyc, path FROM c",
+    );
+    assert_eq!(
+        row_description_type_oids(&described),
+        [
+            crate::sql::types::oid::INT4,
+            crate::sql::types::oid::RECORD,
+            crate::sql::types::oid::BOOL,
+            crate::sql::types::oid::RECORD_ARRAY,
+        ]
+    );
+    assert_eq!(
+        row_description_names(&described),
+        ["n", "ord", "cyc", "path"]
+    );
+
+    for query in [
+        "WITH c(n) AS (SELECT 1) SEARCH DEPTH FIRST BY n SET ord SELECT * FROM c",
+        "WITH RECURSIVE c(n) AS (SELECT 1) CYCLE n SET cyc USING path SELECT * FROM c",
+        "WITH RECURSIVE c(n) AS (INSERT INTO missing VALUES (1) RETURNING n) \
+         SEARCH DEPTH FIRST BY n SET ord SELECT * FROM c",
+    ] {
+        let rejected = run_with(&mut e, &mut b, query);
+        assert!(
+            String::from_utf8_lossy(&rejected).contains("ERROR"),
+            "{query}: {}",
+            String::from_utf8_lossy(&rejected)
+        );
+    }
+
+    let quoted = run_with(
+        &mut e,
+        &mut b,
+        "WITH RECURSIVE c(\"N\") AS (SELECT 1 UNION ALL SELECT \"N\" + 1 FROM c WHERE \"N\" < 2) \
+         SEARCH DEPTH FIRST BY \"N\" SET \"Path\" SELECT \"N\", \"Path\" FROM c",
+    );
+    assert_eq!(
+        data_rows(&quoted),
+        ["1|{(1)}", "2|{(1),(2)}"],
+        "{}",
+        String::from_utf8_lossy(&quoted)
+    );
+
+    let arena = Arena::new(&mut b, "recursive SEARCH/CYCLE binary", 1 << 18).unwrap();
+    let mut buffer = crate::mem::FixedBuf::new(&mut b, "recursive binary send", 1 << 18).unwrap();
+    let mut transaction = TxnState::new(&mut b, 128).unwrap();
+    let mut pool = test_pool(&mut b);
+    let mut cursors = test_cursors(&mut b);
+    let mut guc = GucState::new();
+    {
+        let mut responder =
+            Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
+        assert!(matches!(
+            e.execute_extended(
+                "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2) \
+                 SEARCH BREADTH FIRST BY n SET ord CYCLE n SET cyc USING path \
+                 SELECT ord, path FROM c WHERE n = 1",
+                &arena,
+                &[],
+                &[],
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+                false,
+            )
+            .unwrap(),
+            ExtendedExecutionStatus::Complete(true)
+        ));
+    }
+    let binary = buffer.readable();
+    let row_at = binary.iter().position(|byte| *byte == b'D').unwrap();
+    let payload = &binary[row_at + 5..];
+    assert_eq!(i16::from_be_bytes(payload[..2].try_into().unwrap()), 2);
+    assert_eq!(i32::from_be_bytes(payload[2..6].try_into().unwrap()), 32);
+    assert_eq!(i32::from_be_bytes(payload[6..10].try_into().unwrap()), 2);
+    assert_eq!(i32::from_be_bytes(payload[10..14].try_into().unwrap()), 20);
+    assert_eq!(i32::from_be_bytes(payload[26..30].try_into().unwrap()), 23);
+    assert_eq!(i32::from_be_bytes(payload[38..42].try_into().unwrap()), 40);
+    assert_eq!(
+        i32::from_be_bytes(payload[50..54].try_into().unwrap()),
+        2249
+    );
+}
+
+#[test]
+fn recursive_cte_search_cycle_uses_provider_neutral_spill() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_NAMESPACE.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("recursive-search-cycle-spill-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!(
+        "recursive-search-cycle-spill-{}-{sequence}",
+        std::process::id()
+    );
+    config.object_store_response_bytes = 1 << 20;
+    config.work_arena_bytes = 1 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH RECURSIVE c(n) AS (\
+           SELECT 1 UNION ALL SELECT CASE WHEN n = 8 THEN 1 ELSE n + 1 END FROM c\
+         ) SEARCH DEPTH FIRST BY n SET ord CYCLE n SET cyc USING path \
+         SELECT n, cyc, cardinality(path) FROM c",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1|f|1", "2|f|2", "3|f|3", "4|f|4", "5|f|5", "6|f|6", "7|f|7", "8|f|8", "1|t|9",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    for statement in [
+        "CREATE VIEW invalid_search_view AS \
+           WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2) \
+           SEARCH DEPTH FIRST BY n SET ord SELECT n, ord FROM c",
+        "CREATE TABLE invalid_cycle_table AS \
+           WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2) \
+           CYCLE n SET cyc USING path SELECT n, path FROM c",
+        "CREATE MATERIALIZED VIEW invalid_cycle_materialized AS \
+           WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2) \
+           CYCLE n SET cyc USING path SELECT n, path FROM c",
+    ] {
+        let rejected = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&rejected).contains("record[]"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&rejected)
+        );
+    }
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW durable_cycle_view AS \
+           WITH RECURSIVE c(n) AS (\
+             SELECT 1 UNION ALL SELECT CASE WHEN n = 3 THEN 1 ELSE n + 1 END FROM c\
+           ) SEARCH DEPTH FIRST BY n SET ord CYCLE n SET cyc USING path \
+           SELECT n, cyc FROM c",
+    );
+    assert!(
+        String::from_utf8_lossy(&created).contains("CREATE VIEW"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_rows = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT n, cyc FROM durable_cycle_view",
+    );
+    assert_eq!(
+        data_rows(&recovered_rows),
+        ["1|f", "2|f", "3|f", "1|t"],
+        "{}",
+        String::from_utf8_lossy(&recovered_rows)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

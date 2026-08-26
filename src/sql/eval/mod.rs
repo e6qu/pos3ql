@@ -287,6 +287,14 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    fn recursive_state(&self, qualifier: &str, _index: usize) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::INVALID_COLUMN_REFERENCE,
+            "recursive state for \"{}\" is unavailable",
+            qualifier
+        ))
+    }
+
     /// The scope-resolved identity of a column reference, when this lookup can
     /// name one — used to match a grouping key spelled `a` against a select
     /// item spelled `t.a` (PostgreSQL matches grouping keys semantically, not
@@ -532,6 +540,10 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
 impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError> {
         (**self).lookup(qualifier, name)
+    }
+
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'a>, SqlError> {
+        (**self).recursive_state(qualifier, index)
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
@@ -1136,6 +1148,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         | Expr::RoutineParam { .. }
         | Expr::WholeRow(_)
         | Expr::SchemaColumn { .. }
+        | Expr::RecursiveState { .. }
         | Expr::Param(_)
         | Expr::DefaultMarker => Ok(None),
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
@@ -1454,6 +1467,9 @@ pub fn eval_full<'a>(
                 .map_err(|_| arena_full())?;
             materialize_named_composite(row.lookup(Some(composed), name)?, hooks, arena)
         }
+        Expr::RecursiveState {
+            qualifier, index, ..
+        } => row.recursive_state(qualifier, index as usize),
         Expr::Param(n) => params.get(n as usize - 1).copied().ok_or_else(|| {
             sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,

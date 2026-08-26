@@ -1162,5 +1162,6 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         | ArraySubquery(_)
         | InSubquery { .. }
         | QuantifiedSubquery { .. } => 1000,
+        RecursiveState { .. } => 0,
     }
 }

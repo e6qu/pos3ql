@@ -816,6 +816,21 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         }
     }
 
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
+        let table = self.scope.table_index(qualifier)?;
+        let visible = self.scope.defs[table].expect("resolved").n_columns;
+        self.values[table]
+            .and_then(|values| values.get(visible + index))
+            .copied()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "recursive state for \"{}\" is unavailable",
+                    qualifier
+                )
+            })
+    }
+
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
         let entry = self.scope.find_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
@@ -921,6 +936,16 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'a>, SqlError> {
+        match self.inner.recursive_state(qualifier, index) {
+            Ok(value) => Ok(value),
+            Err(error) => match self.outer {
+                Some(outer) => outer.recursive_state(qualifier, index),
+                None => Err(error),
+            },
+        }
+    }
+
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         match self.inner.whole_row_present(table) {
             Ok(v) => Ok(v),
@@ -1935,19 +1960,27 @@ fn scan_source_mode<'a>(
             match bound[t] {
                 Some(BoundRow::Encoded(bytes)) => {
                     if scope.derived[t].is_some() {
-                        for (c, slot) in buffer.iter_mut().enumerate().take(def.n_columns) {
+                        let width = crate::sql::exec::projected_row_width(bytes);
+                        if width > buffer.len() {
+                            return Err(sql_err!(
+                                sqlstate::TOO_MANY_COLUMNS,
+                                "recursive row has too many columns"
+                            ));
+                        }
+                        for (c, slot) in buffer.iter_mut().enumerate().take(width) {
                             // Structural decode: a record column comes back
                             // as a `Datum::Record` (fields in the arena), so
                             // field access sees its shape.
                             *slot = crate::sql::exec::decode_projected_col_record(bytes, c, arena)?;
                         }
+                        values[t] = Some(&buffer[..width]);
                     } else {
                         let mut schema = [ColType::Bool; MAX_COLUMNS];
                         def.schema(&mut schema);
                         rowenc::decode(bytes, &schema[..def.n_columns], buffer)?;
                         refresh_catalog_object_names(storage, txid, buffer, arena)?;
+                        values[t] = Some(&buffer[..def.n_columns]);
                     }
-                    values[t] = Some(&buffer[..def.n_columns]);
                 }
                 Some(BoundRow::Values(row_values)) => values[t] = Some(row_values),
                 None => values[t] = Some(&[]), // outer-join null row

@@ -1194,7 +1194,10 @@ fn ungrouped_column<'e, 'a>(
             .find_map(|e| ungrouped_column(e, group_by, scope, storage, txid))
     };
     match expression {
-        Expr::Column { .. } | Expr::WholeRow(_) | Expr::SchemaColumn { .. } => Some(expression),
+        Expr::Column { .. }
+        | Expr::WholeRow(_)
+        | Expr::SchemaColumn { .. }
+        | Expr::RecursiveState { .. } => Some(expression),
         Expr::RoutineParam {
             qualifier, name, ..
         } => scope.find_column(*qualifier, name).ok().map(|_| expression),

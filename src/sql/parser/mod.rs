@@ -1606,6 +1606,8 @@ impl<'a> Parser<'a> {
             columns: &[],
             recursive: false,
             materialization: crate::sql::ast::CteMaterialization::Default,
+            search: None,
+            cycle: None,
             query: placeholder,
             dml: None,
         }; MAX_CTES];
@@ -1648,11 +1650,61 @@ impl<'a> Parser<'a> {
                 (&*boxed, None)
             };
             self.expect_op(")")?;
+            let search = if self.eat_ident("search")? {
+                let order = if self.eat_ident("breadth")? {
+                    crate::sql::ast::CteSearchOrder::BreadthFirst
+                } else {
+                    self.expect_ident("depth")?;
+                    crate::sql::ast::CteSearchOrder::DepthFirst
+                };
+                self.expect_ident("first")?;
+                self.expect_ident("by")?;
+                let columns = self.cte_clause_columns("SEARCH column")?;
+                self.expect_ident("set")?;
+                let sequence_column = self.col_ident("SEARCH sequence column")?;
+                Some(crate::sql::ast::CteSearch {
+                    order,
+                    columns,
+                    sequence_column,
+                })
+            } else {
+                None
+            };
+            let cycle = if self.eat_ident("cycle")? {
+                let columns = self.cte_clause_columns("CYCLE column")?;
+                self.expect_ident("set")?;
+                let mark_column = self.col_ident("CYCLE mark column")?;
+                let mark = if self.eat_ident("to")? {
+                    let value = self.expression(0)?;
+                    self.expect_ident("default")?;
+                    let default = self.expression(0)?;
+                    crate::sql::ast::CteCycleMark::Custom { value, default }
+                } else {
+                    crate::sql::ast::CteCycleMark::Boolean
+                };
+                self.expect_ident("using")?;
+                let path_column = self.col_ident("CYCLE path column")?;
+                Some(crate::sql::ast::CteCycle {
+                    columns,
+                    mark_column,
+                    mark,
+                    path_column,
+                })
+            } else {
+                None
+            };
+            if (search.is_some() || cycle.is_some()) && (!recursive || dml.is_some()) {
+                return Err(self.err_here(
+                    "SEARCH and CYCLE clauses require a recursive SELECT common table expression",
+                ));
+            }
             ctes[n] = Cte {
                 name,
                 columns,
                 recursive,
                 materialization,
+                search,
+                cycle,
                 query: boxed,
                 dml,
             };
@@ -1686,6 +1738,22 @@ impl<'a> Parser<'a> {
                     .err_here("WITH must be followed by SELECT, INSERT, UPDATE, DELETE, or MERGE"))
             }
         }
+    }
+
+    fn cte_clause_columns(&mut self, what: &'static str) -> Result<&'a [&'a str], ParseError> {
+        let mut columns: [&'a str; MAX_LIST] = [""; MAX_LIST];
+        let mut count = 0;
+        loop {
+            if count == MAX_LIST {
+                return Err(self.limit(what, MAX_LIST));
+            }
+            columns[count] = self.col_ident(what)?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.arena_slice(&columns[..count])
     }
 
     fn query(&mut self) -> Result<Stmt<'a>, ParseError> {

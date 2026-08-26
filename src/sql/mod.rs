@@ -141,8 +141,7 @@ static EMPTY_DML_CTE: ast::MaterializedCte<'static> = ast::MaterializedCte {
     column_names: &[],
     column_types: &[],
     column_collations: &[],
-    rows: &[],
-    external_run: None,
+    source: ast::MaterializedCteSource::Inline(&[]),
 };
 
 #[derive(Clone, Copy)]
@@ -5764,8 +5763,7 @@ impl Engine {
                     column_names,
                     column_types,
                     column_collations,
-                    rows,
-                    external_run: None,
+                    source: ast::MaterializedCteSource::Inline(rows),
                 })
                 .map_err(|_| query::arena_full_pub())?;
             if n == parser::MAX_CTES {

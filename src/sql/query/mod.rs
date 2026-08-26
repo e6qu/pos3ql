@@ -2522,7 +2522,25 @@ pub fn validate_view<'a>(
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     // A view may reference a table/view created earlier in this transaction;
     // other sessions still cannot see either pending object.
-    describe_query(sql, storage, txid, arena, &mut columns)?;
+    let count = describe_query(sql, storage, txid, arena, &mut columns)?;
+    for column in &columns[..count] {
+        if matches!(
+            column.type_oid,
+            super::types::oid::RECORD | super::types::oid::RECORD_ARRAY
+        ) {
+            let type_name = if column.type_oid == super::types::oid::RECORD {
+                "record"
+            } else {
+                "record[]"
+            };
+            return Err(sql_err!(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                "column \"{}\" has pseudo-type {}",
+                column.name,
+                type_name
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -3069,6 +3087,7 @@ fn rewrite_grouped_expr<'a>(
             array: rewrite(array)?,
             all: *all,
         }),
+        Expr::RecursiveState { .. } => Ok(e),
     }
 }
 

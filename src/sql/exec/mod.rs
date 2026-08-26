@@ -40306,20 +40306,34 @@ pub fn apply_typmod<'a>(
         (_, TypeMod::TemporalPrecision(p), Datum::Timetz(t, zone)) => {
             Ok(Datum::Timetz(round_micros(t, p), zone))
         }
-        // An interval range form with no precision (`interval hour to minute`)
-        // rounds nothing — its `precision: None` cannot be mistaken for a
-        // number, where the packed 0xFFFF once could.
-        (
-            _,
-            TypeMod::IntervalMod {
-                precision: Some(p), ..
-            },
-            Datum::Interval(iv),
-        ) => Ok(Datum::Interval(crate::sql::types::Interval {
-            months: iv.months,
-            days: iv.days,
-            micros: round_micros(iv.micros, p),
-        })),
+        (_, TypeMod::IntervalMod { range, precision }, Datum::Interval(iv)) => {
+            use crate::sql::types::IntervalField;
+            let micros = match range.last() {
+                IntervalField::Year => 0,
+                IntervalField::Month => 0,
+                IntervalField::Day => 0,
+                IntervalField::Hour => iv.micros / 3_600_000_000 * 3_600_000_000,
+                IntervalField::Minute => iv.micros / 60_000_000 * 60_000_000,
+                IntervalField::Second => {
+                    precision.map_or(iv.micros, |p| round_micros(iv.micros, p))
+                }
+            };
+            let days = if matches!(range.last(), IntervalField::Year | IntervalField::Month) {
+                0
+            } else {
+                iv.days
+            };
+            let months = if range.last() == IntervalField::Year {
+                iv.months / 12 * 12
+            } else {
+                iv.months
+            };
+            Ok(Datum::Interval(crate::sql::types::Interval {
+                months,
+                days,
+                micros,
+            }))
+        }
         _ => Ok(v),
     }
 }

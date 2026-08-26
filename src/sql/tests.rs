@@ -8583,7 +8583,12 @@ fn session_gucs_honored_or_rejected_faithfully() {
     assert!(run("SET lock_timeout = 5000; SHOW lock_timeout").contains("5000"));
     assert!(run("SET lock_timeout = '50ms'; SHOW lock_timeout").contains("50ms"));
     assert!(run("SET row_security = off; SHOW row_security").contains("off"));
-    assert!(run("SET intervalstyle = postgres; SHOW intervalstyle").contains("postgres"));
+    for style in ["postgres", "postgres_verbose", "sql_standard", "iso_8601"] {
+        assert!(
+            run(&format!("SET intervalstyle = {style}; SHOW intervalstyle")).contains(style),
+            "{style}"
+        );
+    }
     assert!(run("SET synchronize_seqscans = off; SHOW synchronize_seqscans").contains("off"));
     assert!(run("SET check_function_bodies = false; SHOW check_function_bodies").contains("off"));
     assert!(run("SET xmloption = content; SHOW xmloption").contains("content"));
@@ -8617,10 +8622,7 @@ fn session_gucs_honored_or_rejected_faithfully() {
         run("SET bytea_output = 'bogus'").contains("22023"),
         "unknown format"
     );
-    assert!(
-        run("SET intervalstyle = sql_standard").contains("0A000"),
-        "unsupported style"
-    );
+    assert!(run("SET intervalstyle = unknown").contains("22023"));
     assert!(
         run("SET synchronize_seqscans = on").contains("0A000"),
         "unsupported scan mode"
@@ -9579,6 +9581,86 @@ fn format_type_preserves_builtin_array_identity() {
 }
 
 #[test]
+fn temporal_and_float_precision_parse_to_concrete_postgresql_types() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE precision_types (
+           plain_time time(2),
+           zoned_time time(3) with time zone,
+           plain_stamp timestamp(4) without time zone,
+           zoned_stamp timestamp(5) with time zone,
+           low_float float(24),
+           high_float float(25));
+         SELECT attname,atttypid,atttypmod,format_type(atttypid,atttypmod)
+           FROM pg_attribute
+          WHERE attrelid='precision_types'::regclass AND attnum>0
+          ORDER BY attnum",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "plain_time|1083|2|time(2) without time zone",
+            "zoned_time|1266|3|time(3) with time zone",
+            "plain_stamp|1114|4|timestamp(4) without time zone",
+            "zoned_stamp|1184|5|timestamp(5) with time zone",
+            "low_float|700|-1|real",
+            "high_float|701|-1|double precision",
+        ]
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 1::float(24),1::float(25),'2024-01-02 03:04:05.6789'::timestamp(3)"
+        )),
+        [
+            crate::sql::types::oid::FLOAT4,
+            crate::sql::types::oid::FLOAT8,
+            crate::sql::types::oid::TIMESTAMP,
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT varchar(2) 'abc', numeric(3,1) '12.34', float(24) '1.2',
+                    timestamp(3) '2024-01-02 03:04:05.6789',
+                    time(3) with time zone '03:04:05.6789+00',
+                    interval(2) '1.234 seconds'"
+        )),
+        ["ab|12.3|1.2|2024-01-02 03:04:05.679|03:04:05.679+00|00:00:01.23"]
+    );
+    for invalid in ["SELECT 1::float(0)", "SELECT 1::float(54)"] {
+        let response = run_with(&mut engine, &mut budget, invalid);
+        assert!(
+            String::from_utf8_lossy(&response).contains("22023"),
+            "{invalid}: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+    let invalid = "CREATE TABLE bad_temporal (value timestamp with time zone(3))";
+    let response = run_with(&mut engine, &mut budget, invalid);
+    assert!(
+        String::from_utf8_lossy(&response).contains("42601"),
+        "{invalid}: {}",
+        String::from_utf8_lossy(&response)
+    );
+    for invalid in [
+        "SELECT interval(2) '1.234 seconds' second(1)",
+        "SELECT interval(2) '1.234 seconds' day to second(1)",
+    ] {
+        let response = run_with(&mut engine, &mut budget, invalid);
+        assert!(
+            String::from_utf8_lossy(&response).contains("42601"),
+            "{invalid}: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+}
+
+#[test]
 fn json_and_jsonb_types() {
     // Output/normalization/operators verified against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
@@ -9656,6 +9738,390 @@ fn interval_type() {
     assert!(
         run("SELECT '1 day 2 hours'::interval - '3 hours'::interval").contains("1 day -01:00:00")
     );
+}
+
+#[test]
+fn intervalstyle_formats_scalars_nested_values_json_and_copy() {
+    let (mut engine, mut budget) = test_engine();
+    let literal = "'1 year 2 mons 3 days 04:05:06.789'::interval";
+    for (style, expected) in [
+        (
+            "postgres",
+            "1 year 2 mons 3 days 04:05:06.789|{\"1 year 2 mons 3 days 04:05:06.789\"}|(\"1 year 2 mons 3 days 04:05:06.789\")|\"1 year 2 mons 3 days 04:05:06.789\"",
+        ),
+        (
+            "postgres_verbose",
+            "@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs|{\"@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs\"}|(\"@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs\")|\"@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs\"",
+        ),
+        (
+            "sql_standard",
+            "+1-2 +3 +4:05:06.789|{\"+1-2 +3 +4:05:06.789\"}|(\"+1-2 +3 +4:05:06.789\")|\"+1-2 +3 +4:05:06.789\"",
+        ),
+        (
+            "iso_8601",
+            "P1Y2M3DT4H5M6.789S|{P1Y2M3DT4H5M6.789S}|(P1Y2M3DT4H5M6.789S)|\"P1Y2M3DT4H5M6.789S\"",
+        ),
+    ] {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "SET intervalstyle={style}; SELECT v::text,ARRAY[v]::text,ROW(v)::text,to_json(v)::text FROM (VALUES ({literal})) q(v)"
+            ),
+        );
+        assert_eq!(
+            data_rows(&output),
+            [expected],
+            "{style}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    for (literal, verbose, standard, iso) in [
+        ("0", "@ 0", "0", "PT0S"),
+        (
+            "-1 mon 5 days -06:07:08.9",
+            "@ 1 mon -5 days 6 hours 7 mins 8.9 secs ago",
+            "-0-1 +5 -6:07:08.9",
+            "P-1M5DT-6H-7M-8.9S",
+        ),
+        (
+            "1 mon -5 days 06:07:08.9",
+            "@ 1 mon -5 days 6 hours 7 mins 8.9 secs",
+            "+0-1 -5 +6:07:08.9",
+            "P1M-5DT6H7M8.9S",
+        ),
+        (
+            "-1 day 02:00:00",
+            "@ 1 day -2 hours ago",
+            "+0-0 -1 +2:00:00",
+            "P-1DT2H",
+        ),
+    ] {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "SET intervalstyle=postgres_verbose; SELECT '{literal}'::interval; \
+                 SET intervalstyle=sql_standard; SELECT '{literal}'::interval; \
+                 SET intervalstyle=iso_8601; SELECT '{literal}'::interval"
+            ),
+        );
+        assert_eq!(data_rows(&output), [verbose, standard, iso], "{literal}");
+    }
+
+    let copied = run_with(
+        &mut engine,
+        &mut budget,
+        &format!("SET intervalstyle=iso_8601; COPY (SELECT {literal}) TO STDOUT"),
+    );
+    assert_eq!(copy_data_rows(&copied), ["P1Y2M3DT4H5M6.789S"]);
+}
+
+#[test]
+fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE interval_ranges (
+           y interval year,
+           m interval month,
+           ym interval year to month,
+           d interval day,
+           h interval hour,
+           mi interval minute,
+           s interval second,
+           ds interval day to second(3),
+           fp interval(4));
+         INSERT INTO interval_ranges VALUES (
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 day 02:03:04.56789',
+           '1 day 02:03:04.56789');
+         CREATE DOMAIN interval_domain AS interval day to second(2)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let values = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT y::text,m::text,ym::text,d::text,h::text,mi::text,s::text,ds::text,fp::text FROM interval_ranges",
+    );
+    assert_eq!(
+        data_rows(&values),
+        [
+            "1 year|1 year 2 mons|1 year 2 mons|1 year 2 mons 3 days|1 year 2 mons 3 days 04:00:00|1 year 2 mons 3 days 04:05:00|1 year 2 mons 3 days 04:05:06.789|1 day 02:03:04.568|1 day 02:03:04.5679"
+        ]
+    );
+
+    let descriptions = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT string_agg(format_type(atttypid,atttypmod),',' ORDER BY attnum) FROM pg_attribute WHERE attrelid='interval_ranges'::regclass AND attnum>0",
+    );
+    assert_eq!(
+        data_rows(&descriptions),
+        [
+            "interval year,interval month,interval year to month,interval day,interval hour,interval minute,interval second,interval day to second(3),interval(4)"
+        ]
+    );
+    let information_schema = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT column_name,datetime_precision,interval_type,interval_precision IS NULL FROM information_schema.columns WHERE table_name='interval_ranges' ORDER BY ordinal_position",
+    );
+    assert_eq!(
+        data_rows(&information_schema),
+        [
+            "y|6|YEAR|t",
+            "m|6|MONTH|t",
+            "ym|6|YEAR TO MONTH|t",
+            "d|6|DAY|t",
+            "h|6|HOUR|t",
+            "mi|6|MINUTE|t",
+            "s|6|SECOND|t",
+            "ds|3|DAY TO SECOND(3)|t",
+            "fp|4|NULL|t",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT datetime_precision,interval_type,interval_precision IS NULL FROM information_schema.domains WHERE domain_name='interval_domain'"
+        )),
+        ["2|DAY TO SECOND(2)|t"]
+    );
+
+    let literals = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT
+           interval '1 year 2 mons 3 days 04:05:06.789' YEAR,
+           interval '1 year 2 mons 3 days 04:05:06.789' MONTH,
+           interval '1 year 2 mons 3 days 04:05:06.789' DAY,
+           interval '1 year 2 mons 3 days 04:05:06.789' HOUR,
+           interval '1 year 2 mons 3 days 04:05:06.789' MINUTE,
+           interval '1 year 2 mons 3 days 04:05:06.789' SECOND(2),
+           CAST('1 day 02:03:04.567' AS interval hour to minute)",
+    );
+    assert_eq!(
+        data_rows(&literals),
+        [
+            "1 year|1 year 2 mons|1 year 2 mons 3 days|1 year 2 mons 3 days 04:00:00|1 year 2 mons 3 days 04:05:00|1 year 2 mons 3 days 04:05:06.79|1 day 02:03:00"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT '1.5 years'::interval,'1.5 months'::interval,'1.5 weeks'::interval,'1.5 days'::interval,'1.1234567 seconds'::interval"
+        )),
+        ["1 year 6 mons|1 mon 15 days|10 days 12:00:00|1 day 12:00:00|00:00:01.123457"]
+    );
+
+    assert_eq!(
+        row_description_type_modifiers(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ds,fp FROM interval_ranges"
+        )),
+        [
+            crate::sql::types::TypeMod::IntervalMod {
+                range: crate::sql::types::IntervalRange::DayToSecond,
+                precision: Some(3),
+            }
+            .encode(),
+            crate::sql::types::TypeMod::IntervalMod {
+                range: crate::sql::types::IntervalRange::Full,
+                precision: Some(4),
+            }
+            .encode(),
+        ]
+    );
+
+    let copied = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT ds,fp FROM interval_ranges) TO STDOUT",
+    );
+    assert_eq!(
+        copy_data_rows(&copied),
+        ["1 day 02:03:04.568\t1 day 02:03:04.5679"]
+    );
+    let copied = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT ds,fp FROM interval_ranges) TO STDOUT (FORMAT binary)",
+    );
+    assert!(
+        !message_types(&copied).contains(&b'E')
+            && copied
+                .windows(crate::sql::copy::BINARY_SIGNATURE.len())
+                .any(|bytes| bytes == crate::sql::copy::BINARY_SIGNATURE),
+        "{copied:?}"
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE interval_copy_input (value interval day to minute)",
+    );
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "interval copy send", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "interval copy sql", 1 << 18).unwrap();
+    let mut transaction = TxnState::new(&mut budget, 128).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY interval_copy_input FROM STDIN",
+                &arena,
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine
+        .take_pending_copy()
+        .expect("COPY enters text streaming mode");
+    arena.reset();
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut transaction,
+        guc.seq_session(),
+        &arena,
+        b"2 days 03:04:05.6",
+    )
+    .unwrap();
+    finish_copy(&mut engine, &mut budget, &setup, &mut transaction, &guc).unwrap();
+
+    arena.reset();
+    send.clear();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY interval_copy_input FROM STDIN (FORMAT binary)",
+                &arena,
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine
+        .take_pending_copy()
+        .expect("COPY enters binary streaming mode");
+    let mut binary_row = Vec::new();
+    binary_row.extend_from_slice(&1_i16.to_be_bytes());
+    binary_row.extend_from_slice(&16_i32.to_be_bytes());
+    binary_row.extend_from_slice(&3_723_456_789_i64.to_be_bytes());
+    binary_row.extend_from_slice(&1_i32.to_be_bytes());
+    binary_row.extend_from_slice(&0_i32.to_be_bytes());
+    copy_binary_row(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut transaction,
+        guc.seq_session(),
+        &arena,
+        &binary_row,
+    )
+    .unwrap();
+    finish_copy(&mut engine, &mut budget, &setup, &mut transaction, &guc).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value::text FROM interval_copy_input ORDER BY value"
+        )),
+        ["1 day 01:02:00", "2 days 03:04:00"]
+    );
+}
+
+#[test]
+fn interval_field_ranges_survive_checkpoint_and_object_store_cold_start() {
+    let mut config = test_config("interval-range-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("interval-range-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE DOMAIN durable_interval AS interval hour to second(2);
+             CREATE TABLE durable_intervals (
+               id integer PRIMARY KEY,
+               value interval day to minute,
+               domain_value durable_interval);
+             INSERT INTO durable_intervals VALUES
+               (1, '2 days 03:04:05.6', '6:07:08.129'),
+               (2, '-1 day -02:03:04', '-4:05:06.125');
+             CHECKPOINT",
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        engine.commit_wal().unwrap();
+    }
+
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT id,value::text,domain_value::text FROM durable_intervals ORDER BY id"
+        )),
+        [
+            "1|2 days 03:04:00|06:07:08.13",
+            "2|-1 days -02:03:00|-04:05:06.13"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT format_type(a.atttypid,a.atttypmod) FROM pg_attribute a WHERE a.attrelid='durable_intervals'::regclass AND a.attname='value'"
+        )),
+        ["interval day to minute"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT datetime_precision,interval_type FROM information_schema.domains WHERE domain_name='durable_interval'"
+        )),
+        ["2|HOUR TO SECOND(2)"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
 #[test]
@@ -35243,8 +35709,7 @@ fn empty_outer_query_does_not_hide_invalid_subquery_source() {
 #[test]
 fn copy_formats_and_unsupported() {
     // The engine speaks COPY's text, CSV and binary formats. CSV-only options
-    // misused in text mode, and binary of a type whose binary codec is not yet
-    // emitted, refuse loudly rather than mis-read or corrupt a stream.
+    // misused in text mode refuse loudly rather than mis-read a stream.
     let (mut engine, mut budget) = test_engine();
     let ok = run_with(&mut engine, &mut budget, "CREATE TABLE c (a int, b text)");
     assert!(!message_types(&ok).contains(&b'E'));

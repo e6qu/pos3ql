@@ -778,6 +778,9 @@ impl<'a> Parser<'a> {
                 // `ARRAY` is itself reserved, which is why this cannot come
                 // first. A `can be function or type name` keyword may continue:
                 // it is exactly the category PostgreSQL allows to name one.
+                if self.peeked == Tok::Op("(") && self.typed_literal_with_modifier_ahead(name)? {
+                    return self.modified_typed_literal(name);
+                }
                 if self.peeked == Tok::Op("(") {
                     return self.call(name);
                 }
@@ -792,16 +795,16 @@ impl<'a> Parser<'a> {
                     // qualifier interprets an otherwise-unitless value in
                     // that field, so it is folded into the literal before
                     // the cast rather than left dangling.
-                    let lit = if name.eq_ignore_ascii_case("interval") {
+                    let (lit, type_mod) = if name.eq_ignore_ascii_case("interval") {
                         self.interval_with_qualifier(lit)?
                     } else {
-                        lit
+                        (lit, -1)
                     };
                     let operand = self.arena_expr(Expr::Str(lit))?;
                     return self.arena_expr(Expr::Cast {
                         operand,
                         type_name: name,
-                        type_mod: -1,
+                        type_mod,
                     });
                 }
                 if self.peeked == Tok::Op(".") {
@@ -1291,23 +1294,26 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Desugars `left IS [NOT] DISTINCT FROM right` into a null-safe `CASE`:
-    /// both null → equal, one null → distinct, else the plain comparison.
-    /// Applies an SQL-standard interval unit qualifier (`INTERVAL '1' DAY`) to
-    /// the literal, folding the trailing field into the string. Returns the
-    /// literal unchanged when no qualifier follows.
-    ///
-    /// A single field interprets a bare numeric value in that unit and, for
-    /// every field but SECOND, truncates it toward zero to that field's
-    /// resolution — `'2.5' HOUR` is two hours, not two and a half. The
-    /// hyphenated `YEAR TO MONTH` range form and a qualifier on an already
-    /// unit-bearing string are not yet handled and are refused rather than
-    /// quietly mis-parsed.
-    fn interval_with_qualifier(&mut self, lit: &'a str) -> Result<&'a str, ParseError> {
-        let Some((word, keep_fraction)) = self.peek_interval_field() else {
-            return Ok(lit);
+    /// Parses an SQL interval qualifier into the same typed modifier used by
+    /// columns and domains. Compact range input is normalized to the verbose
+    /// form consumed by the interval value parser; ordinary unit-bearing input
+    /// stays intact and is constrained later by the typed coercion boundary.
+    fn interval_with_qualifier(&mut self, lit: &'a str) -> Result<(&'a str, i32), ParseError> {
+        let Some((word, _)) = self.peek_interval_field() else {
+            return Ok((lit, -1));
         };
+        let first = crate::sql::types::IntervalField::parse(word)
+            .expect("interval keyword maps to a typed field");
         self.advance()?;
+        let mut precision = None;
+        if self.peeked == Tok::Op("(") {
+            if first != crate::sql::types::IntervalField::Second {
+                return Err(self.err_here(
+                    "interval precision is allowed only when SECOND is the trailing field",
+                ));
+            }
+            precision = Some(self.interval_precision()?);
+        }
         if self.eat_ident("to")? {
             // YEAR TO MONTH carries a self-contained `Y-M` format; the clock
             // ranges (DAY/HOUR/MINUTE TO ...) carry a `D H:M:S` value truncated
@@ -1315,7 +1321,17 @@ impl<'a> Parser<'a> {
             // from a coarser field to a finer one.
             if word == "year" {
                 if self.eat_ident("month")? {
-                    return self.year_to_month(lit);
+                    let normalized = if lit.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+                        lit
+                    } else {
+                        self.year_to_month(lit)?
+                    };
+                    let modifier = crate::sql::types::TypeMod::IntervalMod {
+                        range: crate::sql::types::IntervalRange::YearToMonth,
+                        precision: None,
+                    }
+                    .encode();
+                    return Ok((normalized, modifier));
                 }
                 return Err(self.err_here("expected MONTH after YEAR TO"));
             }
@@ -1338,28 +1354,141 @@ impl<'a> Parser<'a> {
                 );
             }
             self.advance()?;
-            return self.clock_range(lit, start, end);
+            if self.peeked == Tok::Op("(") {
+                if end_word != "second" {
+                    return Err(self.err_here(
+                        "interval precision is allowed only when SECOND is the trailing field",
+                    ));
+                }
+                precision = Some(self.interval_precision()?);
+            }
+            let last = crate::sql::types::IntervalField::parse(end_word)
+                .expect("interval keyword maps to a typed field");
+            let range = crate::sql::types::IntervalRange::from_bounds(first, last)
+                .ok_or_else(|| self.err_here("invalid interval field range"))?;
+            let normalized = if lit.bytes().any(|byte| byte.is_ascii_alphabetic()) {
+                lit
+            } else {
+                self.clock_range(lit, start, end)?
+            };
+            let modifier = crate::sql::types::TypeMod::IntervalMod { range, precision }.encode();
+            return Ok((normalized, modifier));
         }
         let value = lit.trim();
         let numeric = value.strip_prefix(['-', '+']).unwrap_or(value);
         let is_number = !numeric.is_empty()
             && numeric.bytes().all(|b| b.is_ascii_digit() || b == b'.')
             && numeric.bytes().filter(|&b| b == b'.').count() <= 1;
-        if !is_number {
-            return Err(self.err_here(
-                "INTERVAL unit qualifier on a non-numeric literal is not supported yet",
-            ));
-        }
-        // Truncate toward zero for the coarser fields by dropping any fraction.
-        let magnitude = if keep_fraction {
-            value
+        let normalized = if is_number {
+            let combined = crate::stack_format!(64, "{} {}", value, word);
+            self.arena
+                .alloc_str(combined.as_str())
+                .map_err(|_| self.err_here("interval literal too large for SQL arena"))?
         } else {
-            value.split_once('.').map_or(value, |(head, _)| head)
+            lit
         };
-        let combined = crate::stack_format!(64, "{} {}", magnitude, word);
-        self.arena
-            .alloc_str(combined.as_str())
-            .map_err(|_| self.err_here("interval literal too large for SQL arena"))
+        let range = crate::sql::types::IntervalRange::from_bounds(first, first)
+            .expect("single interval field is a valid range");
+        Ok((
+            normalized,
+            crate::sql::types::TypeMod::IntervalMod { range, precision }.encode(),
+        ))
+    }
+
+    fn interval_precision(&mut self) -> Result<u8, ParseError> {
+        match crate::sql::types::TypeMod::decode(
+            crate::sql::types::ColType::Interval,
+            self.type_modifier("interval")?,
+        ) {
+            crate::sql::types::TypeMod::IntervalMod {
+                precision: Some(precision),
+                ..
+            } => Ok(precision),
+            _ => unreachable!("interval precision parser returns an interval modifier"),
+        }
+    }
+
+    /// A modifier-bearing typed constant and a function call share the same
+    /// `name (` prefix. PostgreSQL resolves the former only when a string
+    /// follows the complete modifier (and the optional temporal zone words),
+    /// so bounded lexical lookahead keeps the two grammar paths disjoint.
+    fn typed_literal_with_modifier_ahead(&self, name: &str) -> Result<bool, ParseError> {
+        if crate::sql::types::ColType::from_sql_name(name).is_none() {
+            return Ok(false);
+        }
+        let mut lookahead = self.lexer.clone();
+        let mut depth = 1_usize;
+        let mut token = lookahead.next_token()?;
+        loop {
+            match token {
+                Tok::Op("(") => depth += 1,
+                Tok::Op(")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        token = lookahead.next_token()?;
+                        break;
+                    }
+                }
+                Tok::Eof => return Ok(false),
+                _ => {}
+            }
+            token = lookahead.next_token()?;
+        }
+        if (name.eq_ignore_ascii_case("timestamp") || name.eq_ignore_ascii_case("time"))
+            && (token == Tok::Ident("with") || token == Tok::Ident("without"))
+        {
+            if lookahead.next_token()? != Tok::Ident("time")
+                || lookahead.next_token()? != Tok::Ident("zone")
+            {
+                return Ok(false);
+            }
+            token = lookahead.next_token()?;
+        }
+        Ok(matches!(token, Tok::Str(_)))
+    }
+
+    fn modified_typed_literal(&mut self, mut name: &'a str) -> Result<&'a Expr<'a>, ParseError> {
+        let type_mod = if name.eq_ignore_ascii_case("float") {
+            name = self.float_precision_type()?;
+            -1
+        } else {
+            self.type_modifier(name)?
+        };
+        if name.eq_ignore_ascii_case("timestamp") || name.eq_ignore_ascii_case("time") {
+            if self.eat_ident("with")? {
+                self.expect_ident("time")?;
+                self.expect_ident("zone")?;
+                name = if name.eq_ignore_ascii_case("timestamp") {
+                    "timestamptz"
+                } else {
+                    "timetz"
+                };
+            } else if self.eat_ident("without")? {
+                self.expect_ident("time")?;
+                self.expect_ident("zone")?;
+            }
+        }
+        let Tok::Str(literal) = self.peeked else {
+            return Err(self.unexpected("expected a string literal after type modifier"));
+        };
+        self.advance()?;
+        let (literal, type_mod) = if name.eq_ignore_ascii_case("interval") {
+            let (literal, qualifier_mod) = self.interval_with_qualifier(literal)?;
+            if qualifier_mod != -1 {
+                return Err(
+                    self.unexpected("an interval qualifier cannot follow INTERVAL precision")
+                );
+            }
+            (literal, type_mod)
+        } else {
+            (literal, type_mod)
+        };
+        let operand = self.arena_expr(Expr::Str(literal))?;
+        self.arena_expr(Expr::Cast {
+            operand,
+            type_name: name,
+            type_mod,
+        })
     }
 
     /// `INTERVAL '1-2' YEAR TO MONTH`: the `Y-M` value is years and months, a

@@ -73,6 +73,29 @@ SELECT '2020-01-01'::timestamp(7), '12:00'::time(8);
 -- in range: no warning
 SELECT '2020-01-01'::timestamp(6);
 SELECT '2020-01-01'::timestamp(0);
+-- modifier-bearing typed constants and SQL-standard temporal zone ordering
+SELECT varchar(2) 'abc', numeric(3,1) '12.34', float(24) '1.2';
+SELECT timestamp(3) '2024-01-01 12:34:56.1236';
+SELECT timestamp(3) with time zone '2024-01-01 12:34:56.1236+00';
+SELECT time(3) '12:34:56.7894', time(3) with time zone '12:34:56.7894+00';
+SELECT interval(2) '1.234 seconds';
+CREATE TABLE precision_type_probe (
+  plain_time time(2),
+  zoned_time time(3) with time zone,
+  plain_stamp timestamp(4) without time zone,
+  zoned_stamp timestamp(5) with time zone,
+  low_float float(24),
+  high_float float(25)
+);
+SELECT attname, atttypid, atttypmod, format_type(atttypid, atttypmod)
+FROM pg_attribute
+WHERE attrelid = 'precision_type_probe'::regclass AND attnum > 0
+ORDER BY attnum;
+DROP TABLE precision_type_probe;
+SELECT 1::float(0);
+SELECT 1::float(54);
+SELECT interval(2) '1.234 seconds' second(1);
+SELECT interval(2) '1.234 seconds' day to second(1);
 -- timetz (time with time zone)
 SELECT '12:00:00'::timetz, '12:00:00+05'::timetz, '12:00:00-05:30'::timetz;
 SELECT '12:00:00.123456+02:00'::timetz, '12:00:00.1+02:00'::timetz, '12:00:00+05:45'::timetz;

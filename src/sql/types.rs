@@ -1720,6 +1720,201 @@ impl ArrElem {
     }
 }
 
+/// One field named by an SQL interval qualifier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntervalField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+impl IntervalField {
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "year" => Self::Year,
+            "month" => Self::Month,
+            "day" => Self::Day,
+            "hour" => Self::Hour,
+            "minute" => Self::Minute,
+            "second" => Self::Second,
+            _ => return None,
+        })
+    }
+
+    const fn mask(self) -> u16 {
+        match self {
+            Self::Year => 0x0004,
+            Self::Month => 0x0002,
+            Self::Day => 0x0008,
+            Self::Hour => 0x0400,
+            Self::Minute => 0x0800,
+            Self::Second => 0x1000,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Year => "year",
+            Self::Month => "month",
+            Self::Day => "day",
+            Self::Hour => "hour",
+            Self::Minute => "minute",
+            Self::Second => "second",
+        }
+    }
+}
+
+/// A valid PostgreSQL interval field range. Keeping the accepted masks closed
+/// prevents corrupt or parser-invented masks from reaching catalogs,
+/// coercion, WAL, or the wire as apparently valid type modifiers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntervalRange {
+    Full,
+    Year,
+    Month,
+    YearToMonth,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    DayToHour,
+    DayToMinute,
+    DayToSecond,
+    HourToMinute,
+    HourToSecond,
+    MinuteToSecond,
+}
+
+impl IntervalRange {
+    pub const fn from_bounds(first: IntervalField, last: IntervalField) -> Option<Self> {
+        use IntervalField::{Day, Hour, Minute, Month, Second, Year};
+        Some(match (first, last) {
+            (Year, Year) => Self::Year,
+            (Month, Month) => Self::Month,
+            (Year, Month) => Self::YearToMonth,
+            (Day, Day) => Self::Day,
+            (Hour, Hour) => Self::Hour,
+            (Minute, Minute) => Self::Minute,
+            (Second, Second) => Self::Second,
+            (Day, Hour) => Self::DayToHour,
+            (Day, Minute) => Self::DayToMinute,
+            (Day, Second) => Self::DayToSecond,
+            (Hour, Minute) => Self::HourToMinute,
+            (Hour, Second) => Self::HourToSecond,
+            (Minute, Second) => Self::MinuteToSecond,
+            _ => return None,
+        })
+    }
+
+    pub const fn from_mask(mask: u16) -> Option<Self> {
+        Some(match mask {
+            INTERVAL_FULL_RANGE => Self::Full,
+            0x0004 => Self::Year,
+            0x0002 => Self::Month,
+            0x0006 => Self::YearToMonth,
+            0x0008 => Self::Day,
+            0x0400 => Self::Hour,
+            0x0800 => Self::Minute,
+            0x1000 => Self::Second,
+            0x0408 => Self::DayToHour,
+            0x0C08 => Self::DayToMinute,
+            0x1C08 => Self::DayToSecond,
+            0x0C00 => Self::HourToMinute,
+            0x1C00 => Self::HourToSecond,
+            0x1800 => Self::MinuteToSecond,
+            _ => return None,
+        })
+    }
+
+    pub const fn mask(self) -> u16 {
+        match self {
+            Self::Full => INTERVAL_FULL_RANGE,
+            Self::Year => IntervalField::Year.mask(),
+            Self::Month => IntervalField::Month.mask(),
+            Self::YearToMonth => IntervalField::Year.mask() | IntervalField::Month.mask(),
+            Self::Day => IntervalField::Day.mask(),
+            Self::Hour => IntervalField::Hour.mask(),
+            Self::Minute => IntervalField::Minute.mask(),
+            Self::Second => IntervalField::Second.mask(),
+            Self::DayToHour => IntervalField::Day.mask() | IntervalField::Hour.mask(),
+            Self::DayToMinute => {
+                IntervalField::Day.mask()
+                    | IntervalField::Hour.mask()
+                    | IntervalField::Minute.mask()
+            }
+            Self::DayToSecond => {
+                IntervalField::Day.mask()
+                    | IntervalField::Hour.mask()
+                    | IntervalField::Minute.mask()
+                    | IntervalField::Second.mask()
+            }
+            Self::HourToMinute => IntervalField::Hour.mask() | IntervalField::Minute.mask(),
+            Self::HourToSecond => {
+                IntervalField::Hour.mask()
+                    | IntervalField::Minute.mask()
+                    | IntervalField::Second.mask()
+            }
+            Self::MinuteToSecond => IntervalField::Minute.mask() | IntervalField::Second.mask(),
+        }
+    }
+
+    pub const fn name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Full => return None,
+            Self::Year => "year",
+            Self::Month => "month",
+            Self::YearToMonth => "year to month",
+            Self::Day => "day",
+            Self::Hour => "hour",
+            Self::Minute => "minute",
+            Self::Second => "second",
+            Self::DayToHour => "day to hour",
+            Self::DayToMinute => "day to minute",
+            Self::DayToSecond => "day to second",
+            Self::HourToMinute => "hour to minute",
+            Self::HourToSecond => "hour to second",
+            Self::MinuteToSecond => "minute to second",
+        })
+    }
+
+    pub const fn information_schema_name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Full => return None,
+            Self::Year => "YEAR",
+            Self::Month => "MONTH",
+            Self::YearToMonth => "YEAR TO MONTH",
+            Self::Day => "DAY",
+            Self::Hour => "HOUR",
+            Self::Minute => "MINUTE",
+            Self::Second => "SECOND",
+            Self::DayToHour => "DAY TO HOUR",
+            Self::DayToMinute => "DAY TO MINUTE",
+            Self::DayToSecond => "DAY TO SECOND",
+            Self::HourToMinute => "HOUR TO MINUTE",
+            Self::HourToSecond => "HOUR TO SECOND",
+            Self::MinuteToSecond => "MINUTE TO SECOND",
+        })
+    }
+
+    pub const fn last(self) -> IntervalField {
+        match self {
+            Self::Full
+            | Self::Second
+            | Self::DayToSecond
+            | Self::HourToSecond
+            | Self::MinuteToSecond => IntervalField::Second,
+            Self::Month | Self::YearToMonth => IntervalField::Month,
+            Self::Year => IntervalField::Year,
+            Self::Day => IntervalField::Day,
+            Self::Hour | Self::DayToHour => IntervalField::Hour,
+            Self::Minute | Self::DayToMinute | Self::HourToMinute => IntervalField::Minute,
+        }
+    }
+}
+
 /// The decoded view of a PostgreSQL `atttypmod`.
 ///
 /// On the wire and in the catalog a type modifier is one `i32`, but that
@@ -1752,7 +1947,10 @@ pub enum TypeMod {
     /// which is why the precision is an `Option`: the encoding's `0xFFFF`
     /// low half means "unspecified", and treating it as a number to clamp
     /// would silently round to 6 digits.
-    IntervalMod { range: u16, precision: Option<u8> },
+    IntervalMod {
+        range: IntervalRange,
+        precision: Option<u8>,
+    },
 }
 
 /// PostgreSQL's INTERVAL_FULL_RANGE: the field-range mask a plain `interval`
@@ -1796,15 +1994,16 @@ impl TypeMod {
             }
             ColType::Interval => {
                 let precision_raw = atttypmod & 0xFFFF;
-                TypeMod::IntervalMod {
-                    range: ((atttypmod as u32) >> 16) as u16,
-                    // 0xFFFF is "no precision given", not a precision.
-                    precision: if precision_raw <= 6 {
-                        Some(precision_raw as u8)
-                    } else {
-                        None
-                    },
-                }
+                let Some(range) = IntervalRange::from_mask(((atttypmod as u32) >> 16) as u16)
+                else {
+                    return TypeMod::None;
+                };
+                let precision = match precision_raw {
+                    0..=6 => Some(precision_raw as u8),
+                    0xFFFF => None,
+                    _ => return TypeMod::None,
+                };
+                TypeMod::IntervalMod { range, precision }
             }
             _ => TypeMod::None,
         }
@@ -1821,7 +2020,7 @@ impl TypeMod {
             }
             TypeMod::TemporalPrecision(p) => i32::from(p),
             TypeMod::IntervalMod { range, precision } => {
-                ((range as i32) << 16) | precision.map_or(0xFFFF, i32::from)
+                ((range.mask() as i32) << 16) | precision.map_or(0xFFFF, i32::from)
             }
         }
     }
@@ -2322,7 +2521,11 @@ impl fmt::Display for Datum<'_> {
                 f.write_str(super::datetime::iso_offset_string(*zone).as_str())
             }
             Datum::Interval(interval) => {
-                f.write_str(super::datetime::format_interval(*interval).as_str())
+                let style = super::guc::active_render()
+                    .map_or(super::datetime::IntervalStyle::Postgres, |render| {
+                        render.intervalstyle
+                    });
+                f.write_str(super::datetime::format_interval_styled(*interval, style).as_str())
             }
             Datum::Json { text, .. } => f.write_str(text),
             Datum::Range { text, .. } => f.write_str(text),
@@ -2597,7 +2800,7 @@ mod tests {
         assert_eq!(TypeMod::TemporalPrecision(0).encode(), 0); // timestamp(0)
         assert_eq!(
             TypeMod::IntervalMod {
-                range: INTERVAL_FULL_RANGE,
+                range: IntervalRange::Full,
                 precision: Some(1)
             }
             .encode(),
@@ -2605,7 +2808,7 @@ mod tests {
         );
         assert_eq!(
             TypeMod::IntervalMod {
-                range: 0x0C00,
+                range: IntervalRange::HourToMinute,
                 precision: None
             }
             .encode(),
@@ -2634,14 +2837,14 @@ mod tests {
             (
                 ColType::Interval,
                 TypeMod::IntervalMod {
-                    range: INTERVAL_FULL_RANGE,
+                    range: IntervalRange::Full,
                     precision: Some(4),
                 },
             ),
             (
                 ColType::Interval,
                 TypeMod::IntervalMod {
-                    range: 0x0C00,
+                    range: IntervalRange::HourToMinute,
                     precision: None,
                 },
             ),
@@ -2672,13 +2875,21 @@ mod tests {
         assert_eq!(TypeMod::decode(ColType::Varchar, 3), TypeMod::None);
         assert_eq!(TypeMod::decode(ColType::Numeric, 2), TypeMod::None);
         assert_eq!(TypeMod::decode(ColType::Timestamp, 7), TypeMod::None);
+        assert_eq!(
+            TypeMod::decode(ColType::Interval, (0x7FFF_i32 << 16) | 7),
+            TypeMod::None
+        );
+        assert_eq!(
+            TypeMod::decode(ColType::Interval, (0x0001_i32 << 16) | 0xFFFF),
+            TypeMod::None
+        );
         // A type with no modifier concept ignores any value.
         assert_eq!(TypeMod::decode(ColType::Int4, 9), TypeMod::None);
         // The interval 0xFFFF low half is "no precision", not precision 65535.
         assert_eq!(
             TypeMod::decode(ColType::Interval, 201392127),
             TypeMod::IntervalMod {
-                range: 0x0C00,
+                range: IntervalRange::HourToMinute,
                 precision: None
             }
         );

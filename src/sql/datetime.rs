@@ -884,6 +884,43 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
     let mut months = 0i64;
     let mut days = 0i64;
     let mut micros = 0i64;
+    let overflow = || {
+        sql_err!(
+            sqlstate::INTERVAL_FIELD_OVERFLOW,
+            "interval field value out of range: \"{}\"",
+            s
+        )
+    };
+    let add_micros = |total: &mut i64, value: f64| -> Result<(), SqlError> {
+        if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+            return Err(overflow());
+        }
+        *total = total
+            .checked_add(value.round() as i64)
+            .ok_or_else(overflow)?;
+        Ok(())
+    };
+    let add_days =
+        |day_total: &mut i64, micro_total: &mut i64, value: f64| -> Result<(), SqlError> {
+            if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+                return Err(overflow());
+            }
+            let whole = value.trunc();
+            *day_total = day_total.checked_add(whole as i64).ok_or_else(overflow)?;
+            add_micros(micro_total, (value - whole) * DAY_US as f64)
+        };
+    let add_months = |month_total: &mut i64,
+                      day_total: &mut i64,
+                      micro_total: &mut i64,
+                      value: f64|
+     -> Result<(), SqlError> {
+        if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+            return Err(overflow());
+        }
+        let whole = value.trunc();
+        *month_total = month_total.checked_add(whole as i64).ok_or_else(overflow)?;
+        add_days(day_total, micro_total, (value - whole) * 30.0)
+    };
     let mut it = s.split_whitespace().peekable();
     let mut saw = false;
     while let Some(tok) = it.next() {
@@ -891,7 +928,10 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
             // A bare clock time contributes to the microseconds field.
             let neg = tok.starts_with('-');
             let t = tok.trim_start_matches(['-', '+']);
-            micros += if neg { -parse_time(t)? } else { parse_time(t)? };
+            let clock = parse_time(t)?;
+            micros = micros
+                .checked_add(if neg { -clock } else { clock })
+                .ok_or_else(overflow)?;
             saw = true;
             continue;
         }
@@ -899,21 +939,21 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
         // no unit is seconds, as PostgreSQL reads a bare `INTERVAL '90'`.
         let n: f64 = tok.parse().map_err(|_| bad())?;
         let Some(unit) = it.next() else {
-            micros += (n * 1_000_000.0) as i64;
+            add_micros(&mut micros, n * 1_000_000.0)?;
             saw = true;
             continue;
         };
         let u = unit.trim_end_matches('s'); // singular/plural
         match u {
-            "year" | "yr" => months += (n * 12.0) as i64,
-            "month" | "mon" => months += n as i64,
-            "week" | "wk" => days += (n * 7.0) as i64,
-            "day" | "d" => days += n as i64,
-            "hour" | "hr" | "h" => micros += (n * 3_600_000_000.0) as i64,
-            "minute" | "min" | "m" => micros += (n * 60_000_000.0) as i64,
-            "second" | "sec" | "s" => micros += (n * 1_000_000.0) as i64,
-            "millisecond" | "msec" | "ms" => micros += (n * 1_000.0) as i64,
-            "microsecond" | "usec" | "us" => micros += n as i64,
+            "year" | "yr" => add_months(&mut months, &mut days, &mut micros, n * 12.0)?,
+            "month" | "mon" => add_months(&mut months, &mut days, &mut micros, n)?,
+            "week" | "wk" => add_days(&mut days, &mut micros, n * 7.0)?,
+            "day" | "d" => add_days(&mut days, &mut micros, n)?,
+            "hour" | "hr" | "h" => add_micros(&mut micros, n * 3_600_000_000.0)?,
+            "minute" | "min" | "m" => add_micros(&mut micros, n * 60_000_000.0)?,
+            "second" | "sec" | "s" => add_micros(&mut micros, n * 1_000_000.0)?,
+            "millisecond" | "msec" | "ms" => add_micros(&mut micros, n * 1_000.0)?,
+            "microsecond" | "usec" | "us" => add_micros(&mut micros, n)?,
             _ => return Err(bad()),
         }
         saw = true;
@@ -922,19 +962,65 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
         return Err(bad());
     }
     Ok(Interval {
-        months: months as i32,
-        days: days as i32,
+        months: months.try_into().map_err(|_| overflow())?,
+        days: days.try_into().map_err(|_| overflow())?,
         micros,
     })
 }
 
-/// Formats an `interval` exactly as PostgreSQL's default (postgres) style does:
-/// nonzero year/month/day fields with units, then a signed `HH:MM:SS[.ffffff]`
-/// time part (shown when microseconds are nonzero, or when the whole interval
-/// is zero).
-pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalStyle {
+    Postgres,
+    PostgresVerbose,
+    SqlStandard,
+    Iso8601,
+}
+
+impl IntervalStyle {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(if value.eq_ignore_ascii_case("postgres") {
+            Self::Postgres
+        } else if value.eq_ignore_ascii_case("postgres_verbose") {
+            Self::PostgresVerbose
+        } else if value.eq_ignore_ascii_case("sql_standard") {
+            Self::SqlStandard
+        } else if value.eq_ignore_ascii_case("iso_8601") {
+            Self::Iso8601
+        } else {
+            return None;
+        })
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::PostgresVerbose => "postgres_verbose",
+            Self::SqlStandard => "sql_standard",
+            Self::Iso8601 => "iso_8601",
+        }
+    }
+}
+
+pub fn format_interval(interval: super::types::Interval) -> StackStr<96> {
+    format_interval_styled(interval, IntervalStyle::Postgres)
+}
+
+pub fn format_interval_styled(
+    interval: super::types::Interval,
+    style: IntervalStyle,
+) -> StackStr<96> {
+    match style {
+        IntervalStyle::Postgres => format_interval_postgres(interval),
+        IntervalStyle::PostgresVerbose => format_interval_verbose(interval),
+        IntervalStyle::SqlStandard => format_interval_sql_standard(interval),
+        IntervalStyle::Iso8601 => format_interval_iso8601(interval),
+    }
+}
+
+/// PostgreSQL's default style: named calendar fields and a clock field.
+fn format_interval_postgres(interval: super::types::Interval) -> StackStr<96> {
     use core::fmt::Write;
-    let mut out = StackStr::<48>::new();
+    let mut out = StackStr::<96>::new();
     let years = interval.months / 12;
     let mons = interval.months % 12;
     let mut first = true;
@@ -943,14 +1029,14 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
     // all-positive fields stays bare. `prev_neg` tracks that immediately
     // preceding sign.
     let mut prev_neg = false;
-    let sep = |out: &mut StackStr<48>, first: &mut bool| {
+    let sep = |out: &mut StackStr<96>, first: &mut bool| {
         if !*first {
             let _ = write!(out, " ");
         }
         *first = false;
     };
     let unit =
-        |out: &mut StackStr<48>, first: &mut bool, prev_neg: &mut bool, n: i32, singular: &str| {
+        |out: &mut StackStr<96>, first: &mut bool, prev_neg: &mut bool, n: i32, singular: &str| {
             if n != 0 {
                 sep(out, first);
                 if n > 0 && *prev_neg {
@@ -971,7 +1057,7 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
         // before it was negative, `-` when it is itself negative.
         sep(&mut out, &mut first);
         let neg = interval.micros < 0;
-        let a = interval.micros.unsigned_abs() as i64;
+        let a = interval.micros.unsigned_abs();
         let seconds = a / 1_000_000;
         let frac = a % 1_000_000;
         let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
@@ -997,6 +1083,201 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
                 let _ = write!(out, "{d}");
             }
         }
+    }
+    out
+}
+
+fn write_fraction(out: &mut StackStr<96>, fraction: u64) {
+    use core::fmt::Write;
+    if fraction == 0 {
+        return;
+    }
+    let mut value = fraction;
+    let mut digits = [0_u8; 6];
+    for digit in digits.iter_mut().rev() {
+        *digit = (value % 10) as u8;
+        value /= 10;
+    }
+    let mut length = digits.len();
+    while digits[length - 1] == 0 {
+        length -= 1;
+    }
+    let _ = out.write_char('.');
+    for digit in &digits[..length] {
+        let _ = write!(out, "{digit}");
+    }
+}
+
+fn format_interval_verbose(interval: super::types::Interval) -> StackStr<96> {
+    use core::fmt::Write;
+    let before = interval.months < 0
+        || interval.months == 0 && interval.days < 0
+        || interval.months == 0 && interval.days == 0 && interval.micros < 0;
+    let direction = if before { -1_i64 } else { 1_i64 };
+    let months = i64::from(interval.months) * direction;
+    let days = i64::from(interval.days) * direction;
+    let micros = i128::from(interval.micros) * i128::from(direction);
+    let mut out = StackStr::<96>::from_str("@ ");
+    let mut wrote = false;
+    let mut unit = |value: i64, singular: &str| {
+        if value == 0 {
+            return;
+        }
+        if wrote {
+            let _ = out.write_char(' ');
+        }
+        let _ = write!(out, "{value} {singular}");
+        if value.unsigned_abs() != 1 {
+            let _ = out.write_char('s');
+        }
+        wrote = true;
+    };
+    unit(months / 12, "year");
+    unit(months % 12, "mon");
+    unit(days, "day");
+    let negative_time = micros < 0;
+    let absolute = micros.unsigned_abs();
+    let seconds = absolute / 1_000_000;
+    let fraction = (absolute % 1_000_000) as u64;
+    let hours = seconds / 3600;
+    let minutes = seconds % 3600 / 60;
+    let second = seconds % 60;
+    let sign = if negative_time { -1 } else { 1 };
+    unit((hours as i64) * sign, "hour");
+    unit((minutes as i64) * sign, "min");
+    if second != 0 || fraction != 0 {
+        if wrote {
+            let _ = out.write_char(' ');
+        }
+        if negative_time {
+            let _ = out.write_char('-');
+        }
+        let _ = write!(out, "{second}");
+        write_fraction(&mut out, fraction);
+        let _ = out.write_str(if second == 1 && fraction == 0 {
+            " sec"
+        } else {
+            " secs"
+        });
+        wrote = true;
+    }
+    if !wrote {
+        let _ = out.write_char('0');
+    }
+    if before {
+        let _ = out.write_str(" ago");
+    }
+    out
+}
+
+fn interval_signs(interval: super::types::Interval) -> (bool, bool) {
+    let negative = interval.months < 0 || interval.days < 0 || interval.micros < 0;
+    let positive = interval.months > 0 || interval.days > 0 || interval.micros > 0;
+    (negative, positive)
+}
+
+enum SqlClockSign {
+    Own,
+    Explicit,
+    SharedWithDay,
+}
+
+fn write_sql_clock(out: &mut StackStr<96>, micros: i64, sign: SqlClockSign) {
+    use core::fmt::Write;
+    match sign {
+        SqlClockSign::Own if micros < 0 => {
+            let _ = out.write_char('-');
+        }
+        SqlClockSign::Explicit => {
+            let _ = out.write_char(if micros < 0 { '-' } else { '+' });
+        }
+        SqlClockSign::Own | SqlClockSign::SharedWithDay => {}
+    }
+    let value = micros.unsigned_abs();
+    let seconds = value / 1_000_000;
+    let fraction = value % 1_000_000;
+    let _ = write!(
+        out,
+        "{}:{:02}:{:02}",
+        seconds / 3600,
+        seconds % 3600 / 60,
+        seconds % 60
+    );
+    write_fraction(out, fraction);
+}
+
+fn format_interval_sql_standard(interval: super::types::Interval) -> StackStr<96> {
+    use core::fmt::Write;
+    if interval.months == 0 && interval.days == 0 && interval.micros == 0 {
+        return StackStr::from_str("0");
+    }
+    let (negative, positive) = interval_signs(interval);
+    let separate_groups = negative && positive
+        || interval.months != 0 && (interval.days != 0 || interval.micros != 0);
+    let mut out = StackStr::<96>::new();
+    if separate_groups {
+        let month_sign = if interval.months < 0 { '-' } else { '+' };
+        let months = i64::from(interval.months).unsigned_abs();
+        let _ = write!(out, "{month_sign}{}-{}", months / 12, months % 12);
+        let day_sign = if interval.days < 0 { '-' } else { '+' };
+        let _ = write!(
+            out,
+            " {day_sign}{} ",
+            i64::from(interval.days).unsigned_abs()
+        );
+        write_sql_clock(&mut out, interval.micros, SqlClockSign::Explicit);
+    } else if interval.months != 0 {
+        if interval.months < 0 {
+            let _ = out.write_char('-');
+        }
+        let months = i64::from(interval.months).unsigned_abs();
+        let _ = write!(out, "{}-{}", months / 12, months % 12);
+    } else if interval.days != 0 {
+        let _ = write!(out, "{} ", interval.days);
+        write_sql_clock(&mut out, interval.micros, SqlClockSign::SharedWithDay);
+    } else {
+        write_sql_clock(&mut out, interval.micros, SqlClockSign::Own);
+    }
+    out
+}
+
+fn format_interval_iso8601(interval: super::types::Interval) -> StackStr<96> {
+    use core::fmt::Write;
+    let mut out = StackStr::<96>::from_str("P");
+    let years = interval.months / 12;
+    let months = interval.months % 12;
+    if years != 0 {
+        let _ = write!(out, "{years}Y");
+    }
+    if months != 0 {
+        let _ = write!(out, "{months}M");
+    }
+    if interval.days != 0 {
+        let _ = write!(out, "{}D", interval.days);
+    }
+    if interval.micros != 0 {
+        let _ = out.write_char('T');
+        let negative = interval.micros < 0;
+        let absolute = interval.micros.unsigned_abs();
+        let seconds = absolute / 1_000_000;
+        let fraction = absolute % 1_000_000;
+        let hours = seconds / 3600;
+        let minutes = seconds % 3600 / 60;
+        let second = seconds % 60;
+        let sign = if negative { "-" } else { "" };
+        if hours != 0 {
+            let _ = write!(out, "{sign}{hours}H");
+        }
+        if minutes != 0 {
+            let _ = write!(out, "{sign}{minutes}M");
+        }
+        if second != 0 || fraction != 0 {
+            let _ = write!(out, "{sign}{second}");
+            write_fraction(&mut out, fraction);
+            let _ = out.write_char('S');
+        }
+    } else if interval.months == 0 && interval.days == 0 {
+        let _ = out.write_str("T0S");
     }
     out
 }

@@ -10,7 +10,7 @@ use crate::util::StackStr;
 
 use super::ast::*;
 use super::lexer::{LexError, Lexer, Tok};
-use super::types::{INTERVAL_FULL_RANGE, TypeMod};
+use super::types::{IntervalField, IntervalRange, TypeMod};
 
 /// Names for the calls a desugaring produces, for syntax PostgreSQL does not
 /// also expose as a function. A space cannot appear in an identifier, so a
@@ -4757,7 +4757,12 @@ impl<'a> Parser<'a> {
         if (name == "character" || name == "char") && self.eat_ident("varying")? {
             name = "varchar";
         }
-        if name == "timestamp" || name == "time" {
+        let standard_temporal = name == "timestamp" || name == "time";
+        let mut leading_type_mod = None;
+        if standard_temporal && self.peeked == Tok::Op("(") {
+            leading_type_mod = Some(self.type_modifier(name)?);
+        }
+        if standard_temporal {
             if self.eat_ident("with")? {
                 self.expect_ident("time")?;
                 self.expect_ident("zone")?;
@@ -4771,8 +4776,17 @@ impl<'a> Parser<'a> {
                 self.expect_ident("zone")?;
             }
         }
-        let type_mod = if self.peeked == Tok::Op("(") {
+        let type_mod = if let Some(type_mod) = leading_type_mod {
+            type_mod
+        } else if standard_temporal && self.peeked == Tok::Op("(") {
+            return Err(self.unexpected("precision must precede WITH/WITHOUT TIME ZONE"));
+        } else if name == "float" && self.peeked == Tok::Op("(") {
+            name = self.float_precision_type()?;
+            -1
+        } else if self.peeked == Tok::Op("(") {
             self.type_modifier(name)?
+        } else if name == "interval" {
+            self.interval_range_modifier()?.unwrap_or(-1)
         } else if name == "char" || name == "character" {
             // Bare `char`/`character` is char(1) in PostgreSQL (`'ab'::char`
             // is 'a'); only the internal name `bpchar` means unlimited.
@@ -4795,6 +4809,85 @@ impl<'a> Parser<'a> {
             return Ok((array, type_mod));
         }
         Ok((name, type_mod))
+    }
+
+    /// SQL `float(p)` chooses one of two concrete PostgreSQL types; `p` is not
+    /// an atttypmod. Resolve the representation while parsing so execution and
+    /// catalogs never carry an unvalidated precision beside a float value.
+    fn float_precision_type(&mut self) -> Result<&'a str, ParseError> {
+        self.expect_op("(")?;
+        let Tok::Num(text) = self.peeked else {
+            return Err(self.unexpected("float precision must be an integer"));
+        };
+        let precision = text
+            .parse::<u32>()
+            .map_err(|_| self.unexpected("float precision must be an integer"))?;
+        self.advance()?;
+        self.expect_op(")")?;
+        if precision == 0 {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "precision for type float must be at least 1 bit"),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        if precision > 53 {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "precision for type float must be less than 54 bits"),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        Ok(if precision <= 24 { "float4" } else { "float8" })
+    }
+
+    /// Parses the closed set of PostgreSQL interval field ranges after an
+    /// `interval` type name. The raw bit mask is produced only by
+    /// `IntervalRange::encode`, so invalid field combinations cannot enter a
+    /// stored or wire type modifier.
+    fn interval_range_modifier(&mut self) -> Result<Option<i32>, ParseError> {
+        let Tok::Ident(first_name) = self.peeked else {
+            return Ok(None);
+        };
+        let Some(first) = IntervalField::parse(first_name) else {
+            return Ok(None);
+        };
+        self.advance()?;
+        let last = if self.eat_ident("to")? {
+            let Tok::Ident(last_name) = self.peeked else {
+                return Err(self.unexpected("expected an interval field after TO"));
+            };
+            let Some(last) = IntervalField::parse(last_name) else {
+                return Err(self.unexpected("expected an interval field after TO"));
+            };
+            self.advance()?;
+            last
+        } else {
+            first
+        };
+        let Some(range) = IntervalRange::from_bounds(first, last) else {
+            return Err(self.unexpected("invalid interval field range"));
+        };
+        let precision = if self.peeked == Tok::Op("(") {
+            if last != IntervalField::Second {
+                return Err(self.unexpected(
+                    "interval precision is allowed only when SECOND is the trailing field",
+                ));
+            }
+            match TypeMod::decode(
+                super::types::ColType::Interval,
+                self.type_modifier("interval")?,
+            ) {
+                TypeMod::IntervalMod {
+                    precision: Some(precision),
+                    ..
+                } => Some(precision),
+                _ => unreachable!("interval precision parser returns an interval modifier"),
+            }
+        } else {
+            None
+        };
+        Ok(Some(TypeMod::IntervalMod { range, precision }.encode()))
     }
 
     /// A type name for a prepared-statement parameter: PostgreSQL parses and
@@ -4902,7 +4995,7 @@ impl<'a> Parser<'a> {
                 // precision; the other temporal types carry the precision bare.
                 if base == "interval" {
                     Ok(TypeMod::IntervalMod {
-                        range: INTERVAL_FULL_RANGE,
+                        range: IntervalRange::Full,
                         precision: Some(precision),
                     }
                     .encode())

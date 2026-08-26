@@ -109,6 +109,13 @@ pub struct MergedColumn<'d> {
     pub ctype: ColType,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct UsingAlias<'d> {
+    pub name: &'d str,
+    pub first_merged: usize,
+    pub n_columns: usize,
+}
+
 /// A column name resolved against a query scope: a plain table column
 /// (table index, column index), or a USING/NATURAL-merged join column
 /// (index into `QueryScope::merged`).
@@ -150,6 +157,8 @@ pub struct QueryScope<'d> {
     /// USING/NATURAL-merged join columns (see `MergedColumn`).
     pub merged: &'d mut [MergedColumn<'d>],
     pub n_merged: usize,
+    /// Qualifiers introduced by `USING (...) AS alias`, indexed by join.
+    using_aliases: &'d mut [Option<UsingAlias<'d>>],
     /// The join tree's output columns in PostgreSQL's order — each
     /// USING/NATURAL join hoists its merged columns to the front and hides
     /// the per-side copies. `n_output == 0` means no merges anywhere: the
@@ -218,7 +227,7 @@ impl<'d> QueryScope<'d> {
                 if join.natural {
                     MAX_USING_COLUMNS
                 } else {
-                    join.using_columns.map_or(0, <[&str]>::len)
+                    join.using.map_or(0, |using| using.columns.len())
                 }
             })
             .sum::<usize>()
@@ -269,6 +278,9 @@ impl<'d> QueryScope<'d> {
         let join_on = arena
             .alloc_slice_with(from.joins.len().max(1), |_| None)
             .map_err(|_| arena_full())?;
+        let using_aliases = arena
+            .alloc_slice_with(from.joins.len().max(1), |_| None)
+            .map_err(|_| arena_full())?;
         Ok(QueryScope {
             names,
             defs,
@@ -281,6 +293,7 @@ impl<'d> QueryScope<'d> {
             n: 0,
             merged,
             n_merged: 0,
+            using_aliases,
             output,
             n_output: 0,
             join_on,
@@ -875,11 +888,7 @@ impl<'d> QueryScope<'d> {
         scratch_arena: &'d Arena,
         expression_arena: Option<&'d Arena>,
     ) -> Result<(), SqlError> {
-        if !from
-            .joins
-            .iter()
-            .any(|j| j.natural || j.using_columns.is_some())
-        {
+        if !from.joins.iter().any(|j| j.natural || j.using.is_some()) {
             return Ok(());
         }
         // The left join tree's output columns, updated join by join.
@@ -894,7 +903,7 @@ impl<'d> QueryScope<'d> {
         for (join_index, join) in from.joins.iter().enumerate() {
             let right_t = join_index + 1;
             let right_def = self.defs[right_t].expect("resolved");
-            if !(join.natural || join.using_columns.is_some()) {
+            if !(join.natural || join.using.is_some()) {
                 for c in 0..right_def.n_columns {
                     out[n_out] = ResolvedColumn::Table(right_t, c);
                     n_out += 1;
@@ -905,9 +914,9 @@ impl<'d> QueryScope<'d> {
             // output name the right table also has, in left output order.
             let mut using = [""; MAX_USING_COLUMNS];
             let mut n_using = 0usize;
-            if let Some(cols) = join.using_columns {
-                using[..cols.len()].copy_from_slice(cols);
-                n_using = cols.len();
+            if let Some(clause) = join.using {
+                using[..clause.columns.len()].copy_from_slice(clause.columns);
+                n_using = clause.columns.len();
             } else {
                 for entry in &out[..n_out] {
                     let name = self.output_name(*entry);
@@ -1031,6 +1040,25 @@ impl<'d> QueryScope<'d> {
             // remaining left-tree output, then the right table's columns
             // minus the consumed ones.
             let n_new = self.n_merged - first_new_merge;
+            if let Some(alias) = join.using.and_then(|using| using.alias) {
+                if self.names[..self.n].contains(&alias)
+                    || self.using_aliases[..join_index]
+                        .iter()
+                        .flatten()
+                        .any(|prior| prior.name == alias)
+                {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_ALIAS,
+                        "table name \"{}\" specified more than once",
+                        alias
+                    ));
+                }
+                self.using_aliases[join_index] = Some(UsingAlias {
+                    name: alias,
+                    first_merged: first_new_merge,
+                    n_columns: n_new,
+                });
+            }
             out.copy_within(0..n_out, n_new);
             for (k, slot) in out[..n_new].iter_mut().enumerate() {
                 *slot = ResolvedColumn::Merged(first_new_merge + k);
@@ -1240,6 +1268,41 @@ impl<'d> QueryScope<'d> {
         })
     }
 
+    pub(super) fn using_alias(&self, name: &str) -> Option<UsingAlias<'d>> {
+        self.using_aliases
+            .iter()
+            .flatten()
+            .find(|a| a.name == name)
+            .copied()
+    }
+
+    /// Width of a qualified star, whether it names a FROM item or a merged
+    /// USING-column alias.
+    pub fn qualified_star_columns(&self, name: &str) -> Result<usize, SqlError> {
+        if let Some(alias) = self.using_alias(name) {
+            return Ok(alias.n_columns);
+        }
+        let table = self.table_index(name)?;
+        Ok(self.defs[table].expect("resolved").n_columns)
+    }
+
+    /// Resolved column at a qualified-star position.
+    pub fn qualified_star_entry(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Result<ResolvedColumn, SqlError> {
+        if let Some(alias) = self.using_alias(name) {
+            return (index < alias.n_columns)
+                .then_some(ResolvedColumn::Merged(alias.first_merged + index))
+                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column does not exist"));
+        }
+        let table = self.table_index(name)?;
+        (index < self.defs[table].expect("resolved").n_columns)
+            .then_some(ResolvedColumn::Table(table, index))
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column does not exist"))
+    }
+
     /// If `name` refers to a set-returning-function scan, the type of its single
     /// scalar output column — the type a whole-row reference to it carries. A
     /// storage- or subquery-derived table returns None (its whole-row reference
@@ -1260,6 +1323,20 @@ impl<'d> QueryScope<'d> {
     ) -> Result<ResolvedColumn, SqlError> {
         match qualifier {
             Some(q) => {
+                if let Some(alias) = self.using_alias(q) {
+                    return (0..alias.n_columns)
+                        .map(|index| alias.first_merged + index)
+                        .find(|&merged| self.merged[merged].name == name)
+                        .map(ResolvedColumn::Merged)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column {}.{} does not exist",
+                                q,
+                                name
+                            )
+                        });
+                }
                 let t = self.table_index(q)?;
                 match self.defs[t].expect("resolved").column_index(name) {
                     Some(c) => Ok(ResolvedColumn::Table(t, c)),

@@ -799,11 +799,22 @@ pub(super) fn grouped_rows<'a>(
         (1u64 << n_keys) - 1
     };
     let single = [all_mask];
-    let masks: &[u64] = if statement.grouping_sets.is_empty() {
+    let mut masks: &[u64] = if statement.grouping_sets.is_empty() {
         &single[..]
     } else {
         statement.grouping_sets
     };
+    let mut distinct_masks = [0u64; crate::sql::parser::MAX_GROUPING_SETS];
+    if statement.grouping_set_quantifier == crate::sql::ast::GroupingSetQuantifier::Distinct {
+        let mut count = 0usize;
+        for &mask in masks {
+            if !distinct_masks[..count].contains(&mask) {
+                distinct_masks[count] = mask;
+                count += 1;
+            }
+        }
+        masks = &distinct_masks[..count];
+    }
     if masks.len() > crate::sql::parser::MAX_GROUPING_SETS {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -1073,11 +1084,9 @@ fn expand_grouped_stars<'a>(
                 }
             }
             SelectItem::TableWildcard(q) => {
-                let t = scope.table_index(q)?;
-                let def = scope.defs[t].expect("resolved");
-                for c in 0..def.n_columns {
+                for index in 0..scope.qualified_star_columns(q)? {
                     let expression =
-                        scope.star_expression(super::scope::ResolvedColumn::Table(t, c), arena)?;
+                        scope.star_expression(scope.qualified_star_entry(q, index)?, arena)?;
                     push(
                         SelectItem::Expr {
                             expression,

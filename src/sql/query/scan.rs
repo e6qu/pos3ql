@@ -987,6 +987,9 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        if self.scope.using_alias(table).is_some() {
+            return Ok(true);
+        }
         let t = self.scope.table_index(table)?;
         match self.values[t] {
             Some([]) => Ok(false), // outer-join null row
@@ -1004,6 +1007,24 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         table: &str,
         arena: &'v Arena,
     ) -> Result<Option<&'v [crate::sql::types::RecordField<'v>]>, SqlError> {
+        if let Some(alias) = self.scope.using_alias(table) {
+            let mut fields = [crate::sql::types::RecordField {
+                name: "",
+                type_oid: 0,
+                value: Datum::Null,
+            }; MAX_COLUMNS];
+            for (index, field) in fields.iter_mut().enumerate().take(alias.n_columns) {
+                let entry = self.scope.qualified_star_entry(table, index)?;
+                let name = self.scope.output_name(entry);
+                field.name = arena.alloc_str(name).map_err(|_| arena_full())?;
+                field.type_oid = self.scope.output_type(entry).oid();
+                field.value = self.lookup(Some(table), name)?;
+            }
+            return arena
+                .alloc_slice_copy(&fields[..alias.n_columns])
+                .map(|fields| Some(&*fields))
+                .map_err(|_| arena_full());
+        }
         let t = self.scope.table_index(table)?;
         let def = self.scope.defs[t].expect("resolved");
         let vals = match self.values[t] {
@@ -1037,6 +1058,34 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             .alloc_slice_copy(&fields[..def.n_columns])
             .map_err(|_| arena_full())?;
         Ok(Some(&*out))
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<&'v [crate::sql::types::RecordField<'v>], SqlError> {
+        if let Some(fields) = self.whole_row_fields(table, arena)? {
+            return Ok(fields);
+        }
+        let table = self.scope.table_index(table)?;
+        let definition = self.scope.defs[table].expect("resolved");
+        let columns = definition.columns();
+        let fields = arena
+            .alloc_slice_with(definition.n_columns, |index| {
+                crate::sql::types::RecordField {
+                    name: "",
+                    type_oid: columns[index].ctype.oid(),
+                    value: Datum::Null,
+                }
+            })
+            .map_err(|_| arena_full())?;
+        for (field, column) in fields.iter_mut().zip(columns) {
+            field.name = arena
+                .alloc_str(column.name.as_str())
+                .map_err(|_| arena_full())?;
+        }
+        Ok(fields)
     }
 }
 
@@ -1078,6 +1127,20 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             Err(e) => match self.outer {
                 Some(o) => o.whole_row_fields(table, arena),
                 None => Err(e),
+            },
+        }
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [crate::sql::types::RecordField<'a>], SqlError> {
+        match self.inner.whole_row_expansion_fields(table, arena) {
+            Ok(fields) => Ok(fields),
+            Err(error) => match self.outer {
+                Some(outer) => outer.whole_row_expansion_fields(table, arena),
+                None => Err(error),
             },
         }
     }

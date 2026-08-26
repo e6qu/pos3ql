@@ -1025,6 +1025,54 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         )
     }
 
+    fn null_composite_fields<'a>(
+        &self,
+        type_oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        let Ok(slot) = usize::try_from(type_oid - super::types::oid::FIRST_COMPOSITE) else {
+            return Ok(None);
+        };
+        let Some(definition) = self
+            .storage
+            .composites_with_slots_visible_to(self.txid)
+            .find_map(|(candidate, definition)| (candidate == slot).then_some(definition))
+        else {
+            return Ok(None);
+        };
+        let fields = arena
+            .alloc_slice_with(definition.active_field_count(), |_| {
+                super::types::RecordField {
+                    name: "",
+                    type_oid: super::types::oid::UNKNOWN,
+                    value: Datum::Null,
+                }
+            })
+            .map_err(|_| arena_full())?;
+        for (out, field) in fields.iter_mut().zip(definition.active_fields()) {
+            out.name = arena
+                .alloc_str(field.name.as_str())
+                .map_err(|_| arena_full())?;
+            out.type_oid = match field.user_type {
+                Some(identity) => self
+                    .storage
+                    .user_type_identity_oid(
+                        identity,
+                        matches!(field.ctype, ColType::Array(_)),
+                        self.txid,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "composite field type identity is unavailable"
+                        )
+                    })?,
+                None => field.ctype.oid(),
+            };
+        }
+        Ok(Some(fields))
+    }
+
     fn compare_text(
         &self,
         collation: super::ast::Collation,
@@ -1969,11 +2017,7 @@ fn patch_subquery_column_types<'a>(
             SelectItem::Wildcard => slot += scope.map_or(0, |s| s.star_columns()),
             SelectItem::TableWildcard(q) => {
                 slot += scope
-                    .and_then(|s| {
-                        s.table_index(q)
-                            .ok()
-                            .map(|t| s.defs[t].expect("resolved").n_columns)
-                    })
+                    .and_then(|s| s.qualified_star_columns(q).ok())
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {
@@ -2268,15 +2312,12 @@ fn resolve_position_target<'a>(
                 let Some(scope) = scope else {
                     return Err(position_error());
                 };
-                let t = scope.table_index(q)?;
-                let def = scope.defs[t].expect("resolved");
-                if remaining < def.n_columns {
-                    return column_ref(
-                        Some(scope.names[t]),
-                        def.columns()[remaining].name.as_str(),
-                    );
+                let width = scope.qualified_star_columns(q)?;
+                if remaining < width {
+                    let entry = scope.qualified_star_entry(q, remaining)?;
+                    return column_ref(Some(q), scope.output_name(entry));
                 }
-                remaining -= def.n_columns;
+                remaining -= width;
             }
             SelectItem::RecordStar(base) => {
                 let Some(scope) = scope else {
@@ -5239,9 +5280,32 @@ fn project_row_skipping<'a>(
         }
         match item {
             SelectItem::TableWildcard(q) => {
-                let t = scope.table_index(q)?;
-                let vals = row.values[t].expect("bound");
-                for c in 0..scope.defs[t].expect("resolved").n_columns {
+                let value_of = |entry| match entry {
+                    ResolvedColumn::Table(t, c) => {
+                        let values = row.values[t].expect("bound");
+                        if values.is_empty() {
+                            Datum::Null
+                        } else {
+                            values[c]
+                        }
+                    }
+                    ResolvedColumn::Merged(m) => {
+                        let merged = &scope.merged[m];
+                        merged.parts[..merged.n_parts]
+                            .iter()
+                            .map(|&(t, c)| {
+                                let values = row.values[t].expect("bound");
+                                if values.is_empty() {
+                                    Datum::Null
+                                } else {
+                                    values[c]
+                                }
+                            })
+                            .find(|value| !value.is_null())
+                            .unwrap_or(Datum::Null)
+                    }
+                };
+                for index in 0..scope.qualified_star_columns(q)? {
                     if n == MAX_PROJ {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5249,11 +5313,7 @@ fn project_row_skipping<'a>(
                             MAX_PROJ
                         ));
                     }
-                    out[n] = if vals.is_empty() {
-                        Datum::Null
-                    } else {
-                        vals[c]
-                    };
+                    out[n] = value_of(scope.qualified_star_entry(q, index)?);
                     n += 1;
                 }
             }
@@ -5359,16 +5419,22 @@ pub fn describe_scope_items<'q>(
     for item in items {
         match item {
             SelectItem::TableWildcard(q) => {
-                let t = scope.table_index(q)?;
-                for c in scope.defs[t].expect("resolved").columns() {
+                for index in 0..scope.qualified_star_columns(q)? {
                     if n == out.len() {
                         return Err(sql_err!(
                             sqlstate::PROGRAM_LIMIT_EXCEEDED,
                             "select list too wide"
                         ));
                     }
-                    out[n] = ColDesc::of_type(c.name.as_str(), c.ctype).with_type_mod(c.type_mod);
-                    out[n].collation = c.collation;
+                    let entry = scope.qualified_star_entry(q, index)?;
+                    out[n] = ColDesc::of_type(scope.output_name(entry), scope.output_type(entry))
+                        .with_type_mod(match entry {
+                            ResolvedColumn::Table(table, column) => {
+                                scope.defs[table].expect("resolved").columns()[column].type_mod
+                            }
+                            ResolvedColumn::Merged(_) => -1,
+                        });
+                    out[n].collation = scope.output_collation(entry);
                     n += 1;
                 }
             }
@@ -6193,18 +6259,23 @@ fn describe_scope_record_star<'q>(
         txid,
     };
     match base {
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+        Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
             super::exec::check_row_field_types(base, &resolver)?;
-            for (i, arg) in args
-                .iter()
-                .take(super::exec::RECORD_FIELD_NAMES.len())
-                .enumerate()
-            {
-                let (oid, typlen) = super::exec::infer_type_res(arg, &resolver)?;
-                push(
-                    ColDesc::new(super::exec::RECORD_FIELD_NAMES[i], oid, typlen),
-                    &mut n,
-                )?;
+            let mut error = None;
+            let mut index = 0usize;
+            super::exec::record_shape(base, &resolver, |_, ctype| {
+                if error.is_none() {
+                    error = push(
+                        ColDesc::of_type(super::exec::RECORD_FIELD_NAMES[index], ctype),
+                        &mut n,
+                    )
+                    .err();
+                }
+                index += 1;
+            })
+            .ok_or_else(|| super::exec::could_not_identify("*"))?;
+            if let Some(error) = error {
+                return Err(error);
             }
         }
         Expr::WholeRow(table)
@@ -6367,7 +6438,7 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
-        self.0.table_index(name).is_ok()
+        self.0.qualified_star_columns(name).is_ok()
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
@@ -6378,6 +6449,19 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
         let t = self.0.table_index(name).ok()?;
         let def = self.0.defs[t]?;
         Some(&def.columns()[..def.n_columns])
+    }
+
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
+        let entry = self.0.qualified_star_entry(name, index).ok()?;
+        let field_name = self.0.output_name(entry);
+        Some((
+            crate::util::StackStr::from_str(field_name),
+            self.column_meta(Some(name), field_name)?,
+        ))
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -6392,11 +6476,11 @@ impl super::exec::ColTypeResolver for ScopeCols<'_, '_> {
     }
 }
 
-struct CatalogScopeCols<'scope, 'definition, 'storage> {
-    scope: &'scope QueryScope<'definition>,
-    outer_scope: Option<&'scope QueryScope<'definition>>,
-    storage: &'storage Storage,
-    txid: u32,
+pub(crate) struct CatalogScopeCols<'scope, 'definition, 'storage> {
+    pub(crate) scope: &'scope QueryScope<'definition>,
+    pub(crate) outer_scope: Option<&'scope QueryScope<'definition>>,
+    pub(crate) storage: &'storage Storage,
+    pub(crate) txid: u32,
 }
 
 impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
@@ -6535,10 +6619,10 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
-        self.scope.table_index(name).is_ok()
+        self.scope.qualified_star_columns(name).is_ok()
             || self
                 .outer_scope
-                .is_some_and(|scope| scope.table_index(name).is_ok())
+                .is_some_and(|scope| scope.qualified_star_columns(name).is_ok())
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
@@ -6555,6 +6639,43 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         let scope = self.outer_scope?;
         let table = scope.table_index(name).ok()?;
         Some(scope.defs[table]?.columns())
+    }
+
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
+        let scope = if self.scope.qualified_star_columns(name).is_ok() {
+            self.scope
+        } else {
+            let outer = self.outer_scope?;
+            outer.qualified_star_columns(name).ok()?;
+            outer
+        };
+        let entry = scope.qualified_star_entry(name, index).ok()?;
+        let field_name = scope.output_name(entry);
+        let ctype = scope.output_type(entry);
+        let (type_oid, type_mod) = match entry {
+            scope::ResolvedColumn::Table(table, column) => {
+                let column = scope.defs[table]?.columns().get(column)?;
+                (
+                    self.storage
+                        .routine_type_oid(column.ctype, column.user_type, self.txid)?,
+                    column.type_mod,
+                )
+            }
+            scope::ResolvedColumn::Merged(_) => (ctype.oid(), -1),
+        };
+        Some((
+            crate::util::StackStr::from_str(field_name),
+            super::exec::StaticTypeMeta {
+                ctype,
+                type_oid,
+                type_mod,
+                collation: scope.output_collation(entry),
+            },
+        ))
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {

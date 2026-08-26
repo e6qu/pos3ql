@@ -199,12 +199,11 @@ fn collect_select<'a>(
                         }
                     }
                     SelectItem::TableWildcard(name) => {
-                        let table = scope.table_index(name)?;
-                        for column in 0..scope.defs[table].expect("resolved").n_columns {
-                            dependencies.mark_referenced_column(
-                                DependencyClass::Table,
-                                scope.slots[table],
-                                column,
+                        for index in 0..scope.qualified_star_columns(name)? {
+                            mark_resolved_column(
+                                &scope,
+                                scope.qualified_star_entry(name, index)?,
+                                dependencies,
                             )?;
                         }
                     }
@@ -336,7 +335,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
 
     fn is_whole_row(&self, name: &str) -> bool {
         self.scope
-            .is_some_and(|scope| scope.table_index(name).is_ok())
+            .is_some_and(|scope| scope.qualified_star_columns(name).is_ok())
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
@@ -347,6 +346,14 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         let scope = self.scope?;
         let table = scope.table_index(name).ok()?;
         Some(scope.defs[table]?.columns())
+    }
+
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        super::ScopeCols(self.scope?).whole_row_field(name, index)
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -830,17 +837,33 @@ fn record_column_references(
                 return;
             }
         };
-        if let super::ResolvedColumn::Table(table, column) = resolved
-            && let Err(error) = dependencies.mark_referenced_column(
-                DependencyClass::Table,
-                scope.slots[table],
-                column,
-            )
-        {
+        if let Err(error) = mark_resolved_column(scope, resolved, dependencies) {
             failure = Some(error);
         }
     });
     failure.map_or(Ok(()), Err)
+}
+
+fn mark_resolved_column(
+    scope: &super::QueryScope<'_>,
+    resolved: super::ResolvedColumn,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    match resolved {
+        super::ResolvedColumn::Table(table, column) => {
+            dependencies.mark_referenced_column(DependencyClass::Table, scope.slots[table], column)
+        }
+        super::ResolvedColumn::Merged(merged) => {
+            for &(table, column) in &scope.merged[merged].parts[..scope.merged[merged].n_parts] {
+                dependencies.mark_referenced_column(
+                    DependencyClass::Table,
+                    scope.slots[table],
+                    column,
+                )?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn collect_set_tree<'a>(

@@ -42,12 +42,7 @@ impl<'a> Parser<'a> {
                 return Err(self.limit("ORDER BY", MAX_LIST));
             }
             let expression = self.expression(0)?;
-            let descending = if self.eat_ident("desc")? {
-                true
-            } else {
-                self.eat_ident("asc")?;
-                false
-            };
+            let descending = self.order_direction()?;
             let nulls_first = if self.eat_ident("nulls")? {
                 if self.eat_ident("first")? {
                     true

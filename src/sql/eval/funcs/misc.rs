@@ -49,29 +49,57 @@ pub(crate) fn dispatch<'a>(
             // Record constructor `ROW(a, b, ...)` / `row(...)`: fields are named
             // f1, f2, ... as PostgreSQL does for an anonymous record.
             "row" => {
-                if args.len() > parser::MAX_LIST {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "too many fields in ROW()"
-                    ));
-                }
                 let mut fields = [RecordField {
                     name: "",
                     type_oid: 0,
                     value: Datum::Null,
                 }; parser::MAX_LIST];
-                for (i, arg) in args.iter().enumerate() {
-                    let v = eval_full(arg, arena, params, row, hooks)?;
-                    let type_oid = expression_type_identity(arg, row, hooks)?.record_field_oid();
-                    let name = stack_format!(12, "f{}", i + 1);
-                    fields[i] = RecordField {
-                        name: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
-                        type_oid,
-                        value: v,
+                let mut count = 0usize;
+                for arg in args {
+                    let expansion = match arg {
+                        Expr::WholeRow(_) => Some(*arg),
+                        Expr::Field { base, field: "*" } => Some(*base),
+                        _ => None,
                     };
+                    if let Some(base) = expansion {
+                        let expanded =
+                            super::super::record_star_expand(base, arena, params, row, hooks)?;
+                        if count + expanded.len() > fields.len() {
+                            return Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "too many fields in ROW()"
+                            ));
+                        }
+                        for field in expanded {
+                            let name = stack_format!(12, "f{}", count + 1);
+                            fields[count] = RecordField {
+                                name: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
+                                type_oid: field.type_oid,
+                                value: field.value,
+                            };
+                            count += 1;
+                        }
+                    } else {
+                        if count == fields.len() {
+                            return Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "too many fields in ROW()"
+                            ));
+                        }
+                        let value = eval_full(arg, arena, params, row, hooks)?;
+                        let type_oid =
+                            expression_type_identity(arg, row, hooks)?.record_field_oid();
+                        let name = stack_format!(12, "f{}", count + 1);
+                        fields[count] = RecordField {
+                            name: arena.alloc_str(name.as_str()).map_err(|_| arena_full())?,
+                            type_oid,
+                            value,
+                        };
+                        count += 1;
+                    }
                 }
                 let out = arena
-                    .alloc_slice_copy(&fields[..args.len()])
+                    .alloc_slice_copy(&fields[..count])
                     .map_err(|_| arena_full())?;
                 Ok(Datum::Record(&*out))
             }

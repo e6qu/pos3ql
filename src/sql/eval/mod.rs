@@ -321,6 +321,21 @@ pub trait ColumnLookup<'a> {
         ))
     }
 
+    /// Fields used by `(row).*` and `ROW(row.*, ...)`. Unlike a whole-row
+    /// value, expansion retains the declared shape of an outer-join null row.
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        self.whole_row_fields(table, arena)?.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "null whole-row expansion lacks its declared shape"
+            )
+        })
+    }
+
     /// A whole-row reference (`t.*` as a value): Ok(true) when the row is
     /// present, Ok(false) when it is an outer-join null row. Contexts without
     /// join rows reject it.
@@ -560,6 +575,14 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).whole_row_fields(table, arena)
     }
 
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        (**self).whole_row_expansion_fields(table, arena)
+    }
+
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
         (**self).col_type(qualifier, name)
     }
@@ -703,6 +726,15 @@ pub trait CatalogAccess {
             sqlstate::FEATURE_NOT_SUPPORTED,
             "named composite catalog access is unavailable"
         ))
+    }
+    /// Produces the declared fields of a null named-composite value. `None`
+    /// means the OID is not a visible named composite.
+    fn null_composite_fields<'a>(
+        &self,
+        _type_oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        Ok(None)
     }
     /// Compares text with a resolved database collation. A query executor must
     /// supply this for the database default; an evaluator without a catalog
@@ -4205,6 +4237,19 @@ pub fn record_star_expand<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+    if let Expr::WholeRow(table) = base {
+        return row.whole_row_expansion_fields(table, arena);
+    }
+    if let Expr::Column {
+        qualifier: None,
+        name,
+    } = base
+        && row
+            .lookup(None, name)
+            .is_err_and(|error| error.sqlstate == sqlstate::UNDEFINED_COLUMN)
+    {
+        return row.whole_row_expansion_fields(name, arena);
+    }
     match eval_full(base, arena, params, row, hooks)? {
         Datum::Record(fields) | Datum::Composite { fields, .. } => Ok(fields),
         Datum::CompositeText {
@@ -4224,6 +4269,31 @@ pub fn record_star_expand<'a>(
                 unreachable!("catalog materializes named composites")
             };
             Ok(fields)
+        }
+        Datum::Null => {
+            let ExpressionTypeIdentity::Known(type_oid) =
+                expression_type_identity(base, row, hooks)?
+            else {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "record expansion of an untyped null value"
+                ));
+            };
+            hooks
+                .catalog
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "named composite catalog access is unavailable"
+                    )
+                })?
+                .null_composite_fields(type_oid, arena)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "record expansion of a non-composite null value"
+                    )
+                })
         }
         other => Err(type_mismatch(
             "record expansion of a non-composite value",

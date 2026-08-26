@@ -31636,6 +31636,7 @@ pub fn merge(
         from: Some(source_from),
         where_clause: None,
         group_by: &[],
+        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
         grouping_sets: &[],
         having: None,
         order_by: &[],
@@ -39749,6 +39750,9 @@ fn coerce_composite_value_inner<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
     if let Datum::Composite { slot: actual, .. } = value {
         return if actual == slot {
             Ok(value)

@@ -193,15 +193,15 @@ fn spooled_column_witness<'a>(
                     "SELECT * with no tables specified is not valid"
                 )
             })?;
-            let table = scope.table_index(qualifier)?;
-            let def = scope.defs[table].expect("resolved table wildcard");
-            if def.n_columns != 1 {
+            if scope.qualified_star_columns(qualifier)? != 1 {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "subquery must return only one column"
                 ));
             }
-            Ok(type_witness(def.columns()[0].ctype))
+            Ok(type_witness(
+                scope.output_type(scope.qualified_star_entry(qualifier, 0)?),
+            ))
         }
         _ => {
             if let Some((witness, _)) = scope_record_witness(item, scope, storage, txid, arena)? {
@@ -1052,10 +1052,9 @@ fn subquery_collations<'a>(
                         "SELECT * with no tables specified is not valid"
                     )
                 })?;
-                let table = scope.table_index(qualifier)?;
-                let definition = scope.defs[table].expect("resolved table wildcard");
-                for column in definition.columns() {
-                    output[count] = column.collation;
+                for index in 0..scope.qualified_star_columns(qualifier)? {
+                    output[count] =
+                        scope.output_collation(scope.qualified_star_entry(qualifier, index)?);
                     count += 1;
                 }
             }
@@ -2533,9 +2532,7 @@ fn run_subquery<'a>(
             })
             .map_err(|_| arena_full())?
     } else if let Some(q) = table_star {
-        let t = scope.table_index(q)?;
-        let def = scope.defs[t].expect("resolved");
-        if def.n_columns != 1 {
+        if scope.qualified_star_columns(q)? != 1 {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "subquery must return only one column"
@@ -2544,7 +2541,7 @@ fn run_subquery<'a>(
         arena
             .alloc(Expr::Column {
                 qualifier: Some(q),
-                name: def.columns()[0].name.as_str(),
+                name: scope.output_name(scope.qualified_star_entry(q, 0)?),
             })
             .map_err(|_| arena_full())?
     } else {

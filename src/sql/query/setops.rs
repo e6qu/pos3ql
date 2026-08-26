@@ -1130,12 +1130,7 @@ fn register_first_leaf_record_shapes(
             SelectItem::Wildcard => slot += scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(name) => {
                 slot += scope
-                    .and_then(|scope| {
-                        scope
-                            .table_index(name)
-                            .ok()
-                            .map(|table| scope.defs[table].expect("resolved").n_columns)
-                    })
+                    .and_then(|scope| scope.qualified_star_columns(name).ok())
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {

@@ -5197,6 +5197,7 @@ impl Engine {
         };
         if let Ok(Some(statement)) = parser.next_stmt() {
             self.infer_stmt_params(&statement, txn.txid, &mut oids);
+            self.infer_resolved_stmt_params(&statement, txn.txid, arena, &mut oids);
         }
         // A client's explicit (non-zero) parameter type overrides inference.
         for (i, &c) in client_oids.iter().enumerate().take(MAX_BIND_PARAMS) {
@@ -5205,6 +5206,225 @@ impl Engine {
             }
         }
         oids
+    }
+
+    fn infer_resolved_stmt_params<'a>(
+        &'a self,
+        statement: &'a Stmt<'a>,
+        txid: u32,
+        arena: &'a Arena,
+        oids: &mut [i32; MAX_BIND_PARAMS],
+    ) {
+        match statement {
+            Stmt::Select(select) => self.infer_resolved_select_params(select, txid, arena, oids),
+            Stmt::SetQuery(query) => {
+                self.infer_resolved_set_tree_params(query.body, txid, arena, oids);
+                for cte in query.with {
+                    match cte.dml {
+                        Some(dml) => self.infer_resolved_stmt_params(dml, txid, arena, oids),
+                        None => self.infer_resolved_select_params(cte.query, txid, arena, oids),
+                    }
+                }
+            }
+            Stmt::With { ctes, statement } => {
+                for cte in *ctes {
+                    match cte.dml {
+                        Some(dml) => self.infer_resolved_stmt_params(dml, txid, arena, oids),
+                        None => self.infer_resolved_select_params(cte.query, txid, arena, oids),
+                    }
+                }
+                self.infer_resolved_stmt_params(statement, txid, arena, oids);
+            }
+            Stmt::Insert(insert) => {
+                if let Some(select) = insert.select {
+                    self.infer_resolved_select_params(select, txid, arena, oids);
+                }
+            }
+            Stmt::Explain { statement, .. } => {
+                self.infer_resolved_stmt_params(statement, txid, arena, oids);
+            }
+            _ => {}
+        }
+    }
+
+    fn infer_resolved_set_tree_params<'a>(
+        &'a self,
+        tree: &'a ast::SetTree<'a>,
+        txid: u32,
+        arena: &'a Arena,
+        oids: &mut [i32; MAX_BIND_PARAMS],
+    ) {
+        match tree {
+            ast::SetTree::Select(select) => {
+                self.infer_resolved_select_params(select, txid, arena, oids)
+            }
+            ast::SetTree::Op { left, right, .. } => {
+                self.infer_resolved_set_tree_params(left, txid, arena, oids);
+                self.infer_resolved_set_tree_params(right, txid, arena, oids);
+            }
+        }
+    }
+
+    fn infer_resolved_select_params<'a>(
+        &'a self,
+        select: &'a ast::Select<'a>,
+        txid: u32,
+        arena: &'a Arena,
+        oids: &mut [i32; MAX_BIND_PARAMS],
+    ) {
+        if let Some(tree) = select.set_body {
+            self.infer_resolved_set_tree_params(tree, txid, arena, oids);
+        }
+        for cte in select.with {
+            match cte.dml {
+                Some(dml) => self.infer_resolved_stmt_params(dml, txid, arena, oids),
+                None => self.infer_resolved_select_params(cte.query, txid, arena, oids),
+            }
+        }
+
+        let scope = match select.from.as_ref() {
+            Some(from) => match query::QueryScope::resolve_schema(&self.storage, from, txid, arena)
+            {
+                Ok(scope) => Some(scope),
+                Err(_) => return,
+            },
+            None => None,
+        };
+        let resolver = scope.as_ref().map(|scope| query::CatalogScopeCols {
+            scope,
+            outer_scope: None,
+            storage: &self.storage,
+            txid,
+        });
+        let infer = |expression: &Expr<'a>| {
+            let inferred = match &resolver {
+                Some(resolver) => exec::infer_type_res(expression, resolver),
+                None => exec::infer_type_catalog(expression, None, &self.storage, txid),
+            }
+            .ok()?
+            .0;
+            (inferred != types::oid::UNKNOWN).then_some(inferred)
+        };
+
+        let mut visit =
+            |expression| self.infer_expression_params(expression, txid, arena, oids, &infer);
+        for item in select.items {
+            match item {
+                ast::SelectItem::Expr { expression, .. }
+                | ast::SelectItem::RecordStar(expression) => visit(expression),
+                ast::SelectItem::Wildcard | ast::SelectItem::TableWildcard(_) => {}
+            }
+        }
+        if let Some(from) = select.from {
+            for join in from.joins {
+                if let Some(on) = join.on {
+                    visit(on);
+                }
+            }
+        }
+        for expression in select
+            .where_clause
+            .into_iter()
+            .chain(select.group_by.iter().copied())
+            .chain(select.having)
+            .chain(select.order_by.iter().map(|order| order.expression))
+            .chain(select.limit)
+            .chain(select.offset)
+        {
+            visit(expression);
+        }
+    }
+
+    fn infer_expression_params<'a>(
+        &'a self,
+        expression: &'a Expr<'a>,
+        txid: u32,
+        arena: &'a Arena,
+        oids: &mut [i32; MAX_BIND_PARAMS],
+        infer: &impl Fn(&Expr<'a>) -> Option<i32>,
+    ) {
+        let assign = |expression: &Expr, type_oid: i32, oids: &mut [i32; MAX_BIND_PARAMS]| {
+            if let Expr::Param(index) = expression
+                && *index >= 1
+                && (*index as usize) <= MAX_BIND_PARAMS
+            {
+                oids[*index as usize - 1] = type_oid;
+            }
+        };
+        match expression {
+            Expr::Cast {
+                operand, type_name, ..
+            } => {
+                let type_oid = types::ColType::from_sql_name(type_name)
+                    .map(types::ColType::oid)
+                    .or_else(|| catalog::user_type_oid(&self.storage, txid, type_name));
+                if let Some(type_oid) = type_oid {
+                    assign(operand, type_oid, oids);
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                if let Some(type_oid) = infer(right) {
+                    assign(left, type_oid, oids);
+                }
+                if let Some(type_oid) = infer(left) {
+                    assign(right, type_oid, oids);
+                }
+            }
+            Expr::Between {
+                operand, low, high, ..
+            } => {
+                if let Some(type_oid) = infer(operand) {
+                    assign(low, type_oid, oids);
+                    assign(high, type_oid, oids);
+                } else if let Some(type_oid) = infer(low).or_else(|| infer(high)) {
+                    assign(operand, type_oid, oids);
+                }
+            }
+            Expr::InList { operand, list, .. } => {
+                if let Some(type_oid) = infer(operand) {
+                    for item in *list {
+                        assign(item, type_oid, oids);
+                    }
+                } else if let Some(type_oid) = list.iter().find_map(|item| infer(item)) {
+                    assign(operand, type_oid, oids);
+                }
+            }
+            Expr::Like {
+                operand, pattern, ..
+            }
+            | Expr::Match {
+                operand, pattern, ..
+            } => {
+                assign(operand, types::oid::TEXT, oids);
+                assign(pattern, types::oid::TEXT, oids);
+                if let Expr::Like { escape, .. } = expression
+                    && let Some(escape) = escape
+                {
+                    assign(escape, types::oid::TEXT, oids);
+                }
+            }
+            Expr::Unary {
+                operator: ast::UnaryOp::Not,
+                operand,
+            } => assign(operand, types::oid::BOOL, oids),
+            Expr::Case { whens, .. } => {
+                for (condition, _) in *whens {
+                    assign(condition, types::oid::BOOL, oids);
+                }
+            }
+            Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+                self.infer_resolved_select_params(select, txid, arena, oids);
+            }
+            Expr::InSubquery { select, .. } | Expr::QuantifiedSubquery { select, .. } => {
+                self.infer_resolved_select_params(select, txid, arena, oids);
+            }
+            _ => {}
+        }
+        query::walk_children(expression, &mut |child| {
+            self.infer_expression_params(child, txid, arena, oids, infer);
+            Ok(())
+        })
+        .expect("parameter expression walk cannot fail");
     }
 
     /// The OID of a named column of a visible table, if resolvable.
@@ -5310,8 +5530,6 @@ impl Engine {
             }
             Stmt::Select(s) => {
                 self.infer_select_source_params(s, txid, oids);
-                // Single-table WHERE comparisons only (joins would need scope
-                // resolution; those params stay text).
                 if let (Some(from), Some(w)) = (&s.from, s.where_clause)
                     && from.joins.is_empty()
                     && from.base.subquery.is_none()

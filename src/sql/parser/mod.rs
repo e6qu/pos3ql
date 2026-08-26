@@ -1265,11 +1265,18 @@ impl<'a> Parser<'a> {
             None
         };
         let where_clause = self.where_clause()?;
-        let (group_by, grouping_sets) = if self.eat_ident("group")? {
+        let (group_by, grouping_sets, grouping_set_quantifier) = if self.eat_ident("group")? {
             self.expect_ident("by")?;
-            self.group_by_clause()?
+            let quantifier = if self.eat_ident("distinct")? {
+                GroupingSetQuantifier::Distinct
+            } else {
+                let _ = self.eat_ident("all")?;
+                GroupingSetQuantifier::All
+            };
+            let (group_by, grouping_sets) = self.group_by_clause()?;
+            (group_by, grouping_sets, quantifier)
         } else {
-            (&[][..], &[][..])
+            (&[][..], &[][..], GroupingSetQuantifier::All)
         };
         let having = if self.eat_ident("having")? {
             Some(self.expression(0)?)
@@ -1288,6 +1295,7 @@ impl<'a> Parser<'a> {
             from,
             where_clause,
             group_by,
+            grouping_set_quantifier,
             grouping_sets,
             having,
             order_by: &[],
@@ -1360,12 +1368,7 @@ impl<'a> Parser<'a> {
                     return Err(self.limit("order by list", MAX_LIST));
                 }
                 let expression = self.expression(0)?;
-                let descending = if self.eat_ident("desc")? {
-                    true
-                } else {
-                    self.eat_ident("asc")?;
-                    false
-                };
+                let descending = self.order_direction()?;
                 // Optional NULLS FIRST/LAST; PostgreSQL defaults NULLS LAST
                 // for ASC and NULLS FIRST for DESC.
                 let nulls_first = if self.eat_ident("nulls")? {
@@ -1437,6 +1440,53 @@ impl<'a> Parser<'a> {
         Ok((order_by, limit, offset, with_ties))
     }
 
+    /// Parses ASC, DESC, or PostgreSQL's ordering-operator spelling shared by
+    /// query, aggregate, and window ORDER BY lists.
+    pub(super) fn order_direction(&mut self) -> Result<bool, ParseError> {
+        if self.eat_ident("using")? {
+            let (schema, operator) = if self.eat_ident("operator")? {
+                self.expect_op("(")?;
+                let first = self.any_op_token()?;
+                let pair = if self.eat_op(".")? {
+                    (Some(first), self.any_op_token()?)
+                } else {
+                    (None, first)
+                };
+                self.expect_op(")")?;
+                pair
+            } else {
+                (None, self.any_op_token()?)
+            };
+            if let Some(schema) = schema
+                && schema != "pg_catalog"
+            {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "operator {}.{} does not exist", schema, operator),
+                    sqlstate: sqlstate::UNDEFINED_FUNCTION,
+                });
+            }
+            match operator {
+                "<" => Ok(false),
+                ">" => Ok(true),
+                _ => Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(
+                        96,
+                        "operator {} is not a valid ordering operator",
+                        operator
+                    ),
+                    sqlstate: sqlstate::WRONG_OBJECT_TYPE,
+                }),
+            }
+        } else if self.eat_ident("desc")? {
+            Ok(true)
+        } else {
+            self.eat_ident("asc")?;
+            Ok(false)
+        }
+    }
+
     /// A subquery body: a set-operation tree of SELECTs, then the trailing
     /// ORDER BY / LIMIT / OFFSET applying to the whole result. A lone SELECT
     /// (no set operator) folds those clauses back into itself; a genuine
@@ -1471,6 +1521,7 @@ impl<'a> Parser<'a> {
             from: None,
             where_clause: None,
             group_by: &[],
+            grouping_set_quantifier: GroupingSetQuantifier::All,
             grouping_sets: &[],
             having: None,
             order_by,
@@ -1499,6 +1550,7 @@ impl<'a> Parser<'a> {
                 from: None,
                 where_clause: None,
                 group_by: &[],
+                grouping_set_quantifier: GroupingSetQuantifier::All,
                 grouping_sets: &[],
                 having: None,
                 order_by: query.order_by,
@@ -1590,6 +1642,7 @@ impl<'a> Parser<'a> {
                 from: None,
                 where_clause: None,
                 group_by: &[],
+                grouping_set_quantifier: GroupingSetQuantifier::All,
                 grouping_sets: &[],
                 having: None,
                 order_by: &[],
@@ -1881,6 +1934,7 @@ impl<'a> Parser<'a> {
                     from: None,
                     where_clause: None,
                     group_by: &[],
+                    grouping_set_quantifier: GroupingSetQuantifier::All,
                     grouping_sets: &[],
                     having: None,
                     order_by,
@@ -1936,6 +1990,7 @@ impl<'a> Parser<'a> {
                     from: None,
                     where_clause: None,
                     group_by: &[],
+                    grouping_set_quantifier: GroupingSetQuantifier::All,
                     grouping_sets: &[],
                     having: None,
                     order_by: &[],
@@ -2013,6 +2068,7 @@ impl<'a> Parser<'a> {
                 }),
                 where_clause: None,
                 group_by: &[],
+                grouping_set_quantifier: GroupingSetQuantifier::All,
                 grouping_sets: &[],
                 having: None,
                 order_by: &[],
@@ -2370,7 +2426,7 @@ impl<'a> Parser<'a> {
             },
             kind: JoinKind::Inner,
             on: None,
-            using_columns: None,
+            using: None,
             natural: false,
         };
         let mut joins = [dummy; crate::sql::query::MAX_JOIN_TABLES - 1];
@@ -2426,7 +2482,7 @@ impl<'a> Parser<'a> {
                 return Err(self.limit("joins", joins.len()));
             }
             let table = self.table_ref()?;
-            let mut using_columns = None;
+            let mut using = None;
             let on = if natural || kind == JoinKind::Cross {
                 None
             } else if self.eat_ident("using")? {
@@ -2447,7 +2503,13 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect_op(")")?;
-                using_columns = Some(self.arena_slice(&cols[..n_cols])?);
+                let columns = self.arena_slice(&cols[..n_cols])?;
+                let alias = if self.eat_ident("as")? {
+                    Some(self.col_ident("join USING alias")?)
+                } else {
+                    None
+                };
+                using = Some(JoinUsing { columns, alias });
                 None
             } else {
                 self.expect_ident("on")?;
@@ -2457,7 +2519,7 @@ impl<'a> Parser<'a> {
                 table,
                 kind,
                 on,
-                using_columns,
+                using,
                 natural,
             };
             n += 1;
@@ -6254,7 +6316,18 @@ mod tests {
             };
             assert_eq!(s.group_by.len(), 2);
             assert!(s.grouping_sets.is_empty());
+            assert_eq!(s.grouping_set_quantifier, GroupingSetQuantifier::All);
         });
+        with_parser(
+            "SELECT a FROM t GROUP BY DISTINCT GROUPING SETS ((a), (a))",
+            |p| {
+                let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert_eq!(s.grouping_set_quantifier, GroupingSetQuantifier::Distinct);
+                assert_eq!(s.grouping_sets, &[1, 1]);
+            },
+        );
         // ROLLUP(a, b) -> {a,b}, {a}, {} (bits index group_by = [a, b]).
         with_parser("SELECT a FROM t GROUP BY ROLLUP(a, b)", |p| {
             let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
@@ -6419,6 +6492,54 @@ mod tests {
                 assert!(s.order_by[0].descending);
                 assert!(!s.order_by[1].descending);
                 assert_eq!(s.limit, Some(&Expr::Int(10)));
+            },
+        );
+        with_parser(
+            "SELECT a FROM t ORDER BY a USING > NULLS LAST, a USING OPERATOR(pg_catalog.<)",
+            |p| {
+                let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert!(s.order_by[0].descending);
+                assert!(!s.order_by[0].nulls_first);
+                assert!(!s.order_by[1].descending);
+                assert!(!s.order_by[1].nulls_first);
+            },
+        );
+        with_parser("SELECT a FROM t ORDER BY a USING =", |p| {
+            let error = p.next_stmt().unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::WRONG_OBJECT_TYPE);
+        });
+        with_parser(
+            "SELECT array_agg(a ORDER BY a USING >), \
+                    row_number() OVER (ORDER BY a USING OPERATOR(pg_catalog.<)) FROM t",
+            |p| {
+                let Stmt::Select(select) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                let SelectItem::Expr {
+                    expression:
+                        Expr::Call {
+                            order_by: aggregate_order,
+                            ..
+                        },
+                    ..
+                } = select.items[0]
+                else {
+                    panic!()
+                };
+                assert!(aggregate_order[0].descending);
+                let SelectItem::Expr {
+                    expression:
+                        Expr::Call {
+                            over: Some(over), ..
+                        },
+                    ..
+                } = select.items[1]
+                else {
+                    panic!()
+                };
+                assert!(!over.order_by[0].descending);
             },
         );
     }

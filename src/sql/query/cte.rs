@@ -856,6 +856,7 @@ fn wrap_set_tree_with<'a>(
         from: None,
         where_clause: None,
         group_by: &[],
+        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
         grouping_sets: &[],
         having: None,
         order_by: &[],
@@ -883,6 +884,7 @@ static EMPTY_SELECT: Select<'static> = Select {
     from: None,
     where_clause: None,
     group_by: &[],
+    grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
     grouping_sets: &[],
     having: None,
     order_by: &[],
@@ -2239,6 +2241,7 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
         from: None,
         where_clause: None,
         group_by: &[],
+        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
         grouping_sets: &[],
         having: None,
         order_by: &[],
@@ -3026,6 +3029,7 @@ fn subst_select_body<'a>(
         from,
         where_clause: opt_subst(s.where_clause, context, arena)?,
         group_by,
+        grouping_set_quantifier: s.grouping_set_quantifier,
         grouping_sets,
         having: opt_subst(s.having, context, arena)?,
         order_by,
@@ -3293,7 +3297,7 @@ fn subst_from<'a>(
         table: f.base,
         kind: JoinKind::Inner,
         on: None,
-        using_columns: None,
+        using: None,
         natural: false,
     };
     let mut joins = [dummy; MAX_JOIN_TABLES - 1];
@@ -3305,7 +3309,7 @@ fn subst_from<'a>(
             table: subst_tableref(&j.table, context, arena)?,
             kind: j.kind,
             on: opt_subst(j.on, context, arena)?,
-            using_columns: j.using_columns,
+            using: j.using,
             natural: j.natural,
         };
     }

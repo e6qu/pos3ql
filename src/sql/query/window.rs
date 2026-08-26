@@ -148,6 +148,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         from: statement.from,
         where_clause: statement.where_clause,
         group_by: statement.group_by,
+        grouping_set_quantifier: statement.grouping_set_quantifier,
         grouping_sets: statement.grouping_sets,
         having: statement.having,
         order_by: &[],
@@ -234,6 +235,7 @@ pub(crate) fn rewrite_grouped_windows<'a>(
         from: Some(from),
         where_clause: None,
         group_by: &[],
+        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
         grouping_sets: &[],
         having: None,
         order_by: arena
@@ -1658,20 +1660,20 @@ fn compare_encoded_order<'a>(
 
 /// The projected column count for a statement's select list: wildcards expand
 /// by the scope, expressions occupy one slot.
-fn projected_width<'a>(items: &[SelectItem<'a>], scope: &QueryScope<'a>) -> usize {
-    items
-        .iter()
-        .map(|item| match item {
+fn projected_width<'a>(
+    items: &[SelectItem<'a>],
+    scope: &QueryScope<'a>,
+) -> Result<usize, SqlError> {
+    let mut width = 0;
+    for item in items {
+        width += match item {
             SelectItem::Wildcard => scope.star_columns(),
-            SelectItem::TableWildcard(qualifier) => {
-                scope.defs[scope.table_index(qualifier).expect("resolved table")]
-                    .expect("resolved table")
-                    .n_columns
-            }
+            SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => record_star_width(base, scope),
             SelectItem::Expr { .. } => 1,
-        })
-        .sum()
+        };
+    }
+    Ok(width)
 }
 
 /// Doubles an arena-backed scratch array, copying the live prefix. Growth is
@@ -2005,7 +2007,7 @@ pub(crate) fn external_window_into<'a>(
 
     // Re-scan the source, projecting each row with its window values read
     // back from the completed run, and sort the projected rows by ORDER BY.
-    let width = projected_width(statement.items, scope);
+    let width = projected_width(statement.items, scope)?;
     let mut statement_order_collations = [Collation::None; MAX_WIN_KEYS];
     for (index, order) in statement.order_by.iter().enumerate() {
         let expression = resolve_order_target(order.expression, statement.items, scope, arena)?;

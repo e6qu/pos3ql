@@ -1539,6 +1539,9 @@ pub struct Select<'a> {
     pub from: Option<FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub group_by: &'a [&'a Expr<'a>],
+    /// Whether duplicate grouping sets are retained (`ALL`, PostgreSQL's
+    /// default) or collapsed before aggregation (`DISTINCT`).
+    pub grouping_set_quantifier: GroupingSetQuantifier,
     /// Grouping sets for `ROLLUP`/`CUBE`/`GROUPING SETS`. Each element is a
     /// bitmask over `group_by` indices selecting the columns that group in that
     /// set (bit *i* set = `group_by[i]` participates; a cleared bit means that
@@ -1562,6 +1565,12 @@ pub struct Select<'a> {
     /// `FOR UPDATE`/`FOR SHARE`/… row-locking clauses, in written order. Empty
     /// when the query carries none.
     pub locking: &'a [LockClause<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupingSetQuantifier {
+    All,
+    Distinct,
 }
 
 /// The strength of a `FOR ...` row-locking clause, strongest first (this order
@@ -1848,13 +1857,20 @@ pub struct Join<'a> {
     /// equality predicate is synthesized at plan time, where the joined
     /// tables' columns are known).
     pub on: Option<&'a Expr<'a>>,
-    /// `USING (c1, ...)` column names. Each names one column of the left join
-    /// tree and one of the right table; the pair is merged into a single
-    /// output column.
-    pub using_columns: Option<&'a [&'a str]>,
+    /// Typed `USING` clause. Keeping its optional alias inside the clause
+    /// makes an alias without merged columns unrepresentable.
+    pub using: Option<JoinUsing<'a>>,
     /// NATURAL join: the using-column list is every common column name,
     /// resolved at plan time.
     pub natural: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JoinUsing<'a> {
+    /// Each name resolves once on the left join tree and once on the right.
+    pub columns: &'a [&'a str],
+    /// Qualifies only the merged columns and shares the table-alias namespace.
+    pub alias: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -4133,6 +4133,15 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         &[0; MAX_BIND_PARAMS],
     );
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
+    let inferred = engine.infer_param_types(
+        "SELECT p.state, count(*) FROM protocol_types p \
+         JOIN protocol_types q ON p.count = q.count \
+         WHERE p.state = $2 GROUP BY p.state HAVING count(*) >= $1",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(inferred[..2], [crate::sql::types::oid::INT8, enum_oid]);
 }
 
 #[test]
@@ -8737,12 +8746,70 @@ fn join_using_clause() {
     run("CREATE TABLE bb (id int, y text)");
     run("INSERT INTO a VALUES (1,'a1'),(2,'a2')");
     run("INSERT INTO bb VALUES (1,'b1'),(3,'b3')");
-    // JOIN ... USING (id) is desugared to ON a.id = bb.id.
     let out = run("SELECT a.x, bb.y FROM a JOIN bb USING (id)");
     assert!(out.contains("a1") && out.contains("b1"), "match: {out}");
     assert!(
         !out.contains("a2") && !out.contains("b3"),
         "non-match dropped: {out}"
+    );
+    let aliased = run("SELECT merged.*, merged.id, ROW(merged.*, 42)::text \
+           FROM a JOIN bb USING (id) AS merged ORDER BY merged.id");
+    assert!(aliased.contains("(1,42)"), "{aliased}");
+    let missing = run("SELECT merged.x FROM a JOIN bb USING (id) AS merged");
+    assert!(missing.contains("42703"), "{missing}");
+    let duplicate = run("SELECT 1 FROM a AS merged JOIN bb USING (id) AS merged");
+    assert!(duplicate.contains("42712"), "{duplicate}");
+    let outer_null = run("SELECT (bb).*, ROW(bb.*, 42)::text \
+           FROM a LEFT JOIN bb ON a.id = bb.id WHERE a.id = 2");
+    assert!(
+        !outer_null.contains("ERROR") && outer_null.contains("(,,42)"),
+        "{outer_null}"
+    );
+}
+
+#[test]
+fn grouping_set_quantifiers_control_duplicate_groups() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE grouping_quantifier_values(a integer); \
+         INSERT INTO grouping_quantifier_values VALUES (1),(1),(2)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT a, count(*) FROM grouping_quantifier_values \
+           GROUP BY ALL GROUPING SETS ((a),(a)) ORDER BY a; \
+         SELECT a, count(*) FROM grouping_quantifier_values \
+           GROUP BY DISTINCT GROUPING SETS ((a),(a)) ORDER BY a; \
+         SELECT a FROM grouping_quantifier_values ORDER BY a USING >; \
+         SELECT array_agg(a ORDER BY a USING >), \
+                string_agg(a::text, ',' ORDER BY a USING OPERATOR(pg_catalog.<)) \
+           FROM grouping_quantifier_values; \
+         SELECT a, row_number() OVER (ORDER BY a USING >) \
+           FROM grouping_quantifier_values ORDER BY a, 2",
+    );
+    assert_eq!(
+        data_rows(&rows),
+        [
+            "1|2",
+            "1|2",
+            "2|1",
+            "2|1",
+            "1|2",
+            "2|1",
+            "2",
+            "1",
+            "1",
+            "{2,1,1}|1,1,2",
+            "1|2",
+            "1|3",
+            "2|1",
+        ],
+        "{}",
+        String::from_utf8_lossy(&rows)
     );
 }
 
@@ -23755,6 +23822,17 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
         "{}",
         String::from_utf8_lossy(&bytes)
     );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT (NULL::address).*, ROW((NULL::address).*, 42)::text",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["NULL|NULL|(,,42)"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     run_with(
         &mut e,
         &mut b,
@@ -37159,6 +37237,101 @@ fn table_sources_survive_stored_queries_copy_cursors_and_object_cold_recovery() 
         )),
         copy_before
     );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn grouping_and_using_alias_semantics_survive_stored_queries_and_cold_recovery() {
+    let mut config = test_config("grouping-using-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("grouping-using-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_using_left (id integer, value text); \
+         CREATE TABLE durable_using_right (id integer, label text); \
+         CREATE TYPE durable_null_record AS (id integer, label text); \
+         INSERT INTO durable_using_left VALUES (1,'a'),(1,'b'),(2,'c'); \
+         INSERT INTO durable_using_right VALUES (1,'x'),(2,'y'); \
+         CREATE VIEW durable_using_view AS \
+           SELECT merged.*, ROW(merged.*, 42)::text AS expanded \
+             FROM durable_using_left JOIN durable_using_right USING (id) AS merged; \
+         CREATE MATERIALIZED VIEW durable_grouping_view AS \
+           SELECT merged.id, count(*) AS matches \
+             FROM durable_using_left JOIN durable_using_right USING (id) AS merged \
+             GROUP BY DISTINCT GROUPING SETS ((merged.id),(merged.id)) \
+             WITH DATA; \
+         CREATE VIEW durable_null_record_view AS \
+           SELECT (NULL::durable_null_record).*, \
+                  ROW((NULL::durable_null_record).*, 42)::text AS expanded; \
+         CREATE VIEW durable_outer_record_view AS \
+           SELECT (right_row).*, ROW(right_row.*, 42)::text AS expanded \
+             FROM (SELECT 3::integer AS id) left_row \
+             LEFT JOIN durable_using_right right_row ON right_row.id = left_row.id",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let before_output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM durable_grouping_view ORDER BY id USING >; \
+         SELECT * FROM durable_using_view ORDER BY id USING >; \
+         SELECT * FROM durable_null_record_view; \
+         SELECT * FROM durable_outer_record_view",
+    );
+    let before = data_rows(&before_output);
+    assert_eq!(
+        before,
+        [
+            "2|1",
+            "1|2",
+            "2|(2,42)",
+            "1|(1,42)",
+            "1|(1,42)",
+            "NULL|NULL|(,,42)",
+            "NULL|NULL|(,,42)",
+        ],
+        "{}",
+        String::from_utf8_lossy(&before_output)
+    );
+    let copy = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT * FROM durable_grouping_view ORDER BY id USING >) \
+           TO STDOUT (FORMAT binary)",
+    );
+    assert!(
+        !message_types(&copy).contains(&b'E') && copy.windows(6).any(|bytes| bytes == b"PGCOPY"),
+        "{}",
+        String::from_utf8_lossy(&copy)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let after = data_rows(&run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT * FROM durable_grouping_view ORDER BY id USING >; \
+         SELECT * FROM durable_using_view ORDER BY id USING >; \
+         SELECT * FROM durable_null_record_view; \
+         SELECT * FROM durable_outer_record_view",
+    ));
+    assert_eq!(after, before);
     drop(cold);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

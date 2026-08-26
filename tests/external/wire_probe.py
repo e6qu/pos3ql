@@ -2776,6 +2776,63 @@ def test_deferred_constraint_commit_over_raw_wire():
     s.close()
 
 
+def test_constraint_trigger_savepoint_and_partition_clone_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_constraint_trigger_target (id integer PRIMARY KEY); "
+        "CREATE TABLE wire_constraint_trigger_audit (id integer); "
+        "CREATE FUNCTION wire_constraint_trigger_fn() RETURNS trigger LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_constraint_trigger_audit VALUES (NEW.id); RETURN NEW; END'; "
+        "CREATE CONSTRAINT TRIGGER wire_constraint_trigger AFTER INSERT "
+        "ON wire_constraint_trigger_target DEFERRABLE INITIALLY DEFERRED "
+        "FOR EACH ROW EXECUTE FUNCTION wire_constraint_trigger_fn(); "
+        "BEGIN; INSERT INTO wire_constraint_trigger_target VALUES (1); "
+        "SAVEPOINT queued; SET CONSTRAINTS wire_constraint_trigger IMMEDIATE; "
+        "ROLLBACK TO SAVEPOINT queued; COMMIT",
+    )
+    check(
+        "raw wire: savepoint restores a completed constraint-trigger event",
+        not any(kind == b"E" for kind, _ in setup)
+        and first_text_row(simple_query(s, "SELECT id FROM wire_constraint_trigger_audit")) == "1",
+        setup,
+    )
+
+    partition = simple_query(
+        s,
+        "CREATE TABLE wire_clone_root (id integer) PARTITION BY RANGE (id); "
+        "CREATE TABLE wire_clone_low PARTITION OF wire_clone_root FOR VALUES FROM (0) TO (100); "
+        "CREATE FUNCTION wire_clone_fn() RETURNS trigger LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_constraint_trigger_audit VALUES (NEW.id); RETURN NEW; END'; "
+        "CREATE TRIGGER wire_clone_after AFTER INSERT ON wire_clone_root "
+        "FOR EACH ROW EXECUTE FUNCTION wire_clone_fn(); "
+        "ALTER TABLE ONLY wire_clone_root DISABLE TRIGGER wire_clone_after; "
+        "INSERT INTO wire_clone_root VALUES (2); "
+        "ALTER TABLE wire_clone_low DISABLE TRIGGER wire_clone_after; "
+        "INSERT INTO wire_clone_root VALUES (3)",
+    )
+    clone_rows = simple_query(
+        s,
+        "SELECT c.relname || ':' || t.tgenabled FROM pg_trigger t "
+        "JOIN pg_class c ON c.oid = t.tgrelid WHERE t.tgname = 'wire_clone_after' "
+        "ORDER BY c.relname",
+    )
+    check(
+        "raw wire: ONLY and leaf clone firing modes are independent",
+        not any(kind == b"E" for kind, _ in partition)
+        and [first_text_row([message]) for message in clone_rows if message[0] == b"D"]
+        == ["wire_clone_low:D", "wire_clone_root:D"]
+        and first_text_row(
+            simple_query(s, "SELECT string_agg(id::text, ',' ORDER BY id) FROM wire_constraint_trigger_audit")
+        )
+        == "1,2",
+        partition + clone_rows,
+    )
+    s.close()
+
+
 def test_row_security_over_named_statement_and_portal():
     s = connect()
     s.sendall(startup_payload(0))

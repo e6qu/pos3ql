@@ -597,6 +597,11 @@ pub(crate) enum WalOp<'a> {
         table: &'a str,
         function_schema: &'a str,
         function: &'a str,
+        or_replace: bool,
+        constraint: bool,
+        constraint_timing: u8,
+        referenced_schema: Option<&'a str>,
+        referenced_table: Option<&'a str>,
         timing: u8,
         level: crate::sql::ast::TriggerLevel,
         events: crate::sql::ast::TriggerEvents,
@@ -1919,6 +1924,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             table,
             function_schema,
             function,
+            referenced_schema,
+            referenced_table,
             old_table,
             new_table,
             when,
@@ -1936,7 +1943,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + function_schema.len()
                 + 1
                 + function.len()
-                + 15
+                + 4
+                + referenced_schema.map_or(0, str::len)
+                + referenced_table.map_or(0, str::len)
+                + 16
                 + old_table.map_or(0, str::len)
                 + new_table.map_or(0, str::len)
                 + when.map_or(0, str::len)
@@ -3696,6 +3706,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             table,
             function_schema,
             function,
+            or_replace,
+            constraint,
+            constraint_timing,
+            referenced_schema,
+            referenced_table,
             timing,
             level,
             events,
@@ -3713,6 +3728,13 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, function_schema)
                 && name_bytes(buffer, function)
+                && buffer.append(&[
+                    u8::from(*or_replace),
+                    u8::from(*constraint),
+                    *constraint_timing,
+                ])
+                && name_bytes(buffer, referenced_schema.unwrap_or(""))
+                && name_bytes(buffer, referenced_table.unwrap_or(""))
                 && buffer.append(&[*timing, level.code(), events.bits()])
                 && buffer.append(&update_columns.to_le_bytes())
                 && name_bytes(buffer, old_table.unwrap_or(""))
@@ -4927,7 +4949,33 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let table = take_name(&mut at)?;
             let function_schema = take_name(&mut at)?;
             let function = take_name(&mut at)?;
+            let or_replace = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let constraint = match *payload.get(at + 1)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let constraint_timing = *payload.get(at + 2)?;
+            crate::storage::ConstraintTiming::from_code(constraint_timing)?;
+            at += 3;
+            let referenced_schema = take_name(&mut at)?;
+            let referenced_table = take_name(&mut at)?;
+            let referenced_schema = (!referenced_schema.is_empty()).then_some(referenced_schema);
+            let referenced_table = (!referenced_table.is_empty()).then_some(referenced_table);
+            if (!constraint
+                && (constraint_timing != crate::storage::ConstraintTiming::NotDeferrable.code()
+                    || referenced_schema.is_some()
+                    || referenced_table.is_some()))
+                || referenced_schema.is_some() != referenced_table.is_some()
+            {
+                return None;
+            }
             let timing = *payload.get(at)?;
+            let typed_timing = crate::sql::ast::TriggerTiming::from_code(timing)?;
             let level = crate::sql::ast::TriggerLevel::from_code(*payload.get(at + 1)?)?;
             let events = crate::sql::ast::TriggerEvents::from_bits(*payload.get(at + 2)?)?;
             at += 3;
@@ -4956,15 +5004,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             for argument in arguments.iter_mut().take(argument_count) {
                 *argument = take_name(&mut at)?;
             }
-            (timing <= 2
-                && (matches!(level, crate::sql::ast::TriggerLevel::Statement)
-                    || !events.has_truncate())
-                && crate::storage::TriggerTransitionTables::from_names(old_table, new_table)
-                    .is_some_and(|tables| {
-                        tables.is_valid_for(timing, level, events)
-                            && (matches!(tables, crate::storage::TriggerTransitionTables::None)
-                                || update_columns == 0)
-                    })
+            let transition_tables =
+                crate::storage::TriggerTransitionTables::from_names(old_table, new_table)?;
+            (!(or_replace && constraint)
+                && crate::storage::trigger_shape_is_valid(
+                    target == TriggerTargetKind::View,
+                    constraint,
+                    typed_timing,
+                    level,
+                    events,
+                    update_columns,
+                    transition_tables,
+                )
                 && at == payload.len())
             .then_some(WalOp::CreateTrigger {
                 name,
@@ -4973,6 +5024,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 table,
                 function_schema,
                 function,
+                or_replace,
+                constraint,
+                constraint_timing,
+                referenced_schema,
+                referenced_table,
                 timing,
                 level,
                 events,
@@ -7441,6 +7497,11 @@ mod tests {
                 table: "orders",
                 function_schema: "public",
                 function: "audit_order",
+                or_replace: false,
+                constraint: false,
+                constraint_timing: crate::storage::ConstraintTiming::NotDeferrable.code(),
+                referenced_schema: None,
+                referenced_table: None,
                 timing: 0,
                 level: crate::sql::ast::TriggerLevel::Row,
                 events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
@@ -7469,6 +7530,11 @@ mod tests {
                 table: "orders",
                 function_schema: "public",
                 function: "audit_orders",
+                or_replace: false,
+                constraint: false,
+                constraint_timing: crate::storage::ConstraintTiming::NotDeferrable.code(),
+                referenced_schema: None,
+                referenced_table: None,
                 timing: 1,
                 level: crate::sql::ast::TriggerLevel::Statement,
                 events: crate::sql::ast::TriggerEvents::from_bits(2).unwrap(),
@@ -7505,6 +7571,11 @@ mod tests {
                 table: "orders_view",
                 function_schema: "public",
                 function: "write_orders",
+                or_replace: false,
+                constraint: false,
+                constraint_timing: crate::storage::ConstraintTiming::NotDeferrable.code(),
+                referenced_schema: None,
+                referenced_table: None,
                 timing: 2,
                 level: crate::sql::ast::TriggerLevel::Row,
                 events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
@@ -7603,6 +7674,11 @@ mod tests {
                 table: "orders",
                 function_schema: "public",
                 function: "audit_order",
+                or_replace: false,
+                constraint: false,
+                constraint_timing: crate::storage::ConstraintTiming::NotDeferrable.code(),
+                referenced_schema: None,
+                referenced_table: None,
                 timing: 0,
                 level: crate::sql::ast::TriggerLevel::Row,
                 events: crate::sql::ast::TriggerEvents::from_bits(1).unwrap(),
@@ -7928,6 +8004,11 @@ mod tests {
                     table: "orders",
                     function_schema: "public",
                     function: "audit_order",
+                    or_replace: false,
+                    constraint: false,
+                    constraint_timing: crate::storage::ConstraintTiming::NotDeferrable.code(),
+                    referenced_schema: None,
+                    referenced_table: None,
                     timing: 0,
                     level: crate::sql::ast::TriggerLevel::Row,
                     events: crate::sql::ast::TriggerEvents::from_bits(3).unwrap(),

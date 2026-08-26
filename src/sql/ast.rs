@@ -407,8 +407,9 @@ pub enum Stmt<'a> {
     },
     /// DROP TRIGGER [IF EXISTS] name ON table.
     DropTrigger {
-        triggers: &'a [TriggerIdentity<'a>],
+        trigger: TriggerIdentity<'a>,
         if_exists: bool,
+        cascade: bool,
     },
     /// A row-security policy whose command-specific expression shape was
     /// validated while parsing. In particular, INSERT cannot carry USING and
@@ -1039,6 +1040,25 @@ pub enum TriggerTiming {
     InsteadOf,
 }
 
+impl TriggerTiming {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Before => 0,
+            Self::After => 1,
+            Self::InsteadOf => 2,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Before),
+            1 => Some(Self::After),
+            2 => Some(Self::InsteadOf),
+            _ => None,
+        }
+    }
+}
+
 /// PostgreSQL's trigger granularity. The parser records the SQL default
 /// explicitly, so execution never infers row behavior from omission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1141,11 +1161,13 @@ impl<'a> TriggerTransitionTables<'a> {
     }
 }
 
-/// A parsed trigger definition. Constraint and INSTEAD OF forms retain
-/// distinct semantics and are rejected until supported.
+/// A parsed trigger definition whose ordinary and constraint forms retain
+/// their distinct legal states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateTrigger<'a> {
+    pub or_replace: bool,
     pub name: &'a str,
+    pub kind: TriggerKind<'a>,
     pub timing: TriggerTiming,
     pub level: TriggerLevel,
     pub events: &'a [TriggerEvent],
@@ -1160,9 +1182,22 @@ pub struct CreateTrigger<'a> {
     pub arguments: &'a [&'a str],
 }
 
+/// Ordinary and constraint triggers have different legal timing and
+/// transaction behavior. Keeping the forms distinct prevents durable ordinary
+/// triggers from accidentally acquiring deferrability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerKind<'a> {
+    Ordinary,
+    Constraint {
+        referenced_table: Option<QualName<'a>>,
+        timing: ConstraintTiming,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlterTriggerAction<'a> {
     Rename(&'a str),
+    DependsOnExtension { extension: &'a str, enabled: bool },
 }
 
 /// PostgreSQL's SET PUBLICATION refresh choice. A fresh copy is distinct from
@@ -1447,6 +1482,8 @@ pub enum CommentTarget<'a> {
     Tablespace(&'a str),
     /// EXTENSION name.
     Extension(&'a str),
+    /// TRIGGER name ON relation; trigger names are relation-local.
+    Trigger(TriggerIdentity<'a>),
     /// TYPE name, or DOMAIN name when `domain_only` requires that kind.
     Type { name: &'a str, domain_only: bool },
 }
@@ -2606,6 +2643,8 @@ pub struct AlterTable<'a> {
     pub table: QualName<'a>,
     /// ALTER TABLE IF EXISTS: a missing target emits a notice and succeeds.
     pub if_exists: bool,
+    /// `ONLY` suppresses partition recursion.
+    pub only: bool,
     /// One or more subcommands. PostgreSQL applies a comma-separated list in a
     /// fixed pass order (drops, then type changes, then adds, then constraints,
     /// then column-attribute changes), not left to right; the parser sorts the

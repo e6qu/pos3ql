@@ -42,8 +42,12 @@ pub struct Savepoint {
     pub listen_mark: usize,
     pub subscription_advance_mark: usize,
     pub constraint_obligation_mark: usize,
+    pub constraint_completion_mark: usize,
     pub constraint_mode_mark: usize,
     pub constraint_rename_mark: usize,
+    pub deferred_trigger_mark: usize,
+    pub deferred_trigger_completion_mark: usize,
+    pub deferred_trigger_bytes_mark: usize,
     /// The `failed` flag at savepoint time, restored on ROLLBACK TO.
     pub failed: bool,
 }
@@ -63,8 +67,12 @@ pub(crate) struct StatementMark {
     pub listen_ops: usize,
     pub subscription_advances: usize,
     pub constraint_obligations: usize,
+    pub constraint_completions: usize,
     pub constraint_modes: usize,
     pub constraint_renames: usize,
+    pub deferred_triggers: usize,
+    pub deferred_trigger_completions: usize,
+    pub deferred_trigger_bytes: usize,
 }
 
 pub const MAX_SAVEPOINTS: usize = 16;
@@ -157,8 +165,12 @@ pub struct TxnState {
     /// them.  They are journaled immediately before the transaction marker.
     subscription_advances: FixedVec<crate::storage::SubscriptionAdvance>,
     deferred_constraints: FixedVec<ConstraintObligation>,
+    completed_constraints: FixedVec<usize>,
     constraint_modes: FixedVec<ConstraintModeChange>,
     constraint_renames: FixedVec<ConstraintLifecycle>,
+    deferred_triggers: FixedVec<DeferredTriggerEvent>,
+    completed_deferred_triggers: FixedVec<usize>,
+    deferred_trigger_bytes: FixedBuf,
 }
 
 /// How to undo one DDL statement.
@@ -197,6 +209,10 @@ pub(crate) enum DdlUndo {
     TriggerAltered {
         slot: u32,
         prior: Option<crate::storage::PendingTriggerDefinition>,
+    },
+    PartitionTriggerAltered {
+        slot: u32,
+        prior: crate::storage::PartitionTriggerState,
     },
     PolicyCreated(u32),
     PolicyDropped(u32),
@@ -387,13 +403,20 @@ pub const MAX_TXN_ANALYZE: usize = crate::storage::MAX_PENDING_STATISTICS_PER_TX
 const SUBSCRIPTION_ADVANCES_PER_TXN: usize = 1;
 pub const MAX_DEFERRED_CONSTRAINTS: usize = 128;
 
-/// A constraint's transaction identity. Names are unique within a table and
-/// the table slot remains stable across relation renames.
+/// A table constraint is versioned across DROP/recreate while a constraint
+/// trigger has a stable catalog slot. Keeping these identities distinct means
+/// renaming a trigger cannot orphan an already queued firing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ConstraintIdentity {
-    pub(crate) table: u32,
-    pub(crate) name: crate::storage::SqlName,
-    pub(crate) generation: u16,
+pub(crate) enum ConstraintIdentity {
+    Table {
+        table: u32,
+        name: crate::storage::SqlName,
+        generation: u16,
+    },
+    Trigger {
+        table: u32,
+        slot: u16,
+    },
 }
 
 /// One row whose transaction-visible state must satisfy a deferred
@@ -411,6 +434,37 @@ pub(crate) struct ConstraintModeChange {
     pub(crate) constraint: Option<ConstraintIdentity>,
     pub(crate) mode: crate::sql::ast::ConstraintMode,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeferredTriggerTuple {
+    pub(crate) offset: u32,
+    pub(crate) length: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeferredTriggerEvent {
+    pub(crate) kind: DeferredTriggerKind,
+    pub(crate) event: u8,
+    pub(crate) updated_columns: u64,
+    pub(crate) old: Option<DeferredTriggerTuple>,
+    pub(crate) new: Option<DeferredTriggerTuple>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeferredTriggerKind {
+    Constraint {
+        identity: ConstraintIdentity,
+        effective_table: u16,
+        trigger_depth: u16,
+    },
+    AfterRow {
+        trigger_slot: u16,
+        effective_table: u16,
+        trigger_depth: u16,
+    },
+}
+
+pub const DEFERRED_TRIGGER_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConstraintLifecycle {
@@ -446,8 +500,12 @@ impl TxnState {
             + SUBSCRIPTION_ADVANCES_PER_TXN
                 * core::mem::size_of::<crate::storage::SubscriptionAdvance>()
             + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<ConstraintObligation>()
+            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<usize>()
             + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<ConstraintModeChange>()
             + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<ConstraintLifecycle>()
+            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<DeferredTriggerEvent>()
+            + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<usize>()
+            + DEFERRED_TRIGGER_BYTES
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
@@ -498,6 +556,11 @@ impl TxnState {
                 "txn_deferred_constraints",
                 MAX_DEFERRED_CONSTRAINTS,
             )?,
+            completed_constraints: FixedVec::new(
+                budget,
+                "txn_completed_constraints",
+                MAX_DEFERRED_CONSTRAINTS,
+            )?,
             constraint_modes: FixedVec::new(
                 budget,
                 "txn_constraint_modes",
@@ -507,6 +570,21 @@ impl TxnState {
                 budget,
                 "txn_constraint_renames",
                 MAX_DEFERRED_CONSTRAINTS,
+            )?,
+            deferred_triggers: FixedVec::new(
+                budget,
+                "txn_deferred_triggers",
+                MAX_DEFERRED_CONSTRAINTS,
+            )?,
+            completed_deferred_triggers: FixedVec::new(
+                budget,
+                "txn_completed_deferred_triggers",
+                MAX_DEFERRED_CONSTRAINTS,
+            )?,
+            deferred_trigger_bytes: FixedBuf::new(
+                budget,
+                "txn_deferred_trigger_bytes",
+                DEFERRED_TRIGGER_BYTES,
             )?,
         })
     }
@@ -543,6 +621,10 @@ impl TxnState {
         }
         self.trigger_depth += 1;
         Ok(())
+    }
+
+    pub(crate) fn trigger_depth(&self) -> u16 {
+        self.trigger_depth
     }
 
     pub fn leave_trigger_sql(&mut self) {
@@ -758,6 +840,9 @@ impl TxnState {
         constraint: ConstraintIdentity,
         timing: crate::storage::ConstraintTiming,
     ) -> crate::sql::ast::ConstraintMode {
+        if !timing.is_deferrable() {
+            return crate::sql::ast::ConstraintMode::Immediate;
+        }
         let constraint = self.current_constraint_identity(constraint);
         for change in self.constraint_modes.iter().rev() {
             if change.constraint.is_none()
@@ -805,7 +890,14 @@ impl TxnState {
         rowid: u64,
     ) -> Result<(), SqlError> {
         let obligation = ConstraintObligation { constraint, rowid };
-        if self.deferred_constraints.contains(&obligation) {
+        if self
+            .deferred_constraints
+            .iter()
+            .enumerate()
+            .any(|(index, item)| {
+                *item == obligation && !self.completed_constraints.contains(&index)
+            })
+        {
             return Ok(());
         }
         self.deferred_constraints.push(obligation).map_err(|_| {
@@ -821,24 +913,35 @@ impl TxnState {
         &self.deferred_constraints
     }
 
+    pub(crate) fn deferred_constraint_is_complete(&self, index: usize) -> bool {
+        self.completed_constraints.contains(&index)
+    }
+
     pub(crate) fn deferred_constraint_for(
         &self,
         current: ConstraintIdentity,
-    ) -> Option<ConstraintObligation> {
+    ) -> Option<(usize, ConstraintObligation)> {
         self.deferred_constraints
             .iter()
-            .copied()
-            .find(|obligation| self.current_constraint_identity(obligation.constraint) == current)
+            .enumerate()
+            .filter(|(index, _)| !self.completed_constraints.contains(index))
+            .map(|(index, obligation)| (index, *obligation))
+            .find(|(_, obligation)| {
+                self.current_constraint_identity(obligation.constraint) == current
+            })
     }
 
-    pub(crate) fn clear_deferred_constraint(&mut self, obligation: ConstraintObligation) {
-        if let Some(index) = self
-            .deferred_constraints
-            .iter()
-            .position(|item| *item == obligation)
-        {
-            self.deferred_constraints.swap_remove(index);
+    pub(crate) fn complete_deferred_constraint(&mut self, index: usize) -> Result<(), SqlError> {
+        if self.completed_constraints.contains(&index) {
+            return Ok(());
         }
+        self.completed_constraints.push(index).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "transaction completes more than {} deferred constraints",
+                MAX_DEFERRED_CONSTRAINTS
+            )
+        })
     }
 
     pub(crate) fn rename_constraint(
@@ -865,7 +968,10 @@ impl TxnState {
         name: crate::storage::SqlName,
     ) -> Result<(), SqlError> {
         let identity = self.constraint_identity(table, name);
-        let next_generation = identity.generation.checked_add(1).ok_or_else(|| {
+        let ConstraintIdentity::Table { generation, .. } = identity else {
+            unreachable!("table constraint lookup returns a table identity")
+        };
+        let next_generation = generation.checked_add(1).ok_or_else(|| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "constraint generation is exhausted"
@@ -893,31 +999,54 @@ impl TxnState {
         for event in self.constraint_renames.iter().rev() {
             match *event {
                 ConstraintLifecycle::Drop {
-                    identity,
+                    identity:
+                        ConstraintIdentity::Table {
+                            table: identity_table,
+                            name: identity_name,
+                            ..
+                        },
                     next_generation,
-                } if identity.table == table && identity.name == name => {
-                    return ConstraintIdentity {
+                } if identity_table == table && identity_name == name => {
+                    return ConstraintIdentity::Table {
                         table,
                         name,
                         generation: next_generation,
                     };
                 }
-                ConstraintLifecycle::Rename { identity, to }
-                    if identity.table == table && to == name =>
-                {
-                    return ConstraintIdentity {
+                ConstraintLifecycle::Rename {
+                    identity:
+                        identity @ ConstraintIdentity::Table {
+                            table: identity_table,
+                            ..
+                        },
+                    to,
+                } if identity_table == table && to == name => {
+                    let ConstraintIdentity::Table { generation, .. } = identity else {
+                        unreachable!("constraint lifecycle contains table identities")
+                    };
+                    return ConstraintIdentity::Table {
                         table,
                         name,
-                        generation: identity.generation,
+                        generation,
                     };
                 }
                 _ => {}
             }
         }
-        ConstraintIdentity {
+        ConstraintIdentity::Table {
             table,
             name,
             generation: 0,
+        }
+    }
+
+    pub(crate) fn catalog_constraint_identity(
+        &self,
+        identity: ConstraintIdentity,
+    ) -> ConstraintIdentity {
+        match identity {
+            ConstraintIdentity::Table { table, name, .. } => self.constraint_identity(table, name),
+            ConstraintIdentity::Trigger { .. } => identity,
         }
     }
 
@@ -925,6 +1054,9 @@ impl TxnState {
         &self,
         mut identity: ConstraintIdentity,
     ) -> ConstraintIdentity {
+        if !matches!(identity, ConstraintIdentity::Table { .. }) {
+            return identity;
+        }
         for event in self.constraint_renames.iter() {
             if let ConstraintLifecycle::Rename {
                 identity: renamed,
@@ -932,7 +1064,17 @@ impl TxnState {
             } = *event
                 && renamed == identity
             {
-                identity.name = to;
+                let ConstraintIdentity::Table {
+                    table, generation, ..
+                } = identity
+                else {
+                    unreachable!("constraint lifecycle contains table identities")
+                };
+                identity = ConstraintIdentity::Table {
+                    table,
+                    name: to,
+                    generation,
+                };
             }
         }
         identity
@@ -940,14 +1082,27 @@ impl TxnState {
 
     pub(crate) fn constraint_identity_is_current(&self, identity: ConstraintIdentity) -> bool {
         let current = self.current_constraint_identity(identity);
-        self.constraint_identity(current.table, current.name) == current
+        match current {
+            ConstraintIdentity::Table { table, name, .. } => {
+                self.constraint_identity(table, name) == current
+            }
+            ConstraintIdentity::Trigger { .. } => true,
+        }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "rewind restores every independently bounded constraint queue"
+    )]
     pub(crate) fn rewind_constraints(
         &mut self,
         obligation_mark: usize,
+        completion_mark: usize,
         mode_mark: usize,
         rename_mark: usize,
+        trigger_mark: usize,
+        trigger_completion_mark: usize,
+        trigger_bytes_mark: usize,
     ) {
         while self.deferred_constraints.len() > obligation_mark {
             self.deferred_constraints.pop();
@@ -955,9 +1110,196 @@ impl TxnState {
         while self.constraint_modes.len() > mode_mark {
             self.constraint_modes.pop();
         }
+        while self.completed_constraints.len() > completion_mark {
+            self.completed_constraints.pop();
+        }
         while self.constraint_renames.len() > rename_mark {
             self.constraint_renames.pop();
         }
+        while self.deferred_triggers.len() > trigger_mark {
+            self.deferred_triggers.pop();
+        }
+        while self.completed_deferred_triggers.len() > trigger_completion_mark {
+            self.completed_deferred_triggers.pop();
+        }
+        self.deferred_trigger_bytes.truncate_to(trigger_bytes_mark);
+    }
+
+    pub(crate) fn queue_constraint_trigger(
+        &mut self,
+        identity: ConstraintIdentity,
+        effective_table: u16,
+        event: u8,
+        updated_columns: u64,
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<(), SqlError> {
+        self.queue_trigger_event(
+            DeferredTriggerKind::Constraint {
+                identity,
+                effective_table,
+                trigger_depth: self.trigger_depth,
+            },
+            event,
+            updated_columns,
+            old,
+            new,
+        )
+    }
+
+    pub(crate) fn queue_after_row_trigger(
+        &mut self,
+        trigger_slot: u16,
+        effective_table: u16,
+        event: u8,
+        updated_columns: u64,
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<(), SqlError> {
+        self.queue_trigger_event(
+            DeferredTriggerKind::AfterRow {
+                trigger_slot,
+                effective_table,
+                trigger_depth: self.trigger_depth,
+            },
+            event,
+            updated_columns,
+            old,
+            new,
+        )
+    }
+
+    fn queue_trigger_event(
+        &mut self,
+        kind: DeferredTriggerKind,
+        event: u8,
+        updated_columns: u64,
+        old: Option<&[u8]>,
+        new: Option<&[u8]>,
+    ) -> Result<(), SqlError> {
+        let bytes_mark = self.deferred_trigger_bytes.mark();
+        let mut append = |bytes: Option<&[u8]>| -> Result<Option<DeferredTriggerTuple>, SqlError> {
+            let Some(bytes) = bytes else { return Ok(None) };
+            let offset = self.deferred_trigger_bytes.mark();
+            if !self.deferred_trigger_bytes.append(bytes) {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "deferred trigger row images exceed {} bytes",
+                    DEFERRED_TRIGGER_BYTES
+                ));
+            }
+            Ok(Some(DeferredTriggerTuple {
+                offset: offset as u32,
+                length: bytes.len() as u32,
+            }))
+        };
+        let old = append(old)?;
+        let new = match append(new) {
+            Ok(new) => new,
+            Err(error) => {
+                self.deferred_trigger_bytes.truncate_to(bytes_mark);
+                return Err(error);
+            }
+        };
+        if self
+            .deferred_triggers
+            .push(DeferredTriggerEvent {
+                kind,
+                event,
+                updated_columns,
+                old,
+                new,
+            })
+            .is_err()
+        {
+            self.deferred_trigger_bytes.truncate_to(bytes_mark);
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "transaction queues more than {} constraint trigger firings",
+                MAX_DEFERRED_CONSTRAINTS
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn deferred_trigger_events(&self) -> &[DeferredTriggerEvent] {
+        &self.deferred_triggers
+    }
+
+    pub(crate) fn has_deferred_triggers(&self) -> bool {
+        self.deferred_triggers
+            .iter()
+            .enumerate()
+            .any(|(index, _)| !self.completed_deferred_triggers.contains(&index))
+    }
+
+    pub(crate) fn deferred_trigger_is_complete(&self, index: usize) -> bool {
+        self.completed_deferred_triggers.contains(&index)
+    }
+
+    pub(crate) fn deferred_trigger_bytes(&self, tuple: DeferredTriggerTuple) -> &[u8] {
+        &self.deferred_trigger_bytes.readable()
+            [tuple.offset as usize..tuple.offset as usize + tuple.length as usize]
+    }
+
+    pub(crate) fn complete_deferred_trigger(&mut self, index: usize) -> Result<(), SqlError> {
+        if self.completed_deferred_triggers.contains(&index) {
+            return Ok(());
+        }
+        self.completed_deferred_triggers.push(index).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "transaction completes more than {} deferred trigger firings",
+                MAX_DEFERRED_CONSTRAINTS
+            )
+        })
+    }
+
+    /// Reclaims completed queue entries only when no SQL savepoint can make
+    /// them live again. Completion markers otherwise form the undo state for
+    /// `ROLLBACK TO SAVEPOINT`.
+    pub(crate) fn compact_completed_constraints(&mut self) {
+        if !self.savepoints.is_empty() {
+            return;
+        }
+
+        let mut write = 0usize;
+        for read in 0..self.deferred_constraints.len() {
+            if self.completed_constraints.contains(&read) {
+                continue;
+            }
+            self.deferred_constraints[write] = self.deferred_constraints[read];
+            write += 1;
+        }
+        while self.deferred_constraints.len() > write {
+            self.deferred_constraints.pop();
+        }
+        self.completed_constraints.clear();
+
+        let mut event_write = 0usize;
+        let mut byte_write = 0usize;
+        for read in 0..self.deferred_triggers.len() {
+            if self.completed_deferred_triggers.contains(&read) {
+                continue;
+            }
+            let mut event = self.deferred_triggers[read];
+            for tuple in [&mut event.old, &mut event.new].into_iter().flatten() {
+                let source = tuple.offset as usize;
+                let length = tuple.length as usize;
+                self.deferred_trigger_bytes
+                    .filled_mut()
+                    .copy_within(source..source + length, byte_write);
+                tuple.offset = byte_write as u32;
+                byte_write += length;
+            }
+            self.deferred_triggers[event_write] = event;
+            event_write += 1;
+        }
+        while self.deferred_triggers.len() > event_write {
+            self.deferred_triggers.pop();
+        }
+        self.deferred_trigger_bytes.truncate_to(byte_write);
+        self.completed_deferred_triggers.clear();
     }
 
     /// Discards this transaction's buffered notifications and listen ops (at
@@ -1009,8 +1351,12 @@ impl TxnState {
             listen_mark: self.pending_listen_ops.len(),
             subscription_advance_mark: self.subscription_advances.len(),
             constraint_obligation_mark: self.deferred_constraints.len(),
+            constraint_completion_mark: self.completed_constraints.len(),
             constraint_mode_mark: self.constraint_modes.len(),
             constraint_rename_mark: self.constraint_renames.len(),
+            deferred_trigger_mark: self.deferred_triggers.len(),
+            deferred_trigger_completion_mark: self.completed_deferred_triggers.len(),
+            deferred_trigger_bytes_mark: self.deferred_trigger_bytes.mark(),
             failed: self.failed,
         };
         self.savepoints.push(sp).map_err(|_| {
@@ -1035,8 +1381,12 @@ impl TxnState {
             listen_ops: self.pending_listen_ops.len(),
             subscription_advances: self.subscription_advances.len(),
             constraint_obligations: self.deferred_constraints.len(),
+            constraint_completions: self.completed_constraints.len(),
             constraint_modes: self.constraint_modes.len(),
             constraint_renames: self.constraint_renames.len(),
+            deferred_triggers: self.deferred_triggers.len(),
+            deferred_trigger_completions: self.completed_deferred_triggers.len(),
+            deferred_trigger_bytes: self.deferred_trigger_bytes.mark(),
         }
     }
 
@@ -1163,7 +1513,11 @@ impl TxnState {
         self.pending_listen_ops.clear();
         self.subscription_advances.clear();
         self.deferred_constraints.clear();
+        self.completed_constraints.clear();
         self.constraint_modes.clear();
         self.constraint_renames.clear();
+        self.deferred_triggers.clear();
+        self.completed_deferred_triggers.clear();
+        self.deferred_trigger_bytes.clear();
     }
 }

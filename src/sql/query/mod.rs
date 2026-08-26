@@ -1121,6 +1121,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::function_def_text(self.storage, self.txid, oid, arena)
     }
 
+    fn trigger_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::trigger_def_text(self.storage, self.txid, oid, arena)
+    }
+
     fn function_arguments<'a>(
         &self,
         oid: i32,

@@ -4557,15 +4557,15 @@ impl TriggerTransitionTables {
 
     pub(crate) const fn is_valid_for(
         self,
-        timing: u8,
-        level: crate::sql::ast::TriggerLevel,
+        timing: crate::sql::ast::TriggerTiming,
+        _level: crate::sql::ast::TriggerLevel,
         events: crate::sql::ast::TriggerEvents,
     ) -> bool {
         match self {
             Self::None => true,
             Self::Old(_) | Self::New(_) | Self::OldNew { .. } => {
-                timing == 1
-                    && matches!(level, crate::sql::ast::TriggerLevel::Statement)
+                matches!(timing, crate::sql::ast::TriggerTiming::After)
+                    && events.bits().count_ones() == 1
                     && !events.has_truncate()
                     && (self.old().is_none()
                         || events.contains(crate::sql::ast::TriggerEvents::UPDATE)
@@ -4587,9 +4587,54 @@ pub(crate) enum TriggerTarget {
     View(u16),
 }
 
+/// Constraint-trigger-only state is carried as one durable variant. Ordinary
+/// triggers therefore cannot accidentally become deferrable or acquire a
+/// referenced relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TriggerKind {
+    Ordinary,
+    Constraint {
+        referenced_table: Option<u16>,
+        timing: ConstraintTiming,
+    },
+}
+
+impl TriggerKind {
+    pub(crate) const fn timing(self) -> ConstraintTiming {
+        match self {
+            Self::Ordinary => ConstraintTiming::NotDeferrable,
+            Self::Constraint { timing, .. } => timing,
+        }
+    }
+
+    pub(crate) const fn referenced_table(self) -> Option<u16> {
+        match self {
+            Self::Ordinary => None,
+            Self::Constraint {
+                referenced_table, ..
+            } => referenced_table,
+        }
+    }
+}
+
 impl From<usize> for TriggerTarget {
     fn from(slot: usize) -> Self {
         Self::Table(u16::try_from(slot).expect("table slots fit the trigger target representation"))
+    }
+}
+
+impl TriggerTarget {
+    /// Internal comment identity. Relation slots are stable across renames and
+    /// schema moves; the high bit separates table and view namespaces.
+    pub(crate) const fn comment_subid(self) -> u32 {
+        match self {
+            Self::Table(slot) => slot as u32 + 1,
+            Self::View(slot) => (1u32 << 31) | (slot as u32 + 1),
+        }
+    }
+
+    const fn is_view(self) -> bool {
+        matches!(self, Self::View(_))
     }
 }
 
@@ -4598,8 +4643,9 @@ pub(crate) struct TriggerDef {
     pub(crate) created_at: u64,
     pub(crate) name: SqlName,
     pub(crate) target: TriggerTarget,
+    pub(crate) kind: TriggerKind,
     pub(crate) function: u16,
-    pub(crate) timing: u8,
+    pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
     pub(crate) update_columns: u64,
@@ -4608,14 +4654,27 @@ pub(crate) struct TriggerDef {
     pub(crate) arguments: TriggerArguments,
     pub(crate) enabled: TriggerEnabled,
     pending_definition: Option<PendingTriggerDefinition>,
-    pub(crate) ownership: Ownership,
     pub(crate) ddl_state: CatalogDdlState,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingTriggerDefinition {
     pub(crate) txid: u32,
+    pub(crate) definition: TriggerDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TriggerDefinition {
     pub(crate) name: SqlName,
+    pub(crate) kind: TriggerKind,
+    pub(crate) function: u16,
+    pub(crate) timing: crate::sql::ast::TriggerTiming,
+    pub(crate) level: crate::sql::ast::TriggerLevel,
+    pub(crate) events: crate::sql::ast::TriggerEvents,
+    pub(crate) update_columns: u64,
+    pub(crate) transition_tables: TriggerTransitionTables,
+    pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
+    pub(crate) arguments: TriggerArguments,
     pub(crate) enabled: TriggerEnabled,
 }
 
@@ -4627,6 +4686,38 @@ pub(crate) enum TriggerEnabled {
     Replica,
     Always,
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingPartitionTriggerState {
+    txid: u32,
+    enabled: TriggerEnabled,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PartitionTriggerState {
+    trigger: u16,
+    table: u16,
+    enabled: TriggerEnabled,
+    present: bool,
+    pending: Option<PendingPartitionTriggerState>,
+}
+
+impl PartitionTriggerState {
+    const EMPTY: Self = Self {
+        trigger: u16::MAX,
+        table: u16::MAX,
+        enabled: TriggerEnabled::Origin,
+        present: false,
+        pending: None,
+    };
+
+    fn enabled_to(self, txid: u32) -> Option<TriggerEnabled> {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map(|pending| pending.enabled)
+            .or(self.present.then_some(self.enabled))
+    }
 }
 
 impl TriggerEnabled {
@@ -4662,6 +4753,10 @@ impl TriggerEnabled {
 /// state may itself be absent. An `Option<PendingTriggerDefinition>` alone
 /// cannot encode that distinction safely.
 #[derive(Clone, Copy)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "indirection would allocate while trigger DDL is startup-memory bounded"
+)]
 pub(crate) enum TriggerAlter {
     Unchanged,
     Changed {
@@ -4673,14 +4768,74 @@ pub(crate) enum TriggerAlter {
 pub(crate) struct TriggerSpec {
     pub(crate) name: SqlName,
     pub(crate) target: TriggerTarget,
+    pub(crate) kind: TriggerKind,
     pub(crate) function: usize,
-    pub(crate) timing: u8,
+    pub(crate) timing: crate::sql::ast::TriggerTiming,
     pub(crate) level: crate::sql::ast::TriggerLevel,
     pub(crate) events: crate::sql::ast::TriggerEvents,
     pub(crate) update_columns: u64,
     pub(crate) transition_tables: TriggerTransitionTables,
     pub(crate) when: Option<StackStr<TRIGGER_WHEN_MAX>>,
     pub(crate) arguments: TriggerArguments,
+}
+
+impl TriggerSpec {
+    /// This is the durable catalog boundary for legal PostgreSQL trigger
+    /// shapes. Parser and executor checks provide user-facing diagnostics;
+    /// every create, replacement, and restore still passes through here.
+    pub(crate) const fn is_valid(self) -> bool {
+        trigger_shape_is_valid(
+            self.target.is_view(),
+            matches!(self.kind, TriggerKind::Constraint { .. }),
+            self.timing,
+            self.level,
+            self.events,
+            self.update_columns,
+            self.transition_tables,
+        )
+    }
+}
+
+pub(crate) const fn trigger_shape_is_valid(
+    target_is_view: bool,
+    constraint: bool,
+    timing: crate::sql::ast::TriggerTiming,
+    level: crate::sql::ast::TriggerLevel,
+    events: crate::sql::ast::TriggerEvents,
+    update_columns: u64,
+    transition_tables: TriggerTransitionTables,
+) -> bool {
+    let has_transition_tables = !matches!(transition_tables, TriggerTransitionTables::None);
+    if (matches!(level, crate::sql::ast::TriggerLevel::Row) && events.has_truncate())
+        || (has_transition_tables && update_columns != 0)
+        || !transition_tables.is_valid_for(timing, level, events)
+    {
+        return false;
+    }
+
+    if target_is_view {
+        if constraint || events.has_truncate() || has_transition_tables {
+            return false;
+        }
+        return matches!(
+            (timing, level),
+            (
+                crate::sql::ast::TriggerTiming::InsteadOf,
+                crate::sql::ast::TriggerLevel::Row
+            ) | (
+                crate::sql::ast::TriggerTiming::Before | crate::sql::ast::TriggerTiming::After,
+                crate::sql::ast::TriggerLevel::Statement
+            )
+        );
+    }
+
+    if matches!(timing, crate::sql::ast::TriggerTiming::InsteadOf) {
+        return false;
+    }
+    !constraint
+        || (matches!(timing, crate::sql::ast::TriggerTiming::After)
+            && matches!(level, crate::sql::ast::TriggerLevel::Row)
+            && !has_transition_tables)
 }
 
 /// Maximum source length of a durable row-trigger `WHEN` predicate.
@@ -4859,8 +5014,9 @@ impl TriggerDef {
         created_at: 0,
         name: SqlName::EMPTY,
         target: TriggerTarget::Table(u16::MAX),
+        kind: TriggerKind::Ordinary,
         function: u16::MAX,
-        timing: 0,
+        timing: crate::sql::ast::TriggerTiming::Before,
         level: crate::sql::ast::TriggerLevel::Row,
         events: crate::sql::ast::TriggerEvents::from_bits(1).expect("INSERT event is valid"),
         update_columns: 0,
@@ -4869,7 +5025,6 @@ impl TriggerDef {
         arguments: TriggerArguments::EMPTY,
         enabled: TriggerEnabled::Disabled,
         pending_definition: None,
-        ownership: Ownership::BOOTSTRAP,
         ddl_state: CatalogDdlState::Absent,
     };
 
@@ -4878,15 +5033,54 @@ impl TriggerDef {
     }
 
     pub(crate) fn name_to(&self, txid: u32) -> SqlName {
-        self.pending_definition
-            .filter(|pending| pending.txid == txid)
-            .map_or(self.name, |pending| pending.name)
+        self.definition_to(txid).name
     }
 
     pub(crate) fn enabled_to(&self, txid: u32) -> TriggerEnabled {
+        self.definition_to(txid).enabled
+    }
+
+    pub(crate) fn definition_to(&self, txid: u32) -> TriggerDefinition {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
-            .map_or(self.enabled, |pending| pending.enabled)
+            .map_or_else(|| self.definition(), |pending| pending.definition)
+    }
+
+    fn definition(&self) -> TriggerDefinition {
+        TriggerDefinition {
+            name: self.name,
+            kind: self.kind,
+            function: self.function,
+            timing: self.timing,
+            level: self.level,
+            events: self.events,
+            update_columns: self.update_columns,
+            transition_tables: self.transition_tables,
+            when: self.when,
+            arguments: self.arguments,
+            enabled: self.enabled,
+        }
+    }
+
+    fn apply_definition(&mut self, definition: TriggerDefinition) {
+        self.name = definition.name;
+        self.kind = definition.kind;
+        self.function = definition.function;
+        self.timing = definition.timing;
+        self.level = definition.level;
+        self.events = definition.events;
+        self.update_columns = definition.update_columns;
+        self.transition_tables = definition.transition_tables;
+        self.when = definition.when;
+        self.arguments = definition.arguments;
+        self.enabled = definition.enabled;
+    }
+
+    fn effective_to(&self, txid: u32) -> Self {
+        let mut trigger = *self;
+        trigger.apply_definition(self.definition_to(txid));
+        trigger.pending_definition = None;
+        trigger
     }
 }
 
@@ -6439,6 +6633,7 @@ pub(crate) enum AccessClass {
     Tablespace = 10,
     Statistics = 11,
     Extension = 12,
+    Trigger = 13,
 }
 
 /// Object classes addressable by ALTER DEFAULT PRIVILEGES.
@@ -6499,6 +6694,7 @@ impl AccessClass {
             10 => Self::Tablespace,
             11 => Self::Statistics,
             12 => Self::Extension,
+            13 => Self::Trigger,
             _ => return None,
         })
     }
@@ -6807,6 +7003,7 @@ pub enum CommentClass {
     Type,
     Tablespace,
     Extension,
+    Trigger,
 }
 
 impl CommentClass {
@@ -6817,6 +7014,7 @@ impl CommentClass {
             CommentClass::Type => 2,
             CommentClass::Tablespace => 3,
             CommentClass::Extension => 4,
+            CommentClass::Trigger => 5,
         }
     }
 
@@ -6827,6 +7025,7 @@ impl CommentClass {
             2 => CommentClass::Type,
             3 => CommentClass::Tablespace,
             4 => CommentClass::Extension,
+            5 => CommentClass::Trigger,
             _ => return None,
         })
     }
@@ -6851,6 +7050,12 @@ pub struct PendingComment {
     pub text: Option<StackStr<COMMENT_MAX>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingCommentIdentity {
+    txid: u32,
+    name: SqlName,
+}
+
 /// A comment attached to a database object, keyed by `(class, schema, name,
 /// subid)` — restart-stable, since object OIDs derive from catalog slots but
 /// names do not. `subid` is 0 for a relation or schema and the 1-based column
@@ -6865,6 +7070,7 @@ pub struct CommentEntry {
     pub subid: u32,
     pub live: Option<StackStr<COMMENT_MAX>>,
     pub pending: Option<PendingComment>,
+    pending_identity: Option<PendingCommentIdentity>,
 }
 
 impl CommentEntry {
@@ -6877,6 +7083,7 @@ impl CommentEntry {
             subid: 0,
             live: None,
             pending: None,
+            pending_identity: None,
         }
     }
 
@@ -6886,6 +7093,26 @@ impl CommentEntry {
             && self.subid == subid
             && self.name.as_str() == name
             && self.schema.as_str() == schema
+    }
+
+    fn matches_to(
+        &self,
+        class: CommentClass,
+        schema: &str,
+        name: &str,
+        subid: u32,
+        txid: u32,
+    ) -> bool {
+        self.used
+            && self.class == class
+            && self.subid == subid
+            && self.schema.as_str() == schema
+            && self
+                .pending_identity
+                .filter(|identity| identity.txid == txid)
+                .map_or(self.name, |identity| identity.name)
+                .as_str()
+                == name
     }
 
     /// The text `txid` sees: its own uncommitted overlay when present, else the
@@ -6999,6 +7226,7 @@ pub struct Storage {
     views: FixedVec<ViewDef>,
     routines: FixedVec<RoutineDef>,
     triggers: FixedVec<TriggerDef>,
+    partition_trigger_states: FixedVec<PartitionTriggerState>,
     policies: FixedVec<PolicyDef>,
     extended_statistics: FixedVec<ExtendedStatisticsDef>,
     pending_extended_statistics_data: FixedVec<PendingExtendedStatisticsDataSlot>,
@@ -7638,6 +7866,7 @@ impl Storage {
                     + size_of::<ViewDef>()
                     + size_of::<RoutineDef>()
                     + size_of::<TriggerDef>()
+                    + config.max_tables * size_of::<PartitionTriggerState>()
                     + MAX_POLICIES_PER_TABLE * size_of::<PolicyDef>()
                     + MAX_EXTENDED_STATISTICS_PER_TABLE * size_of::<ExtendedStatisticsDef>()
                     + size_of::<PublicationDef>()
@@ -7774,6 +8003,17 @@ impl Storage {
             triggers
                 .push(TriggerDef::EMPTY)
                 .expect("sized to max_tables");
+        }
+        let partition_trigger_state_capacity = config.max_tables * config.max_tables;
+        let mut partition_trigger_states = FixedVec::new(
+            budget,
+            "partition_trigger_states",
+            partition_trigger_state_capacity,
+        )?;
+        for _ in 0..partition_trigger_state_capacity {
+            partition_trigger_states
+                .push(PartitionTriggerState::EMPTY)
+                .expect("sized to trigger-table pairs");
         }
         let policy_capacity = config.max_tables * MAX_POLICIES_PER_TABLE;
         let mut policies = FixedVec::new(budget, "policies", policy_capacity)?;
@@ -8115,6 +8355,7 @@ impl Storage {
             views,
             routines,
             triggers,
+            partition_trigger_states,
             policies,
             extended_statistics,
             pending_extended_statistics_data,
@@ -8701,6 +8942,10 @@ impl Storage {
             AccessClass::Tablespace => &self.tablespaces[slot].ownership,
             AccessClass::Statistics => &self.extended_statistics[slot].ownership,
             AccessClass::Extension => &self.extensions[slot].ownership,
+            AccessClass::Trigger => match self.triggers[slot].target {
+                TriggerTarget::Table(table) => &self.tables[usize::from(table)].ownership,
+                TriggerTarget::View(view) => &self.views[usize::from(view)].ownership,
+            },
         }
     }
 
@@ -8720,6 +8965,9 @@ impl Storage {
             AccessClass::Tablespace => &mut self.tablespaces[slot].ownership,
             AccessClass::Statistics => &mut self.extended_statistics[slot].ownership,
             AccessClass::Extension => &mut self.extensions[slot].ownership,
+            AccessClass::Trigger => {
+                unreachable!("triggers inherit relation ownership and cannot be reassigned")
+            }
         }
     }
 
@@ -8794,6 +9042,7 @@ impl Storage {
             AccessClass::Tablespace => self.tablespace_slot(name, txid),
             AccessClass::Statistics => self.extended_statistics_slot(schema, name, txid),
             AccessClass::Extension => self.extension_slot(name, txid),
+            AccessClass::Trigger => None,
         }?;
         u16::try_from(slot)
             .ok()
@@ -8860,6 +9109,14 @@ impl Storage {
                 (definition.schema, definition.name)
             }
             AccessClass::Extension => (SqlName::EMPTY, self.extensions[slot].name),
+            AccessClass::Trigger => {
+                let trigger = &self.triggers[slot];
+                let schema = match trigger.target {
+                    TriggerTarget::Table(table) => self.table_def(usize::from(table), txid).schema,
+                    TriggerTarget::View(view) => self.views[usize::from(view)].schema,
+                };
+                (schema, trigger.name_to(txid))
+            }
         }
     }
 
@@ -8883,6 +9140,7 @@ impl Storage {
                 self.extended_statistics[slot].ddl_state == CatalogDdlState::Present
             }
             AccessClass::Extension => self.extensions[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Trigger => self.triggers[slot].ddl_state == CatalogDdlState::Present,
         }
     }
 
@@ -8902,6 +9160,7 @@ impl Storage {
             AccessClass::Tablespace => self.tablespaces[slot].visible_to(txid),
             AccessClass::Statistics => self.extended_statistics[slot].visible_to(txid),
             AccessClass::Extension => self.extensions[slot].visible_to(txid),
+            AccessClass::Trigger => self.triggers[slot].visible_to(txid),
         }
     }
 
@@ -8920,6 +9179,7 @@ impl Storage {
             AccessClass::Tablespace => self.tablespaces.len(),
             AccessClass::Statistics => self.extended_statistics.len(),
             AccessClass::Extension => self.extensions.len(),
+            AccessClass::Trigger => self.triggers.len(),
         }
     }
 
@@ -10308,7 +10568,7 @@ impl Storage {
     ) -> Option<&str> {
         self.comments
             .iter()
-            .find(|c| c.matches(class, schema, name, subid))
+            .find(|c| c.matches_to(class, schema, name, subid, txid))
             .and_then(|c| c.visible_text(txid))
     }
 
@@ -10329,9 +10589,31 @@ impl Storage {
             if !c.used {
                 return None;
             }
+            let name = c
+                .pending_identity
+                .as_ref()
+                .filter(|identity| identity.txid == txid)
+                .map_or(c.name.as_str(), |identity| identity.name.as_str());
             c.visible_text(txid)
-                .map(|t| (c.class, c.schema.as_str(), c.name.as_str(), c.subid, t))
+                .map(|t| (c.class, c.schema.as_str(), name, c.subid, t))
         })
+    }
+
+    fn stage_trigger_comment_rename(
+        &mut self,
+        old_name: SqlName,
+        new_name: SqlName,
+        subid: u32,
+        txid: u32,
+    ) {
+        for comment in self.comments.iter_mut().filter(|comment| {
+            comment.matches_to(CommentClass::Trigger, "", old_name.as_str(), subid, txid)
+        }) {
+            comment.pending_identity = Some(PendingCommentIdentity {
+                txid,
+                name: new_name,
+            });
+        }
     }
 
     /// Sets (or, with `text == None`, removes) a comment as `txid`'s
@@ -10350,7 +10632,7 @@ impl Storage {
         if let Some(slot) = self
             .comments
             .iter()
-            .position(|c| c.matches(class, schema.as_str(), name.as_str(), subid))
+            .position(|c| c.matches_to(class, schema.as_str(), name.as_str(), subid, txid))
         {
             let prior = self.comments[slot].pending.take();
             self.comments[slot].pending = Some(PendingComment { txid, text });
@@ -10371,6 +10653,7 @@ impl Storage {
             subid,
             live: None,
             pending: Some(PendingComment { txid, text }),
+            pending_identity: None,
         };
         Ok((slot, None))
     }
@@ -10451,6 +10734,7 @@ impl Storage {
             subid,
             live: text,
             pending: None,
+            pending_identity: None,
         };
         Ok(())
     }
@@ -10476,7 +10760,7 @@ impl Storage {
     /// uncommitted overlay.
     fn reap_comment(&mut self, slot: usize) {
         let c = &mut self.comments[slot];
-        if c.live.is_none() && c.pending.is_none() {
+        if c.live.is_none() && c.pending.is_none() && c.pending_identity.is_none() {
             *c = CommentEntry::empty();
         }
     }
@@ -13251,6 +13535,36 @@ impl Storage {
             };
             current = self.partition_child_target(current, strategy, keys, n_keys, values, txid)?;
         }
+    }
+
+    /// Verifies the complete attachment chain of a leaf after `BEFORE ROW`
+    /// triggers have had an opportunity to rewrite its partition keys.
+    pub(crate) fn validate_partition_target(
+        &self,
+        leaf: usize,
+        values: &[crate::sql::types::Datum],
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let mut child = leaf;
+        while let Some(PartitionAttachment { parent, bound }) =
+            self.table_def(child, txid).partition.attachment
+        {
+            if !self.partition_attachment_accepts(
+                usize::from(parent),
+                child,
+                bound,
+                values,
+                txid,
+            )? {
+                return Err(sql_err!(
+                    crate::sql::eval::sqlstate::CHECK_VIOLATION,
+                    "new row for relation \"{}\" violates partition constraint",
+                    self.table_def(child, txid).name.as_str()
+                ));
+            }
+            child = usize::from(parent);
+        }
+        Ok(())
     }
 
     pub(crate) fn partition_child_target(
@@ -20539,33 +20853,35 @@ impl Storage {
         &self,
         table: usize,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &TriggerDef)> {
+    ) -> impl Iterator<Item = (usize, TriggerDef)> + '_ {
         self.triggers
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| {
                 trigger.visible_to(txid) && trigger.target == TriggerTarget::Table(table as u16)
             })
+            .map(move |(slot, trigger)| (slot, trigger.effective_to(txid)))
     }
 
     pub(crate) fn triggers_for_view(
         &self,
         view: usize,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &TriggerDef)> {
+    ) -> impl Iterator<Item = (usize, TriggerDef)> + '_ {
         self.triggers
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| {
                 trigger.visible_to(txid) && trigger.target == TriggerTarget::View(view as u16)
             })
+            .map(move |(slot, trigger)| (slot, trigger.effective_to(txid)))
     }
 
     pub(crate) fn triggers_for_target(
         &self,
         target: TriggerTarget,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &TriggerDef)> {
+    ) -> impl Iterator<Item = (usize, TriggerDef)> + '_ {
         self.triggers_with_slots_visible_to(txid)
             .filter(move |(_, trigger)| trigger.target == target)
     }
@@ -20573,11 +20889,20 @@ impl Storage {
     pub(crate) fn triggers_with_slots_visible_to(
         &self,
         txid: u32,
-    ) -> impl Iterator<Item = (usize, &TriggerDef)> {
+    ) -> impl Iterator<Item = (usize, TriggerDef)> + '_ {
         self.triggers
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| trigger.visible_to(txid))
+            .map(move |(slot, trigger)| (slot, trigger.effective_to(txid)))
+    }
+
+    pub(crate) fn trigger(&self, slot: usize) -> &TriggerDef {
+        &self.triggers[slot]
+    }
+
+    pub(crate) fn trigger_to(&self, slot: usize, txid: u32) -> TriggerDef {
+        self.triggers[slot].effective_to(txid)
     }
 
     pub(crate) fn trigger_slot_on(
@@ -20590,28 +20915,161 @@ impl Storage {
             .find_map(|(slot, trigger)| (trigger.name_to(txid).as_str() == name).then_some(slot))
     }
 
+    pub(crate) fn trigger_slot_inherited_by(
+        &self,
+        table: usize,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        self.triggers_with_slots_visible_to(txid)
+            .find_map(|(slot, trigger)| {
+                let TriggerTarget::Table(parent) = trigger.target else {
+                    return None;
+                };
+                (matches!(trigger.level, crate::sql::ast::TriggerLevel::Row)
+                    && trigger.name_to(txid).as_str() == name
+                    && self.partition_descends_from(table, usize::from(parent), txid))
+                .then_some(slot)
+            })
+    }
+
+    pub(crate) fn partition_trigger_enabled_to(
+        &self,
+        trigger: usize,
+        table: usize,
+        txid: u32,
+    ) -> TriggerEnabled {
+        self.partition_trigger_states
+            .iter()
+            .find(|state| state.trigger as usize == trigger && state.table as usize == table)
+            .and_then(|state| state.enabled_to(txid))
+            .unwrap_or_else(|| self.trigger_to(trigger, txid).enabled_to(txid))
+    }
+
+    pub(crate) fn stage_partition_trigger_enabled(
+        &mut self,
+        trigger: usize,
+        table: usize,
+        enabled: TriggerEnabled,
+        txid: u32,
+    ) -> Result<Option<(usize, PartitionTriggerState)>, SqlError> {
+        let existing = self.partition_trigger_states.iter().position(|state| {
+            state.trigger as usize == trigger
+                && state.table as usize == table
+                && (state.present || state.pending.is_some())
+        });
+        let slot = existing.or_else(|| {
+            self.partition_trigger_states
+                .iter()
+                .position(|state| !state.present && state.pending.is_none())
+        });
+        let Some(slot) = slot else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "partition trigger state exceeds the startup catalog capacity"
+            ));
+        };
+        let prior = self.partition_trigger_states[slot];
+        if let Some(pending) = prior.pending
+            && pending.txid != txid
+        {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                pending.txid,
+                self.trigger(trigger).name.as_str(),
+            ));
+        }
+        if prior.enabled_to(txid) == Some(enabled) {
+            return Ok(None);
+        }
+        self.partition_trigger_states[slot] = PartitionTriggerState {
+            trigger: trigger as u16,
+            table: table as u16,
+            enabled: prior.enabled,
+            present: prior.present,
+            pending: Some(PendingPartitionTriggerState { txid, enabled }),
+        };
+        Ok(Some((slot, prior)))
+    }
+
+    pub(crate) fn commit_partition_trigger_state(&mut self, slot: usize, txid: u32) {
+        let state = &mut self.partition_trigger_states[slot];
+        if let Some(pending) = state.pending
+            && pending.txid == txid
+        {
+            state.enabled = pending.enabled;
+            state.present = true;
+            state.pending = None;
+        }
+    }
+
+    pub(crate) fn rollback_partition_trigger_state(
+        &mut self,
+        slot: usize,
+        prior: PartitionTriggerState,
+    ) {
+        self.partition_trigger_states[slot] = prior;
+    }
+
+    pub(crate) fn restore_partition_trigger_state(
+        &mut self,
+        trigger: usize,
+        table: usize,
+        enabled: TriggerEnabled,
+    ) -> Result<(), SqlError> {
+        if self.partition_trigger_states.iter().any(|state| {
+            state.present && state.trigger as usize == trigger && state.table as usize == table
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "duplicate partition trigger state in checkpoint"
+            ));
+        }
+        let Some(slot) = self
+            .partition_trigger_states
+            .iter()
+            .position(|state| !state.present && state.pending.is_none())
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many partition trigger states in checkpoint"
+            ));
+        };
+        self.partition_trigger_states[slot] = PartitionTriggerState {
+            trigger: trigger as u16,
+            table: table as u16,
+            enabled,
+            present: true,
+            pending: None,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn partition_trigger_states(
+        &self,
+    ) -> impl Iterator<Item = (usize, usize, TriggerEnabled)> + '_ {
+        self.partition_trigger_states.iter().filter_map(|state| {
+            state.present.then_some((
+                usize::from(state.trigger),
+                usize::from(state.table),
+                state.enabled,
+            ))
+        })
+    }
+
+    pub(crate) const fn trigger_access_object(slot: usize) -> AccessObject {
+        AccessObject {
+            class: AccessClass::Trigger,
+            slot: slot as u16,
+        }
+    }
+
     pub(crate) fn create_trigger(
         &mut self,
         spec: TriggerSpec,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        if spec.timing > 2
-            || (matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
-                && spec.events.has_truncate())
-            || (matches!(spec.level, crate::sql::ast::TriggerLevel::Statement)
-                && spec.when.is_some())
-            || (!matches!(spec.transition_tables, TriggerTransitionTables::None)
-                && spec.update_columns != 0)
-            || (spec.timing == 2
-                && (!matches!(spec.target, TriggerTarget::View(_))
-                    || !matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
-                    || spec.events.has_truncate()
-                    || spec.update_columns != 0
-                    || !matches!(spec.transition_tables, TriggerTransitionTables::None)))
-            || !spec
-                .transition_tables
-                .is_valid_for(spec.timing, spec.level, spec.events)
-        {
+        if !spec.is_valid() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "invalid trigger definition"
@@ -20647,6 +21105,7 @@ impl Storage {
             created_at: self.catalog_seq,
             name: spec.name,
             target: spec.target,
+            kind: spec.kind,
             function: u16::try_from(spec.function).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -20662,7 +21121,6 @@ impl Storage {
             arguments: spec.arguments,
             enabled: TriggerEnabled::Origin,
             pending_definition: None,
-            ownership: self.initial_ownership(txid),
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         Ok(slot)
@@ -20687,14 +21145,69 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, pending.txid, name.as_str()));
         }
         let trigger = &mut self.triggers[slot];
-        if trigger.name_to(txid) == name && trigger.enabled_to(txid) == enabled {
+        let mut definition = trigger.definition_to(txid);
+        if definition.name == name && definition.enabled == enabled {
             return Ok(TriggerAlter::Unchanged);
         }
+        let old_name = definition.name;
+        let comment_subid = trigger.target.comment_subid();
         let prior = trigger.pending_definition;
-        trigger.pending_definition = Some(PendingTriggerDefinition {
+        definition.name = name;
+        definition.enabled = enabled;
+        trigger.pending_definition = Some(PendingTriggerDefinition { txid, definition });
+        if old_name != name {
+            self.stage_trigger_comment_rename(old_name, name, comment_subid, txid);
+        }
+        Ok(TriggerAlter::Changed { prior })
+    }
+
+    pub(crate) fn replace_trigger(
+        &mut self,
+        slot: usize,
+        spec: TriggerSpec,
+        txid: u32,
+    ) -> Result<TriggerAlter, SqlError> {
+        if !spec.is_valid() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid replacement trigger definition"
+            ));
+        }
+        let trigger = &self.triggers[slot];
+        if let Some(pending) = trigger.pending_definition
+            && pending.txid != txid
+        {
+            return Err(self.catalog_ddl_wait_error(txid, pending.txid, trigger.name.as_str()));
+        }
+        if trigger.target != spec.target || !matches!(trigger.kind, TriggerKind::Ordinary) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "trigger \"{}\" for relation is a constraint trigger",
+                spec.name.as_str()
+            ));
+        }
+        let function = u16::try_from(spec.function).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine slot exceeds trigger capacity"
+            )
+        })?;
+        let prior = trigger.pending_definition;
+        self.triggers[slot].pending_definition = Some(PendingTriggerDefinition {
             txid,
-            name,
-            enabled,
+            definition: TriggerDefinition {
+                name: spec.name,
+                kind: spec.kind,
+                function,
+                timing: spec.timing,
+                level: spec.level,
+                events: spec.events,
+                update_columns: spec.update_columns,
+                transition_tables: spec.transition_tables,
+                when: spec.when,
+                arguments: spec.arguments,
+                enabled: TriggerEnabled::Origin,
+            },
         });
         Ok(TriggerAlter::Changed { prior })
     }
@@ -20704,9 +21217,25 @@ impl Storage {
         if let Some(pending) = trigger.pending_definition
             && pending.txid == txid
         {
-            trigger.name = pending.name;
-            trigger.enabled = pending.enabled;
+            let old_name = trigger.name;
+            let new_name = pending.definition.name;
+            let subid = trigger.target.comment_subid();
+            trigger.apply_definition(pending.definition);
             trigger.pending_definition = None;
+            for comment in self.comments.iter_mut().filter(|comment| {
+                comment.used
+                    && comment.class == CommentClass::Trigger
+                    && comment.subid == subid
+                    && ((old_name != new_name && comment.name == old_name)
+                        || comment
+                            .pending_identity
+                            .is_some_and(|identity| identity.txid == txid))
+            }) {
+                if old_name != new_name {
+                    comment.name = new_name;
+                }
+                comment.pending_identity = None;
+            }
         }
     }
 
@@ -20715,6 +21244,28 @@ impl Storage {
         slot: usize,
         prior: Option<PendingTriggerDefinition>,
     ) {
+        let current = self.triggers[slot].pending_definition;
+        let committed_name = self.triggers[slot].name;
+        let restored_name = prior
+            .map(|pending| pending.definition.name)
+            .unwrap_or(committed_name);
+        let subid = self.triggers[slot].target.comment_subid();
+        if let Some(current) = current {
+            for comment in self.comments.iter_mut().filter(|comment| {
+                comment.used
+                    && comment.class == CommentClass::Trigger
+                    && comment.subid == subid
+                    && comment
+                        .pending_identity
+                        .is_some_and(|identity| identity.txid == current.txid)
+            }) {
+                comment.pending_identity =
+                    (restored_name != comment.name).then_some(PendingCommentIdentity {
+                        txid: current.txid,
+                        name: restored_name,
+                    });
+            }
+        }
         self.triggers[slot].pending_definition = prior;
     }
 
@@ -20725,27 +21276,10 @@ impl Storage {
     pub(crate) fn restore_trigger(
         &mut self,
         created_at: u64,
-        owner: u16,
         spec: TriggerSpec,
         enabled: TriggerEnabled,
     ) -> Result<usize, SqlError> {
-        if spec.timing > 2
-            || (matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
-                && spec.events.has_truncate())
-            || (matches!(spec.level, crate::sql::ast::TriggerLevel::Statement)
-                && spec.when.is_some())
-            || (!matches!(spec.transition_tables, TriggerTransitionTables::None)
-                && spec.update_columns != 0)
-            || (spec.timing == 2
-                && (!matches!(spec.target, TriggerTarget::View(_))
-                    || !matches!(spec.level, crate::sql::ast::TriggerLevel::Row)
-                    || spec.events.has_truncate()
-                    || spec.update_columns != 0
-                    || !matches!(spec.transition_tables, TriggerTransitionTables::None)))
-            || !spec
-                .transition_tables
-                .is_valid_for(spec.timing, spec.level, spec.events)
-        {
+        if !spec.is_valid() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
                 "invalid trigger definition in checkpoint"
@@ -20778,6 +21312,7 @@ impl Storage {
             created_at,
             name: spec.name,
             target: spec.target,
+            kind: spec.kind,
             function: u16::try_from(spec.function).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -20793,10 +21328,6 @@ impl Storage {
             arguments: spec.arguments,
             enabled,
             pending_definition: None,
-            ownership: Ownership {
-                owner,
-                pending: None,
-            },
             ddl_state: CatalogDdlState::Present,
         };
         Ok(slot)
@@ -20807,18 +21338,41 @@ impl Storage {
     }
 
     pub(crate) fn commit_trigger_drop(&mut self, slot: usize) {
+        let trigger = self.triggers[slot];
         self.triggers[slot].ddl_state = self.triggers[slot].ddl_state.commit_drop();
+        self.clear_extension_dependencies_for_object(Self::trigger_access_object(slot));
+        for state in self.partition_trigger_states.iter_mut() {
+            if usize::from(state.trigger) == slot {
+                *state = PartitionTriggerState::EMPTY;
+            }
+        }
+        for comment_slot in 0..self.comments.len() {
+            let comment = &self.comments[comment_slot];
+            if comment.used
+                && comment.class == CommentClass::Trigger
+                && comment.name == trigger.name
+                && comment.subid == trigger.target.comment_subid()
+            {
+                self.comments[comment_slot].live = None;
+                self.reap_comment(comment_slot);
+            }
+        }
     }
 
     /// Triggers are internal relation dependents. A committed table drop
     /// retires them in the same catalog transition.
     pub(crate) fn commit_triggers_for_table(&mut self, table: usize) {
-        for trigger in self.triggers.iter_mut() {
+        for (slot, trigger) in self.triggers.iter_mut().enumerate() {
             if trigger.ddl_state != CatalogDdlState::Absent
                 && trigger.target == TriggerTarget::Table(table as u16)
             {
                 trigger.ddl_state = CatalogDdlState::Absent;
                 trigger.pending_definition = None;
+                for state in self.partition_trigger_states.iter_mut() {
+                    if usize::from(state.trigger) == slot {
+                        *state = PartitionTriggerState::EMPTY;
+                    }
+                }
             }
         }
     }
@@ -22603,10 +23157,11 @@ mod tests {
             CommentClass::Type,
             CommentClass::Tablespace,
             CommentClass::Extension,
+            CommentClass::Trigger,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(5), None);
+        assert_eq!(CommentClass::from_u8(6), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 
@@ -22626,6 +23181,7 @@ mod tests {
             AccessClass::Statistics,
             AccessClass::Tablespace,
             AccessClass::Extension,
+            AccessClass::Trigger,
         ] {
             assert_eq!(AccessClass::from_u8(class as u8), Some(class));
         }
@@ -22644,6 +23200,10 @@ mod tests {
         c.max_extension_scripts = 8;
         c.extension_script_bytes = 1 << 16;
         c
+    }
+
+    fn test_budget(config: &Config) -> Budget {
+        Budget::new(config.memtable_bytes + Storage::extra_budget_bytes(config) + (1 << 20))
     }
 
     fn make_def(name: &str, columns: &[(&str, ColType, bool)]) -> TableDef {
@@ -22701,7 +23261,7 @@ mod tests {
     #[test]
     fn user_type_identity_is_atomic() {
         let config = test_config();
-        let mut budget = Budget::new(1 << 23);
+        let mut budget = test_budget(&config);
         let storage = Storage::new(&config, &mut budget).unwrap();
         let mut column = ColumnMeta::EMPTY;
         column.ctype = ColType::Enum(0);
@@ -22728,7 +23288,7 @@ mod tests {
     #[test]
     fn create_find_drop_reuse() {
         let config = test_config();
-        let mut budget = Budget::new(1 << 23);
+        let mut budget = test_budget(&config);
         let mut s = Storage::new(&config, &mut budget).unwrap();
         let def = make_def("t1", &[("id", ColType::Int4, true)]);
         let index = s.create_table(def).unwrap();
@@ -22754,7 +23314,7 @@ mod tests {
     #[test]
     fn published_generation_cleanup_keeps_newer_table_writes_dirty() {
         let config = test_config();
-        let mut budget = Budget::new(8 << 20);
+        let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let slot = storage
             .create_table(make_def(
@@ -22774,7 +23334,7 @@ mod tests {
     #[test]
     fn replay_table_rewrite_marker_must_be_paired_exactly_once() {
         let config = test_config();
-        let mut budget = Budget::new(1 << 23);
+        let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         storage
             .create_table(make_def("t", &[("id", ColType::Int4, true)]))
@@ -22858,7 +23418,7 @@ mod tests {
     fn heap_append_and_full() {
         let mut config = test_config();
         config.memtable_bytes = 64;
-        let mut budget = Budget::new(1 << 23);
+        let mut budget = test_budget(&config);
         let mut s = Storage::new(&config, &mut budget).unwrap();
         let (loc, slice) = s.heap.append(10).unwrap();
         slice.copy_from_slice(b"0123456789");
@@ -22870,7 +23430,7 @@ mod tests {
     #[test]
     fn heap_compaction_preserves_rows_of_a_pending_create() {
         let config = test_config();
-        let mut budget = Budget::new(1 << 23);
+        let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         let slot = storage
             .create_table_in(make_def("pending", &[("id", ColType::Int4, true)]), 7)
@@ -22926,7 +23486,7 @@ mod tests {
     fn replication_slots_are_bounded_and_have_resume_positions() {
         let mut config = test_config();
         config.max_replication_slots = 1;
-        let mut budget = Budget::new(1 << 23);
+        let mut budget = test_budget(&config);
         let mut storage = Storage::new(&config, &mut budget).unwrap();
         storage
             .create_replication_slot(

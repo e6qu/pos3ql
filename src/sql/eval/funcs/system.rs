@@ -307,6 +307,7 @@ pub(crate) fn dispatch<'a>(
             | "pg_get_constraintdef"
             | "pg_get_partkeydef"
             | "pg_get_functiondef"
+            | "pg_get_triggerdef"
             | "pg_get_function_arguments"
             | "pg_get_function_identity_arguments"
             | "pg_get_function_result"
@@ -716,6 +717,25 @@ pub(crate) fn dispatch<'a>(
                         "function pg_get_functiondef(integer) does not exist"
                     )),
                 }
+            }
+            "pg_get_triggerdef" => {
+                if args.is_empty() || args.len() > 2 {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function pg_get_triggerdef(...) does not exist"
+                    ));
+                }
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                Ok(cat
+                    .trigger_def(oid, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
             }
             "pg_get_function_arguments"
             | "pg_get_function_identity_arguments"

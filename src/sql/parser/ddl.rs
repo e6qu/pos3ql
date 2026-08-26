@@ -24,8 +24,8 @@ use crate::sql::ast::{
     StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget, SubscriptionBehavior,
     SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName,
     SubscriptionSlotPlan, SubscriptionStreaming, SubscriptionSynchronousCommit,
-    TablespaceOptionNames, TablespaceOptions, TriggerEvent, TriggerIdentity, TriggerTiming,
-    TriggerTransitionTables, ViewSecurity,
+    TablespaceOptionNames, TablespaceOptions, TriggerEvent, TriggerIdentity, TriggerKind,
+    TriggerTiming, TriggerTransitionTables, ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -533,7 +533,14 @@ impl<'a> Parser<'a> {
             self.expect_ident("to")?;
             AlterTriggerAction::Rename(self.col_ident("new trigger name")?)
         } else {
-            return Err(self.err_here("expected RENAME after ALTER TRIGGER"));
+            let enabled = !self.eat_ident("no")?;
+            self.expect_ident("depends")?;
+            self.expect_ident("on")?;
+            self.expect_ident("extension")?;
+            AlterTriggerAction::DependsOnExtension {
+                extension: self.col_ident("extension name")?,
+                enabled,
+            }
         };
         Ok(Stmt::AlterTrigger {
             trigger: TriggerIdentity { name, table },
@@ -651,8 +658,11 @@ impl<'a> Parser<'a> {
             if self.eat_ident("aggregate")? {
                 return self.create_aggregate(true);
             }
+            if self.eat_ident("trigger")? {
+                return self.create_trigger(true, false);
+            }
             return Err(self.unexpected(
-                "expected VIEW, FUNCTION, PROCEDURE, or AGGREGATE after CREATE OR REPLACE",
+                "expected VIEW, FUNCTION, PROCEDURE, AGGREGATE, or TRIGGER after CREATE OR REPLACE",
             ));
         }
         if self.eat_ident("unique")? {
@@ -681,7 +691,11 @@ impl<'a> Parser<'a> {
             return self.create_subscription();
         }
         if self.eat_ident("trigger")? {
-            return self.create_trigger();
+            return self.create_trigger(false, false);
+        }
+        if self.eat_ident("constraint")? {
+            self.expect_ident("trigger")?;
+            return self.create_trigger(false, true);
         }
         if self.eat_ident("policy")? {
             return self.create_policy();
@@ -1349,7 +1363,18 @@ impl<'a> Parser<'a> {
     }
 
     /// CREATE TRIGGER forms with a complete durable execution model.
-    fn create_trigger(&mut self) -> Result<Stmt<'a>, ParseError> {
+    fn create_trigger(
+        &mut self,
+        or_replace: bool,
+        constraint: bool,
+    ) -> Result<Stmt<'a>, ParseError> {
+        if or_replace && constraint {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "CREATE OR REPLACE CONSTRAINT TRIGGER is not supported"),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
         let name = self.col_ident("trigger name")?;
         let timing = if self.eat_ident("before")? {
             TriggerTiming::Before
@@ -1374,7 +1399,19 @@ impl<'a> Parser<'a> {
                         if update_column_count == update_columns.len() {
                             return Err(self.limit("UPDATE OF columns", update_columns.len()));
                         }
-                        update_columns[update_column_count] = self.col_ident("UPDATE OF column")?;
+                        let column = self.col_ident("UPDATE OF column")?;
+                        if update_columns[..update_column_count].contains(&column) {
+                            return Err(ParseError {
+                                at: self.peek_at,
+                                message: stack_format!(
+                                    96,
+                                    "column \"{}\" specified more than once",
+                                    column
+                                ),
+                                sqlstate: sqlstate::DUPLICATE_COLUMN,
+                            });
+                        }
+                        update_columns[update_column_count] = column;
                         update_column_count += 1;
                         if !self.eat_op(",")? {
                             break;
@@ -1401,6 +1438,43 @@ impl<'a> Parser<'a> {
         }
         self.expect_ident("on")?;
         let table = self.qual_name("trigger table")?;
+        let referenced_table = if self.eat_ident("from")? {
+            Some(self.qual_name("referenced table")?)
+        } else {
+            None
+        };
+        let mut timing_clause = false;
+        let constraint_timing = if self.eat_ident("not")? {
+            timing_clause = true;
+            self.expect_ident("deferrable")?;
+            ConstraintTiming::NotDeferrable
+        } else {
+            let deferrable = self.eat_ident("deferrable")?;
+            timing_clause |= deferrable;
+            let mut initially_written = false;
+            let initially = if self.eat_ident("initially")? {
+                timing_clause = true;
+                initially_written = true;
+                if self.eat_ident("deferred")? {
+                    ConstraintMode::Deferred
+                } else {
+                    self.expect_ident("immediate")?;
+                    ConstraintMode::Immediate
+                }
+            } else {
+                ConstraintMode::Immediate
+            };
+            if deferrable || initially_written {
+                ConstraintTiming::Deferrable(initially)
+            } else {
+                ConstraintTiming::NotDeferrable
+            }
+        };
+        if !constraint && (referenced_table.is_some() || timing_clause) {
+            return Err(
+                self.err_here("FROM and deferrability clauses require CREATE CONSTRAINT TRIGGER")
+            );
+        }
         let transition_tables = if self.eat_ident("referencing")? {
             let mut old = None;
             let mut new = None;
@@ -1461,12 +1535,13 @@ impl<'a> Parser<'a> {
             }
         }
         if !matches!(transition_tables, TriggerTransitionTables::None) {
-            if !matches!(timing, TriggerTiming::After)
-                || !matches!(level, crate::sql::ast::TriggerLevel::Statement)
-            {
+            if event_count != 1 {
                 return Err(self.err_here(
-                    "transition tables are only valid for AFTER FOR EACH STATEMENT triggers",
+                    "transition tables cannot be specified for triggers with more than one event",
                 ));
+            }
+            if !matches!(timing, TriggerTiming::After) {
+                return Err(self.err_here("transition tables are only valid for AFTER triggers"));
             }
             if events[..event_count].contains(&TriggerEvent::Truncate) {
                 return Err(self.err_here("TRUNCATE triggers cannot have transition tables"));
@@ -1495,12 +1570,12 @@ impl<'a> Parser<'a> {
             .eat_ident("when")?
             .then(|| self.check_text())
             .transpose()?;
-        if when.is_some() && matches!(level, crate::sql::ast::TriggerLevel::Statement) {
-            return Err(self.err_here("statement triggers cannot have WHEN conditions"));
+        if when.is_some() && matches!(timing, TriggerTiming::InsteadOf) {
+            return Err(self.err_here("INSTEAD OF triggers cannot have WHEN conditions"));
         }
         self.expect_ident("execute")?;
-        if !self.eat_ident("function")? {
-            return Err(self.err_here("trigger procedures are not supported; use EXECUTE FUNCTION"));
+        if !self.eat_ident("function")? && !self.eat_ident("procedure")? {
+            return Err(self.err_here("expected FUNCTION or PROCEDURE after EXECUTE"));
         }
         let function = self.qual_name("trigger function")?;
         self.expect_op("(")?;
@@ -1511,7 +1586,16 @@ impl<'a> Parser<'a> {
                 if argument_count == arguments.len() {
                     return Err(self.limit("trigger arguments", arguments.len()));
                 }
-                arguments[argument_count] = self.str_literal("trigger argument")?;
+                arguments[argument_count] = match self.peeked {
+                    crate::sql::lexer::Tok::Str(value)
+                    | crate::sql::lexer::Tok::Num(value)
+                    | crate::sql::lexer::Tok::Ident(value)
+                    | crate::sql::lexer::Tok::QuotedIdent(value) => {
+                        self.advance()?;
+                        value
+                    }
+                    _ => return Err(self.unexpected("expected trigger argument")),
+                };
                 argument_count += 1;
                 if self.eat_op(")")? {
                     break;
@@ -1520,7 +1604,26 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(Stmt::CreateTrigger(CreateTrigger {
+            or_replace,
             name,
+            kind: if constraint {
+                if !matches!(timing, TriggerTiming::After)
+                    || !matches!(level, crate::sql::ast::TriggerLevel::Row)
+                {
+                    return Err(
+                        self.err_here("constraint triggers must be AFTER FOR EACH ROW triggers")
+                    );
+                }
+                if !matches!(transition_tables, TriggerTransitionTables::None) {
+                    return Err(self.err_here("constraint triggers cannot have transition tables"));
+                }
+                TriggerKind::Constraint {
+                    referenced_table,
+                    timing: constraint_timing,
+                }
+            } else {
+                TriggerKind::Ordinary
+            },
             timing,
             level,
             events: self.arena_slice(&events[..event_count])?,
@@ -3900,33 +4003,22 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let mut triggers = [TriggerIdentity {
-            name: "",
-            table: QualName::bare(""),
-        }; MAX_LIST];
-        let mut count = 0usize;
-        loop {
-            if count == triggers.len() {
-                return Err(self.limit("triggers", triggers.len()));
-            }
-            let name = self.col_ident("trigger name")?;
-            self.expect_ident("on")?;
-            triggers[count] = TriggerIdentity {
-                name,
-                table: self.qual_name("trigger table")?,
-            };
-            count += 1;
-            if !self.eat_op(",")? {
-                break;
-            }
-        }
-        if self.eat_ident("cascade")? {
-            return Err(self.err_here("DROP TRIGGER CASCADE is not supported"));
-        }
-        let _ = self.eat_ident("restrict")?;
+        let name = self.col_ident("trigger name")?;
+        self.expect_ident("on")?;
+        let trigger = TriggerIdentity {
+            name,
+            table: self.qual_name("trigger table")?,
+        };
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
         Ok(Stmt::DropTrigger {
-            triggers: self.arena_slice(&triggers[..count])?,
+            trigger,
             if_exists,
+            cascade,
         })
     }
 

@@ -179,6 +179,22 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
+        oid: 1662,
+        name: "pg_get_triggerdef",
+        result_oid: 25,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2731,
+        name: "pg_get_triggerdef",
+        result_oid: 25,
+        argument_types: "26 16",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 1716,
         name: "pg_get_expr",
         result_oid: 25,
@@ -1285,9 +1301,9 @@ fn acl<'a>(
         crate::storage::AccessClass::Routine => crate::storage::PrivilegeSet::FUNCTION_ALL,
         crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
         crate::storage::AccessClass::Tablespace => crate::storage::PrivilegeSet::CREATE,
-        crate::storage::AccessClass::Statistics | crate::storage::AccessClass::Extension => {
-            crate::storage::PrivilegeSet::NONE
-        }
+        crate::storage::AccessClass::Statistics
+        | crate::storage::AccessClass::Extension
+        | crate::storage::AccessClass::Trigger => crate::storage::PrivilegeSet::NONE,
     };
     let render = |grantee: &str,
                   grantor: &str,
@@ -2787,6 +2803,236 @@ pub fn function_def_text<'a>(
     ))
 }
 
+pub fn trigger_def_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    let mut found = None;
+    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+        if crate::storage::trigger_oid(&trigger) == oid {
+            found = Some((trigger, trigger.target));
+            break;
+        }
+        let crate::storage::TriggerTarget::Table(parent) = trigger.target else {
+            continue;
+        };
+        if !matches!(trigger.level, super::ast::TriggerLevel::Row) {
+            continue;
+        }
+        for child in 0..storage.table_count() {
+            if storage.table(child).visible_to(txid)
+                && storage.partition_descends_from(child, usize::from(parent), txid)
+                && partition_trigger_oid(&trigger, child)? == oid
+            {
+                found = Some((trigger, crate::storage::TriggerTarget::Table(child as u16)));
+                break;
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let Some((trigger, render_target)) = found else {
+        return Ok(None);
+    };
+    let mut output = StackStr::<8192>::new();
+    use core::fmt::Write;
+    output
+        .write_str("CREATE ")
+        .map_err(|_| super::eval::arena_full())?;
+    if matches!(trigger.kind, crate::storage::TriggerKind::Constraint { .. }) {
+        output
+            .write_str("CONSTRAINT ")
+            .map_err(|_| super::eval::arena_full())?;
+    }
+    output
+        .write_str("TRIGGER ")
+        .map_err(|_| super::eval::arena_full())?;
+    write_identifier(&mut output, trigger.name_to(txid).as_str());
+    write!(
+        output,
+        " {}",
+        match trigger.timing {
+            super::ast::TriggerTiming::Before => "BEFORE",
+            super::ast::TriggerTiming::After => "AFTER",
+            super::ast::TriggerTiming::InsteadOf => "INSTEAD OF",
+        }
+    )
+    .map_err(|_| super::eval::arena_full())?;
+    let mut event_count = 0usize;
+    for (event, keyword) in [
+        (super::ast::TriggerEvents::INSERT, "INSERT"),
+        (super::ast::TriggerEvents::DELETE, "DELETE"),
+        (super::ast::TriggerEvents::UPDATE, "UPDATE"),
+        (super::ast::TriggerEvents::TRUNCATE, "TRUNCATE"),
+    ] {
+        if !trigger.events.contains(event) {
+            continue;
+        }
+        write!(
+            output,
+            "{}{}",
+            if event_count == 0 { " " } else { " OR " },
+            keyword
+        )
+        .map_err(|_| super::eval::arena_full())?;
+        event_count += 1;
+        if event == super::ast::TriggerEvents::UPDATE && trigger.update_columns != 0 {
+            output
+                .write_str(" OF ")
+                .map_err(|_| super::eval::arena_full())?;
+            let definition = match render_target {
+                crate::storage::TriggerTarget::Table(table) => {
+                    *storage.table_def(usize::from(table), txid)
+                }
+                crate::storage::TriggerTarget::View(view) => {
+                    super::exec::view_trigger_definition(storage, usize::from(view), txid, arena)?
+                }
+            };
+            let mut written = 0usize;
+            for column in 0..definition.n_columns {
+                if trigger.update_columns & (1u64 << column) == 0 {
+                    continue;
+                }
+                if written != 0 {
+                    output
+                        .write_str(", ")
+                        .map_err(|_| super::eval::arena_full())?;
+                }
+                write_identifier(&mut output, definition.columns()[column].name.as_str());
+                written += 1;
+            }
+        }
+    }
+    output
+        .write_str(" ON ")
+        .map_err(|_| super::eval::arena_full())?;
+    match render_target {
+        crate::storage::TriggerTarget::Table(table) => {
+            let definition = storage.table_def(usize::from(table), txid);
+            write_identifier(&mut output, definition.schema.as_str());
+            output
+                .write_char('.')
+                .map_err(|_| super::eval::arena_full())?;
+            write_identifier(&mut output, definition.name.as_str());
+        }
+        crate::storage::TriggerTarget::View(view) => {
+            let definition = storage.view(usize::from(view));
+            write_identifier(&mut output, definition.schema.as_str());
+            output
+                .write_char('.')
+                .map_err(|_| super::eval::arena_full())?;
+            write_identifier(&mut output, definition.name.as_str());
+        }
+    }
+    output
+        .write_char(' ')
+        .map_err(|_| super::eval::arena_full())?;
+    if let crate::storage::TriggerKind::Constraint {
+        referenced_table,
+        timing,
+    } = trigger.kind
+    {
+        if let Some(table) = referenced_table {
+            let definition = storage.table_def(usize::from(table), txid);
+            output
+                .write_str("FROM ")
+                .map_err(|_| super::eval::arena_full())?;
+            if storage.resolve_relation(None, definition.name.as_str(), txid)
+                != Some(crate::storage::ResolvedRelation::Table(usize::from(table)))
+            {
+                write_identifier(&mut output, definition.schema.as_str());
+                output
+                    .write_char('.')
+                    .map_err(|_| super::eval::arena_full())?;
+            }
+            write_identifier(&mut output, definition.name.as_str());
+            output
+                .write_char(' ')
+                .map_err(|_| super::eval::arena_full())?;
+        }
+        write!(
+            output,
+            "{}DEFERRABLE INITIALLY {} ",
+            if timing.is_deferrable() { "" } else { "NOT " },
+            if timing.initially_deferred() {
+                "DEFERRED"
+            } else {
+                "IMMEDIATE"
+            }
+        )
+        .map_err(|_| super::eval::arena_full())?;
+    }
+    if let Some(old) = trigger.transition_tables.old() {
+        output
+            .write_str("REFERENCING OLD TABLE AS ")
+            .map_err(|_| super::eval::arena_full())?;
+        write_identifier(&mut output, old.as_str());
+        output
+            .write_char(' ')
+            .map_err(|_| super::eval::arena_full())?;
+    }
+    if let Some(new) = trigger.transition_tables.new_table() {
+        if trigger.transition_tables.old().is_none() {
+            output
+                .write_str("REFERENCING ")
+                .map_err(|_| super::eval::arena_full())?;
+        }
+        output
+            .write_str("NEW TABLE AS ")
+            .map_err(|_| super::eval::arena_full())?;
+        write_identifier(&mut output, new.as_str());
+        output
+            .write_char(' ')
+            .map_err(|_| super::eval::arena_full())?;
+    }
+    write!(
+        output,
+        "FOR EACH {} ",
+        if matches!(trigger.level, super::ast::TriggerLevel::Row) {
+            "ROW"
+        } else {
+            "STATEMENT"
+        }
+    )
+    .map_err(|_| super::eval::arena_full())?;
+    if let Some(when) = trigger.when {
+        write!(output, "WHEN ({}) ", when.as_str()).map_err(|_| super::eval::arena_full())?;
+    }
+    output
+        .write_str("EXECUTE FUNCTION ")
+        .map_err(|_| super::eval::arena_full())?;
+    let routine = storage.routine_for(usize::from(trigger.function), txid);
+    if storage.trigger_slot_for_call(routine.name.as_str(), txid)
+        != Some(usize::from(trigger.function))
+    {
+        write_identifier(&mut output, routine.schema.as_str());
+        output
+            .write_char('.')
+            .map_err(|_| super::eval::arena_full())?;
+    }
+    write_identifier(&mut output, routine.name.as_str());
+    output
+        .write_char('(')
+        .map_err(|_| super::eval::arena_full())?;
+    for (index, argument) in trigger.arguments.values().iter().enumerate() {
+        if index != 0 {
+            output
+                .write_str(", ")
+                .map_err(|_| super::eval::arena_full())?;
+        }
+        output
+            .write_str(quote_literal_str(argument.as_str(), arena)?)
+            .map_err(|_| super::eval::arena_full())?;
+    }
+    output
+        .write_char(')')
+        .map_err(|_| super::eval::arena_full())?;
+    alloc_rendered(&output, "trigger definition is too long", arena).map(Some)
+}
+
 pub fn function_arguments_text<'a>(
     storage: &Storage,
     txid: u32,
@@ -3066,12 +3312,28 @@ fn pg_description<'a>(
                 };
                 (extension_oid(slot), 3079)
             }
+            crate::storage::CommentClass::Trigger => {
+                let trigger = storage
+                    .triggers_with_slots_visible_to(txid)
+                    .map(|(_, trigger)| trigger)
+                    .find(|trigger| {
+                        trigger.name_to(txid).as_str() == name
+                            && trigger.target.comment_subid() == subid
+                    });
+                let Some(trigger) = trigger else { continue };
+                (crate::storage::trigger_oid(&trigger), 2620)
+            }
+        };
+        let catalog_subid = if class == crate::storage::CommentClass::Trigger {
+            0
+        } else {
+            subid as i32
         };
         out[n] = row(
             &[
                 Datum::Int4(objoid),
                 Datum::Int4(classoid),
-                Datum::Int4(subid as i32),
+                Datum::Int4(catalog_subid),
                 text(description, arena)?,
             ],
             arena,
@@ -3376,6 +3638,18 @@ pub fn comment_text_for<'a>(
                         tablespace.name_for(txid).as_str() == name
                             && tablespace_oid(*tablespace) == oid
                     })
+            }
+            "pg_trigger" => {
+                class == crate::storage::CommentClass::Trigger
+                    && subid == 0
+                    && storage
+                        .triggers_with_slots_visible_to(txid)
+                        .map(|(_, trigger)| trigger)
+                        .any(|trigger| {
+                            trigger.name_to(txid).as_str() == name
+                                && trigger.target.comment_subid() == csub
+                                && crate::storage::trigger_oid(&trigger) == oid
+                        })
             }
             _ => {
                 class == crate::storage::CommentClass::Relation
@@ -6188,6 +6462,82 @@ fn pg_constraint<'a>(
         )?;
         n += 1;
     }
+    // User constraint triggers have a pg_constraint identity linked from
+    // pg_trigger.tgconstraint. They do not own an index.
+    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+        let crate::storage::TriggerKind::Constraint { timing, .. } = trigger.kind else {
+            continue;
+        };
+        let crate::storage::TriggerTarget::Table(table) = trigger.target else {
+            continue;
+        };
+        if n == out.len() {
+            return Err(catalog_capacity_exceeded("pg_constraint"));
+        }
+        let table = usize::from(table);
+        let root_row = n;
+        out[n] = row(
+            &[
+                Datum::Int4(crate::storage::trigger_oid(&trigger) + 500_000),
+                text(trigger.name_to(txid).as_str(), arena)?,
+                Datum::Int4(table_oid(storage, table)),
+                Datum::Int4(0),
+                text("t", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Bool(timing.is_deferrable()),
+                Datum::Bool(timing.initially_deferred()),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                text(" ", arena)?,
+                text(" ", arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                Datum::Int4(2606),
+                Datum::Int4(namespace_oid(
+                    storage,
+                    storage.table_def(table, txid).schema.as_str(),
+                )),
+                text(" ", arena)?,
+                Datum::Bool(true),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+        if !matches!(trigger.level, crate::sql::ast::TriggerLevel::Row) {
+            continue;
+        }
+        for child in 0..storage.table_count() {
+            if !storage.table(child).visible_to(txid)
+                || !storage.partition_descends_from(child, table, txid)
+            {
+                continue;
+            }
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_constraint"));
+            }
+            let mut clone = [Datum::Null; 29];
+            clone.copy_from_slice(out[root_row]);
+            clone[0] = Datum::Int4(partition_trigger_oid(&trigger, child)? + 500_000);
+            clone[2] = Datum::Int4(table_oid(storage, child));
+            clone[18] = Datum::Int4(namespace_oid(
+                storage,
+                storage.table_def(child, txid).schema.as_str(),
+            ));
+            out[n] = row(&clone, arena)?;
+            n += 1;
+        }
+    }
     // CHECK constraints are catalog objects too. Their source predicate is
     // preserved by the table definition and reconstructed by
     // pg_get_constraintdef, which is what psql's "Check constraints" section
@@ -6655,6 +7005,7 @@ fn extension_dependency_catalog_identity(
         AccessClass::Statistics => (3381, extended_statistics_oid(slot)),
         AccessClass::Tablespace => return None,
         AccessClass::Extension => (3079, extension_oid(slot)),
+        AccessClass::Trigger => (2620, crate::storage::trigger_oid(storage.trigger(slot))),
     })
 }
 
@@ -6874,6 +7225,121 @@ fn pg_depend<'a>(
                 0,
                 "n",
             )?;
+        }
+    }
+    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+        let trigger_oid = crate::storage::trigger_oid(&trigger);
+        let relation_oid = match trigger.target {
+            crate::storage::TriggerTarget::Table(table) => table_oid(storage, usize::from(table)),
+            crate::storage::TriggerTarget::View(view) => view_oid(usize::from(view)),
+        };
+        push(
+            2620,
+            trigger_oid,
+            PG_PROC_OID,
+            crate::storage::routine_oid(&storage.routine_for(usize::from(trigger.function), txid)),
+            0,
+            "n",
+        )?;
+        push(2620, trigger_oid, PG_CLASS_OID, relation_oid, 0, "a")?;
+        if let crate::storage::TriggerKind::Constraint {
+            referenced_table, ..
+        } = trigger.kind
+        {
+            if let Some(referenced) = referenced_table {
+                push(
+                    2620,
+                    trigger_oid,
+                    PG_CLASS_OID,
+                    table_oid(storage, usize::from(referenced)),
+                    0,
+                    "a",
+                )?;
+            }
+            push(2606, trigger_oid + 500_000, 2620, trigger_oid, 0, "i")?;
+        }
+        for column in 0..MAX_COLUMNS {
+            if trigger.update_columns & (1u64 << column) != 0 {
+                push(
+                    2620,
+                    trigger_oid,
+                    PG_CLASS_OID,
+                    relation_oid,
+                    column as i32 + 1,
+                    "n",
+                )?;
+            }
+        }
+
+        let crate::storage::TriggerTarget::Table(parent_table) = trigger.target else {
+            continue;
+        };
+        if !matches!(trigger.level, crate::sql::ast::TriggerLevel::Row) {
+            continue;
+        }
+        let parent_table = usize::from(parent_table);
+        for child in 0..storage.table_count() {
+            if !storage.table(child).visible_to(txid)
+                || !storage.partition_descends_from(child, parent_table, txid)
+            {
+                continue;
+            }
+            let clone_oid = partition_trigger_oid(&trigger, child)?;
+            let child_relation_oid = table_oid(storage, child);
+            push(
+                2620,
+                clone_oid,
+                PG_PROC_OID,
+                crate::storage::routine_oid(
+                    &storage.routine_for(usize::from(trigger.function), txid),
+                ),
+                0,
+                "n",
+            )?;
+            push(2620, clone_oid, PG_CLASS_OID, child_relation_oid, 0, "a")?;
+            if let crate::storage::TriggerKind::Constraint {
+                referenced_table, ..
+            } = trigger.kind
+            {
+                if let Some(referenced) = referenced_table {
+                    push(
+                        2620,
+                        clone_oid,
+                        PG_CLASS_OID,
+                        table_oid(storage, usize::from(referenced)),
+                        0,
+                        "a",
+                    )?;
+                }
+                push(2606, clone_oid + 500_000, 2620, clone_oid, 0, "i")?;
+            }
+            for column in 0..MAX_COLUMNS {
+                if trigger.update_columns & (1u64 << column) != 0 {
+                    push(
+                        2620,
+                        clone_oid,
+                        PG_CLASS_OID,
+                        child_relation_oid,
+                        column as i32 + 1,
+                        "n",
+                    )?;
+                }
+            }
+            let direct_parent = usize::from(
+                storage
+                    .table_def(child, txid)
+                    .partition
+                    .attachment
+                    .expect("partition descendant has a parent")
+                    .parent,
+            );
+            let parent_oid = if direct_parent == parent_table {
+                trigger_oid
+            } else {
+                partition_trigger_oid(&trigger, direct_parent)?
+            };
+            push(2620, clone_oid, 2620, parent_oid, 0, "P")?;
+            push(2620, clone_oid, PG_CLASS_OID, child_relation_oid, 0, "S")?;
         }
     }
     for (_, dependency) in storage.extension_dependencies_visible_to(txid) {
@@ -7537,6 +8003,27 @@ fn pg_operator<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     finish(definition, &rows, arena)
 }
 
+const FIRST_PARTITION_TRIGGER_OID: i32 = 1_000_000;
+
+fn partition_trigger_oid(
+    trigger: &crate::storage::TriggerDef,
+    table: usize,
+) -> Result<i32, SqlError> {
+    let ordinal = trigger
+        .created_at
+        .checked_mul(u64::from(u16::MAX) + 1)
+        .and_then(|value| value.checked_add(table as u64))
+        .and_then(|value| i32::try_from(value).ok())
+        .and_then(|value| FIRST_PARTITION_TRIGGER_OID.checked_add(value))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "partition trigger OID range exhausted"
+            )
+        })?;
+    Ok(ordinal)
+}
+
 fn pg_trigger<'a>(
     storage: &Storage,
     txid: u32,
@@ -7547,20 +8034,29 @@ fn pg_trigger<'a>(
         &[
             ("tableoid", ColType::Oid),
             ("oid", ColType::Oid),
-            ("tgname", ColType::Name),
             ("tgrelid", ColType::Oid),
+            ("tgparentid", ColType::Oid),
+            ("tgname", ColType::Name),
+            ("tgfoid", ColType::Oid),
+            ("tgtype", ColType::Int2),
             ("tgenabled", ColType::Bpchar),
             ("tgisinternal", ColType::Bool),
+            ("tgconstrrelid", ColType::Oid),
+            ("tgconstrindid", ColType::Oid),
             ("tgconstraint", ColType::Oid),
-            ("tgfoid", ColType::Oid),
-            ("tgparentid", ColType::Oid),
+            ("tgdeferrable", ColType::Bool),
+            ("tginitdeferred", ColType::Bool),
+            ("tgnargs", ColType::Int2),
+            ("tgattr", ColType::Int2Vector),
+            ("tgargs", ColType::Bytea),
+            ("tgqual", ColType::Text),
             ("tgoldtable", ColType::Name),
             ("tgnewtable", ColType::Name),
         ],
     );
     let mut rows: [&[Datum]; 512] = [&[]; 512];
     let mut count = 0usize;
-    for (_, trigger) in storage.triggers_with_slots_visible_to(txid) {
+    for (trigger_slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_trigger"));
         }
@@ -7581,20 +8077,93 @@ fn pg_trigger<'a>(
             }
         };
         let function = storage.routine(usize::from(trigger.function));
+        let (constraint_oid, constraint_timing, referenced_oid) = match trigger.kind {
+            crate::storage::TriggerKind::Ordinary => {
+                (0, crate::storage::ConstraintTiming::NotDeferrable, 0)
+            }
+            crate::storage::TriggerKind::Constraint {
+                referenced_table,
+                timing,
+            } => (
+                crate::storage::trigger_oid(&trigger) + 500_000,
+                timing,
+                referenced_table.map_or(0, |slot| table_oid(storage, usize::from(slot))),
+            ),
+        };
+        let mut trigger_type = match trigger.level {
+            crate::sql::ast::TriggerLevel::Row => 1i16,
+            crate::sql::ast::TriggerLevel::Statement => 0,
+        };
+        trigger_type |= match trigger.timing {
+            crate::sql::ast::TriggerTiming::Before => 2,
+            crate::sql::ast::TriggerTiming::After => 0,
+            crate::sql::ast::TriggerTiming::InsteadOf => 64,
+        };
+        if trigger
+            .events
+            .contains(crate::sql::ast::TriggerEvents::INSERT)
+        {
+            trigger_type |= 4;
+        }
+        if trigger
+            .events
+            .contains(crate::sql::ast::TriggerEvents::DELETE)
+        {
+            trigger_type |= 8;
+        }
+        if trigger
+            .events
+            .contains(crate::sql::ast::TriggerEvents::UPDATE)
+        {
+            trigger_type |= 16;
+        }
+        if trigger
+            .events
+            .contains(crate::sql::ast::TriggerEvents::TRUNCATE)
+        {
+            trigger_type |= 32;
+        }
+        let mut update_columns = [u16::MAX; MAX_COLUMNS];
+        let mut update_count = 0usize;
+        for column in 0..MAX_COLUMNS {
+            if trigger.update_columns & (1u64 << column) != 0 {
+                update_columns[update_count] = column as u16;
+                update_count += 1;
+            }
+        }
+        let argument_bytes = trigger
+            .arguments
+            .values()
+            .iter()
+            .map(|argument| argument.as_str().len() + 1)
+            .sum::<usize>();
+        let encoded_arguments = arena
+            .alloc_slice_with(argument_bytes, |_| 0u8)
+            .map_err(|_| arena_full())?;
+        let mut argument_at = 0usize;
+        for argument in trigger.arguments.values() {
+            let bytes = argument.as_str().as_bytes();
+            encoded_arguments[argument_at..argument_at + bytes.len()].copy_from_slice(bytes);
+            argument_at += bytes.len() + 1;
+        }
         let (old_table, new_table) = match &trigger.transition_tables {
-            crate::storage::TriggerTransitionTables::None => ("", ""),
-            crate::storage::TriggerTransitionTables::Old(old) => (old.as_str(), ""),
-            crate::storage::TriggerTransitionTables::New(new) => ("", new.as_str()),
+            crate::storage::TriggerTransitionTables::None => (None, None),
+            crate::storage::TriggerTransitionTables::Old(old) => (Some(old.as_str()), None),
+            crate::storage::TriggerTransitionTables::New(new) => (None, Some(new.as_str())),
             crate::storage::TriggerTransitionTables::OldNew { old, new } => {
-                (old.as_str(), new.as_str())
+                (Some(old.as_str()), Some(new.as_str()))
             }
         };
+        let root_row = count;
         rows[count] = row(
             &[
                 Datum::Int4(2620),
-                Datum::Int4(crate::storage::trigger_oid(trigger)),
-                text(trigger.name_to(txid).as_str(), arena)?,
+                Datum::Int4(crate::storage::trigger_oid(&trigger)),
                 Datum::Int4(relation_oid),
+                Datum::Int4(0),
+                text(trigger.name_to(txid).as_str(), arena)?,
+                Datum::Int4(crate::storage::routine_oid(function)),
+                Datum::Int2(trigger_type),
                 Datum::Bpchar(match trigger.enabled_to(txid) {
                     crate::storage::TriggerEnabled::Origin => "O",
                     crate::storage::TriggerEnabled::Replica => "R",
@@ -7602,15 +8171,72 @@ fn pg_trigger<'a>(
                     crate::storage::TriggerEnabled::Disabled => "D",
                 }),
                 Datum::Bool(false),
+                Datum::Int4(referenced_oid),
                 Datum::Int4(0),
-                Datum::Int4(crate::storage::routine_oid(function)),
-                Datum::Int4(0),
-                text(old_table, arena)?,
-                text(new_table, arena)?,
+                Datum::Int4(constraint_oid),
+                Datum::Bool(constraint_timing.is_deferrable()),
+                Datum::Bool(constraint_timing.initially_deferred()),
+                Datum::Int2(trigger.arguments.values().len() as i16),
+                int2vector(&update_columns[..update_count], arena)?,
+                Datum::Bytea(encoded_arguments),
+                trigger
+                    .when
+                    .map_or(Ok(Datum::Null), |when| text(when.as_str(), arena))?,
+                old_table.map_or(Ok(Datum::Null), |name| text(name, arena))?,
+                new_table.map_or(Ok(Datum::Null), |name| text(name, arena))?,
             ],
             arena,
         )?;
         count += 1;
+        let crate::storage::TriggerTarget::Table(parent_table) = trigger.target else {
+            continue;
+        };
+        if !matches!(trigger.level, crate::sql::ast::TriggerLevel::Row) {
+            continue;
+        }
+        let parent_table = usize::from(parent_table);
+        for child in 0..storage.table_count() {
+            if !storage.table(child).visible_to(txid)
+                || !storage.partition_descends_from(child, parent_table, txid)
+            {
+                continue;
+            }
+            if count == rows.len() {
+                return Err(catalog_capacity_exceeded("pg_trigger"));
+            }
+            let direct_parent = usize::from(
+                storage
+                    .table_def(child, txid)
+                    .partition
+                    .attachment
+                    .expect("partition descendant has a direct parent")
+                    .parent,
+            );
+            let parent_oid = if direct_parent == parent_table {
+                crate::storage::trigger_oid(&trigger)
+            } else {
+                partition_trigger_oid(&trigger, direct_parent)?
+            };
+            let clone_oid = partition_trigger_oid(&trigger, child)?;
+            let mut clone = [Datum::Null; 20];
+            clone.copy_from_slice(rows[root_row]);
+            clone[1] = Datum::Int4(clone_oid);
+            clone[2] = Datum::Int4(table_oid(storage, child));
+            clone[3] = Datum::Int4(parent_oid);
+            clone[7] = Datum::Bpchar(
+                match storage.partition_trigger_enabled_to(trigger_slot, child, txid) {
+                    crate::storage::TriggerEnabled::Origin => "O",
+                    crate::storage::TriggerEnabled::Replica => "R",
+                    crate::storage::TriggerEnabled::Always => "A",
+                    crate::storage::TriggerEnabled::Disabled => "D",
+                },
+            );
+            if matches!(trigger.kind, crate::storage::TriggerKind::Constraint { .. }) {
+                clone[11] = Datum::Int4(clone_oid + 500_000);
+            }
+            rows[count] = row(&clone, arena)?;
+            count += 1;
+        }
     }
     finish(definition, &rows[..count], arena)
 }

@@ -251,6 +251,12 @@ impl SubscriptionApply {
         self.confirmed_lsn
     }
 
+    fn commit(&mut self, engine: &mut crate::sql::Engine) -> Result<(), SqlError> {
+        self.trigger_response.clear();
+        let mut responder = Responder::new(&mut self.trigger_response);
+        engine.commit_txn_with_triggers(&mut self.txn, &self.guc, &self.arena, &mut responder)
+    }
+
     pub(crate) fn establish_frontier(
         &mut self,
         engine: &mut crate::sql::Engine,
@@ -265,7 +271,7 @@ impl SubscriptionApply {
                         "subscription bootstrap frontier did not advance",
                     ));
                 }
-                engine.commit_txn(&mut self.txn, &self.guc)
+                self.commit(engine)
             });
         if result.is_err() && self.txn.is_active() {
             engine.rollback_txn(&mut self.txn, &self.guc);
@@ -387,7 +393,7 @@ impl SubscriptionApply {
                 "subscription bootstrap frontier did not advance",
             ));
         }
-        let result = engine.commit_txn(&mut self.txn, &self.guc);
+        let result = self.commit(engine);
         if result.is_ok() {
             self.confirmed_lsn = confirmed_lsn;
         }
@@ -530,7 +536,7 @@ impl SubscriptionApply {
                             "subscription received a non-monotonic commit after apply began",
                         ));
                     }
-                    engine.commit_txn(&mut self.txn, &self.guc)?;
+                    self.commit(engine)?;
                     self.confirmed_lsn = end_lsn;
                     self.remote = RemoteTransaction::Idle;
                     self.arena.reset();
@@ -560,7 +566,7 @@ impl SubscriptionApply {
                         final_lsn,
                         end_lsn,
                     )?;
-                    engine.commit_txn(&mut self.txn, &self.guc)?;
+                    self.commit(engine)?;
                     self.behavior.skip_lsn = None;
                     self.confirmed_lsn = end_lsn;
                     self.remote = RemoteTransaction::Idle;
@@ -832,7 +838,7 @@ impl SubscriptionApply {
                         "subscription received a non-monotonic streamed commit",
                     ));
                 }
-                engine.commit_txn(&mut self.txn, &self.guc)?;
+                self.commit(engine)?;
                 self.confirmed_lsn = end_lsn;
                 self.remote = RemoteTransaction::Idle;
                 self.arena.reset();

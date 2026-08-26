@@ -241,6 +241,7 @@ EOF
 then ok "psycopg driver"; else bad "psycopg driver"; cat "$WORK/driver.out"; fi
 
 # --- PostgreSQL 18.4 pg_dump plain-format restore --------------------------
+restart_p3_fresh || exit 1
 echo "=== PostgreSQL 18.4 plain dump restore ==="
 # PostgreSQL 18 added \restrict guards to plain dumps. Ubuntu's client package
 # can lag the server image, so remove only those two client-side guard lines;
@@ -476,6 +477,20 @@ CREATE TABLE outbound_dump.partition_leaf PARTITION OF outbound_dump.partition_m
   FOR VALUES IN (1);
 CREATE TABLE outbound_dump.partition_other PARTITION OF outbound_dump.partition_mid DEFAULT;
 INSERT INTO outbound_dump.partition_root VALUES (10, 1), (20, 2);
+CREATE TABLE outbound_dump.partition_trigger_audit (id integer);
+CREATE FUNCTION outbound_dump.partition_trigger_write() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN INSERT INTO outbound_dump.partition_trigger_audit VALUES (NEW.id); RETURN NEW; END';
+CREATE TRIGGER outbound_partition_after AFTER INSERT ON outbound_dump.partition_root
+  FOR EACH ROW EXECUTE FUNCTION outbound_dump.partition_trigger_write();
+COMMENT ON TRIGGER outbound_partition_after ON outbound_dump.partition_root
+  IS 'dumped partition trigger';
+CREATE TABLE outbound_dump.constraint_trigger_target (id integer PRIMARY KEY);
+CREATE TABLE outbound_dump.constraint_trigger_audit (id integer);
+CREATE FUNCTION outbound_dump.constraint_trigger_write() RETURNS trigger LANGUAGE plpgsql AS
+  'BEGIN INSERT INTO outbound_dump.constraint_trigger_audit VALUES (NEW.id); RETURN NEW; END';
+CREATE CONSTRAINT TRIGGER outbound_constraint_after AFTER INSERT
+  ON outbound_dump.constraint_trigger_target DEFERRABLE INITIALLY DEFERRED
+  FOR EACH ROW EXECUTE FUNCTION outbound_dump.constraint_trigger_write();
 CREATE INDEX outbound_partition_region_idx ON outbound_dump.partition_root
   (id, region DESC) WITH (fillfactor=75);
 CREATE STATISTICS outbound_dump.outbound_items_mood_note
@@ -568,6 +583,19 @@ else
       SELECT id,owner_name FROM outbound_dump.protected_view ORDER BY id;
       RESET ROLE;
       SELECT id,region FROM outbound_dump.partition_root ORDER BY id;
+      INSERT INTO outbound_dump.partition_root VALUES (30, 1);
+      SELECT id FROM outbound_dump.partition_trigger_audit;
+      BEGIN;
+      INSERT INTO outbound_dump.constraint_trigger_target VALUES (7);
+      SELECT count(*) FROM outbound_dump.constraint_trigger_audit;
+      COMMIT;
+      SELECT id FROM outbound_dump.constraint_trigger_audit;
+      SELECT obj_description(root_trigger.oid, 'pg_trigger'),
+             (SELECT count(*) FROM pg_trigger clone_trigger
+               WHERE clone_trigger.tgname = root_trigger.tgname)
+        FROM pg_trigger root_trigger
+       WHERE root_trigger.tgname = 'outbound_partition_after'
+         AND root_trigger.tgparentid = 0;
       SELECT relation.relkind, count(inheritance.inhrelid)
         FROM pg_class relation
         LEFT JOIN pg_inherits inheritance ON inheritance.inhparent = relation.oid
@@ -584,7 +612,7 @@ else
       SELECT outbound_dump.dump_first(value), outbound_dump.dump_first(label)
         FROM (VALUES (2, 'x'::text), (3, 'y'::text)) input(value,label);
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nI|1\n7|C\n10\n2|x'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

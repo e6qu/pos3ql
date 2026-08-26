@@ -723,6 +723,9 @@ pub trait CatalogAccess {
     fn function_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
+    fn trigger_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
     fn function_arguments<'a>(
         &self,
         _oid: i32,

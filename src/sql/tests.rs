@@ -439,6 +439,14 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
          ALTER MATERIALIZED VIEW extension_kept_snapshot NO DEPENDS ON EXTENSION empty_ext; \
          CREATE FUNCTION extension_function() RETURNS integer LANGUAGE SQL AS $$ SELECT 1 $$; \
          ALTER FUNCTION extension_function DEPENDS ON EXTENSION empty_ext; \
+         CREATE TABLE extension_trigger_target(id integer); \
+         CREATE FUNCTION extension_trigger_function() RETURNS trigger LANGUAGE plpgsql \
+           AS $$ BEGIN RETURN NEW; END $$; \
+         CREATE TRIGGER extension_trigger BEFORE INSERT ON extension_trigger_target \
+           FOR EACH ROW EXECUTE FUNCTION extension_trigger_function(); \
+         ALTER TRIGGER extension_trigger ON extension_trigger_target DEPENDS ON EXTENSION empty_ext; \
+         CREATE OR REPLACE TRIGGER extension_trigger AFTER INSERT ON extension_trigger_target \
+           FOR EACH ROW EXECUTE FUNCTION extension_trigger_function(); \
          CREATE FUNCTION extension_sum_state(state bigint, value integer) RETURNS bigint \
            LANGUAGE SQL AS $$ SELECT coalesce(state, 0) + value $$; \
          CREATE AGGREGATE extension_sum(integer) \
@@ -458,12 +466,15 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
          SELECT count(*) FROM pg_class WHERE relname='extension_snapshot'; \
          SELECT count(*) FROM pg_class WHERE relname='extension_kept_snapshot'; \
          SELECT count(*) FROM pg_proc WHERE proname IN ('extension_function','extension_sum'); \
+         SELECT count(*) FROM pg_trigger WHERE tgname='extension_trigger'; \
+         SELECT count(*) FROM pg_class WHERE relname='extension_trigger_target'; \
+         SELECT count(*) FROM pg_proc WHERE proname='extension_trigger_function'; \
          SELECT count(*) FROM indexed_table; \
          DROP MATERIALIZED VIEW extension_kept_snapshot",
     );
     assert_eq!(
         data_rows(&automatic),
-        ["0", "0", "1", "0", "0"],
+        ["0", "0", "1", "0", "0", "1", "1", "0"],
         "{}",
         String::from_utf8_lossy(&automatic)
     );
@@ -4884,6 +4895,15 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
 /// Like run_with but with a caller-owned TxnState, so explicit
 /// transactions span calls (one call ≈ one wire message).
 fn run_txn(engine: &mut Engine, budget: &mut Budget, txn: &mut TxnState, sql_text: &str) -> String {
+    String::from_utf8_lossy(&run_txn_bytes(engine, budget, txn, sql_text)).to_string()
+}
+
+fn run_txn_bytes(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    txn: &mut TxnState,
+    sql_text: &str,
+) -> Vec<u8> {
     let mut buffer = crate::mem::FixedBuf::new(budget, "send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "sql", 1 << 18).unwrap();
     let mut pool = test_pool(budget);
@@ -4901,7 +4921,7 @@ fn run_txn(engine: &mut Engine, budget: &mut Budget, txn: &mut TxnState, sql_tex
             1,
         )
         .unwrap();
-    String::from_utf8_lossy(buffer.readable()).to_string()
+    buffer.readable().to_vec()
 }
 
 #[test]
@@ -5008,13 +5028,14 @@ fn logical_replication_omits_transactions_without_published_changes() {
 fn logical_replication_omits_transactions_without_published_changes_on_sized_stack() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
-    run_txn(
+    let setup = run_txn(
         &mut engine,
         &mut budget,
         &mut transaction,
         "CREATE TABLE published_table (id int); CREATE TABLE hidden_table (id int); \
          CREATE PUBLICATION changes FOR TABLE published_table",
     );
+    assert!(!setup.contains("ERROR"), "{setup:?}");
     let floor = engine.storage.lsn();
     run_txn(
         &mut engine,
@@ -5922,6 +5943,188 @@ fn root_row_triggers_are_inherited_through_subpartition_attachments() {
          SELECT id FROM inherited_trigger_audit",
     );
     assert_eq!(data_rows(&output), ["10"]);
+}
+
+#[test]
+fn after_row_triggers_observe_the_completed_postgresql_query_state() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE after_query_target (id integer PRIMARY KEY, changed boolean);
+         CREATE TABLE after_query_log (id integer, changed_rows integer);
+         INSERT INTO after_query_target VALUES (1, false), (2, false);
+         CREATE FUNCTION after_query_trigger() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO after_query_log
+              VALUES (NEW.id, (SELECT count(*) FROM after_query_target WHERE changed));
+              RETURN NEW;
+            END';
+         CREATE TRIGGER after_query_trigger AFTER UPDATE ON after_query_target
+           FOR EACH ROW EXECUTE FUNCTION after_query_trigger();
+         UPDATE after_query_target SET changed = true;
+         SELECT id, changed_rows FROM after_query_log ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|2", "2|2"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn partition_trigger_clones_have_catalog_identity_and_independent_firing_modes() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE clone_trigger_audit (id integer);
+         CREATE TABLE clone_trigger_root (id integer, region integer) PARTITION BY RANGE (id);
+         CREATE TABLE clone_trigger_mid PARTITION OF clone_trigger_root
+           FOR VALUES FROM (0) TO (100) PARTITION BY LIST (region);
+         CREATE TABLE clone_trigger_leaf PARTITION OF clone_trigger_mid FOR VALUES IN (1);
+         CREATE FUNCTION clone_trigger_program() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO clone_trigger_audit VALUES (NEW.id); RETURN NEW; END';
+         CREATE TRIGGER clone_trigger_after AFTER INSERT ON clone_trigger_root
+           FOR EACH ROW EXECUTE FUNCTION clone_trigger_program();
+         SELECT c.relname, t.tgparentid = 0, p.oid IS NOT NULL,
+                pg_get_triggerdef(t.oid)
+           FROM pg_trigger t
+           JOIN pg_class c ON c.oid = t.tgrelid
+           LEFT JOIN pg_trigger p ON p.oid = t.tgparentid
+          WHERE t.tgname = 'clone_trigger_after'
+          ORDER BY c.relname;
+         SELECT count(*) FROM pg_depend d
+           JOIN pg_trigger t ON t.oid = d.objid
+          WHERE t.tgname = 'clone_trigger_after' AND d.deptype IN ('P', 'S');",
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows.len(), 4, "{}", String::from_utf8_lossy(&output));
+    assert!(rows[0].starts_with("clone_trigger_leaf|f|t|CREATE TRIGGER"));
+    assert!(rows[0].contains(" ON public.clone_trigger_leaf "));
+    assert!(rows[1].starts_with("clone_trigger_mid|f|t|CREATE TRIGGER"));
+    assert!(rows[2].starts_with("clone_trigger_root|t|f|CREATE TRIGGER"));
+    assert_eq!(rows[3], "4");
+
+    let modes = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE ONLY clone_trigger_root DISABLE TRIGGER clone_trigger_after;
+         INSERT INTO clone_trigger_leaf VALUES (1, 1);
+         ALTER TABLE clone_trigger_leaf DISABLE TRIGGER clone_trigger_after;
+         INSERT INTO clone_trigger_leaf VALUES (2, 1);
+         ALTER TABLE clone_trigger_root ENABLE TRIGGER clone_trigger_after;
+         INSERT INTO clone_trigger_leaf VALUES (3, 1);
+         SELECT id FROM clone_trigger_audit ORDER BY id;
+         SELECT c.relname, t.tgenabled FROM pg_trigger t
+           JOIN pg_class c ON c.oid = t.tgrelid
+          WHERE t.tgname = 'clone_trigger_after' ORDER BY c.relname;",
+    );
+    assert_eq!(
+        data_rows(&modes),
+        [
+            "1",
+            "3",
+            "clone_trigger_leaf|O",
+            "clone_trigger_mid|O",
+            "clone_trigger_root|O",
+        ],
+        "{}",
+        String::from_utf8_lossy(&modes)
+    );
+
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER TABLE clone_trigger_leaf DISABLE TRIGGER clone_trigger_after;
+         ROLLBACK;
+         INSERT INTO clone_trigger_leaf VALUES (4, 1);
+         SELECT id FROM clone_trigger_audit ORDER BY id;",
+    );
+    assert_eq!(data_rows(&rolled_back), ["1", "3", "4"]);
+}
+
+#[test]
+fn partition_before_trigger_clones_fire_after_routing_and_cannot_move_rows() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routed_trigger_root (id integer) PARTITION BY RANGE (id);
+         CREATE TABLE routed_trigger_low PARTITION OF routed_trigger_root
+           FOR VALUES FROM (0) TO (100);
+         CREATE TABLE routed_trigger_high PARTITION OF routed_trigger_root
+           FOR VALUES FROM (100) TO (200);
+         CREATE FUNCTION move_inherited_trigger_row() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN NEW.id := NEW.id + 100; RETURN NEW; END';
+         CREATE TRIGGER inherited_move BEFORE INSERT ON routed_trigger_root
+           FOR EACH ROW EXECUTE FUNCTION move_inherited_trigger_row();",
+    );
+    let inherited_move = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO routed_trigger_root VALUES (10)",
+    );
+    assert!(
+        String::from_utf8_lossy(&inherited_move).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&inherited_move)
+    );
+    let disabled_clone = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE routed_trigger_low DISABLE TRIGGER inherited_move;
+         INSERT INTO routed_trigger_root VALUES (10);
+         SELECT id FROM routed_trigger_low;",
+    );
+    assert_eq!(data_rows(&disabled_clone), ["10"]);
+
+    let local_move = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION move_local_trigger_row() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN NEW.id := NEW.id + 100; RETURN NEW; END';
+         CREATE TRIGGER local_move BEFORE INSERT ON routed_trigger_low
+           FOR EACH ROW EXECUTE FUNCTION move_local_trigger_row();
+         INSERT INTO routed_trigger_root VALUES (20);",
+    );
+    assert!(
+        String::from_utf8_lossy(&local_move).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&local_move)
+    );
+}
+
+#[test]
+fn partition_trigger_clones_share_one_postgresql_name_order() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE ordered_partition_trigger_log (position serial, name text);
+         CREATE TABLE ordered_partition_trigger_root (id integer) PARTITION BY RANGE (id);
+         CREATE TABLE ordered_partition_trigger_leaf PARTITION OF ordered_partition_trigger_root
+           FOR VALUES FROM (0) TO (10);
+         CREATE FUNCTION ordered_partition_trigger() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO ordered_partition_trigger_log (name) VALUES (TG_NAME); RETURN NEW; END';
+         CREATE TRIGGER z_before BEFORE INSERT ON ordered_partition_trigger_root
+           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
+         CREATE TRIGGER a_before BEFORE INSERT ON ordered_partition_trigger_leaf
+           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
+         CREATE TRIGGER z_after AFTER INSERT ON ordered_partition_trigger_root
+           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
+         CREATE TRIGGER a_after AFTER INSERT ON ordered_partition_trigger_leaf
+           FOR EACH ROW EXECUTE FUNCTION ordered_partition_trigger();
+         INSERT INTO ordered_partition_trigger_root VALUES (1);
+         SELECT name FROM ordered_partition_trigger_log ORDER BY position;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["a_before", "z_before", "a_after", "z_after"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
 }
 
 #[test]
@@ -6839,9 +7042,9 @@ fn partitioned_relations_scan_as_inner_join_sources() {
 }
 
 #[test]
-fn parent_before_insert_trigger_runs_before_partition_routing() {
+fn parent_before_insert_trigger_cannot_change_the_routed_partition() {
     let (mut engine, mut budget) = test_engine();
-    run_with(
+    let moved = run_with(
         &mut engine,
         &mut budget,
         "CREATE TABLE trigger_audit (id int); \
@@ -6854,21 +7057,10 @@ fn parent_before_insert_trigger_runs_before_partition_routing() {
            FOR EACH ROW EXECUTE FUNCTION move_partition(); \
          INSERT INTO trigger_parent VALUES (1)",
     );
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT id FROM trigger_high"
-        )),
-        ["11"]
-    );
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT id FROM trigger_audit"
-        )),
-        ["11"]
+    assert!(
+        String::from_utf8_lossy(&moved).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&moved)
     );
 }
 
@@ -6891,7 +7083,7 @@ fn direct_leaf_insert_runs_parent_trigger_but_keeps_leaf_bound() {
         "INSERT INTO direct_trigger_low VALUES (1)",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("violates partition constraint"),
+        String::from_utf8_lossy(&output).contains("0A000"),
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -6930,9 +7122,9 @@ fn parent_for_update_locks_the_physical_leaf_row() {
 }
 
 #[test]
-fn parent_before_update_trigger_can_move_a_row_to_another_leaf() {
+fn parent_before_update_trigger_cannot_move_a_row_to_another_leaf() {
     let (mut engine, mut budget) = test_engine();
-    run_with(
+    let moved = run_with(
         &mut engine,
         &mut budget,
         "CREATE TABLE update_trigger_parent (id int) PARTITION BY RANGE (id); \
@@ -6945,13 +7137,10 @@ fn parent_before_update_trigger_can_move_a_row_to_another_leaf() {
          INSERT INTO update_trigger_parent VALUES (1); \
          UPDATE update_trigger_parent SET id = 2 WHERE id = 1",
     );
-    assert_eq!(
-        data_rows(&run_with(
-            &mut engine,
-            &mut budget,
-            "SELECT id FROM update_trigger_high"
-        )),
-        ["11"]
+    assert!(
+        String::from_utf8_lossy(&moved).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&moved)
     );
 }
 
@@ -14584,6 +14773,217 @@ fn trigger_catalog_lifecycle_is_transactional_and_dependency_exact() {
 }
 
 #[test]
+fn trigger_creation_uses_relation_trigger_and_routine_execute_privileges() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE trigger_author;
+         CREATE TABLE trigger_privilege_target (id integer);
+         CREATE FUNCTION trigger_privilege_program() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN RETURN NEW; END';
+         REVOKE EXECUTE ON FUNCTION trigger_privilege_program() FROM PUBLIC;
+         GRANT TRIGGER ON TABLE trigger_privilege_target TO trigger_author;
+         GRANT EXECUTE ON FUNCTION trigger_privilege_program() TO trigger_author;
+         SET ROLE trigger_author;
+         CREATE TRIGGER trigger_privilege_before BEFORE INSERT ON trigger_privilege_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_privilege_program();
+         RESET ROLE;
+         SELECT tgname FROM pg_trigger WHERE tgname = 'trigger_privilege_before';",
+    );
+    assert_eq!(
+        data_rows(&created),
+        ["trigger_privilege_before"],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+
+    let alter_denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE trigger_author;
+         ALTER TRIGGER trigger_privilege_before ON trigger_privilege_target RENAME TO denied_name;",
+    );
+    assert!(String::from_utf8_lossy(&alter_denied).contains("42501"));
+    run_with(&mut engine, &mut budget, "RESET ROLE");
+
+    let execute_denied = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE EXECUTE ON FUNCTION trigger_privilege_program() FROM trigger_author;
+         SET ROLE trigger_author;
+         CREATE TRIGGER trigger_privilege_second BEFORE INSERT ON trigger_privilege_target
+           FOR EACH ROW EXECUTE FUNCTION trigger_privilege_program();",
+    );
+    assert!(String::from_utf8_lossy(&execute_denied).contains("42501"));
+    run_with(&mut engine, &mut budget, "RESET ROLE");
+
+    let owner = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE trigger_privilege_target OWNER TO trigger_author;
+         SET ROLE trigger_author;
+         ALTER TRIGGER trigger_privilege_before ON trigger_privilege_target
+           RENAME TO trigger_privilege_renamed;
+         RESET ROLE;
+         SELECT tgname FROM pg_trigger WHERE tgname = 'trigger_privilege_renamed';",
+    );
+    assert_eq!(data_rows(&owner), ["trigger_privilege_renamed"]);
+}
+
+#[test]
+fn constraint_triggers_follow_transaction_modes_and_savepoints() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE constraint_trigger_target (id integer PRIMARY KEY); \
+         CREATE TABLE constraint_trigger_audit (id integer); \
+         CREATE FUNCTION record_constraint_trigger() RETURNS trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO constraint_trigger_audit VALUES (NEW.id); RETURN NEW; END'; \
+         CREATE CONSTRAINT TRIGGER deferred_row_check AFTER INSERT \
+           ON constraint_trigger_target DEFERRABLE INITIALLY DEFERRED \
+           FOR EACH ROW EXECUTE FUNCTION record_constraint_trigger()",
+    );
+
+    run_txn(&mut engine, &mut budget, &mut txn, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO constraint_trigger_target VALUES (1)",
+    );
+    let before = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SELECT count(*) FROM constraint_trigger_audit",
+    );
+    assert!(before.contains('0'), "{before:?}");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SET CONSTRAINTS deferred_row_check IMMEDIATE",
+    );
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT id FROM constraint_trigger_audit",
+        )
+        .contains('1')
+    );
+    run_txn(&mut engine, &mut budget, &mut txn, "COMMIT");
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "BEGIN;
+         SET CONSTRAINTS deferred_row_check DEFERRED;
+         INSERT INTO constraint_trigger_target VALUES (2);
+         SAVEPOINT queued_event;
+         SET CONSTRAINTS deferred_row_check IMMEDIATE;",
+    );
+    assert_eq!(
+        data_rows(&run_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT id FROM constraint_trigger_audit ORDER BY id"
+        )),
+        ["1", "2"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ROLLBACK TO SAVEPOINT queued_event; COMMIT",
+    );
+    assert_eq!(
+        data_rows(&run_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT id FROM constraint_trigger_audit ORDER BY id"
+        )),
+        ["1", "2"],
+        "the event made pending again by savepoint rollback fires at commit"
+    );
+
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "BEGIN; SAVEPOINT before_row",
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SET CONSTRAINTS deferred_row_check DEFERRED; \
+         INSERT INTO constraint_trigger_target VALUES (3); \
+         ROLLBACK TO SAVEPOINT before_row; COMMIT",
+    );
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT id FROM constraint_trigger_audit ORDER BY id",
+        )
+        .contains('1')
+    );
+
+    let immediate = run_txn_bytes(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE immediate_constraint_trigger_target (id integer CHECK (id > 0));
+         CREATE TABLE immediate_constraint_trigger_audit (id integer);
+         CREATE FUNCTION record_immediate_constraint_trigger() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO immediate_constraint_trigger_audit VALUES (NEW.id); RETURN NEW; END';
+         CREATE CONSTRAINT TRIGGER immediate_row_check AFTER INSERT
+           ON immediate_constraint_trigger_target NOT DEFERRABLE
+           FOR EACH ROW EXECUTE FUNCTION record_immediate_constraint_trigger();
+         BEGIN;
+         SET CONSTRAINTS immediate_constraint_trigger_target_id_check IMMEDIATE;
+         SET CONSTRAINTS immediate_row_check IMMEDIATE;
+         SET CONSTRAINTS ALL DEFERRED;
+         INSERT INTO immediate_constraint_trigger_target VALUES (4);
+         SELECT id FROM immediate_constraint_trigger_audit;
+         COMMIT",
+    );
+    assert_eq!(data_rows(&immediate), ["4"]);
+    let not_deferrable = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "BEGIN; SET CONSTRAINTS immediate_row_check DEFERRED",
+    );
+    assert!(not_deferrable.contains("42809"), "{not_deferrable:?}");
+    run_txn(&mut engine, &mut budget, &mut txn, "ROLLBACK");
+
+    let catalog = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "SELECT trigger_catalog.tgdeferrable, trigger_catalog.tginitdeferred, \
+                trigger_catalog.tgconstraint = constraint_catalog.oid, \
+                constraint_catalog.contype \
+           FROM pg_trigger trigger_catalog \
+           JOIN pg_constraint constraint_catalog \
+             ON constraint_catalog.oid = trigger_catalog.tgconstraint \
+          WHERE trigger_catalog.tgname = 'deferred_row_check'",
+    );
+    assert!(catalog.matches('t').count() >= 4, "{catalog:?}");
+}
+
+#[test]
 fn replacing_trigger_function_preserves_identity_rollback_and_recovery() {
     let config = test_config("replace-trigger-function");
     let function_oid: String;
@@ -15709,7 +16109,7 @@ fn row_trigger_new_assignments_are_typed_and_rechecked() {
     );
     assert_eq!(
         data_rows(&output),
-        ["1|9|18", "1|5", "1|9", "1|5", "1|9"],
+        ["1|9|18", "1|4", "1|8", "1|5", "1|9"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -16482,7 +16882,8 @@ fn row_trigger_when_and_update_of_are_typed_and_selective() {
          INSERT INTO trigger_qualification_target VALUES (2, 1, 0)",
     );
     assert!(
-        String::from_utf8_lossy(&invalid_transition).contains("record \"OLD\" is not assigned"),
+        String::from_utf8_lossy(&invalid_transition)
+            .contains("INSERT trigger's WHEN condition cannot reference OLD values"),
         "{}",
         String::from_utf8_lossy(&invalid_transition)
     );
@@ -16539,10 +16940,128 @@ fn statement_triggers_default_once_and_cover_truncate() {
            EXECUTE FUNCTION statement_trigger_note()",
     );
     assert!(
-        String::from_utf8_lossy(&unavailable).contains("statement triggers cannot have WHEN"),
+        String::from_utf8_lossy(&unavailable)
+            .contains("statement trigger's WHEN condition cannot reference column values"),
         "{}",
         String::from_utf8_lossy(&unavailable)
     );
+}
+
+#[test]
+fn view_statement_triggers_wrap_rewritten_dml_and_filter_update_columns() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE view_statement_base (id integer PRIMARY KEY, value integer);
+         CREATE VIEW view_statement_target AS
+           SELECT id, value FROM view_statement_base;
+         CREATE TABLE view_statement_audit (event text);
+         CREATE FUNCTION view_statement_note() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO view_statement_audit VALUES (TG_WHEN || '':'' || TG_OP); RETURN NULL; END';
+         CREATE TRIGGER view_statement_before
+           BEFORE INSERT OR UPDATE ON view_statement_target
+           FOR EACH STATEMENT WHEN (true)
+           EXECUTE FUNCTION view_statement_note();
+         CREATE TRIGGER view_statement_after
+           AFTER INSERT OR UPDATE OF value ON view_statement_target
+           FOR EACH STATEMENT
+           EXECUTE FUNCTION view_statement_note();
+         INSERT INTO view_statement_target VALUES (1, 10);
+         UPDATE view_statement_target SET id = 1 WHERE id = 1;
+         UPDATE view_statement_target SET value = 11 WHERE id = 1;
+         SELECT event FROM view_statement_audit;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "BEFORE:INSERT",
+            "AFTER:INSERT",
+            "BEFORE:UPDATE",
+            "BEFORE:UPDATE",
+            "AFTER:UPDATE",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn create_or_replace_trigger_preserves_oid_comment_and_transaction_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE replace_trigger_target (id integer PRIMARY KEY);
+         CREATE TABLE replace_trigger_audit (source text);
+         CREATE FUNCTION replace_trigger_first() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO replace_trigger_audit VALUES (''first''); RETURN NEW; END';
+         CREATE FUNCTION replace_trigger_second() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO replace_trigger_audit VALUES (''second''); RETURN NEW; END';
+         CREATE TRIGGER replace_trigger BEFORE INSERT ON replace_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION replace_trigger_first();
+         COMMENT ON TRIGGER replace_trigger ON replace_trigger_target IS 'stable comment';
+         ALTER TABLE replace_trigger_target DISABLE TRIGGER replace_trigger;
+         SELECT oid, tgenabled FROM pg_trigger WHERE tgname = 'replace_trigger';
+         CREATE OR REPLACE TRIGGER replace_trigger BEFORE INSERT ON replace_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION replace_trigger_second();
+         SELECT oid, tgenabled FROM pg_trigger WHERE tgname = 'replace_trigger';
+         SELECT description FROM pg_description d
+           JOIN pg_trigger t ON t.oid = d.objoid
+          WHERE t.tgname = 'replace_trigger';
+         SELECT obj_description(oid, 'pg_trigger'), pg_get_triggerdef(oid)
+           FROM pg_trigger WHERE tgname = 'replace_trigger';
+         INSERT INTO replace_trigger_target VALUES (1);
+         SELECT source FROM replace_trigger_audit;",
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows.len(), 5, "{}", String::from_utf8_lossy(&output));
+    let first = rows[0].split_once('|').expect("OID and firing mode");
+    let second = rows[1].split_once('|').expect("OID and firing mode");
+    assert_eq!(first.0, second.0);
+    assert_eq!(first.1, "D");
+    assert_eq!(second.1, "O");
+    assert_eq!(rows[2], "stable comment");
+    assert!(
+        rows[3].starts_with("stable comment|CREATE TRIGGER replace_trigger BEFORE INSERT ON public.replace_trigger_target FOR EACH ROW EXECUTE FUNCTION replace_trigger_second()"),
+        "{}",
+        rows[3]
+    );
+    assert_eq!(rows[4], "second");
+
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         CREATE OR REPLACE TRIGGER replace_trigger AFTER INSERT ON replace_trigger_target
+           FOR EACH ROW EXECUTE FUNCTION replace_trigger_first();
+         ROLLBACK;
+         INSERT INTO replace_trigger_target VALUES (2);
+         SELECT source FROM replace_trigger_audit ORDER BY source;",
+    );
+    assert_eq!(
+        data_rows(&rolled_back),
+        ["second", "second"],
+        "{}",
+        String::from_utf8_lossy(&rolled_back)
+    );
+
+    let lifecycle = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TRIGGER replace_trigger ON replace_trigger_target RENAME TO renamed_trigger;
+         SELECT description FROM pg_description d
+           JOIN pg_trigger t ON t.oid = d.objoid
+          WHERE t.tgname = 'renamed_trigger';
+         COMMENT ON TRIGGER renamed_trigger ON replace_trigger_target IS NULL;
+         SELECT count(*) FROM pg_description d
+           JOIN pg_trigger t ON t.oid = d.objoid
+          WHERE t.tgname = 'renamed_trigger';
+         COMMENT ON TRIGGER renamed_trigger ON replace_trigger_target IS 'drop with trigger';
+         DROP TRIGGER renamed_trigger ON replace_trigger_target;
+         SELECT count(*) FROM pg_description WHERE description = 'drop with trigger';",
+    );
+    assert_eq!(data_rows(&lifecycle), ["stable comment", "0", "0"]);
 }
 
 #[test]
@@ -16564,6 +17083,105 @@ fn after_statement_trigger_reads_typed_new_transition_table() {
     assert_eq!(
         data_rows(&output),
         ["1|10", "2|20"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn after_row_trigger_sees_the_complete_statement_transition_tables() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE row_transition_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE row_transition_audit
+           (fired_id integer, old_count integer, new_count integer);
+         INSERT INTO row_transition_target VALUES (1, 10), (2, 20);
+         CREATE FUNCTION row_transition_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE old_count integer;
+                    new_count integer;
+            BEGIN
+              SELECT count(*) INTO old_count FROM old_rows;
+              SELECT count(*) INTO new_count FROM new_rows;
+              INSERT INTO row_transition_audit VALUES (NEW.id, old_count, new_count);
+              RETURN NEW;
+            END';
+         CREATE TRIGGER row_transition_after AFTER UPDATE ON row_transition_target
+           REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH ROW
+           EXECUTE FUNCTION row_transition_program();
+         UPDATE row_transition_target SET value = value + 1;
+         SELECT fired_id, old_count, new_count FROM row_transition_audit ORDER BY fired_id;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|2|2", "2|2|2"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE row_transition_parent (id integer) PARTITION BY RANGE (id);
+         CREATE TRIGGER row_transition_partitioned AFTER INSERT ON row_transition_parent
+           REFERENCING NEW TABLE AS new_rows FOR EACH ROW
+           EXECUTE FUNCTION row_transition_program();",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains(
+            "ROW triggers with transition tables are not supported on partitioned tables"
+        ),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+}
+
+#[test]
+fn after_row_events_share_postgresql_order_before_after_statement() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE ordered_after_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE ordered_after_audit
+           (position serial, trigger_name text, row_id integer, transition_count integer);
+         INSERT INTO ordered_after_target VALUES (1, 10), (2, 20);
+         CREATE FUNCTION ordered_after_ordinary() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO ordered_after_audit (trigger_name, row_id)
+              VALUES (TG_NAME, NEW.id); RETURN NEW; END';
+         CREATE FUNCTION ordered_after_transition() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE row_count integer;
+            BEGIN SELECT count(*) INTO row_count FROM changed_rows;
+              INSERT INTO ordered_after_audit (trigger_name, row_id, transition_count)
+              VALUES (TG_NAME, NEW.id, row_count); RETURN NEW; END';
+         CREATE FUNCTION ordered_after_statement() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO ordered_after_audit (trigger_name)
+              VALUES (TG_NAME); RETURN NULL; END';
+         CREATE TRIGGER a_ordinary AFTER UPDATE ON ordered_after_target
+           FOR EACH ROW EXECUTE FUNCTION ordered_after_ordinary();
+         CREATE TRIGGER b_transition AFTER UPDATE ON ordered_after_target
+           REFERENCING NEW TABLE AS changed_rows FOR EACH ROW
+           EXECUTE FUNCTION ordered_after_transition();
+         CREATE CONSTRAINT TRIGGER c_constraint AFTER UPDATE ON ordered_after_target
+           NOT DEFERRABLE FOR EACH ROW EXECUTE FUNCTION ordered_after_ordinary();
+         CREATE TRIGGER z_statement AFTER UPDATE ON ordered_after_target
+           FOR EACH STATEMENT EXECUTE FUNCTION ordered_after_statement();
+         UPDATE ordered_after_target SET value = value + 1;
+         SELECT trigger_name, row_id, transition_count
+           FROM ordered_after_audit ORDER BY position;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "a_ordinary|1|NULL",
+            "b_transition|1|2",
+            "c_constraint|1|NULL",
+            "a_ordinary|2|NULL",
+            "b_transition|2|2",
+            "c_constraint|2|NULL",
+            "z_statement|NULL|NULL",
+        ],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -16678,7 +17296,7 @@ fn transition_table_definition_survives_checkpoint_and_recovery() {
     );
     assert_eq!(
         data_rows(&output),
-        ["2", "|inserted_rows"],
+        ["2", "NULL|inserted_rows"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -16802,6 +17420,88 @@ fn statement_trigger_catalog_checkpoint_and_recovery_preserve_level() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+}
+
+#[test]
+fn partition_trigger_modes_and_row_transitions_survive_wal_and_cold_recovery() {
+    let mut config = test_config("partition-trigger-state-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("partition-trigger-state-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE recovered_clone_audit (id integer);
+         CREATE TABLE recovered_clone_root (id integer) PARTITION BY RANGE (id);
+         CREATE TABLE recovered_clone_leaf PARTITION OF recovered_clone_root
+           FOR VALUES FROM (0) TO (100);
+         CREATE FUNCTION recovered_clone_program() RETURNS trigger LANGUAGE plpgsql AS
+           'BEGIN INSERT INTO recovered_clone_audit VALUES (NEW.id); RETURN NEW; END';
+         CREATE TRIGGER recovered_clone_after AFTER INSERT ON recovered_clone_root
+           FOR EACH ROW EXECUTE FUNCTION recovered_clone_program();
+         CREATE TABLE recovered_transition_target (id integer PRIMARY KEY, value integer);
+         CREATE TABLE recovered_transition_audit (id integer, changed integer);
+         CREATE FUNCTION recovered_transition_program() RETURNS trigger LANGUAGE plpgsql AS
+           'DECLARE changed integer;
+            BEGIN
+              SELECT count(*) INTO changed FROM new_rows;
+              INSERT INTO recovered_transition_audit VALUES (NEW.id, changed);
+              RETURN NEW;
+            END';
+         CREATE TRIGGER recovered_transition_after AFTER UPDATE ON recovered_transition_target
+           REFERENCING NEW TABLE AS new_rows FOR EACH ROW
+           EXECUTE FUNCTION recovered_transition_program();
+         INSERT INTO recovered_transition_target VALUES (1, 10), (2, 20);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE recovered_clone_leaf DISABLE TRIGGER recovered_clone_after",
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT t.tgenabled FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+          WHERE t.tgname = 'recovered_clone_after' AND c.relname = 'recovered_clone_leaf';
+         INSERT INTO recovered_clone_leaf VALUES (1);
+         UPDATE recovered_transition_target SET value = value + 1;
+         SELECT count(*) FROM recovered_clone_audit;
+         SELECT id, changed FROM recovered_transition_audit ORDER BY id;
+         ALTER TABLE recovered_clone_leaf ENABLE TRIGGER recovered_clone_after;",
+    );
+    assert_eq!(
+        data_rows(&recovered_output),
+        ["D", "0", "1|2", "2|2"],
+        "{}",
+        String::from_utf8_lossy(&recovered_output)
+    );
+    assert!(recovered.checkpoint().unwrap());
+    drop(recovered);
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let cold_output = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "INSERT INTO recovered_clone_leaf VALUES (2);
+         SELECT id FROM recovered_clone_audit;",
+    );
+    assert_eq!(data_rows(&cold_output), ["2"]);
 }
 
 #[test]
@@ -19257,7 +19957,7 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
 #[test]
 fn alter_column_default_and_not_null() {
     let config = test_config("alter-column");
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE ac (id int, a int, b text)");
     run_with(&mut e, &mut b, "INSERT INTO ac VALUES (1, NULL, 'x')");
@@ -19482,7 +20182,7 @@ fn alter_rename_constraint() {
 #[test]
 fn check_constraint_auto_naming() {
     let config = test_config("check-naming");
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b).unwrap();
     // Four unnamed CHECKs: a>0 and a<100 and a<>50 each reference only `a`, so
     // they collide on cn_a_check and disambiguate to cn_a_check / cn_a_check1 /
@@ -19565,7 +20265,7 @@ fn value_index_matches_uniqueness_oracle() {
     // Each statement gets a fresh scratch budget: the harness's per-statement
     // draws are not reclaimed, and this workload runs a thousand of them.
     let run = |e: &mut Engine, sql: &str| {
-        String::from_utf8_lossy(&run_with(e, &mut Budget::new(2 << 20), sql)).to_string()
+        String::from_utf8_lossy(&run_with(e, &mut Budget::new(3 << 20), sql)).to_string()
     };
 
     {
@@ -19613,7 +20313,7 @@ fn value_index_matches_uniqueness_oracle() {
     // Restart: the index is gone and must be rebuilt from the replayed rows.
     let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
-    let bytes = run_with(&mut e, &mut Budget::new(2 << 20), "SELECT count(*) FROM t");
+    let bytes = run_with(&mut e, &mut Budget::new(3 << 20), "SELECT count(*) FROM t");
     assert_eq!(data_rows(&bytes), [format!("{}", present.len())]);
     for _ in 0..200 {
         let key = (next() % 50) as i64;
@@ -19630,7 +20330,7 @@ fn value_index_matches_uniqueness_oracle() {
 #[test]
 fn named_single_column_key_retains_name() {
     let config = test_config("named-single-key");
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b).unwrap();
     // An explicit name on a single-column UNIQUE is kept: the violation names it
     // and DROP CONSTRAINT finds it.

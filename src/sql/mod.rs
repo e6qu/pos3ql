@@ -2834,6 +2834,12 @@ impl Engine {
         if !txn.is_active() {
             return Ok(());
         }
+        if txn.has_deferred_triggers() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "commit reached durability before queued constraint triggers fired"
+            ));
+        }
         self.work.reset();
         if let Err(error) =
             exec::constraints::validate_deferred_constraints(&self.storage, txn, false, &self.work)
@@ -3585,6 +3591,9 @@ impl Engine {
                 DdlUndo::TriggerAltered { slot, .. } => {
                     self.storage.commit_trigger_alter(*slot as usize, txn.txid)
                 }
+                DdlUndo::PartitionTriggerAltered { slot, .. } => self
+                    .storage
+                    .commit_partition_trigger_state(*slot as usize, txn.txid),
                 DdlUndo::PolicyCreated(slot) => self.storage.commit_policy_create(*slot as usize),
                 DdlUndo::PolicyDropped(slot) => self.storage.commit_policy_drop(*slot as usize),
                 DdlUndo::PolicyAltered { slot, .. } => {
@@ -3851,6 +3860,42 @@ impl Engine {
         notify_result.and(index_result)
     }
 
+    pub(crate) fn commit_txn_with_triggers(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        arena: &Arena,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        self.fire_constraint_trigger_boundary(
+            txn,
+            guc,
+            arena,
+            responder,
+            exec::TriggerQueueBoundary::Transaction,
+        )?;
+        self.commit_txn(txn, guc)
+    }
+
+    fn fire_constraint_trigger_boundary(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        arena: &Arena,
+        responder: &mut Responder,
+        boundary: exec::TriggerQueueBoundary,
+    ) -> Result<(), SqlError> {
+        exec::fire_constraint_triggers(
+            &mut self.storage,
+            txn,
+            arena,
+            guc.seq_session(),
+            responder,
+            &mut self.dml_scratch,
+            boundary,
+        )
+    }
+
     /// Applies a committing transaction's buffered LISTEN/UNLISTEN to the shared
     /// registry and moves its NOTIFYs into the delivery outbox. Called only past
     /// the commit's durability point.
@@ -3895,6 +3940,9 @@ impl Engine {
             DdlUndo::TriggerAltered { slot, prior } => {
                 self.storage.rollback_trigger_alter(slot as usize, prior)
             }
+            DdlUndo::PartitionTriggerAltered { slot, prior } => self
+                .storage
+                .rollback_partition_trigger_state(slot as usize, prior),
             DdlUndo::PolicyCreated(slot) => self.storage.rollback_policy_create(slot as usize),
             DdlUndo::PolicyDropped(slot) => self.storage.rollback_policy_drop(slot as usize, txid),
             DdlUndo::PolicyAltered { slot, prior } => {
@@ -4165,8 +4213,12 @@ impl Engine {
         txn.rewind_subscription_advances(mark.subscription_advances);
         txn.rewind_constraints(
             mark.constraint_obligations,
+            mark.constraint_completions,
             mark.constraint_modes,
             mark.constraint_renames,
+            mark.deferred_triggers,
+            mark.deferred_trigger_completions,
+            mark.deferred_trigger_bytes,
         );
         txn.rewind_notifications(
             mark.notifications,
@@ -4207,8 +4259,12 @@ impl Engine {
         txn.rewind_subscription_advances(sp.subscription_advance_mark);
         txn.rewind_constraints(
             sp.constraint_obligation_mark,
+            sp.constraint_completion_mark,
             sp.constraint_mode_mark,
             sp.constraint_rename_mark,
+            sp.deferred_trigger_mark,
+            sp.deferred_trigger_completion_mark,
+            sp.deferred_trigger_bytes_mark,
         );
         txn.rewind_notifications(sp.notify_mark, sp.notify_payload_mark, sp.listen_mark);
         self.storage.rollback_locks_to(txn.txid, sp.lock_mark);
@@ -4694,6 +4750,16 @@ impl Engine {
             &self.copy_transition_scratch,
         )?;
         exec::constraints::validate_deferred_constraints(&self.storage, txn, true, &self.work)?;
+        exec::fire_constraint_triggers(
+            &mut self.storage,
+            txn,
+            &self.work,
+            guc.seq_session(),
+            responder,
+            &mut self.dml_scratch,
+            exec::TriggerQueueBoundary::Statement,
+        )?;
+        txn.compact_completed_constraints();
         if txn.mode == TxnMode::Implicit {
             return self.commit_txn(txn, guc);
         }
@@ -4921,6 +4987,15 @@ impl Engine {
                                 arena,
                             )
                         })
+                        .and_then(|()| {
+                            self.fire_constraint_trigger_boundary(
+                                txn,
+                                guc,
+                                arena,
+                                responder,
+                                exec::TriggerQueueBoundary::Statement,
+                            )
+                        })
                         .and_then(|()| query::check_timeout());
                     if let Err(mut e) = outcome {
                         if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
@@ -4951,6 +5026,7 @@ impl Engine {
                         responder.error(e.sqlstate, e.message.as_str())?;
                         return Ok(ExecutionStatus::Complete);
                     }
+                    txn.compact_completed_constraints();
                     statement_index += 1;
                 }
                 Ok(None) => break,
@@ -5048,9 +5124,19 @@ impl Engine {
             .and_then(|()| {
                 exec::constraints::validate_deferred_constraints(&self.storage, txn, true, arena)
             })
+            .and_then(|()| {
+                self.fire_constraint_trigger_boundary(
+                    txn,
+                    guc,
+                    arena,
+                    responder,
+                    exec::TriggerQueueBoundary::Statement,
+                )
+            })
             .and_then(|()| query::check_timeout());
         match outcome {
             Ok(()) => {
+                txn.compact_completed_constraints();
                 if txn.mode == TxnMode::Implicit
                     && self.pending_copy.is_none()
                     && let Err(e) = self.commit_txn(txn, guc)
@@ -5684,6 +5770,102 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let relation = match statement {
+            Stmt::Insert(insert) => Some(insert.table),
+            Stmt::Update(update) => Some(update.table),
+            Stmt::Delete(delete) => Some(delete.table),
+            _ => None,
+        };
+        let view = relation.and_then(|relation| {
+            match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
+                Some(crate::storage::ResolvedRelation::View(view)) => Some(view),
+                _ => None,
+            }
+        });
+        let Some(view) = view else {
+            return Self::execute_data_modification_inner(
+                storage, scratch, arena, statement, txn, params, guc, responder, capture,
+            );
+        };
+        let event = match statement {
+            Stmt::Insert(_) => ast::TriggerEvents::INSERT,
+            Stmt::Update(_) => ast::TriggerEvents::UPDATE,
+            Stmt::Delete(_) => ast::TriggerEvents::DELETE,
+            _ => unreachable!(),
+        };
+        if !storage
+            .triggers_for_view(view, txn.txid)
+            .any(|(_, trigger)| {
+                matches!(trigger.level, ast::TriggerLevel::Statement)
+                    && trigger.events.contains(event)
+            })
+        {
+            return Self::execute_data_modification_inner(
+                storage, scratch, arena, statement, txn, params, guc, responder, capture,
+            );
+        }
+        if let Err(error) = exec::fire_view_statement_triggers(
+            storage,
+            txn,
+            scratch,
+            arena,
+            guc.seq_session(),
+            responder,
+            view,
+            statement,
+            true,
+        ) {
+            return Ok(Err(error));
+        }
+        let capturing = capture.is_some();
+        let outcome = responder.without_command_complete(|responder| {
+            Self::execute_data_modification_inner(
+                storage, scratch, arena, statement, txn, params, guc, responder, capture,
+            )
+        })?;
+        let affected = responder.take_affected_rows().unwrap_or(0);
+        if outcome.is_err() {
+            return Ok(outcome);
+        }
+        if let Err(error) = exec::fire_view_statement_triggers(
+            storage,
+            txn,
+            scratch,
+            arena,
+            guc.seq_session(),
+            responder,
+            view,
+            statement,
+            false,
+        ) {
+            return Ok(Err(error));
+        }
+        if capturing {
+            responder.set_affected_rows(affected);
+        } else {
+            let tag = match statement {
+                Stmt::Insert(_) => crate::stack_format!(48, "INSERT 0 {}", affected),
+                Stmt::Update(_) => crate::stack_format!(48, "UPDATE {}", affected),
+                Stmt::Delete(_) => crate::stack_format!(48, "DELETE {}", affected),
+                _ => unreachable!(),
+            };
+            responder.command_complete_rows(tag.as_str(), affected)?;
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn execute_data_modification_inner<'a, 'capture>(
+        storage: &mut Storage,
+        scratch: &mut exec::DmlScratch,
+        arena: &Arena,
+        statement: &'a Stmt<'a>,
+        txn: &mut TxnState,
+        params: &[Datum<'a>],
+        guc: &mut GucState,
+        responder: &mut Responder,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
+    ) -> Result<Result<(), SqlError>, WireFull> {
         match statement {
             Stmt::Insert(insert) => {
                 if let Some(crate::storage::ResolvedRelation::View(view)) =
@@ -5691,7 +5873,8 @@ impl Engine {
                     && storage
                         .triggers_for_view(view, txn.txid)
                         .any(|(_, trigger)| {
-                            matches!(trigger.level, ast::TriggerLevel::Row) && trigger.timing == 2
+                            matches!(trigger.level, ast::TriggerLevel::Row)
+                                && matches!(trigger.timing, ast::TriggerTiming::InsteadOf)
                         })
                 {
                     return exec::instead_of_view_dml(
@@ -5767,7 +5950,8 @@ impl Engine {
                     && storage
                         .triggers_for_view(view, txn.txid)
                         .any(|(_, trigger)| {
-                            matches!(trigger.level, ast::TriggerLevel::Row) && trigger.timing == 2
+                            matches!(trigger.level, ast::TriggerLevel::Row)
+                                && matches!(trigger.timing, ast::TriggerTiming::InsteadOf)
                         })
                 {
                     return exec::instead_of_view_dml(
@@ -5842,7 +6026,8 @@ impl Engine {
                     && storage
                         .triggers_for_view(view, txn.txid)
                         .any(|(_, trigger)| {
-                            matches!(trigger.level, ast::TriggerLevel::Row) && trigger.timing == 2
+                            matches!(trigger.level, ast::TriggerLevel::Row)
+                                && matches!(trigger.timing, ast::TriggerTiming::InsteadOf)
                         })
                 {
                     return exec::instead_of_view_dml(
@@ -7603,18 +7788,25 @@ impl Engine {
                 *if_exists,
                 responder,
             ),
-            Stmt::CreateTrigger(trigger) => {
-                exec::create_trigger(&mut self.storage, &mut self.wal, txn, trigger, responder)
-            }
+            Stmt::CreateTrigger(trigger) => exec::create_trigger(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                trigger,
+                arena,
+                responder,
+            ),
             Stmt::DropTrigger {
-                triggers,
+                trigger,
                 if_exists,
+                cascade,
             } => exec::drop_trigger(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                triggers,
+                trigger,
                 *if_exists,
+                *cascade,
                 responder,
             ),
             Stmt::AlterTrigger { trigger, action } => exec::alter_trigger(
@@ -8466,7 +8658,7 @@ impl Engine {
                     self.rollback_txn(txn, guc);
                     cursors.on_rollback();
                 } else {
-                    if let Err(e) = self.commit_txn(txn, guc) {
+                    if let Err(e) = self.commit_txn_with_triggers(txn, guc, arena, responder) {
                         return Ok(Err(e));
                     }
                     cursors.on_commit();
@@ -8581,7 +8773,7 @@ impl Engine {
                     responder.command_complete("SET CONSTRAINTS")?;
                     return Ok(Ok(()));
                 }
-                let empty = txn::ConstraintIdentity {
+                let empty = txn::ConstraintIdentity::Table {
                     table: 0,
                     name: crate::storage::SqlName::EMPTY,
                     generation: 0,
@@ -8596,6 +8788,7 @@ impl Engine {
                             let matched = match exec::constraints::resolve_constraint_name(
                                 &self.storage,
                                 name,
+                                *mode,
                                 txn.txid,
                                 &mut matches,
                             ) {
@@ -8603,8 +8796,7 @@ impl Engine {
                                 Err(error) => return Ok(Err(error)),
                             };
                             for identity in matches[..matched].iter().copied() {
-                                let identity =
-                                    txn.constraint_identity(identity.table, identity.name);
+                                let identity = txn.catalog_constraint_identity(identity);
                                 if identities[..count].contains(&identity) {
                                     continue;
                                 }
@@ -8646,7 +8838,9 @@ impl Engine {
                         }
                     } else {
                         for identity in identities[..count].iter().copied() {
-                            while let Some(obligation) = txn.deferred_constraint_for(identity) {
+                            while let Some((index, obligation)) =
+                                txn.deferred_constraint_for(identity)
+                            {
                                 if let Err(error) =
                                     exec::constraints::validate_constraint_obligation(
                                         &self.storage,
@@ -8658,7 +8852,32 @@ impl Engine {
                                 {
                                     return Ok(Err(error));
                                 }
-                                txn.clear_deferred_constraint(obligation);
+                                if let Err(error) = txn.complete_deferred_constraint(index) {
+                                    return Ok(Err(error));
+                                }
+                            }
+                        }
+                    }
+                    if matches!(targets, crate::sql::ast::ConstraintTargets::All) {
+                        if let Err(error) = self.fire_constraint_trigger_boundary(
+                            txn,
+                            guc,
+                            arena,
+                            responder,
+                            exec::TriggerQueueBoundary::Constraints(None),
+                        ) {
+                            return Ok(Err(error));
+                        }
+                    } else {
+                        for identity in identities[..count].iter().copied() {
+                            if let Err(error) = self.fire_constraint_trigger_boundary(
+                                txn,
+                                guc,
+                                arena,
+                                responder,
+                                exec::TriggerQueueBoundary::Constraints(Some(identity)),
+                            ) {
+                                return Ok(Err(error));
                             }
                         }
                     }
@@ -9747,6 +9966,32 @@ impl Engine {
             crate::storage::AccessClass::Index => "DROP INDEX ",
             crate::storage::AccessClass::Schema => "DROP SCHEMA ",
             crate::storage::AccessClass::Statistics => "DROP STATISTICS ",
+            crate::storage::AccessClass::Trigger => {
+                let trigger = self.storage.trigger(object.slot as usize);
+                let (relation_schema, relation_name) = match trigger.target {
+                    crate::storage::TriggerTarget::Table(table) => {
+                        let definition = self.storage.table_def(table as usize, txn.txid);
+                        (definition.schema, definition.name)
+                    }
+                    crate::storage::TriggerTarget::View(view) => {
+                        let definition = self.storage.view(view as usize);
+                        (definition.schema, definition.name)
+                    }
+                };
+                let _ = write!(command, "DROP TRIGGER ");
+                if let Err(error) = write_extension_identifier(&mut command, name.as_str()) {
+                    return Ok(Err(error));
+                }
+                let _ = write!(command, " ON ");
+                if let Err(error) = write_extension_qualified_identifier(
+                    &mut command,
+                    relation_schema.as_str(),
+                    relation_name.as_str(),
+                ) {
+                    return Ok(Err(error));
+                }
+                ""
+            }
             crate::storage::AccessClass::Tablespace | crate::storage::AccessClass::Extension => {
                 return Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -9755,8 +10000,9 @@ impl Engine {
             }
         };
         let _ = write!(command, "{}", keyword);
-        if let Err(error) =
-            write_extension_qualified_identifier(&mut command, schema.as_str(), name.as_str())
+        if object.class != crate::storage::AccessClass::Trigger
+            && let Err(error) =
+                write_extension_qualified_identifier(&mut command, schema.as_str(), name.as_str())
         {
             return Ok(Err(error));
         }
@@ -10708,6 +10954,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             table,
             function_schema,
             function,
+            or_replace,
+            constraint,
+            constraint_timing,
+            referenced_schema,
+            referenced_table,
             timing,
             level,
             events,
@@ -10758,34 +11009,79 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     "journal trigger function has invalid return type"
                 ));
             }
-            let slot = storage.create_trigger(
-                crate::storage::TriggerSpec {
-                    name: crate::storage::SqlName::parse(name)?,
-                    target,
-                    function: function_slot,
-                    timing,
-                    level,
-                    events,
-                    update_columns,
-                    transition_tables: crate::storage::TriggerTransitionTables::from_names(
-                        old_table, new_table,
-                    )
-                    .ok_or_else(|| {
-                        sql_err!(
+            let kind = if constraint {
+                let referenced_table = match (referenced_schema, referenced_table) {
+                    (Some(schema), Some(table)) => {
+                        match storage.resolve_relation(Some(schema), table, 0) {
+                            Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                                Some(slot as u16)
+                            }
+                            _ => {
+                                return Err(sql_err!(
+                                    sqlstate::UNDEFINED_TABLE,
+                                    "journal constraint trigger references unknown table \"{}.{}\"",
+                                    schema,
+                                    table
+                                ));
+                            }
+                        }
+                    }
+                    (None, None) => None,
+                    _ => {
+                        return Err(sql_err!(
                             sqlstate::INVALID_OBJECT_DEFINITION,
-                            "journal trigger has duplicate transition table names"
-                        )
-                    })?,
-                    when: when
-                        .map(crate::storage::trigger_when_stackstr)
-                        .transpose()?,
-                    arguments: crate::storage::TriggerArguments::parse(
-                        &arguments[..argument_count],
-                    )?,
-                },
-                0,
-            )?;
-            storage.commit_trigger_create(slot);
+                            "journal constraint trigger has incomplete referenced table"
+                        ));
+                    }
+                };
+                crate::storage::TriggerKind::Constraint {
+                    referenced_table,
+                    timing: crate::storage::ConstraintTiming::from_code(constraint_timing)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INVALID_OBJECT_DEFINITION,
+                                "journal constraint trigger has invalid timing"
+                            )
+                        })?,
+                }
+            } else {
+                crate::storage::TriggerKind::Ordinary
+            };
+            let spec = crate::storage::TriggerSpec {
+                name: crate::storage::SqlName::parse(name)?,
+                target,
+                kind,
+                function: function_slot,
+                timing: crate::sql::ast::TriggerTiming::from_code(timing).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "journal trigger has invalid timing"
+                    )
+                })?,
+                level,
+                events,
+                update_columns,
+                transition_tables: crate::storage::TriggerTransitionTables::from_names(
+                    old_table, new_table,
+                )
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "journal trigger has duplicate transition table names"
+                    )
+                })?,
+                when: when
+                    .map(crate::storage::trigger_when_stackstr)
+                    .transpose()?,
+                arguments: crate::storage::TriggerArguments::parse(&arguments[..argument_count])?,
+            };
+            if or_replace && let Some(existing) = storage.trigger_slot_on(target, name, 0) {
+                storage.replace_trigger(existing, spec, 0)?;
+                storage.commit_trigger_alter(existing, 0);
+            } else {
+                let slot = storage.create_trigger(spec, 0)?;
+                storage.commit_trigger_create(slot);
+            }
         }
         WalOp::DropTrigger {
             name,
@@ -10844,25 +11140,36 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     ));
                 }
             };
-            let slot = storage.trigger_slot_on(target, name, 0).ok_or_else(|| {
+            let enabled = crate::storage::TriggerEnabled::from_code(enabled).ok_or_else(|| {
                 sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "journal trigger has invalid enabled mode"
+                )
+            })?;
+            if let Some(slot) = storage.trigger_slot_on(target, name, 0) {
+                storage.alter_trigger(
+                    slot,
+                    crate::storage::SqlName::parse(new_name)?,
+                    enabled,
+                    0,
+                )?;
+                storage.commit_trigger_alter(slot, 0);
+            } else if let crate::storage::TriggerTarget::Table(table) = target
+                && name == new_name
+                && let Some(slot) = storage.trigger_slot_inherited_by(usize::from(table), name, 0)
+            {
+                if let Some((state, _)) =
+                    storage.stage_partition_trigger_enabled(slot, usize::from(table), enabled, 0)?
+                {
+                    storage.commit_partition_trigger_state(state, 0);
+                }
+            } else {
+                return Err(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "journal alters unknown trigger \"{}\"",
                     name
-                )
-            })?;
-            storage.alter_trigger(
-                slot,
-                crate::storage::SqlName::parse(new_name)?,
-                crate::storage::TriggerEnabled::from_code(enabled).ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "journal trigger has invalid enabled mode"
-                    )
-                })?,
-                0,
-            )?;
-            storage.commit_trigger_alter(slot, 0);
+                ));
+            }
         }
         WalOp::CreateTable(def) => {
             // A journal written before its schema existed cannot occur going

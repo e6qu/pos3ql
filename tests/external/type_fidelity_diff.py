@@ -87,6 +87,8 @@ STATIC_COLUMNS = [
     ("cidr_array", "cidr[]", "ARRAY['192.0.2.0/24', NULL, '2001:db8::/64']::cidr[]"),
     ("macaddr_array", "macaddr[]", "ARRAY['08:00:2b:01:02:03', NULL, '08:00:2b:04:05:06']::macaddr[]"),
     ("macaddr8_array", "macaddr8[]", "ARRAY['08:00:2b:ff:fe:01:02:03', NULL, '08:00:2b:ff:fe:04:05:06']::macaddr8[]"),
+    ("name_array", "name[]", "ARRAY['first_name', NULL, 'second_name']::name[]"),
+    ("oid_array", "oid[]", "ARRAY[23, NULL, 25]::oid[]"),
     ("int4_range", "int4range", "'[1,5)'"),
     ("int8_range", "int8range", "'[100,200]'"),
     ("numeric_range", "numrange", "'[1.25,3.5)'"),
@@ -99,6 +101,18 @@ STATIC_COLUMNS = [
     ("date_multirange", "datemultirange", "'{[2021-01-01,2021-01-03)}'"),
     ("timestamp_multirange", "tsmultirange", "'{[2021-01-01 01:02:03,2021-01-03 04:05:06)}'"),
     ("timestamptz_multirange", "tstzmultirange", "'{[2021-01-01 01:02:03+00,2021-01-03 04:05:06+00)}'"),
+    ("int4_range_array", "int4range[]", "ARRAY['[1,5)'::int4range, NULL, 'empty'::int4range]"),
+    ("int8_range_array", "int8range[]", "ARRAY['[100,200]'::int8range, NULL]"),
+    ("numeric_range_array", "numrange[]", "ARRAY['[1.25,3.5)'::numrange, NULL]"),
+    ("date_range_array", "daterange[]", "ARRAY['[2021-01-01,2021-01-03)'::daterange, NULL]"),
+    ("timestamp_range_array", "tsrange[]", "ARRAY['[2021-01-01 01:02:03,2021-01-03 04:05:06)'::tsrange, NULL]"),
+    ("timestamptz_range_array", "tstzrange[]", "ARRAY['[2021-01-01 01:02:03+00,2021-01-03 04:05:06+00)'::tstzrange, NULL]"),
+    ("int4_multirange_array", "int4multirange[]", "ARRAY['{[1,3),[5,7)}'::int4multirange, NULL]"),
+    ("int8_multirange_array", "int8multirange[]", "ARRAY['{[1,3),[5,7)}'::int8multirange, NULL]"),
+    ("numeric_multirange_array", "nummultirange[]", "ARRAY['{[1.25,3.5),[5,7)}'::nummultirange, NULL]"),
+    ("date_multirange_array", "datemultirange[]", "ARRAY['{[2021-01-01,2021-01-03)}'::datemultirange, NULL]"),
+    ("timestamp_multirange_array", "tsmultirange[]", "ARRAY['{[2021-01-01 01:02:03,2021-01-03 04:05:06)}'::tsmultirange, NULL]"),
+    ("timestamptz_multirange_array", "tstzmultirange[]", "ARRAY['{[2021-01-01 01:02:03+00,2021-01-03 04:05:06+00)}'::tstzmultirange, NULL]"),
     ("object_identifier", "oid", "23"),
     ("type_reference", "regtype", "'integer'::regtype"),
     ("routine_reference", "regproc", "'version'::regproc"),
@@ -106,6 +120,14 @@ STATIC_COLUMNS = [
     ("operator_signature_reference", "regoperator", "'+(integer,integer)'::regoperator"),
     ("namespace_reference", "regnamespace", "'public'::regnamespace"),
     ("role_reference", "regrole", "'postgres'::regrole"),
+    ("relation_reference", "regclass", "'pg_type'::regclass"),
+    ("type_reference_array", "regtype[]", "ARRAY['integer'::regtype, NULL, 'text'::regtype]"),
+    ("routine_reference_array", "regproc[]", "ARRAY['version'::regproc, NULL, 'current_schema'::regproc]"),
+    ("routine_signature_reference_array", "regprocedure[]", "ARRAY['version()'::regprocedure, NULL, 'current_schema()'::regprocedure]"),
+    ("operator_signature_reference_array", "regoperator[]", "ARRAY['=(integer,integer)'::regoperator, NULL, '<(integer,integer)'::regoperator]"),
+    ("relation_reference_array", "regclass[]", "ARRAY['pg_type'::regclass, NULL, 'pg_class'::regclass]"),
+    ("namespace_reference_array", "regnamespace[]", "ARRAY['public'::regnamespace, NULL, 'pg_catalog'::regnamespace]"),
+    ("role_reference_array", "regrole[]", "ARRAY['postgres'::regrole, NULL]"),
 ]
 
 
@@ -166,13 +188,13 @@ def text_bind_rows(conn, table, columns):
     return output
 
 
-def portal_rows(conn, table):
+def portal_rows(conn, table, binary=False):
     # A named cursor uses Parse/Bind plus a named portal and repeated Execute.
     # Its declaration is text because PostgreSQL exposes that SQL cursor's
     # captured RowDescription through Describe Portal before FETCH chooses a
     # result format.
     with conn.transaction():
-        cursor = conn.cursor(name="fidelity_matrix")
+        cursor = conn.cursor(name="fidelity_matrix", binary=binary)
         cursor.execute(f"SELECT * FROM {table} ORDER BY marker")
         first = cursor.fetchmany(1)
         second = cursor.fetchmany(1)
@@ -241,6 +263,11 @@ def main():
         )
         failures += report(
             f"named portal preserves matrix group {group_index}", portal_rows(pg, table), portal_rows(p3, table)
+        )
+        failures += report(
+            f"binary named portal preserves matrix group {group_index}",
+            portal_rows(pg, table, binary=True),
+            portal_rows(p3, table, binary=True),
         )
 
     print(f"type-fidelity: {failures} check(s) failed; {len(STATIC_COLUMNS)} typed columns")

@@ -5117,33 +5117,37 @@ impl Engine {
         let statement_mark =
             txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         emit_parse_warnings(&mut parser, responder)?;
-        let outcome = self
-            .execute_stmt(
-                &statement, arena, params, txn, sqlprep, cursors, guc, responder,
-            )?
-            .and_then(|()| {
-                exec::constraints::validate_deferred_constraints(&self.storage, txn, true, arena)
-            })
-            .and_then(|()| {
-                self.fire_constraint_trigger_boundary(
-                    txn,
-                    guc,
-                    arena,
-                    responder,
-                    exec::TriggerQueueBoundary::Statement,
-                )
-            })
-            .and_then(|()| query::check_timeout());
+        let output_mark = responder.buffer.mark();
+        let outcome = match self.execute_stmt(
+            &statement, arena, params, txn, sqlprep, cursors, guc, responder,
+        ) {
+            Ok(outcome) => outcome,
+            Err(WireFull) => {
+                if txn.is_explicit() {
+                    txn.failed = true;
+                } else {
+                    self.rollback_txn(txn, guc);
+                }
+                responder.replace_with_overflow_error(output_mark)?;
+                return Ok(ExtendedExecutionStatus::Complete(false));
+            }
+        }
+        .and_then(|()| {
+            exec::constraints::validate_deferred_constraints(&self.storage, txn, true, arena)
+        })
+        .and_then(|()| {
+            self.fire_constraint_trigger_boundary(
+                txn,
+                guc,
+                arena,
+                responder,
+                exec::TriggerQueueBoundary::Statement,
+            )
+        })
+        .and_then(|()| query::check_timeout());
         match outcome {
             Ok(()) => {
                 txn.compact_completed_constraints();
-                if txn.mode == TxnMode::Implicit
-                    && self.pending_copy.is_none()
-                    && let Err(e) = self.commit_txn(txn, guc)
-                {
-                    responder.error(e.sqlstate, e.message.as_str())?;
-                    return Ok(ExtendedExecutionStatus::Complete(false));
-                }
                 Ok(ExtendedExecutionStatus::Complete(true))
             }
             Err(mut e) => {
@@ -5468,6 +5472,7 @@ impl Engine {
         text: &str,
         arena: &Arena,
         txn: &TxnState,
+        cursors: Option<&cursor::CursorPool>,
         responder: &mut Responder,
     ) -> Result<bool, WireFull> {
         // responder already carries the portal's result-format flag when this is
@@ -5568,6 +5573,25 @@ impl Engine {
             }
             Stmt::Show(name) => {
                 responder.row_description(&[ColDesc::new(name, types::oid::TEXT, -1)])?;
+                Ok(true)
+            }
+            Stmt::FetchCursor {
+                name, move_only, ..
+            } => {
+                if *move_only {
+                    responder.no_data()?;
+                    return Ok(true);
+                }
+                let Some((description, formats)) = cursors.and_then(|cursors| {
+                    cursors.fetch_description(name, responder.result_formats())
+                }) else {
+                    responder.error(
+                        eval::sqlstate::UNDEFINED_CURSOR,
+                        stack_format!(96, "cursor \"{name}\" does not exist").as_str(),
+                    )?;
+                    return Ok(false);
+                };
+                responder.cursor_row_description(description, formats)?;
                 Ok(true)
             }
             _ => {
@@ -8467,7 +8491,7 @@ impl Engine {
                         "DECLARE CURSOR can only be used in transaction blocks"
                     )));
                 }
-                let at = match cursors.open(name, *scroll, *hold) {
+                let at = match cursors.open(name, *scroll, *hold, *binary) {
                     Ok(at) => at,
                     Err(e) => return Ok(Err(e)),
                 };
@@ -8495,11 +8519,8 @@ impl Engine {
                             )));
                         }
                     };
-                    let mut capture = if *binary {
-                        Responder::for_binary_cursor(cursors.result_buffer(at))
-                    } else {
-                        Responder::new(cursors.result_buffer(at))
-                    };
+                    let (text, binary) = cursors.result_buffers(at);
+                    let mut capture = Responder::for_cursor(text, binary);
                     capture.set_render(guc.render());
                     let sequence =
                         sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
@@ -8594,11 +8615,23 @@ impl Engine {
                     Err(e) => return Ok(Err(e)),
                 };
                 if !*move_only {
-                    let (description, rows) = cursors.wire_parts(name).expect("fetch found it");
-                    responder.raw(description)?;
-                    for &(offset, len) in cursors.emitted() {
-                        let (offset, len) = (offset as usize, len as usize);
-                        responder.raw(&rows[offset..offset + len])?;
+                    let requested = responder.result_formats();
+                    let wire = cursors.wire_parts(name).expect("fetch found it");
+                    let formats = if requested.count() == 0 && wire.declared_binary {
+                        crate::pg::respond::ResultFmt::ALL_BINARY
+                    } else {
+                        requested
+                    };
+                    responder.cursor_row_description(wire.description, formats)?;
+                    for &row in cursors.emitted() {
+                        let (text_offset, text_len) = wire.text_spans[row as usize];
+                        let (binary_offset, binary_len) = wire.binary_spans[row as usize];
+                        responder.cursor_data_row(
+                            &wire.text[text_offset as usize..(text_offset + text_len) as usize],
+                            &wire.binary
+                                [binary_offset as usize..(binary_offset + binary_len) as usize],
+                            formats,
+                        )?;
                     }
                     responder.command_complete(stack_format!(32, "FETCH {}", count).as_str())?;
                 } else {

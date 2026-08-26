@@ -2338,10 +2338,103 @@ pub fn function_oid_is_visible(oid: i32) -> bool {
     INTRINSIC_ROUTINES.iter().any(|routine| routine.oid == oid)
 }
 
+fn identifier_spelling_matches(written: &str, name: &str) -> bool {
+    let written = written.trim();
+    if let Some(inner) = written
+        .strip_prefix('"')
+        .and_then(|written| written.strip_suffix('"'))
+    {
+        let mut expected = name.bytes();
+        let mut input = inner.bytes();
+        while let Some(byte) = input.next() {
+            let byte = if byte == b'"' {
+                if input.next() != Some(b'"') {
+                    return false;
+                }
+                b'"'
+            } else {
+                byte
+            };
+            if expected.next() != Some(byte) {
+                return false;
+            }
+        }
+        expected.next().is_none()
+    } else {
+        !written.is_empty()
+            && !written.bytes().any(|byte| {
+                byte.is_ascii_whitespace() || matches!(byte, b'"' | b'.' | b'(' | b')' | b',')
+            })
+            && written
+                .bytes()
+                .map(|byte| byte.to_ascii_lowercase())
+                .eq(name.bytes())
+    }
+}
+
+fn split_qualified_routine_name(written: &str) -> Option<(Option<&str>, &str)> {
+    let written = written.trim();
+    let bytes = written.as_bytes();
+    let mut quoted = false;
+    let mut separator = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' if quoted && bytes.get(index + 1) == Some(&b'"') => index += 2,
+            b'"' => {
+                quoted = !quoted;
+                index += 1;
+            }
+            b'.' if !quoted => {
+                if separator.replace(index).is_some() {
+                    return None;
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    if quoted {
+        return None;
+    }
+    Some(match separator {
+        Some(separator) => (
+            Some(written[..separator].trim()),
+            written[separator + 1..].trim(),
+        ),
+        None => (None, written),
+    })
+}
+
 fn routine_name_matches(written: &str, schema: &str, name: &str) -> bool {
-    match written.split_once('.') {
-        Some((written_schema, written_name)) => written_schema == schema && written_name == name,
-        None => written == name,
+    let Some((written_schema, written_name)) = split_qualified_routine_name(written) else {
+        return false;
+    };
+    identifier_spelling_matches(written_name, name)
+        && written_schema
+            .is_none_or(|written_schema| identifier_spelling_matches(written_schema, schema))
+}
+
+#[cfg(test)]
+mod routine_name_tests {
+    use super::routine_name_matches;
+
+    #[test]
+    fn routine_names_parse_identifier_spelling() {
+        assert!(routine_name_matches(
+            "\"current_schema\"",
+            "pg_catalog",
+            "current_schema"
+        ));
+        assert!(routine_name_matches(
+            "pg_catalog.\"current_schema\"",
+            "pg_catalog",
+            "current_schema"
+        ));
+        assert!(routine_name_matches("VERSION", "pg_catalog", "version"));
+        assert!(!routine_name_matches("mixed", "public", "Mixed"));
+        assert!(routine_name_matches("\"Mixed\"", "public", "Mixed"));
+        assert!(routine_name_matches("\"a\"\"b\"", "public", "a\"b"));
     }
 }
 
@@ -2351,33 +2444,140 @@ fn parse_routine_signature<'a>(
     txid: u32,
     arguments: &mut [crate::storage::RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
 ) -> Option<(&'a str, usize)> {
-    let (name, written_arguments) = written.strip_suffix(')')?.split_once('(')?;
+    let end = written.strip_suffix(')')?.len();
+    let bytes = written.as_bytes();
+    let mut quoted = false;
+    let mut open = None;
+    let mut offset = 0usize;
+    while offset < end {
+        match bytes[offset] {
+            b'"' if quoted && bytes.get(offset + 1) == Some(&b'"') => offset += 2,
+            b'"' => {
+                quoted = !quoted;
+                offset += 1;
+            }
+            b'(' if !quoted => {
+                open = Some(offset);
+                break;
+            }
+            _ => offset += 1,
+        }
+    }
+    let open = open?;
+    let name = written[..open].trim();
+    let written_arguments = &written[open + 1..end];
     let written_arguments = written_arguments.trim();
     if written_arguments.is_empty() {
-        return Some((name.trim(), 0));
+        return Some((name, 0));
     }
     let mut count = 0;
-    for written_type in written_arguments.split(',') {
-        let written_type = written_type
-            .trim()
-            .strip_prefix("pg_catalog.")
-            .unwrap_or(written_type.trim());
-        if count == arguments.len() {
-            return None;
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut offset = 0usize;
+    loop {
+        let at_end = offset == written_arguments.len();
+        let separator = at_end
+            || (!quoted && depth == 0 && written_arguments.as_bytes().get(offset) == Some(&b','));
+        if separator {
+            let written_type = written_arguments[start..offset].trim();
+            if written_type.is_empty() || count == arguments.len() {
+                return None;
+            }
+            let written_type = written_type
+                .strip_prefix("pg_catalog.")
+                .unwrap_or(written_type);
+            let resolved = if let Some(ctype) = routine_builtin_type(written_type) {
+                crate::storage::RoutineResult::builtin(ctype)
+            } else {
+                super::exec::resolve_routine_type(storage, txid, written_type).ok()?
+            };
+            arguments[count] = crate::storage::RoutineArgumentDef {
+                name: crate::storage::SqlName::EMPTY,
+                ctype: resolved.ctype,
+                user_type: resolved.user_type,
+            };
+            count += 1;
+            if at_end {
+                break;
+            }
+            start = offset + 1;
+            offset += 1;
+            continue;
         }
-        let resolved = if let Some(ctype) = ColType::from_sql_name(written_type) {
-            crate::storage::RoutineResult::builtin(ctype)
-        } else {
-            super::exec::resolve_routine_type(storage, txid, written_type).ok()?
-        };
-        arguments[count] = crate::storage::RoutineArgumentDef {
-            name: crate::storage::SqlName::EMPTY,
-            ctype: resolved.ctype,
-            user_type: resolved.user_type,
-        };
-        count += 1;
+        match written_arguments.as_bytes()[offset] {
+            b'"' if quoted && written_arguments.as_bytes().get(offset + 1) == Some(&b'"') => {
+                offset += 2;
+            }
+            b'"' => {
+                quoted = !quoted;
+                offset += 1;
+            }
+            b'(' if !quoted => {
+                depth = depth.checked_add(1)?;
+                offset += 1;
+            }
+            b')' if !quoted => {
+                depth = depth.checked_sub(1)?;
+                offset += 1;
+            }
+            _ => offset += 1,
+        }
     }
-    Some((name.trim(), count))
+    (!quoted && depth == 0).then_some((name, count))
+}
+
+fn routine_builtin_type(written: &str) -> Option<ColType> {
+    if let Some(base) = written.strip_suffix("[]") {
+        return crate::sql::types::ArrElem::from_coltype(routine_builtin_type(base)?)
+            .map(ColType::Array);
+    }
+    match written {
+        "timestamp without time zone" => return Some(ColType::Timestamp),
+        "timestamp with time zone" => return Some(ColType::Timestamptz),
+        "time without time zone" => return Some(ColType::Time),
+        _ => {}
+    }
+    if let Some(ctype) = ColType::from_sql_name(written) {
+        return Some(ctype);
+    }
+    let bytes = written.as_bytes();
+    let mut quoted = false;
+    let mut open = None;
+    let mut depth = 0usize;
+    let mut close = None;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'"' if quoted && bytes.get(offset + 1) == Some(&b'"') => offset += 2,
+            b'"' => {
+                quoted = !quoted;
+                offset += 1;
+            }
+            b'(' if !quoted => {
+                if open.is_none() {
+                    open = Some(offset);
+                }
+                depth += 1;
+                offset += 1;
+            }
+            b')' if !quoted && depth != 0 => {
+                depth -= 1;
+                offset += 1;
+                if depth == 0 {
+                    close = Some(offset);
+                    break;
+                }
+            }
+            _ => offset += 1,
+        }
+    }
+    let (open, close) = (open?, close?);
+    let mut base = StackStr::<128>::new();
+    use core::fmt::Write as _;
+    base.write_str(written[..open].trim_end()).ok()?;
+    base.write_str(&written[close..]).ok()?;
+    routine_builtin_type(base.as_str())
 }
 
 fn intrinsic_argument_matches(
@@ -2403,7 +2603,9 @@ fn routine_signature<'a>(
 ) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
     let mut text = StackStr::<256>::new();
-    write!(text, "{}(", name).map_err(|_| super::eval::arena_full())?;
+    write_identifier(&mut text, name);
+    text.write_char('(')
+        .map_err(|_| super::eval::arena_full())?;
     for (index, argument) in arguments.enumerate() {
         if index != 0 {
             write!(text, ",").map_err(|_| super::eval::arena_full())?;
@@ -2423,7 +2625,9 @@ fn routine_declared_signature<'a>(
 ) -> Result<&'a str, SqlError> {
     use core::fmt::Write;
     let mut text = StackStr::<256>::new();
-    write!(text, "{}(", name).map_err(|_| super::eval::arena_full())?;
+    write_identifier(&mut text, name);
+    text.write_char('(')
+        .map_err(|_| super::eval::arena_full())?;
     for (index, argument) in arguments.iter().enumerate() {
         if index != 0 {
             write!(text, ",").map_err(|_| super::eval::arena_full())?;
@@ -2464,12 +2668,9 @@ fn write_routine_type<const N: usize>(
 ) -> Result<(), core::fmt::Error> {
     use core::fmt::Write;
     if let Some(identity) = argument.user_type {
-        write!(
-            output,
-            "{}.{}",
-            identity.schema.as_str(),
-            identity.name.as_str()
-        )?;
+        write_identifier(output, identity.schema.as_str());
+        output.write_char('.')?;
+        write_identifier(output, identity.name.as_str());
         if matches!(argument.ctype, ColType::Array(_)) {
             output.write_str("[]")?;
         }
@@ -2562,10 +2763,14 @@ pub(crate) fn routine_name_by_oid<'a>(
 ) -> Result<Option<&'a str>, SqlError> {
     if let Some(routine) = INTRINSIC_ROUTINES.iter().find(|routine| routine.oid == oid) {
         if !signature {
-            return arena
-                .alloc_str(routine.name)
-                .map(Some)
-                .map_err(|_| super::eval::arena_full());
+            return if ident_needs_quotes(routine.name) {
+                super::eval::quote_ident_str(routine.name, arena).map(Some)
+            } else {
+                arena
+                    .alloc_str(routine.name)
+                    .map(Some)
+                    .map_err(|_| super::eval::arena_full())
+            };
         }
         let arguments = routine
             .argument_types
@@ -2581,10 +2786,14 @@ pub(crate) fn routine_name_by_oid<'a>(
     let current_name = routine.name_for(txid);
     let name = current_name.as_str();
     if !signature {
-        return arena
-            .alloc_str(name)
-            .map(Some)
-            .map_err(|_| super::eval::arena_full());
+        return if ident_needs_quotes(name) {
+            super::eval::quote_ident_str(name, arena).map(Some)
+        } else {
+            arena
+                .alloc_str(name)
+                .map(Some)
+                .map_err(|_| super::eval::arena_full())
+        };
     }
     routine_declared_signature(name, routine.arguments(), arena).map(Some)
 }
@@ -7560,7 +7769,7 @@ fn index_operator_classes<'a>(
             let source = index_expression_source(storage, info, position, txid)
                 .expect("expression index has source");
             let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
-            let (oid, _) = super::exec::infer_type_pub(expression, Some(table))?;
+            let (oid, _) = super::exec::infer_type_catalog(expression, Some(table), storage, txid)?;
             super::exec::catalog_column_type(storage, txid, oid)
                 .map(|(ctype, _)| ctype)
                 .and_then(crate::sql::types::BtreeOperatorClass::for_type)
@@ -7640,6 +7849,14 @@ fn catalog_column_type_oid(
     Ok(storage.declared_column_type(column, txid)?.catalog_oid())
 }
 
+fn catalog_column_type_mod(column: &ColumnMeta) -> i32 {
+    if column.user_type.is_some() {
+        -1
+    } else {
+        column.type_mod
+    }
+}
+
 fn pg_attribute<'a>(
     storage: &Storage,
     txid: u32,
@@ -7691,7 +7908,7 @@ fn pg_attribute<'a>(
                     Datum::Int4(i as i32 + 1),
                     Datum::Bool(c.not_null.is_required()),
                     Datum::Int4(i32::from(c.ctype.typlen())),
-                    Datum::Int4(c.type_mod),
+                    Datum::Int4(catalog_column_type_mod(c)),
                     Datum::Bool(!matches!(c.default, crate::storage::ColumnDefault::None)),
                     Datum::Int4(c.collation.oid()),
                     text(
@@ -7766,7 +7983,7 @@ fn pg_attribute<'a>(
                     if field.dropped {
                         Datum::Int4(-1)
                     } else {
-                        Datum::Int4(field.type_mod)
+                        Datum::Int4(catalog_column_type_mod(&column))
                     },
                     Datum::Bool(false),
                     if field.dropped {
@@ -7814,13 +8031,25 @@ fn pg_attribute<'a>(
             let (name, ctype, type_oid, type_mod, collation) = if let Some(source) = expression {
                 let source = arena.alloc_str(source.as_str()).map_err(|_| arena_full())?;
                 let expression = crate::sql::parser::parse_expr(source, arena)?;
-                let (type_oid, type_mod) = super::exec::infer_type_pub(expression, Some(table))?;
-                let ctype = ColType::from_oid(type_oid).unwrap_or(ColType::Text);
+                let (type_oid, type_mod) =
+                    super::exec::infer_type_catalog(expression, Some(table), storage, txid)?;
+                let (ctype, user_type) = super::exec::catalog_column_type(storage, txid, type_oid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "index expression type OID {} does not exist",
+                            type_oid
+                        )
+                    })?;
                 (
                     super::exec::derived_name(expression),
                     ctype,
                     type_oid,
-                    i32::from(type_mod),
+                    if user_type.is_some() {
+                        -1
+                    } else {
+                        i32::from(type_mod)
+                    },
                     info.collations[attribute],
                 )
             } else {
@@ -7834,7 +8063,7 @@ fn pg_attribute<'a>(
                     column.name.as_str(),
                     column.ctype,
                     catalog_column_type_oid(storage, column, txid)?,
-                    column.type_mod,
+                    catalog_column_type_mod(column),
                     column.collation,
                 )
             };
@@ -7883,7 +8112,7 @@ fn pg_attribute<'a>(
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attribute"));
             }
-            let (ctype, _) = view_column_catalog_type(storage, txid, column.type_oid)?;
+            let (ctype, user_type) = view_column_catalog_type(storage, txid, column.type_oid)?;
             out[n] = row(
                 &[
                     Datum::Int4(view_oid(slot)),
@@ -7892,7 +8121,11 @@ fn pg_attribute<'a>(
                     Datum::Int4(attribute as i32 + 1),
                     Datum::Bool(false),
                     Datum::Int4(i32::from(column.typlen)),
-                    Datum::Int4(column.type_mod),
+                    Datum::Int4(if user_type.is_some() {
+                        -1
+                    } else {
+                        column.type_mod
+                    }),
                     Datum::Bool(false),
                     Datum::Int4(0),
                     text("", arena)?,

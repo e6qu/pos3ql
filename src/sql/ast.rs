@@ -648,7 +648,7 @@ pub enum Stmt<'a> {
     DeclareCursor {
         name: &'a str,
         binary: bool,
-        scroll: bool,
+        scroll: crate::sql::cursor::CursorScroll,
         hold: bool,
         sql: &'a str,
     },

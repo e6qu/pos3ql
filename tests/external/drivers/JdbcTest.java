@@ -10,6 +10,8 @@
 // The pgJDBC jar must be on the classpath.
 
 import java.sql.*;
+import java.util.UUID;
+import org.postgresql.util.PGobject;
 
 public class JdbcTest {
     static StringBuilder out = new StringBuilder();
@@ -24,9 +26,12 @@ public class JdbcTest {
         try (Connection c = DriverManager.getConnection(url, "postgres", "")) {
             ddlAndCrud(c);
             transactions(c);
+            typedValuesAndPortalPaging(c);
             metadata(c);
         } catch (SQLException e) {
             line("FATAL " + sqlstate(e) + " " + firstLine(e.getMessage()));
+            System.out.print(out);
+            System.exit(1);
         }
         System.out.print(out);
     }
@@ -91,6 +96,57 @@ public class JdbcTest {
             rs.next();
             line("after rollback id=9 count=" + rs.getInt(1));
         }
+        c.setAutoCommit(true);
+    }
+
+    static void typedValuesAndPortalPaging(Connection c) throws SQLException {
+        try (Statement s = c.createStatement()) {
+            s.execute("DROP TABLE IF EXISTS jdbc_types");
+            s.execute("CREATE TABLE jdbc_types (id int PRIMARY KEY, label varchar(4), "
+                + "amount numeric(7,2), ids integer[], note jsonb, span int4range, key uuid)");
+        }
+        PGobject json = new PGobject();
+        json.setType("jsonb");
+        json.setValue("{\"ready\": true}");
+        PGobject range = new PGobject();
+        range.setType("int4range");
+        range.setValue("[1,5)");
+        try (PreparedStatement ps = c.prepareStatement(
+                "INSERT INTO jdbc_types VALUES (?, ?, ?, ?, ?, ?, ?)")) {
+            ps.setInt(1, 1);
+            ps.setString(2, "wide");
+            ps.setBigDecimal(3, new java.math.BigDecimal("12.345"));
+            ps.setArray(4, c.createArrayOf("integer", new Object[]{1, null, 3}));
+            ps.setObject(5, json);
+            ps.setObject(6, range);
+            ps.setObject(7, UUID.fromString("00112233-4455-6677-8899-aabbccddeeff"));
+            line("typed insert rows=" + ps.executeUpdate());
+        }
+        try (Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery(
+                 "SELECT label, amount, ids::text, note::text, span::text, key::text FROM jdbc_types")) {
+            rs.next();
+            line("typed " + rs.getString(1) + "|" + rs.getBigDecimal(2) + "|"
+                + rs.getString(3) + "|" + rs.getString(4) + "|" + rs.getString(5)
+                + "|" + rs.getString(6));
+        }
+        try (Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT label, amount, ids, note, span, key FROM jdbc_types")) {
+            ResultSetMetaData md = rs.getMetaData();
+            for (int column = 1; column <= md.getColumnCount(); column++) {
+                line("typed-meta " + md.getColumnName(column) + "|" + md.getColumnTypeName(column)
+                    + "|precision=" + md.getPrecision(column) + "|scale=" + md.getScale(column));
+            }
+        }
+
+        c.setAutoCommit(false);
+        try (PreparedStatement ps = c.prepareStatement("SELECT generate_series(1,3) AS value")) {
+            ps.setFetchSize(1);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) line("portal-page " + rs.getInt(1));
+            }
+        }
+        c.rollback();
         c.setAutoCommit(true);
     }
 

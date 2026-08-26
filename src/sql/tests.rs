@@ -1485,7 +1485,7 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
         Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
     assert!(
         engine
-            .describe(sql_text, &arena, &transaction, &mut responder)
+            .describe(sql_text, &arena, &transaction, None, &mut responder)
             .unwrap()
     );
     buffer.readable().to_vec()
@@ -3928,6 +3928,30 @@ fn routine_catalog_columns_preserve_regproc_and_regprocedure_identity() {
         )),
         ["routine_catalog_overload(integer)"]
     );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION routine_catalog_numeric(value numeric) RETURNS integer LANGUAGE SQL \
+           AS 'SELECT 1'; \
+         CREATE FUNCTION routine_catalog_timestamp(value timestamp) RETURNS integer LANGUAGE SQL \
+           AS 'SELECT 1'",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 'routine_catalog_numeric(numeric(7,2))'::regprocedure",
+        )),
+        ["routine_catalog_numeric(numeric)"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 'routine_catalog_timestamp(timestamp(3) without time zone)'::regprocedure",
+        )),
+        ["routine_catalog_timestamp(timestamp without time zone)"]
+    );
 }
 
 #[test]
@@ -4441,6 +4465,7 @@ fn binary_parameters_resolve_catalog_types_before_decoding() {
             ExtendedExecutionStatus::Complete(true)
         ));
     }
+    engine.commit_txn(&mut transaction, &guc).unwrap();
     let mut composite_domain_array_binary = composite_array_binary.clone();
     composite_domain_array_binary[8..12].copy_from_slice(&composite_domain_oid.to_be_bytes());
     let composite_domain_array_oid = crate::sql::types::oid::domain_array_oid(
@@ -9498,6 +9523,59 @@ fn cursor_fetch_preserves_row_description_type_modifier() {
     );
     assert_eq!(row_description_type_modifiers(&output), [7]);
     assert_eq!(data_rows(&output), ["abc"]);
+}
+
+#[test]
+fn no_scroll_cursor_rejects_backward_motion() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         DECLARE forward_only NO SCROLL CURSOR FOR SELECT 1; \
+         FETCH NEXT FROM forward_only; \
+         FETCH PRIOR FROM forward_only",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("C55000\0"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn regproc_array_text_round_trips_quoted_keyword_names() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        r#"SELECT ('{version,"\"current_schema\""}'::regproc[])[2]::text"#,
+    );
+    assert_eq!(data_rows(&output), ["\"current_schema\""]);
+}
+
+#[test]
+fn format_type_preserves_builtin_array_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalog_array_type (ids integer[], labels varchar(4)[], \
+             amounts numeric(7,2)[], stamps timestamp(3)[]); \
+         SELECT atttypid, format_type(atttypid, atttypmod) \
+         FROM pg_attribute \
+         WHERE attrelid = 'catalog_array_type'::regclass AND attnum > 0 \
+         ORDER BY attnum",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1007|integer[]",
+            "1015|character varying(4)[]",
+            "1231|numeric(7,2)[]",
+            "1115|timestamp(3) without time zone[]",
+        ]
+    );
 }
 
 #[test]
@@ -24641,6 +24719,23 @@ fn anonymous_record_field_preserves_catalog_cast_type() {
         row_description_type_oids(&output),
         [crate::sql::types::oid::INT4]
     );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof((ROW(7::record_field_domain)).f1)",
+        )),
+        ["record_field_domain"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof((q).f1), pg_typeof((q).f2) \
+             FROM (SELECT ROW(1, 'typed'::text) AS q) AS source",
+        )),
+        ["integer|text"]
+    );
     let enum_output = run_with(
         &mut engine,
         &mut budget,
@@ -24659,6 +24754,50 @@ fn anonymous_record_field_preserves_catalog_cast_type() {
     assert!(
         String::from_utf8_lossy(&expansion_in_scalar).contains("0A000"),
         "{expansion_in_scalar:?}"
+    );
+}
+
+#[test]
+fn expression_index_attributes_preserve_catalog_type_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN expression_index_domain AS varchar(7); \
+         CREATE TABLE expression_index_types (value expression_index_domain); \
+         CREATE INDEX expression_index_domain_idx ON expression_index_types \
+           (((value || '')::expression_index_domain))",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let domain_oid = crate::sql::types::oid::domain_oid(
+        engine
+            .storage
+            .domain_slot("public", "expression_index_domain", 0)
+            .unwrap() as u16,
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT atttypid, atttypmod, attlen, attstorage \
+             FROM pg_attribute \
+             WHERE attrelid = 'expression_index_types'::regclass AND attnum = 1",
+        )),
+        [format!("{domain_oid}|-1|-1|x")]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT atttypid, atttypmod, attlen, attstorage \
+             FROM pg_attribute \
+             WHERE attrelid = 'expression_index_domain_idx'::regclass AND attnum = 1",
+        )),
+        [format!("{domain_oid}|-1|-1|x")]
     );
 }
 

@@ -39,6 +39,7 @@ max_tables = 64
 table_rows = 65536
 max_value_indexes = 64
 memtable_bytes = 256MiB
+max_prepared = 64
 EOF
 "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
 P3_PID=$!
@@ -54,8 +55,16 @@ run() { local outfile=$1; shift; local host=$1 port=$2; shift 2; "$@" "$host" "$
 
 diff_driver() { # name  build-and-run-fn
   local name=$1 fn=$2
-  $fn "$WORK/$name.pg" "$PGHOST" "$PGPORT"
-  $fn "$WORK/$name.p3" 127.0.0.1 "$P3_PORT"
+  if ! $fn "$WORK/$name.pg" "$PGHOST" "$PGPORT"; then
+    bad "$name (PostgreSQL driver execution failed)"
+    cat "$WORK/$name.pg"
+    return
+  fi
+  if ! $fn "$WORK/$name.p3" 127.0.0.1 "$P3_PORT"; then
+    bad "$name (pos3ql driver execution failed)"
+    cat "$WORK/$name.p3"
+    return
+  fi
   if diff -u "$WORK/$name.pg" "$WORK/$name.p3" > "$WORK/$name.diff"; then
     ok "$name ($(wc -l < "$WORK/$name.pg" | tr -d ' ') lines match)"
   else
@@ -75,7 +84,7 @@ if command -v javac >/dev/null; then
       --connect-timeout 10 --max-time 30 -o "$JAR" \
       "https://repo1.maven.org/maven2/org/postgresql/postgresql/$JDBC_VER/postgresql-$JDBC_VER.jar" \
       && jar tf "$JAR" >/dev/null; then
-    javac -d "$WORK" "$DRV/JdbcTest.java"
+    javac -cp "$JAR" -d "$WORK" "$DRV/JdbcTest.java"
     jdbc() { java -cp "$WORK:$JAR" JdbcTest "$2" "$3" > "$1" 2>&1; }
     diff_driver jdbc jdbc
   else

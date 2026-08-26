@@ -363,6 +363,54 @@ def test_binary_cursor_preserves_catalog_identity():
     s.close()
 
 
+def test_fetch_honors_mixed_result_formats_independently_of_cursor_declaration():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    declared = simple_query(
+        s,
+        "BEGIN; DECLARE mixed_cursor CURSOR FOR "
+        "SELECT 123.45::numeric(7,2) AS amount, 'abc'::text AS label",
+    )
+    check(
+        "SQL cursor: ordinary declaration succeeds",
+        not any(kind == b"E" for kind, _ in declared),
+        declared,
+    )
+    parse = frontend_message(
+        b"P",
+        b"mixed_fetch_statement\x00FETCH ALL FROM mixed_cursor\x00\x00\x00",
+    )
+    bind = frontend_message(
+        b"B",
+        b"mixed_fetch_portal\x00mixed_fetch_statement\x00"
+        + struct.pack("!hhhhh", 0, 0, 2, 1, 0),
+    )
+    describe = frontend_message(b"D", b"Pmixed_fetch_portal\x00")
+    execute = frontend_message(b"E", b"mixed_fetch_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    numeric = struct.pack("!hhhhhh", 2, 0, 0, 2, 123, 4500)
+    expected = b"\x00\x02" + struct.pack("!i", len(numeric)) + numeric
+    expected += struct.pack("!i", 3) + b"abc"
+    row = next((payload for kind, payload in out if kind == b"D"), None)
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    check(
+        "SQL cursor: FETCH chooses binary numeric and text independently",
+        description is not None
+        and row_description_formats(description) == [1, 0]
+        and row == expected
+        and not any(kind == b"E" for kind, _ in out),
+        out,
+    )
+    s.close()
+
+
 def test_binary_portal_preserves_catalog_identity():
     s = connect()
     s.sendall(startup_payload(0))
@@ -416,6 +464,8 @@ def test_binary_portal_paging_retains_result_shape_and_format():
         "INSERT INTO wire_paged_portal VALUES (1, 'one'), (2, 'two'), (3, 'tri')",
     )
     check("binary portal paging setup", not any(kind == b"E" for kind, _ in setup), setup)
+    transaction = simple_query(s, "BEGIN")
+    check("binary portal paging transaction", not any(kind == b"E" for kind, _ in transaction), transaction)
     parse = frontend_message(
         b"P",
         b"paged_binary_statement\x00SELECT (wire_paged_portal).* FROM wire_paged_portal ORDER BY id\x00\x00\x00",
@@ -457,12 +507,149 @@ def test_binary_portal_paging_retains_result_shape_and_format():
             if item[0] == b"Z":
                 break
         row = next((payload for kind, payload in out if kind == b"D"), None)
-        terminal = b"C" if index == len(expected_rows) - 1 else b"s"
         check(
             f"binary paged portal Execute {index + 1} retains row bytes and suspension",
-            row == expected and [kind for kind, _ in out] == [b"D", terminal, b"Z"],
+            row == expected and [kind for kind, _ in out] == [b"D", b"s", b"Z"],
             out,
         )
+    s.sendall(frontend_message(b"E", b"paged_binary_portal\x00\x00\x00\x00\x01") + frontend_message(b"S"))
+    completed = []
+    while True:
+        item = read_message(s)
+        completed.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "binary paged portal detects exhaustion on the following Execute",
+        [kind for kind, _ in completed] == [b"C", b"Z"]
+        and completed[0][1] == b"SELECT 0\x00",
+        completed,
+    )
+    s.close()
+
+
+def test_portal_lifetime_and_execute_counts_match_postgresql():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+
+    parse = frontend_message(
+        b"P", b"idle_statement\x00SELECT generate_series(1,2)\x00\x00\x00"
+    )
+    bind = frontend_message(
+        b"B", b"idle_portal\x00idle_statement\x00" + struct.pack("!hhh", 0, 0, 0)
+    )
+    s.sendall(parse + bind + frontend_message(b"S"))
+    while read_message(s)[0] != b"Z":
+        pass
+    s.sendall(
+        frontend_message(b"E", b"idle_portal\x00\x00\x00\x00\x01")
+        + frontend_message(b"S")
+    )
+    expired = []
+    while True:
+        item = read_message(s)
+        expired.append(item)
+        if item[0] == b"Z":
+            break
+    error = next((payload for kind, payload in expired if kind == b"E"), b"")
+    check(
+        "portal lifetime: Sync destroys an idle transaction's portal",
+        b"C34000\x00" in error,
+        expired,
+    )
+
+    parse = frontend_message(
+        b"P", b"paged_statement\x00SELECT generate_series(1,2)\x00\x00\x00"
+    )
+    bind = frontend_message(
+        b"B", b"paged_portal\x00paged_statement\x00" + struct.pack("!hhh", 0, 0, 0)
+    )
+    execute = frontend_message(b"E", b"paged_portal\x00\x00\x00\x00\x01")
+    s.sendall(parse + bind + execute + execute + execute + execute + frontend_message(b"S"))
+    paged = []
+    while True:
+        item = read_message(s)
+        paged.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "portal paging: exact pages suspend, exhaustion and repeats report SELECT 0",
+        [kind for kind, _ in paged]
+        == [b"1", b"2", b"D", b"s", b"D", b"s", b"C", b"C", b"Z"]
+        and [payload for kind, payload in paged if kind == b"C"]
+        == [b"SELECT 0\x00", b"SELECT 0\x00"],
+        paged,
+    )
+    s.close()
+
+
+def test_paged_portal_capacity_is_a_named_error_not_a_disconnect():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    simple_query(s, "BEGIN")
+    parse = frontend_message(
+        b"P",
+        b"bounded_statement\x00SELECT repeat('x', 1024) FROM generate_series(1,100)\x00\x00\x00",
+    )
+    bind = frontend_message(
+        b"B", b"bounded_portal\x00bounded_statement\x00" + struct.pack("!hhh", 0, 0, 0)
+    )
+    execute = frontend_message(b"E", b"bounded_portal\x00\x00\x00\x00\x01")
+    s.sendall(parse + bind + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    error = next((payload for kind, payload in output if kind == b"E"), b"")
+    check(
+        "bounded portal: result capacity reports 54000 and keeps the connection",
+        b"C54000\x00" in error
+        and b"statement response exceeds its configured buffer" in error
+        and output[-1][0] == b"Z",
+        output,
+    )
+    s.close()
+
+
+def test_named_portals_cannot_be_silently_rebound():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    simple_query(s, "BEGIN")
+    parse = frontend_message(b"P", b"duplicate_portal_statement\x00SELECT 7\x00\x00\x00")
+    bind = frontend_message(
+        b"B",
+        b"duplicate_portal\x00duplicate_portal_statement\x00" + struct.pack("!hhh", 0, 0, 0),
+    )
+    s.sendall(parse + bind + bind + frontend_message(b"S"))
+    duplicate = []
+    while True:
+        item = read_message(s)
+        duplicate.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "named portal: duplicate Bind is 42P03",
+        has_sqlstate(duplicate, "42P03") and duplicate[-1] == (b"Z", b"T"),
+        duplicate,
+    )
+    execute = frontend_message(b"E", b"duplicate_portal\x00\x00\x00\x00\x00")
+    s.sendall(execute + frontend_message(b"S"))
+    original = []
+    while True:
+        item = read_message(s)
+        original.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "named portal: failed rebind retains the original portal",
+        first_text_row(original) == "7" and not any(kind == b"E" for kind, _ in original),
+        original,
+    )
     s.close()
 
 
@@ -470,6 +657,8 @@ def test_rows_from_binary_portal_retains_lockstep_shape_and_format():
     s = connect()
     s.sendall(startup_payload(0))
     drain_startup(s)
+    transaction = simple_query(s, "BEGIN")
+    check("ROWS FROM portal paging transaction", not any(kind == b"E" for kind, _ in transaction), transaction)
     query = (
         "SELECT * FROM ROWS FROM (generate_series(1,2), "
         "unnest(ARRAY['x']::varchar(2)[])) WITH ORDINALITY "
@@ -516,12 +705,24 @@ def test_rows_from_binary_portal_retains_lockstep_shape_and_format():
             if item[0] == b"Z":
                 break
         row = next((payload for kind, payload in output if kind == b"D"), None)
-        terminal = b"C" if index == len(expected_rows) - 1 else b"s"
         check(
             f"ROWS FROM binary portal page {index + 1} preserves NULL padding",
-            row == expected and [kind for kind, _ in output] == [b"D", terminal, b"Z"],
+            row == expected and [kind for kind, _ in output] == [b"D", b"s", b"Z"],
             output,
         )
+    s.sendall(frontend_message(b"E", b"rows_from_portal\x00\x00\x00\x00\x01") + frontend_message(b"S"))
+    completed = []
+    while True:
+        item = read_message(s)
+        completed.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "ROWS FROM portal detects exhaustion on the following Execute",
+        [kind for kind, _ in completed] == [b"C", b"Z"]
+        and completed[0][1] == b"SELECT 0\x00",
+        completed,
+    )
     s.close()
 
 

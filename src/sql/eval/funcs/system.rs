@@ -980,14 +980,18 @@ pub(crate) fn dispatch<'a>(
                 let Some(coltype) = exec::coltype_of_oid(o) else {
                     return Ok(Datum::Text("???"));
                 };
-                let name = coltype.name();
-                // The modifier is decoded once under the type's own encoding;
-                // the arms render meanings, not integer arithmetic.
-                let text = match TypeMod::decode(coltype, type_mod) {
-                    TypeMod::None => return Ok(Datum::Text(name)),
-                    TypeMod::Length(n) => stack_format!(64, "{}({})", name, n),
+                let (base, array) = match coltype {
+                    ColType::Array(element) => (element.to_coltype(), true),
+                    scalar => (scalar, false),
+                };
+                let name = base.name();
+                // Array typmods describe their elements. Render the base under
+                // that modifier, then attach [] as PostgreSQL does.
+                let mut text = match TypeMod::decode(base, type_mod) {
+                    TypeMod::None => stack_format!(80, "{}", name),
+                    TypeMod::Length(n) => stack_format!(80, "{}({})", name, n),
                     TypeMod::NumericPS { precision, scale } => {
-                        stack_format!(64, "{}({},{})", name, precision, scale)
+                        stack_format!(80, "{}({},{})", name, precision, scale)
                     }
                     TypeMod::TemporalPrecision(p) => {
                         // The precision sits inside the name, before the
@@ -996,22 +1000,26 @@ pub(crate) fn dispatch<'a>(
                         // "without" begins "with".
                         match name.split_once(" with") {
                             Some((head, tail)) => {
-                                stack_format!(64, "{}({}) with{}", head, p, tail)
+                                stack_format!(80, "{}({}) with{}", head, p, tail)
                             }
-                            None => stack_format!(64, "{}({})", name, p),
+                            None => stack_format!(80, "{}({})", name, p),
                         }
                     }
                     TypeMod::IntervalMod {
                         precision: Some(p), ..
                     } => {
-                        stack_format!(64, "interval({})", p)
+                        stack_format!(80, "interval({})", p)
                     }
                     // A range form with no precision renders bare; naming the
                     // field range (`interval hour to minute`) is not built yet.
                     TypeMod::IntervalMod {
                         precision: None, ..
-                    } => return Ok(Datum::Text(name)),
+                    } => stack_format!(80, "{}", name),
                 };
+                if array {
+                    use core::fmt::Write as _;
+                    let _ = text.write_str("[]");
+                }
                 Ok(Datum::Text(
                     arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
                 ))
@@ -1118,10 +1126,18 @@ pub(crate) fn dispatch<'a>(
                 {
                     return Ok(regtype(v.type_oid(), name));
                 }
+                if matches!(args[0], crate::sql::ast::Expr::Field { .. })
+                    && let Ok(super::super::ExpressionTypeIdentity::Known(referenced_oid)) =
+                        super::super::expression_type_identity(args[0], row, hooks)
+                    && let Some(cat) = hooks.catalog
+                    && let Some(name) = cat.type_name(referenced_oid, arena)?
+                {
+                    return Ok(regtype(referenced_oid, name));
+                }
                 // Array subscripting yields a structural record value, but
                 // inference still retains the declared named-composite OID.
                 // Prefer that catalog identity to the structural runtime tag.
-                if let Some(referenced_oid) = exec::typeof_static_oid(args[0], row)
+                if let Some(referenced_oid) = exec::typeof_static_oid(args[0], row, hooks.catalog)
                     && let Some(cat) = hooks.catalog
                     && let Some(name) = cat.type_name(referenced_oid, arena)?
                 {
@@ -1133,11 +1149,12 @@ pub(crate) fn dispatch<'a>(
                 // runtime value (same storage type, or NULL); an inconsistent
                 // one — a mis-inferred set-returning function, say — falls
                 // back to the type the value itself carries.
-                if let Some(name) = exec::typeof_static(args[0], row)
-                    && let Some(referenced_oid) = exec::typeof_static_oid(args[0], row)
+                if let Some(name) = exec::typeof_static(args[0], row, hooks.catalog)
+                    && let Some(referenced_oid) =
+                        exec::typeof_static_oid(args[0], row, hooks.catalog)
                 {
                     let consistent = v.is_null()
-                        || exec::typeof_static_coltype(args[0], row)
+                        || exec::typeof_static_coltype(args[0], row, hooks.catalog)
                             .is_some_and(|ct| ct.storage().oid() == v.type_oid());
                     if consistent {
                         return Ok(regtype(referenced_oid, name));

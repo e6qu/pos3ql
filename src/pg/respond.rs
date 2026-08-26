@@ -76,6 +76,10 @@ pub enum FlushSink<'b> {
 
 pub struct Responder<'b> {
     pub buffer: &'b mut FixedBuf,
+    /// SQL cursor materialization captures both representations during one
+    /// evaluation so FETCH can honor its own result-format codes.
+    alternate_buffer: Option<&'b mut FixedBuf>,
+    alternate_formats: ResultFmt,
     /// Extended-protocol Execute must not resend RowDescription (the
     /// client got it from Describe).
     suppress_row_description: bool,
@@ -232,6 +236,8 @@ impl<'b> Responder<'b> {
     pub fn new(buffer: &'b mut FixedBuf) -> Self {
         Self {
             buffer,
+            alternate_buffer: None,
+            alternate_formats: ResultFmt::ALL_TEXT,
             suppress_row_description: false,
             formats: ResultFmt::ALL_TEXT,
             flush: FlushSink::None,
@@ -249,6 +255,8 @@ impl<'b> Responder<'b> {
     pub fn for_execute(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
             buffer,
+            alternate_buffer: None,
+            alternate_formats: ResultFmt::ALL_TEXT,
             suppress_row_description: true,
             formats,
             flush: FlushSink::None,
@@ -263,13 +271,14 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// A SQL `DECLARE BINARY CURSOR` captures a complete binary result set
-    /// for later `FETCH` messages, which must retain its RowDescription.
-    pub fn for_binary_cursor(buffer: &'b mut FixedBuf) -> Self {
+    /// Captures text and binary SQL-cursor rows from one execution.
+    pub fn for_cursor(text: &'b mut FixedBuf, binary: &'b mut FixedBuf) -> Self {
         Self {
-            buffer,
+            buffer: text,
+            alternate_buffer: Some(binary),
+            alternate_formats: ResultFmt::ALL_BINARY,
             suppress_row_description: false,
-            formats: ResultFmt::ALL_BINARY,
+            formats: ResultFmt::ALL_TEXT,
             flush: FlushSink::None,
             render: crate::sql::guc::RenderContext::default(),
             discard_query_output: false,
@@ -287,6 +296,8 @@ impl<'b> Responder<'b> {
     pub fn for_describe(buffer: &'b mut FixedBuf, formats: ResultFmt) -> Self {
         Self {
             buffer,
+            alternate_buffer: None,
+            alternate_formats: ResultFmt::ALL_TEXT,
             suppress_row_description: false,
             formats,
             flush: FlushSink::None,
@@ -522,7 +533,23 @@ impl<'b> Responder<'b> {
                 m.i16(if formats.is_binary(i) { 1 } else { 0 });
             }
             m.finish()
-        })
+        })?;
+        if let Some(buffer) = self.alternate_buffer.as_deref_mut() {
+            let formats = self.alternate_formats;
+            let mut m = MsgOut::begin(buffer, wire::MSG_ROW_DESCRIPTION);
+            m.i16(columns.len() as i16);
+            for (i, c) in columns.iter().enumerate() {
+                m.cstr(c.name);
+                m.i32(0);
+                m.i16(0);
+                m.i32(c.type_oid);
+                m.i16(c.typlen);
+                m.i32(c.type_mod);
+                m.i16(if formats.is_binary(i) { 1 } else { 0 });
+            }
+            m.finish()?;
+        }
+        Ok(())
     }
 
     /// CopyInResponse / CopyOutResponse. `binary` selects PostgreSQL's format
@@ -669,8 +696,95 @@ impl<'b> Responder<'b> {
         })
     }
 
+    pub(crate) fn data_row_prepared_alternate(
+        &mut self,
+        values: &[Datum],
+        write: &dyn Fn(&mut MsgOut),
+    ) -> Result<(), WireFull> {
+        let Some(buffer) = self.alternate_buffer.as_deref_mut() else {
+            return Ok(());
+        };
+        let mut message = MsgOut::begin(buffer, wire::MSG_DATA_ROW);
+        message.i16(values.len() as i16);
+        write(&mut message);
+        message.finish()
+    }
+
     pub(crate) fn result_formats(&self) -> ResultFmt {
         self.formats
+    }
+
+    pub(crate) fn alternate_result_formats(&self) -> Option<ResultFmt> {
+        self.alternate_buffer
+            .as_ref()
+            .map(|_| self.alternate_formats)
+    }
+
+    /// Rewrites a captured SQL-cursor RowDescription for this FETCH's result
+    /// formats. Cursor sealing has already validated the message boundary.
+    pub(crate) fn cursor_row_description(
+        &mut self,
+        captured: &[u8],
+        formats: ResultFmt,
+    ) -> Result<(), WireFull> {
+        if self.suppress_row_description || self.discard_query_output {
+            return Ok(());
+        }
+        let payload = &captured[5..];
+        let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
+        self.with_retry(|buffer| {
+            let mut message = MsgOut::begin(buffer, wire::MSG_ROW_DESCRIPTION);
+            message.i16(count as i16);
+            let mut at = 2usize;
+            for column in 0..count {
+                let name_end = payload[at..].iter().position(|byte| *byte == 0).unwrap() + at + 1;
+                message.bytes(&payload[at..name_end + 16]);
+                message.i16(if formats.is_binary(column) { 1 } else { 0 });
+                at = name_end + 18;
+            }
+            message.finish()
+        })
+    }
+
+    /// Builds one FETCH DataRow from the text and binary representations
+    /// captured during DECLARE, including mixed per-column formats.
+    pub(crate) fn cursor_data_row(
+        &mut self,
+        text: &[u8],
+        binary: &[u8],
+        formats: ResultFmt,
+    ) -> Result<(), WireFull> {
+        fn payload(message: &[u8]) -> (&[u8], usize) {
+            let payload = &message[5..];
+            let count = i16::from_be_bytes(payload[..2].try_into().unwrap()) as usize;
+            (payload, count)
+        }
+        let (text, count) = payload(text);
+        let (binary, binary_count) = payload(binary);
+        debug_assert_eq!(count, binary_count);
+        self.with_retry(|buffer| {
+            let mut output = MsgOut::begin(buffer, wire::MSG_DATA_ROW);
+            output.i16(count as i16);
+            let mut text_at = 2usize;
+            let mut binary_at = 2usize;
+            for column in 0..count {
+                let text_len = i32::from_be_bytes(text[text_at..text_at + 4].try_into().unwrap());
+                let binary_len =
+                    i32::from_be_bytes(binary[binary_at..binary_at + 4].try_into().unwrap());
+                let (source, at, len) = if formats.is_binary(column) {
+                    (binary, binary_at, binary_len)
+                } else {
+                    (text, text_at, text_len)
+                };
+                output.i32(len);
+                if len >= 0 {
+                    output.bytes(&source[at + 4..at + 4 + len as usize]);
+                }
+                text_at += 4 + text_len.max(0) as usize;
+                binary_at += 4 + binary_len.max(0) as usize;
+            }
+            output.finish()
+        })
     }
 
     /// Emits one row, each column in its Bind-requested text or binary format.
@@ -1485,7 +1599,7 @@ impl<'b> Responder<'b> {
         self.buffer.truncate_to(mark);
         self.error(
             crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "response does not fit in the connection send buffer",
+            "statement response exceeds its configured buffer",
         )
     }
 }

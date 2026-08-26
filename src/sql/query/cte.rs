@@ -1,18 +1,18 @@
 //! `WITH` expansion and the AST substitution it rests on.
 //!
-//! A non-recursive CTE is inlined as a derived table wherever its name is used;
-//! a recursive one is materialized by fixpoint iteration and bound to its rows.
+//! An ordinary CTE is either inlined or materialized under its typed PostgreSQL
+//! evaluation contract; a recursive one is materialized by fixpoint iteration.
 //! Views expand the same way, from their stored text. Both rest on one thing: a
 //! substituting walk that rebuilds a statement's expressions and FROM items in
 //! the arena with each reference replaced, which is the rest of this module.
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{
-    Cte, Delete, Expr, FromClause, Insert, Join, JoinKind, MaterializedCte, Merge, MergeAction,
-    MergeWhen, OnConflict, OnConflictTarget, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree,
-    Stmt, TableRef, Update,
+    Cte, CteMaterialization, Delete, Expr, FromClause, Insert, Join, JoinKind, MaterializedCte,
+    Merge, MergeAction, MergeWhen, OnConflict, OnConflictTarget, OrderBy, Select, SelectItem,
+    SetOp, SetQuery, SetTree, Stmt, TableRef, Update,
 };
-use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
 use crate::sql::exec::MAX_PROJ;
 use crate::sql::types::{ColDesc, Datum};
 use crate::sql_err;
@@ -29,7 +29,7 @@ pub fn expand_ctes<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    expand_ctes_with_path(sel, storage, txid, None, None, arena)
+    expand_ctes_with_path(sel, storage, txid, None, None, 0, None, arena)
 }
 
 /// Expands a view body under the search path captured when that view was
@@ -42,7 +42,7 @@ pub fn expand_ctes_under<'a>(
     path: crate::storage::PathContext,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    expand_ctes_with_path(sel, storage, txid, Some(path), None, arena)
+    expand_ctes_with_path(sel, storage, txid, Some(path), None, 0, None, arena)
 }
 
 pub(crate) fn expand_stored_query<'a>(
@@ -53,7 +53,52 @@ pub(crate) fn expand_stored_query<'a>(
     dependencies: &crate::storage::StoredQueryDependencies,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
-    expand_ctes_with_path(select, storage, txid, Some(path), Some(dependencies), arena)
+    expand_ctes_with_path(
+        select,
+        storage,
+        txid,
+        Some(path),
+        Some(dependencies),
+        0,
+        None,
+        arena,
+    )
+}
+
+/// Execution counterpart to [`expand_stored_query`]. Stored dependencies and
+/// the creator's path remain attached while CTEs are materialized, so a
+/// volatile or explicitly materialized CTE cannot be inlined before its
+/// catalog identities are rebound.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand_stored_query_exec<'a>(
+    select: &'a Select<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: &'a crate::storage::StoredQueryDependencies,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
+) -> Result<&'a Select<'a>, SqlError> {
+    with_exec_context(
+        select.with,
+        select,
+        storage,
+        txid,
+        arena,
+        params,
+        &[],
+        &[],
+        &[],
+        &[],
+        sequences,
+        0,
+        Some(path),
+        Some(dependencies),
+        None,
+        |name| select_references(select, name),
+        |context| subst_select_body(select, context, arena),
+    )
 }
 
 pub(crate) fn expand_stored_expression<'a>(
@@ -75,17 +120,21 @@ pub(crate) fn expand_stored_expression<'a>(
             dependencies: Some(dependencies),
             authorization_role: None,
             qualifier: None,
+            execution: None,
         },
         arena,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_ctes_with_path<'a>(
     sel: &'a Select<'a>,
     storage: &Storage,
     txid: u32,
     path: Option<crate::storage::PathContext>,
     dependencies: Option<&crate::storage::StoredQueryDependencies>,
+    depth: u32,
+    authorization_role: Option<u16>,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
     // Fast path: nothing to rewrite (no CTEs anywhere and no views defined).
@@ -115,11 +164,12 @@ fn expand_ctes_with_path<'a>(
             materialized: &[],
             storage,
             txid,
-            depth: 0,
+            depth,
             path,
             dependencies,
-            authorization_role: None,
+            authorization_role,
             qualifier: None,
+            execution: None,
         };
         // A self-referencing recursive CTE cannot be inlined; this schema-only
         // path (Describe / view validation) binds its non-recursive term,
@@ -142,13 +192,14 @@ fn expand_ctes_with_path<'a>(
         materialized: &[],
         storage,
         txid,
-        depth: 0,
+        depth,
         path,
         dependencies,
-        authorization_role: None,
+        authorization_role,
         qualifier: None,
+        execution: None,
     };
-    subst_select(sel, context, arena)
+    subst_select_body(sel, context, arena)
 }
 
 /// Like [`expand_ctes`], but for execution: a self-referencing recursive CTE is
@@ -162,6 +213,7 @@ pub fn expand_ctes_exec<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
+    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Select<'a>, SqlError> {
     if sel.with.is_empty() && !storage.has_any_view() {
         return Ok(sel);
@@ -175,7 +227,15 @@ pub fn expand_ctes_exec<'a>(
         params,
         dml_mats,
         &[],
-        |context| subst_select(sel, context, arena),
+        &[],
+        &[],
+        sequences,
+        0,
+        None,
+        None,
+        None,
+        |name| select_references(sel, name),
+        |context| subst_select_body(sel, context, arena),
     )
 }
 
@@ -199,6 +259,7 @@ pub(crate) fn bind_materialized_relations<'a>(
         dependencies: None,
         authorization_role: None,
         qualifier: None,
+        execution: None,
     };
     subst_select(select, context, arena)
 }
@@ -207,6 +268,7 @@ pub(crate) fn bind_materialized_relations<'a>(
 /// AST borrows only the statement arena and materialized CTE rows, never the
 /// catalog borrow used while resolving names. That separation is what permits
 /// the caller to mutate storage after expansion.
+#[allow(clippy::too_many_arguments)]
 pub fn expand_dml_ctes<'a>(
     statement: &'a Stmt<'a>,
     with: &'a [Cte<'a>],
@@ -215,8 +277,19 @@ pub fn expand_dml_ctes<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
+    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
-    expand_dml_ctes_with_relations(statement, with, storage, txid, arena, params, dml_mats, &[])
+    expand_dml_ctes_with_relations(
+        statement,
+        with,
+        storage,
+        txid,
+        arena,
+        params,
+        dml_mats,
+        &[],
+        sequences,
+    )
 }
 
 /// Binds executor-owned relations into a data-modifying statement. Unlike a
@@ -230,7 +303,17 @@ pub(crate) fn bind_dml_materialized_relations<'a>(
     params: &[Datum<'a>],
     relations: &[(&'a str, &'a MaterializedCte<'a>)],
 ) -> Result<&'a Stmt<'a>, SqlError> {
-    expand_dml_ctes_with_relations(statement, &[], storage, txid, arena, params, &[], relations)
+    expand_dml_ctes_with_relations(
+        statement,
+        &[],
+        storage,
+        txid,
+        arena,
+        params,
+        &[],
+        relations,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -243,6 +326,7 @@ fn expand_dml_ctes_with_relations<'a>(
     params: &[Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
     relations: &[(&'a str, &'a MaterializedCte<'a>)],
+    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
     let placeholder = match statement {
         Stmt::Insert(insert) => insert.select.unwrap_or(&EMPTY_SELECT),
@@ -257,6 +341,14 @@ fn expand_dml_ctes_with_relations<'a>(
         params,
         dml_mats,
         relations,
+        &[],
+        &[],
+        sequences,
+        0,
+        None,
+        None,
+        None,
+        |name| statement_references(statement, name),
         |context| {
             let expanded = match statement {
                 Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
@@ -303,6 +395,7 @@ pub fn rewrite_view_dml<'a>(
             to: base_name,
             to_schema: base_schema,
         }),
+        execution: None,
     };
     let expanded_returning =
         |items| expand_view_returning(items, view_name, exposed_columns, arena);
@@ -417,16 +510,24 @@ fn expand_view_returning<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn with_exec_context<'a, 's, R>(
+fn with_exec_context<'a, 's, 'e, R>(
     with: &'a [Cte<'a>],
     placeholder: &'a Select<'a>,
     storage: &'s Storage,
     txid: u32,
     arena: &'a Arena,
-    params: &[Datum<'a>],
+    params: &'e [Datum<'a>],
     dml_mats: &[(&'a str, &'a MaterializedCte<'a>)],
     relations: &[(&'a str, &'a MaterializedCte<'a>)],
-    build: impl for<'c> FnOnce(Subst<'c, 'a, 's>) -> Result<R, SqlError>,
+    inherited_ctes: &CteBindings<'a>,
+    inherited_materialized: &[(&'a str, &'a MaterializedCte<'a>)],
+    sequences: Option<&'e dyn SequenceAccess>,
+    depth: u32,
+    path: Option<crate::storage::PathContext>,
+    dependencies: Option<&'s crate::storage::StoredQueryDependencies>,
+    authorization_role: Option<u16>,
+    root_references: impl Fn(&str) -> usize,
+    build: impl for<'c> FnOnce(Subst<'c, 'a, 's, 'e>) -> Result<R, SqlError>,
 ) -> Result<R, SqlError> {
     if with.len() > crate::sql::parser::MAX_CTES {
         return Err(sql_err!(
@@ -455,26 +556,63 @@ fn with_exec_context<'a, 's, R>(
         materialized[nm] = (name, relation);
         nm += 1;
     }
-    for cte in with {
-        if resolved[..n].iter().any(|(name, _, _)| *name == cte.name)
-            || materialized[..nm].iter().any(|(name, _)| *name == cte.name)
-        {
+    for (cte_index, cte) in with.iter().enumerate() {
+        if with[..cte_index].iter().any(|prior| prior.name == cte.name) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,
                 "WITH query name \"{}\" specified more than once",
                 cte.name
             ));
         }
+        let mut scoped_ctes = [("", placeholder, &[] as &'a [&'a str]); MAX_VISIBLE_CTES];
+        let mut scoped_n = 0usize;
+        for binding in &resolved[..n] {
+            if scoped_n == scoped_ctes.len() {
+                return Err(too_many_visible_ctes());
+            }
+            scoped_ctes[scoped_n] = *binding;
+            scoped_n += 1;
+        }
+        for binding in inherited_ctes {
+            if with.iter().any(|local| local.name == binding.0) {
+                continue;
+            }
+            if scoped_n == scoped_ctes.len() {
+                return Err(too_many_visible_ctes());
+            }
+            scoped_ctes[scoped_n] = *binding;
+            scoped_n += 1;
+        }
+        let mut scoped_materialized = [("", &EMPTY_CTE); MAX_VISIBLE_CTES];
+        let mut scoped_nm = 0usize;
+        for binding in &materialized[..nm] {
+            if scoped_nm == scoped_materialized.len() {
+                return Err(too_many_visible_ctes());
+            }
+            scoped_materialized[scoped_nm] = *binding;
+            scoped_nm += 1;
+        }
+        for binding in inherited_materialized {
+            if with.iter().any(|local| local.name == binding.0) {
+                continue;
+            }
+            if scoped_nm == scoped_materialized.len() {
+                return Err(too_many_visible_ctes());
+            }
+            scoped_materialized[scoped_nm] = *binding;
+            scoped_nm += 1;
+        }
         let context = Subst {
-            ctes: &resolved[..n],
-            materialized: &materialized[..nm],
+            ctes: &scoped_ctes[..scoped_n],
+            materialized: &scoped_materialized[..scoped_nm],
             storage,
             txid,
-            depth: 0,
-            path: None,
-            dependencies: None,
-            authorization_role: None,
+            depth,
+            path,
+            dependencies,
+            authorization_role,
             qualifier: None,
+            execution: Some(ExecutionSubst { params, sequences }),
         };
         if cte.dml.is_some() {
             let materialized_cte = dml_mats
@@ -491,27 +629,156 @@ fn with_exec_context<'a, 's, R>(
             materialized[nm] = (cte.name, materialized_cte);
             nm += 1;
         } else if cte.recursive && select_references(cte.query, cte.name) > 0 {
-            let recursive = materialize_recursive(cte, context, storage, txid, arena, params)?;
+            let recursive =
+                materialize_recursive(cte, context, storage, txid, arena, params, sequences)?;
             materialized[nm] = (cte.name, recursive);
             nm += 1;
         } else {
             let query = subst_select(cte.query, context, arena)?;
-            resolved[n] = (cte.name, query, cte.columns);
-            n += 1;
+            let references = root_references(cte.name)
+                + with[cte_index + 1..]
+                    .iter()
+                    .map(|later| cte_references(later, cte.name))
+                    .sum::<usize>();
+            let volatile = select_contains_volatile(query, storage, txid);
+            let requires_evaluate_once = match cte.materialization {
+                CteMaterialization::Default => references > 1 || volatile,
+                CteMaterialization::Materialized => true,
+                CteMaterialization::NotMaterialized => volatile,
+            };
+            if references > 0 && requires_evaluate_once {
+                let relation = materialize_query_cte(
+                    cte.name,
+                    cte.columns,
+                    query,
+                    storage,
+                    txid,
+                    arena,
+                    params,
+                    sequences,
+                )?;
+                materialized[nm] = (cte.name, relation);
+                nm += 1;
+            } else {
+                resolved[n] = (cte.name, query, cte.columns);
+                n += 1;
+            }
         }
     }
+    let mut scoped_ctes = [("", placeholder, &[] as &'a [&'a str]); MAX_VISIBLE_CTES];
+    let mut scoped_n = 0usize;
+    for binding in &resolved[..n] {
+        if scoped_n == scoped_ctes.len() {
+            return Err(too_many_visible_ctes());
+        }
+        scoped_ctes[scoped_n] = *binding;
+        scoped_n += 1;
+    }
+    for binding in inherited_ctes {
+        if with.iter().any(|local| local.name == binding.0) {
+            continue;
+        }
+        if scoped_n == scoped_ctes.len() {
+            return Err(too_many_visible_ctes());
+        }
+        scoped_ctes[scoped_n] = *binding;
+        scoped_n += 1;
+    }
+    let mut scoped_materialized = [("", &EMPTY_CTE); MAX_VISIBLE_CTES];
+    let mut scoped_nm = 0usize;
+    for binding in &materialized[..nm] {
+        if scoped_nm == scoped_materialized.len() {
+            return Err(too_many_visible_ctes());
+        }
+        scoped_materialized[scoped_nm] = *binding;
+        scoped_nm += 1;
+    }
+    for binding in inherited_materialized {
+        if with.iter().any(|local| local.name == binding.0) {
+            continue;
+        }
+        if scoped_nm == scoped_materialized.len() {
+            return Err(too_many_visible_ctes());
+        }
+        scoped_materialized[scoped_nm] = *binding;
+        scoped_nm += 1;
+    }
     let context = Subst {
-        ctes: &resolved[..n],
-        materialized: &materialized[..nm],
+        ctes: &scoped_ctes[..scoped_n],
+        materialized: &scoped_materialized[..scoped_nm],
         storage,
         txid,
-        depth: 0,
-        path: None,
-        dependencies: None,
-        authorization_role: None,
+        depth,
+        path,
+        dependencies,
+        authorization_role,
         qualifier: None,
+        execution: Some(ExecutionSubst { params, sequences }),
     };
     build(context)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_query_cte<'a>(
+    name: &str,
+    aliases: &'a [&'a str],
+    query: &'a Select<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
+) -> Result<&'a MaterializedCte<'a>, SqlError> {
+    let tree = arena
+        .alloc(SetTree::Select(query))
+        .map_err(|_| arena_full())?;
+    let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let ncols = describe_set_body(storage, tree, txid, &mut described, arena)?;
+    if aliases.len() > ncols {
+        return Err(sql_err!(
+            sqlstate::INVALID_COLUMN_REFERENCE,
+            "WITH query \"{}\" has {} columns available but {} columns specified",
+            name,
+            ncols,
+            aliases.len()
+        ));
+    }
+    let column_names = {
+        let mut names = [""; MAX_PROJ];
+        for (index, output) in names.iter_mut().enumerate().take(ncols) {
+            *output = arena
+                .alloc_str(aliases.get(index).copied().unwrap_or(described[index].name))
+                .map_err(|_| arena_full())?;
+        }
+        arena
+            .alloc_slice_copy(&names[..ncols])
+            .map_err(|_| arena_full())?
+    };
+    let column_types = arena
+        .alloc_slice_with(ncols, |index| {
+            (
+                described[index].type_oid,
+                described[index].typlen,
+                described[index].type_mod,
+            )
+        })
+        .map_err(|_| arena_full())?;
+    let column_collations = arena
+        .alloc_slice_with(ncols, |index| described[index].collation)
+        .map_err(|_| arena_full())?;
+    let (rows, _, materialized_columns) =
+        materialize_set_body(storage, txid, tree, arena, params, sequences)?;
+    debug_assert_eq!(materialized_columns, ncols);
+    arena
+        .alloc(MaterializedCte {
+            column_names,
+            column_types,
+            column_collations,
+            rows,
+            external_run: None,
+        })
+        .map(|relation| &*relation)
+        .map_err(|_| arena_full())
 }
 
 /// Describes a whole set-operation query (Describe path): expands CTEs and
@@ -554,12 +821,13 @@ pub(super) fn expand_set_tree_exec<'a>(
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a SetTree<'a>, SqlError> {
     if with.is_empty() && !storage.has_any_view() {
         return Ok(tree);
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
-    let expanded = expand_ctes_exec(wrapper, storage, txid, arena, params, &[])?;
+    let expanded = expand_ctes_exec(wrapper, storage, txid, arena, params, &[], sequences)?;
     Ok(expanded.set_body.expect("wrapper keeps its set body"))
 }
 
@@ -619,12 +887,22 @@ static EMPTY_SELECT: Select<'static> = Select {
 
 type CteBindings<'a> = [(&'a str, &'a Select<'a>, &'a [&'a str])];
 
+const MAX_VISIBLE_CTES: usize = crate::sql::parser::MAX_CTES * (MAX_VIEW_DEPTH as usize + 1);
+
+fn too_many_visible_ctes() -> SqlError {
+    sql_err!(
+        sqlstate::TOO_MANY_ARGUMENTS,
+        "nested WITH scopes expose more than {} common table expressions",
+        MAX_VISIBLE_CTES
+    )
+}
+
 /// Threaded through the FROM-reference rewrite: CTE bindings in scope (query
 /// plus optional column-rename list), materialized recursive CTEs, storage (to
 /// resolve view names), and the current view-expansion depth (a cycle /
 /// runaway-nesting guard).
 #[derive(Clone, Copy)]
-struct Subst<'c, 'a, 's> {
+struct Subst<'c, 'a, 's, 'e> {
     ctes: &'c CteBindings<'a>,
     materialized: &'c [(&'a str, &'a MaterializedCte<'a>)],
     storage: &'s Storage,
@@ -643,6 +921,13 @@ struct Subst<'c, 'a, 's> {
     /// DML on an auto-updatable view is executed against its base table.
     /// Qualified target references must follow that rewrite too.
     qualifier: Option<ViewQualifier<'a>>,
+    execution: Option<ExecutionSubst<'e, 'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct ExecutionSubst<'e, 'a> {
+    params: &'e [Datum<'a>],
+    sequences: Option<&'e dyn SequenceAccess>,
 }
 
 #[derive(Clone, Copy)]
@@ -658,34 +943,178 @@ const MAX_VIEW_DEPTH: u32 = 12;
 /// select — FROM items (recursing into derived-table subqueries), the set-op
 /// body, and expression subqueries.
 fn select_references(s: &Select, name: &str) -> usize {
-    if let Some(tree) = s.set_body {
-        return set_tree_references(tree, name);
-    }
-    let mut count = 0usize;
+    let mut count = s.set_body.map_or(0, |tree| set_tree_references(tree, name));
     if let Some(f) = &s.from {
-        count += tref_references(&f.base, name);
-        for j in f.joins {
-            count += tref_references(&j.table, name);
-            if let Some(on) = j.on {
-                count += expr_references(on, name);
-            }
-        }
+        count += from_references(f, name);
     }
     for it in s.items {
-        if let SelectItem::Expr { expression, .. } = it {
-            count += expr_references(expression, name);
-        }
+        count += select_item_references(it, name);
     }
-    if let Some(w) = s.where_clause {
-        count += expr_references(w, name);
-    }
-    if let Some(h) = s.having {
-        count += expr_references(h, name);
-    }
-    for g in s.group_by {
-        count += expr_references(g, name);
-    }
+    count += s
+        .where_clause
+        .map_or(0, |expression| expr_references(expression, name));
+    count += s
+        .having
+        .map_or(0, |expression| expr_references(expression, name));
+    count += s
+        .group_by
+        .iter()
+        .map(|expression| expr_references(expression, name))
+        .sum::<usize>();
+    count += s
+        .distinct_on
+        .iter()
+        .map(|expression| expr_references(expression, name))
+        .sum::<usize>();
+    count += s
+        .order_by
+        .iter()
+        .map(|order| expr_references(order.expression, name))
+        .sum::<usize>();
+    count += s
+        .limit
+        .map_or(0, |expression| expr_references(expression, name));
+    count += s
+        .offset
+        .map_or(0, |expression| expr_references(expression, name));
+    count += s
+        .with
+        .iter()
+        .map(|cte| cte_references(cte, name))
+        .sum::<usize>();
     count
+}
+
+fn cte_references(cte: &Cte<'_>, name: &str) -> usize {
+    cte.dml.map_or_else(
+        || select_references(cte.query, name),
+        |statement| statement_references(statement, name),
+    )
+}
+
+fn select_item_references(item: &SelectItem<'_>, name: &str) -> usize {
+    match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            expr_references(expression, name)
+        }
+        SelectItem::Wildcard | SelectItem::TableWildcard(_) => 0,
+    }
+}
+
+fn from_references(from: &FromClause<'_>, name: &str) -> usize {
+    tref_references(&from.base, name)
+        + from
+            .joins
+            .iter()
+            .map(|join| {
+                tref_references(&join.table, name)
+                    + join.on.map_or(0, |on| expr_references(on, name))
+            })
+            .sum::<usize>()
+}
+
+fn returning_references(items: &[SelectItem<'_>], name: &str) -> usize {
+    items
+        .iter()
+        .map(|item| select_item_references(item, name))
+        .sum()
+}
+
+fn statement_references(statement: &Stmt<'_>, name: &str) -> usize {
+    match statement {
+        Stmt::Select(select) => select_references(select, name),
+        Stmt::SetQuery(query) => {
+            set_tree_references(query.body, name)
+                + query
+                    .order_by
+                    .iter()
+                    .map(|order| expr_references(order.expression, name))
+                    .sum::<usize>()
+                + query
+                    .limit
+                    .map_or(0, |expression| expr_references(expression, name))
+                + query
+                    .offset
+                    .map_or(0, |expression| expr_references(expression, name))
+        }
+        Stmt::With { ctes, statement } => {
+            ctes.iter()
+                .map(|cte| cte_references(cte, name))
+                .sum::<usize>()
+                + statement_references(statement, name)
+        }
+        Stmt::Insert(insert) => {
+            insert
+                .select
+                .map_or(0, |select| select_references(select, name))
+                + insert
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.iter())
+                    .map(|expression| expr_references(expression, name))
+                    .sum::<usize>()
+                + insert.on_conflict.map_or(0, |conflict| {
+                    conflict
+                        .target
+                        .iter()
+                        .map(|target| expr_references(target.expression, name))
+                        .sum::<usize>()
+                        + conflict.update.map_or(0, |assignments| {
+                            assignments
+                                .iter()
+                                .map(|(_, expression)| expr_references(expression, name))
+                                .sum::<usize>()
+                        })
+                        + conflict
+                            .update_where
+                            .map_or(0, |expression| expr_references(expression, name))
+                })
+                + returning_references(insert.returning, name)
+        }
+        Stmt::Update(update) => {
+            update.from.map_or(0, |from| from_references(from, name))
+                + update
+                    .assignments
+                    .iter()
+                    .map(|(_, expression)| expr_references(expression, name))
+                    .sum::<usize>()
+                + update
+                    .where_clause
+                    .map_or(0, |expression| expr_references(expression, name))
+                + returning_references(update.returning, name)
+        }
+        Stmt::Delete(delete) => {
+            delete.using.map_or(0, |from| from_references(from, name))
+                + delete
+                    .where_clause
+                    .map_or(0, |expression| expr_references(expression, name))
+                + returning_references(delete.returning, name)
+        }
+        Stmt::Merge(merge) => {
+            tref_references(&merge.source, name)
+                + expr_references(merge.on, name)
+                + merge
+                    .whens
+                    .iter()
+                    .map(|when| {
+                        when.cond
+                            .map_or(0, |condition| expr_references(condition, name))
+                            + match when.action {
+                                MergeAction::Update(assignments) => assignments
+                                    .iter()
+                                    .map(|(_, expression)| expr_references(expression, name))
+                                    .sum(),
+                                MergeAction::Insert { values, .. } => values
+                                    .iter()
+                                    .map(|expression| expr_references(expression, name))
+                                    .sum(),
+                                MergeAction::Delete | MergeAction::DoNothing => 0,
+                            }
+                    })
+                    .sum::<usize>()
+        }
+        _ => 0,
+    }
 }
 
 fn tref_references(t: &TableRef, name: &str) -> usize {
@@ -735,7 +1164,38 @@ fn expr_references(e: &Expr, name: &str) -> usize {
         Expr::Binary { left, right, .. } => {
             expr_references(left, name) + expr_references(right, name)
         }
-        Expr::Call { args, .. } => args.iter().map(|a| expr_references(a, name)).sum(),
+        Expr::Call {
+            args,
+            order_by,
+            over,
+            filter,
+            ..
+        } => {
+            args.iter()
+                .map(|argument| expr_references(argument, name))
+                .sum::<usize>()
+                + order_by
+                    .iter()
+                    .map(|order| expr_references(order.expression, name))
+                    .sum::<usize>()
+                + over.map_or(0, |window| {
+                    window
+                        .partition_by
+                        .iter()
+                        .map(|expression| expr_references(expression, name))
+                        .sum::<usize>()
+                        + window
+                            .order_by
+                            .iter()
+                            .map(|order| expr_references(order.expression, name))
+                            .sum::<usize>()
+                        + window.frame.map_or(0, |frame| {
+                            frame_bound_references(frame.start, name)
+                                + frame_bound_references(frame.end, name)
+                        })
+                })
+                + filter.map_or(0, |expression| expr_references(expression, name))
+        }
         Expr::InList { operand, list, .. } => {
             expr_references(operand, name)
                 + list.iter().map(|x| expr_references(x, name)).sum::<usize>()
@@ -748,9 +1208,16 @@ fn expr_references(e: &Expr, name: &str) -> usize {
                 + expr_references(high, name)
         }
         Expr::Like {
-            operand, pattern, ..
+            operand,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_references(operand, name)
+                + expr_references(pattern, name)
+                + escape.map_or(0, |expression| expr_references(expression, name))
         }
-        | Expr::Match {
+        Expr::Match {
             operand, pattern, ..
         } => expr_references(operand, name) + expr_references(pattern, name),
         Expr::Case {
@@ -770,11 +1237,133 @@ fn expr_references(e: &Expr, name: &str) -> usize {
         Expr::Subscript { base, index } => {
             expr_references(base, name) + expr_references(index, name)
         }
+        Expr::Slice { base, lower, upper } => {
+            expr_references(base, name)
+                + lower.map_or(0, |expression| expr_references(expression, name))
+                + upper.map_or(0, |expression| expr_references(expression, name))
+        }
         Expr::Field { base, .. } => expr_references(base, name),
         Expr::AnyAll { operand, array, .. } => {
             expr_references(operand, name) + expr_references(array, name)
         }
         _ => 0,
+    }
+}
+
+fn frame_bound_references(bound: crate::sql::ast::FrameBound<'_>, name: &str) -> usize {
+    match bound {
+        crate::sql::ast::FrameBound::Preceding(expression)
+        | crate::sql::ast::FrameBound::Following(expression) => expr_references(expression, name),
+        crate::sql::ast::FrameBound::UnboundedPreceding
+        | crate::sql::ast::FrameBound::CurrentRow
+        | crate::sql::ast::FrameBound::UnboundedFollowing => 0,
+    }
+}
+
+fn expression_contains_volatile(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
+    if expression.contains_volatile_function().is_some()
+        || matches!(expression, Expr::Call { name, args, .. }
+            if storage.has_volatile_function_routine_candidate(name, args.len(), txid))
+    {
+        return true;
+    }
+    let nested = match expression {
+        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+            select_contains_volatile(select, storage, txid)
+        }
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => {
+            expression_contains_volatile(operand, storage, txid)
+                || select_contains_volatile(select, storage, txid)
+        }
+        _ => false,
+    };
+    if nested {
+        return true;
+    }
+    let mut found = false;
+    super::walk_children(expression, &mut |child| {
+        found |= expression_contains_volatile(child, storage, txid);
+        Ok(())
+    })
+    .expect("expression visitor cannot fail");
+    found
+}
+
+fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -> bool {
+    let expression_has_it =
+        |expression: &Expr<'_>| expression_contains_volatile(expression, storage, txid);
+    if select.items.iter().any(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            expression_has_it(expression)
+        }
+        SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+    }) || select.where_clause.is_some_and(expression_has_it)
+        || select.having.is_some_and(expression_has_it)
+        || select
+            .group_by
+            .iter()
+            .any(|expression| expression_has_it(expression))
+        || select
+            .distinct_on
+            .iter()
+            .any(|expression| expression_has_it(expression))
+        || select
+            .order_by
+            .iter()
+            .any(|order| expression_has_it(order.expression))
+        || select.limit.is_some_and(expression_has_it)
+        || select.offset.is_some_and(expression_has_it)
+    {
+        return true;
+    }
+    if let Some(from) = select.from {
+        let table_has_it = |table: &TableRef<'_>| {
+            table
+                .subquery
+                .is_some_and(|query| select_contains_volatile(query, storage, txid))
+                || table.func_args.is_some_and(|arguments| {
+                    arguments.iter().any(|argument| expression_has_it(argument))
+                })
+                || table.rows_from.is_some_and(|tables| {
+                    tables.iter().any(|table| {
+                        table.func_args.is_some_and(|arguments| {
+                            arguments.iter().any(|argument| expression_has_it(argument))
+                        }) || table
+                            .subquery
+                            .is_some_and(|query| select_contains_volatile(query, storage, txid))
+                    })
+                })
+        };
+        if table_has_it(&from.base)
+            || from
+                .joins
+                .iter()
+                .any(|join| table_has_it(&join.table) || join.on.is_some_and(expression_has_it))
+        {
+            return true;
+        }
+    }
+    select
+        .set_body
+        .is_some_and(|tree| set_tree_contains_volatile(tree, storage, txid))
+        || select
+            .with
+            .iter()
+            .any(|cte| select_contains_volatile(cte.query, storage, txid))
+}
+
+fn set_tree_contains_volatile(tree: &SetTree<'_>, storage: &Storage, txid: u32) -> bool {
+    match tree {
+        SetTree::Select(select) => select_contains_volatile(select, storage, txid),
+        SetTree::Op { left, right, .. } => {
+            set_tree_contains_volatile(left, storage, txid)
+                || set_tree_contains_volatile(right, storage, txid)
+        }
     }
 }
 
@@ -829,7 +1418,7 @@ fn recursive_parts<'a>(
     if !q.order_by.is_empty() || q.limit.is_some() || q.offset.is_some() {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
-            "ORDER BY/LIMIT in a recursive query body is not supported"
+            "ORDER BY/LIMIT in a recursive query is not implemented"
         ));
     }
     if set_tree_references(left, name) > 0 {
@@ -873,6 +1462,7 @@ fn external_recursive_tree(
     txid: u32,
     arena: &Arena,
     params: &[Datum<'_>],
+    sequences: Option<&dyn SequenceAccess>,
     sorted: bool,
 ) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
     let mut sorter = storage.external_sorter()?;
@@ -894,7 +1484,7 @@ fn external_recursive_tree(
         false,
         arena,
         params,
-        None,
+        sequences,
         &mut |values| {
             storage
                 .with_block_store(|blocks| {
@@ -1035,11 +1625,12 @@ fn external_recursive_union(
 /// with arena exhaustion, and the statement timeout is honored per iteration.
 fn materialize_recursive<'a>(
     cte: &'a Cte<'a>,
-    outer: Subst<'_, 'a, '_>,
+    outer: Subst<'_, 'a, '_, '_>,
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
     params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a MaterializedCte<'a>, SqlError> {
     let (base_tree, recursive_tree, union_all) = recursive_parts(cte.query, cte.name)?;
     // References to earlier CTEs inline now; the self-reference stays a bare
@@ -1106,7 +1697,9 @@ fn materialize_recursive<'a>(
         .map_err(|_| arena_full())?;
 
     if storage.spill_attached() {
-        let base = external_recursive_tree(base_tree, storage, txid, arena, params, !union_all)?;
+        let base = external_recursive_tree(
+            base_tree, storage, txid, arena, params, sequences, !union_all,
+        )?;
         let mut all = if union_all {
             base
         } else {
@@ -1136,6 +1729,7 @@ fn materialize_recursive<'a>(
                 dependencies: None,
                 authorization_role: None,
                 qualifier: None,
+                execution: outer.execution,
             };
             let step_tree = subst_set_tree(recursive_tree, context, arena)?;
             let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -1158,8 +1752,9 @@ fn materialize_recursive<'a>(
                     ));
                 }
             }
-            let candidates =
-                external_recursive_tree(step_tree, storage, txid, arena, params, !union_all)?;
+            let candidates = external_recursive_tree(
+                step_tree, storage, txid, arena, params, sequences, !union_all,
+            )?;
             let fresh = if union_all {
                 candidates
             } else {
@@ -1190,7 +1785,8 @@ fn materialize_recursive<'a>(
     // Base rows; UNION (without ALL) deduplicates them among themselves.
     // Projected-row encoding is order-preserving-for-equality, so byte equality
     // is row equality.
-    let (base_rows, _, _) = materialize_set_body(storage, txid, base_tree, arena, params, None)?;
+    let (base_rows, _, _) =
+        materialize_set_body(storage, txid, base_tree, arena, params, sequences)?;
     const EMPTY: &[u8] = &[];
     let mut all_rows: &'a [&'a [u8]] = if union_all {
         base_rows
@@ -1233,6 +1829,7 @@ fn materialize_recursive<'a>(
             dependencies: None,
             authorization_role: None,
             qualifier: None,
+            execution: outer.execution,
         };
         let step_tree = subst_set_tree(recursive_tree, context, arena)?;
         // The recursive term's column types must agree with the non-recursive
@@ -1258,7 +1855,7 @@ fn materialize_recursive<'a>(
             }
         }
         let (step_rows, _, _) =
-            materialize_set_body(storage, txid, step_tree, arena, params, None)?;
+            materialize_set_body(storage, txid, step_tree, arena, params, sequences)?;
         // Keep the rows this iteration added: all of them under UNION ALL, only
         // never-seen ones under UNION.
         let fresh: &'a [&'a [u8]] = if union_all {
@@ -1300,8 +1897,118 @@ fn materialize_recursive<'a>(
 }
 
 fn subst_select<'a>(
+    select: &'a Select<'a>,
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a Select<'a>, SqlError> {
+    if select.with.is_empty() {
+        return subst_select_body(select, context, arena);
+    }
+    if let Some(execution) = context.execution {
+        return with_exec_context(
+            select.with,
+            select,
+            context.storage,
+            context.txid,
+            arena,
+            execution.params,
+            &[],
+            &[],
+            context.ctes,
+            context.materialized,
+            execution.sequences,
+            context.depth,
+            context.path,
+            context.dependencies,
+            context.authorization_role,
+            |name| select_references(select, name),
+            |inner| subst_select_body(select, inner, arena),
+        );
+    }
+
+    let mut resolved = [("", select, &[] as &'a [&'a str]); crate::sql::parser::MAX_CTES];
+    let mut resolved_count = 0usize;
+    for (index, cte) in select.with.iter().enumerate() {
+        if select.with[..index]
+            .iter()
+            .any(|prior| prior.name == cte.name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_ALIAS,
+                "WITH query name \"{}\" specified more than once",
+                cte.name
+            ));
+        }
+        if cte.dml.is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "WITH clause containing a data-modifying statement must be at the top level"
+            ));
+        }
+        let mut scoped = [("", select, &[] as &'a [&'a str]); MAX_VISIBLE_CTES];
+        let mut scoped_count = 0usize;
+        for binding in &resolved[..resolved_count] {
+            if scoped_count == scoped.len() {
+                return Err(too_many_visible_ctes());
+            }
+            scoped[scoped_count] = *binding;
+            scoped_count += 1;
+        }
+        for binding in context.ctes {
+            if select.with.iter().any(|local| local.name == binding.0) {
+                continue;
+            }
+            if scoped_count == scoped.len() {
+                return Err(too_many_visible_ctes());
+            }
+            scoped[scoped_count] = *binding;
+            scoped_count += 1;
+        }
+        let child = Subst {
+            ctes: &scoped[..scoped_count],
+            ..context
+        };
+        let query = if cte.recursive && select_references(cte.query, cte.name) > 0 {
+            let (base, _, _) = recursive_parts(cte.query, cte.name)?;
+            subst_select(wrap_set_tree(base, arena)?, child, arena)?
+        } else {
+            subst_select(cte.query, child, arena)?
+        };
+        resolved[resolved_count] = (cte.name, query, cte.columns);
+        resolved_count += 1;
+    }
+    let mut scoped = [("", select, &[] as &'a [&'a str]); MAX_VISIBLE_CTES];
+    let mut scoped_count = 0usize;
+    for binding in &resolved[..resolved_count] {
+        if scoped_count == scoped.len() {
+            return Err(too_many_visible_ctes());
+        }
+        scoped[scoped_count] = *binding;
+        scoped_count += 1;
+    }
+    for binding in context.ctes {
+        if select.with.iter().any(|local| local.name == binding.0) {
+            continue;
+        }
+        if scoped_count == scoped.len() {
+            return Err(too_many_visible_ctes());
+        }
+        scoped[scoped_count] = *binding;
+        scoped_count += 1;
+    }
+    subst_select_body(
+        select,
+        Subst {
+            ctes: &scoped[..scoped_count],
+            ..context
+        },
+        arena,
+    )
+}
+
+fn subst_select_body<'a>(
     s: &'a Select<'a>,
-    mut context: Subst<'_, 'a, '_>,
+    mut context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a Select<'a>, SqlError> {
     if let (Some(qualifier), Some(from)) = (context.qualifier, s.from)
@@ -1372,7 +2079,7 @@ fn from_shadows_qualifier(from: &FromClause<'_>, qualifier: &str) -> bool {
 
 fn subst_select_items<'a>(
     source: &'a [SelectItem<'a>],
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [SelectItem<'a>], SqlError> {
     let mut items = [SelectItem::Wildcard; MAX_PROJ];
@@ -1405,7 +2112,7 @@ fn subst_select_items<'a>(
 
 fn subst_assignments<'a>(
     source: &'a [(&'a str, &'a Expr<'a>)],
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
     if source.len() > crate::sql::parser::MAX_LIST {
@@ -1426,7 +2133,7 @@ fn subst_assignments<'a>(
 
 fn subst_on_conflict_targets<'a>(
     source: &'a [OnConflictTarget<'a>],
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [OnConflictTarget<'a>], SqlError> {
     let mut targets = [OnConflictTarget {
@@ -1449,7 +2156,7 @@ fn subst_on_conflict_targets<'a>(
 
 fn subst_insert<'a>(
     statement: &'a Insert<'a>,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<Insert<'a>, SqlError> {
     if statement.rows.len() > crate::sql::parser::MAX_LIST {
@@ -1494,7 +2201,7 @@ fn subst_insert<'a>(
 
 fn subst_update<'a>(
     statement: &'a Update<'a>,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<Update<'a>, SqlError> {
     Ok(Update {
@@ -1516,7 +2223,7 @@ fn subst_update<'a>(
 
 fn subst_delete<'a>(
     statement: &'a Delete<'a>,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<Delete<'a>, SqlError> {
     Ok(Delete {
@@ -1537,7 +2244,7 @@ fn subst_delete<'a>(
 
 fn subst_merge<'a>(
     statement: &'a Merge<'a>,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<Merge<'a>, SqlError> {
     if statement.whens.len() > crate::sql::parser::MAX_LIST {
@@ -1589,7 +2296,7 @@ fn subst_merge<'a>(
 /// mirroring [`subst_select`] for a set-operator subquery body.
 fn subst_set_tree<'a>(
     tree: &'a SetTree<'a>,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a SetTree<'a>, SqlError> {
     let out = match tree {
@@ -1611,7 +2318,7 @@ fn subst_set_tree<'a>(
 
 fn subst_from<'a>(
     f: &'a FromClause<'a>,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<FromClause<'a>, SqlError> {
     let base = subst_tableref(&f.base, context, arena)?;
@@ -1643,7 +2350,7 @@ fn subst_from<'a>(
 
 fn subst_tableref<'a>(
     t: &TableRef<'a>,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<TableRef<'a>, SqlError> {
     if let Some(functions) = t.rows_from {
@@ -1826,18 +2533,39 @@ fn subst_tableref<'a>(
         let vsel = crate::sql::parser::parse_view_select(view_sql, arena)?;
         // The view body has its own scope: no outer CTEs, deeper view depth,
         // and the creator's path for its own references.
-        let inner = Subst {
-            ctes: &[],
-            materialized: &[],
-            storage: context.storage,
-            txid: context.txid,
-            depth: context.depth + 1,
-            path: Some(view_path),
-            dependencies: Some(context.storage.view_dependencies(slot)),
-            authorization_role,
-            qualifier: None,
+        let dependencies = context.storage.view_dependencies(slot);
+        let expanded = if let Some(execution) = context.execution {
+            with_exec_context(
+                vsel.with,
+                vsel,
+                context.storage,
+                context.txid,
+                arena,
+                execution.params,
+                &[],
+                &[],
+                &[],
+                &[],
+                execution.sequences,
+                context.depth + 1,
+                Some(view_path),
+                Some(dependencies),
+                authorization_role,
+                |name| select_references(vsel, name),
+                |inner| subst_select_body(vsel, inner, arena),
+            )?
+        } else {
+            expand_ctes_with_path(
+                vsel,
+                context.storage,
+                context.txid,
+                Some(view_path),
+                Some(dependencies),
+                context.depth + 1,
+                authorization_role,
+                arena,
+            )?
         };
-        let expanded = subst_select(vsel, inner, arena)?;
         return Ok(TableRef {
             schema: None,
             table: "",
@@ -1877,7 +2605,7 @@ fn subst_tableref<'a>(
 
 fn opt_subst<'a>(
     e: Option<&'a Expr<'a>>,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<Option<&'a Expr<'a>>, SqlError> {
     match e {
@@ -1888,7 +2616,7 @@ fn opt_subst<'a>(
 
 fn subst_expr_slice<'a>(
     xs: &'a [&'a Expr<'a>],
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [&'a Expr<'a>], SqlError> {
     if context.qualifier.is_none() && !xs.iter().any(|x| expr_has_subquery(x)) {
@@ -2004,7 +2732,7 @@ fn frame_bound_has_subquery(bound: crate::sql::ast::FrameBound<'_>) -> bool {
 
 fn subst_frame_bound<'a>(
     bound: crate::sql::ast::FrameBound<'a>,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<crate::sql::ast::FrameBound<'a>, SqlError> {
     Ok(match bound {
@@ -2020,7 +2748,7 @@ fn subst_frame_bound<'a>(
 
 fn rewrite_stored_type_name<'a>(
     type_name: &'a str,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     let Some(dependencies) = context.dependencies else {
@@ -2073,7 +2801,7 @@ fn rewrite_stored_type_name<'a>(
 fn stored_routine_dependency<'a>(
     schema: &str,
     name: &str,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
 ) -> Option<crate::storage::StoredQueryDependency> {
     context
         .dependencies?
@@ -2089,7 +2817,7 @@ fn stored_routine_dependency<'a>(
 
 fn rewrite_stored_routine_name<'a>(
     name: &'a str,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
     let (schema, bare) = name.split_once('.').unwrap_or(("", name));
@@ -2112,7 +2840,7 @@ fn rewrite_stored_routine_name<'a>(
 
 fn subst_expr<'a>(
     e: &'a Expr<'a>,
-    context: Subst<'_, 'a, '_>,
+    context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
     if context.qualifier.is_none() && context.dependencies.is_none() && !expr_has_subquery(e) {

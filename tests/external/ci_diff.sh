@@ -380,6 +380,13 @@ COMMENT ON TABLE outbound_dump.items IS 'dumped table comment';
 COMMENT ON COLUMN outbound_dump.items.note IS 'dumped column comment';
 CREATE VIEW outbound_dump.item_view AS
   SELECT id,mood,location,moods,locations,marked_location,marked_locations,note FROM outbound_dump.items;
+CREATE VIEW outbound_dump.cte_view AS
+  WITH selected AS MATERIALIZED (SELECT id,note FROM outbound_dump.items)
+  SELECT left_value.id,left_value.note
+    FROM selected AS left_value JOIN selected AS right_value USING (id);
+CREATE MATERIALIZED VIEW outbound_dump.cte_matview AS
+  WITH selected AS MATERIALIZED (SELECT id,note FROM outbound_dump.items)
+  SELECT id,note FROM selected;
 CREATE TABLE outbound_dump.view_base (id integer PRIMARY KEY, value integer NOT NULL);
 INSERT INTO outbound_dump.view_base VALUES (1, 10), (2, 20);
 CREATE VIEW outbound_dump.writable_view AS
@@ -527,6 +534,8 @@ else
       SELECT id,mood,(location).east,(location).y,(location).z IS NULL,moods[1],
              (locations[1]).y,(marked_location).east,(marked_locations[1]).y,note
         FROM outbound_dump.item_view ORDER BY id;
+      SELECT id,note FROM outbound_dump.cte_view ORDER BY id;
+      SELECT id,note FROM outbound_dump.cte_matview ORDER BY id;
       INSERT INTO outbound_dump.items(mood,location,moods,locations,marked_location,marked_locations,note)
         VALUES ('ok', ROW(5,6,NULL)::outbound_type_target.location,
                 ARRAY['ok'::outbound_type_target.mood],
@@ -612,7 +621,7 @@ else
       SELECT outbound_dump.dump_first(value), outbound_dump.dump_first(label)
         FROM (VALUES (2, 'x'::text), (3, 'y'::text)) input(value,label);
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

@@ -3078,6 +3078,54 @@ def test_row_security_over_named_statement_and_portal():
     s.close()
 
 
+def test_nested_materialized_cte_named_portal():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(s, "CREATE SEQUENCE wire_cte_sequence")
+    check("raw wire: CTE sequence setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    query = (
+        "WITH outer_value AS MATERIALIZED ("
+        "SELECT nextval('wire_cte_sequence') AS marker, $1::varchar(5) AS label) "
+        "SELECT nested.left_marker, nested.right_marker, nested.label FROM ("
+        "WITH inner_value AS MATERIALIZED (SELECT marker, label FROM outer_value) "
+        "SELECT l.marker AS left_marker, r.marker AS right_marker, l.label "
+        "FROM inner_value AS l CROSS JOIN inner_value AS r) AS nested"
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_cte_statement\x00" + query.encode() + b"\x00" + struct.pack("!hI", 1, 1043),
+    )
+    bind = frontend_message(
+        b"B",
+        b"wire_cte_portal\x00wire_cte_statement\x00"
+        + struct.pack("!hh", 0, 1)
+        + struct.pack("!i", 3)
+        + b"abc"
+        + struct.pack("!h", 0),
+    )
+    describe = frontend_message(b"D", b"Pwire_cte_portal\x00")
+    execute = frontend_message(b"E", b"wire_cte_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    check(
+        "raw wire: nested materialized CTE retains typed portal metadata and evaluates once",
+        description is not None
+        and row_description_type_oids(description) == [20, 20, 1043]
+        and row_description_type_modifiers(description) == [-1, -1, 9]
+        and [text_row_fields(payload) for kind, payload in out if kind == b"D"]
+        == [["1", "1", "abc"]],
+        out,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

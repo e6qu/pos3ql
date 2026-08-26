@@ -1962,7 +1962,7 @@ impl<'a> Parser<'a> {
         materialized: bool,
     ) -> Result<Stmt<'a>, ParseError> {
         let start = self.peek_at;
-        let _ = self.query()?;
+        let _ = self.query_select()?;
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
         let with_data = if self.eat_ident("with")? {
@@ -3007,7 +3007,7 @@ impl<'a> Parser<'a> {
         // Capture the raw SELECT text (re-parsed at query time).
         let start = self.peek_at;
         // Validate the body parses now, so a bad view errors at CREATE time.
-        let _ = self.query()?;
+        let _ = self.query_select()?;
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
         Ok(Stmt::CreateView {

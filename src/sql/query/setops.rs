@@ -86,7 +86,7 @@ pub fn set_query<'a>(
         ));
     }
     // WITH CTEs and view references expand across the whole tree first.
-    let body = match expand_set_tree_exec(q.with, q.body, storage, txid, arena, params) {
+    let body = match expand_set_tree_exec(q.with, q.body, storage, txid, arena, params, sequences) {
         Ok(b) => b,
         Err(e) => return sql_fail(e),
     };
@@ -210,7 +210,9 @@ pub(crate) fn set_query_into_rows<'a>(
             clause.strength.keyword()
         ));
     }
-    let body = expand_set_tree_exec(query.with, query.body, storage, txid, arena, params)?;
+    let body = expand_set_tree_exec(
+        query.with, query.body, storage, txid, arena, params, sequences,
+    )?;
     if storage.spill_attached() {
         return external_set_body_into(
             storage,

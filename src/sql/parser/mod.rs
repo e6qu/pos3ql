@@ -436,17 +436,17 @@ impl<'a> Parser<'a> {
         self.advance()?; // declare
         let name = self.col_ident("cursor name")?;
         let mut binary = false;
-        let mut scroll = false;
+        let mut scroll = crate::sql::cursor::CursorScroll::Default;
         loop {
             if self.eat_ident("binary")? {
                 binary = true;
             } else if self.eat_ident("insensitive")? || self.eat_ident("asensitive")? {
                 // Materialization makes every cursor insensitive.
             } else if self.eat_ident("scroll")? {
-                scroll = true;
+                scroll = crate::sql::cursor::CursorScroll::Scroll;
             } else if self.eat_ident("no")? {
                 self.expect_ident("scroll")?;
-                scroll = false;
+                scroll = crate::sql::cursor::CursorScroll::NoScroll;
             } else {
                 break;
             }

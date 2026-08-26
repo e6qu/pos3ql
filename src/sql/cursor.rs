@@ -8,6 +8,7 @@
 use crate::config::Config;
 use crate::mem::budget::{Budget, BudgetError};
 use crate::mem::buffer::FixedBuf;
+use crate::pg::respond::ResultFmt;
 use crate::sql_err;
 use crate::storage::SqlName;
 
@@ -25,26 +26,43 @@ pub enum FetchMotion {
     Relative(i64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorScroll {
+    Default,
+    Scroll,
+    NoScroll,
+}
+
+pub struct CursorWireParts<'a> {
+    pub description: &'a [u8],
+    pub text: &'a [u8],
+    pub text_spans: &'a [(u32, u32)],
+    pub binary: &'a [u8],
+    pub binary_spans: &'a [(u32, u32)],
+    pub declared_binary: bool,
+}
+
 pub struct CursorPool {
     slots: Vec<CursorSlot>,
-    /// Spans of the rows the last [`Self::fetch`] selected, in emission order.
-    emit: Vec<(u32, u32)>,
+    /// Row indexes selected by the last [`Self::fetch`], in emission order.
+    emit: Vec<u32>,
 }
 
 struct CursorSlot {
     active: bool,
     name: SqlName,
-    scroll: bool,
+    scroll: CursorScroll,
     hold: bool,
+    binary: bool,
     /// Created in the still-open transaction: a rollback closes it even WITH
     /// HOLD (holdability begins at commit, as PostgreSQL has it).
     tentative: bool,
-    /// The RowDescription message bytes captured at DECLARE.
-    description: FixedBuf,
-    /// Concatenated DataRow message bytes captured at DECLARE.
-    rows: FixedBuf,
-    /// Byte span of each DataRow within `rows`, for random access.
-    spans: Vec<(u32, u32)>,
+    description_text: FixedBuf,
+    description_binary: FixedBuf,
+    rows_text: FixedBuf,
+    rows_binary: FixedBuf,
+    spans_text: Vec<(u32, u32)>,
+    spans_binary: Vec<(u32, u32)>,
     /// PostgreSQL's cursor position: 0 before the first row, `1..=n` on a
     /// row, `n + 1` after the last.
     position: i64,
@@ -53,10 +71,63 @@ struct CursorSlot {
 /// How many rows one cursor may hold (the span index's capacity).
 const MAX_CURSOR_ROWS: usize = 65536;
 
+fn seal_capture(
+    rows: &FixedBuf,
+    description: &mut FixedBuf,
+    spans: &mut Vec<(u32, u32)>,
+) -> Result<(), SqlError> {
+    let bytes = rows.readable();
+    let mut cursor = 0usize;
+    let mut captured_description: Option<(usize, usize)> = None;
+    while cursor + 5 <= bytes.len() {
+        let kind = bytes[cursor];
+        let len = u32::from_be_bytes(bytes[cursor + 1..cursor + 5].try_into().unwrap()) as usize;
+        let total = 1 + len;
+        if cursor + total > bytes.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor captured a torn wire message"
+            ));
+        }
+        match kind {
+            b'T' => captured_description = Some((cursor, total)),
+            b'D' => {
+                if spans.len() == MAX_CURSOR_ROWS {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "cursor holds more than {} rows",
+                        MAX_CURSOR_ROWS
+                    ));
+                }
+                spans.push((cursor as u32, total as u32));
+            }
+            _ => {}
+        }
+        cursor += total;
+    }
+    if cursor != bytes.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cursor captured a torn wire message"
+        ));
+    }
+    if let Some((offset, total)) = captured_description
+        && (total > description.capacity() || !description.append(&bytes[offset..offset + total]))
+    {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "cursor row description exceeds its buffer"
+        ));
+    }
+    Ok(())
+}
+
 impl CursorPool {
     pub fn budget_bytes(config: &Config) -> usize {
         config.max_cursors
-            * (config.cursor_bytes + 1024 + MAX_CURSOR_ROWS * core::mem::size_of::<(u32, u32)>())
+            * (config.cursor_bytes * 2
+                + 2048
+                + MAX_CURSOR_ROWS * 2 * core::mem::size_of::<(u32, u32)>())
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
@@ -65,12 +136,16 @@ impl CursorPool {
             slots.push(CursorSlot {
                 active: false,
                 name: SqlName::parse("").expect("empty fits"),
-                scroll: false,
+                scroll: CursorScroll::Default,
                 hold: false,
+                binary: false,
                 tentative: false,
-                description: FixedBuf::new(budget, "cursor_description", 1024)?,
-                rows: FixedBuf::new(budget, "cursor_rows", config.cursor_bytes)?,
-                spans: Vec::with_capacity(MAX_CURSOR_ROWS),
+                description_text: FixedBuf::new(budget, "cursor_text_description", 1024)?,
+                description_binary: FixedBuf::new(budget, "cursor_binary_description", 1024)?,
+                rows_text: FixedBuf::new(budget, "cursor_text_rows", config.cursor_bytes)?,
+                rows_binary: FixedBuf::new(budget, "cursor_binary_rows", config.cursor_bytes)?,
+                spans_text: Vec::with_capacity(MAX_CURSOR_ROWS),
+                spans_binary: Vec::with_capacity(MAX_CURSOR_ROWS),
                 position: 0,
             });
         }
@@ -97,7 +172,13 @@ impl CursorPool {
 
     /// Reserves a slot for a fresh cursor, handing back its index; the caller
     /// fills the buffers and then calls [`Self::seal`].
-    pub fn open(&mut self, name: &str, scroll: bool, hold: bool) -> Result<usize, SqlError> {
+    pub fn open(
+        &mut self,
+        name: &str,
+        scroll: CursorScroll,
+        hold: bool,
+        binary: bool,
+    ) -> Result<usize, SqlError> {
         if self.find(name).is_some() {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_CURSOR,
@@ -116,17 +197,22 @@ impl CursorPool {
         slot.name = SqlName::parse(name)?;
         slot.scroll = scroll;
         slot.hold = hold;
+        slot.binary = binary;
         slot.tentative = true;
-        slot.description.clear();
-        slot.rows.clear();
-        slot.spans.clear();
+        slot.description_text.clear();
+        slot.description_binary.clear();
+        slot.rows_text.clear();
+        slot.rows_binary.clear();
+        slot.spans_text.clear();
+        slot.spans_binary.clear();
         slot.position = 0;
         Ok(at)
     }
 
     /// The result buffer of a slot being filled at DECLARE.
-    pub fn result_buffer(&mut self, at: usize) -> &mut FixedBuf {
-        &mut self.slots[at].rows
+    pub fn result_buffers(&mut self, at: usize) -> (&mut FixedBuf, &mut FixedBuf) {
+        let slot = &mut self.slots[at];
+        (&mut slot.rows_text, &mut slot.rows_binary)
     }
 
     /// Splits the captured wire output into the description and per-row
@@ -135,56 +221,21 @@ impl CursorPool {
     /// protocol invariant violation and errors loudly.
     pub fn seal(&mut self, at: usize) -> Result<(), SqlError> {
         let slot = &mut self.slots[at];
-        let bytes = slot.rows.readable();
-        let mut cursor = 0usize;
-        let mut description: Option<(usize, usize)> = None;
-        while cursor + 5 <= bytes.len() {
-            let kind = bytes[cursor];
-            let len =
-                u32::from_be_bytes(bytes[cursor + 1..cursor + 5].try_into().unwrap()) as usize;
-            let total = 1 + len;
-            if cursor + total > bytes.len() {
-                return Err(sql_err!(
-                    sqlstate::INTERNAL_ERROR,
-                    "cursor captured a torn wire message"
-                ));
-            }
-            match kind {
-                b'T' => description = Some((cursor, total)),
-                b'D' => {
-                    if slot.spans.len() == MAX_CURSOR_ROWS {
-                        return Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "cursor holds more than {} rows",
-                            MAX_CURSOR_ROWS
-                        ));
-                    }
-                    slot.spans.push((cursor as u32, total as u32));
-                }
-                // CommandComplete / notices pass through uncaptured.
-                _ => {}
-            }
-            cursor += total;
-        }
-        if let Some((offset, total)) = description {
-            let copied = {
-                let mut scratch = [0u8; 1024];
-                if total > scratch.len() {
-                    return Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "cursor row description exceeds 1024 bytes"
-                    ));
-                }
-                scratch[..total].copy_from_slice(&slot.rows.readable()[offset..offset + total]);
-                (scratch, total)
-            };
-            slot.description.clear();
-            if !slot.description.append(&copied.0[..copied.1]) {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "cursor row description exceeds its buffer"
-                ));
-            }
+        seal_capture(
+            &slot.rows_text,
+            &mut slot.description_text,
+            &mut slot.spans_text,
+        )?;
+        seal_capture(
+            &slot.rows_binary,
+            &mut slot.description_binary,
+            &mut slot.spans_binary,
+        )?;
+        if slot.spans_text.len() != slot.spans_binary.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor wire representations have different row counts"
+            ));
         }
         slot.active = true;
         Ok(())
@@ -205,7 +256,27 @@ impl CursorPool {
     /// install result decoders before their first FETCH.
     pub fn description(&self, name: &str) -> Option<&[u8]> {
         let at = self.find(name)?;
-        Some(self.slots[at].description.readable())
+        let slot = &self.slots[at];
+        Some(if slot.binary {
+            slot.description_binary.readable()
+        } else {
+            slot.description_text.readable()
+        })
+    }
+
+    pub fn fetch_description(
+        &self,
+        name: &str,
+        requested: ResultFmt,
+    ) -> Option<(&[u8], ResultFmt)> {
+        let at = self.find(name)?;
+        let slot = &self.slots[at];
+        let formats = if requested.count() == 0 && slot.binary {
+            ResultFmt::ALL_BINARY
+        } else {
+            requested
+        };
+        Some((slot.description_text.readable(), formats))
     }
 
     /// Applies one FETCH/MOVE motion: returns the spans of the rows to emit
@@ -221,23 +292,34 @@ impl CursorPool {
             ));
         };
         let slot = &mut self.slots[at];
-        let n = slot.spans.len() as i64;
-        // PostgreSQL refuses backward motion on a NO SCROLL cursor only when
-        // the plan cannot scan backward; materialization makes every plan
-        // backward-capable, so — by PostgreSQL's own "simple enough" rule —
-        // backward motion is always served here. (More lenient than a plan
-        // PostgreSQL would refuse; never wrong for one it accepts.)
+        let n = slot.spans_text.len() as i64;
+        let target = match motion {
+            FetchMotion::Absolute(k) if k >= 0 => k.clamp(0, n + 1),
+            FetchMotion::Absolute(k) => (n + 1 + k).clamp(0, n + 1),
+            FetchMotion::Relative(k) => (slot.position + k).clamp(0, n + 1),
+            _ => slot.position,
+        };
+        let backward = matches!(motion, FetchMotion::Count(k) if k < 0)
+            || matches!(motion, FetchMotion::BackwardAll)
+            || matches!(motion, FetchMotion::Absolute(k) if k < 0 || target < slot.position)
+            || matches!(motion, FetchMotion::Relative(k) if k < 0);
+        if slot.scroll == CursorScroll::NoScroll && backward {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cursor can only scan forward"
+            ));
+        }
         self.emit.clear();
-        let out_spans = &mut self.emit;
-        let push_row = |slot: &CursorSlot, row: i64, out: &mut Vec<(u32, u32)>| {
+        let out_rows = &mut self.emit;
+        let push_row = |row: i64, out: &mut Vec<u32>| {
             if row >= 1 && row <= n {
-                out.push(slot.spans[(row - 1) as usize]);
+                out.push((row - 1) as u32);
             }
         };
         match motion {
             FetchMotion::Count(0) => {
                 // Re-fetch the current row, position unchanged.
-                push_row(slot, slot.position, out_spans);
+                push_row(slot.position, out_rows);
             }
             FetchMotion::Count(k) if k > 0 => {
                 for _ in 0..k {
@@ -245,7 +327,7 @@ impl CursorPool {
                         break;
                     }
                     slot.position += 1;
-                    push_row(slot, slot.position, out_spans);
+                    push_row(slot.position, out_rows);
                 }
                 slot.position = slot.position.min(n + 1);
             }
@@ -255,50 +337,54 @@ impl CursorPool {
                         break;
                     }
                     slot.position -= 1;
-                    push_row(slot, slot.position, out_spans);
+                    push_row(slot.position, out_rows);
                 }
                 slot.position = slot.position.max(0);
             }
             FetchMotion::All => {
                 while slot.position <= n {
                     slot.position += 1;
-                    push_row(slot, slot.position, out_spans);
+                    push_row(slot.position, out_rows);
                 }
                 slot.position = n + 1;
             }
             FetchMotion::BackwardAll => {
                 while slot.position >= 1 {
                     slot.position -= 1;
-                    push_row(slot, slot.position, out_spans);
+                    push_row(slot.position, out_rows);
                 }
                 slot.position = 0;
             }
             FetchMotion::Absolute(k) => {
                 let target = if k >= 0 { k } else { n + 1 + k };
                 slot.position = target.clamp(0, n + 1);
-                push_row(slot, slot.position, out_spans);
+                push_row(slot.position, out_rows);
             }
             FetchMotion::Relative(k) => {
                 slot.position = (slot.position + k).clamp(0, n + 1);
-                push_row(slot, slot.position, out_spans);
+                push_row(slot.position, out_rows);
             }
         }
         Ok(self.emit.len())
     }
 
-    /// The spans the last [`Self::fetch`] selected.
-    pub fn emitted(&self) -> &[(u32, u32)] {
+    /// The row indexes selected by the last [`Self::fetch`].
+    pub fn emitted(&self) -> &[u32] {
         &self.emit
     }
 
-    /// The stored RowDescription and row bytes of a cursor (post-`fetch`,
-    /// same borrow).
-    pub fn wire_parts(&self, name: &str) -> Option<(&[u8], &[u8])> {
+    /// The stored representations used to assemble FETCH output.
+    pub fn wire_parts(&self, name: &str) -> Option<CursorWireParts<'_>> {
         let at = self.find(name)?;
-        Some((
-            self.slots[at].description.readable(),
-            self.slots[at].rows.readable(),
-        ))
+        let slot = &self.slots[at];
+        Some(CursorWireParts {
+            description: slot.description_text.readable(),
+            text: slot.rows_text.readable(),
+            text_spans: &slot.spans_text,
+            binary: slot.rows_binary.readable(),
+            binary_spans: &slot.spans_binary,
+            declared_binary: slot.binary,
+        })
     }
 
     /// CLOSE name — false when no such cursor exists.

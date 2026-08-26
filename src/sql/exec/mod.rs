@@ -201,7 +201,7 @@ pub use describe::{
 };
 pub(crate) use describe::{
     StaticTypeMeta, builtin_record_srf_field_pub, coltype_of_oid, infer_routine_argument_oid,
-    routine_result_metadata, unify_numeric_tower,
+    infer_type_catalog, routine_result_metadata, unify_numeric_tower,
 };
 pub(crate) use describe::{enter_bound_parameter_types, enter_routine_parameter_types};
 
@@ -8357,7 +8357,8 @@ fn publication_members(
                 ));
             }
             let referenced = crate::sql::exec::ddl::check_referenced_columns(filter, definition)?;
-            let (type_oid, _) = describe::infer_type_pub(filter, Some(definition))?;
+            let (type_oid, _) =
+                describe::infer_type_catalog(filter, Some(definition), storage, txid)?;
             if type_oid != ColType::Bool.oid() {
                 return Err(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
@@ -18800,7 +18801,7 @@ pub(crate) fn catalog_column_type(
     if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32)
         .contains(&type_oid)
     {
-        let domain = storage.domain((type_oid - oid::FIRST_DOMAIN) as usize);
+        let domain = storage.domain_for((type_oid - oid::FIRST_DOMAIN) as usize, txid);
         return domain.visible_to(txid).then_some((
             domain.base,
             Some(crate::storage::UserTypeName {
@@ -18813,7 +18814,7 @@ pub(crate) fn catalog_column_type(
         .contains(&type_oid)
     {
         let slot = (type_oid - oid::FIRST_DOMAIN_ARRAY) as usize;
-        let domain = storage.domain(slot);
+        let domain = storage.domain_for(slot, txid);
         let element = ArrElem::domain(slot as u16, domain.base)?;
         return domain.visible_to(txid).then_some((
             ColType::Array(element),
@@ -21621,7 +21622,7 @@ fn drop_composite_type(
         .enumerate()
         .take(storage.domain_count())
     {
-        let domain = storage.domain(domain_slot);
+        let domain = storage.domain_for(domain_slot, txn.txid);
         *selected = domain.visible_to(txn.txid)
             && matches!(domain.base, ColType::Composite(candidate) if candidate as usize == slot)
             && domain.base_user_type
@@ -25367,7 +25368,12 @@ pub fn create_statistics(
                         function
                     ));
                 }
-                if let Err(error) = infer_type_pub(expression.expression, Some(&table_definition)) {
+                if let Err(error) = infer_type_catalog(
+                    expression.expression,
+                    Some(&table_definition),
+                    storage,
+                    txn.txid,
+                ) {
                     return sql_fail(error);
                 }
                 match crate::storage::extended_statistics_expression(expression.source) {
@@ -26013,10 +26019,11 @@ pub fn create_index(
         ));
     }
     if let Some(predicate_expression) = command.predicate {
-        let (type_oid, _) = match infer_type_pub(predicate_expression, Some(&tdef)) {
-            Ok(value) => value,
-            Err(error) => return sql_fail(error),
-        };
+        let (type_oid, _) =
+            match infer_type_catalog(predicate_expression, Some(&tdef), storage, txn.txid) {
+                Ok(value) => value,
+                Err(error) => return sql_fail(error),
+            };
         if type_oid != crate::sql::types::oid::BOOL {
             return sql_fail(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
@@ -26050,10 +26057,11 @@ pub fn create_index(
             columns[i] = column_index as u16;
             tdef.columns()[column_index].ctype
         } else {
-            let (type_oid, _) = match infer_type_pub(index_column.expression, Some(&tdef)) {
-                Ok(result) => result,
-                Err(error) => return sql_fail(error),
-            };
+            let (type_oid, _) =
+                match infer_type_catalog(index_column.expression, Some(&tdef), storage, txn.txid) {
+                    Ok(result) => result,
+                    Err(error) => return sql_fail(error),
+                };
             expressions[i] =
                 match crate::storage::index_expression_stackstr(index_column.expression_text) {
                     Ok(expression) => Some(expression),
@@ -29625,7 +29633,7 @@ pub(crate) fn resolve_parameter_input_type(
     let domain_slot = (oid - oids::FIRST_DOMAIN) as usize;
     if (oids::FIRST_DOMAIN..oids::FIRST_DOMAIN + crate::storage::MAX_DOMAINS as i32).contains(&oid)
     {
-        let domain = storage.domain(domain_slot);
+        let domain = storage.domain_for(domain_slot, txid);
         if !domain.visible_to(txid) {
             return Err(unknown_type());
         }
@@ -29638,7 +29646,7 @@ pub(crate) fn resolve_parameter_input_type(
     if (oids::FIRST_DOMAIN_ARRAY..oids::FIRST_DOMAIN_ARRAY + crate::storage::MAX_DOMAINS as i32)
         .contains(&oid)
     {
-        let domain = storage.domain(domain_array_slot);
+        let domain = storage.domain_for(domain_array_slot, txid);
         if !domain.visible_to(txid) {
             return Err(unknown_type());
         }

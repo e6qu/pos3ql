@@ -11,7 +11,7 @@
 //! results are injected into evaluation by node identity (EvalHooks).
 
 use crate::mem::arena::Arena;
-use crate::pg::respond::Responder;
+use crate::pg::respond::{Responder, ResultFmt};
 use crate::pg::wire::WireFull;
 use crate::sql_err;
 use crate::stack_format;
@@ -1821,43 +1821,53 @@ pub(crate) fn emit_data_row(
     values: &[Datum],
 ) -> Outcome {
     let formats = responder.result_formats();
+    let alternate_formats = responder.alternate_result_formats();
     let catalog = storage_catalog(storage, arena, txid);
-    let mut prepared = [Datum::Null; MAX_PROJ];
-    for (index, output) in prepared.iter_mut().enumerate().take(values.len()) {
-        *output = if formats.is_binary(index) {
-            values[index]
-        } else {
+    let mut text_values = [Datum::Null; MAX_PROJ];
+    for (index, output) in text_values.iter_mut().enumerate().take(values.len()) {
+        *output =
             match super::eval::materialize_composite_text_output(values[index], &catalog, arena) {
                 Ok(value) => value,
                 Err(error) => return sql_fail(error),
-            }
-        };
+            };
     }
-    let prepared = &prepared[..values.len()];
-    if !(0..values.len()).any(|index| formats.is_binary(index)) {
-        return responder.data_row(prepared).map(|()| Ok(()));
+    let text_values = &text_values[..values.len()];
+    let any_binary = (0..values.len()).any(|index| {
+        formats.is_binary(index)
+            || alternate_formats.is_some_and(|alternate| alternate.is_binary(index))
+    });
+    if !any_binary {
+        return responder.data_row(text_values).map(|()| Ok(()));
     }
     let mut plans = [super::exec::BinaryFieldPlan::Direct; MAX_PROJ];
     for (index, plan) in plans.iter_mut().enumerate().take(values.len()) {
-        if formats.is_binary(index) {
-            *plan = match super::exec::binary_field_plan(&prepared[index], storage, txid, arena) {
+        if formats.is_binary(index)
+            || alternate_formats.is_some_and(|alternate| alternate.is_binary(index))
+        {
+            *plan = match super::exec::binary_field_plan(&values[index], storage, txid, arena) {
                 Ok(plan) => plan,
                 Err(error) => return sql_fail(error),
             };
         }
     }
     let render = responder.render_context();
-    responder
-        .data_row_prepared(prepared, &|m| {
-            for (index, value) in prepared.iter().enumerate() {
-                if formats.is_binary(index) {
-                    super::exec::encode_binary_field_plan(m, value, plans[index]);
-                } else {
-                    Responder::encode_value_text(m, value, render);
-                }
+    let emit = |message: &mut crate::pg::wire::MsgOut, selected: ResultFmt| {
+        for (index, value) in values.iter().enumerate() {
+            if selected.is_binary(index) {
+                super::exec::encode_binary_field_plan(message, value, plans[index]);
+            } else {
+                Responder::encode_value_text(message, &text_values[index], render);
             }
-        })
-        .map(|()| Ok(()))
+        }
+    };
+    responder.data_row_prepared(values, &|message| emit(message, formats))?;
+    if let Some(alternate) = alternate_formats {
+        responder
+            .data_row_prepared_alternate(values, &|message| emit(message, alternate))
+            .map(|()| Ok(()))
+    } else {
+        Ok(Ok(()))
+    }
 }
 
 /// The aggregate hook data for a select's items: the aggregate-call node

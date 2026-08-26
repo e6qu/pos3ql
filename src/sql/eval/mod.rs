@@ -434,6 +434,16 @@ pub(crate) fn expression_type_identity<'a>(
                 )
             });
     }
+    if let Expr::Field { base, field } = expression
+        && let Expr::Call { name, args, .. } = &**base
+        && name.eq_ignore_ascii_case("row")
+        && let Some(position) = crate::sql::exec::RECORD_FIELD_NAMES
+            .iter()
+            .position(|candidate| candidate.eq_ignore_ascii_case(field))
+        && let Some(argument) = args.get(position)
+    {
+        return expression_type_identity(argument, row, hooks);
+    }
     if let Expr::Array(elements) = expression
         && let Some(first) = elements.first()
     {
@@ -476,13 +486,24 @@ pub(crate) fn expression_type_identity<'a>(
             return Ok(ExpressionTypeIdentity::Known(result_oid));
         }
     }
-    match crate::sql::exec::infer_type_res(expression, &RuntimeColumnTypes(row))?.0 {
+    match crate::sql::exec::infer_type_res(
+        expression,
+        &RuntimeColumnTypes {
+            row,
+            catalog: hooks.catalog,
+        },
+    )?
+    .0
+    {
         super::types::oid::UNKNOWN => Ok(ExpressionTypeIdentity::Unresolved),
         oid => Ok(ExpressionTypeIdentity::Known(oid)),
     }
 }
 
-struct RuntimeColumnTypes<'row, 'datum>(&'row dyn ColumnLookup<'datum>);
+struct RuntimeColumnTypes<'row, 'datum> {
+    row: &'row dyn ColumnLookup<'datum>,
+    catalog: Option<&'row dyn CatalogAccess>,
+}
 
 impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
     fn resolve(
@@ -490,13 +511,19 @@ impl crate::sql::exec::ColTypeResolver for RuntimeColumnTypes<'_, '_> {
         qualifier: Option<&str>,
         name: &str,
     ) -> Result<super::types::ColType, SqlError> {
-        self.0.col_type(qualifier, name).ok_or_else(|| {
+        self.row.col_type(qualifier, name).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" does not exist",
                 name
             )
         })
+    }
+
+    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        self.catalog
+            .and_then(|catalog| catalog.user_type_oid(type_name))
+            .or_else(|| super::types::ColType::from_sql_name(type_name).map(|ctype| ctype.oid()))
     }
 }
 

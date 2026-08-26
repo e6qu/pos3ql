@@ -17,6 +17,7 @@ async function main() {
   await c.connect();
   try {
     await c.query('DROP TABLE IF EXISTS node_drv');
+    await c.query('DROP TABLE IF EXISTS node_types');
     await c.query('CREATE TABLE node_drv (id int PRIMARY KEY, name text, score float8)');
 
     // Parameterized inserts (extended protocol).
@@ -34,6 +35,17 @@ async function main() {
     line('update rows=' + (await c.query('UPDATE node_drv SET score=$1 WHERE id=$2', [10, 3])).rowCount);
     line('delete rows=' + (await c.query('DELETE FROM node_drv WHERE id=$1', [2])).rowCount);
 
+    await c.query('CREATE TABLE node_types (id int PRIMARY KEY, label varchar(4), amount numeric(7,2), ' +
+      'ids integer[], note jsonb, span int4range, key uuid)');
+    line('typed insert rows=' + (await c.query(
+      'INSERT INTO node_types VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [1, 'wide', '12.345', [1, null, 3], { ready: true }, '[1,5)',
+        '00112233-4455-6677-8899-aabbccddeeff'])).rowCount);
+    const typed = (await c.query(
+      'SELECT label, amount, ids, note, span::text, key::text FROM node_types')).rows[0];
+    line(`typed ${typed.label}|${typed.amount}|${JSON.stringify(typed.ids)}|` +
+      `${JSON.stringify(typed.note)}|${typed.span}|${typed.key}`);
+
     // Transaction rollback must not persist.
     await c.query('BEGIN');
     await c.query("INSERT INTO node_drv VALUES (9,'tmp',null)");
@@ -49,8 +61,11 @@ async function main() {
     for (const r of cols.rows) {
       line(`col ${r.attname}|${r.t}|notnull=${r.attnotnull}`);
     }
-  } catch (e) {
-    line('FATAL ' + (e.code || '?????') + ' ' + String(e.message).split('\n')[0]);
+    const typedCols = await c.query(
+      "SELECT attname, format_type(atttypid, atttypmod) AS t " +
+      "FROM pg_attribute WHERE attrelid = 'node_types'::regclass AND attnum > 0 " +
+      "AND NOT attisdropped ORDER BY attnum");
+    for (const r of typedCols.rows) line(`typed-col ${r.attname}|${r.t}`);
   } finally {
     await c.end();
   }

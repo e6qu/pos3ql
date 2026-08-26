@@ -56,6 +56,13 @@ struct Prepared {
     param_oids: [i32; MAX_BIND_PARAMS],
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PortalExecution {
+    Fresh,
+    Paging,
+    Complete,
+}
+
 struct Portal {
     active: bool,
     name: SqlName,
@@ -70,7 +77,9 @@ struct Portal {
     result_formats: ResultFmt,
     /// Buffered result messages for max_rows paging (Execute suspension).
     result: FixedBuf,
-    executed: bool,
+    execution: PortalExecution,
+    completion: crate::util::StackStr<64>,
+    returned_rows: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,7 +305,9 @@ impl Conn {
                 n_params: 0,
                 result_formats: ResultFmt::ALL_TEXT,
                 result: FixedBuf::new(budget, "portal_result", config.portal_result_bytes)?,
-                executed: false,
+                execution: PortalExecution::Fresh,
+                completion: crate::util::StackStr::new(),
+                returned_rows: false,
             });
         }
         Ok(Self {
@@ -1116,6 +1127,11 @@ impl Conn {
             self.recv.consume(total);
             if is_sync {
                 self.phase = Phase::Ready;
+                if self.txn.mode == crate::sql::txn::TxnMode::Idle {
+                    for portal in &mut self.portals {
+                        portal.active = false;
+                    }
+                }
                 let status = self.txn.status_byte();
                 let mut responder = Responder::new(&mut self.send);
                 if responder.ready_for_query(status).is_err() {
@@ -1129,6 +1145,22 @@ impl Conn {
             wire::FMSG_QUERY => self.handle_query(engine, total),
             wire::FMSG_TERMINATE => Step::Close,
             wire::FMSG_SYNC => {
+                if self.txn.mode == crate::sql::txn::TxnMode::Implicit
+                    && let Err(error) = engine.commit_txn(&mut self.txn, &self.guc)
+                {
+                    let mut responder = Responder::new(&mut self.send);
+                    if responder
+                        .error(error.sqlstate, error.message.as_str())
+                        .is_err()
+                    {
+                        return Step::Close;
+                    }
+                }
+                if self.txn.mode == crate::sql::txn::TxnMode::Idle {
+                    for portal in &mut self.portals {
+                        portal.active = false;
+                    }
+                }
                 let status = self.txn.status_byte();
                 let mut responder = Responder::new(&mut self.send);
                 match responder.ready_for_query(status) {
@@ -1932,7 +1964,13 @@ impl Conn {
             let mark = self.send.mark();
             let described = {
                 let mut responder = Responder::for_describe(&mut self.send, result_formats);
-                engine.describe(text, &self.arena, &self.txn, &mut responder)
+                engine.describe(
+                    text,
+                    &self.arena,
+                    &self.txn,
+                    Some(&self.cursors),
+                    &mut responder,
+                )
             };
             match described {
                 Ok(true) => {}
@@ -1979,11 +2017,19 @@ impl Conn {
             }
         }
 
-        let slot = self
+        let existing = self
             .portals
             .iter()
-            .position(|p| p.active && p.name.as_str() == portal_name)
-            .or_else(|| self.portals.iter().position(|p| !p.active));
+            .position(|portal| portal.active && portal.name.as_str() == portal_name);
+        if !portal_name.is_empty() && existing.is_some() {
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                sqlstate::DUPLICATE_CURSOR,
+                crate::stack_format!(96, "portal \"{portal_name}\" already exists").as_str(),
+            );
+        }
+        let slot = existing.or_else(|| self.portals.iter().position(|portal| !portal.active));
         let Some(slot) = slot else {
             return ext_err(&mut self.send, &mut self.phase, "54000", "too many portals");
         };
@@ -2014,7 +2060,9 @@ impl Conn {
         portal.n_params = n_params as u16;
         portal.result_formats = result_formats;
         portal.result.clear();
-        portal.executed = false;
+        portal.execution = PortalExecution::Fresh;
+        portal.completion.clear();
+        portal.returned_rows = false;
 
         let mut responder = Responder::new(&mut self.send);
         match responder.bind_complete() {
@@ -2050,11 +2098,8 @@ impl Conn {
                         self.portals[i].statement
                     });
                 if protocol_portal.is_none() {
-                    // A SQL DECLARE runs through an unnamed protocol portal,
-                    // but PostgreSQL exposes the resulting named SQL cursor to
-                    // Describe Portal.  Its declaration captured the exact
-                    // text RowDescription, which is the only valid metadata
-                    // for the later text FETCH stream.
+                    // PostgreSQL exposes a named SQL cursor to Describe Portal;
+                    // DECLARE captured its exact text or binary description.
                     if let Some(description) = self.cursors.description(name) {
                         return if self.send.append(description) {
                             Step::Continue
@@ -2109,7 +2154,13 @@ impl Conn {
         }
         let _parameter_types =
             crate::sql::exec::enter_bound_parameter_types(&param_oids[..n_params as usize]);
-        match engine.describe(text, &self.arena, &self.txn, &mut responder) {
+        match engine.describe(
+            text,
+            &self.arena,
+            &self.txn,
+            Some(&self.cursors),
+            &mut responder,
+        ) {
             Ok(true) => Step::Continue,
             Ok(false) => {
                 self.phase = Phase::SkipToSync;
@@ -2143,12 +2194,34 @@ impl Conn {
             );
         };
 
-        // A portal already producing rows (executed==true) always drains
-        // from its buffer, even for a following Execute with max_rows=0.
-        // A fresh portal buffers when paged (max_rows>0), else streams.
-        let already_started = self.portals[portal_slot].executed;
-        let mut paged = max_rows > 0 || already_started;
-        let need_run = !already_started;
+        if max_rows < 0 {
+            return ext_err(
+                &mut self.send,
+                &mut self.phase,
+                sqlstate::PROTOCOL_VIOLATION,
+                "Execute message has a negative row limit",
+            );
+        }
+        if self.portals[portal_slot].execution == PortalExecution::Complete {
+            let portal = &self.portals[portal_slot];
+            let mut responder = Responder::new(&mut self.send);
+            return if portal.completion.as_str().is_empty() {
+                match responder.empty_query_response() {
+                    Ok(()) => Step::Continue,
+                    Err(WireFull) => Step::Close,
+                }
+            } else {
+                let tag = command_tag_rows(portal.completion.as_str(), 0);
+                match responder.command_complete(tag.as_str()) {
+                    Ok(()) => Step::Continue,
+                    Err(WireFull) => Step::Close,
+                }
+            };
+        }
+
+        let need_run = self.portals[portal_slot].execution == PortalExecution::Fresh;
+        let mut paged =
+            max_rows > 0 || self.portals[portal_slot].execution == PortalExecution::Paging;
 
         if need_run {
             self.arena.reset();
@@ -2343,8 +2416,16 @@ impl Conn {
                 return Step::Continue;
             }
             if paged {
-                self.portals[portal_slot].executed = true;
+                self.portals[portal_slot].execution = PortalExecution::Paging;
             } else {
+                let completion = command_completion_in(
+                    self.send.filled_mut().get(send_mark..).unwrap_or_default(),
+                )
+                .map(crate::util::StackStr::from_str)
+                .unwrap_or_default();
+                let portal = &mut self.portals[portal_slot];
+                portal.completion = completion;
+                portal.execution = PortalExecution::Complete;
                 return Step::Continue;
             }
         }
@@ -2353,6 +2434,13 @@ impl Conn {
         let portal = &mut self.portals[portal_slot];
         let mut sent = 0i32;
         loop {
+            if max_rows > 0 && sent == max_rows {
+                let mut responder = Responder::new(&mut self.send);
+                return match resp_portal_suspended(&mut responder) {
+                    Ok(()) => Step::Continue,
+                    Err(WireFull) => Step::Close,
+                };
+            }
             let data = portal.result.readable();
             if data.len() < 5 {
                 break;
@@ -2363,10 +2451,20 @@ impl Conn {
             if data.len() < total_msg {
                 break;
             }
-            if msg_type == wire::MSG_DATA_ROW && max_rows > 0 && sent >= max_rows {
-                // More rows remain: suspend the portal.
+            if msg_type == wire::MSG_COMMAND_COMPLETE {
+                let Some(tag) = command_completion_in(&data[..total_msg]) else {
+                    return Step::Close;
+                };
+                portal.completion = crate::util::StackStr::from_str(tag);
                 let mut responder = Responder::new(&mut self.send);
-                return match resp_portal_suspended(&mut responder) {
+                let result = if portal.returned_rows {
+                    let page_tag = command_tag_rows(tag, sent as u64);
+                    responder.command_complete(page_tag.as_str())
+                } else {
+                    responder.raw(&data[..total_msg])
+                };
+                portal.execution = PortalExecution::Complete;
+                return match result {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
                 };
@@ -2376,6 +2474,7 @@ impl Conn {
             }
             if msg_type == wire::MSG_DATA_ROW {
                 sent += 1;
+                portal.returned_rows = true;
             }
             portal.result.consume(total_msg);
         }
@@ -3745,6 +3844,37 @@ fn resp_portal_suspended(responder: &mut Responder) -> Result<(), crate::pg::wir
     MsgOut::begin(responder.buffer, MSG_PORTAL_SUSPENDED).finish()
 }
 
+fn command_completion_in(mut bytes: &[u8]) -> Option<&str> {
+    while bytes.len() >= 5 {
+        let length = i32::from_be_bytes(bytes[1..5].try_into().ok()?);
+        let total = usize::try_from(length).ok()?.checked_add(1)?;
+        if length < 4 || total > bytes.len() {
+            return None;
+        }
+        if bytes[0] == wire::MSG_COMMAND_COMPLETE {
+            let payload = &bytes[5..total];
+            let tag = payload.strip_suffix(&[0])?;
+            return core::str::from_utf8(tag).ok();
+        }
+        bytes = &bytes[total..];
+    }
+    None
+}
+
+fn command_tag_rows(tag: &str, rows: u64) -> crate::util::StackStr<64> {
+    use core::fmt::Write as _;
+
+    let Some((prefix, count)) = tag.rsplit_once(' ') else {
+        return crate::util::StackStr::from_str(tag);
+    };
+    if count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return crate::util::StackStr::from_str(tag);
+    }
+    let mut result = crate::util::StackStr::new();
+    let _ = write!(result, "{prefix} {rows}");
+    result
+}
+
 /// Decodes a binary-format parameter using its declared type OID
 /// (network byte order per the protocol's binary representations). `arena`
 /// backs the values (e.g. NUMERIC) that need it.
@@ -4030,6 +4160,17 @@ fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, messa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_completion_tags_count_only_the_current_execute() {
+        assert_eq!(command_tag_rows("SELECT 9", 2).as_str(), "SELECT 2");
+        assert_eq!(command_tag_rows("INSERT 0 9", 0).as_str(), "INSERT 0 0");
+        assert_eq!(command_tag_rows("CREATE TABLE", 0).as_str(), "CREATE TABLE");
+
+        let message = b"C\0\0\0\x0dSELECT 2\0";
+        assert_eq!(command_completion_in(message), Some("SELECT 2"));
+        assert_eq!(command_completion_in(&message[..message.len() - 1]), None);
+    }
 
     #[test]
     fn cancellation_keys_preserve_protocol_version_boundaries() {

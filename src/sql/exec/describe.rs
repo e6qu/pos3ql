@@ -1043,22 +1043,10 @@ pub fn register_named_composite_shape(
     })
 }
 
-fn visit_named_composite_shape(name: &str, mut visit: impl FnMut(&str, ColType)) -> Option<usize> {
-    RECORD_SHAPES.with(|p| {
-        let p = p.borrow();
-        let pool = p.as_ref()?;
-        let at = pool.named_names[..pool.named_n]
-            .iter()
-            .position(|candidate| candidate.as_str().eq_ignore_ascii_case(name))?;
-        let len = pool.named_lens[at] as usize;
-        for field in &pool.named[at][..len] {
-            visit(field.name.as_str(), field.ctype);
-        }
-        Some(len)
-    })
-}
-
-fn visit_composite_slot_shape(slot: u16, mut visit: impl FnMut(&str, ColType)) -> Option<usize> {
+fn visit_composite_slot_shape_metadata(
+    slot: u16,
+    mut visit: impl FnMut(&str, StaticTypeMeta),
+) -> Option<usize> {
     RECORD_SHAPES.with(|p| {
         let p = p.borrow();
         let pool = p.as_ref()?;
@@ -1067,7 +1055,7 @@ fn visit_composite_slot_shape(slot: u16, mut visit: impl FnMut(&str, ColType)) -
             .position(|candidate| *candidate == slot)?;
         let len = pool.named_lens[at] as usize;
         for field in &pool.named[at][..len] {
-            visit(field.name.as_str(), field.ctype);
+            visit(field.name.as_str(), field.metadata());
         }
         Some(len)
     })
@@ -1468,27 +1456,34 @@ pub fn record_shape(
     columns: &dyn ColTypeResolver,
     mut visit: impl FnMut(&str, ColType),
 ) -> Option<usize> {
+    record_shape_metadata(base, columns, |name, meta| visit(name, meta.ctype))
+}
+
+fn record_shape_metadata(
+    base: &Expr,
+    columns: &dyn ColTypeResolver,
+    mut visit: impl FnMut(&str, StaticTypeMeta),
+) -> Option<usize> {
     match base {
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
             let n = args.len().min(RECORD_FIELD_NAMES.len());
             for (i, arg) in args[..n].iter().enumerate() {
-                let oid = infer_type_res(arg, columns).ok()?.0;
                 visit(
                     RECORD_FIELD_NAMES[i],
-                    coltype_of_oid(oid).unwrap_or(ColType::Text),
+                    expression_static_metadata(arg, columns)?,
                 );
             }
             Some(n)
         }
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
-            visit("x", expand_array_element_metadata(args, columns)?.ctype);
-            visit("n", ColType::Int4);
+            visit("x", expand_array_element_metadata(args, columns)?);
+            visit("n", StaticTypeMeta::of(ColType::Int4));
             Some(2)
         }
         Expr::Call { name, .. } if builtin_record_srf_field(name, 0).is_some() => {
             let mut count = 0;
             while let Some((field, ctype)) = builtin_record_srf_field(name, count) {
-                visit(field, ctype);
+                visit(field, StaticTypeMeta::of(ctype));
                 count += 1;
             }
             Some(count)
@@ -1505,19 +1500,16 @@ pub fn record_shape(
             while let Some((field_name, meta)) =
                 columns.routine_record_field(name, &argument_oids[..args.len()], count)
             {
-                visit(field_name.as_str(), meta.ctype);
+                visit(field_name.as_str(), meta);
                 count += 1;
             }
             (count != 0).then_some(count)
         }
-        Expr::WholeRow(table) => shape_from_columns(columns.table_columns(table)?, visit),
+        Expr::WholeRow(table) => shape_from_columns_metadata(table, columns, visit),
         Expr::Cast { type_name, .. } => {
-            if let Some(count) = visit_named_composite_shape(type_name, &mut visit) {
-                return Some(count);
-            }
             let mut n = 0;
             while let Some((name, meta)) = columns.named_composite_field(type_name, n) {
-                visit(name.as_str(), meta.ctype);
+                visit(name.as_str(), meta);
                 n += 1;
             }
             (n != 0).then_some(n)
@@ -1528,7 +1520,7 @@ pub fn record_shape(
             let ColType::Composite(slot) = columns.resolve(*qualifier, name).ok()? else {
                 unreachable!()
             };
-            visit_composite_slot_shape(slot, visit)
+            visit_composite_slot_shape_metadata(slot, visit)
         }
         Expr::Field { base, field }
             if matches!(
@@ -1539,7 +1531,7 @@ pub fn record_shape(
             let Ok(ColType::Composite(slot)) = record_field_type(base, field, columns) else {
                 unreachable!()
             };
-            visit_composite_slot_shape(slot, visit)
+            visit_composite_slot_shape_metadata(slot, visit)
         }
         Expr::Subscript { base: array, .. } => {
             let element = match &**array {
@@ -1567,24 +1559,32 @@ pub fn record_shape(
             let Some(ColType::Composite(slot)) = element else {
                 return None;
             };
-            visit_composite_slot_shape(slot, visit)
+            visit_composite_slot_shape_metadata(slot, visit)
         }
         // A record-typed column (or a record field of one) with a registered
         // shape exposes its fields for selection and star expansion.
         Expr::Column { .. } | Expr::Field { .. } if expr_record_handle(base, columns).is_some() => {
-            visit_record_shape(expr_record_handle(base, columns)?, visit)
+            visit_record_shape_metadata(expr_record_handle(base, columns)?, visit)
         }
         Expr::Column {
             qualifier: None,
             name,
-        } if columns.is_whole_row(name) => shape_from_columns(columns.table_columns(name)?, visit),
+        } if columns.is_whole_row(name) => shape_from_columns_metadata(name, columns, visit),
         _ => None,
     }
 }
 
-fn shape_from_columns(cols: &[ColumnMeta], mut visit: impl FnMut(&str, ColType)) -> Option<usize> {
+fn shape_from_columns_metadata(
+    table: &str,
+    columns: &dyn ColTypeResolver,
+    mut visit: impl FnMut(&str, StaticTypeMeta),
+) -> Option<usize> {
+    let cols = columns.table_columns(table)?;
     for col in cols {
-        visit(col.name.as_str(), col.ctype);
+        visit(
+            col.name.as_str(),
+            columns.column_meta(Some(table), col.name.as_str())?,
+        );
     }
     Some(cols.len())
 }
@@ -1730,9 +1730,9 @@ pub fn record_field_metadata(
         return Ok(meta);
     }
     let mut found = None;
-    let shape = record_shape(base, columns, |name, ctype| {
+    let shape = record_shape_metadata(base, columns, |name, meta| {
         if found.is_none() && name.eq_ignore_ascii_case(field) {
-            found = Some(StaticTypeMeta::of(ctype));
+            found = Some(meta);
         }
     });
     if shape.is_none() {
@@ -1977,16 +1977,25 @@ impl<'a> ColumnLookup<'a> for AliasedDefCols<'_, '_> {
 /// Adapts a runtime row (`ColumnLookup`) to the static `ColTypeResolver` that
 /// `infer_type_res` needs, so an expression's declared type can be recovered
 /// during evaluation even when its value is NULL.
-struct RowCols<'r, 'a>(&'r dyn crate::sql::eval::ColumnLookup<'a>);
+struct RowCols<'r, 'a> {
+    row: &'r dyn crate::sql::eval::ColumnLookup<'a>,
+    catalog: Option<&'r dyn crate::sql::eval::CatalogAccess>,
+}
 impl<'a> ColTypeResolver for RowCols<'_, 'a> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
-        self.0.col_type(qualifier, name).ok_or_else(|| {
+        self.row.col_type(qualifier, name).ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
                 "column \"{}\" does not exist",
                 name
             )
         })
+    }
+
+    fn named_type_oid(&self, type_name: &str) -> Option<i32> {
+        self.catalog
+            .and_then(|catalog| catalog.user_type_oid(type_name))
+            .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
     }
 }
 
@@ -1999,16 +2008,18 @@ impl<'a> ColTypeResolver for RowCols<'_, 'a> {
 pub fn typeof_static_coltype<'a>(
     expression: &Expr,
     row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
 ) -> Option<ColType> {
-    let (type_oid, _) = infer_type_res(expression, &RowCols(row)).ok()?;
+    let (type_oid, _) = infer_type_res(expression, &RowCols { row, catalog }).ok()?;
     coltype_of_oid(type_oid)
 }
 
 pub fn typeof_static<'a>(
     expression: &Expr,
     row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
 ) -> Option<&'static str> {
-    let (type_oid, _) = infer_type_res(expression, &RowCols(row)).ok()?;
+    let (type_oid, _) = infer_type_res(expression, &RowCols { row, catalog }).ok()?;
     Some(match coltype_of_oid(type_oid)? {
         ColType::Array(elem) => elem.typeof_name(),
         other => other.name(),
@@ -2020,8 +2031,9 @@ pub fn typeof_static<'a>(
 pub fn typeof_static_oid<'a>(
     expression: &Expr,
     row: &dyn crate::sql::eval::ColumnLookup<'a>,
+    catalog: Option<&dyn crate::sql::eval::CatalogAccess>,
 ) -> Option<i32> {
-    infer_type_res(expression, &RowCols(row))
+    infer_type_res(expression, &RowCols { row, catalog })
         .ok()
         .map(|(type_oid, _)| type_oid)
 }
@@ -2104,6 +2116,23 @@ pub fn infer_type_pub(expression: &Expr, def: Option<&TableDef>) -> Result<(i32,
         Some(d) => infer_type_res(expression, &DefCols(d)),
         None => infer_type_res(expression, &NoCols),
     }
+}
+
+pub(crate) fn infer_type_catalog(
+    expression: &Expr,
+    definition: Option<&TableDef>,
+    storage: &crate::storage::Storage,
+    txid: u32,
+) -> Result<(i32, i16), SqlError> {
+    infer_type_res(
+        expression,
+        &CatalogCols {
+            definition,
+            alias: None,
+            storage,
+            txid,
+        },
+    )
 }
 
 /// Static type inference with operator/aggregate validation, matching
@@ -2514,15 +2543,15 @@ pub fn infer_type_res(
             type_name,
             ..
         } => {
-            if type_name.eq_ignore_ascii_case("regtype") {
-                return Ok((oid::REGTYPE, 4));
+            if let Some(type_oid) = columns.named_type_oid(type_name) {
+                return Ok((
+                    type_oid,
+                    coltype_of_oid(type_oid).map_or(-1, ColType::typlen),
+                ));
             }
             match ColType::from_sql_name(type_name) {
                 Some(t) => of(t),
-                // A non-base type name may be a user-defined enum, which this
-                // catalog-free inference cannot resolve to an OID. Report it as
-                // unknown here; the eval-time Cast resolves the actual enum
-                // value (or errors on a genuinely missing type).
+                // A resolver without a catalog cannot identify a user type.
                 None => (oid::UNKNOWN, -2),
             }
         }

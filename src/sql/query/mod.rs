@@ -62,7 +62,7 @@ pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
     rewrite_view_dml,
 };
-pub(crate) use cte::{expand_set_tree, expand_stored_query};
+pub(crate) use cte::{expand_set_tree, expand_stored_query, expand_stored_query_exec};
 
 pub fn stored_query_dependencies(
     sql: &str,
@@ -789,7 +789,7 @@ pub(crate) fn execute_routine_query<'a>(
 ) -> Result<(), SqlError> {
     match query {
         RoutineQuery::Select(select) => {
-            let select = expand_ctes_exec(select, storage, txid, arena, params, &[])?;
+            let select = expand_ctes_exec(select, storage, txid, arena, params, &[], None)?;
             validate_locking(select)?;
             if recycling {
                 select_into_rows_recycling(storage, txid, select, arena, params, None, None, emit)

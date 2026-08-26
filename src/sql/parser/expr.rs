@@ -187,8 +187,8 @@ impl<'a> Parser<'a> {
                 };
                 if self.eat_ident("in")? {
                     self.expect_op("(")?;
-                    if self.peeked == Tok::Ident("select") {
-                        let select = self.select()?;
+                    if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
+                        let select = self.query_select()?;
                         self.expect_op(")")?;
                         let boxed = self
                             .arena
@@ -368,8 +368,8 @@ impl<'a> Parser<'a> {
                 let all = self.peeked == Tok::Ident("all");
                 self.advance()?;
                 self.expect_op("(")?;
-                if self.peeked == Tok::Ident("select") {
-                    let select = self.select()?;
+                if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
+                    let select = self.query_select()?;
                     self.expect_op(")")?;
                     let boxed = self
                         .arena
@@ -482,8 +482,8 @@ impl<'a> Parser<'a> {
             }
             Tok::Op("(") => {
                 self.advance()?;
-                if self.peeked == Tok::Ident("select") {
-                    let select = self.select()?;
+                if matches!(self.peeked, Tok::Ident("select") | Tok::Ident("with")) {
+                    let select = self.query_select()?;
                     self.expect_op(")")?;
                     let boxed = self
                         .arena
@@ -641,7 +641,7 @@ impl<'a> Parser<'a> {
             Tok::Ident("exists") => {
                 self.advance()?;
                 self.expect_op("(")?;
-                let select = self.select()?;
+                let select = self.query_select()?;
                 self.expect_op(")")?;
                 let boxed = self
                     .arena
@@ -765,7 +765,7 @@ impl<'a> Parser<'a> {
                 // `ARRAY(SELECT ...)` array-from-subquery constructor.
                 if name.eq_ignore_ascii_case("array") && self.peeked == Tok::Op("(") {
                     self.advance()?;
-                    let select = self.select()?;
+                    let select = self.query_select()?;
                     self.expect_op(")")?;
                     let boxed = self
                         .arena

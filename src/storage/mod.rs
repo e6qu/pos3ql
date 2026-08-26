@@ -19811,8 +19811,8 @@ impl Storage {
     }
 
     pub(crate) fn has_aggregate_candidate(&self, name: &str, arity: usize, txid: u32) -> bool {
-        self.has_routine_candidate(name, arity, txid, |kind| {
-            matches!(kind, RoutineKind::Aggregate(_))
+        self.has_routine_candidate(name, arity, txid, |routine| {
+            matches!(routine.kind, RoutineKind::Aggregate(_))
         })
     }
 
@@ -19903,7 +19903,7 @@ impl Storage {
     }
 
     pub(crate) fn has_set_routine_candidate(&self, name: &str, arity: usize, txid: u32) -> bool {
-        self.has_routine_candidate(name, arity, txid, |kind| kind.is_set_returning())
+        self.has_routine_candidate(name, arity, txid, |routine| routine.kind.is_set_returning())
     }
 
     pub(crate) fn has_function_routine_candidate(
@@ -19912,13 +19912,29 @@ impl Storage {
         arity: usize,
         txid: u32,
     ) -> bool {
-        self.has_routine_candidate(name, arity, txid, |kind| {
+        self.has_routine_candidate(name, arity, txid, |routine| {
             matches!(
-                kind,
+                routine.kind,
                 RoutineKind::Function { .. }
                     | RoutineKind::SetFunction { .. }
                     | RoutineKind::TableFunction
             )
+        })
+    }
+
+    pub(crate) fn has_volatile_function_routine_candidate(
+        &self,
+        name: &str,
+        arity: usize,
+        txid: u32,
+    ) -> bool {
+        self.has_routine_candidate(name, arity, txid, |routine| {
+            matches!(
+                routine.kind,
+                RoutineKind::Function { .. }
+                    | RoutineKind::SetFunction { .. }
+                    | RoutineKind::TableFunction
+            ) && routine.attributes.volatility == RoutineVolatility::Volatile
         })
     }
 
@@ -19927,13 +19943,13 @@ impl Storage {
         name: &str,
         arity: usize,
         txid: u32,
-        accepts: impl Fn(RoutineKind) -> bool,
+        accepts: impl Fn(RoutineDef) -> bool,
     ) -> bool {
         let matches = |schema: &str, routine_name: &str| {
             self.routines.iter().any(|routine| {
                 let definition = routine.definition_for(txid);
                 routine.visible_to(txid)
-                    && accepts(definition.kind)
+                    && accepts(definition)
                     && definition.argument_count == arity
                     && definition.schema_for(txid).as_str() == schema
                     && definition.name_for(txid).as_str() == routine_name

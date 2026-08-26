@@ -192,6 +192,31 @@ assert [d.name for d in cur.description] == ["id", "name", "score"]
 assert cur.fetchone() == (8, "eve", 6.5)
 print("with dml extended protocol ok")
 
+# A query-local WITH scope keeps its parameter and output metadata through a
+# named extended-protocol execution, while materialization evaluates a volatile
+# body once even when nested and referenced twice.
+cur.execute("CREATE SEQUENCE drv_cte_sequence")
+cte_query = """
+    WITH outer_value AS MATERIALIZED (
+        SELECT nextval('drv_cte_sequence') AS marker, %s::varchar(5) AS label
+    )
+    SELECT nested.left_marker, nested.right_marker, nested.label
+    FROM (
+        WITH inner_value AS MATERIALIZED (SELECT marker, label FROM outer_value)
+        SELECT left_value.marker AS left_marker,
+               right_value.marker AS right_marker,
+               left_value.label
+        FROM inner_value AS left_value CROSS JOIN inner_value AS right_value
+    ) AS nested
+"""
+cur.execute(cte_query, ("abc",))
+assert [d.name for d in cur.description] == ["left_marker", "right_marker", "label"]
+assert [d.type_code for d in cur.description] == [20, 20, 1043]
+assert cur.fetchone() == (1, 1, "abc")
+cur.execute(cte_query, ("xyz",))
+assert cur.fetchone() == (2, 2, "xyz")
+print("nested materialized CTE extended protocol ok")
+
 # RowDescription atttypmod: a table column carries its declared modifier and a
 # cast its target's, while a computed expression carries none — psycopg derives
 # display_size/precision/scale from it, so a client sees varchar(5) as 5.

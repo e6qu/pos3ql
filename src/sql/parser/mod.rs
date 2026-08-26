@@ -277,7 +277,9 @@ pub fn parse_query<'a>(
         message: crate::stack_format!(192, "invalid query: {}", m),
     };
     let mut parser = Parser::new(sql, arena).map_err(|e| to_sql(e.message.as_str()))?;
-    let sel = parser.select().map_err(|e| to_sql(e.message.as_str()))?;
+    let sel = parser
+        .query_select()
+        .map_err(|e| to_sql(e.message.as_str()))?;
     if parser.peeked != Tok::Eof {
         return Err(to_sql("trailing tokens after query"));
     }
@@ -464,7 +466,7 @@ impl<'a> Parser<'a> {
         self.expect_ident("for")?;
         // Capture the raw SELECT text; validated by parsing it now.
         let start = self.peek_at;
-        let _ = self.query()?;
+        let _ = self.query_select()?;
         let end = self.peek_at;
         let sql = self.text[start..end].trim();
         Ok(Stmt::DeclareCursor {
@@ -1481,6 +1483,36 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parses any query expression into the Select-shaped representation used
+    /// by stored definitions and query-bearing commands. WITH is part of that
+    /// expression in PostgreSQL, not a top-level-only statement prefix.
+    fn query_select(&mut self) -> Result<Select<'a>, ParseError> {
+        if self.peeked != Tok::Ident("with") {
+            return self.select();
+        }
+        match self.with_query()? {
+            Stmt::Select(select) => Ok(select),
+            Stmt::SetQuery(query) => Ok(Select {
+                items: &[],
+                distinct: false,
+                distinct_on: &[],
+                from: None,
+                where_clause: None,
+                group_by: &[],
+                grouping_sets: &[],
+                having: None,
+                order_by: query.order_by,
+                limit: query.limit,
+                offset: query.offset,
+                with_ties: query.with_ties,
+                with: query.with,
+                set_body: Some(query.body),
+                locking: query.locking,
+            }),
+            _ => Err(self.err_here("query must end in SELECT, TABLE, or VALUES")),
+        }
+    }
+
     /// Parses the trailing `FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }
     /// [OF t, …] [NOWAIT | SKIP LOCKED]` row-locking clauses (zero or more).
     fn locking_clauses(&mut self) -> Result<&'a [LockClause<'a>], ParseError> {
@@ -1573,6 +1605,7 @@ impl<'a> Parser<'a> {
             name: "",
             columns: &[],
             recursive: false,
+            materialization: crate::sql::ast::CteMaterialization::Default,
             query: placeholder,
             dml: None,
         }; MAX_CTES];
@@ -1585,6 +1618,14 @@ impl<'a> Parser<'a> {
             // Optional output-column rename list `name(c1, c2, ...)`.
             let columns = self.column_alias_list()?.unwrap_or(&[]);
             self.expect_ident("as")?;
+            let materialization = if self.eat_ident("materialized")? {
+                crate::sql::ast::CteMaterialization::Materialized
+            } else if self.eat_ident("not")? {
+                self.expect_ident("materialized")?;
+                crate::sql::ast::CteMaterialization::NotMaterialized
+            } else {
+                crate::sql::ast::CteMaterialization::Default
+            };
             self.expect_op("(")?;
             // A data-modifying CTE body is an INSERT/UPDATE/DELETE (run once,
             // its RETURNING becomes the relation); anything else is a query.
@@ -1599,7 +1640,7 @@ impl<'a> Parser<'a> {
                     .map_err(|_| self.err_here("statement too large for SQL arena"))?;
                 (placeholder, Some(&*boxed_stmt))
             } else {
-                let q = self.select()?;
+                let q = self.query_select()?;
                 let boxed = self
                     .arena
                     .alloc(q)
@@ -1611,6 +1652,7 @@ impl<'a> Parser<'a> {
                 name,
                 columns,
                 recursive,
+                materialization,
                 query: boxed,
                 dml,
             };
@@ -1971,7 +2013,7 @@ impl<'a> Parser<'a> {
         // alias, so a missing one is a syntax error.
         if self.peeked == Tok::Op("(") {
             self.advance()?;
-            let select = self.select()?;
+            let select = self.query_select()?;
             self.expect_op(")")?;
             let boxed = self
                 .arena
@@ -2226,7 +2268,7 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Op("(") {
             self.advance()?;
             let start = self.peek_at;
-            let _ = self.query()?;
+            let _ = self.query_select()?;
             let end = self.peek_at;
             self.expect_op(")")?;
             let query = self.text[start..end].trim();
@@ -5321,6 +5363,38 @@ mod tests {
                 ));
             },
         );
+    }
+
+    #[test]
+    fn cte_materialization_and_query_bodies_are_typed_at_parse_time() {
+        with_parser(
+            "WITH a AS MATERIALIZED (SELECT 1), \
+                  b AS NOT MATERIALIZED (SELECT * FROM a) \
+             SELECT * FROM b",
+            |parser| {
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected WITH query")
+                };
+                assert_eq!(
+                    select.with[0].materialization,
+                    crate::sql::ast::CteMaterialization::Materialized
+                );
+                assert_eq!(
+                    select.with[1].materialization,
+                    crate::sql::ast::CteMaterialization::NotMaterialized
+                );
+            },
+        );
+        for query in [
+            "CREATE TABLE copied AS WITH value AS (SELECT 1 AS id) SELECT id FROM value",
+            "CREATE VIEW copied_view AS WITH value AS (SELECT 1 AS id) SELECT id FROM value",
+            "COPY (WITH value AS (SELECT 1 AS id) SELECT id FROM value) TO STDOUT",
+            "DECLARE copied_cursor CURSOR FOR WITH value AS (SELECT 1 AS id) SELECT id FROM value",
+        ] {
+            with_parser(query, |parser| {
+                assert!(parser.next_stmt().unwrap().is_some(), "rejected {query}")
+            });
+        }
     }
 
     #[test]

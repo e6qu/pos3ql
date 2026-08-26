@@ -5653,6 +5653,11 @@ impl Engine {
                 arena,
                 params,
                 &mats[..n],
+                Some(&sequence::SeqEval::new(
+                    &self.storage,
+                    guc.seq_session(),
+                    txn.txid,
+                )),
             )?;
             let (target, returning) = match dml {
                 Stmt::Insert(i) => (&i.table, i.returning),
@@ -6241,20 +6246,6 @@ impl Engine {
             Ok(materialized) => materialized.unwrap_or(&[]),
             Err(error) => return Ok(Err(error)),
         };
-        let statement = match query::expand_ctes_exec(
-            statement,
-            &self.storage,
-            txn.txid,
-            &self.work,
-            params,
-            dml_mats,
-        ) {
-            Ok(expanded) => expanded,
-            Err(error) => return Ok(Err(error)),
-        };
-        if let Err(error) = query::validate_locking(statement) {
-            return Ok(Err(error));
-        }
         let base_sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
         let replay_sequence =
             sequence_state.map(|state| sequence::ReplaySeqEval::new(base_sequence, state));
@@ -6262,6 +6253,21 @@ impl Engine {
             .as_ref()
             .map(|sequence| sequence as &dyn SequenceAccess)
             .unwrap_or(&base_sequence);
+        let statement = match query::expand_ctes_exec(
+            statement,
+            &self.storage,
+            txn.txid,
+            &self.work,
+            params,
+            dml_mats,
+            Some(sequence),
+        ) {
+            Ok(expanded) => expanded,
+            Err(error) => return Ok(Err(error)),
+        };
+        if let Err(error) = query::validate_locking(statement) {
+            return Ok(Err(error));
+        }
         if statement.from.is_none() {
             query::constant_select_resumable(
                 &self.storage,
@@ -6933,6 +6939,7 @@ impl Engine {
             Ok(materialized) => materialized.unwrap_or(&[]),
             Err(error) => return Ok(Err(error)),
         };
+        let sequence = sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
         let statement = match query::expand_dml_ctes(
             statement,
             ctes,
@@ -6941,6 +6948,7 @@ impl Engine {
             &self.work,
             params,
             dml_mats,
+            Some(&sequence),
         ) {
             Ok(expanded) => expanded,
             Err(error) => return Ok(Err(error)),
@@ -7917,6 +7925,7 @@ impl Engine {
                 *if_not_exists,
                 *materialized,
                 guc.search_path().as_str(),
+                guc.seq_session(),
                 arena,
                 params,
                 responder,
@@ -7926,6 +7935,7 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 name,
+                guc.seq_session(),
                 arena,
                 params,
                 responder,
@@ -8522,8 +8532,11 @@ impl Engine {
                     let (text, binary) = cursors.result_buffers(at);
                     let mut capture = Responder::for_cursor(text, binary);
                     capture.set_render(guc.render());
-                    let sequence =
-                        sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid);
+                    let sequence_state = sequence::SequenceReplayState::new();
+                    let sequence = sequence::ReplaySeqEval::new(
+                        sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
+                        &sequence_state,
+                    );
                     match &parsed {
                         Stmt::Select(sel) => {
                             let sel = match query::expand_ctes_exec(
@@ -8533,6 +8546,7 @@ impl Engine {
                                 &self.work,
                                 params,
                                 &[],
+                                Some(&sequence),
                             ) {
                                 Ok(x) => x,
                                 Err(e) => {

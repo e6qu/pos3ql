@@ -18765,12 +18765,15 @@ fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
 
 #[test]
 fn matview_survives_restart() {
-    // A materialized view's rows (its backing table) and its defining query
-    // (the matview catalog) are both journaled, so they survive a WAL-replay
-    // restart — and REFRESH still works afterward.
-    let config = test_config("matview_restart");
+    let mut config = test_config("matview_restart");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("matview-restart-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 29);
         let mut e = Engine::new(&config, &mut budget).unwrap();
         run_with(&mut e, &mut budget, "CREATE TABLE t (id int, v int)");
         run_with(
@@ -18778,23 +18781,45 @@ fn matview_survives_restart() {
             &mut budget,
             "INSERT INTO t VALUES (1,10),(2,20),(3,30)",
         );
-        run_with(
-            &mut e,
-            &mut budget,
-            "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t WHERE v > 15",
-        );
+        for definition in [
+            "CREATE SEQUENCE materialized_value",
+            "CREATE MATERIALIZED VIEW mv AS
+               WITH selected AS MATERIALIZED (
+                 SELECT id, nextval('materialized_value') AS marker FROM t WHERE v > 15 ORDER BY id
+               )
+               SELECT id, marker FROM selected",
+            "CREATE VIEW live_view AS
+               WITH value AS MATERIALIZED (SELECT nextval('materialized_value') AS marker)
+               SELECT left_value.marker AS left_marker, right_value.marker AS right_marker
+               FROM value AS left_value CROSS JOIN value AS right_value",
+        ] {
+            let output = run_with(&mut e, &mut budget, definition);
+            assert!(
+                !String::from_utf8_lossy(&output).contains("ERROR"),
+                "{}",
+                String::from_utf8_lossy(&output)
+            );
+        }
         e.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 29);
     let mut e = Engine::new(&config, &mut budget).unwrap();
     // The materialized rows survived the restart.
     assert_eq!(
         data_rows(&run_with(
             &mut e,
             &mut budget,
-            "SELECT id FROM mv ORDER BY id"
+            "SELECT id, marker FROM mv ORDER BY id"
         )),
-        ["2", "3"]
+        ["2|1", "3|2"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT left_marker, right_marker FROM live_view"
+        )),
+        ["3|3"]
     );
     // It is reported as a materialized view (relkind 'm'), not a table.
     assert!(
@@ -18815,18 +18840,32 @@ fn matview_survives_restart() {
         data_rows(&run_with(
             &mut e,
             &mut budget,
-            "SELECT id FROM mv ORDER BY id"
+            "SELECT id, marker FROM mv ORDER BY id"
         )),
-        ["2", "3"]
+        ["2|1", "3|2"]
     );
     run_with(&mut e, &mut budget, "REFRESH MATERIALIZED VIEW mv");
     assert_eq!(
         data_rows(&run_with(
             &mut e,
             &mut budget,
-            "SELECT id FROM mv ORDER BY id"
+            "SELECT id, marker FROM mv ORDER BY id"
         )),
-        ["2", "3", "4"]
+        ["2|4", "3|5", "4|6"]
+    );
+    assert!(e.checkpoint().unwrap());
+    drop(e);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 29);
+    let mut e = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut budget,
+            "SELECT id, marker FROM mv ORDER BY id;
+             SELECT left_marker, right_marker FROM live_view"
+        )),
+        ["2|4", "3|5", "4|6", "7|7"]
     );
     // DROP MATERIALIZED VIEW removes it.
     run_with(&mut e, &mut budget, "DROP MATERIALIZED VIEW mv");
@@ -33910,6 +33949,74 @@ fn common_table_expressions() {
         [crate::sql::types::oid::VARCHAR]
     );
     assert_eq!(row_description_type_modifiers(&description), [7]);
+
+    // A default or explicit materialized CTE is one evaluate-once relation,
+    // even when the parent scans it twice. PostgreSQL also ignores NOT
+    // MATERIALIZED for a volatile body, while a pure body remains eligible
+    // for inlining.
+    run_with(&mut e, &mut b, "CREATE SEQUENCE cte_evaluation_sequence");
+    for directive in ["", "MATERIALIZED", "NOT MATERIALIZED"] {
+        let query = format!(
+            "WITH value AS {directive} (SELECT nextval('cte_evaluation_sequence') AS n) \
+             SELECT left_value.n, right_value.n FROM value AS left_value CROSS JOIN value AS right_value"
+        );
+        let rows = data_rows(&run_with(&mut e, &mut b, &query));
+        assert_eq!(rows.len(), 1, "{query}");
+        let (left, right) = rows[0].split_once('|').expect("two projected values");
+        assert_eq!(left, right, "{query}");
+    }
+    let setup = run_with(
+        &mut e,
+        &mut b,
+        "CREATE FUNCTION cte_stable_identity(value integer) RETURNS integer LANGUAGE sql STABLE \
+           AS 'SELECT $1'; \
+         CREATE FUNCTION cte_volatile_identity(value integer) RETURNS integer LANGUAGE sql \
+           AS 'SELECT $1'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let mut ast_budget = Budget::new(1 << 20);
+    let mut ast_arena = Arena::new(&mut ast_budget, "CTE policy", 1 << 18).unwrap();
+    let parsed = crate::sql::parser::parse_query(
+        "WITH value AS NOT MATERIALIZED (SELECT cte_stable_identity(id) AS n FROM t) \
+         SELECT left_value.n, right_value.n \
+         FROM value AS left_value CROSS JOIN value AS right_value",
+        &ast_arena,
+    )
+    .unwrap();
+    let expanded =
+        crate::sql::query::expand_ctes_exec(parsed, &e.storage, 0, &ast_arena, &[], &[], None)
+            .unwrap();
+    let from = expanded.from.expect("expanded CTE sources");
+    assert!(from.base.subquery.is_some() && from.base.cte.is_none());
+    assert!(from.joins[0].table.subquery.is_some() && from.joins[0].table.cte.is_none());
+    ast_arena.reset();
+    let parsed = crate::sql::parser::parse_query(
+        "WITH value AS NOT MATERIALIZED (SELECT cte_volatile_identity(id) AS n FROM t) \
+         SELECT left_value.n, right_value.n \
+         FROM value AS left_value CROSS JOIN value AS right_value",
+        &ast_arena,
+    )
+    .unwrap();
+    let expanded =
+        crate::sql::query::expand_ctes_exec(parsed, &e.storage, 0, &ast_arena, &[], &[], None)
+            .unwrap();
+    let from = expanded.from.expect("expanded CTE sources");
+    assert!(from.base.cte.is_some() && from.base.subquery.is_none());
+    assert!(from.joins[0].table.cte.is_some() && from.joins[0].table.subquery.is_none());
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH value AS NOT MATERIALIZED (SELECT id FROM t WHERE id <= 2) \
+             SELECT left_value.id, right_value.id FROM value AS left_value \
+             JOIN value AS right_value ON left_value.id = right_value.id ORDER BY 1",
+        )),
+        ["1|1", "2|2"]
+    );
     // The required shape is enforced loudly.
     assert!(
         String::from_utf8_lossy(&run_with(

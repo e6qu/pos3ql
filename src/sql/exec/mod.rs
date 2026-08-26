@@ -18535,6 +18535,7 @@ pub fn create_table_as(
     if_not_exists: bool,
     materialized: bool,
     raw_path: &str,
+    seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
@@ -18658,11 +18659,25 @@ pub fn create_table_as(
             Ok(s) => s,
             Err(e) => return sql_fail(e),
         };
-        let sel = match super::query::expand_ctes_exec(sel, storage, txn.txid, arena, params, &[]) {
+        let replay_state = crate::sql::sequence::SequenceReplayState::new();
+        let live_sequence = crate::sql::sequence::ReplaySeqEval::new(
+            crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
+            &replay_state,
+        );
+        let sel = match super::query::expand_ctes_exec(
+            sel,
+            storage,
+            txn.txid,
+            arena,
+            params,
+            &[],
+            Some(&live_sequence),
+        ) {
             Ok(select) => select,
             Err(error) => return sql_fail(error),
         };
         let mut rows = 0usize;
+        let dry_sequence = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
         if let Err(e) = super::query::select_into_rows(
             storage,
             txn.txid,
@@ -18670,7 +18685,7 @@ pub fn create_table_as(
             arena,
             params,
             None,
-            None,
+            Some(&dry_sequence),
             &mut |_| {
                 rows += 1;
                 Ok(())
@@ -18696,7 +18711,7 @@ pub fn create_table_as(
             arena,
             params,
             None,
-            None,
+            Some(&live_sequence),
             &mut |vals| {
                 rows_bytes[at] = encode_projected_pub(vals, arena)?;
                 at += 1;
@@ -18880,11 +18895,13 @@ pub(crate) fn catalog_column_type(
 
 /// REFRESH MATERIALIZED VIEW: re-run the stored query, replacing every row of
 /// the backing table.
+#[allow(clippy::too_many_arguments)]
 pub fn refresh_materialized_view(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
     name: &crate::sql::ast::QualName,
+    seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
@@ -18918,18 +18935,73 @@ pub fn refresh_materialized_view(
         Ok(select) => select,
         Err(error) => return sql_fail(error),
     };
-    let select = match super::query::expand_stored_query(
+    let replay_state = crate::sql::sequence::SequenceReplayState::new();
+    let live_sequence = crate::sql::sequence::ReplaySeqEval::new(
+        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid),
+        &replay_state,
+    );
+    let select = match super::query::expand_stored_query_exec(
         select,
         storage,
         txn.txid,
         path,
         storage.matview_dependencies(slot),
         arena,
+        params,
+        Some(&live_sequence),
     ) {
         Ok(select) => select,
         Err(error) => return sql_fail(error),
     };
-    // Remove every visible row, transactionally (a matview has no constraints).
+    // Capture the replacement before mutating the backing table. Besides
+    // separating immutable reads from writes, this preserves the statement
+    // snapshot when a materialized view references its prior contents.
+    let mut rows = 0usize;
+    let dry_sequence = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
+    if let Err(e) = super::query::select_into_rows(
+        storage,
+        txn.txid,
+        select,
+        arena,
+        params,
+        None,
+        Some(&dry_sequence),
+        &mut |_| {
+            rows += 1;
+            Ok(())
+        },
+    ) {
+        return sql_fail(e);
+    }
+    let empty: &[u8] = &[];
+    let rows_bytes: &mut [&[u8]] = match arena.alloc_slice_with(rows, |_| empty) {
+        Ok(r) => r,
+        Err(_) => {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "REFRESH result exceeds the statement arena"
+            ));
+        }
+    };
+    let mut at = 0usize;
+    if let Err(e) = super::query::select_into_rows(
+        storage,
+        txn.txid,
+        select,
+        arena,
+        params,
+        None,
+        Some(&live_sequence),
+        &mut |values| {
+            rows_bytes[at] = encode_projected_pub(values, arena)?;
+            at += 1;
+            Ok(())
+        },
+    ) {
+        return sql_fail(e);
+    }
+    // Remove every visible row transactionally (a materialized view has no
+    // constraints), then install the already-captured replacement.
     let mut rowids: [u64; 4096] = [0; 4096];
     loop {
         let mut count = 0usize;
@@ -18964,51 +19036,6 @@ pub fn refresh_materialized_view(
                 Err(e) => return sql_fail(e),
             }
         }
-    }
-    // Re-run the query and store its rows into the backing table (two-pass, so
-    // the source may read another table without overlapping the write).
-    let mut rows = 0usize;
-    if let Err(e) = super::query::select_into_rows(
-        storage,
-        txn.txid,
-        select,
-        arena,
-        params,
-        None,
-        None,
-        &mut |_| {
-            rows += 1;
-            Ok(())
-        },
-    ) {
-        return sql_fail(e);
-    }
-    let empty: &[u8] = &[];
-    let rows_bytes: &mut [&[u8]] = match arena.alloc_slice_with(rows, |_| empty) {
-        Ok(r) => r,
-        Err(_) => {
-            return sql_fail(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "REFRESH result exceeds the statement arena"
-            ));
-        }
-    };
-    let mut at = 0usize;
-    if let Err(e) = super::query::select_into_rows(
-        storage,
-        txn.txid,
-        select,
-        arena,
-        params,
-        None,
-        None,
-        &mut |values| {
-            rows_bytes[at] = encode_projected_pub(values, arena)?;
-            at += 1;
-            Ok(())
-        },
-    ) {
-        return sql_fail(e);
     }
     let n_cols = def.n_columns;
     for bytes in rows_bytes.iter() {
@@ -30760,7 +30787,7 @@ pub fn copy_out_query(
             .map_err(wire_to_sql)?;
     }
     let sel = crate::sql::parser::parse_query(sql, arena)?;
-    let sel = super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[])?;
+    let sel = super::query::expand_ctes_exec(sel, storage, txid, arena, params, &[], seq)?;
     let render = responder.render_context();
     let fmt = &fmt;
     let mut count = 0u64;

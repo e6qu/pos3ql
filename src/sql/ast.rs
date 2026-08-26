@@ -1619,6 +1619,16 @@ pub struct LockClause<'a> {
     pub wait: LockWait,
 }
 
+/// PostgreSQL's materialization directive on one common table expression.
+/// Keeping the three grammar states distinct lets execution apply the
+/// evaluate-once contract without inferring it from missing syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CteMaterialization {
+    Default,
+    Materialized,
+    NotMaterialized,
+}
+
 /// One `WITH name [(col, ...)] AS (SELECT ...)` common table expression.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cte<'a> {
@@ -1628,6 +1638,7 @@ pub struct Cte<'a> {
     /// The WITH clause carried the RECURSIVE keyword (a self-referencing body
     /// is executed by fixpoint iteration rather than inline expansion).
     pub recursive: bool,
+    pub materialization: CteMaterialization,
     /// The CTE body as a query. For a data-modifying CTE (`dml` is `Some`) this
     /// is a placeholder and unused.
     pub query: &'a Select<'a>,
@@ -1747,8 +1758,7 @@ pub enum SelectItem<'a> {
     },
 }
 
-/// A window function's `OVER (PARTITION BY ... ORDER BY ...)` clause. Only the
-/// default frame is supported; an explicit ROWS/RANGE frame is rejected.
+/// A window function's resolved `OVER` clause.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowSpec<'a> {
     pub partition_by: &'a [&'a Expr<'a>],
@@ -3441,12 +3451,41 @@ impl Expr<'_> {
             ];
             NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
         }
+        self.find_function(is_nonimmutable)
+    }
+
+    /// The volatile subset relevant to PostgreSQL's CTE inlining rule.
+    pub fn contains_volatile_function(&self) -> Option<&str> {
+        fn is_volatile(name: &str) -> bool {
+            const NAMES: &[&str] = &[
+                "clock_timestamp",
+                "timeofday",
+                "random",
+                "random_normal",
+                "nextval",
+                "currval",
+                "lastval",
+                "setval",
+                "gen_random_uuid",
+                "uuid_generate_v1",
+                "uuid_generate_v4",
+                "txid_current",
+                "pg_current_xact_id",
+                "pg_is_in_recovery",
+                "set_config",
+            ];
+            NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
+        }
+        self.find_function(is_volatile)
+    }
+
+    fn find_function(&self, matches: fn(&str) -> bool) -> Option<&str> {
         match self {
             Expr::Call { name, args, .. } => {
-                if is_nonimmutable(name) {
+                if matches(name) {
                     return Some(name);
                 }
-                args.iter().find_map(|a| a.contains_nonimmutable_function())
+                args.iter().find_map(|a| a.find_function(matches))
             }
             Expr::Null
             | Expr::Bool(_)
@@ -3470,11 +3509,11 @@ impl Expr<'_> {
             | Expr::Cast { operand, .. }
             | Expr::Collate { operand, .. }
             | Expr::IsNull { operand, .. }
-            | Expr::Field { base: operand, .. } => operand.contains_nonimmutable_function(),
+            | Expr::Field { base: operand, .. } => operand.find_function(matches),
             Expr::Slice { base, lower, upper } => base
-                .contains_nonimmutable_function()
-                .or_else(|| lower.and_then(|e| e.contains_nonimmutable_function()))
-                .or_else(|| upper.and_then(|e| e.contains_nonimmutable_function())),
+                .find_function(matches)
+                .or_else(|| lower.and_then(|e| e.find_function(matches)))
+                .or_else(|| upper.and_then(|e| e.find_function(matches))),
             Expr::Binary { left, right, .. }
             | Expr::Subscript {
                 base: left,
@@ -3485,42 +3524,40 @@ impl Expr<'_> {
                 array: right,
                 ..
             } => left
-                .contains_nonimmutable_function()
-                .or_else(|| right.contains_nonimmutable_function()),
+                .find_function(matches)
+                .or_else(|| right.find_function(matches)),
             Expr::InList { operand, list, .. } => operand
-                .contains_nonimmutable_function()
-                .or_else(|| list.iter().find_map(|e| e.contains_nonimmutable_function())),
+                .find_function(matches)
+                .or_else(|| list.iter().find_map(|e| e.find_function(matches))),
             Expr::Between {
                 operand, low, high, ..
             } => operand
-                .contains_nonimmutable_function()
-                .or_else(|| low.contains_nonimmutable_function())
-                .or_else(|| high.contains_nonimmutable_function()),
+                .find_function(matches)
+                .or_else(|| low.find_function(matches))
+                .or_else(|| high.find_function(matches)),
             Expr::Like {
                 operand, pattern, ..
             }
             | Expr::Match {
                 operand, pattern, ..
             } => operand
-                .contains_nonimmutable_function()
-                .or_else(|| pattern.contains_nonimmutable_function()),
+                .find_function(matches)
+                .or_else(|| pattern.find_function(matches)),
             Expr::Case {
                 operand,
                 whens,
                 otherwise,
                 ..
             } => operand
-                .and_then(|o| o.contains_nonimmutable_function())
+                .and_then(|o| o.find_function(matches))
                 .or_else(|| {
                     whens.iter().find_map(|(c, r)| {
-                        c.contains_nonimmutable_function()
-                            .or_else(|| r.contains_nonimmutable_function())
+                        c.find_function(matches)
+                            .or_else(|| r.find_function(matches))
                     })
                 })
-                .or_else(|| otherwise.and_then(|o| o.contains_nonimmutable_function())),
-            Expr::Array(items) => items
-                .iter()
-                .find_map(|e| e.contains_nonimmutable_function()),
+                .or_else(|| otherwise.and_then(|o| o.find_function(matches))),
+            Expr::Array(items) => items.iter().find_map(|e| e.find_function(matches)),
         }
     }
 

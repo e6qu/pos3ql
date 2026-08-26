@@ -1770,6 +1770,28 @@ pub struct FromClause<'a> {
     pub joins: &'a [Join<'a>],
 }
 
+/// Whether a relation source includes its inheritance/partition descendants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationInheritance {
+    Descendants,
+    Only,
+}
+
+/// The built-in PostgreSQL sampling methods pos3ql can execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableSampleMethod {
+    System,
+    Bernoulli,
+}
+
+/// A relation's typed `TABLESAMPLE` clause.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TableSample<'a> {
+    pub method: TableSampleMethod,
+    pub percentage: &'a Expr<'a>,
+    pub repeatable: Option<&'a Expr<'a>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TableRef<'a> {
     /// Optional schema qualifier (pg_catalog / information_schema / public).
@@ -1787,10 +1809,12 @@ pub struct TableRef<'a> {
     /// parsed table source is either one function or one non-empty function
     /// group, never both.
     pub rows_from: Option<&'a [TableRef<'a>]>,
-    /// Column-alias list (`alias(c1, c2, ...)`): renames the output columns of a
-    /// derived table or a table function. A table function has a single output
-    /// column, so it accepts exactly one name.
+    /// Column-alias list (`alias(c1, c2, ...)`): renames leading output columns.
     pub col_alias: Option<&'a [&'a str]>,
+    /// Default inheritance traversal or explicit `ONLY` selection.
+    pub inheritance: RelationInheritance,
+    /// Sampling applies only to a physical table or materialized view.
+    pub sample: Option<TableSample<'a>>,
     /// Materialized recursive-CTE reference: when set, this FROM item reads the
     /// pre-computed row set instead of a table or subquery.
     pub cte: Option<&'a MaterializedCte<'a>>,

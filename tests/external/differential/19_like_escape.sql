@@ -37,7 +37,7 @@ SELECT 'abc' SIMILAR TO 'a_c';
 
 CREATE TABLE likeesc (a text);
 INSERT INTO likeesc VALUES ('a%c'), ('abc'), ('a_c');
-SELECT a FROM likeesc WHERE a LIKE 'a$%c' ESCAPE '$' ORDER BY a;
-SELECT a FROM likeesc WHERE a LIKE 'a%c' ORDER BY a;
-SELECT a FROM likeesc WHERE a SIMILAR TO 'a#_c' ESCAPE '#' ORDER BY a;
+SELECT a FROM likeesc WHERE a LIKE 'a$%c' ESCAPE '$' ORDER BY a COLLATE "C";
+SELECT a FROM likeesc WHERE a LIKE 'a%c' ORDER BY a COLLATE "C";
+SELECT a FROM likeesc WHERE a SIMILAR TO 'a#_c' ESCAPE '#' ORDER BY a COLLATE "C";
 DROP TABLE likeesc;

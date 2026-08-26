@@ -572,6 +572,26 @@ fn collect_routine_dependencies_with_resolver(
     }
     if let Some(from) = select.from {
         for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            if let Some(sample) = table.sample {
+                visit_expr(
+                    sample.percentage,
+                    storage,
+                    txid,
+                    resolver,
+                    dependencies,
+                    &mut needs_scope,
+                )?;
+                if let Some(repeatable) = sample.repeatable {
+                    visit_expr(
+                        repeatable,
+                        storage,
+                        txid,
+                        resolver,
+                        dependencies,
+                        &mut needs_scope,
+                    )?;
+                }
+            }
             if let Some(args) = table.func_args {
                 record_table_call(
                     table,
@@ -677,7 +697,10 @@ fn record_relation_column_references<'a>(
                 source.slot = slot;
                 source.n_columns = definition.columns().len();
                 for column in 0..source.n_columns {
-                    source.columns[column] = definition.columns()[column].name.as_str();
+                    source.columns[column] = table
+                        .col_alias
+                        .and_then(|aliases| aliases.get(column).copied())
+                        .unwrap_or(definition.columns()[column].name.as_str());
                 }
             }
             ResolvedRelation::View(slot) => {
@@ -698,7 +721,10 @@ fn record_relation_column_references<'a>(
                     &mut described,
                 )?;
                 for (column, described) in described.iter().enumerate().take(source.n_columns) {
-                    source.columns[column] = described.name;
+                    source.columns[column] = table
+                        .col_alias
+                        .and_then(|aliases| aliases.get(column).copied())
+                        .unwrap_or(described.name);
                 }
             }
             _ => continue,
@@ -885,6 +911,20 @@ fn collect_table_ref<'a>(
     if let Some(arguments) = table.func_args {
         for argument in arguments {
             collect_expression(argument, storage, txid, path, ctes, dependencies, arena)?;
+        }
+    }
+    if let Some(sample) = table.sample {
+        collect_expression(
+            sample.percentage,
+            storage,
+            txid,
+            path,
+            ctes,
+            dependencies,
+            arena,
+        )?;
+        if let Some(repeatable) = sample.repeatable {
+            collect_expression(repeatable, storage, txid, path, ctes, dependencies, arena)?;
         }
     }
     if let Some(functions) = table.rows_from {

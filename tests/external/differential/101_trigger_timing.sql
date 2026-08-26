@@ -45,7 +45,8 @@ CREATE TRIGGER trigger_timing_z_statement AFTER UPDATE ON trigger_timing_target
 COMMENT ON TRIGGER trigger_timing_after ON trigger_timing_target IS 'transition rows';
 INSERT INTO trigger_timing_target VALUES (1, 10), (2, 20);
 UPDATE trigger_timing_target SET value = value + 1;
-SELECT event, id, old_rows, new_rows FROM trigger_timing_audit ORDER BY event, id;
+SELECT event, id, old_rows, new_rows FROM trigger_timing_audit
+ORDER BY event COLLATE "C", id;
 SELECT name, id, transition_count FROM trigger_timing_order ORDER BY position;
 SELECT obj_description(oid, 'pg_trigger'), pg_get_triggerdef(oid),
        tgoldtable, tgnewtable
@@ -125,3 +126,7 @@ DROP TABLE trigger_timing_target, trigger_timing_audit,
   trigger_timing_order,
   trigger_timing_constraint_target, trigger_timing_constraint_audit,
   trigger_timing_root, trigger_timing_partition_order CASCADE;
+DROP FUNCTION trigger_timing_completed_query(), trigger_timing_constraint(),
+  trigger_timing_move(), trigger_timing_partition(),
+  trigger_timing_partition_order(), trigger_timing_statement(),
+  trigger_timing_transition();

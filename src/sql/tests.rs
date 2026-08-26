@@ -1481,12 +1481,13 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
     let mut buffer = crate::mem::FixedBuf::new(budget, "describe send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "describe sql", 1 << 18).unwrap();
     let transaction = TxnState::new(budget, 1024).unwrap();
-    let mut responder =
-        Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
-    let described = engine
-        .describe(sql_text, &arena, &transaction, None, &mut responder)
-        .unwrap();
-    drop(responder);
+    let described = {
+        let mut responder =
+            Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
+        engine
+            .describe(sql_text, &arena, &transaction, None, &mut responder)
+            .unwrap()
+    };
     assert!(described, "{}", String::from_utf8_lossy(buffer.readable()));
     buffer.readable().to_vec()
 }
@@ -17640,9 +17641,26 @@ fn create_or_replace_trigger_preserves_oid_comment_and_transaction_identity() {
           WHERE t.tgname = 'renamed_trigger';
          COMMENT ON TRIGGER renamed_trigger ON replace_trigger_target IS 'drop with trigger';
          DROP TRIGGER renamed_trigger ON replace_trigger_target;
-         SELECT count(*) FROM pg_description WHERE description = 'drop with trigger';",
+         SELECT count(*) FROM pg_description WHERE description = 'drop with trigger';
+         CREATE TABLE trigger_comment_cascade (id integer);
+         CREATE TRIGGER trigger_comment_cascade BEFORE INSERT ON trigger_comment_cascade
+           FOR EACH ROW EXECUTE FUNCTION replace_trigger_first();
+         COMMENT ON TRIGGER trigger_comment_cascade ON trigger_comment_cascade IS 'drop with table';
+         DROP TABLE trigger_comment_cascade;
+         SELECT count(*) FROM pg_trigger WHERE tgname = 'trigger_comment_cascade';
+         SELECT count(*) FROM pg_description WHERE description = 'drop with table';
+         CREATE TABLE trigger_comment_cascade (id integer);
+         CREATE TRIGGER trigger_comment_cascade BEFORE INSERT ON trigger_comment_cascade
+           FOR EACH ROW EXECUTE FUNCTION replace_trigger_first();
+         COMMENT ON TRIGGER trigger_comment_cascade ON trigger_comment_cascade IS 'drop with table';
+         SELECT count(*) FROM pg_description WHERE description = 'drop with table';",
     );
-    assert_eq!(data_rows(&lifecycle), ["stable comment", "0", "0"]);
+    assert_eq!(
+        data_rows(&lifecycle),
+        ["stable comment", "0", "0", "0", "0", "1"],
+        "{}",
+        String::from_utf8_lossy(&lifecycle)
+    );
 }
 
 #[test]
@@ -35644,6 +35662,56 @@ fn insert_select() {
 }
 
 #[test]
+fn dml_query_sources_expand_views_before_writes() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE dml_view_source_base (id integer PRIMARY KEY, value integer); \
+         INSERT INTO dml_view_source_base VALUES (1, 10), (2, 20); \
+         CREATE VIEW dml_view_source AS TABLE dml_view_source_base; \
+         CREATE TABLE dml_view_insert_target (id integer PRIMARY KEY, value integer); \
+         CREATE TABLE dml_view_update_target (id integer PRIMARY KEY, value integer); \
+         INSERT INTO dml_view_update_target VALUES (1, 0), (2, 0), (3, 0); \
+         CREATE TABLE dml_view_merge_target (id integer PRIMARY KEY, value integer); \
+         INSERT INTO dml_view_merge_target VALUES (1, 1), (3, 3)",
+    );
+    let insert = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO dml_view_insert_target TABLE dml_view_source; \
+         SELECT id, value FROM dml_view_insert_target ORDER BY id",
+    );
+    let update_delete = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE dml_view_update_target AS target SET value = source.value \
+           FROM dml_view_source AS source WHERE target.id = source.id; \
+         DELETE FROM dml_view_update_target AS target USING dml_view_source AS source \
+           WHERE target.id = source.id AND source.id = 2; \
+         SELECT id, value FROM dml_view_update_target ORDER BY id",
+    );
+    let merge = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "MERGE INTO dml_view_merge_target AS target USING dml_view_source AS source \
+           ON target.id = source.id \
+           WHEN MATCHED THEN UPDATE SET value = source.value \
+           WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value); \
+         SELECT id, value FROM dml_view_merge_target ORDER BY id",
+        1 << 20,
+    );
+    assert_eq!(data_rows(&insert), ["1|10", "2|20"]);
+    assert_eq!(data_rows(&update_delete), ["1|10", "3|0"]);
+    assert_eq!(
+        data_rows(&merge),
+        ["1|10", "2|20", "3|3"],
+        "{}",
+        String::from_utf8_lossy(&merge)
+    );
+}
+
+#[test]
 fn insert_select_column_count_mismatch() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE src (a int, b int)");
@@ -36852,6 +36920,246 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
             "7|10|520", "8|10|530", "9|10|540"
         ]
     );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn table_query_inheritance_alias_and_sampling_are_one_typed_source_boundary() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE sampled_source (id integer, label text)",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO sampled_source SELECT value, 'row-' || value FROM generate_series(1,100) value",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "TABLE sampled_source ORDER BY id DESC LIMIT 2; \
+         WITH copied AS (TABLE sampled_source) SELECT count(*) FROM copied; \
+         SELECT renamed_id, renamed_label FROM sampled_source AS renamed(renamed_id, renamed_label) \
+           ORDER BY renamed_id LIMIT 1; \
+         SELECT count(*) FROM sampled_source TABLESAMPLE BERNOULLI (100); \
+         SELECT count(*) FROM sampled_source TABLESAMPLE SYSTEM (0); \
+         SELECT count(*) FROM sampled_source TABLESAMPLE SYSTEM ((SELECT 100));",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "100|row-100",
+            "99|row-99",
+            "100",
+            "1|row-1",
+            "100",
+            "0",
+            "100"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE sampled_partition (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE sampled_partition_leaf PARTITION OF sampled_partition FOR VALUES FROM (0) TO (10); \
+         INSERT INTO sampled_partition VALUES (1), (2)",
+    );
+    let inheritance = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM sampled_partition; \
+         SELECT count(*) FROM ONLY sampled_partition; \
+         SELECT count(*) FROM (TABLE ONLY sampled_partition) AS parent_rows",
+    );
+    assert_eq!(
+        data_rows(&inheritance),
+        ["2", "0", "0"],
+        "{}",
+        String::from_utf8_lossy(&inheritance)
+    );
+
+    let first = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_agg(id ORDER BY id)::text \
+           FROM sampled_source TABLESAMPLE BERNOULLI (35) REPEATABLE (42)",
+    );
+    let second = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_agg(id ORDER BY id)::text \
+           FROM sampled_source TABLESAMPLE BERNOULLI (35) REPEATABLE (42)",
+    );
+    assert_eq!(data_rows(&first), data_rows(&second));
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE sample_join_left (id integer); INSERT INTO sample_join_left VALUES (1), (2)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM sample_join_left AS left_side \
+               LEFT JOIN sampled_source AS impossible TABLESAMPLE BERNOULLI (0) \
+                 ON impossible.id = left_side.id; \
+             SELECT count(*) FROM sample_join_left AS left_side \
+               RIGHT JOIN sampled_source AS impossible TABLESAMPLE BERNOULLI (0) \
+                 ON impossible.id = left_side.id; \
+             SELECT count(*) FROM sample_join_left AS left_side \
+               FULL JOIN sampled_source AS impossible TABLESAMPLE BERNOULLI (0) \
+                 ON impossible.id = left_side.id",
+        )),
+        ["2", "0", "2"]
+    );
+
+    for (sql, state, message) in [
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE BERNOULLI (NULL)",
+            "2202H",
+            "TABLESAMPLE parameter cannot be null",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE SYSTEM (101)",
+            "2202H",
+            "sample percentage must be between 0 and 100",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE BERNOULLI (10) REPEATABLE (NULL)",
+            "2202G",
+            "TABLESAMPLE REPEATABLE parameter cannot be null",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE missing (10)",
+            "42704",
+            "tablesample method missing does not exist",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE SYSTEM (id)",
+            "42703",
+            "column \"id\" does not exist",
+        ),
+        (
+            "SELECT * FROM sampled_source AS sampled TABLESAMPLE SYSTEM (sampled.id)",
+            "42P01",
+            "invalid reference to FROM-clause entry for table \"sampled\"",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE SYSTEM (count(*))",
+            "42803",
+            "aggregate functions are not allowed in functions in FROM",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE SYSTEM (row_number() OVER ())",
+            "42P20",
+            "window functions are not allowed in functions in FROM",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE SYSTEM (generate_series(1, 2))",
+            "42804",
+            "argument of TABLESAMPLE must not return a set",
+        ),
+    ] {
+        let error = run_with(&mut engine, &mut budget, sql);
+        let text = String::from_utf8_lossy(&error);
+        assert!(text.contains(state) && text.contains(message), "{text}");
+    }
+}
+
+#[test]
+fn table_sources_survive_stored_queries_copy_cursors_and_object_cold_recovery() {
+    let mut config = test_config("table-source-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("table-source-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_sample_source (id integer PRIMARY KEY, label text)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO durable_sample_source \
+           SELECT value, 'durable-' || value FROM generate_series(1,50) value",
+    );
+    let definitions = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW durable_table_view AS TABLE durable_sample_source; \
+         CREATE VIEW durable_sample_view AS \
+           SELECT id, label FROM durable_sample_source \
+             TABLESAMPLE BERNOULLI (40) REPEATABLE (73); \
+         CREATE TABLE durable_table_copy AS TABLE durable_sample_source WITH DATA; \
+         CREATE TABLE durable_insert_copy (id integer PRIMARY KEY, label text); \
+         INSERT INTO durable_insert_copy TABLE durable_table_view",
+    );
+    assert!(
+        !String::from_utf8_lossy(&definitions).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&definitions)
+    );
+    let before = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_agg(id ORDER BY id)::text FROM durable_sample_view; \
+         SELECT count(*) FROM durable_table_view; \
+         SELECT count(*) FROM durable_table_copy; \
+         SELECT count(*) FROM durable_insert_copy; \
+         BEGIN; DECLARE durable_table_cursor CURSOR FOR TABLE durable_table_view; \
+         FETCH FORWARD 2 FROM durable_table_cursor; COMMIT",
+    ));
+    assert_eq!(before[1..4], ["50", "50", "50"]);
+    assert_eq!(before[4..], ["1|durable-1", "2|durable-2"]);
+    let copy_before = copy_data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (TABLE durable_sample_view) TO STDOUT",
+    ));
+    assert!(!copy_before.is_empty());
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let after = data_rows(&run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT array_agg(id ORDER BY id)::text FROM durable_sample_view; \
+         SELECT count(*) FROM durable_table_view; \
+         SELECT count(*) FROM durable_table_copy; \
+         SELECT count(*) FROM durable_insert_copy",
+    ));
+    assert_eq!(after, before[..4]);
+    assert_eq!(
+        copy_data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "COPY (TABLE durable_sample_view) TO STDOUT",
+        )),
+        copy_before
+    );
+    drop(cold);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

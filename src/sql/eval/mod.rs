@@ -196,6 +196,8 @@ pub mod sqlstate {
     pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
     pub const STRING_DATA_LENGTH_MISMATCH: &str = "22026";
     pub const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";
+    pub const INVALID_TABLESAMPLE_REPEAT: &str = "2202G";
+    pub const INVALID_TABLESAMPLE_ARGUMENT: &str = "2202H";
     pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
     pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
     pub const DUPLICATE_COLUMN: &str = "42701";

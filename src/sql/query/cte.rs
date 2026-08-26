@@ -1150,8 +1150,15 @@ fn tref_references(t: &TableRef, name: &str) -> usize {
             .map(|function| tref_references(function, name))
             .sum()
     });
+    let sample_references = t.sample.map_or(0, |sample| {
+        expr_references(sample.percentage, name)
+            + sample
+                .repeatable
+                .map_or(0, |repeatable| expr_references(repeatable, name))
+    });
     argument_references
         + grouped_references
+        + sample_references
         + usize::from(t.schema.is_none() && !t.is_function_source() && t.table == name)
 }
 
@@ -1484,6 +1491,10 @@ fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -
                             .subquery
                             .is_some_and(|query| select_contains_volatile(query, storage, txid))
                     })
+                })
+                || table.sample.is_some_and(|sample| {
+                    expression_has_it(sample.percentage)
+                        || sample.repeatable.is_some_and(expression_has_it)
                 })
         };
         if table_has_it(&from.base)
@@ -3309,6 +3320,18 @@ fn subst_tableref<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<TableRef<'a>, SqlError> {
+    let rewritten = TableRef {
+        sample: match t.sample {
+            Some(sample) => Some(crate::sql::ast::TableSample {
+                method: sample.method,
+                percentage: subst_expr(sample.percentage, context, arena)?,
+                repeatable: opt_subst(sample.repeatable, context, arena)?,
+            }),
+            None => None,
+        },
+        ..*t
+    };
+    let t = &rewritten;
     if let Some(functions) = t.rows_from {
         let mut rewritten = [*t; crate::sql::parser::MAX_LIST];
         for (slot, function) in rewritten.iter_mut().zip(functions) {
@@ -3370,6 +3393,8 @@ fn subst_tableref<'a>(
             func_args: None,
             rows_from: None,
             col_alias: t.col_alias,
+            inheritance: t.inheritance,
+            sample: t.sample,
             cte: Some(m),
             with_ordinality: false,
             lateral: false,
@@ -3396,6 +3421,8 @@ fn subst_tableref<'a>(
             func_args: None,
             rows_from: None,
             col_alias: renames,
+            inheritance: t.inheritance,
+            sample: t.sample,
             cte: None,
             with_ordinality: false,
             lateral: false,
@@ -3530,6 +3557,8 @@ fn subst_tableref<'a>(
             func_args: None,
             rows_from: None,
             col_alias: None,
+            inheritance: t.inheritance,
+            sample: t.sample,
             cte: None,
             with_ordinality: false,
             lateral: false,

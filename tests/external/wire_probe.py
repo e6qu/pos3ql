@@ -3187,6 +3187,68 @@ def test_format_models_over_named_portal():
     s.close()
 
 
+def test_table_sample_binary_bind_and_named_portal():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_sample_source (id integer PRIMARY KEY); "
+        "INSERT INTO wire_sample_source SELECT value FROM generate_series(1,20) value",
+    )
+    check(
+        "raw wire: TABLESAMPLE source setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    query = (
+        "SELECT id FROM wire_sample_source "
+        "TABLESAMPLE BERNOULLI ($1) REPEATABLE ($2) ORDER BY id"
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_sample_statement\x00" + query.encode() + b"\x00" + struct.pack("!h", 0),
+    )
+    bind_body = (
+        b"wire_sample_portal\x00wire_sample_statement\x00"
+        + struct.pack("!hhh", 2, 1, 1)
+        + struct.pack("!h", 2)
+        + struct.pack("!if", 4, 100.0)
+        + struct.pack("!id", 8, 42.0)
+        + struct.pack("!hh", 1, 1)
+    )
+    bind = frontend_message(b"B", bind_body)
+    describe = frontend_message(b"D", b"Pwire_sample_portal\x00")
+    execute_first = frontend_message(b"E", b"wire_sample_portal\x00" + struct.pack("!i", 7))
+    execute_rest = frontend_message(b"E", b"wire_sample_portal\x00" + struct.pack("!i", 0))
+    s.sendall(parse + bind + describe + execute_first + execute_rest + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in output if kind == b"T"), None)
+    rows = [payload for kind, payload in output if kind == b"D"]
+    check(
+        "raw wire: inferred TABLESAMPLE parameters accept binary float4/float8 Bind values",
+        not any(kind == b"E" for kind, _ in output)
+        and description is not None
+        and row_description_type_oids(description) == [23]
+        and row_description_formats(description) == [1],
+        output,
+    )
+    check(
+        "raw wire: sampled named portal suspends and resumes without resampling",
+        len(rows) == 20
+        and b"s" in [kind for kind, _ in output]
+        and rows[0] == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", 1)
+        and rows[-1] == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", 20),
+        output,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

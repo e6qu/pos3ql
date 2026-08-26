@@ -337,6 +337,8 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 func_args: Some(args),
                 rows_from: None,
                 col_alias: None,
+                inheritance: crate::sql::ast::RelationInheritance::Descendants,
+                sample: None,
                 cte: None,
                 with_ordinality: false,
                 lateral: false,

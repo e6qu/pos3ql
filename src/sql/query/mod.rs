@@ -238,6 +238,18 @@ fn collect_stored_query_composite_field_rename_select<'a>(
         for table in core::iter::once(&from_clause.base)
             .chain(from_clause.joins.iter().map(|join| &join.table))
         {
+            if let Some(sample) = table.sample {
+                rename.collect_expression(
+                    sample.percentage,
+                    columns,
+                    nested_outer,
+                    sites,
+                    count,
+                )?;
+                if let Some(repeatable) = sample.repeatable {
+                    rename.collect_expression(repeatable, columns, nested_outer, sites, count)?;
+                }
+            }
             if let Some(arguments) = table.func_args {
                 for argument in arguments {
                     rename.collect_expression(argument, columns, nested_outer, sites, count)?;
@@ -3400,8 +3412,8 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     }
 
     // Subqueries first (uncorrelated, evaluated once).
-    let mut sub_exprs: [Option<&Expr>; 4 + 2 * super::parser::MAX_LIST] =
-        [None; 4 + 2 * super::parser::MAX_LIST];
+    let mut sub_exprs: [Option<&Expr>; 4 + 2 * super::parser::MAX_LIST + 2 * MAX_JOIN_TABLES] =
+        [None; 4 + 2 * super::parser::MAX_LIST + 2 * MAX_JOIN_TABLES];
     sub_exprs[0] = statement.where_clause;
     sub_exprs[1] = statement.having;
     for (i, item) in statement.items.iter().enumerate() {
@@ -3416,6 +3428,8 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
             sub_exprs[4 + super::parser::MAX_LIST + i] = Some(ob.expression);
         }
     }
+    let sample_start = 4 + 2 * super::parser::MAX_LIST;
+    collect_table_sample_expressions(from, &mut sub_exprs[sample_start..]);
     // Uncorrelated subqueries are evaluated once; correlated ones are deferred
     // and re-evaluated per outer row during the scan.
     let outer_subs = match prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params) {
@@ -3850,6 +3864,8 @@ fn over_one_row<'a>(
             func_args: None,
             rows_from: None,
             col_alias: None,
+            inheritance: crate::sql::ast::RelationInheritance::Descendants,
+            sample: None,
             cte: None,
             with_ordinality: false,
             lateral: false,
@@ -4393,6 +4409,20 @@ pub fn select_into_rows<'a>(
     )
 }
 
+pub(super) fn collect_table_sample_expressions<'a>(
+    from: &'a FromClause<'a>,
+    output: &mut [Option<&'a Expr<'a>>],
+) {
+    let mut at = 0;
+    for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+        if let Some(sample) = table.sample {
+            output[at] = Some(sample.percentage);
+            output[at + 1] = sample.repeatable;
+        }
+        at += 2;
+    }
+}
+
 /// Streaming row-source form for consumers that copy every emitted datum
 /// before returning. In particular, external-run producers use it so a cold
 /// SST scan recycles fetched row bytes instead of growing the statement arena.
@@ -4621,7 +4651,8 @@ fn select_into_rows_mode<'a>(
         let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
         let statement = resolve_group_ordinals(statement, Some(&scope), arena, storage, txid)?;
         check_key_types(statement, &scope, arena)?;
-        let mut sub_exprs: [Option<&Expr>; 2 + MAX_PROJ] = [None; 2 + MAX_PROJ];
+        let mut sub_exprs: [Option<&Expr>; 2 + MAX_PROJ + 2 * MAX_JOIN_TABLES] =
+            [None; 2 + MAX_PROJ + 2 * MAX_JOIN_TABLES];
         sub_exprs[0] = statement.where_clause;
         sub_exprs[1] = statement.having;
         for (i, item) in statement.items.iter().enumerate() {
@@ -4629,6 +4660,7 @@ fn select_into_rows_mode<'a>(
                 sub_exprs[2 + i] = Some(expression);
             }
         }
+        collect_table_sample_expressions(from, &mut sub_exprs[2 + MAX_PROJ..]);
         let outer_subs = prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params)?;
         let hooks = EvalHooks {
             group: None,
@@ -4666,7 +4698,8 @@ fn select_into_rows_mode<'a>(
         }
         return Ok(());
     }
-    let mut sub_exprs: [Option<&Expr>; 1 + MAX_PROJ] = [None; 1 + MAX_PROJ];
+    let mut sub_exprs: [Option<&Expr>; 1 + MAX_PROJ + 2 * MAX_JOIN_TABLES] =
+        [None; 1 + MAX_PROJ + 2 * MAX_JOIN_TABLES];
     sub_exprs[0] = statement.where_clause;
     for (i, item) in statement.items.iter().enumerate() {
         if let SelectItem::Expr { expression, .. } = item {
@@ -4782,6 +4815,7 @@ fn select_into_rows_mode<'a>(
         return Ok(());
     };
 
+    collect_table_sample_expressions(from, &mut sub_exprs[1 + MAX_PROJ..]);
     let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
     let outer_subs = prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params)?;
     let correlated = outer_subs.correlated;
@@ -6628,7 +6662,10 @@ pub fn first_from_match<'a>(
     on_match: &mut dyn FnMut(&dyn ColumnLookup<'a>) -> Result<(), SqlError>,
 ) -> Result<bool, SqlError> {
     let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, Some(target))?;
-    let subs = subquery_hooks(&[where_clause], storage, txid, arena, params)?;
+    let mut subquery_expressions = [None; 1 + 2 * MAX_JOIN_TABLES];
+    subquery_expressions[0] = where_clause;
+    collect_table_sample_expressions(from, &mut subquery_expressions[1..]);
+    let subs = subquery_hooks(&subquery_expressions, storage, txid, arena, params)?;
     let catalog = StorageCatalog {
         storage,
         routine_workspace: arena,

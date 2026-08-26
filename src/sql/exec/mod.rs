@@ -2691,6 +2691,20 @@ pub fn drop_table(
                         return sql_fail(error);
                     }
                 }
+                let trigger_target = crate::storage::TriggerTarget::Table(index as u16);
+                loop {
+                    let trigger = storage.triggers_with_slots_visible_to(txn.txid).find_map(
+                        |(slot, trigger)| (trigger.target == trigger_target).then_some(slot),
+                    );
+                    let Some(slot) = trigger else { break };
+                    storage.drop_trigger(slot, txn.txid);
+                    if let Err(error) =
+                        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))
+                    {
+                        storage.rollback_trigger_drop(slot, txn.txid);
+                        return sql_fail(error);
+                    }
+                }
                 let lsn = storage.bump_lsn();
                 if let Err(e) = wal.stage(
                     txn.txid,

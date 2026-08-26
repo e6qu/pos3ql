@@ -27,6 +27,7 @@ public class JdbcTest {
             ddlAndCrud(c);
             transactions(c);
             typedValuesAndPortalPaging(c);
+            tableSampling(c);
             metadata(c);
         } catch (SQLException e) {
             line("FATAL " + sqlstate(e) + " " + firstLine(e.getMessage()));
@@ -148,6 +149,33 @@ public class JdbcTest {
         }
         c.rollback();
         c.setAutoCommit(true);
+    }
+
+    static void tableSampling(Connection c) throws SQLException {
+        try (Statement s = c.createStatement()) {
+            s.execute("CREATE TABLE jdbc_sample_source (id integer PRIMARY KEY)");
+            s.execute("INSERT INTO jdbc_sample_source SELECT value FROM generate_series(1,20) value");
+        }
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT count(*) FROM jdbc_sample_source "
+                + "TABLESAMPLE BERNOULLI (?) REPEATABLE (?)")) {
+            ps.setDouble(1, 100.0);
+            ps.setDouble(2, 42.0);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                line("sample rows=" + rs.getInt(1));
+            }
+        }
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT count(*) FROM jdbc_sample_source "
+                + "TABLESAMPLE SYSTEM (?) REPEATABLE (?)")) {
+            ps.setDouble(1, 0.0);
+            ps.setDouble(2, 42.0);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                line("system sample rows=" + rs.getInt(1));
+            }
+        }
     }
 
     // DatabaseMetaData — what ORMs/tools issue to introspect the schema.

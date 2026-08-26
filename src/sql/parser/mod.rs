@@ -819,7 +819,7 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self) -> Result<Stmt<'a>, ParseError> {
         match self.peeked {
-            Tok::Ident("select") | Tok::Ident("values") | Tok::Op("(") => self.query(),
+            Tok::Ident("select" | "table" | "values") | Tok::Op("(") => self.query(),
             Tok::Ident("explain") => self.explain(),
             Tok::Ident("with") => self.with_query(),
             Tok::Ident("create") => self.create(),
@@ -1966,6 +1966,69 @@ impl<'a> Parser<'a> {
             }
             return Ok(tree.expect("at least one VALUES row"));
         }
+        // Lower TABLE to a typed SELECT so every query consumer shares one
+        // execution path.
+        if self.peeked == Tok::Ident("table") {
+            self.advance()?;
+            let inheritance = if self.eat_ident("only")? {
+                RelationInheritance::Only
+            } else {
+                RelationInheritance::Descendants
+            };
+            let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
+            let first = self.col_ident("table name")?;
+            let (schema, table) = if self.eat_op(".")? {
+                (Some(first), self.col_ident("table name")?)
+            } else {
+                (None, first)
+            };
+            if parenthesized {
+                self.expect_op(")")?;
+            }
+            if inheritance == RelationInheritance::Descendants {
+                let _ = self.eat_op("*")?;
+            }
+            let source = TableRef {
+                schema,
+                table,
+                alias: None,
+                subquery: None,
+                func_args: None,
+                rows_from: None,
+                col_alias: None,
+                inheritance,
+                sample: None,
+                cte: None,
+                with_ordinality: false,
+                lateral: false,
+                authorization_role: None,
+            };
+            let select = Select {
+                items: self.arena_slice(&[SelectItem::Wildcard])?,
+                distinct: false,
+                distinct_on: &[],
+                from: Some(FromClause {
+                    base: source,
+                    joins: &[],
+                }),
+                where_clause: None,
+                group_by: &[],
+                grouping_sets: &[],
+                having: None,
+                order_by: &[],
+                limit: None,
+                offset: None,
+                with_ties: false,
+                with: &[],
+                set_body: None,
+                locking: &[],
+            };
+            return self.alloc_set(SetTree::Select(
+                self.arena
+                    .alloc(select)
+                    .map_err(|_| self.err_here("statement too large for SQL arena"))?,
+            ));
+        }
         let core = self.select_core()?;
         let core = self
             .arena
@@ -1996,6 +2059,11 @@ impl<'a> Parser<'a> {
         // reference the FROM items to its left. It applies to whichever kind of
         // item follows, so it is captured here and stamped on the result.
         let lateral = self.eat_ident("lateral")?;
+        let inheritance = if self.eat_ident("only")? {
+            RelationInheritance::Only
+        } else {
+            RelationInheritance::Descendants
+        };
         // ROWS FROM composes function scans in lockstep. Keep the member calls
         // typed as function-only TableRefs so ordinary relations, subqueries,
         // and nested groups cannot enter this state.
@@ -2013,6 +2081,8 @@ impl<'a> Parser<'a> {
                     func_args: None,
                     rows_from: None,
                     col_alias: None,
+                    inheritance: RelationInheritance::Descendants,
+                    sample: None,
                     cte: None,
                     with_ordinality: false,
                     lateral: false,
@@ -2067,6 +2137,8 @@ impl<'a> Parser<'a> {
                     func_args: None,
                     rows_from: Some(self.arena_slice(&functions[..count])?),
                     col_alias,
+                    inheritance: RelationInheritance::Descendants,
+                    sample: None,
                     cte: None,
                     with_ordinality,
                     lateral,
@@ -2106,18 +2178,27 @@ impl<'a> Parser<'a> {
                 func_args: None,
                 rows_from: None,
                 col_alias,
+                inheritance: RelationInheritance::Descendants,
+                sample: None,
                 cte: None,
                 with_ordinality: false,
                 lateral,
                 authorization_role: None,
             });
         }
+        let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
         let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
             (Some(first), self.col_ident("table name")?)
         } else {
             (None, first)
         };
+        if parenthesized {
+            self.expect_op(")")?;
+        }
+        if inheritance == RelationInheritance::Descendants {
+            let _ = self.eat_op("*")?;
+        }
         // Table function: `func(args) [WITH ORDINALITY] [AS] alias`. Only valid
         // immediately after the (possibly schema-qualified) name.
         let func_args = if self.peeked == Tok::Op("(") {
@@ -2141,6 +2222,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        if func_args.is_some() && inheritance == RelationInheritance::Only {
+            return Err(self.err_here("ONLY requires a relation, not a function call"));
+        }
+        if lateral && func_args.is_none() {
+            return Err(self.err_here("LATERAL requires a subquery or function call"));
+        }
         // `WITH ORDINALITY` follows the argument list, before any alias.
         let with_ordinality = if func_args.is_some() && self.eat_ident("with")? {
             self.expect_ident("ordinality")?;
@@ -2160,11 +2247,9 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // A column-alias list `alias(col, ...)` after a table function renames
-        // its output columns (the count is validated against the function's
-        // arity at planning time, where PostgreSQL's 42P10 error is raised).
-        let col_alias = if func_args.is_some() {
-            self.column_alias_list()?
+        let col_alias = self.column_alias_list()?;
+        let sample = if func_args.is_none() && self.eat_ident("tablesample")? {
+            Some(self.table_sample()?)
         } else {
             None
         };
@@ -2176,10 +2261,65 @@ impl<'a> Parser<'a> {
             func_args,
             rows_from: None,
             col_alias,
+            inheritance,
+            sample,
             cte: None,
             with_ordinality,
             lateral,
             authorization_role: None,
+        })
+    }
+
+    fn table_sample(&mut self) -> Result<TableSample<'a>, ParseError> {
+        let method_at = self.peek_at;
+        let method_name = self.any_ident("TABLESAMPLE method")?;
+        let method = match method_name {
+            "system" => TableSampleMethod::System,
+            "bernoulli" => TableSampleMethod::Bernoulli,
+            _ => {
+                return Err(ParseError {
+                    at: method_at,
+                    message: stack_format!(96, "tablesample method {} does not exist", method_name),
+                    sqlstate: sqlstate::UNDEFINED_OBJECT,
+                });
+            }
+        };
+        self.expect_op("(")?;
+        let percentage = self.expression(0)?;
+        if self.eat_op(",")? {
+            let mut count = 1usize;
+            loop {
+                let _ = self.expression(0)?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            return Err(ParseError {
+                at: method_at,
+                message: stack_format!(
+                    96,
+                    "tablesample method {} requires 1 argument, not {}",
+                    method_name,
+                    count
+                ),
+                sqlstate: sqlstate::INVALID_TABLESAMPLE_ARGUMENT,
+            });
+        }
+        self.expect_op(")")?;
+        let repeatable = if self.eat_ident("repeatable")? {
+            self.expect_op("(")?;
+            let seed = self.expression(0)?;
+            self.expect_op(")")?;
+            Some(seed)
+        } else {
+            None
+        };
+        Ok(TableSample {
+            method,
+            percentage,
+            repeatable,
         })
     }
 
@@ -2221,6 +2361,8 @@ impl<'a> Parser<'a> {
                 func_args: None,
                 rows_from: None,
                 col_alias: None,
+                inheritance: RelationInheritance::Descendants,
+                sample: None,
                 cte: None,
                 with_ordinality: false,
                 lateral: false,
@@ -4218,12 +4360,15 @@ impl<'a> Parser<'a> {
         } else {
             crate::sql::ast::Overriding::None
         };
-        // Source is either VALUES (...), ... or a SELECT.
+        // Source is either VALUES (...), ... or any PostgreSQL query body.
         let mut rows: [&'a [&'a Expr<'a>]; MAX_ROWS] = [&[]; MAX_ROWS];
         let mut n_rows = 0;
         let mut select = None;
-        if self.peeked == Tok::Ident("select") {
-            let sel = self.select()?;
+        if matches!(
+            self.peeked,
+            Tok::Ident("select" | "table" | "with") | Tok::Op("(")
+        ) {
+            let sel = self.query_select()?;
             select = Some(
                 self.arena
                     .alloc(sel)
@@ -6432,6 +6577,65 @@ mod tests {
         ] {
             with_parser(sql, |parser| {
                 assert!(parser.next_stmt().is_err(), "accepted {sql}")
+            });
+        }
+    }
+
+    #[test]
+    fn table_sources_parse_into_closed_inheritance_and_sampling_states() {
+        with_parser(
+            "TABLE ONLY (app.events) UNION ALL TABLE archived_events *; \
+             SELECT event_id FROM app.events AS sampled(event_id, payload) \
+               TABLESAMPLE BERNOULLI ($1) REPEATABLE ($2)",
+            |parser| {
+                let Stmt::SetQuery(query) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected TABLE set query")
+                };
+                let SetTree::Op { left, right, .. } = query.body else {
+                    panic!("expected UNION ALL tree")
+                };
+                let SetTree::Select(left) = left else {
+                    panic!()
+                };
+                assert_eq!(
+                    left.from.unwrap().base.inheritance,
+                    RelationInheritance::Only
+                );
+                let SetTree::Select(right) = right else {
+                    panic!()
+                };
+                assert_eq!(
+                    right.from.unwrap().base.inheritance,
+                    RelationInheritance::Descendants
+                );
+
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected sampled SELECT")
+                };
+                let table = select.from.unwrap().base;
+                assert_eq!(table.col_alias.unwrap(), ["event_id", "payload"]);
+                let sample = table.sample.expect("typed TABLESAMPLE");
+                assert_eq!(sample.method, TableSampleMethod::Bernoulli);
+                assert!(matches!(sample.percentage, Expr::Param(1)));
+                assert!(matches!(sample.repeatable, Some(Expr::Param(2))));
+            },
+        );
+
+        for (sql, state) in [
+            (
+                "SELECT * FROM events TABLESAMPLE missing (10)",
+                sqlstate::UNDEFINED_OBJECT,
+            ),
+            (
+                "SELECT * FROM events TABLESAMPLE system (1, 2)",
+                sqlstate::INVALID_TABLESAMPLE_ARGUMENT,
+            ),
+            ("SELECT * FROM LATERAL events", sqlstate::SYNTAX_ERROR),
+            ("TABLE ONLY events *", sqlstate::SYNTAX_ERROR),
+        ] {
+            with_parser(sql, |parser| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(error.sqlstate, state, "{sql}");
             });
         }
     }

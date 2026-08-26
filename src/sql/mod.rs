@@ -3557,8 +3557,6 @@ impl Engine {
                     let name = self.storage.table(*slot as usize).def.name;
                     let schema = self.storage.table(*slot as usize).def.schema;
                     self.storage.commit_drop(*slot as usize);
-                    self.storage.commit_triggers_for_table(*slot as usize);
-                    self.storage.commit_policies_for_table(*slot as usize);
                     // The table's indexes were pending-dropped with it.
                     self.storage
                         .commit_indexes_for(schema.as_str(), name.as_str(), txn.txid);
@@ -5282,6 +5280,9 @@ impl Engine {
                         }
                     }
                 }
+                if let Some(select) = ins.select {
+                    self.infer_select_source_params(select, txid, oids);
+                }
             }
             Stmt::Update(u) => {
                 for (col, value) in u.assignments {
@@ -5292,13 +5293,23 @@ impl Engine {
                 if let Some(w) = u.where_clause {
                     self.infer_where_params(&u.table, w, txid, oids);
                 }
+                if let Some(from) = u.from {
+                    Self::infer_from_source_params(from, oids);
+                }
             }
             Stmt::Delete(d) => {
                 if let Some(w) = d.where_clause {
                     self.infer_where_params(&d.table, w, txid, oids);
                 }
+                if let Some(using) = d.using {
+                    Self::infer_from_source_params(using, oids);
+                }
+            }
+            Stmt::Merge(merge) => {
+                Self::infer_table_sample_params(&merge.source, oids);
             }
             Stmt::Select(s) => {
+                self.infer_select_source_params(s, txid, oids);
                 // Single-table WHERE comparisons only (joins would need scope
                 // resolution; those params stay text).
                 if let (Some(from), Some(w)) = (&s.from, s.where_clause)
@@ -5320,7 +5331,74 @@ impl Engine {
                     }
                 }
             }
+            Stmt::SetQuery(query) => {
+                self.infer_set_tree_source_params(query.body, txid, oids);
+                for cte in query.with {
+                    match cte.dml {
+                        Some(dml) => self.infer_stmt_params(dml, txid, oids),
+                        None => self.infer_select_source_params(cte.query, txid, oids),
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn infer_select_source_params(
+        &self,
+        select: &ast::Select<'_>,
+        txid: u32,
+        oids: &mut [i32; MAX_BIND_PARAMS],
+    ) {
+        if let Some(from) = select.from {
+            Self::infer_from_source_params(&from, oids);
+        }
+        if let Some(tree) = select.set_body {
+            self.infer_set_tree_source_params(tree, txid, oids);
+        }
+        for cte in select.with {
+            match cte.dml {
+                Some(dml) => self.infer_stmt_params(dml, txid, oids),
+                None => self.infer_select_source_params(cte.query, txid, oids),
+            }
+        }
+    }
+
+    fn infer_from_source_params(from: &ast::FromClause<'_>, oids: &mut [i32; MAX_BIND_PARAMS]) {
+        Self::infer_table_sample_params(&from.base, oids);
+        for join in from.joins {
+            Self::infer_table_sample_params(&join.table, oids);
+        }
+    }
+
+    fn infer_table_sample_params(table: &ast::TableRef<'_>, oids: &mut [i32; MAX_BIND_PARAMS]) {
+        let Some(sample) = table.sample else { return };
+        let assign = |expression: &Expr, oid: i32, oids: &mut [i32; MAX_BIND_PARAMS]| {
+            if let Expr::Param(parameter) = expression
+                && *parameter >= 1
+                && (*parameter as usize) <= MAX_BIND_PARAMS
+            {
+                oids[*parameter as usize - 1] = oid;
+            }
+        };
+        assign(sample.percentage, types::ColType::Float4.oid(), oids);
+        if let Some(repeatable) = sample.repeatable {
+            assign(repeatable, types::ColType::Float8.oid(), oids);
+        }
+    }
+
+    fn infer_set_tree_source_params(
+        &self,
+        tree: &ast::SetTree<'_>,
+        txid: u32,
+        oids: &mut [i32; MAX_BIND_PARAMS],
+    ) {
+        match tree {
+            ast::SetTree::Select(select) => self.infer_select_source_params(select, txid, oids),
+            ast::SetTree::Op { left, right, .. } => {
+                self.infer_set_tree_source_params(left, txid, oids);
+                self.infer_set_tree_source_params(right, txid, oids);
+            }
         }
     }
 
@@ -5789,7 +5867,7 @@ impl Engine {
     fn execute_data_modification<'a, 'capture>(
         storage: &mut Storage,
         scratch: &mut exec::DmlScratch,
-        arena: &Arena,
+        arena: &'a Arena,
         statement: &'a Stmt<'a>,
         txn: &mut TxnState,
         params: &[Datum<'a>],
@@ -5797,6 +5875,22 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        // Expand every DML source before the mutable storage borrow so views
+        // behave consistently across INSERT, UPDATE FROM, DELETE USING and MERGE.
+        let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
+        let statement = match query::expand_dml_ctes(
+            statement,
+            &[],
+            storage,
+            txn.txid,
+            arena,
+            params,
+            &[],
+            Some(&sequence),
+        ) {
+            Ok(expanded) => expanded,
+            Err(error) => return Ok(Err(error)),
+        };
         let relation = match statement {
             Stmt::Insert(insert) => Some(insert.table),
             Stmt::Update(update) => Some(update.table),
@@ -5879,6 +5973,44 @@ impl Engine {
             responder.command_complete_rows(tag.as_str(), affected)?;
         }
         Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_merge<'a>(
+        storage: &mut Storage,
+        scratch: &mut exec::DmlScratch,
+        arena: &'a Arena,
+        statement: &'a Stmt<'a>,
+        txn: &mut TxnState,
+        params: &[Datum<'a>],
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
+        let expanded = match query::expand_dml_ctes(
+            statement,
+            &[],
+            storage,
+            txn.txid,
+            arena,
+            params,
+            &[],
+            Some(&sequence),
+        ) {
+            Ok(Stmt::Merge(merge)) => merge,
+            Ok(_) => unreachable!("MERGE source expansion keeps its statement kind"),
+            Err(error) => return Ok(Err(error)),
+        };
+        exec::merge(
+            storage,
+            txn,
+            scratch,
+            expanded,
+            arena,
+            params,
+            guc.seq_session(),
+            responder,
+        )
     }
 
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -6898,14 +7030,14 @@ impl Engine {
                 responder,
                 None,
             ),
-            Stmt::Merge(merge) => exec::merge(
+            Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
-                txn,
                 &mut self.dml_scratch,
-                merge,
                 &self.work,
+                statement,
+                txn,
                 params,
-                guc.seq_session(),
+                guc,
                 responder,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
@@ -6963,14 +7095,14 @@ impl Engine {
                 responder,
                 capture,
             ),
-            Stmt::Merge(merge) => exec::merge(
+            Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
-                txn,
                 &mut self.dml_scratch,
-                merge,
                 &self.work,
+                statement,
+                txn,
                 params,
-                guc.seq_session(),
+                guc,
                 responder,
             ),
             _ => Ok(Err(sql_err!(
@@ -8209,14 +8341,14 @@ impl Engine {
                 responder,
                 capture,
             ),
-            Stmt::Merge(m) => exec::merge(
+            Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
-                txn,
                 &mut self.dml_scratch,
-                m,
                 arena,
+                statement,
+                txn,
                 params,
-                guc.seq_session(),
+                guc,
                 responder,
             ),
             Stmt::Comment { target, text } => exec::comment(

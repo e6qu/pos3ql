@@ -216,6 +216,8 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             func_args: None,
             rows_from: None,
             col_alias: None,
+            inheritance: crate::sql::ast::RelationInheritance::Descendants,
+            sample: None,
             cte: None,
             with_ordinality: false,
             lateral: false,

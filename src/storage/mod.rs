@@ -15341,6 +15341,8 @@ impl Storage {
         self.tables[index].pending_ddl = None;
         self.tables[index].rows.clear();
         self.tables[index].statistics_wal_dirty = false;
+        self.commit_triggers_for_table(index);
+        self.commit_policies_for_table(index);
     }
 
     /// Rolls back an uncommitted CREATE, freeing the slot.
@@ -21356,6 +21358,10 @@ impl Storage {
     pub(crate) fn commit_trigger_drop(&mut self, slot: usize) {
         let trigger = self.triggers[slot];
         self.triggers[slot].ddl_state = self.triggers[slot].ddl_state.commit_drop();
+        self.clear_trigger_dependents(slot, trigger);
+    }
+
+    fn clear_trigger_dependents(&mut self, slot: usize, trigger: TriggerDef) {
         self.clear_extension_dependencies_for_object(Self::trigger_access_object(slot));
         for state in self.partition_trigger_states.iter_mut() {
             if usize::from(state.trigger) == slot {
@@ -21375,20 +21381,28 @@ impl Storage {
         }
     }
 
+    fn drop_trigger_comments_for_target(&mut self, target: TriggerTarget) {
+        let subid = target.comment_subid();
+        for slot in 0..self.comments.len() {
+            let comment = &self.comments[slot];
+            if comment.used && comment.class == CommentClass::Trigger && comment.subid == subid {
+                self.comments[slot].live = None;
+                self.reap_comment(slot);
+            }
+        }
+    }
+
     /// Triggers are internal relation dependents. A committed table drop
     /// retires them in the same catalog transition.
     pub(crate) fn commit_triggers_for_table(&mut self, table: usize) {
-        for (slot, trigger) in self.triggers.iter_mut().enumerate() {
-            if trigger.ddl_state != CatalogDdlState::Absent
-                && trigger.target == TriggerTarget::Table(table as u16)
-            {
-                trigger.ddl_state = CatalogDdlState::Absent;
-                trigger.pending_definition = None;
-                for state in self.partition_trigger_states.iter_mut() {
-                    if usize::from(state.trigger) == slot {
-                        *state = PartitionTriggerState::EMPTY;
-                    }
-                }
+        let target = TriggerTarget::Table(table as u16);
+        self.drop_trigger_comments_for_target(target);
+        for slot in 0..self.triggers.len() {
+            let trigger = self.triggers[slot];
+            if trigger.ddl_state != CatalogDdlState::Absent && trigger.target == target {
+                self.triggers[slot].ddl_state = CatalogDdlState::Absent;
+                self.triggers[slot].pending_definition = None;
+                self.clear_trigger_dependents(slot, trigger);
             }
         }
     }

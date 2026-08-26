@@ -66,6 +66,17 @@ async function main() {
       "FROM pg_attribute WHERE attrelid = 'node_types'::regclass AND attnum > 0 " +
       "AND NOT attisdropped ORDER BY attnum");
     for (const r of typedCols.rows) line(`typed-col ${r.attname}|${r.t}`);
+
+    await c.query('CREATE TABLE node_sample_source (id integer PRIMARY KEY)');
+    await c.query('INSERT INTO node_sample_source SELECT value FROM generate_series(1,20) value');
+    const sampled = await c.query(
+      'SELECT count(*)::int AS n FROM node_sample_source ' +
+      'TABLESAMPLE BERNOULLI ($1) REPEATABLE ($2)', [100.0, 42.0]);
+    line('sample rows=' + sampled.rows[0].n);
+    const emptySample = await c.query(
+      'SELECT count(*)::int AS n FROM node_sample_source ' +
+      'TABLESAMPLE SYSTEM ($1) REPEATABLE ($2)', [0.0, 42.0]);
+    line('system sample rows=' + emptySample.rows[0].n);
   } finally {
     await c.end();
   }

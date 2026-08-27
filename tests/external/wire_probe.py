@@ -1839,6 +1839,72 @@ def test_plpgsql_procedure_output_over_raw_wire():
     s.close()
 
 
+def test_plpgsql_transaction_boundaries_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_plpgsql_transaction_log(value integer PRIMARY KEY); "
+        "CREATE PROCEDURE wire_plpgsql_simple_transaction() LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_plpgsql_transaction_log VALUES (1); COMMIT; "
+        "INSERT INTO wire_plpgsql_transaction_log VALUES (2); END'; "
+        "CREATE PROCEDURE wire_plpgsql_extended_transaction() LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_plpgsql_transaction_log VALUES (3); COMMIT; "
+        "INSERT INTO wire_plpgsql_transaction_log VALUES (4); END'; "
+        "CREATE PROCEDURE wire_plpgsql_forbidden_transaction() LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_plpgsql_transaction_log VALUES (5); COMMIT; END'",
+    )
+    check(
+        "raw wire: transaction procedure setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+
+    called = simple_query(s, "CALL wire_plpgsql_simple_transaction()")
+    check(
+        "raw wire: lone simple CALL crosses a real commit boundary",
+        [kind for kind, _ in called] == [b"C", b"Z"],
+        called,
+    )
+
+    query = "CALL wire_plpgsql_extended_transaction()"
+    parse = frontend_message(b"P", b"\x00" + query.encode() + b"\x00\x00\x00")
+    bind = frontend_message(b"B", b"\x00\x00\x00\x00\x00\x00\x00\x00")
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + execute + frontend_message(b"S"))
+    extended = []
+    while True:
+        item = read_message(s)
+        extended.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "raw wire: lone extended CALL crosses a real commit boundary",
+        [kind for kind, _ in extended] == [b"1", b"2", b"C", b"Z"],
+        extended,
+    )
+
+    rejected = simple_query(s, "CALL wire_plpgsql_forbidden_transaction(); SELECT 1")
+    check(
+        "raw wire: multi-statement CALL rejects transaction termination",
+        has_sqlstate(rejected, "2D000") and rejected[-1][0] == b"Z",
+        rejected,
+    )
+    check(
+        "raw wire: rejected boundary rolls back its procedure writes",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT string_agg(value::text, ',' ORDER BY value) "
+                "FROM wire_plpgsql_transaction_log",
+            )
+        )
+        == "1,2,3,4",
+    )
+    s.close()
+
+
 def test_trigger_function_replacement_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

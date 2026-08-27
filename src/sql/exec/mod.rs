@@ -4,7 +4,7 @@
 //! materializes sort keys into the per-statement arena (bounded by the
 //! arena size, loudly). No allocation anywhere.
 
-use super::txn::TxnState;
+use super::txn::{TxnMode, TxnState};
 use crate::mem::arena::Arena;
 use crate::mem::fixed_vec::FixedVec;
 use crate::pg::respond::Responder;
@@ -811,16 +811,16 @@ fn execute_row_trigger_body<'a>(
     let (table_schema, table_name) = match target {
         crate::storage::TriggerTarget::Table(table) => {
             let target_definition = context
-                .storage
+                .storage()
                 .table_def(usize::from(table), context.txn.txid);
             (target_definition.schema, target_definition.name)
         }
         crate::storage::TriggerTarget::View(_) => (definition.schema, definition.name),
     };
     let routine = context
-        .storage
+        .storage()
         .routine_for(usize::from(trigger.function), context.txn.txid);
-    let owner = context.storage.role_name(
+    let owner = context.storage().role_name(
         routine.ownership.owner_to(context.txn.txid).into(),
         context.txn.txid,
     );
@@ -9032,7 +9032,7 @@ pub enum InsertSource<'a> {
 #[derive(Clone, Copy)]
 enum TriggerStatement<'a> {
     Null,
-    TransactionControl,
+    TransactionControl(PlpgsqlTransactionCommand),
     Assign(TriggerAssignment<'a>),
     LocalAssign(TriggerLocalAssignment<'a>),
     SelectInto(TriggerSelectInto<'a>),
@@ -9050,6 +9050,24 @@ enum TriggerStatement<'a> {
     Loop(TriggerBlock<'a>),
     LoopControl(TriggerLoopControl<'a>),
     Return(TriggerReturn),
+}
+
+#[derive(Clone, Copy)]
+enum PlpgsqlTransactionCommand {
+    Commit(PlpgsqlNextTransaction),
+    Rollback(PlpgsqlNextTransaction),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlpgsqlNextTransaction {
+    Defaults,
+    Chained,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlpgsqlTransactionContext {
+    Atomic,
+    NonAtomic,
 }
 
 #[derive(Clone, Copy)]
@@ -10816,6 +10834,8 @@ fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> 
         sqlstate::DIVISION_BY_ZERO
     } else if text.eq_ignore_ascii_case("cardinality_violation") {
         sqlstate::CARDINALITY_VIOLATION
+    } else if text.eq_ignore_ascii_case("invalid_transaction_termination") {
+        sqlstate::INVALID_TRANSACTION_TERMINATION
     } else if text.eq_ignore_ascii_case("raise_exception") {
         sqlstate::RAISE_EXCEPTION
     } else if text.eq_ignore_ascii_case("assert_failure") {
@@ -10881,8 +10901,27 @@ fn parse_trigger_statement<'a>(
     if segment.eq_ignore_ascii_case("null") {
         return Ok(TriggerStatement::Null);
     }
-    if segment.eq_ignore_ascii_case("commit") || segment.eq_ignore_ascii_case("rollback") {
-        return Ok(TriggerStatement::TransactionControl);
+    for (keyword, make) in [
+        ("commit", PlpgsqlTransactionCommand::Commit as fn(_) -> _),
+        (
+            "rollback",
+            PlpgsqlTransactionCommand::Rollback as fn(_) -> _,
+        ),
+    ] {
+        let Some(tail) = strip_trigger_keyword(segment, keyword) else {
+            continue;
+        };
+        let tail = tail.trim();
+        let next = if tail.is_empty() {
+            PlpgsqlNextTransaction::Defaults
+        } else if tail.eq_ignore_ascii_case("and chain") {
+            PlpgsqlNextTransaction::Chained
+        } else if tail.eq_ignore_ascii_case("and no chain") {
+            PlpgsqlNextTransaction::Defaults
+        } else {
+            return Err(unsupported_trigger_body());
+        };
+        return Ok(TriggerStatement::TransactionControl(make(next)));
     }
     if let Some(result) = parse_trigger_return(segment, program_kind)? {
         return Ok(TriggerStatement::Return(result));
@@ -11501,26 +11540,35 @@ fn validate_plpgsql_procedure_namespace(
 /// interpreter as stored PL/pgSQL. The anonymous invocation has no trigger
 /// transition state, so `TG_*`, `OLD`, `NEW`, and trigger return values never
 /// become representable in its expression scope.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "anonymous procedure execution owns its transaction-capable call context"
+)]
 pub(crate) fn execute_anonymous_plpgsql<'a>(
-    storage: &mut Storage,
+    engine: &mut super::Engine,
     txn: &mut TxnState,
-    scratch: &mut DmlScratch,
+    cursors: &mut super::cursor::CursorPool,
+    guc: &super::guc::GucState,
+    transaction_context: PlpgsqlTransactionContext,
     source: &'a str,
     arena: &'a Arena,
-    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder<'_>,
 ) -> Result<(), SqlError> {
     let program = parse_plpgsql_program(source, arena, PlpgsqlProgramKind::Anonymous)?;
     let definition = TableDef::empty();
     let invocation = TriggerInvocation::anonymous();
     let mut context = TriggerExecContext {
-        storage,
+        host: PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            cursors,
+            transaction_context,
+        },
         txn,
         arena,
         params: crate::sql::eval::NO_PARAMS,
-        seq_session,
+        seq_session: guc.seq_session(),
         responder,
-        scratch,
     };
     let mut local_values = [Datum::Null; MAX_COLUMNS];
     let mut status = TriggerExecutionStatus::default();
@@ -11566,13 +11614,14 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
     reason = "stored procedure execution owns its complete typed call context"
 )]
 pub(crate) fn execute_plpgsql_procedure<'a>(
-    storage: &mut Storage,
+    engine: &mut super::Engine,
     txn: &mut TxnState,
-    scratch: &mut DmlScratch,
+    cursors: &mut super::cursor::CursorPool,
+    guc: &super::guc::GucState,
+    transaction_context: PlpgsqlTransactionContext,
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
-    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder<'_>,
     outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
 ) -> Result<usize, SqlError> {
@@ -11652,13 +11701,17 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     let definition = TableDef::empty();
     let invocation = TriggerInvocation::procedure(routine, arena)?;
     let mut context = TriggerExecContext {
-        storage,
+        host: PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            cursors,
+            transaction_context,
+        },
         txn,
         arena,
         params: inputs,
-        seq_session,
+        seq_session: guc.seq_session(),
         responder,
-        scratch,
     };
     let mut local_values = [Datum::Null; MAX_COLUMNS];
     let mut status = TriggerExecutionStatus::default();
@@ -12302,17 +12355,127 @@ fn snapshot_trigger_dml_scope<'a>(
         .map_err(|_| super::query::arena_full_pub())
 }
 
+enum PlpgsqlExecHost<'s> {
+    Atomic {
+        storage: &'s mut Storage,
+        // Nested DML reuses the caller's startup-sized scratch only after the
+        // outer scan is detached; the pointer is never borrowed concurrently.
+        scratch: *mut DmlScratch,
+    },
+    Routine {
+        engine: &'s mut super::Engine,
+        guc: &'s super::guc::GucState,
+        cursors: &'s mut super::cursor::CursorPool,
+        transaction_context: PlpgsqlTransactionContext,
+    },
+}
+
+impl PlpgsqlExecHost<'_> {
+    fn storage(&self) -> &Storage {
+        match self {
+            Self::Atomic { storage, .. } => storage,
+            Self::Routine { engine, .. } => &engine.storage,
+        }
+    }
+
+    fn storage_mut(&mut self) -> &mut Storage {
+        match self {
+            Self::Atomic { storage, .. } => storage,
+            Self::Routine { engine, .. } => &mut engine.storage,
+        }
+    }
+
+    fn scratch(&mut self) -> *mut DmlScratch {
+        match self {
+            Self::Atomic { scratch, .. } => *scratch,
+            Self::Routine { engine, .. } => &mut engine.dml_scratch,
+        }
+    }
+
+    fn transaction_control(
+        &mut self,
+        command: PlpgsqlTransactionCommand,
+        txn: &mut TxnState,
+        arena: &Arena,
+        responder: &mut Responder<'_>,
+    ) -> Result<(), SqlError> {
+        let Self::Routine {
+            engine,
+            guc,
+            cursors,
+            transaction_context: PlpgsqlTransactionContext::NonAtomic,
+        } = self
+        else {
+            return Err(sql_err!(
+                sqlstate::INVALID_TRANSACTION_TERMINATION,
+                "invalid transaction termination"
+            ));
+        };
+        if txn.is_explicit() || txn.has_savepoints() {
+            return Err(sql_err!(
+                sqlstate::INVALID_TRANSACTION_TERMINATION,
+                "invalid transaction termination"
+            ));
+        }
+        let prior_characteristics = (txn.isolation, txn.read_only, txn.deferrable);
+        let next = match command {
+            PlpgsqlTransactionCommand::Commit(next) => {
+                engine.commit_txn_with_triggers(txn, guc, arena, responder)?;
+                cursors.on_commit();
+                engine.commit_wal()?;
+                next
+            }
+            PlpgsqlTransactionCommand::Rollback(next) => {
+                engine.rollback_txn(txn, guc);
+                cursors.on_rollback();
+                next
+            }
+        };
+        engine.ensure_txn(txn, TxnMode::Implicit, guc);
+        if next == PlpgsqlNextTransaction::Chained {
+            txn.set_characteristics(
+                prior_characteristics.0,
+                prior_characteristics.1,
+                prior_characteristics.2,
+            );
+        }
+        Ok(())
+    }
+}
+
 struct TriggerExecContext<'s, 'a, 'b> {
-    storage: &'s mut Storage,
+    host: PlpgsqlExecHost<'s>,
     txn: &'s mut TxnState,
     arena: &'a Arena,
     params: &'a [Datum<'a>],
     seq_session: &'s crate::sql::guc::SeqSession,
     responder: &'s mut Responder<'b>,
-    // The caller owns this startup-sized workspace for the duration of the
-    // trigger dispatch. Nested DML temporarily borrows it through this raw
-    // pointer only after saving the outer scan; no two uses overlap.
-    scratch: *mut DmlScratch,
+}
+
+impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
+    fn storage(&self) -> &Storage {
+        self.host.storage()
+    }
+
+    fn storage_mut(&mut self) -> &mut Storage {
+        self.host.storage_mut()
+    }
+
+    fn scratch(&mut self) -> *mut DmlScratch {
+        self.host.scratch()
+    }
+
+    fn dml_parts<'borrow>(
+        &'borrow mut self,
+    ) -> (
+        &'borrow mut Storage,
+        &'borrow mut TxnState,
+        *mut DmlScratch,
+        &'borrow mut Responder<'b>,
+    ) {
+        let scratch = self.host.scratch();
+        (self.host.storage_mut(), self.txn, scratch, self.responder)
+    }
 }
 
 fn eval_trigger_expression<'a>(
@@ -12320,9 +12483,9 @@ fn eval_trigger_expression<'a>(
     expression: &'a Expr<'a>,
     row: &impl ColumnLookup<'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let catalog = super::query::storage_catalog(&*context.storage, context.arena, context.txn.txid);
+    let catalog = super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
     let sequence = crate::sql::sequence::SeqEval::new(
-        &*context.storage,
+        context.storage(),
         context.seq_session,
         context.txn.txid,
     );
@@ -12336,20 +12499,21 @@ fn eval_trigger_expression<'a>(
 
 fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>, index: usize) {
     let savepoint = context.txn.savepoint_at(index);
+    let txid = context.txn.txid;
     for at in (savepoint.touched_mark..context.txn.touched().len()).rev() {
         let (table, rowid, prior) = context.txn.touched()[at];
         context
-            .storage
-            .restore_pending(table as usize, rowid, context.txn.txid, prior);
+            .storage_mut()
+            .restore_pending(table as usize, rowid, txid, prior);
     }
     for at in (savepoint.statistics_mark..context.txn.statistics_undo().len()).rev() {
         match context.txn.statistics_undo()[at] {
             super::txn::StatisticsUndo::Table(table) => context
-                .storage
-                .rollback_table_statistics(table as usize, context.txn.txid),
+                .storage_mut()
+                .rollback_table_statistics(table as usize, txid),
             super::txn::StatisticsUndo::Extended(statistics) => context
-                .storage
-                .rollback_extended_statistics_data(statistics as usize, context.txn.txid),
+                .storage_mut()
+                .rollback_extended_statistics_data(statistics as usize, txid),
         }
     }
     context.txn.rewind_touched(savepoint.touched_mark);
@@ -12364,8 +12528,8 @@ fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>,
         savepoint.listen_mark,
     );
     context
-        .storage
-        .rollback_locks_to(context.txn.txid, savepoint.lock_mark);
+        .storage_mut()
+        .rollback_locks_to(txid, savepoint.lock_mark);
     context.txn.release_savepoints_from(index);
     context.txn.failed = savepoint.failed;
 }
@@ -12736,19 +12900,12 @@ fn execute_trigger_block<'a>(
     for statement in block.statements {
         match *statement {
             TriggerStatement::Null => {}
-            TriggerStatement::TransactionControl => {
-                return Err(if context.txn.is_explicit() {
-                    sql_err!(
-                        sqlstate::INVALID_TRANSACTION_TERMINATION,
-                        "invalid transaction termination"
-                    )
-                } else {
-                    sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "PL/pgSQL transaction control is not supported"
-                    )
-                });
-            }
+            TriggerStatement::TransactionControl(command) => context.host.transaction_control(
+                command,
+                context.txn,
+                context.arena,
+                context.responder,
+            )?,
             TriggerStatement::Return(result) => return Ok(Some(TriggerFlow::Return(result))),
             TriggerStatement::Assign(assignment) => {
                 if !before || new.is_none() {
@@ -12787,7 +12944,7 @@ fn execute_trigger_block<'a>(
                 let value = coerce(
                     value,
                     &definition.columns()[column],
-                    context.storage,
+                    context.storage(),
                     context.txn.txid,
                     context.arena,
                 )?;
@@ -12873,7 +13030,7 @@ fn execute_trigger_block<'a>(
                     Some(relations) => super::query::bind_materialized_relations(
                         statement.query,
                         relations,
-                        context.storage,
+                        context.storage(),
                         context.txn.txid,
                         context.arena,
                     )?,
@@ -12892,7 +13049,7 @@ fn execute_trigger_block<'a>(
                     transition: &transition,
                 };
                 let sequence = crate::sql::sequence::SeqEval::new(
-                    context.storage,
+                    context.storage(),
                     context.seq_session,
                     context.txn.txid,
                 );
@@ -12900,7 +13057,7 @@ fn execute_trigger_block<'a>(
                 let mut found = false;
                 let mut row_count = 0usize;
                 super::query::select_into_rows(
-                    context.storage,
+                    context.storage(),
                     context.txn.txid,
                     query,
                     context.arena,
@@ -12959,7 +13116,7 @@ fn execute_trigger_block<'a>(
                     Some(relations) => super::query::bind_materialized_relations(
                         query,
                         relations,
-                        context.storage,
+                        context.storage(),
                         context.txn.txid,
                         context.arena,
                     )?,
@@ -12978,13 +13135,13 @@ fn execute_trigger_block<'a>(
                     transition: &transition,
                 };
                 let sequence = crate::sql::sequence::SeqEval::new(
-                    context.storage,
+                    context.storage(),
                     context.seq_session,
                     context.txn.txid,
                 );
                 let mut row_count = 0u64;
                 super::query::select_into_rows(
-                    context.storage,
+                    context.storage(),
                     context.txn.txid,
                     query,
                     context.arena,
@@ -13187,7 +13344,7 @@ fn execute_trigger_block<'a>(
             TriggerStatement::Exception(exception_block) => {
                 context
                     .txn
-                    .savepoint("__trigger_exception__", 0, context.storage.lock_mark())?;
+                    .savepoint("__trigger_exception__", 0, context.storage().lock_mark())?;
                 let index = context
                     .txn
                     .savepoint_index("__trigger_exception__")
@@ -13295,14 +13452,14 @@ fn execute_trigger_block<'a>(
                             Some(relations) => super::query::bind_materialized_relations(
                                 select,
                                 relations,
-                                context.storage,
+                                context.storage(),
                                 context.txn.txid,
                                 context.arena,
                             )?,
                             None => select,
                         };
                         Some(materialize_trigger_insert_source(
-                            context.storage,
+                            context.storage(),
                             select,
                             context.arena,
                             context.arena,
@@ -13328,18 +13485,22 @@ fn execute_trigger_block<'a>(
                     )?),
                     None => None,
                 };
-                let scratch = unsafe { &mut *context.scratch };
-                context.txn.enter_trigger_sql()?;
-                context.responder.clear_affected_rows();
-                let outcome = context.responder.without_command_complete(|responder| {
+                let arena = context.arena;
+                let params = context.params;
+                let seq_session = context.seq_session;
+                let (storage, txn, scratch, responder) = context.dml_parts();
+                let scratch = unsafe { &mut *scratch };
+                txn.enter_trigger_sql()?;
+                responder.clear_affected_rows();
+                let outcome = responder.without_command_complete(|responder| {
                     insert(
-                        context.storage,
-                        context.txn,
+                        storage,
+                        txn,
                         scratch,
                         &statement,
-                        context.arena,
-                        context.params,
-                        context.seq_session,
+                        arena,
+                        params,
+                        seq_session,
                         responder,
                         None,
                         Some(&scope),
@@ -13349,7 +13510,7 @@ fn execute_trigger_block<'a>(
                             .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
                     )
                 });
-                context.txn.leave_trigger_sql();
+                txn.leave_trigger_sql();
                 match outcome {
                     Ok(Ok(())) => status.set_rows(
                         context
@@ -13381,7 +13542,7 @@ fn execute_trigger_block<'a>(
                         let super::ast::Stmt::Update(bound) =
                             *super::query::bind_dml_materialized_relations(
                                 dml,
-                                context.storage,
+                                context.storage(),
                                 context.txn.txid,
                                 context.arena,
                                 context.params,
@@ -13394,7 +13555,7 @@ fn execute_trigger_block<'a>(
                     }
                     None => statement,
                 };
-                let scratch = unsafe { &mut *context.scratch };
+                let scratch = unsafe { &mut *context.scratch() };
                 let saved = context
                     .arena
                     .alloc_slice_copy(scratch.as_slice())
@@ -13404,8 +13565,6 @@ fn execute_trigger_block<'a>(
                             "nested trigger UPDATE exceeds the statement arena"
                         )
                     })?;
-                context.txn.enter_trigger_sql()?;
-                context.responder.clear_affected_rows();
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -13418,21 +13577,27 @@ fn execute_trigger_block<'a>(
                     invocation,
                     transition: &transition,
                 };
-                let outcome = context.responder.without_command_complete(|responder| {
+                let arena = context.arena;
+                let params = context.params;
+                let seq_session = context.seq_session;
+                let (storage, txn, _, responder) = context.dml_parts();
+                txn.enter_trigger_sql()?;
+                responder.clear_affected_rows();
+                let outcome = responder.without_command_complete(|responder| {
                     update(
-                        context.storage,
-                        context.txn,
+                        storage,
+                        txn,
                         scratch,
                         &statement,
-                        context.arena,
-                        context.params,
-                        context.seq_session,
+                        arena,
+                        params,
+                        seq_session,
                         responder,
                         None,
                         Some(&scope),
                     )
                 });
-                context.txn.leave_trigger_sql();
+                txn.leave_trigger_sql();
                 scratch.clear();
                 for item in saved.iter().copied() {
                     scratch.push(item).map_err(|_| {
@@ -13473,7 +13638,7 @@ fn execute_trigger_block<'a>(
                         let super::ast::Stmt::Delete(bound) =
                             *super::query::bind_dml_materialized_relations(
                                 dml,
-                                context.storage,
+                                context.storage(),
                                 context.txn.txid,
                                 context.arena,
                                 context.params,
@@ -13486,7 +13651,7 @@ fn execute_trigger_block<'a>(
                     }
                     None => statement,
                 };
-                let scratch = unsafe { &mut *context.scratch };
+                let scratch = unsafe { &mut *context.scratch() };
                 let saved = context
                     .arena
                     .alloc_slice_copy(scratch.as_slice())
@@ -13496,8 +13661,6 @@ fn execute_trigger_block<'a>(
                             "nested trigger DELETE exceeds the statement arena"
                         )
                     })?;
-                context.txn.enter_trigger_sql()?;
-                context.responder.clear_affected_rows();
                 let transition = TriggerTransition {
                     definition,
                     old,
@@ -13510,21 +13673,27 @@ fn execute_trigger_block<'a>(
                     invocation,
                     transition: &transition,
                 };
-                let outcome = context.responder.without_command_complete(|responder| {
+                let arena = context.arena;
+                let params = context.params;
+                let seq_session = context.seq_session;
+                let (storage, txn, _, responder) = context.dml_parts();
+                txn.enter_trigger_sql()?;
+                responder.clear_affected_rows();
+                let outcome = responder.without_command_complete(|responder| {
                     delete(
-                        context.storage,
-                        context.txn,
+                        storage,
+                        txn,
                         scratch,
                         &statement,
-                        context.arena,
-                        context.params,
-                        context.seq_session,
+                        arena,
+                        params,
+                        seq_session,
                         responder,
                         None,
                         Some(&scope),
                     )
                 });
-                context.txn.leave_trigger_sql();
+                txn.leave_trigger_sql();
                 scratch.clear();
                 for item in saved.iter().copied() {
                     scratch.push(item).map_err(|_| {
@@ -13665,7 +13834,7 @@ fn execute_trigger_block<'a>(
                             Some(relations) => super::query::bind_materialized_relations(
                                 query,
                                 relations,
-                                context.storage,
+                                context.storage(),
                                 context.txn.txid,
                                 context.arena,
                             )?,
@@ -13686,7 +13855,7 @@ fn execute_trigger_block<'a>(
                             };
                             if locals[target].ctype == ColType::Record {
                                 materialize_trigger_for_record_query(
-                                    context.storage,
+                                    context.storage(),
                                     query,
                                     context.arena,
                                     context.arena,
@@ -13699,7 +13868,7 @@ fn execute_trigger_block<'a>(
                                 )?
                             } else {
                                 materialize_trigger_for_query(
-                                    context.storage,
+                                    context.storage(),
                                     query,
                                     context.arena,
                                     context.arena,
@@ -14029,7 +14198,7 @@ fn execute_trigger_block<'a>(
                             !operand.is_null()
                                 && !value.is_null()
                                 && compare_datums_collated(
-                                    &*context.storage,
+                                    context.storage(),
                                     collation,
                                     &operand,
                                     &value,
@@ -14093,7 +14262,7 @@ fn fire_row_trigger_slot<'a>(
 ) -> Result<Option<bool>, SqlError> {
     let mut new = new;
     let trigger = context
-        .storage
+        .storage()
         .triggers_for_target(target, context.txn.txid)
         .find_map(|(slot, trigger)| (slot == trigger_slot).then_some(trigger))
         .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "trigger version is not visible"))?;
@@ -14107,7 +14276,7 @@ fn fire_row_trigger_slot<'a>(
         || trigger.enabled_to(context.txn.txid),
         |table| {
             context
-                .storage
+                .storage()
                 .partition_trigger_enabled_to(trigger_slot, table, context.txn.txid)
         },
     );
@@ -14203,7 +14372,7 @@ fn fire_row_trigger_slot<'a>(
             (clone_table, target, new.as_deref())
         && usize::from(declaring_table) != leaf
         && context
-            .storage
+            .storage()
             .validate_partition_target(leaf, values, context.txn.txid)
             .is_err()
     {
@@ -14220,7 +14389,7 @@ fn fire_row_trigger_slot<'a>(
     reason = "row-transition dispatch carries the complete typed firing context"
 )]
 fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
-    context: TriggerExecContext<'_, 'a, '_>,
+    mut context: TriggerExecContext<'_, 'a, '_>,
     target: T,
     clone_table: Option<usize>,
     definition: &TableDef,
@@ -14233,7 +14402,7 @@ fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
     let target = target.into();
     let mut last_name: Option<SqlName> = None;
     while let Some(trigger_slot) = context
-        .storage
+        .storage()
         .triggers_for_target(target, context.txn.txid)
         .filter(|(_, trigger)| {
             last_name.is_none_or(|last| trigger.name_to(context.txn.txid).as_str() > last.as_str())
@@ -14247,20 +14416,23 @@ fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
     {
         last_name = Some(
             context
-                .storage
+                .storage()
                 .trigger(trigger_slot)
                 .name_to(context.txn.txid),
         );
+        let arena = context.arena;
+        let params = context.params;
+        let seq_session = context.seq_session;
+        let (storage, txn, scratch, responder) = context.dml_parts();
         if matches!(
             fire_row_trigger_slot(
                 TriggerExecContext {
-                    storage: &mut *context.storage,
-                    txn: &mut *context.txn,
-                    arena: context.arena,
-                    params: context.params,
-                    seq_session: context.seq_session,
-                    responder: &mut *context.responder,
-                    scratch: context.scratch,
+                    host: PlpgsqlExecHost::Atomic { storage, scratch },
+                    txn,
+                    arena,
+                    params,
+                    seq_session,
+                    responder,
                 },
                 target,
                 clone_table,
@@ -14335,13 +14507,12 @@ fn execute_deferred_trigger_event<'a>(
     // statement and savepoint rewind restore the marker if execution fails.
     txn.complete_deferred_trigger(index)?;
     let mut context = TriggerExecContext {
-        storage,
+        host: PlpgsqlExecHost::Atomic { storage, scratch },
         txn,
         arena,
         params: crate::sql::eval::NO_PARAMS,
         seq_session,
         responder,
-        scratch,
     };
     execute_row_trigger_body(
         &mut context,
@@ -14361,7 +14532,7 @@ fn execute_deferred_trigger_event<'a>(
 /// its AFTER STATEMENT triggers. Nested trigger SQL has an independent depth,
 /// so it cannot consume pending events from its caller.
 fn fire_statement_row_trigger_events<'a>(
-    context: TriggerExecContext<'_, 'a, '_>,
+    mut context: TriggerExecContext<'_, 'a, '_>,
     trigger_depth: u16,
     transition_rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
@@ -14384,7 +14555,7 @@ fn fire_statement_row_trigger_events<'a>(
                 trigger_depth: event_depth,
             } if event_depth == trigger_depth => {
                 let Some(timing) =
-                    constraints::constraint_timing(context.storage, identity, context.txn.txid)
+                    constraints::constraint_timing(context.storage(), identity, context.txn.txid)
                 else {
                     context.txn.complete_deferred_trigger(index)?;
                     index += 1;
@@ -14406,13 +14577,16 @@ fn fire_statement_row_trigger_events<'a>(
             index += 1;
             continue;
         };
+        let arena = context.arena;
+        let seq_session = context.seq_session;
+        let (storage, txn, scratch, responder) = context.dml_parts();
         execute_deferred_trigger_event(
-            context.storage,
-            context.txn,
-            context.arena,
-            context.seq_session,
-            context.responder,
-            context.scratch,
+            storage,
+            txn,
+            arena,
+            seq_session,
+            responder,
+            scratch,
             index,
             trigger_slot,
             table,
@@ -14565,13 +14739,12 @@ fn fire_partition_row_triggers<'a>(
         if matches!(
             fire_row_trigger_slot(
                 TriggerExecContext {
-                    storage,
+                    host: PlpgsqlExecHost::Atomic { storage, scratch },
                     txn,
                     arena,
                     params: crate::sql::eval::NO_PARAMS,
                     seq_session,
                     responder,
-                    scratch,
                 },
                 crate::storage::TriggerTarget::Table(target as u16),
                 Some(leaf),
@@ -14758,7 +14931,7 @@ fn fire_statement_triggers_with_rows<'a>(
     let mut last_name: Option<SqlName> = None;
     while let Some(trigger) = {
         context
-            .storage
+            .storage()
             .triggers_for_target(target, context.txn.txid)
             .filter(|(_, trigger)| {
                 last_name
@@ -14794,9 +14967,9 @@ fn fire_statement_triggers_with_rows<'a>(
             continue;
         }
         let routine = context
-            .storage
+            .storage()
             .routine_for(usize::from(trigger.function), context.txn.txid);
-        let owner = context.storage.role_name(
+        let owner = context.storage().role_name(
             routine.ownership.owner_to(context.txn.txid).into(),
             context.txn.txid,
         );
@@ -14870,7 +15043,7 @@ fn fire_statement_triggers_with_rows<'a>(
 }
 
 fn fire_after_triggers_with_rows<'a>(
-    context: TriggerExecContext<'_, 'a, '_>,
+    mut context: TriggerExecContext<'_, 'a, '_>,
     target: crate::storage::TriggerTarget,
     definition: &TableDef,
     event: u8,
@@ -14878,15 +15051,18 @@ fn fire_after_triggers_with_rows<'a>(
     rows: Option<TransitionRows<'a>>,
 ) -> Result<(), SqlError> {
     let trigger_depth = context.txn.trigger_depth();
+    let arena = context.arena;
+    let params = context.params;
+    let seq_session = context.seq_session;
+    let (storage, txn, scratch, responder) = context.dml_parts();
     fire_statement_row_trigger_events(
         TriggerExecContext {
-            storage: &mut *context.storage,
-            txn: &mut *context.txn,
-            arena: context.arena,
-            params: context.params,
-            seq_session: context.seq_session,
-            responder: &mut *context.responder,
-            scratch: context.scratch,
+            host: PlpgsqlExecHost::Atomic { storage, scratch },
+            txn,
+            arena,
+            params,
+            seq_session,
+            responder,
         },
         trigger_depth,
         rows,
@@ -29917,13 +30093,15 @@ pub fn copy_statement_begin(
     }
     fire_statement_triggers(
         TriggerExecContext {
-            storage,
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: scratch as *mut _,
+            },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
-            scratch: scratch as *mut _,
         },
         setup.table_index,
         &definition,
@@ -29971,13 +30149,15 @@ pub fn copy_statement_end(
     }
     fire_after_triggers_with_rows(
         TriggerExecContext {
-            storage,
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: scratch as *mut _,
+            },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
-            scratch: scratch as *mut _,
         },
         setup.table_index.into(),
         &definition,
@@ -33220,13 +33400,15 @@ pub fn merge(
         if merge_events & event != 0
             && let Err(error) = fire_statement_triggers(
                 TriggerExecContext {
-                    storage,
+                    host: PlpgsqlExecHost::Atomic {
+                        storage,
+                        scratch: scratch as *mut _,
+                    },
                     txn,
                     arena,
                     params: crate::sql::eval::NO_PARAMS,
                     seq_session,
                     responder,
-                    scratch: scratch as *mut _,
                 },
                 table_index,
                 &def,
@@ -34043,13 +34225,15 @@ pub fn merge(
         if merge_events & event != 0
             && let Err(error) = fire_after_triggers_with_rows(
                 TriggerExecContext {
-                    storage,
+                    host: PlpgsqlExecHost::Atomic {
+                        storage,
+                        scratch: scratch as *mut _,
+                    },
                     txn,
                     arena,
                     params: crate::sql::eval::NO_PARAMS,
                     seq_session,
                     responder,
-                    scratch: scratch as *mut _,
                 },
                 table_index.into(),
                 &def,
@@ -34580,13 +34764,15 @@ pub(crate) fn fire_view_statement_triggers(
     };
     fire_statement_triggers_with_rows(
         TriggerExecContext {
-            storage,
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: scratch as *mut _,
+            },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
-            scratch: scratch as *mut _,
         },
         crate::storage::TriggerTarget::View(view_slot as u16),
         &definition,
@@ -35204,13 +35390,15 @@ fn fire_view_row_trigger<'a>(
 ) -> Result<bool, SqlError> {
     fire_row_triggers(
         TriggerExecContext {
-            storage,
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: scratch as *mut _,
+            },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
-            scratch: scratch as *mut _,
         },
         target,
         None,
@@ -35420,13 +35608,15 @@ where
     };
     if let Err(error) = fire_statement_triggers(
         TriggerExecContext {
-            storage,
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: scratch as *mut _,
+            },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
-            scratch: scratch as *mut _,
         },
         table_index,
         &def,
@@ -35439,13 +35629,15 @@ where
     if let Some(updated_columns) = conflict_update_columns
         && let Err(error) = fire_statement_triggers(
             TriggerExecContext {
-                storage,
+                host: PlpgsqlExecHost::Atomic {
+                    storage,
+                    scratch: scratch as *mut _,
+                },
                 txn,
                 arena,
                 params: crate::sql::eval::NO_PARAMS,
                 seq_session,
                 responder,
-                scratch: scratch as *mut _,
             },
             table_index,
             &def,
@@ -35713,13 +35905,15 @@ where
         if let Some(updated_columns) = conflict_update_columns
             && let Err(error) = fire_after_triggers_with_rows(
                 TriggerExecContext {
-                    storage,
+                    host: PlpgsqlExecHost::Atomic {
+                        storage,
+                        scratch: scratch as *mut _,
+                    },
                     txn,
                     arena,
                     params: crate::sql::eval::NO_PARAMS,
                     seq_session,
                     responder,
-                    scratch: scratch as *mut _,
                 },
                 table_index.into(),
                 &def,
@@ -35734,13 +35928,15 @@ where
         }
         if let Err(error) = fire_after_triggers_with_rows(
             TriggerExecContext {
-                storage,
+                host: PlpgsqlExecHost::Atomic {
+                    storage,
+                    scratch: scratch as *mut _,
+                },
                 txn,
                 arena,
                 params: crate::sql::eval::NO_PARAMS,
                 seq_session,
                 responder,
-                scratch: scratch as *mut _,
             },
             table_index.into(),
             &def,
@@ -35943,13 +36139,15 @@ where
     if let Some(updated_columns) = conflict_update_columns
         && let Err(error) = fire_after_triggers_with_rows(
             TriggerExecContext {
-                storage,
+                host: PlpgsqlExecHost::Atomic {
+                    storage,
+                    scratch: scratch as *mut _,
+                },
                 txn,
                 arena,
                 params: crate::sql::eval::NO_PARAMS,
                 seq_session,
                 responder,
-                scratch: scratch as *mut _,
             },
             table_index.into(),
             &def,
@@ -35964,13 +36162,15 @@ where
     }
     if let Err(error) = fire_after_triggers_with_rows(
         TriggerExecContext {
-            storage,
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: scratch as *mut _,
+            },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
-            scratch: scratch as *mut _,
         },
         table_index.into(),
         &def,
@@ -36347,13 +36547,15 @@ pub(crate) fn update<'a>(
     };
     if let Err(error) = fire_statement_triggers(
         TriggerExecContext {
-            storage,
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: scratch as *mut _,
+            },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
-            scratch: scratch as *mut _,
         },
         table_index,
         &def,
@@ -36994,13 +37196,15 @@ pub(crate) fn update<'a>(
     }
     if let Err(error) = fire_after_triggers_with_rows(
         TriggerExecContext {
-            storage,
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: scratch as *mut _,
+            },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
-            scratch: scratch as *mut _,
         },
         table_index.into(),
         &def,
@@ -37095,13 +37299,15 @@ pub(crate) fn delete<'a>(
     let schema = &schema[..def.n_columns];
     if let Err(error) = fire_statement_triggers(
         TriggerExecContext {
-            storage,
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: scratch as *mut _,
+            },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
-            scratch: scratch as *mut _,
         },
         table_index,
         &def,
@@ -37424,13 +37630,15 @@ pub(crate) fn delete<'a>(
     }
     if let Err(error) = fire_after_triggers_with_rows(
         TriggerExecContext {
-            storage,
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch: scratch as *mut _,
+            },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
-            scratch: scratch as *mut _,
         },
         table_index.into(),
         &def,
@@ -37566,13 +37774,15 @@ pub fn truncate(
         let definition = *storage.table_def(table_index, txn.txid);
         if let Err(error) = fire_statement_triggers(
             TriggerExecContext {
-                storage,
+                host: PlpgsqlExecHost::Atomic {
+                    storage,
+                    scratch: scratch as *mut _,
+                },
                 txn,
                 arena,
                 params: crate::sql::eval::NO_PARAMS,
                 seq_session,
                 responder,
-                scratch: scratch as *mut _,
             },
             table_index,
             &definition,
@@ -37663,13 +37873,15 @@ pub fn truncate(
         let definition = *storage.table_def(table_index, txn.txid);
         if let Err(error) = fire_statement_triggers(
             TriggerExecContext {
-                storage,
+                host: PlpgsqlExecHost::Atomic {
+                    storage,
+                    scratch: scratch as *mut _,
+                },
                 txn,
                 arena,
                 params: crate::sql::eval::NO_PARAMS,
                 seq_session,
                 responder,
-                scratch: scratch as *mut _,
             },
             table_index,
             &definition,

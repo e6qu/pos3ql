@@ -59,7 +59,7 @@ ALTER USER MAPPING	missing	-
 ALTER VIEW	partial	76_stored_dependencies.sql
 ANALYZE	complete	48_vacuum_analyze.sql
 BEGIN	complete	05_transactions.sql
-CALL	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql
+CALL	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql (lone top-level PL/pgSQL transaction control, typed outputs, and SQL procedures)
 CHECKPOINT	complete	40_copy.sql
 CLOSE	complete	39_cursors.sql
 CLUSTER	missing	-
@@ -113,7 +113,7 @@ DEALLOCATE	complete	14_surface.sql
 DECLARE	partial	39_cursors.sql
 DELETE	complete	02_dml_returning.sql
 DISCARD	missing	-
-DO	partial	100_plpgsql_procedures.sql and 112_routine_bodies_attributes_do.sql (bounded PL/pgSQL declarations, control flow, diagnostics, exceptions, queries, and DML; transaction termination remains a typed rejection)
+DO	partial	100_plpgsql_procedures.sql and 112_routine_bodies_attributes_do.sql (bounded PL/pgSQL declarations, control flow, diagnostics, exceptions, queries, DML, and lone top-level transaction control)
 DROP ACCESS METHOD	missing	-
 DROP AGGREGATE	complete	110_user_defined_aggregates.sql
 DROP CAST	missing	-

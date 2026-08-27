@@ -4943,104 +4943,135 @@ impl Engine {
         // statement as they do in PostgreSQL.
         datetime::begin_statement();
         self.ensure_txn(txn, TxnMode::Implicit, guc);
-        let mut executed_any = resume_statement > 0;
-        let mut statement_index = 0usize;
+        let mut statements = [None; parser::MAX_LIST];
+        let mut statement_count = 0usize;
         loop {
             match parser.next_stmt() {
                 Ok(Some(statement)) => {
-                    if statement_index < resume_statement {
-                        statement_index += 1;
-                        continue;
-                    }
-                    if self.post_publish_cleanup.is_some()
-                        && !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
-                        && let Err(error) = self.retry_post_publish_cleanup()
-                    {
-                        responder.error(error.sqlstate, error.message.as_str())?;
-                        return Ok(ExecutionStatus::Complete);
-                    }
-                    if self.pending_copy.take().is_some() {
-                        // COPY FROM STDIN takes over the connection; a
-                        // statement after it in the same string has nowhere
-                        // to run.
-                        self.copy_abort(txn, guc);
-                        let e = sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "COPY FROM STDIN must be the last statement in a query string"
+                    if statement_count == statements.len() {
+                        let error = sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "query string has too many statements"
                         );
-                        responder.error(e.sqlstate, e.message.as_str())?;
-                        return Ok(ExecutionStatus::Complete);
-                    }
-                    executed_any = true;
-                    let output_mark = responder.buffer.mark();
-                    let statement_mark =
-                        txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-                    emit_parse_warnings(&mut parser, responder)?;
-                    let outcome = self.execute_stmt(
-                        &statement, arena, NO_PARAMS, txn, sqlprep, cursors, guc, responder,
-                    )?;
-                    let outcome = outcome
-                        .and_then(|()| {
-                            exec::constraints::validate_deferred_constraints(
-                                &self.storage,
-                                txn,
-                                true,
-                                arena,
-                            )
-                        })
-                        .and_then(|()| {
-                            self.fire_constraint_trigger_boundary(
-                                txn,
-                                guc,
-                                arena,
-                                responder,
-                                exec::TriggerQueueBoundary::Statement,
-                            )
-                        })
-                        .and_then(|()| query::check_timeout());
-                    if let Err(mut e) = outcome {
-                        if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
-                            || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
-                        {
-                            self.rollback_waiting_statement(txn, statement_mark);
-                            if !lock_timeout_expired {
-                                return Ok(ExecutionStatus::Blocked {
-                                    completed_statements: statement_index,
-                                    output_mark,
-                                    io_wait: e.sqlstate == sqlstate::INTERNAL_IO_WAIT,
-                                });
-                            }
-                            self.storage
-                                .rollback_locks_to(txn.txid, statement_mark.lock);
-                            e = sql_err!(
-                                sqlstate::LOCK_NOT_AVAILABLE,
-                                "canceling statement due to lock timeout"
-                            );
-                        }
-                        if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
-                            self.abort_explicit_txn(txn, guc);
-                        } else if txn.is_explicit() {
+                        if txn.is_explicit() {
                             txn.failed = true;
                         } else {
                             self.rollback_txn(txn, guc);
                         }
-                        responder.error(e.sqlstate, e.message.as_str())?;
+                        responder.error(error.sqlstate, error.message.as_str())?;
                         return Ok(ExecutionStatus::Complete);
                     }
-                    txn.compact_completed_constraints();
-                    statement_index += 1;
+                    statements[statement_count] = Some(statement);
+                    statement_count += 1;
                 }
                 Ok(None) => break,
-                Err(e) => {
+                Err(error) => {
                     if txn.is_explicit() {
                         txn.failed = true;
                     } else {
                         self.rollback_txn(txn, guc);
                     }
-                    report_parse_error(responder, &e)?;
+                    report_parse_error(responder, &error)?;
                     return Ok(ExecutionStatus::Complete);
                 }
             }
+        }
+        emit_parse_warnings(&mut parser, responder)?;
+        let routine_transaction_context = if !txn.is_explicit() && statement_count == 1 {
+            exec::PlpgsqlTransactionContext::NonAtomic
+        } else {
+            exec::PlpgsqlTransactionContext::Atomic
+        };
+        let mut executed_any = resume_statement > 0;
+        for (statement_index, statement) in statements[..statement_count]
+            .iter()
+            .enumerate()
+            .skip(resume_statement)
+        {
+            let statement = statement.as_ref().expect("parsed query statement");
+            if self.post_publish_cleanup.is_some()
+                && !matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_))
+                && let Err(error) = self.retry_post_publish_cleanup()
+            {
+                responder.error(error.sqlstate, error.message.as_str())?;
+                return Ok(ExecutionStatus::Complete);
+            }
+            if self.pending_copy.take().is_some() {
+                // COPY FROM STDIN takes over the connection; a
+                // statement after it in the same string has nowhere
+                // to run.
+                self.copy_abort(txn, guc);
+                let e = sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "COPY FROM STDIN must be the last statement in a query string"
+                );
+                responder.error(e.sqlstate, e.message.as_str())?;
+                return Ok(ExecutionStatus::Complete);
+            }
+            executed_any = true;
+            let output_mark = responder.buffer.mark();
+            let statement_mark =
+                txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let outcome = self.execute_stmt(
+                statement,
+                arena,
+                NO_PARAMS,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                routine_transaction_context,
+                responder,
+            )?;
+            let outcome = outcome
+                .and_then(|()| {
+                    exec::constraints::validate_deferred_constraints(
+                        &self.storage,
+                        txn,
+                        true,
+                        arena,
+                    )
+                })
+                .and_then(|()| {
+                    self.fire_constraint_trigger_boundary(
+                        txn,
+                        guc,
+                        arena,
+                        responder,
+                        exec::TriggerQueueBoundary::Statement,
+                    )
+                })
+                .and_then(|()| query::check_timeout());
+            if let Err(mut e) = outcome {
+                if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
+                    || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
+                {
+                    self.rollback_waiting_statement(txn, statement_mark);
+                    if !lock_timeout_expired {
+                        return Ok(ExecutionStatus::Blocked {
+                            completed_statements: statement_index,
+                            output_mark,
+                            io_wait: e.sqlstate == sqlstate::INTERNAL_IO_WAIT,
+                        });
+                    }
+                    self.storage
+                        .rollback_locks_to(txn.txid, statement_mark.lock);
+                    e = sql_err!(
+                        sqlstate::LOCK_NOT_AVAILABLE,
+                        "canceling statement due to lock timeout"
+                    );
+                }
+                if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
+                    self.abort_explicit_txn(txn, guc);
+                } else if txn.is_explicit() {
+                    txn.failed = true;
+                } else {
+                    self.rollback_txn(txn, guc);
+                }
+                responder.error(e.sqlstate, e.message.as_str())?;
+                return Ok(ExecutionStatus::Complete);
+            }
+            txn.compact_completed_constraints();
         }
         if !executed_any {
             responder.empty_query_response()?;
@@ -5114,13 +5145,26 @@ impl Engine {
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
         datetime::begin_statement();
+        let routine_transaction_context = if txn.is_active() {
+            exec::PlpgsqlTransactionContext::Atomic
+        } else {
+            exec::PlpgsqlTransactionContext::NonAtomic
+        };
         self.ensure_txn(txn, TxnMode::Implicit, guc);
         let statement_mark =
             txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
         emit_parse_warnings(&mut parser, responder)?;
         let output_mark = responder.buffer.mark();
         let outcome = match self.execute_stmt(
-            &statement, arena, params, txn, sqlprep, cursors, guc, responder,
+            &statement,
+            arena,
+            params,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            routine_transaction_context,
+            responder,
         ) {
             Ok(outcome) => outcome,
             Err(WireFull) => {
@@ -7627,16 +7671,19 @@ impl Engine {
         body: &str,
         arena: &Arena,
         txn: &mut TxnState,
+        cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
+        transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         match exec::execute_anonymous_plpgsql(
-            &mut self.storage,
+            self,
             txn,
-            &mut self.dml_scratch,
+            cursors,
+            guc,
+            transaction_context,
             body,
             arena,
-            guc.seq_session(),
             responder,
         ) {
             Ok(()) => responder.command_complete("DO").map(|_| Ok(())),
@@ -7657,6 +7704,7 @@ impl Engine {
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
+        transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -7882,13 +7930,21 @@ impl Engine {
         if routine.language == crate::storage::RoutineLanguage::PlPgSql {
             let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
             let output_count = match exec::execute_plpgsql_procedure(
-                &mut self.storage,
+                self,
                 txn,
-                &mut self.dml_scratch,
+                cursors,
+                guc,
+                if transaction_context == exec::PlpgsqlTransactionContext::NonAtomic
+                    && !routine.attributes.security_definer
+                    && routine.configs().is_empty()
+                {
+                    exec::PlpgsqlTransactionContext::NonAtomic
+                } else {
+                    exec::PlpgsqlTransactionContext::Atomic
+                },
                 &routine,
                 &completed[..declared.argument_count],
                 arena,
-                guc.seq_session(),
                 responder,
                 &mut output_values,
             ) {
@@ -8005,6 +8061,18 @@ impl Engine {
                 Ok(statement) => statement,
                 Err(error) => return Ok(Err(error)),
             };
+            if matches!(statement, Stmt::Commit) {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "COMMIT is not allowed in an SQL function"
+                )));
+            }
+            if matches!(statement, Stmt::Rollback | Stmt::RollbackToSavepoint(_)) {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "ROLLBACK is not allowed in an SQL function"
+                )));
+            }
             // A top-level CALL has no enclosing query workspace; reclaim each
             // suppressed internal result exactly as the ordinary dispatcher
             // did before routine dispatch gained a non-resetting mode.
@@ -8135,10 +8203,21 @@ impl Engine {
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
+        routine_transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         self.execute_stmt_with_workspace(
-            statement, arena, params, txn, sqlprep, cursors, guc, responder, true, None,
+            statement,
+            arena,
+            params,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            routine_transaction_context,
+            responder,
+            true,
+            None,
         )
     }
 
@@ -8159,7 +8238,17 @@ impl Engine {
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         self.execute_stmt_with_workspace(
-            statement, arena, params, txn, sqlprep, cursors, guc, responder, false, capture,
+            statement,
+            arena,
+            params,
+            txn,
+            sqlprep,
+            cursors,
+            guc,
+            exec::PlpgsqlTransactionContext::Atomic,
+            responder,
+            false,
+            capture,
         )
     }
 
@@ -8173,6 +8262,7 @@ impl Engine {
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
+        routine_transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
         reset_workspace: bool,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
@@ -8648,9 +8738,18 @@ impl Engine {
                 sqlprep,
                 cursors,
                 guc,
+                routine_transaction_context,
                 responder,
             ),
-            Stmt::Do { body } => self.execute_do(body, arena, txn, guc, responder),
+            Stmt::Do { body } => self.execute_do(
+                body,
+                arena,
+                txn,
+                cursors,
+                guc,
+                routine_transaction_context,
+                responder,
+            ),
             Stmt::CreateLanguage(language) => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "{}",
@@ -9327,6 +9426,7 @@ impl Engine {
                             sqlprep,
                             cursors,
                             guc,
+                            exec::PlpgsqlTransactionContext::Atomic,
                             responder,
                         )
                     };
@@ -10326,6 +10426,7 @@ impl Engine {
                         sqlprep,
                         cursors,
                         guc,
+                        exec::PlpgsqlTransactionContext::Atomic,
                         responder,
                     ),
                     Ok(None) => Ok(Ok(())),
@@ -10649,7 +10750,15 @@ impl Engine {
             let ddl_start = txn.ddl().len();
             let result = responder.without_query_output(|responder| {
                 self.execute_stmt(
-                    &statement, arena, params, txn, sqlprep, cursors, guc, responder,
+                    &statement,
+                    arena,
+                    params,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    exec::PlpgsqlTransactionContext::Atomic,
+                    responder,
                 )
             });
             let result = match result {
@@ -10976,7 +11085,15 @@ impl Engine {
             };
             let result = responder.without_command_complete(|responder| {
                 self.execute_stmt(
-                    &statement, arena, params, txn, sqlprep, cursors, guc, responder,
+                    &statement,
+                    arena,
+                    params,
+                    txn,
+                    sqlprep,
+                    cursors,
+                    guc,
+                    exec::PlpgsqlTransactionContext::Atomic,
+                    responder,
                 )
             })?;
             if let Err(error) = result {
@@ -11118,7 +11235,15 @@ impl Engine {
         };
         responder.without_command_complete(|responder| {
             self.execute_stmt(
-                &statement, arena, params, txn, sqlprep, cursors, guc, responder,
+                &statement,
+                arena,
+                params,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                exec::PlpgsqlTransactionContext::Atomic,
+                responder,
             )
         })
     }

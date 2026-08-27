@@ -47,6 +47,34 @@ cur.execute("SELECT value FROM drv_plpgsql_log")
 assert cur.fetchone() == (42,)
 print("plpgsql procedure ok")
 
+# A lone extended-protocol CALL in autocommit mode is non-atomic: PostgreSQL
+# permits COMMIT/ROLLBACK in the procedure and immediately starts the next
+# transaction while preserving parameters and local execution state.
+cur.execute(
+    "CREATE PROCEDURE drv_plpgsql_transaction(value integer) LANGUAGE plpgsql "
+    "AS 'BEGIN INSERT INTO drv_plpgsql_log VALUES (value); COMMIT; "
+    "INSERT INTO drv_plpgsql_log VALUES (value + 1); END'"
+)
+cur.execute("CALL drv_plpgsql_transaction(%s)", (50,))
+cur.execute("SELECT value FROM drv_plpgsql_log WHERE value >= 50 ORDER BY value")
+assert cur.fetchall() == [(50,), (51,)]
+
+transaction_conn = psycopg.connect(
+    host="127.0.0.1", port=5433, user="postgres", dbname="postgres",
+    sslmode="disable", autocommit=False,
+)
+transaction_cur = transaction_conn.cursor()
+try:
+    transaction_cur.execute("CALL drv_plpgsql_transaction(%s)", (60,))
+    raise AssertionError("expected invalid transaction termination")
+except psycopg.errors.InvalidTransactionTermination as e:
+    assert e.sqlstate == "2D000", e.sqlstate
+transaction_conn.rollback()
+transaction_conn.close()
+cur.execute("SELECT count(*) FROM drv_plpgsql_log WHERE value >= 60")
+assert cur.fetchone() == (0,)
+print("plpgsql transaction control extended protocol ok")
+
 # Errors surface as exceptions with SQLSTATE.
 try:
     cur.execute("SELECT 1/0")

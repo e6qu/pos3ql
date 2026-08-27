@@ -14385,6 +14385,146 @@ fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
 }
 
 #[test]
+fn plpgsql_call_and_do_own_real_non_atomic_transaction_boundaries() {
+    let mut config = test_config("plpgsql_non_atomic_transactions");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace =
+        format!("plpgsql-non-atomic-transactions-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE transaction_log(step integer PRIMARY KEY, local_value integer);
+             CREATE PROCEDURE transaction_flow() LANGUAGE plpgsql AS
+             'DECLARE local_value integer := 1;
+              BEGIN
+                INSERT INTO transaction_log VALUES (1, local_value);
+                COMMIT AND CHAIN;
+                local_value := 2;
+                INSERT INTO transaction_log VALUES (2, local_value);
+                ROLLBACK AND NO CHAIN;
+                local_value := 3;
+                INSERT INTO transaction_log VALUES (3, local_value);
+                COMMIT;
+                local_value := 4;
+                INSERT INTO transaction_log VALUES (4, local_value);
+              END';
+             CREATE PROCEDURE forbidden_boundary() LANGUAGE plpgsql AS
+             'BEGIN INSERT INTO transaction_log VALUES (20, 20); COMMIT; END';
+             CREATE PROCEDURE definer_boundary() LANGUAGE plpgsql SECURITY DEFINER AS
+             'BEGIN COMMIT; END';
+             CREATE PROCEDURE configured_boundary() LANGUAGE plpgsql
+               SET application_name TO 'inside' AS 'BEGIN COMMIT; END';
+             CREATE PROCEDURE caught_boundary() LANGUAGE plpgsql AS
+             'BEGIN
+                BEGIN
+                  COMMIT;
+                EXCEPTION WHEN invalid_transaction_termination THEN
+                  INSERT INTO transaction_log VALUES (7, 7);
+                END;
+                INSERT INTO transaction_log VALUES (8, 8);
+              END';
+             CREATE PROCEDURE sql_boundary() LANGUAGE SQL AS
+             'INSERT INTO transaction_log VALUES (30, 30); COMMIT';",
+        );
+        assert!(
+            !String::from_utf8_lossy(&setup).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+
+        let called = run_with(&mut engine, &mut budget, "CALL transaction_flow()");
+        assert!(
+            !String::from_utf8_lossy(&called).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&called)
+        );
+        let anonymous = run_with(
+            &mut engine,
+            &mut budget,
+            "DO 'BEGIN
+                   INSERT INTO transaction_log VALUES (5, 5);
+                   COMMIT;
+                   INSERT INTO transaction_log VALUES (6, 6);
+                 END'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&anonymous).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&anonymous)
+        );
+        let caught = run_with(&mut engine, &mut budget, "CALL caught_boundary()");
+        assert!(
+            !String::from_utf8_lossy(&caught).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&caught)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT step, local_value FROM transaction_log ORDER BY step",
+            )),
+            ["1|1", "3|3", "4|4", "5|5", "6|6", "7|7", "8|8"]
+        );
+
+        for (sql, state) in [
+            ("CALL forbidden_boundary(); SELECT 1", "2D000"),
+            ("CALL definer_boundary()", "2D000"),
+            ("CALL configured_boundary()", "2D000"),
+            ("CALL sql_boundary()", "0A000"),
+        ] {
+            let rejected = run_with(&mut engine, &mut budget, sql);
+            assert!(
+                String::from_utf8_lossy(&rejected).contains(state),
+                "{sql}: {}",
+                String::from_utf8_lossy(&rejected)
+            );
+        }
+        let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
+        assert!(run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN").contains("BEGIN"));
+        let explicit = run_txn(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            "CALL forbidden_boundary()",
+        );
+        assert!(explicit.contains("2D000"), "{explicit}");
+        assert!(
+            run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK",).contains("ROLLBACK")
+        );
+        assert!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT step FROM transaction_log WHERE step IN (20, 30)",
+            ))
+            .is_empty()
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT step, local_value FROM transaction_log ORDER BY step",
+        )),
+        ["1|1", "3|3", "4|4", "5|5", "6|6", "7|7", "8|8"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
     let mut config = test_config("routine_creation_dependencies");
     config.max_tables = 16;

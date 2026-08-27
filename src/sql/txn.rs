@@ -597,6 +597,10 @@ impl TxnState {
         self.mode == TxnMode::Explicit
     }
 
+    pub(crate) fn has_savepoints(&self) -> bool {
+        !self.savepoints.is_empty()
+    }
+
     /// The ReadyForQuery status byte: idle / in transaction / failed.
     /// The current command-id, stamped on this statement's row writes and used
     /// as the read snapshot within the statement.

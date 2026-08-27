@@ -41,5 +41,30 @@ SELECT p.proname, p.prokind, l.lanname
   JOIN pg_language AS l ON l.oid = p.prolang
  WHERE p.proname = 'plpgsql_contract';
 
+CREATE PROCEDURE plpgsql_transaction_contract() LANGUAGE plpgsql AS $$
+DECLARE
+  local_value integer := 10;
+BEGIN
+  INSERT INTO plpgsql_contract_log VALUES ('commit', local_value, 'first');
+  COMMIT AND CHAIN;
+  local_value := local_value + 1;
+  INSERT INTO plpgsql_contract_log VALUES ('rollback', local_value, 'discarded');
+  ROLLBACK AND NO CHAIN;
+  local_value := local_value + 1;
+  INSERT INTO plpgsql_contract_log VALUES ('commit', local_value, 'last');
+END
+$$;
+CALL plpgsql_transaction_contract();
+DO $$
+BEGIN
+  INSERT INTO plpgsql_contract_log VALUES ('do', 20, 'before');
+  COMMIT;
+  INSERT INTO plpgsql_contract_log VALUES ('do', 21, 'after');
+END
+$$;
+SELECT kind, value, note FROM plpgsql_contract_log
+ WHERE kind IN ('commit', 'rollback', 'do') ORDER BY kind, value;
+
+DROP PROCEDURE plpgsql_transaction_contract();
 DROP PROCEDURE plpgsql_contract(integer, integer);
 DROP TABLE plpgsql_contract_log;

@@ -66,6 +66,19 @@ public class JdbcTest {
             rs.next();
             line("standard procedure " + rs.getInt(1));
         }
+        try (Statement s = c.createStatement()) {
+            s.execute("CREATE OR REPLACE PROCEDURE jdbc_plpgsql(value integer) LANGUAGE plpgsql "
+                + "AS 'BEGIN INSERT INTO jdbc_routine_log VALUES (value + 1); END'");
+        }
+        try (PreparedStatement ps = c.prepareStatement("CALL jdbc_plpgsql(?)")) {
+            ps.setInt(1, 44);
+            ps.execute();
+        }
+        try (Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT value FROM jdbc_routine_log WHERE value = 45")) {
+            rs.next();
+            line("plpgsql procedure " + rs.getInt(1));
+        }
     }
 
     // Prepared-statement CRUD, the core of any driver's use.

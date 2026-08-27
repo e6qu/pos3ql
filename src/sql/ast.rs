@@ -3959,10 +3959,7 @@ impl Expr<'_> {
     /// Subqueries own their bindings and are visited by their enclosing query.
     pub fn for_each_column_reference(&self, f: &mut dyn FnMut(Option<&str>, &str)) {
         match self {
-            Expr::Column { qualifier, name }
-            | Expr::RoutineParam {
-                qualifier, name, ..
-            } => f(*qualifier, name),
+            Expr::Column { qualifier, name } => f(*qualifier, name),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -3974,6 +3971,7 @@ impl Expr<'_> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::RoutineParam { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }

@@ -1808,6 +1808,37 @@ def test_row_trigger_body_over_raw_wire():
     s.close()
 
 
+def test_plpgsql_procedure_output_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE PROCEDURE wire_plpgsql_output(IN value integer, INOUT total integer, OUT note text) "
+        "LANGUAGE plpgsql AS 'DECLARE step integer := 0; BEGIN "
+        "WHILE step < value LOOP step := step + 1; total := total + step; END LOOP; "
+        "note := ''total:'' || total; END'",
+    )
+    check(
+        "raw wire: PL/pgSQL procedure setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    called = simple_query(s, "CALL wire_plpgsql_output(3, 4, NULL)")
+    description = next((payload for kind, payload in called if kind == b"T"), None)
+    row = next((payload for kind, payload in called if kind == b"D"), None)
+    check(
+        "raw wire: CALL describes and returns typed PL/pgSQL output parameters",
+        not any(kind == b"E" for kind, _ in called)
+        and description is not None
+        and row_description_type_oids(description) == [23, 25]
+        and row is not None
+        and text_row_fields(row) == ["10", "total:10"],
+        called,
+    )
+    s.close()
+
+
 def test_trigger_function_replacement_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

@@ -2505,6 +2505,23 @@ pub struct StoredQueryDependencies {
     len: u8,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingRoutineDependencies {
+    used: bool,
+    txid: u32,
+    routine: u16,
+    dependencies: StoredQueryDependencies,
+}
+
+impl PendingRoutineDependencies {
+    const EMPTY: Self = Self {
+        used: false,
+        txid: 0,
+        routine: u16::MAX,
+        dependencies: StoredQueryDependencies::EMPTY,
+    };
+}
+
 impl StoredQueryDependencies {
     pub(crate) const EMPTY: Self = Self {
         entries: [StoredQueryDependency::EMPTY; MAX_STORED_QUERY_DEPENDENCIES],
@@ -3911,11 +3928,42 @@ pub(crate) struct RoutineSpec {
     pub kind: RoutineKind,
     pub result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub result_column_count: usize,
+    pub language: RoutineLanguage,
     pub attributes: RoutineAttributes,
     pub configs: [RoutineConfig; MAX_ROUTINE_CONFIGS],
     pub config_count: usize,
     pub body_kind: RoutineBodyKind,
     pub body: StackStr<ROUTINE_SQL_MAX>,
+    pub creation_path: StackStr<128>,
+    pub dependencies: StoredQueryDependencies,
+}
+
+/// Executable languages represented by the engine. Catalog languages that do
+/// not have an execution implementation never enter a routine definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutineLanguage {
+    Sql,
+    PlPgSql,
+    Internal,
+}
+
+impl RoutineLanguage {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Sql => 0,
+            Self::PlPgSql => 1,
+            Self::Internal => 2,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Sql),
+            1 => Some(Self::PlPgSql),
+            2 => Some(Self::Internal),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) const MAX_ROUTINE_CONFIGS: usize = 16;
@@ -4584,11 +4632,13 @@ pub(crate) struct RoutineDef {
     pub kind: RoutineKind,
     pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) result_column_count: usize,
+    pub language: RoutineLanguage,
     pub attributes: RoutineAttributes,
     pub configs: [RoutineConfig; MAX_ROUTINE_CONFIGS],
     pub config_count: usize,
     pub body_kind: RoutineBodyKind,
     pub body: StackStr<ROUTINE_SQL_MAX>,
+    pub creation_path: StackStr<128>,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
 }
@@ -4606,11 +4656,14 @@ pub(crate) struct PendingRoutineDefinition {
     pub(crate) kind: RoutineKind,
     pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) result_column_count: usize,
+    pub(crate) language: RoutineLanguage,
     pub(crate) attributes: RoutineAttributes,
     pub(crate) configs: [RoutineConfig; MAX_ROUTINE_CONFIGS],
     pub(crate) config_count: usize,
     pub(crate) body_kind: RoutineBodyKind,
     pub(crate) body: StackStr<ROUTINE_SQL_MAX>,
+    pub(crate) creation_path: StackStr<128>,
+    pub(crate) dependency_slot: u32,
 }
 
 impl RoutineDef {
@@ -4629,11 +4682,13 @@ impl RoutineDef {
         },
         result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
         result_column_count: 0,
+        language: RoutineLanguage::Sql,
         attributes: RoutineAttributes::DEFAULT,
         configs: [RoutineConfig::EMPTY; MAX_ROUTINE_CONFIGS],
         config_count: 0,
         body_kind: RoutineBodyKind::String,
         body: StackStr::new(),
+        creation_path: StackStr::new(),
         ownership: Ownership::BOOTSTRAP,
         ddl_state: CatalogDdlState::Absent,
     };
@@ -4793,11 +4848,13 @@ impl RoutineDef {
                 kind: pending.kind,
                 result_columns: pending.result_columns,
                 result_column_count: pending.result_column_count,
+                language: pending.language,
                 attributes: pending.attributes,
                 configs: pending.configs,
                 config_count: pending.config_count,
                 body_kind: pending.body_kind,
                 body: pending.body,
+                creation_path: pending.creation_path,
                 pending_definition: None,
                 ..*self
             })
@@ -7547,6 +7604,8 @@ pub struct Storage {
     pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
     views: FixedVec<ViewDef>,
     routines: FixedVec<RoutineDef>,
+    routine_dependencies: FixedVec<StoredQueryDependencies>,
+    pending_routine_dependencies: FixedVec<PendingRoutineDependencies>,
     triggers: FixedVec<TriggerDef>,
     partition_trigger_states: FixedVec<PartitionTriggerState>,
     policies: FixedVec<PolicyDef>,
@@ -8107,6 +8166,13 @@ impl Storage {
                     self.rebind_stored_query_dependencies(serialized, 0)?;
             }
         }
+        for slot in 0..self.routines.len() {
+            if self.routines[slot].ddl_state == CatalogDdlState::Present {
+                let serialized = self.routine_dependencies[slot];
+                self.routine_dependencies[slot] =
+                    self.rebind_stored_query_dependencies(serialized, 0)?;
+            }
+        }
         Ok(())
     }
 
@@ -8139,6 +8205,16 @@ impl Storage {
                         .dependencies
                         .rename(class, slot, schema, name);
                 }
+            }
+        }
+        for routine_slot in 0..self.routines.len() {
+            if self.routines[routine_slot].ddl_state != CatalogDdlState::Absent {
+                self.routine_dependencies[routine_slot].rename(class, slot, schema, name);
+            }
+        }
+        for pending in self.pending_routine_dependencies.iter_mut() {
+            if pending.used {
+                pending.dependencies.rename(class, slot, schema, name);
             }
         }
     }
@@ -8177,6 +8253,19 @@ impl Storage {
                 }
             }
         }
+        for routine_slot in 0..self.routines.len() {
+            if self.routines[routine_slot].ddl_state != CatalogDdlState::Absent {
+                self.routine_dependencies[routine_slot]
+                    .replace_slot(class, old_slot, new_slot, schema, name);
+            }
+        }
+        for pending in self.pending_routine_dependencies.iter_mut() {
+            if pending.used {
+                pending
+                    .dependencies
+                    .replace_slot(class, old_slot, new_slot, schema, name);
+            }
+        }
     }
 
     /// Bytes drawn beyond the row heap itself, for the memory plan.
@@ -8187,6 +8276,8 @@ impl Storage {
                     + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
                     + size_of::<ViewDef>()
                     + size_of::<RoutineDef>()
+                    + size_of::<StoredQueryDependencies>()
+                    + MAX_PENDING_TABLE_DEFS * size_of::<PendingRoutineDependencies>()
                     + size_of::<TriggerDef>()
                     + config.max_tables * size_of::<PartitionTriggerState>()
                     + MAX_POLICIES_PER_TABLE * size_of::<PolicyDef>()
@@ -8319,6 +8410,18 @@ impl Storage {
             routines
                 .push(RoutineDef::EMPTY)
                 .expect("sized to max_tables");
+        }
+        let routine_dependencies =
+            stored_query_dependency_slots(budget, "routine_dependencies", config.max_tables)?;
+        let mut pending_routine_dependencies = FixedVec::new(
+            budget,
+            "pending_routine_dependencies",
+            config.max_tables * MAX_PENDING_TABLE_DEFS,
+        )?;
+        for _ in 0..config.max_tables * MAX_PENDING_TABLE_DEFS {
+            pending_routine_dependencies
+                .push(PendingRoutineDependencies::EMPTY)
+                .expect("sized to pending routine definitions");
         }
         let mut triggers = FixedVec::new(budget, "triggers", config.max_tables)?;
         for _ in 0..config.max_tables {
@@ -8676,6 +8779,8 @@ impl Storage {
             pending_table_statistics,
             views,
             routines,
+            routine_dependencies,
+            pending_routine_dependencies,
             triggers,
             partition_trigger_states,
             policies,
@@ -20216,7 +20321,10 @@ impl Storage {
                     if argument_type_oids.len() < fixed.len() + usize::from(!explicit_variadic)
                         || explicit_variadic && argument_type_oids.len() != fixed.len() + 1
                         || !fixed.iter().zip(argument_type_oids).all(|(argument, oid)| {
-                            self.routine_argument_oid(argument, txid) == Some(*oid)
+                            self.routine_argument_oid(argument, txid)
+                                .is_some_and(|expected| {
+                                    self.routine_implicit_cast(*oid, expected, txid)
+                                })
                         })
                     {
                         return None;
@@ -20228,7 +20336,7 @@ impl Storage {
                     };
                     argument_type_oids[variadic_index..]
                         .iter()
-                        .all(|oid| *oid == expected)
+                        .all(|oid| self.routine_implicit_cast(*oid, expected, txid))
                         .then_some(slot)
                 });
             let first = candidates.next();
@@ -20504,7 +20612,7 @@ impl Storage {
                     };
                     if actual_oid != crate::sql::types::oid::UNKNOWN
                         && argument.polymorphic_type().is_none()
-                        && actual_oid != expected_oid
+                        && !self.routine_implicit_cast(actual_oid, expected_oid, txid)
                     {
                         matches = false;
                         break;
@@ -20545,7 +20653,10 @@ impl Storage {
             && routine.arguments()[..argument_type_oids.len()]
                 .iter()
                 .zip(argument_type_oids)
-                .all(|(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid))
+                .all(|(argument, oid)| {
+                    self.routine_argument_oid(argument, txid)
+                        .is_some_and(|expected| self.routine_implicit_cast(*oid, expected, txid))
+                })
         {
             return Some(routine);
         }
@@ -20918,7 +21029,7 @@ impl Storage {
                     };
                     if actual_oid != crate::sql::types::oid::UNKNOWN
                         && polymorphic.is_none()
-                        && actual_oid != expected_oid
+                        && !self.routine_implicit_cast(actual_oid, expected_oid, txid)
                     {
                         matches = false;
                         break;
@@ -21060,7 +21171,10 @@ impl Storage {
                         .iter()
                         .zip(argument_type_oids)
                         .all(|(argument, oid)| {
-                            self.routine_argument_oid(argument, txid) == Some(*oid)
+                            self.routine_argument_oid(argument, txid)
+                                .is_some_and(|expected| {
+                                    self.routine_implicit_cast(*oid, expected, txid)
+                                })
                         }))
                 .then_some(slot)
             });
@@ -21107,7 +21221,7 @@ impl Storage {
         txid: u32,
         call_kind: RoutineCallKind,
     ) -> Option<usize> {
-        let matches = |routine: &RoutineDef, polymorphic: bool| {
+        let matches = |routine: &RoutineDef, implicit: bool, polymorphic: bool| {
             let definition = routine.definition_for(txid);
             if !routine.visible_to(txid)
                 || !call_kind.accepts(definition.kind)
@@ -21130,18 +21244,27 @@ impl Storage {
                         return false;
                     }
                     saw_polymorphic = true;
-                } else if self.routine_argument_oid(&argument, txid) != Some(*actual_oid) {
-                    return false;
+                } else {
+                    let Some(expected) = self.routine_argument_oid(&argument, txid) else {
+                        return false;
+                    };
+                    if *actual_oid != expected
+                        && (!implicit || !self.routine_implicit_cast(*actual_oid, expected, txid))
+                    {
+                        return false;
+                    }
                 }
             }
             polymorphic == saw_polymorphic
         };
-        for polymorphic in [false, true] {
+        for (implicit, polymorphic) in [(false, false), (true, false), (true, true)] {
             let mut candidates = self
                 .routines
                 .iter()
                 .enumerate()
-                .filter_map(|(slot, routine)| matches(routine, polymorphic).then_some(slot));
+                .filter_map(|(slot, routine)| {
+                    matches(routine, implicit, polymorphic).then_some(slot)
+                });
             let first = candidates.next();
             if first.is_some() && candidates.next().is_none() {
                 return first;
@@ -21160,7 +21283,10 @@ impl Storage {
         let mut saw_polymorphic = false;
         for (argument, actual_oid) in arguments.iter().zip(argument_type_oids) {
             let Some(polymorphic) = argument.polymorphic_type() else {
-                if self.routine_argument_oid(argument, txid) != Some(*actual_oid) {
+                if !self
+                    .routine_argument_oid(argument, txid)
+                    .is_some_and(|expected| self.routine_implicit_cast(*actual_oid, expected, txid))
+                {
                     return None;
                 }
                 continue;
@@ -21267,6 +21393,87 @@ impl Storage {
             });
         }
         ColType::from_oid(type_oid).map(RoutineResult::builtin)
+    }
+
+    /// Whether PostgreSQL permits `actual_oid` to enter a routine parameter
+    /// declared as `expected_oid` without an explicit cast. Routine overload
+    /// resolution consumes this relation; execution then performs the cast at
+    /// the declared-parameter boundary.
+    pub(crate) fn routine_implicit_cast(
+        &self,
+        actual_oid: i32,
+        expected_oid: i32,
+        txid: u32,
+    ) -> bool {
+        use crate::sql::types::{ColType, oid};
+
+        if actual_oid == expected_oid || actual_oid == oid::UNKNOWN {
+            return true;
+        }
+
+        // A domain is implicitly treated as its base type when passed out of
+        // the domain, but PostgreSQL does not implicitly manufacture a value
+        // of a different domain at routine lookup.
+        let expected_is_domain =
+            (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + MAX_DOMAINS as i32).contains(&expected_oid);
+        if expected_is_domain {
+            return false;
+        }
+        let actual = match self.routine_result_for_oid(actual_oid, txid) {
+            Some(actual) => actual,
+            None => return false,
+        };
+        let expected = match self.routine_result_for_oid(expected_oid, txid) {
+            Some(expected) => expected,
+            None => return false,
+        };
+        if actual.user_type.is_some() && actual.ctype == expected.ctype {
+            return true;
+        }
+        if let (ColType::Array(actual), ColType::Array(expected)) = (actual.ctype, expected.ctype) {
+            return self.routine_implicit_cast(actual.element_oid(), expected.element_oid(), txid);
+        }
+
+        matches!(
+            (actual_oid, expected_oid),
+            // Numeric widening casts from pg_cast.castcontext = 'i'.
+            (oid::INT2, oid::INT4 | oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
+                | (oid::INT4, oid::INT8 | oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
+                | (oid::INT8, oid::NUMERIC | oid::FLOAT4 | oid::FLOAT8)
+                | (oid::NUMERIC, oid::FLOAT4 | oid::FLOAT8)
+                | (oid::FLOAT4, oid::FLOAT8)
+                // PostgreSQL string-category binary and function casts.
+                | (oid::BPCHAR, oid::VARCHAR | oid::NAME | oid::TEXT)
+                | (oid::VARCHAR, oid::BPCHAR | oid::NAME | oid::TEXT | oid::REGCLASS)
+                | (oid::TEXT, oid::BPCHAR | oid::VARCHAR | oid::NAME | oid::REGCLASS)
+                | (oid::NAME, oid::TEXT)
+                | (oid::BIT, oid::VARBIT)
+                | (oid::VARBIT, oid::BIT)
+                // Date/time and network casts accepted implicitly by PG18.
+                | (oid::DATE, oid::TIMESTAMP | oid::TIMESTAMPTZ)
+                | (oid::TIMESTAMP, oid::TIMESTAMPTZ)
+                | (oid::TIME, oid::TIMETZ | oid::INTERVAL)
+                | (oid::CIDR, oid::INET)
+                | (oid::MACADDR, oid::MACADDR8)
+                | (oid::MACADDR8, oid::MACADDR)
+                // OID alias types are binary-coercible in both directions;
+                // integer casts to OID aliases follow PostgreSQL's pg_cast.
+                | (oid::INT2 | oid::INT4 | oid::INT8, oid::OID)
+                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGPROC)
+                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGPROCEDURE)
+                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGOPER)
+                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGOPERATOR)
+                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGCLASS)
+                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGTYPE)
+                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGNAMESPACE)
+                | (oid::INT2 | oid::INT4 | oid::INT8, oid::REGROLE)
+                | (oid::OID, oid::REGPROC | oid::REGPROCEDURE | oid::REGOPER | oid::REGOPERATOR | oid::REGCLASS | oid::REGTYPE | oid::REGNAMESPACE | oid::REGROLE)
+                | (oid::REGPROC | oid::REGPROCEDURE | oid::REGOPER | oid::REGOPERATOR | oid::REGCLASS | oid::REGTYPE | oid::REGNAMESPACE | oid::REGROLE, oid::OID)
+                | (oid::REGPROC, oid::REGPROCEDURE)
+                | (oid::REGPROCEDURE, oid::REGPROC)
+                | (oid::REGOPER, oid::REGOPERATOR)
+                | (oid::REGOPERATOR, oid::REGOPER)
+        )
     }
 
     pub(crate) fn user_type_identity_oid(
@@ -21465,6 +21672,46 @@ impl Storage {
         }
     }
 
+    pub(crate) fn routine_dependencies_for(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> &StoredQueryDependencies {
+        if let Some(pending) = self.routines[slot]
+            .pending_definition
+            .filter(|pending| pending.txid == txid)
+        {
+            return &self.pending_routine_dependencies[pending.dependency_slot as usize]
+                .dependencies;
+        }
+        &self.routine_dependencies[slot]
+    }
+
+    fn allocate_pending_routine_dependencies(
+        &mut self,
+        routine: usize,
+        txid: u32,
+        dependencies: StoredQueryDependencies,
+    ) -> Result<u32, SqlError> {
+        let Some(slot) = self
+            .pending_routine_dependencies
+            .iter()
+            .position(|pending| !pending.used)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many pending routine definitions"
+            ));
+        };
+        self.pending_routine_dependencies[slot] = PendingRoutineDependencies {
+            used: true,
+            txid,
+            routine: routine as u16,
+            dependencies,
+        };
+        Ok(slot as u32)
+    }
+
     pub(crate) fn create_routine(
         &mut self,
         spec: RoutineSpec,
@@ -21481,11 +21728,14 @@ impl Storage {
             kind,
             result_columns,
             result_column_count,
+            language,
             attributes,
             configs,
             config_count,
             body_kind,
             body,
+            creation_path,
+            dependencies,
         } = spec;
         if config_count > configs.len()
             || configs[..config_count]
@@ -21666,14 +21916,17 @@ impl Storage {
             kind,
             result_columns,
             result_column_count,
+            language,
             attributes,
             configs,
             config_count,
             body_kind,
             body,
+            creation_path,
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
+        self.routine_dependencies[slot] = dependencies;
         Ok(slot)
     }
 
@@ -21690,12 +21943,14 @@ impl Storage {
 
     pub(crate) fn rollback_routine_create(&mut self, slot: usize) {
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.rollback_create();
+        self.routine_dependencies[slot] = StoredQueryDependencies::EMPTY;
     }
 
     pub(crate) fn replace_routine(
         &mut self,
         slot: usize,
-        definition: PendingRoutineDefinition,
+        mut definition: PendingRoutineDefinition,
+        dependencies: StoredQueryDependencies,
     ) -> Result<Option<PendingRoutineDefinition>, SqlError> {
         let name = self.routines[slot].name;
         if let Some(pending) = self.routines[slot].pending_definition
@@ -21703,6 +21958,8 @@ impl Storage {
         {
             return Err(self.catalog_ddl_wait_error(definition.txid, pending.txid, name.as_str()));
         }
+        definition.dependency_slot =
+            self.allocate_pending_routine_dependencies(slot, definition.txid, dependencies)?;
         let routine = &mut self.routines[slot];
         let prior = routine.pending_definition;
         routine.pending_definition = Some(definition);
@@ -21710,10 +21967,12 @@ impl Storage {
     }
 
     pub(crate) fn commit_routine_replace(&mut self, slot: usize, txid: u32) {
-        let routine = &mut self.routines[slot];
-        if let Some(pending) = routine.pending_definition
+        if let Some(pending) = self.routines[slot].pending_definition
             && pending.txid == txid
         {
+            self.routine_dependencies[slot] =
+                self.pending_routine_dependencies[pending.dependency_slot as usize].dependencies;
+            let routine = &mut self.routines[slot];
             routine.arguments = pending.arguments;
             routine.argument_count = pending.argument_count;
             routine.parameters = pending.parameters;
@@ -21721,12 +21980,22 @@ impl Storage {
             routine.kind = pending.kind;
             routine.result_columns = pending.result_columns;
             routine.result_column_count = pending.result_column_count;
+            routine.language = pending.language;
             routine.attributes = pending.attributes;
             routine.configs = pending.configs;
             routine.config_count = pending.config_count;
             routine.body_kind = pending.body_kind;
             routine.body = pending.body;
+            routine.creation_path = pending.creation_path;
             routine.pending_definition = None;
+            for dependency in self.pending_routine_dependencies.iter_mut() {
+                if dependency.used
+                    && dependency.txid == txid
+                    && usize::from(dependency.routine) == slot
+                {
+                    *dependency = PendingRoutineDependencies::EMPTY;
+                }
+            }
         }
     }
 
@@ -21735,6 +22004,10 @@ impl Storage {
         slot: usize,
         prior: Option<PendingRoutineDefinition>,
     ) {
+        if let Some(current) = self.routines[slot].pending_definition {
+            self.pending_routine_dependencies[current.dependency_slot as usize] =
+                PendingRoutineDependencies::EMPTY;
+        }
         self.routines[slot].pending_definition = prior;
     }
 
@@ -21747,6 +22020,12 @@ impl Storage {
         let object = Self::routine_access_object(slot);
         self.clear_object_acl_entries(object);
         self.clear_extension_dependencies_for_object(object);
+        self.routine_dependencies[slot] = StoredQueryDependencies::EMPTY;
+        for dependency in self.pending_routine_dependencies.iter_mut() {
+            if dependency.used && usize::from(dependency.routine) == slot {
+                *dependency = PendingRoutineDependencies::EMPTY;
+            }
+        }
     }
 
     pub(crate) fn rollback_routine_drop(&mut self, slot: usize, txid: u32) {
@@ -22525,6 +22804,7 @@ impl Storage {
     pub(crate) fn replay_create_routine(
         &mut self,
         mut definition: RoutineDef,
+        dependencies: StoredQueryDependencies,
     ) -> Result<(), SqlError> {
         definition.ownership = definition.ownership.committed();
         if let Some(slot) = self.routine_slot_by_declared_signature(
@@ -22545,11 +22825,14 @@ impl Storage {
                 self.routines[slot].kind = definition.kind;
                 self.routines[slot].result_columns = definition.result_columns;
                 self.routines[slot].result_column_count = definition.result_column_count;
+                self.routines[slot].language = definition.language;
                 self.routines[slot].attributes = definition.attributes;
                 self.routines[slot].configs = definition.configs;
                 self.routines[slot].config_count = definition.config_count;
                 self.routines[slot].body_kind = definition.body_kind;
                 self.routines[slot].body = definition.body;
+                self.routines[slot].creation_path = definition.creation_path;
+                self.routine_dependencies[slot] = dependencies;
                 self.routines[slot].ownership = definition.ownership;
                 self.routines[slot].pending_definition = None;
                 return Ok(());
@@ -22572,11 +22855,14 @@ impl Storage {
                 kind: definition.kind,
                 result_columns: definition.result_columns,
                 result_column_count: definition.result_column_count,
+                language: definition.language,
                 attributes: definition.attributes,
                 configs: definition.configs,
                 config_count: definition.config_count,
                 body_kind: definition.body_kind,
                 body: definition.body,
+                creation_path: definition.creation_path,
+                dependencies,
             },
             0,
         )?;

@@ -62,7 +62,9 @@ pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
     rewrite_view_dml,
 };
-pub(crate) use cte::{expand_set_tree, expand_stored_query, expand_stored_query_exec};
+pub(crate) use cte::{
+    expand_set_tree, expand_stored_query, expand_stored_query_exec, expand_stored_statement_exec,
+};
 
 pub fn stored_query_dependencies(
     sql: &str,
@@ -72,6 +74,16 @@ pub fn stored_query_dependencies(
     arena: &Arena,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
     dependencies::collect(sql, storage, txid, path, arena)
+}
+
+pub(crate) fn stored_routine_dependencies(
+    program: &RoutineFunctionProgram<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    arena: &Arena,
+) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
+    dependencies::collect_routine_program(program, storage, txid, path, arena)
 }
 
 pub(crate) struct StoredQueryCompositeFieldRename<'a> {
@@ -824,9 +836,138 @@ pub(crate) fn execute_routine_query<'a>(
     recycling: bool,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    execute_routine_query_under(query, storage, txid, arena, params, recycling, None, emit)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored routine execution carries its durable identity and result sink"
+)]
+pub(crate) fn execute_bound_routine_query<'a>(
+    query: &RoutineQuery<'a>,
+    storage: &'a Storage,
+    routine_slot: usize,
+    routine: crate::storage::RoutineDef,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    recycling: bool,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if routine.body_kind == crate::storage::RoutineBodyKind::String {
+        return execute_routine_query(query, storage, txid, arena, params, recycling, emit);
+    }
+    let user = super::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid);
+    execute_routine_query_under(
+        query,
+        storage,
+        txid,
+        arena,
+        params,
+        recycling,
+        Some((path, storage.routine_dependencies_for(routine_slot, txid))),
+        emit,
+    )
+}
+
+pub(crate) fn bind_stored_routine_statement<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    routine_slot: usize,
+    routine: crate::storage::RoutineDef,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<&'a Stmt<'a>, SqlError> {
+    if routine.body_kind == crate::storage::RoutineBodyKind::String {
+        return Ok(statement);
+    }
+    let user = super::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid);
+    let dependencies = storage.routine_dependencies_for(routine_slot, txid);
+    let rebound = match statement {
+        Stmt::Select(select) => Stmt::Select(*expand_stored_query_exec(
+            select,
+            storage,
+            txid,
+            path,
+            dependencies,
+            arena,
+            params,
+            None,
+        )?),
+        Stmt::SetQuery(query) => {
+            let body = cte::expand_stored_set_tree_exec(
+                query.with,
+                query.body,
+                storage,
+                txid,
+                cte::StoredExecutionContext::new(path, dependencies, params, None),
+                arena,
+            )?;
+            Stmt::SetQuery(SetQuery {
+                with: &[],
+                body,
+                ..*query
+            })
+        }
+        Stmt::Insert(_)
+        | Stmt::Update(_)
+        | Stmt::Delete(_)
+        | Stmt::Merge(_)
+        | Stmt::With { .. } => {
+            return expand_stored_statement_exec(
+                statement,
+                storage,
+                txid,
+                path,
+                dependencies,
+                arena,
+                params,
+                None,
+            );
+        }
+        _ => return Ok(statement),
+    };
+    arena
+        .alloc(rebound)
+        .map(|statement| &*statement)
+        .map_err(|_| arena_full())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "routine query execution carries its optional creation-time binding"
+)]
+fn execute_routine_query_under<'a>(
+    query: &RoutineQuery<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    recycling: bool,
+    stored: Option<(
+        crate::storage::PathContext,
+        &'a crate::storage::StoredQueryDependencies,
+    )>,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
     match query {
         RoutineQuery::Select(select) => {
-            let select = expand_ctes_exec(select, storage, txid, arena, params, &[], None)?;
+            let select = match stored {
+                Some((path, dependencies)) => expand_stored_query_exec(
+                    select,
+                    storage,
+                    txid,
+                    path,
+                    dependencies,
+                    arena,
+                    params,
+                    None,
+                )?,
+                None => expand_ctes_exec(select, storage, txid, arena, params, &[], None)?,
+            };
             validate_locking(select)?;
             if recycling {
                 select_into_rows_recycling(storage, txid, select, arena, params, None, None, emit)
@@ -835,7 +976,26 @@ pub(crate) fn execute_routine_query<'a>(
             }
         }
         RoutineQuery::Set(query) => {
-            setops::set_query_into_rows(storage, txid, query, arena, params, None, emit)
+            let Some((path, dependencies)) = stored else {
+                return setops::set_query_into_rows(
+                    storage, txid, query, arena, params, None, emit,
+                );
+            };
+            let body = cte::expand_stored_set_tree_exec(
+                query.with,
+                query.body,
+                storage,
+                txid,
+                cte::StoredExecutionContext::new(path, dependencies, params, None),
+                arena,
+            )?;
+            let rebound = SetQuery {
+                with: &[],
+                body,
+                ..**query
+            };
+            let rebound = arena.alloc(rebound).map_err(|_| arena_full())?;
+            setops::set_query_into_rows(storage, txid, rebound, arena, params, None, emit)
         }
     }
 }
@@ -850,11 +1010,11 @@ pub(super) struct StorageCatalog<'storage, 'workspace, 'invocation, 'statement> 
     statement_arena: Option<&'statement Arena>,
 }
 
-pub(super) fn storage_catalog<'a>(
-    storage: &'a Storage,
-    routine_workspace: &'a Arena,
+pub(super) fn storage_catalog<'storage, 'workspace>(
+    storage: &'storage Storage,
+    routine_workspace: &'workspace Arena,
     txid: u32,
-) -> StorageCatalog<'a, 'a, 'static, 'static> {
+) -> StorageCatalog<'storage, 'workspace, 'static, 'static> {
     StorageCatalog {
         storage,
         routine_workspace,
@@ -943,9 +1103,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 Stmt::SetQuery(query) => RoutineQuery::Set(query),
                 _ => unreachable!("mutable routine prelude was rejected above"),
             };
-            execute_routine_query(
+            execute_bound_routine_query(
                 &query,
                 self.storage,
+                slot,
+                routine,
                 self.txid,
                 self.routine_workspace,
                 &parameters[..arguments.len()],
@@ -973,9 +1135,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         ));
                     }
                 };
-                execute_routine_query(
+                execute_bound_routine_query(
                     &query,
                     self.storage,
+                    slot,
+                    routine,
                     self.txid,
                     self.routine_workspace,
                     &parameters[..arguments.len()],
@@ -988,9 +1152,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 return Err(routine_forbidden_statement_error(statement));
             }
         };
-        execute_routine_query(
+        execute_bound_routine_query(
             result_query,
             self.storage,
+            slot,
+            routine,
             self.txid,
             self.routine_workspace,
             &parameters[..arguments.len()],
@@ -1285,6 +1451,15 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
                 self.txid,
             )
             .expect("resolved routine call has a valid polymorphic binding");
+        for (index, argument) in routine.arguments().iter().copied().enumerate() {
+            completed[index] = super::exec::coerce_routine_argument(
+                completed[index],
+                argument,
+                self.storage,
+                self.txid,
+                arena,
+            )?;
+        }
         self.execute_routine(slot, routine, &completed[..declared.argument_count], arena)
     }
 

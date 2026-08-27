@@ -36,6 +36,17 @@ count, total = cur.fetchone()
 assert count == 3 and abs(total - 16.75) < 1e-9, (count, total)
 print("aggregates ok:", count, total)
 
+# Stored PL/pgSQL procedure execution through a parameterized CALL.
+cur.execute("CREATE TABLE drv_plpgsql_log(value integer)")
+cur.execute(
+    "CREATE PROCEDURE drv_plpgsql(value integer) LANGUAGE plpgsql "
+    "AS 'BEGIN INSERT INTO drv_plpgsql_log VALUES (value + 1); END'"
+)
+cur.execute("CALL drv_plpgsql(%s)", (41,))
+cur.execute("SELECT value FROM drv_plpgsql_log")
+assert cur.fetchone() == (42,)
+print("plpgsql procedure ok")
+
 # Errors surface as exceptions with SQLSTATE.
 try:
     cur.execute("SELECT 1/0")

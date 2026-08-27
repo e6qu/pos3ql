@@ -2233,6 +2233,11 @@ impl Checkpointer {
                         "routine body kind",
                     )?)
                     .ok_or(CheckpointSetupError::Corrupt("invalid routine body kind"))?;
+                    let language = crate::storage::RoutineLanguage::from_code(parse_field(
+                        words.next(),
+                        "routine language",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid routine language"))?;
                     let security_definer =
                         match parse_field::<u8>(words.next(), "routine security")? {
                             0 => false,
@@ -2333,11 +2338,6 @@ impl Checkpointer {
                                     })
                                 };
                             }
-                            if words.next().is_some() {
-                                return Err(CheckpointSetupError::Corrupt(
-                                    "malformed routine record",
-                                ));
-                            }
                             crate::storage::RoutineKind::from_wire_code(code, result)
                                 .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?
                         } else if code == 5 {
@@ -2346,23 +2346,25 @@ impl Checkpointer {
                                     .ok_or(CheckpointSetupError::Corrupt(
                                         "invalid aggregate definition",
                                     ))?;
-                            if words.next().is_some() {
-                                return Err(CheckpointSetupError::Corrupt(
-                                    "malformed aggregate record",
-                                ));
-                            }
                             crate::storage::RoutineKind::Aggregate(aggregate)
                         } else {
-                            let kind = crate::storage::RoutineKind::from_wire_code(code, result)
-                                .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?;
-                            if words.next().is_some() {
-                                return Err(CheckpointSetupError::Corrupt(
-                                    "malformed routine record",
-                                ));
-                            }
-                            kind
+                            crate::storage::RoutineKind::from_wire_code(code, result)
+                                .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?
                         }
                     };
+                    let creation_path =
+                        StackStr::<128>::from_str(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("routine creation path missing"),
+                        )?)?);
+                    if creation_path.is_truncated() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "routine creation path too long",
+                        ));
+                    }
+                    let dependencies = parse_stored_query_dependencies(&mut words)?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("malformed routine record"));
+                    }
                     let owner = storage
                         .find_role(&owner)
                         .ok_or(CheckpointSetupError::Corrupt(
@@ -2387,11 +2389,14 @@ impl Checkpointer {
                                 kind,
                                 result_columns,
                                 result_column_count,
+                                language,
                                 attributes,
                                 configs,
                                 config_count,
                                 body_kind,
                                 body: if code == 5 { StackStr::new() } else { body },
+                                creation_path,
+                                dependencies,
                             },
                             0,
                         )
@@ -4872,6 +4877,7 @@ impl Checkpointer {
             let mut schema = StackStr::<130>::new();
             let mut name = StackStr::<130>::new();
             let mut body = StackStr::<{ 2 * crate::storage::ROUTINE_SQL_MAX }>::new();
+            let mut creation_path = StackStr::<260>::new();
             for byte in storage
                 .role(routine.ownership.owner_to(0) as usize)
                 .name
@@ -4885,6 +4891,12 @@ impl Checkpointer {
             }
             for byte in routine.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
+            }
+            for byte in routine.creation_path.as_str().as_bytes() {
+                let _ = write!(creation_path, "{byte:02x}");
+            }
+            if creation_path.as_str().is_empty() {
+                let _ = creation_path.write_str("-");
             }
             let aggregate_body = match routine.kind {
                 crate::storage::RoutineKind::Aggregate(aggregate) => Some(aggregate.encode_wire()),
@@ -5040,7 +5052,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rtn {} {} {} {} {} {} {}{}{}{} {} {} {} {} {} {} {} {} {} {} {}{}",
+                    "rtn {} {} {} {} {} {} {}{}{}{} {} {} {} {} {} {} {} {} {} {} {} {}{} {} {}",
                     routine.created_at,
                     owner.as_str(),
                     match routine.kind {
@@ -5066,6 +5078,7 @@ impl Checkpointer {
                     routine.attributes.volatility.code(),
                     routine.attributes.parallel.code(),
                     routine.body_kind.code(),
+                    routine.language.code(),
                     u8::from(routine.attributes.security_definer),
                     u8::from(routine.attributes.leakproof),
                     routine.attributes.cost_bits.unwrap_or(0),
@@ -5074,6 +5087,8 @@ impl Checkpointer {
                     result_schema.as_str(),
                     result_name.as_str(),
                     result_columns.as_str(),
+                    creation_path.as_str(),
+                    ManifestDependencies(storage.routine_dependencies_for(slot, 0)),
                 ),
             )?;
         }

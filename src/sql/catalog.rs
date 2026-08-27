@@ -3071,12 +3071,12 @@ pub fn function_def_text<'a>(
         crate::storage::RoutineKind::Function { result } => {
             write!(definition, ") RETURNS ").map_err(|_| super::eval::arena_full())?;
             write_routine_result_type(&mut definition, &result)?;
-            write!(definition, " LANGUAGE sql")
+            Ok(())
         }
         crate::storage::RoutineKind::SetFunction { result } => {
             write!(definition, ") RETURNS SETOF ").map_err(|_| super::eval::arena_full())?;
             write_routine_result_type(&mut definition, &result)?;
-            write!(definition, " LANGUAGE sql")
+            Ok(())
         }
         crate::storage::RoutineKind::TableFunction => {
             write!(definition, ") RETURNS TABLE (").map_err(|_| super::eval::arena_full())?;
@@ -3094,21 +3094,31 @@ pub fn function_def_text<'a>(
                 write_routine_type_name(&mut definition, column.ctype, column.user_type, true)
                     .map_err(|_| super::eval::arena_full())?;
             }
-            write!(definition, ") LANGUAGE sql")
+            write!(definition, ")")
         }
         crate::storage::RoutineKind::RecordFunction { set_returning } => {
             write!(
                 definition,
-                ") RETURNS {}record LANGUAGE sql",
+                ") RETURNS {}record",
                 if set_returning { "SETOF " } else { "" }
             )
         }
-        crate::storage::RoutineKind::Trigger => {
-            write!(definition, ") RETURNS trigger LANGUAGE plpgsql")
-        }
-        crate::storage::RoutineKind::Procedure => write!(definition, ") LANGUAGE sql"),
+        crate::storage::RoutineKind::Trigger => write!(definition, ") RETURNS trigger"),
+        crate::storage::RoutineKind::Procedure => write!(definition, ")"),
         crate::storage::RoutineKind::Aggregate(_) => unreachable!("rejected above"),
     }
+    .map_err(|_| super::eval::arena_full())?;
+    write!(
+        definition,
+        " LANGUAGE {}",
+        match routine.language {
+            crate::storage::RoutineLanguage::Sql => "sql",
+            crate::storage::RoutineLanguage::PlPgSql => "plpgsql",
+            crate::storage::RoutineLanguage::Internal => {
+                unreachable!("non-aggregate stored routine has an executable language")
+            }
+        }
+    )
     .map_err(|_| super::eval::arena_full())?;
     match routine.attributes.volatility {
         crate::storage::RoutineVolatility::Immutable => write!(definition, " IMMUTABLE"),
@@ -8996,10 +9006,10 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(Storage::role_oid(routine.ownership.owner_to(txid) as usize)),
                 Datum::Bool(routine.attributes.security_definer),
                 acl(storage, Storage::routine_access_object(slot), txid, arena)?,
-                Datum::Int4(match routine.kind {
-                    crate::storage::RoutineKind::Trigger => 13563,
-                    crate::storage::RoutineKind::Aggregate(_) => 12,
-                    _ => 14,
+                Datum::Int4(match routine.language {
+                    crate::storage::RoutineLanguage::Sql => 14,
+                    crate::storage::RoutineLanguage::PlPgSql => 13563,
+                    crate::storage::RoutineLanguage::Internal => 12,
                 }),
                 text(
                     if matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_)) {

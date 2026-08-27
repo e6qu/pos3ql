@@ -6,7 +6,10 @@
 //! selected under the creator's search path.
 
 use crate::mem::arena::Arena;
-use crate::sql::ast::{Expr, FrameBound, Select, SelectItem, SetTree, TableRef};
+use crate::sql::ast::{
+    Expr, FrameBound, FromClause, Join, JoinKind, QualName, RelationInheritance, Select,
+    SelectItem, SetQuery, SetTree, Stmt, TableRef,
+};
 use crate::sql::eval::{SqlError, sqlstate};
 use crate::sql::exec::{ColTypeResolver, StaticTypeMeta};
 use crate::sql::types::ColType;
@@ -66,6 +69,542 @@ pub(super) fn collect(
         arena,
     )?;
     Ok(dependencies)
+}
+
+pub(super) fn collect_routine_program(
+    program: &super::RoutineFunctionProgram<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: PathContext,
+    arena: &Arena,
+) -> Result<StoredQueryDependencies, SqlError> {
+    let mut dependencies = StoredQueryDependencies::EMPTY;
+    for step in program.preceding {
+        if let super::RoutinePrelude::Statement(statement) = step {
+            collect_statement(statement, storage, txid, &path, &mut dependencies, arena)?;
+        }
+    }
+    match program.result {
+        super::RoutineFunctionResult::Query(super::RoutineQuery::Select(select)) => collect_select(
+            select,
+            storage,
+            txid,
+            &path,
+            CteNames::EMPTY,
+            &mut dependencies,
+            arena,
+        )?,
+        super::RoutineFunctionResult::Query(super::RoutineQuery::Set(query)) => {
+            collect_set_query(query, storage, txid, &path, &mut dependencies, arena)?
+        }
+        super::RoutineFunctionResult::DataModification(statement)
+        | super::RoutineFunctionResult::Void(statement) => {
+            collect_statement(statement, storage, txid, &path, &mut dependencies, arena)?
+        }
+        super::RoutineFunctionResult::Forbidden(_) => {}
+    }
+    Ok(dependencies)
+}
+
+fn collect_set_query(
+    query: &SetQuery<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: &PathContext,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let mut ctes = CteNames::EMPTY;
+    for cte in query.with {
+        collect_select(cte.query, storage, txid, path, ctes, dependencies, arena)?;
+        ctes.push(cte.name)?;
+    }
+    collect_set_tree(query.body, storage, txid, path, ctes, dependencies, arena)?;
+    for expression in query
+        .order_by
+        .iter()
+        .map(|order| order.expression)
+        .chain(query.limit)
+        .chain(query.offset)
+    {
+        collect_expression(expression, storage, txid, path, ctes, dependencies, arena)?;
+    }
+    Ok(())
+}
+
+fn record_routine_target(
+    name: crate::sql::ast::QualName<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: &PathContext,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    let resolved = storage.resolve_relation_under(path, name.schema, name.name, txid);
+    let Some((class, slot, schema, catalog_name)) = (match resolved {
+        Some(ResolvedRelation::Table(slot)) => {
+            let definition = storage.table_def(slot, txid);
+            Some((
+                DependencyClass::Table,
+                slot,
+                definition.schema,
+                definition.name,
+            ))
+        }
+        Some(ResolvedRelation::View(slot)) => {
+            let definition = storage.view(slot);
+            Some((
+                DependencyClass::View,
+                slot,
+                definition.schema,
+                definition.name,
+            ))
+        }
+        Some(ResolvedRelation::Catalog) | None => None,
+    }) else {
+        return Ok(());
+    };
+    dependencies.push(StoredQueryDependency {
+        class,
+        slot: slot as u16,
+        identity: StoredDependencyIdentity::Name,
+        referenced_columns: 0,
+        schema,
+        name: catalog_name,
+        referenced_schema: SqlName::parse(name.schema.unwrap_or(""))?,
+        referenced_name: SqlName::parse(name.name)?,
+    })
+}
+
+fn collect_statement(
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: &PathContext,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let no_excluded: Option<(usize, &crate::storage::TableDef)> = None;
+    macro_rules! collect_expr {
+        ($expression:expr, $scope:expr, $excluded:expr) => {{
+            collect_expression(
+                $expression,
+                storage,
+                txid,
+                path,
+                CteNames::EMPTY,
+                dependencies,
+                arena,
+            )?;
+            if let Some(scope) = $scope {
+                record_dml_column_references($expression, scope, $excluded, dependencies)?;
+            }
+            collect_dml_routine_calls(
+                $expression,
+                storage,
+                txid,
+                $scope,
+                $excluded.map(|(_, definition)| definition),
+                dependencies,
+            )
+        }};
+    }
+    match statement {
+        Stmt::Select(select) => collect_select(
+            select,
+            storage,
+            txid,
+            path,
+            CteNames::EMPTY,
+            dependencies,
+            arena,
+        ),
+        Stmt::SetQuery(query) => collect_set_query(query, storage, txid, path, dependencies, arena),
+        Stmt::With { ctes, statement } => {
+            for cte in *ctes {
+                collect_select(
+                    cte.query,
+                    storage,
+                    txid,
+                    path,
+                    CteNames::EMPTY,
+                    dependencies,
+                    arena,
+                )?;
+            }
+            collect_statement(statement, storage, txid, path, dependencies, arena)
+        }
+        Stmt::Insert(insert) => {
+            let mark = arena.mark();
+            let result = (|| {
+                record_routine_target(insert.table, storage, txid, path, dependencies)?;
+                let scope = dml_dependency_scope(storage, insert.table, None, None, txid, arena)?;
+                let excluded = storage
+                    .resolve_relation_under(path, insert.table.schema, insert.table.name, txid)
+                    .and_then(|relation| match relation {
+                        ResolvedRelation::Table(slot) => {
+                            Some((slot, storage.table_def(slot, txid)))
+                        }
+                        _ => None,
+                    });
+                for row in insert.rows {
+                    for expression in *row {
+                        collect_expr!(expression, None, no_excluded)?;
+                    }
+                }
+                if let Some(select) = insert.select {
+                    collect_select(
+                        select,
+                        storage,
+                        txid,
+                        path,
+                        CteNames::EMPTY,
+                        dependencies,
+                        arena,
+                    )?;
+                }
+                if let Some(conflict) = insert.on_conflict {
+                    for target in conflict.target {
+                        collect_expr!(target.expression, Some(&scope), no_excluded)?;
+                    }
+                    for (_, expression) in conflict.update.into_iter().flatten() {
+                        collect_expr!(expression, Some(&scope), excluded)?;
+                    }
+                    if let Some(expression) = conflict.update_where {
+                        collect_expr!(expression, Some(&scope), excluded)?;
+                    }
+                }
+                for item in insert.returning {
+                    if let SelectItem::Expr { expression, .. }
+                    | SelectItem::RecordStar(expression) = item
+                    {
+                        collect_expr!(expression, Some(&scope), no_excluded)?;
+                    }
+                }
+                Ok(())
+            })();
+            unsafe { arena.rewind_to(mark) };
+            result
+        }
+        Stmt::Update(update) => {
+            let mark = arena.mark();
+            let result = (|| {
+                record_routine_target(update.table, storage, txid, path, dependencies)?;
+                let scope = dml_dependency_scope(
+                    storage,
+                    update.table,
+                    update.alias,
+                    update.from,
+                    txid,
+                    arena,
+                )?;
+                if let Some(from) = update.from {
+                    collect_table_ref(
+                        &from.base,
+                        storage,
+                        txid,
+                        path,
+                        CteNames::EMPTY,
+                        dependencies,
+                        arena,
+                    )?;
+                    for join in from.joins {
+                        collect_table_ref(
+                            &join.table,
+                            storage,
+                            txid,
+                            path,
+                            CteNames::EMPTY,
+                            dependencies,
+                            arena,
+                        )?;
+                        if let Some(expression) = join.on {
+                            collect_expr!(expression, Some(&scope), no_excluded)?;
+                        }
+                    }
+                }
+                for (_, expression) in update.assignments {
+                    collect_expr!(expression, Some(&scope), no_excluded)?;
+                }
+                if let Some(expression) = update.where_clause {
+                    collect_expr!(expression, Some(&scope), no_excluded)?;
+                }
+                for item in update.returning {
+                    if let SelectItem::Expr { expression, .. }
+                    | SelectItem::RecordStar(expression) = item
+                    {
+                        collect_expr!(expression, Some(&scope), no_excluded)?;
+                    }
+                }
+                Ok(())
+            })();
+            unsafe { arena.rewind_to(mark) };
+            result
+        }
+        Stmt::Delete(delete) => {
+            let mark = arena.mark();
+            let result = (|| {
+                record_routine_target(delete.table, storage, txid, path, dependencies)?;
+                let scope = dml_dependency_scope(
+                    storage,
+                    delete.table,
+                    delete.alias,
+                    delete.using,
+                    txid,
+                    arena,
+                )?;
+                if let Some(using) = delete.using {
+                    collect_table_ref(
+                        &using.base,
+                        storage,
+                        txid,
+                        path,
+                        CteNames::EMPTY,
+                        dependencies,
+                        arena,
+                    )?;
+                    for join in using.joins {
+                        collect_table_ref(
+                            &join.table,
+                            storage,
+                            txid,
+                            path,
+                            CteNames::EMPTY,
+                            dependencies,
+                            arena,
+                        )?;
+                        if let Some(expression) = join.on {
+                            collect_expr!(expression, Some(&scope), no_excluded)?;
+                        }
+                    }
+                }
+                if let Some(expression) = delete.where_clause {
+                    collect_expr!(expression, Some(&scope), no_excluded)?;
+                }
+                for item in delete.returning {
+                    if let SelectItem::Expr { expression, .. }
+                    | SelectItem::RecordStar(expression) = item
+                    {
+                        collect_expr!(expression, Some(&scope), no_excluded)?;
+                    }
+                }
+                Ok(())
+            })();
+            unsafe { arena.rewind_to(mark) };
+            result
+        }
+        Stmt::Merge(merge) => {
+            let mark = arena.mark();
+            let result = (|| {
+                record_routine_target(merge.target, storage, txid, path, dependencies)?;
+                collect_table_ref(
+                    &merge.source,
+                    storage,
+                    txid,
+                    path,
+                    CteNames::EMPTY,
+                    dependencies,
+                    arena,
+                )?;
+                let source = arena
+                    .alloc(FromClause {
+                        base: merge.source,
+                        joins: &[],
+                    })
+                    .map_err(|_| super::arena_full())?;
+                let scope = dml_dependency_scope(
+                    storage,
+                    merge.target,
+                    merge.target_alias,
+                    Some(source),
+                    txid,
+                    arena,
+                )?;
+                collect_expr!(merge.on, Some(&scope), no_excluded)?;
+                for when in merge.whens {
+                    if let Some(condition) = when.cond {
+                        collect_expr!(condition, Some(&scope), no_excluded)?;
+                    }
+                    match when.action {
+                        crate::sql::ast::MergeAction::Update(assignments) => {
+                            for (_, expression) in assignments {
+                                collect_expr!(expression, Some(&scope), no_excluded)?;
+                            }
+                        }
+                        crate::sql::ast::MergeAction::Insert { values, .. } => {
+                            for expression in values {
+                                collect_expr!(expression, Some(&scope), no_excluded)?;
+                            }
+                        }
+                        crate::sql::ast::MergeAction::Delete
+                        | crate::sql::ast::MergeAction::DoNothing => {}
+                    }
+                }
+                Ok(())
+            })();
+            unsafe { arena.rewind_to(mark) };
+            result
+        }
+        _ => Ok(()),
+    }
+}
+
+fn collect_dml_routine_calls(
+    expression: &Expr<'_>,
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&super::QueryScope<'_>>,
+    excluded: Option<&crate::storage::TableDef>,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    let resolver = DependencyTypes {
+        scope,
+        excluded,
+        storage,
+        txid,
+    };
+    let mut needs_scope = false;
+    fn visit(
+        expression: &Expr<'_>,
+        storage: &Storage,
+        txid: u32,
+        resolver: &DependencyTypes<'_, '_, '_>,
+        dependencies: &mut StoredQueryDependencies,
+        needs_scope: &mut bool,
+    ) -> Result<(), SqlError> {
+        if let Expr::Call {
+            name,
+            args,
+            argument_names,
+            variadic,
+            ..
+        } = expression
+        {
+            record_routine_call(
+                name,
+                args,
+                argument_names,
+                *variadic,
+                storage,
+                txid,
+                resolver,
+                dependencies,
+                needs_scope,
+            )?;
+        }
+        super::walk_children(expression, &mut |child| {
+            visit(child, storage, txid, resolver, dependencies, needs_scope)
+        })
+    }
+    visit(
+        expression,
+        storage,
+        txid,
+        &resolver,
+        dependencies,
+        &mut needs_scope,
+    )?;
+    if needs_scope {
+        return Err(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "routine call in a data-modifying SQL body needs an unresolved column type"
+        ));
+    }
+    Ok(())
+}
+
+fn record_dml_column_references(
+    expression: &Expr<'_>,
+    scope: &super::QueryScope<'_>,
+    excluded: Option<(usize, &crate::storage::TableDef)>,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    let mut failure = None;
+    expression.for_each_column_reference(&mut |qualifier, name| {
+        if failure.is_some() {
+            return;
+        }
+        if qualifier == Some("excluded")
+            && let Some((slot, definition)) = excluded
+        {
+            let Some(column) = definition.column_index(name) else {
+                failure = Some(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                ));
+                return;
+            };
+            if let Err(error) =
+                dependencies.mark_referenced_column(DependencyClass::Table, slot, column)
+            {
+                failure = Some(error);
+            }
+            return;
+        }
+        let resolved = match scope.find_column(qualifier, name) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                failure = Some(error);
+                return;
+            }
+        };
+        if let Err(error) = mark_resolved_column(scope, resolved, dependencies) {
+            failure = Some(error);
+        }
+    });
+    failure.map_or(Ok(()), Err)
+}
+
+fn dml_dependency_scope<'a>(
+    storage: &'a Storage,
+    target: QualName<'a>,
+    alias: Option<&'a str>,
+    extra: Option<&'a FromClause<'a>>,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<super::QueryScope<'a>, SqlError> {
+    let base = TableRef {
+        schema: target.schema,
+        table: target.name,
+        alias,
+        subquery: None,
+        func_args: None,
+        func_argument_names: &[],
+        func_variadic: false,
+        rows_from: None,
+        col_alias: None,
+        inheritance: RelationInheritance::Descendants,
+        sample: None,
+        cte: None,
+        with_ordinality: false,
+        lateral: false,
+        authorization_role: None,
+    };
+    let joins = match extra {
+        None => &[][..],
+        Some(extra) => {
+            let joins = arena
+                .alloc_slice_with(extra.joins.len() + 1, |index| {
+                    if index == 0 {
+                        Join {
+                            table: extra.base,
+                            kind: JoinKind::Cross,
+                            on: None,
+                            using: None,
+                            natural: false,
+                        }
+                    } else {
+                        extra.joins[index - 1]
+                    }
+                })
+                .map_err(|_| super::arena_full())?;
+            &*joins
+        }
+    };
+    let from = arena
+        .alloc(FromClause { base, joins })
+        .map_err(|_| super::arena_full())?;
+    super::QueryScope::resolve_schema(storage, from, txid, arena)
 }
 
 fn collect_select<'a>(
@@ -232,12 +771,23 @@ fn collect_select<'a>(
 
 struct DependencyTypes<'scope, 'definition, 'storage> {
     scope: Option<&'scope super::QueryScope<'definition>>,
+    excluded: Option<&'storage crate::storage::TableDef>,
     storage: &'storage Storage,
     txid: u32,
 }
 
 impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        if qualifier == Some("excluded")
+            && let Some(column) = self.excluded.and_then(|definition| {
+                definition
+                    .columns()
+                    .iter()
+                    .find(|column| column.name.as_str() == name)
+            })
+        {
+            return Ok(column.ctype);
+        }
         match self.scope {
             Some(scope) => super::ScopeCols(scope).resolve(qualifier, name),
             None => crate::sql::exec::NoCols.resolve(qualifier, name),
@@ -245,6 +795,23 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     }
 
     fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
+        if qualifier == Some("excluded") {
+            let column = self
+                .excluded?
+                .columns()
+                .iter()
+                .find(|column| column.name.as_str() == name)?;
+            return Some(StaticTypeMeta {
+                ctype: column.ctype,
+                type_oid: self.storage.routine_type_oid(
+                    column.ctype,
+                    column.user_type,
+                    self.txid,
+                )?,
+                type_mod: column.type_mod,
+                collation: column.collation,
+            });
+        }
         let scope = self.scope?;
         ColTypeResolver::column_meta(
             &super::CatalogScopeCols {
@@ -405,6 +972,7 @@ fn collect_routine_dependencies(
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
         scope: None,
+        excluded: None,
         storage,
         txid,
     };
@@ -422,6 +990,7 @@ fn collect_routine_dependencies(
             let scope = super::QueryScope::resolve_schema(storage, from, txid, arena)?;
             let resolver = DependencyTypes {
                 scope: Some(&scope),
+                excluded: None,
                 storage,
                 txid,
             };
@@ -447,6 +1016,156 @@ fn collect_routine_dependencies(
     Ok(())
 }
 
+pub(super) fn stored_routine_dependency_for_call(
+    name: &str,
+    args: &[&Expr<'_>],
+    argument_names: &[Option<&str>],
+    variadic: bool,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &StoredQueryDependencies,
+) -> Result<Option<StoredQueryDependency>, SqlError> {
+    let (referenced_schema, referenced_name) =
+        name.split_once('.').map_or(("", name), |parts| parts);
+    let mut candidates = dependencies.entries().iter().copied().filter(|dependency| {
+        dependency.class == DependencyClass::Routine
+            && dependency.referenced_schema.as_str() == referenced_schema
+            && dependency.referenced_name.as_str() == referenced_name
+    });
+    let Some(first) = candidates.next() else {
+        return Ok(None);
+    };
+    let Some(second) = candidates.next() else {
+        return Ok(Some(first));
+    };
+    if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "routine call has too many arguments"
+        ));
+    }
+    let resolver = DependencyTypes {
+        scope: None,
+        excluded: None,
+        storage,
+        txid,
+    };
+    let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    for (output, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
+        *output = match crate::sql::exec::infer_routine_argument_oid(argument, &resolver) {
+            Ok(crate::sql::types::oid::UNKNOWN) if matches!(argument, Expr::Str(_)) => {
+                ColType::Text.oid()
+            }
+            Ok(oid) => oid,
+            Err(_) => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "stored overloaded routine call \"{}\" cannot be rebound without a typed argument",
+                    name
+                ));
+            }
+        };
+    }
+    let argument_oids = &argument_oids[..args.len()];
+    for dependency in core::iter::once(first)
+        .chain(core::iter::once(second))
+        .chain(candidates)
+    {
+        let routine = storage.routine_for(dependency.slot as usize, txid);
+        let qualified = crate::stack_format!(
+            192,
+            "{}.{}",
+            routine.schema_for(txid).as_str(),
+            routine.name_for(txid).as_str()
+        );
+        let resolved = if argument_names.is_empty() {
+            storage.routine_slot_for_function_call_syntax_oids(
+                qualified.as_str(),
+                argument_oids,
+                variadic,
+                txid,
+            )
+        } else {
+            storage.routine_slot_for_named_function_call_oids(
+                qualified.as_str(),
+                argument_names,
+                argument_oids,
+                txid,
+            )
+        };
+        if resolved == Some(dependency.slot as usize) {
+            return Ok(Some(dependency));
+        }
+    }
+    Err(sql_err!(
+        sqlstate::INVALID_FUNCTION_DEFINITION,
+        "stored overloaded routine call \"{}\" no longer has its captured signature",
+        name
+    ))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "routine dependency binding carries call syntax and catalog context"
+)]
+fn record_routine_call(
+    name: &str,
+    args: &[&Expr<'_>],
+    argument_names: &[Option<&str>],
+    variadic: bool,
+    storage: &Storage,
+    txid: u32,
+    resolver: &DependencyTypes<'_, '_, '_>,
+    dependencies: &mut StoredQueryDependencies,
+    needs_scope: &mut bool,
+) -> Result<(), SqlError> {
+    if !storage.has_function_routine_candidate(name, args.len(), txid) {
+        return Ok(());
+    }
+    if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "routine call has too many arguments"
+        ));
+    }
+    let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    for (slot, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
+        match crate::sql::exec::infer_routine_argument_oid(argument, resolver) {
+            Ok(crate::sql::types::oid::UNKNOWN) if matches!(argument, Expr::Str(_)) => {
+                *slot = ColType::Text.oid();
+            }
+            Ok(oid) => *slot = oid,
+            Err(_) => {
+                *needs_scope = true;
+                return Ok(());
+            }
+        }
+    }
+    let argument_oids = &argument_oids[..args.len()];
+    let resolved = if argument_names.is_empty() {
+        storage.routine_slot_for_function_call_syntax_oids(name, argument_oids, variadic, txid)
+    } else {
+        storage.routine_slot_for_named_function_call_oids(name, argument_names, argument_oids, txid)
+    };
+    let Some(slot) = resolved else {
+        return Ok(());
+    };
+    let routine = storage.routine_for(slot, txid);
+    let (referenced_schema, referenced_name) = name
+        .split_once('.')
+        .map_or(("", name), |(schema, name)| (schema, name));
+    dependencies.push(StoredQueryDependency {
+        class: DependencyClass::Routine,
+        slot: slot as u16,
+        identity: StoredDependencyIdentity::RoutineOid(crate::storage::routine_oid(&routine)),
+        referenced_columns: 0,
+        schema: routine.schema_for(txid),
+        name: routine.name_for(txid),
+        referenced_schema: SqlName::parse(referenced_schema)?,
+        referenced_name: SqlName::parse(referenced_name)?,
+    })
+}
+
 fn collect_routine_dependencies_with_resolver(
     select: &Select<'_>,
     storage: &Storage,
@@ -456,62 +1175,6 @@ fn collect_routine_dependencies_with_resolver(
 ) -> Result<bool, SqlError> {
     let mut needs_scope = false;
 
-    fn record_call(
-        name: &str,
-        args: &[&Expr<'_>],
-        storage: &Storage,
-        txid: u32,
-        resolver: &DependencyTypes<'_, '_, '_>,
-        dependencies: &mut StoredQueryDependencies,
-        needs_scope: &mut bool,
-    ) -> Result<(), SqlError> {
-        if !storage.has_function_routine_candidate(name, args.len(), txid) {
-            return Ok(());
-        }
-        if args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS {
-            let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
-            let mut known = true;
-            for (slot, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
-                match crate::sql::exec::infer_routine_argument_oid(argument, resolver) {
-                    Ok(crate::sql::types::oid::UNKNOWN) if matches!(argument, Expr::Str(_)) => {
-                        *slot = ColType::Text.oid();
-                    }
-                    Ok(oid) => *slot = oid,
-                    Err(_) => {
-                        *needs_scope = true;
-                        known = false;
-                        break;
-                    }
-                }
-            }
-            if known
-                && let Some(slot) = storage.routine_slot_for_function_call_oids(
-                    name,
-                    &argument_oids[..args.len()],
-                    txid,
-                )
-            {
-                let routine = storage.routine_for(slot, txid);
-                let (referenced_schema, referenced_name) = name
-                    .split_once('.')
-                    .map_or(("", name), |(schema, name)| (schema, name));
-                dependencies.push(StoredQueryDependency {
-                    class: DependencyClass::Routine,
-                    slot: slot as u16,
-                    identity: StoredDependencyIdentity::RoutineOid(crate::storage::routine_oid(
-                        &routine,
-                    )),
-                    referenced_columns: 0,
-                    schema: routine.schema_for(txid),
-                    name: routine.name_for(txid),
-                    referenced_schema: SqlName::parse(referenced_schema)?,
-                    referenced_name: SqlName::parse(referenced_name)?,
-                })?;
-            }
-        }
-        Ok(())
-    }
-
     fn visit_expr(
         expression: &Expr<'_>,
         storage: &Storage,
@@ -520,10 +1183,19 @@ fn collect_routine_dependencies_with_resolver(
         dependencies: &mut StoredQueryDependencies,
         needs_scope: &mut bool,
     ) -> Result<(), SqlError> {
-        if let Expr::Call { name, args, .. } = expression {
-            record_call(
+        if let Expr::Call {
+            name,
+            args,
+            argument_names,
+            variadic,
+            ..
+        } = expression
+        {
+            record_routine_call(
                 name,
                 args,
+                argument_names,
+                *variadic,
                 storage,
                 txid,
                 resolver,
@@ -558,9 +1230,11 @@ fn collect_routine_dependencies_with_resolver(
         } else {
             table.table
         };
-        record_call(
+        record_routine_call(
             name,
             args,
+            table.func_argument_names,
+            table.func_variadic,
             storage,
             txid,
             resolver,

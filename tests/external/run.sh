@@ -164,11 +164,12 @@ for i in {1..50}; do
 done
 ok "gateway (pid $GATEWAY_PID)"
 
-write_main_config() { # <object prefix>
+write_main_config() { # <object prefix> [data directory name]
   local object_prefix=$1
+  local data_name=${2:-data}
   cat > "$WORK/server.conf" <<EOF
 listen_addr = 127.0.0.1:${PG_PORT}
-data_dir = ${WORK}/data
+data_dir = ${WORK}/${data_name}
 max_connections = 8
 memtable_bytes = 16MiB
 wal_bytes = 16MiB
@@ -204,6 +205,15 @@ start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
 SERVER_PID=$START_PID
 ok "server up (pid $SERVER_PID)"
 
+restart_main_server() { # <fixture name>
+  local fixture=$1
+  stop_pos3ql "$SERVER_PID"
+  SERVER_PID=""
+  write_main_config "run-$$-${fixture}/" "data-${fixture}"
+  start_pos3ql "$WORK/server.conf" "$WORK/server-${fixture}.log" $PG_PORT
+  SERVER_PID=$START_PID
+}
+
 psql_run() { # <name>
   local name=$1
   # psql writes echoed SQL and result rows to stdout but errors to stderr.
@@ -238,6 +248,7 @@ for v in 3.0 3.2; do
 done
 
 step "raw wire-protocol probes (SSLRequest, negotiation, framing)"
+restart_main_server wire
 if POS3QL_PORT=$PG_PORT python3 "$EXT/wire_probe.py" > "$WORK/wire.out" 2>&1; then
   ok "wire probes"
 else
@@ -245,6 +256,7 @@ else
 fi
 
 step "driver test (psycopg 3, extended protocol with binary parameters)"
+restart_main_server psycopg
 VENV=${POS3QL_VENV:-$ROOT/target/external-venv}
 if [[ ! -x "$VENV/bin/python" ]]; then
   python3 -m venv "$VENV" && "$VENV/bin/pip" install --quiet 'psycopg[binary]'
@@ -262,6 +274,7 @@ else
 fi
 
 step "COPY: client-side round trip through psql \\copy"
+restart_main_server copy
 "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
   -c "CREATE TABLE copy_rt (id int, v text, w text)" \
   -c "INSERT INTO copy_rt VALUES (1, E'tab\\there', 'plain'), (2, E'nl\\nhere', NULL), (3, 'back\\slash', 'x')"

@@ -2239,9 +2239,11 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
                 crate::sql::ast::Stmt::SetQuery(query) => super::RoutineQuery::Set(query),
                 _ => unreachable!("mutable table routine was classified before execution"),
             };
-            super::execute_routine_query(
+            super::execute_bound_routine_query(
                 &query,
                 storage,
+                routine_slot,
+                *routine,
                 txid,
                 arena,
                 &routine_params[..routine.argument_count],
@@ -2263,9 +2265,11 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
             _ => unreachable!("mutable table routine was classified before execution"),
         };
         if scalar_result == Some(ColType::Void) {
-            super::execute_routine_query(
+            super::execute_bound_routine_query(
                 result_query,
                 storage,
+                routine_slot,
+                *routine,
                 txid,
                 arena,
                 &routine_params[..routine.argument_count],
@@ -2278,9 +2282,11 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let mut rows: *mut &[u8] = core::ptr::null_mut();
         let mut len = 0usize;
         let mut cap = 0usize;
-        super::execute_routine_query(
+        super::execute_bound_routine_query(
             result_query,
             storage,
+            routine_slot,
+            *routine,
             txid,
             arena,
             &routine_params[..routine.argument_count],

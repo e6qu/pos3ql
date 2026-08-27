@@ -2205,15 +2205,21 @@ impl<'a> Parser<'a> {
             });
         }
         if matches!(kind, RoutineCreateKind::Trigger)
-            != matches!(language, crate::sql::ast::RoutineLanguage::PlPgSql)
+            && language != crate::sql::ast::RoutineLanguage::PlPgSql
         {
-            return Err(
-                self.unexpected(if matches!(kind, RoutineCreateKind::Trigger) {
-                    "trigger functions require LANGUAGE plpgsql"
-                } else {
-                    "only trigger functions support LANGUAGE plpgsql"
-                }),
-            );
+            return Err(self.unexpected("trigger functions require LANGUAGE plpgsql"));
+        }
+        if language == crate::sql::ast::RoutineLanguage::PlPgSql
+            && !matches!(
+                kind,
+                RoutineCreateKind::Trigger | RoutineCreateKind::Procedure
+            )
+        {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "PL/pgSQL function execution is not supported"),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
         }
         Ok(Stmt::CreateRoutine(CreateRoutine {
             name,

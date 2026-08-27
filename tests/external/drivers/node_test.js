@@ -61,6 +61,11 @@ async function main() {
     await c.query("CALL node_standard_proc($1)", [43]);
     const procedure = await c.query("SELECT value FROM node_routine_log");
     line(`standard procedure ${procedure.rows[0].value}`);
+    await c.query("CREATE OR REPLACE PROCEDURE node_plpgsql(value integer) LANGUAGE plpgsql " +
+      "AS 'BEGIN INSERT INTO node_routine_log VALUES (value + 1); END'");
+    await c.query("CALL node_plpgsql($1)", [44]);
+    const plpgsql = await c.query("SELECT value FROM node_routine_log WHERE value = 45");
+    line(`plpgsql procedure ${plpgsql.rows[0].value}`);
 
     // Transaction rollback must not persist.
     await c.query('BEGIN');

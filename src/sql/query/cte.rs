@@ -73,10 +73,10 @@ pub(crate) fn expand_stored_query<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expand_stored_query_exec<'a>(
     select: &'a Select<'a>,
-    storage: &'a Storage,
+    storage: &Storage,
     txid: u32,
     path: crate::storage::PathContext,
-    dependencies: &'a crate::storage::StoredQueryDependencies,
+    dependencies: &crate::storage::StoredQueryDependencies,
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
@@ -303,6 +303,66 @@ pub fn expand_dml_ctes<'a>(
         dml_mats,
         &[],
         sequences,
+    )
+}
+
+/// Rebinds a SQL-standard routine statement to the catalog identities captured
+/// when the routine was defined. String-literal bodies deliberately use the
+/// ordinary invocation-time path and never enter this function.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored statements require their captured catalog and evaluation context"
+)]
+pub(crate) fn expand_stored_statement_exec<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: &crate::storage::StoredQueryDependencies,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let (with, body) = match statement {
+        Stmt::With { ctes, statement } => (*ctes, *statement),
+        _ => (&[][..], statement),
+    };
+    let placeholder = match body {
+        Stmt::Insert(insert) => insert.select.unwrap_or(&EMPTY_SELECT),
+        _ => &EMPTY_SELECT,
+    };
+    with_exec_context(
+        with,
+        placeholder,
+        storage,
+        txid,
+        arena,
+        params,
+        &[],
+        &[],
+        &[],
+        &[],
+        sequences,
+        0,
+        Some(path),
+        Some(dependencies),
+        None,
+        |name| statement_references(body, name),
+        |context| {
+            let rebound = match body {
+                Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
+                Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
+                Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
+                Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "stored routine statement is not data-modifying"
+                    ));
+                }
+            };
+            Ok(&*arena.alloc(rebound).map_err(|_| arena_full())?)
+        },
     )
 }
 
@@ -838,6 +898,51 @@ pub(super) fn expand_set_tree_exec<'a>(
     }
     let wrapper = wrap_set_tree_with(with, tree, arena)?;
     let expanded = expand_ctes_exec(wrapper, storage, txid, arena, params, &[], sequences)?;
+    Ok(expanded.set_body.expect("wrapper keeps its set body"))
+}
+
+pub(super) struct StoredExecutionContext<'storage, 'params, 'a> {
+    path: crate::storage::PathContext,
+    dependencies: &'storage crate::storage::StoredQueryDependencies,
+    params: &'params [Datum<'a>],
+    sequences: Option<&'params dyn SequenceAccess>,
+}
+
+impl<'storage, 'params, 'a> StoredExecutionContext<'storage, 'params, 'a> {
+    pub(super) fn new(
+        path: crate::storage::PathContext,
+        dependencies: &'storage crate::storage::StoredQueryDependencies,
+        params: &'params [Datum<'a>],
+        sequences: Option<&'params dyn SequenceAccess>,
+    ) -> Self {
+        Self {
+            path,
+            dependencies,
+            params,
+            sequences,
+        }
+    }
+}
+
+pub(super) fn expand_stored_set_tree_exec<'a>(
+    with: &'a [Cte<'a>],
+    tree: &'a SetTree<'a>,
+    storage: &Storage,
+    txid: u32,
+    execution: StoredExecutionContext<'_, '_, 'a>,
+    arena: &'a Arena,
+) -> Result<&'a SetTree<'a>, SqlError> {
+    let wrapper = wrap_set_tree_with(with, tree, arena)?;
+    let expanded = expand_stored_query_exec(
+        wrapper,
+        storage,
+        txid,
+        execution.path,
+        execution.dependencies,
+        arena,
+        execution.params,
+        execution.sequences,
+    )?;
     Ok(expanded.set_body.expect("wrapper keeps its set body"))
 }
 
@@ -3160,7 +3265,7 @@ fn subst_insert<'a>(
         None => None,
     };
     Ok(Insert {
-        table: statement.table,
+        table: rewrite_stored_relation_name(statement.table, context, arena)?,
         columns: statement.columns,
         rows,
         select,
@@ -3176,7 +3281,7 @@ fn subst_update<'a>(
     arena: &'a Arena,
 ) -> Result<Update<'a>, SqlError> {
     Ok(Update {
-        table: statement.table,
+        table: rewrite_stored_relation_name(statement.table, context, arena)?,
         alias: statement.alias,
         assignments: subst_assignments(statement.assignments, context, arena)?,
         from: match statement.from {
@@ -3198,7 +3303,7 @@ fn subst_delete<'a>(
     arena: &'a Arena,
 ) -> Result<Delete<'a>, SqlError> {
     Ok(Delete {
-        table: statement.table,
+        table: rewrite_stored_relation_name(statement.table, context, arena)?,
         alias: statement.alias,
         using: match statement.using {
             Some(using) => Some(
@@ -3253,13 +3358,49 @@ fn subst_merge<'a>(
         };
     }
     Ok(Merge {
-        target: statement.target,
+        target: rewrite_stored_relation_name(statement.target, context, arena)?,
         target_alias: statement.target_alias,
         source: subst_tableref(&statement.source, context, arena)?,
         on: subst_expr(statement.on, context, arena)?,
         whens: arena
             .alloc_slice_copy(&whens[..statement.whens.len()])
             .map_err(|_| arena_full())?,
+    })
+}
+
+fn rewrite_stored_relation_name<'a>(
+    name: crate::sql::ast::QualName<'a>,
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<crate::sql::ast::QualName<'a>, SqlError> {
+    let Some(dependencies) = context.dependencies else {
+        return Ok(name);
+    };
+    let Some(dependency) = dependencies.entries().iter().find(|dependency| {
+        matches!(
+            dependency.class,
+            crate::storage::DependencyClass::Table | crate::storage::DependencyClass::View
+        ) && dependency.referenced_schema.as_str() == name.schema.unwrap_or("")
+            && dependency.referenced_name.as_str() == name.name
+    }) else {
+        return Ok(name);
+    };
+    let (schema, relation) = match dependency.class {
+        crate::storage::DependencyClass::Table => {
+            let definition = context
+                .storage
+                .table_def(dependency.slot as usize, context.txid);
+            (definition.schema.as_str(), definition.name.as_str())
+        }
+        crate::storage::DependencyClass::View => {
+            let definition = context.storage.view(dependency.slot as usize);
+            (definition.schema.as_str(), definition.name.as_str())
+        }
+        _ => unreachable!("stored relation rewrite only accepts relations"),
+    };
+    Ok(crate::sql::ast::QualName {
+        schema: Some(arena.alloc_str(schema).map_err(|_| arena_full())?),
+        name: arena.alloc_str(relation).map_err(|_| arena_full())?,
     })
 }
 
@@ -3351,8 +3492,23 @@ fn subst_tableref<'a>(
         });
     }
     if let Some(arguments) = t.func_args {
-        let Some(dependency) = stored_routine_dependency(t.schema.unwrap_or(""), t.table, context)
-        else {
+        let written = match t.schema {
+            Some(schema) => crate::stack_format!(192, "{}.{}", schema, t.table),
+            None => crate::stack_format!(192, "{}", t.table),
+        };
+        let dependency = match context.dependencies {
+            Some(dependencies) => super::dependencies::stored_routine_dependency_for_call(
+                written.as_str(),
+                arguments,
+                t.func_argument_names,
+                t.func_variadic,
+                context.storage,
+                context.txid,
+                dependencies,
+            )?,
+            None => None,
+        };
+        let Some(dependency) = dependency else {
             return Ok(TableRef {
                 func_args: Some(subst_expr_slice(arguments, context, arena)?),
                 ..*t
@@ -3614,7 +3770,11 @@ fn subst_expr_slice<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a [&'a Expr<'a>], SqlError> {
-    if context.qualifier.is_none() && !xs.iter().any(|x| expr_has_subquery(x)) {
+    if context.qualifier.is_none()
+        && context.recursive_state.is_none()
+        && context.dependencies.is_none()
+        && !xs.iter().any(|x| expr_has_subquery(x))
+    {
         return Ok(xs);
     }
     let mut tmp = [&Expr::Null; crate::sql::parser::MAX_LIST];
@@ -3793,30 +3953,27 @@ fn rewrite_stored_type_name<'a>(
     arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
 }
 
-fn stored_routine_dependency<'a>(
-    schema: &str,
-    name: &str,
-    context: Subst<'_, 'a, '_, '_>,
-) -> Option<crate::storage::StoredQueryDependency> {
-    context
-        .dependencies?
-        .entries()
-        .iter()
-        .copied()
-        .find(|dependency| {
-            dependency.class == crate::storage::DependencyClass::Routine
-                && dependency.referenced_schema.as_str() == schema
-                && dependency.referenced_name.as_str() == name
-        })
-}
-
 fn rewrite_stored_routine_name<'a>(
     name: &'a str,
+    args: &[&Expr<'a>],
+    argument_names: &[Option<&str>],
+    variadic: bool,
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a str, SqlError> {
-    let (schema, bare) = name.split_once('.').unwrap_or(("", name));
-    let Some(dependency) = stored_routine_dependency(schema, bare, context) else {
+    let Some(dependencies) = context.dependencies else {
+        return Ok(name);
+    };
+    let Some(dependency) = super::dependencies::stored_routine_dependency_for_call(
+        name,
+        args,
+        argument_names,
+        variadic,
+        context.storage,
+        context.txid,
+        dependencies,
+    )?
+    else {
         return Ok(name);
     };
     let routine = context
@@ -3906,7 +4063,8 @@ fn subst_expr<'a>(
             over,
             filter,
         } => {
-            let name = rewrite_stored_routine_name(name, context, arena)?;
+            let name =
+                rewrite_stored_routine_name(name, args, argument_names, *variadic, context, arena)?;
             let mut ob = [OrderBy {
                 expression: &Expr::Null,
                 descending: false,

@@ -102,6 +102,10 @@ func main() {
 	exec("CALL pgx_standard_proc($1)", 43)
 	must("standard procedure", conn.QueryRow(ctx, "SELECT value FROM pgx_routine_log").Scan(&routineValue))
 	fmt.Printf("standard procedure %d\n", routineValue)
+	exec("CREATE OR REPLACE PROCEDURE pgx_plpgsql(value integer) LANGUAGE plpgsql AS 'BEGIN INSERT INTO pgx_routine_log VALUES (value + 1); END'")
+	exec("CALL pgx_plpgsql($1)", 44)
+	must("plpgsql procedure", conn.QueryRow(ctx, "SELECT value FROM pgx_routine_log WHERE value = 45").Scan(&routineValue))
+	fmt.Printf("plpgsql procedure %d\n", routineValue)
 
 	// Transaction rollback must not persist.
 	tx, err := conn.Begin(ctx)

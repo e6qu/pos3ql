@@ -14107,8 +14107,29 @@ fn routine_parameter_contracts_drive_defaults_outputs_and_catalog_text() {
 }
 
 #[test]
+fn routine_calls_apply_postgresql_implicit_argument_casts() {
+    let config = test_config("routine_implicit_argument_casts");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE implicit_call_log(value integer);
+         CREATE FUNCTION implicit_increment(value integer) RETURNS integer
+             LANGUAGE SQL AS 'SELECT value + 1';
+         CREATE PROCEDURE implicit_record(value integer) LANGUAGE SQL
+             AS 'INSERT INTO implicit_call_log VALUES (value + 1)';
+         SELECT implicit_increment(40::smallint), implicit_increment(40::integer);
+         CALL implicit_record(41::smallint);
+         SELECT value FROM implicit_call_log;",
+    );
+    assert_eq!(data_rows(&output), ["41|41", "42"]);
+}
+
+#[test]
 fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
     let mut config = test_config("routine_body_attributes");
+    config.max_tables = 16;
     config.object_store_on = true;
     config.object_store_sim = true;
     config.object_store_namespace = format!("routine-body-attributes-{}", std::process::id());
@@ -14134,6 +14155,7 @@ fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
         &mut engine,
         &mut budget,
         "CREATE TABLE routine_attribute_log(value text);
+         CREATE TABLE plpgsql_procedure_log(base integer, total integer, label text);
          CREATE FUNCTION standard_return(a integer) RETURNS integer
              LANGUAGE SQL IMMUTABLE PARALLEL SAFE COST 2
              SET application_name TO 'inside' RETURN a + 1;
@@ -14167,6 +14189,18 @@ fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
              LANGUAGE SQL SET application_name TO 'temporary'
              AS 'SET application_name TO ''persisted'';
                  SELECT current_setting(''application_name'')';
+         CREATE PROCEDURE plpgsql_flow(IN base integer, INOUT total integer, OUT label text)
+             LANGUAGE plpgsql AS
+             'DECLARE step integer := 0;
+              BEGIN
+                WHILE step < base LOOP
+                  step := step + 1;
+                  total := total + 1;
+                END LOOP;
+                label := ''sum:'' || total;
+                INSERT INTO plpgsql_procedure_log VALUES ($1, total, label);
+                RETURN;
+              END';
          CREATE ROLE routine_caller;
          SET application_name = 'outside';
          SET ROLE routine_caller;
@@ -14225,6 +14259,7 @@ fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
     );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -14234,11 +14269,18 @@ fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
         "SET application_name = 'recovered';
          SELECT standard_return(2), standard_atomic(2), current_setting('application_name');
          SELECT procost, proconfig::text, prosqlbody IS NULL
-           FROM pg_proc WHERE proname = 'standard_return';",
+           FROM pg_proc WHERE proname = 'standard_return';
+         CALL plpgsql_flow(3, 4, NULL);
+         SELECT base, total, label FROM plpgsql_procedure_log;",
     );
     assert_eq!(
         data_rows(&recovered),
-        ["3|4|recovered", "7|{application_name=altered}|f"],
+        [
+            "3|4|recovered",
+            "7|{application_name=altered}|f",
+            "7|sum:7",
+            "3|7|sum:7",
+        ],
         "{}",
         String::from_utf8_lossy(&recovered)
     );
@@ -14250,6 +14292,44 @@ fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
          SELECT value FROM anonymous_log ORDER BY value;",
     );
     assert_eq!(data_rows(&anonymous), ["1", "2"]);
+    let anonymous_control = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE anonymous_flow(value integer PRIMARY KEY, note text);
+         DO 'DECLARE
+               i integer := 0;
+               total integer := 0;
+             BEGIN
+               WHILE i < 3 LOOP
+                 i := i + 1;
+                 IF i = 2 THEN CONTINUE; END IF;
+                 total := total + i;
+               END LOOP;
+               CASE total
+                 WHEN 4 THEN INSERT INTO anonymous_flow VALUES (total, ''loop'');
+                 ELSE RAISE EXCEPTION ''wrong total'';
+               END CASE;
+               BEGIN
+                 INSERT INTO anonymous_flow VALUES (4, ''duplicate'');
+               EXCEPTION WHEN unique_violation THEN
+                 INSERT INTO anonymous_flow VALUES (5, ''caught'');
+               END;
+             END';
+         SELECT value, note FROM anonymous_flow ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&anonymous_control),
+        ["4|loop", "5|caught"],
+        "{}",
+        String::from_utf8_lossy(&anonymous_control)
+    );
+    let anonymous_trigger_state =
+        run_with(&mut engine, &mut budget, "DO 'BEGIN PERFORM TG_OP; END';");
+    assert!(
+        String::from_utf8_lossy(&anonymous_trigger_state).contains("42703"),
+        "{}",
+        String::from_utf8_lossy(&anonymous_trigger_state)
+    );
     let explicit_termination = run_with(&mut engine, &mut budget, "BEGIN; DO 'BEGIN COMMIT; END';");
     assert!(
         String::from_utf8_lossy(&explicit_termination).contains("2D000"),
@@ -14301,6 +14381,320 @@ fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
         String::from_utf8_lossy(&unsupported_do).contains("0A000"),
         "{}",
         String::from_utf8_lossy(&unsupported_do)
+    );
+}
+
+#[test]
+fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
+    let mut config = test_config("routine_creation_dependencies");
+    config.max_tables = 16;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("routine-creation-dependencies-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE SCHEMA routine_origin;
+             CREATE SCHEMA routine_shadow;
+             CREATE TABLE routine_dependency_log(value integer);
+             SET search_path TO routine_origin, public;
+             CREATE FUNCTION shifted(value integer) RETURNS integer
+               LANGUAGE SQL RETURN value + 1;
+             CREATE PROCEDURE record_shift(value integer) LANGUAGE SQL
+               BEGIN ATOMIC
+                 INSERT INTO routine_dependency_log VALUES (shifted(value));
+               END;
+             RESET search_path;",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        let procedure_slot = engine
+            .storage
+            .procedure_slot_for_call_oids("routine_origin.record_shift", &[23], 0)
+            .unwrap();
+        let dependencies = engine.storage.routine_dependencies_for(procedure_slot, 0);
+        assert_eq!(
+            engine.storage.routine_for(procedure_slot, 0).body_kind,
+            crate::storage::RoutineBodyKind::Atomic
+        );
+        assert!(dependencies.entries().iter().any(|dependency| {
+            dependency.class == crate::storage::DependencyClass::Table
+                && dependency.referenced_name.as_str() == "routine_dependency_log"
+        }));
+        assert!(dependencies.entries().iter().any(|dependency| {
+            dependency.class == crate::storage::DependencyClass::Routine
+                && dependency.referenced_name.as_str() == "shifted"
+                && dependency.referenced_schema.as_str().is_empty()
+        }));
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "SET search_path TO routine_shadow, public;
+             CREATE FUNCTION shifted(value integer) RETURNS integer
+               LANGUAGE SQL RETURN value + 100;
+             RESET search_path;
+             ALTER FUNCTION routine_origin.shifted(integer) RENAME TO renamed_shift;
+             ALTER TABLE routine_dependency_log RENAME TO renamed_routine_dependency_log;
+             CALL routine_origin.record_shift(4);
+             SELECT value FROM renamed_routine_dependency_log;",
+        );
+        assert_eq!(
+            data_rows(&setup),
+            ["5"],
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let recovered = run_with(
+        &mut engine,
+        &mut budget,
+        "SET search_path TO routine_shadow, public;
+         CALL routine_origin.record_shift(8);
+         SELECT value FROM renamed_routine_dependency_log ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        ["5", "9"],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn sql_standard_routine_dependencies_enforce_drop_lifecycle() {
+    let mut budget = Budget::new(1 << 28);
+    let mut engine =
+        Engine::new(&test_config("routine_dependency_lifecycle"), &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_dependency_target(value integer);
+         CREATE FUNCTION routine_dependency_base(value integer) RETURNS integer
+           LANGUAGE SQL RETURN value + 1;
+         CREATE FUNCTION routine_dependency_wrapper(value integer) RETURNS integer
+           LANGUAGE SQL RETURN routine_dependency_base(value);
+         CREATE PROCEDURE routine_dependency_writer(value integer) LANGUAGE SQL
+           BEGIN ATOMIC
+             INSERT INTO routine_dependency_target
+               VALUES (routine_dependency_wrapper(value));
+           END;
+         CREATE VIEW routine_dependency_view AS
+           SELECT routine_dependency_wrapper(4) AS value;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+
+    let table_restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE routine_dependency_target RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&table_restrict).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&table_restrict)
+    );
+    let routine_restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION routine_dependency_base(integer) RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&routine_restrict).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&routine_restrict)
+    );
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION routine_dependency_base(integer) CASCADE;
+         SELECT count(*) FROM pg_proc
+          WHERE proname IN ('routine_dependency_base',
+                            'routine_dependency_wrapper',
+                            'routine_dependency_writer');",
+    );
+    assert_eq!(
+        data_rows(&cascaded),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&cascaded)
+    );
+    let dropped_view = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM routine_dependency_view",
+    );
+    assert!(
+        String::from_utf8_lossy(&dropped_view).contains("42P01"),
+        "{}",
+        String::from_utf8_lossy(&dropped_view)
+    );
+
+    let schema_created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA routine_dependency_schema;
+         CREATE FUNCTION routine_dependency_schema.source(value integer) RETURNS integer
+           LANGUAGE SQL RETURN value * 2;
+         CREATE FUNCTION public.routine_dependency_schema_user(value integer) RETURNS integer
+           LANGUAGE SQL RETURN routine_dependency_schema.source(value);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&schema_created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&schema_created)
+    );
+    let schema_restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA routine_dependency_schema RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&schema_restrict).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&schema_restrict)
+    );
+    let schema_cascade = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA routine_dependency_schema CASCADE;
+         SELECT count(*) FROM pg_proc
+          WHERE proname = 'routine_dependency_schema_user';",
+    );
+    assert_eq!(
+        data_rows(&schema_cascade),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&schema_cascade)
+    );
+}
+
+#[test]
+fn sql_standard_dml_bodies_bind_column_typed_overloads() {
+    let mut budget = Budget::new(1 << 28);
+    let mut engine =
+        Engine::new(&test_config("routine_dml_dependency_types"), &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_dml_scope(id integer PRIMARY KEY, value integer);
+         CREATE TABLE routine_dml_source(id integer, value integer);
+         CREATE FUNCTION routine_dml_pick(value integer) RETURNS integer
+           LANGUAGE SQL RETURN value + 1;
+         CREATE FUNCTION routine_dml_pick(value text) RETURNS integer
+           LANGUAGE SQL RETURN 900;
+         CREATE PROCEDURE routine_dml_upsert(input_id integer, input_value integer)
+           LANGUAGE SQL
+           BEGIN ATOMIC
+             INSERT INTO routine_dml_scope VALUES (input_id, input_value)
+               ON CONFLICT (id) DO UPDATE
+               SET value = routine_dml_pick(excluded.value);
+             UPDATE routine_dml_scope
+               SET value = routine_dml_pick(value)
+               WHERE id = input_id;
+           END;
+         CREATE PROCEDURE routine_dml_merge() LANGUAGE SQL
+           BEGIN ATOMIC
+             MERGE INTO routine_dml_scope AS target
+             USING routine_dml_source AS source
+             ON target.id = source.id
+             WHEN MATCHED THEN
+               UPDATE SET value = routine_dml_pick(source.value)
+             WHEN NOT MATCHED THEN
+               INSERT (id, value)
+               VALUES (source.id, routine_dml_pick(source.value));
+           END;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let procedure = engine
+        .storage
+        .procedure_slot_for_call_oids("routine_dml_upsert", &[23, 23], 0)
+        .unwrap();
+    let dependencies = engine.storage.routine_dependencies_for(procedure, 0);
+    let routine_dependencies = dependencies
+        .entries()
+        .iter()
+        .filter(|dependency| {
+            dependency.class == crate::storage::DependencyClass::Routine
+                && dependency.referenced_name.as_str() == "routine_dml_pick"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(routine_dependencies.len(), 1);
+    let selected = engine
+        .storage
+        .routine_for(usize::from(routine_dependencies[0].slot), 0);
+    assert_eq!(selected.arguments()[0].ctype, ColType::Int4);
+
+    let invoked = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER FUNCTION routine_dml_pick(integer) RENAME TO routine_dml_pick_integer;
+         CALL routine_dml_upsert(1, 4);
+         CALL routine_dml_upsert(1, 8);
+         INSERT INTO routine_dml_source VALUES (1, 20), (2, 30);
+         CALL routine_dml_merge();
+         SELECT value FROM routine_dml_scope ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&invoked),
+        ["21", "31"],
+        "{}",
+        String::from_utf8_lossy(&invoked)
+    );
+    let restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION routine_dml_pick_integer(integer) RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&restrict).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restrict)
+    );
+    let column_restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE routine_dml_source DROP COLUMN value RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&column_restrict).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&column_restrict)
+    );
+    let column_cascade = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE routine_dml_source DROP COLUMN value CASCADE;
+         SELECT count(*) FROM pg_proc WHERE proname = 'routine_dml_merge';",
+    );
+    assert_eq!(
+        data_rows(&column_cascade),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&column_cascade)
     );
 }
 

@@ -859,11 +859,14 @@ fn execute_row_trigger_body<'a>(
     let mut status = TriggerExecutionStatus::default();
     initialize_trigger_locals(
         context,
-        definition,
         invocation,
-        old,
-        new.as_deref(),
+        TriggerTransition {
+            definition,
+            old,
+            new: new.as_deref(),
+        },
         program.locals,
+        &[],
         &mut local_values,
     )?;
     match execute_trigger_block(
@@ -2131,8 +2134,12 @@ where
             arena,
             params,
         )?;
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
         let hooks = EvalHooks {
             subs: Some(&subqueries),
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
             ..NO_HOOKS
         };
         if let Some(cond) = oc.update_where
@@ -2476,7 +2483,11 @@ pub fn drop_table(
                         && dependency.slot as usize == index
                 };
                 let closure = stored_query_dependent_closure(storage, txn.txid, root);
-                let (dependent_views, dependent_matviews) = match closure {
+                let StoredDependencyClosure {
+                    views: dependent_views,
+                    matviews: dependent_matviews,
+                    routines: dependent_routines,
+                } = match closure {
                     Ok(closure) => closure,
                     Err(error) => return sql_fail(error),
                 };
@@ -2486,12 +2497,14 @@ pub fn drop_table(
                 };
                 let has_dependents = dependent_views.iter().any(|selected| *selected)
                     || dependent_matviews.iter().any(|selected| *selected)
+                    || dependent_routines.iter().any(|selected| *selected)
                     || policy_dependents_exist(
                         storage,
                         txn.txid,
                         policy_root,
                         &dependent_views,
                         &dependent_matviews,
+                        &dependent_routines,
                     );
                 if has_dependents && !statement.cascade {
                     if let Err(error) = report_stored_query_dependents(
@@ -2508,6 +2521,7 @@ pub fn drop_table(
                         StoredQuerySelection {
                             views: &dependent_views,
                             matviews: &dependent_matviews,
+                            routines: &dependent_routines,
                             policy_root: Some(policy_root),
                         },
                         false,
@@ -2536,6 +2550,7 @@ pub fn drop_table(
                         StoredQuerySelection {
                             views: &dependent_views,
                             matviews: &dependent_matviews,
+                            routines: &dependent_routines,
                             policy_root: Some(policy_root),
                         },
                         true,
@@ -2550,6 +2565,7 @@ pub fn drop_table(
                         policy_root,
                         &dependent_views,
                         &dependent_matviews,
+                        &dependent_routines,
                     ) {
                         return sql_fail(error);
                     }
@@ -2559,6 +2575,7 @@ pub fn drop_table(
                         txn,
                         &dependent_views,
                         &dependent_matviews,
+                        &dependent_routines,
                     ) {
                         return sql_fail(error);
                     }
@@ -4864,11 +4881,14 @@ pub fn drop_owned(
             .copied()
             .unwrap_or(false),
     };
-    let (dependent_views, dependent_matviews) =
-        match stored_query_dependent_closure(storage, txn.txid, root) {
-            Ok(selection) => selection,
-            Err(error) => return sql_fail(error),
-        };
+    let StoredDependencyClosure {
+        views: dependent_views,
+        matviews: dependent_matviews,
+        routines: dependent_routines,
+    } = match stored_query_dependent_closure(storage, txn.txid, root) {
+        Ok(selection) => selection,
+        Err(error) => return sql_fail(error),
+    };
     let has_policy_dependents =
         storage
             .policies_with_slots_visible_to(txn.txid)
@@ -4886,6 +4906,7 @@ pub fn drop_owned(
                     &routines,
                     &dependent_views,
                     &dependent_matviews,
+                    &dependent_routines,
                 )
             });
     if !cascade
@@ -4896,6 +4917,10 @@ pub fn drop_owned(
             || dependent_matviews
                 .iter()
                 .zip(matviews)
+                .any(|(dependent, owned)| *dependent && !owned)
+            || dependent_routines
+                .iter()
+                .zip(routines)
                 .any(|(dependent, owned)| *dependent && !owned)
             || has_policy_dependents)
     {
@@ -4922,6 +4947,7 @@ pub fn drop_owned(
                         &routines,
                         &dependent_views,
                         &dependent_matviews,
+                        &dependent_routines,
                     )
             };
             if selected && let Err(error) = drop_policy_slot(storage, wal, txn, slot) {
@@ -4933,9 +4959,12 @@ pub fn drop_owned(
         for slot in 0..views.len() {
             views[slot] |= dependent_views[slot];
             matviews[slot] |= dependent_matviews[slot];
+            routines[slot] |= dependent_routines[slot];
         }
     }
-    if let Err(error) = drop_selected_stored_queries(storage, wal, txn, &views, &matviews) {
+    if let Err(error) =
+        drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines)
+    {
         return sql_fail(error);
     }
 
@@ -5836,6 +5865,7 @@ fn acl_grantor(
 enum SchemaObject {
     Table(usize),
     View(usize),
+    Routine(usize),
     Matview {
         table: usize,
         catalog: usize,
@@ -5974,6 +6004,15 @@ pub fn drop_schema(
             && let Err(e) = push(SchemaObject::View(v), &mut n_objects)
         {
             return sql_fail(e);
+        }
+    }
+    for routine in 0..storage.routine_count() {
+        let definition = storage.routine_for(routine, txn.txid);
+        if definition.visible_to(txn.txid)
+            && in_listed(storage, definition.schema_for(txn.txid).as_str())
+            && let Err(error) = push(SchemaObject::Routine(routine), &mut n_objects)
+        {
+            return sql_fail(error);
         }
     }
     for sequence in 0..storage.sequence_count() {
@@ -6158,7 +6197,11 @@ pub fn drop_schema(
             let closure = stored_query_dependent_closure(storage, txn.txid, |dependency| {
                 in_listed(storage, dependency.schema.as_str())
             });
-            let (dependent_views, dependent_matviews) = match closure {
+            let StoredDependencyClosure {
+                views: dependent_views,
+                matviews: dependent_matviews,
+                routines: dependent_routines,
+            } = match closure {
                 Ok(closure) => closure,
                 Err(error) => return sql_fail(error),
             };
@@ -6203,6 +6246,20 @@ pub fn drop_schema(
                     return sql_fail(error);
                 }
             }
+            for (routine_slot, &is_dependent) in dependent_routines
+                .iter()
+                .enumerate()
+                .take(storage.routine_count())
+            {
+                let routine = storage.routine_for(routine_slot, txn.txid);
+                if is_dependent
+                    && routine.visible_to(txn.txid)
+                    && !in_listed(storage, routine.schema_for(txn.txid).as_str())
+                    && let Err(error) = push(SchemaObject::Routine(routine_slot), &mut n_objects)
+                {
+                    return sql_fail(error);
+                }
+            }
             for policy_slot in 0..storage.policy_count() {
                 let policy = storage.policy(policy_slot);
                 if !policy.visible_to(txn.txid)
@@ -6229,6 +6286,7 @@ pub fn drop_schema(
                         dependencies,
                         &dependent_views,
                         &dependent_matviews,
+                        &dependent_routines,
                     ))
                     && let Err(error) = push(
                         SchemaObject::Policy {
@@ -6249,13 +6307,16 @@ pub fn drop_schema(
         }
     }
     if !cascade && n_objects > 0 {
-        let (dependent_views, dependent_matviews) =
-            match stored_query_dependent_closure(storage, txn.txid, |dependency| {
-                in_listed(storage, dependency.schema.as_str())
-            }) {
-                Ok(closure) => closure,
-                Err(error) => return sql_fail(error),
-            };
+        let StoredDependencyClosure {
+            views: dependent_views,
+            matviews: dependent_matviews,
+            routines: dependent_routines,
+        } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
+            in_listed(storage, dependency.schema.as_str())
+        }) {
+            Ok(closure) => closure,
+            Err(error) => return sql_fail(error),
+        };
         for policy_slot in 0..storage.policy_count() {
             let policy = storage.policy(policy_slot);
             if !policy.visible_to(txn.txid)
@@ -6282,6 +6343,7 @@ pub fn drop_schema(
                     dependencies,
                     &dependent_views,
                     &dependent_matviews,
+                    &dependent_routines,
                 ))
                 && let Err(error) = push(
                     SchemaObject::Policy {
@@ -6347,6 +6409,14 @@ pub fn drop_schema(
                 (
                     schema_rank(storage, view.schema.as_str()),
                     view.created_at,
+                    0,
+                )
+            }
+            SchemaObject::Routine(routine) => {
+                let routine = storage.routine_for(*routine, txn.txid);
+                (
+                    schema_rank(storage, routine.schema_for(txn.txid).as_str()),
+                    routine.created_at,
                     0,
                 )
             }
@@ -6446,6 +6516,30 @@ pub fn drop_schema(
                 let _ = write!(out, "view ");
                 write_rel(out, &view.schema, &view.name);
             }
+            SchemaObject::Routine(slot) => {
+                let routine = storage.routine_for(*slot, txn.txid);
+                let noun = match routine.kind {
+                    crate::storage::RoutineKind::Procedure => "procedure",
+                    crate::storage::RoutineKind::Aggregate(_) => "aggregate",
+                    _ => "function",
+                };
+                let _ = write!(out, "{} ", noun);
+                write_rel(
+                    out,
+                    &routine.schema_for(txn.txid),
+                    &routine.name_for(txn.txid),
+                );
+                let _ = write!(out, "(");
+                for (index, argument) in routine.arguments().iter().enumerate() {
+                    let _ = write!(
+                        out,
+                        "{}{}",
+                        if index == 0 { "" } else { "," },
+                        argument.ctype.name()
+                    );
+                }
+                let _ = write!(out, ")");
+            }
             SchemaObject::Matview { table, .. } => {
                 let def = storage.table_def(*table, txn.txid);
                 let _ = write!(out, "materialized view ");
@@ -6499,6 +6593,9 @@ pub fn drop_schema(
             let schema = match o {
                 SchemaObject::Table(t) => storage.table_def(*t, txn.txid).schema,
                 SchemaObject::View(v) => storage.view(*v).schema,
+                SchemaObject::Routine(routine) => {
+                    storage.routine_for(*routine, txn.txid).schema_for(txn.txid)
+                }
                 SchemaObject::Matview { table, .. } => storage.table_def(*table, txn.txid).schema,
                 SchemaObject::Sequence(sequence) => {
                     storage.sequence_for(*sequence, txn.txid).schema
@@ -6653,6 +6750,18 @@ pub fn drop_schema(
                 .count()
         })
         .sum::<usize>();
+    let routine_trigger_undo = storage
+        .triggers_with_slots_visible_to(txn.txid)
+        .filter(|(_, trigger)| {
+            objects[..n_objects].iter().flatten().any(|object| {
+                matches!(
+                    object,
+                    SchemaObject::Routine(routine)
+                        if *routine == usize::from(trigger.function)
+                )
+            })
+        })
+        .count();
     let undo_needed = n_objects
         + objects[..n_objects]
             .iter()
@@ -6660,6 +6769,7 @@ pub fn drop_schema(
             .filter(|object| matches!(object, SchemaObject::Matview { .. }))
             .count()
         + owned_sequence_undo
+        + routine_trigger_undo
         + n_slots;
     if txn.ddl().len() + undo_needed > super::txn::MAX_TXN_DDL {
         return sql_fail(sql_err!(
@@ -6733,6 +6843,27 @@ pub fn drop_schema(
                     && let Err(e) = txn.record_ddl(super::txn::DdlUndo::ViewDropped(slot as u32))
                 {
                     return sql_fail(e);
+                }
+            }
+            SchemaObject::Routine(routine) => {
+                let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
+                let Some(selected) = routines.get_mut(*routine) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "DROP SCHEMA routine dependency plan exceeds {} slots",
+                        routines.len()
+                    ));
+                };
+                *selected = true;
+                if let Err(error) = drop_selected_stored_queries(
+                    storage,
+                    wal,
+                    txn,
+                    &[false; MAX_DEPENDENT_STORED_QUERIES],
+                    &[false; MAX_DEPENDENT_STORED_QUERIES],
+                    &routines,
+                ) {
+                    return sql_fail(error);
                 }
             }
             SchemaObject::Matview { table, catalog } => {
@@ -8497,6 +8628,16 @@ enum TriggerReturn {
     New,
     Old,
     Null,
+    Void,
+}
+
+/// The PL/pgSQL execution boundary determines which runtime-only names and
+/// return forms can enter the parsed program.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlpgsqlProgramKind {
+    Trigger,
+    Procedure,
+    Anonymous,
 }
 
 #[derive(Clone, Copy)]
@@ -8524,6 +8665,7 @@ struct TriggerLocalDecl<'a> {
 /// this value explicitly, including nested trigger SQL snapshots.
 #[derive(Clone, Copy)]
 struct TriggerInvocation<'a> {
+    program_kind: PlpgsqlProgramKind,
     name: &'a str,
     routine_schema: &'a str,
     routine_name: &'a str,
@@ -8635,6 +8777,7 @@ impl<'a> TriggerInvocation<'a> {
             _ => unreachable!("trigger event was validated at the parser boundary"),
         };
         Ok(Self {
+            program_kind: PlpgsqlProgramKind::Trigger,
             name: arena
                 .alloc_str(trigger.name.as_str())
                 .map_err(|_| super::query::arena_full_pub())?,
@@ -8676,18 +8819,71 @@ impl<'a> TriggerInvocation<'a> {
         })
     }
 
+    fn anonymous() -> Self {
+        Self {
+            program_kind: PlpgsqlProgramKind::Anonymous,
+            name: "",
+            routine_schema: "",
+            routine_name: "inline_code_block",
+            table_schema: "",
+            table_name: "",
+            relid: 0,
+            routine_oid: 0,
+            nargs: 0,
+            when: "",
+            level: "",
+            operation: "",
+            argv: Datum::Null,
+            exception: None,
+        }
+    }
+
+    fn procedure(routine: &crate::storage::RoutineDef, arena: &'a Arena) -> Result<Self, SqlError> {
+        Ok(Self {
+            program_kind: PlpgsqlProgramKind::Procedure,
+            name: "",
+            routine_schema: arena
+                .alloc_str(routine.schema.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            routine_name: arena
+                .alloc_str(routine.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            table_schema: "",
+            table_name: "",
+            relid: 0,
+            routine_oid: crate::storage::routine_oid(routine),
+            nargs: 0,
+            when: "",
+            level: "",
+            operation: "",
+            argv: Datum::Null,
+            exception: None,
+        })
+    }
+
     fn with_exception(mut self, exception: TriggerExceptionDiagnostic<'a>) -> Self {
         self.exception = Some(exception);
         self
     }
 
     fn context(self) -> StackStr<192> {
-        stack_format!(
-            192,
-            "PL/pgSQL function {}.{}()",
-            self.routine_schema,
-            self.routine_name
-        )
+        match self.program_kind {
+            PlpgsqlProgramKind::Trigger => stack_format!(
+                192,
+                "PL/pgSQL function {}.{}()",
+                self.routine_schema,
+                self.routine_name
+            ),
+            PlpgsqlProgramKind::Procedure => stack_format!(
+                192,
+                "PL/pgSQL procedure {}.{}()",
+                self.routine_schema,
+                self.routine_name
+            ),
+            PlpgsqlProgramKind::Anonymous => {
+                stack_format!(192, "PL/pgSQL function inline_code_block")
+            }
+        }
     }
 
     fn value(self, field: TriggerContextField) -> Datum<'a> {
@@ -8835,6 +9031,8 @@ pub enum InsertSource<'a> {
 
 #[derive(Clone, Copy)]
 enum TriggerStatement<'a> {
+    Null,
+    TransactionControl,
     Assign(TriggerAssignment<'a>),
     LocalAssign(TriggerLocalAssignment<'a>),
     SelectInto(TriggerSelectInto<'a>),
@@ -9399,7 +9597,7 @@ where
 fn unsupported_trigger_body() -> SqlError {
     sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,
-        "trigger function body is not supported"
+        "PL/pgSQL body is not supported"
     )
 }
 
@@ -9673,6 +9871,7 @@ fn trigger_top_level_keyword(text: &str, keyword: &str) -> Option<usize> {
 fn parse_trigger_local<'a>(
     statement: &'a str,
     arena: &'a Arena,
+    program_kind: PlpgsqlProgramKind,
 ) -> Result<TriggerLocalDecl<'a>, SqlError> {
     let initial = trigger_top_level_keyword(statement, ":=")
         .map(|offset| (offset, 2))
@@ -9694,7 +9893,8 @@ fn parse_trigger_local<'a>(
         return Err(unsupported_trigger_body());
     };
     let name = SqlName::parse(declaration[..split].trim())?;
-    if TriggerContextField::parse(name.as_str()).is_some()
+    if (program_kind == PlpgsqlProgramKind::Trigger
+        && TriggerContextField::parse(name.as_str()).is_some())
         || TriggerExceptionVariable::parse(name.as_str()).is_some()
     {
         return Err(sql_err!(
@@ -10277,19 +10477,22 @@ fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml
     }
 }
 
-fn parse_trigger_return(statement: &str) -> Result<Option<TriggerReturn>, SqlError> {
+fn parse_trigger_return(
+    statement: &str,
+    program_kind: PlpgsqlProgramKind,
+) -> Result<Option<TriggerReturn>, SqlError> {
     let Some(value) = strip_trigger_keyword(statement, "return") else {
         return Ok(None);
     };
     let value = value.trim();
-    let result = if value.eq_ignore_ascii_case("new") {
-        TriggerReturn::New
-    } else if value.eq_ignore_ascii_case("old") {
-        TriggerReturn::Old
-    } else if value.eq_ignore_ascii_case("null") {
-        TriggerReturn::Null
-    } else {
-        return Err(unsupported_trigger_body());
+    let result = match program_kind {
+        PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("new") => TriggerReturn::New,
+        PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("old") => TriggerReturn::Old,
+        PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("null") => TriggerReturn::Null,
+        PlpgsqlProgramKind::Procedure | PlpgsqlProgramKind::Anonymous if value.is_empty() => {
+            TriggerReturn::Void
+        }
+        _ => return Err(unsupported_trigger_body()),
     };
     Ok(Some(result))
 }
@@ -10673,8 +10876,15 @@ fn parse_trigger_statement<'a>(
     arena: &'a Arena,
     loop_labels: &[Option<SqlName>],
     handler_active: bool,
+    program_kind: PlpgsqlProgramKind,
 ) -> Result<TriggerStatement<'a>, SqlError> {
-    if let Some(result) = parse_trigger_return(segment)? {
+    if segment.eq_ignore_ascii_case("null") {
+        return Ok(TriggerStatement::Null);
+    }
+    if segment.eq_ignore_ascii_case("commit") || segment.eq_ignore_ascii_case("rollback") {
+        return Ok(TriggerStatement::TransactionControl);
+    }
+    if let Some(result) = parse_trigger_return(segment, program_kind)? {
         return Ok(TriggerStatement::Return(result));
     }
     if let Some(diagnostics) = parse_trigger_get_diagnostics(segment, arena)? {
@@ -10737,6 +10947,7 @@ fn parse_trigger_block<'a>(
     loop_labels: &mut [Option<SqlName>; MAX_COLUMNS],
     loop_depth: usize,
     handler_active: bool,
+    program_kind: PlpgsqlProgramKind,
 ) -> Result<(TriggerBlock<'a>, TriggerBlockEnd<'a>), SqlError> {
     let mut statements = [None; MAX_COLUMNS];
     let mut statement_count = 0;
@@ -10892,6 +11103,7 @@ fn parse_trigger_block<'a>(
                     loop_labels,
                     loop_depth,
                     handler_active,
+                    program_kind,
                 )?;
                 branches[branch_count] = Some(TriggerBranch { condition, block });
                 branch_count += 1;
@@ -10907,6 +11119,7 @@ fn parse_trigger_block<'a>(
                             loop_labels,
                             loop_depth,
                             handler_active,
+                            program_kind,
                         )?;
                         if !matches!(ending, TriggerBlockEnd::EndIf) {
                             return Err(unsupported_trigger_body());
@@ -10958,6 +11171,7 @@ fn parse_trigger_block<'a>(
                     loop_labels,
                     loop_depth,
                     handler_active,
+                    program_kind,
                 )?;
                 if branch_count == branches.len() {
                     return Err(unsupported_trigger_body());
@@ -10976,6 +11190,7 @@ fn parse_trigger_block<'a>(
                             loop_labels,
                             loop_depth,
                             handler_active,
+                            program_kind,
                         )?;
                         if !matches!(ending, TriggerBlockEnd::EndCase) {
                             return Err(unsupported_trigger_body());
@@ -11007,8 +11222,15 @@ fn parse_trigger_block<'a>(
                 }
             }
         } else if strip_trigger_keyword(segment, "begin").is_some() {
-            let (protected, ending) =
-                parse_trigger_block(segments, at, arena, loop_labels, loop_depth, handler_active)?;
+            let (protected, ending) = parse_trigger_block(
+                segments,
+                at,
+                arena,
+                loop_labels,
+                loop_depth,
+                handler_active,
+                program_kind,
+            )?;
             if matches!(ending, TriggerBlockEnd::Exception) {
                 let mut handlers = [None; MAX_COLUMNS];
                 let mut handler_count = 0;
@@ -11023,8 +11245,15 @@ fn parse_trigger_block<'a>(
                 };
                 *at += 1;
                 loop {
-                    let (block, ending) =
-                        parse_trigger_block(segments, at, arena, loop_labels, loop_depth, true)?;
+                    let (block, ending) = parse_trigger_block(
+                        segments,
+                        at,
+                        arena,
+                        loop_labels,
+                        loop_depth,
+                        true,
+                        program_kind,
+                    )?;
                     if handler_count == handlers.len() {
                         return Err(unsupported_trigger_body());
                     }
@@ -11073,6 +11302,7 @@ fn parse_trigger_block<'a>(
                 loop_labels,
                 loop_depth + 1,
                 handler_active,
+                program_kind,
             )?;
             loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
@@ -11092,6 +11322,7 @@ fn parse_trigger_block<'a>(
                 loop_labels,
                 loop_depth + 1,
                 handler_active,
+                program_kind,
             )?;
             loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
@@ -11111,6 +11342,7 @@ fn parse_trigger_block<'a>(
                 loop_labels,
                 loop_depth + 1,
                 handler_active,
+                program_kind,
             )?;
             loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
@@ -11126,6 +11358,7 @@ fn parse_trigger_block<'a>(
                 loop_labels,
                 loop_depth + 1,
                 handler_active,
+                program_kind,
             )?;
             loop_labels[loop_depth] = None;
             if !matches!(ending, TriggerBlockEnd::EndLoop) {
@@ -11133,7 +11366,13 @@ fn parse_trigger_block<'a>(
             }
             TriggerStatement::Loop(block)
         } else {
-            parse_trigger_statement(segment, arena, &loop_labels[..loop_depth], handler_active)?
+            parse_trigger_statement(
+                segment,
+                arena,
+                &loop_labels[..loop_depth],
+                handler_active,
+                program_kind,
+            )?
         };
         saw_return = matches!(statement, TriggerStatement::Return(_));
         statements[statement_count] = Some(statement);
@@ -11142,9 +11381,10 @@ fn parse_trigger_block<'a>(
     Err(unsupported_trigger_body())
 }
 
-fn parse_trigger_program<'a>(
+fn parse_plpgsql_program<'a>(
     body: &'a str,
     arena: &'a Arena,
+    program_kind: PlpgsqlProgramKind,
 ) -> Result<TriggerProgram<'a>, SqlError> {
     let body = body.trim().strip_suffix(';').unwrap_or(body.trim()).trim();
     let (locals, body) = if let Some(declarations) = strip_trigger_keyword(body, "declare") {
@@ -11156,7 +11396,7 @@ fn parse_trigger_program<'a>(
         let mut locals = [None; MAX_COLUMNS];
         let mut local_count = 0usize;
         for declaration in segments[..count].iter().filter_map(|segment| *segment) {
-            let local = parse_trigger_local(declaration, arena)?;
+            let local = parse_trigger_local(declaration, arena, program_kind)?;
             if locals[..local_count]
                 .iter()
                 .flatten()
@@ -11204,6 +11444,7 @@ fn parse_trigger_program<'a>(
         &mut loop_labels,
         0,
         false,
+        program_kind,
     )?;
     if !matches!(ending, TriggerBlockEnd::End) || at != count {
         return Err(unsupported_trigger_body());
@@ -11212,10 +11453,260 @@ fn parse_trigger_program<'a>(
         .statements
         .iter()
         .any(|statement| matches!(statement, TriggerStatement::Return(_)));
-    if !has_return {
+    if program_kind == PlpgsqlProgramKind::Trigger && !has_return {
         return Err(unsupported_trigger_body());
     }
     Ok(TriggerProgram { locals, body })
+}
+
+fn parse_trigger_program<'a>(
+    body: &'a str,
+    arena: &'a Arena,
+) -> Result<TriggerProgram<'a>, SqlError> {
+    parse_plpgsql_program(body, arena, PlpgsqlProgramKind::Trigger)
+}
+
+fn validate_plpgsql_procedure_namespace(
+    program: &TriggerProgram<'_>,
+    parameters: &[RoutineParameterDef],
+) -> Result<(), SqlError> {
+    for parameter in parameters {
+        let name = parameter.name.as_str();
+        if name.is_empty() {
+            continue;
+        }
+        if TriggerExceptionVariable::parse(name).is_some() {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "procedure parameter \"{}\" conflicts with a PL/pgSQL diagnostic variable",
+                name
+            ));
+        }
+        if program
+            .locals
+            .iter()
+            .any(|local| local.name == parameter.name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "duplicate declaration of PL/pgSQL variable \"{}\"",
+                name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Executes an anonymous PL/pgSQL block through the same bounded typed
+/// interpreter as stored PL/pgSQL. The anonymous invocation has no trigger
+/// transition state, so `TG_*`, `OLD`, `NEW`, and trigger return values never
+/// become representable in its expression scope.
+pub(crate) fn execute_anonymous_plpgsql<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    source: &'a str,
+    arena: &'a Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder<'_>,
+) -> Result<(), SqlError> {
+    let program = parse_plpgsql_program(source, arena, PlpgsqlProgramKind::Anonymous)?;
+    let definition = TableDef::empty();
+    let invocation = TriggerInvocation::anonymous();
+    let mut context = TriggerExecContext {
+        storage,
+        txn,
+        arena,
+        params: crate::sql::eval::NO_PARAMS,
+        seq_session,
+        responder,
+        scratch,
+    };
+    let mut local_values = [Datum::Null; MAX_COLUMNS];
+    let mut status = TriggerExecutionStatus::default();
+    initialize_trigger_locals(
+        &context,
+        invocation,
+        TriggerTransition {
+            definition: &definition,
+            old: None,
+            new: None,
+        },
+        program.locals,
+        &[],
+        &mut local_values,
+    )?;
+    let mut no_new = None;
+    match execute_trigger_block(
+        &mut context,
+        &definition,
+        invocation,
+        None,
+        &mut no_new,
+        false,
+        None,
+        program.locals,
+        &mut local_values,
+        program.body,
+        &mut status,
+        None,
+    )? {
+        None | Some(TriggerFlow::Return(TriggerReturn::Void)) => Ok(()),
+        Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
+            Err(unsupported_trigger_body())
+        }
+    }
+}
+
+/// Executes a stored PL/pgSQL procedure with one typed namespace for formal
+/// parameters and declarations. Named OUT and INOUT values cross back through
+/// the same declared types after the block completes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored procedure execution owns its complete typed call context"
+)]
+pub(crate) fn execute_plpgsql_procedure<'a>(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    routine: &crate::storage::RoutineDef,
+    inputs: &'a [Datum<'a>],
+    arena: &'a Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder<'_>,
+    outputs: &mut [Datum<'a>; crate::storage::MAX_ROUTINE_ARGUMENTS],
+) -> Result<usize, SqlError> {
+    let source = arena
+        .alloc_str(routine.body.as_str())
+        .map_err(|_| super::query::arena_full_pub())?;
+    let program = parse_plpgsql_program(source, arena, PlpgsqlProgramKind::Procedure)?;
+    let mut declarations = [None; MAX_COLUMNS];
+    let mut seeded = [Datum::Null; MAX_COLUMNS];
+    let mut declaration_count = 0usize;
+    let mut input_index = 0usize;
+    for parameter in routine.parameters() {
+        let input = if parameter.mode.is_input() {
+            let value = inputs[input_index];
+            input_index += 1;
+            Some(value)
+        } else {
+            None
+        };
+        if parameter.name.as_str().is_empty() {
+            continue;
+        }
+        if declaration_count == declarations.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL procedure has too many variables"
+            ));
+        }
+        if TriggerExceptionVariable::parse(parameter.name.as_str()).is_some()
+            || declarations[..declaration_count]
+                .iter()
+                .flatten()
+                .any(|prior: &TriggerLocalDecl<'_>| prior.name == parameter.name)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "procedure parameter \"{}\" conflicts with a PL/pgSQL variable",
+                parameter.name.as_str()
+            ));
+        }
+        declarations[declaration_count] = Some(TriggerLocalDecl {
+            name: parameter.name,
+            ctype: parameter.ctype,
+            type_mod: -1,
+            initial: None,
+        });
+        seeded[declaration_count] = input.unwrap_or(Datum::Null);
+        declaration_count += 1;
+    }
+    let seeded_count = declaration_count;
+    for local in program.locals {
+        if declaration_count == declarations.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL procedure has too many variables"
+            ));
+        }
+        if declarations[..declaration_count]
+            .iter()
+            .flatten()
+            .any(|prior| prior.name == local.name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "duplicate declaration of PL/pgSQL variable \"{}\"",
+                local.name.as_str()
+            ));
+        }
+        declarations[declaration_count] = Some(*local);
+        declaration_count += 1;
+    }
+    let locals = arena
+        .alloc_slice_with(declaration_count, |index| {
+            declarations[index].expect("procedure local initialized")
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let definition = TableDef::empty();
+    let invocation = TriggerInvocation::procedure(routine, arena)?;
+    let mut context = TriggerExecContext {
+        storage,
+        txn,
+        arena,
+        params: inputs,
+        seq_session,
+        responder,
+        scratch,
+    };
+    let mut local_values = [Datum::Null; MAX_COLUMNS];
+    let mut status = TriggerExecutionStatus::default();
+    initialize_trigger_locals(
+        &context,
+        invocation,
+        TriggerTransition {
+            definition: &definition,
+            old: None,
+            new: None,
+        },
+        locals,
+        &seeded[..seeded_count],
+        &mut local_values,
+    )?;
+    let mut no_new = None;
+    match execute_trigger_block(
+        &mut context,
+        &definition,
+        invocation,
+        None,
+        &mut no_new,
+        false,
+        None,
+        locals,
+        &mut local_values,
+        program.body,
+        &mut status,
+        None,
+    )? {
+        None | Some(TriggerFlow::Return(TriggerReturn::Void)) => {}
+        Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
+            return Err(unsupported_trigger_body());
+        }
+    }
+    let mut output_count = 0usize;
+    for parameter in routine.parameters() {
+        if !parameter.mode.is_output() {
+            continue;
+        }
+        outputs[output_count] = locals
+            .iter()
+            .position(|local| local.name == parameter.name)
+            .filter(|_| !parameter.name.as_str().is_empty())
+            .map_or(Datum::Null, |index| local_values[index]);
+        output_count += 1;
+    }
+    Ok(output_count)
 }
 
 #[cfg(test)]
@@ -11396,7 +11887,8 @@ where
         {
             return self.transition.lookup(qualifier, name);
         }
-        if qualifier.is_none()
+        if self.invocation.program_kind == PlpgsqlProgramKind::Trigger
+            && qualifier.is_none()
             && let Some(field) = TriggerContextField::parse(name)
         {
             return Ok(self.invocation.value(field));
@@ -11443,7 +11935,8 @@ where
         {
             return self.transition.col_type(qualifier, name);
         }
-        if qualifier.is_none()
+        if self.invocation.program_kind == PlpgsqlProgramKind::Trigger
+            && qualifier.is_none()
             && let Some(field) = TriggerContextField::parse(name)
         {
             return Some(field.ctype());
@@ -11482,7 +11975,9 @@ where
         }
         if qualifier.is_none() {
             let local_type = self.local_index(name).map(|index| self.locals[index].ctype);
-            let runtime_type = TriggerContextField::parse(name)
+            let runtime_type = (self.invocation.program_kind == PlpgsqlProgramKind::Trigger)
+                .then(|| TriggerContextField::parse(name))
+                .flatten()
                 .map(TriggerContextField::ctype)
                 .or_else(|| TriggerStatusVariable::parse(name).map(|_| ColType::Bool))
                 .or_else(|| {
@@ -11538,7 +12033,8 @@ where
         }
         if qualifier.is_none()
             && (self.local_index(name).is_some()
-                || TriggerContextField::parse(name).is_some()
+                || (self.invocation.program_kind == PlpgsqlProgramKind::Trigger
+                    && TriggerContextField::parse(name).is_some())
                 || TriggerStatusVariable::parse(name).is_some())
             || (TriggerExceptionVariable::parse(name).is_some()
                 && self.invocation.exception.is_some())
@@ -11550,13 +12046,18 @@ where
     }
 }
 
+struct TriggerQueryExecution<'params, 'session, 'result> {
+    params: &'params [Datum<'result>],
+    seq_session: &'session crate::sql::guc::SeqSession,
+}
+
 fn materialize_trigger_insert_source<'result, 'query>(
     storage: &'query Storage,
     select: &'query Select<'query>,
     query_arena: &'query Arena,
     result_arena: &'result Arena,
     txid: u32,
-    seq_session: &crate::sql::guc::SeqSession,
+    execution: TriggerQueryExecution<'_, '_, 'result>,
     scope: &TriggerLocalScope<'_, 'result>,
 ) -> Result<&'result [&'result [u8]], SqlError>
 where
@@ -11564,13 +12065,13 @@ where
 {
     let mut count = 0usize;
     {
-        let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txid);
+        let dry = crate::sql::sequence::SeqEval::dry(storage, execution.seq_session, txid);
         super::query::select_into_rows_recycling(
             storage,
             txid,
             select,
             query_arena,
-            crate::sql::eval::NO_PARAMS,
+            execution.params,
             Some(scope),
             Some(&dry),
             &mut |_| {
@@ -11585,13 +12086,13 @@ where
         .map_err(|_| super::query::arena_full_pub())?;
     let mut at = 0usize;
     {
-        let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+        let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
         super::query::select_into_rows(
             storage,
             txid,
             select,
             query_arena,
-            crate::sql::eval::NO_PARAMS,
+            execution.params,
             Some(scope),
             Some(&live),
             &mut |values| {
@@ -11667,7 +12168,9 @@ where
         if let Some(index) = self.local_index(name) {
             return Ok(self.values[index]);
         }
-        if let Some(field) = TriggerContextField::parse(name) {
+        if self.invocation.program_kind == PlpgsqlProgramKind::Trigger
+            && let Some(field) = TriggerContextField::parse(name)
+        {
             return Ok(self.invocation.value(field));
         }
         if let Some(variable) = TriggerExceptionVariable::parse(name)
@@ -11690,7 +12193,12 @@ where
             return self
                 .local_index(name)
                 .map(|index| self.locals[index].ctype)
-                .or_else(|| TriggerContextField::parse(name).map(TriggerContextField::ctype))
+                .or_else(|| {
+                    (self.invocation.program_kind == PlpgsqlProgramKind::Trigger)
+                        .then(|| TriggerContextField::parse(name))
+                        .flatten()
+                        .map(TriggerContextField::ctype)
+                })
                 .or_else(|| {
                     (TriggerExceptionVariable::parse(name).is_some()
                         && self.invocation.exception.is_some())
@@ -11708,7 +12216,12 @@ where
             let ctype = self
                 .local_index(name)
                 .map(|index| self.locals[index].ctype)
-                .or_else(|| TriggerContextField::parse(name).map(TriggerContextField::ctype))
+                .or_else(|| {
+                    (self.invocation.program_kind == PlpgsqlProgramKind::Trigger)
+                        .then(|| TriggerContextField::parse(name))
+                        .flatten()
+                        .map(TriggerContextField::ctype)
+                })
                 .or_else(|| {
                     (TriggerExceptionVariable::parse(name).is_some()
                         && self.invocation.exception.is_some())
@@ -11793,6 +12306,7 @@ struct TriggerExecContext<'s, 'a, 'b> {
     storage: &'s mut Storage,
     txn: &'s mut TxnState,
     arena: &'a Arena,
+    params: &'a [Datum<'a>],
     seq_session: &'s crate::sql::guc::SeqSession,
     responder: &'s mut Responder<'b>,
     // The caller owns this startup-sized workspace for the duration of the
@@ -11817,13 +12331,7 @@ fn eval_trigger_expression<'a>(
         sequences: Some(&sequence),
         ..NO_HOOKS
     };
-    eval_full(
-        expression,
-        context.arena,
-        crate::sql::eval::NO_PARAMS,
-        row,
-        &hooks,
-    )
+    eval_full(expression, context.arena, context.params, row, &hooks)
 }
 
 fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>, index: usize) {
@@ -11872,22 +12380,25 @@ fn trigger_exception_matches(condition: TriggerExceptionCondition, error: &SqlEr
 
 fn initialize_trigger_locals<'a>(
     context: &TriggerExecContext<'_, 'a, '_>,
-    definition: &TableDef,
     invocation: TriggerInvocation<'a>,
-    old: Option<&[Datum<'a>]>,
-    new: Option<&[Datum<'a>]>,
+    transition: TriggerTransition<'_, '_, 'a>,
     locals: &[TriggerLocalDecl<'a>],
+    seeded: &[Datum<'a>],
     values: &mut [Datum<'a>; MAX_COLUMNS],
 ) -> Result<(), SqlError> {
     for (index, local) in locals.iter().enumerate() {
+        if let Some(value) = seeded.get(index).copied() {
+            values[index] = apply_typmod(
+                cast_to(value, local.ctype, context.arena)?,
+                local.ctype,
+                local.type_mod,
+                context.arena,
+            )?;
+            continue;
+        }
         values[index] = Datum::Null;
         let Some(initial) = local.initial else {
             continue;
-        };
-        let transition = TriggerTransition {
-            definition,
-            old,
-            new,
         };
         let scope = TriggerLocalScope {
             locals: &locals[..=index],
@@ -12071,7 +12582,7 @@ fn materialize_trigger_for_query<'result, 'query>(
     query_arena: &'query Arena,
     result_arena: &'result Arena,
     txid: u32,
-    seq_session: &crate::sql::guc::SeqSession,
+    execution: TriggerQueryExecution<'_, '_, 'result>,
     scope: &TriggerLocalScope<'_, 'result>,
 ) -> Result<&'result [Datum<'result>], SqlError>
 where
@@ -12079,13 +12590,13 @@ where
 {
     let mut count = 0usize;
     {
-        let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txid);
+        let dry = crate::sql::sequence::SeqEval::dry(storage, execution.seq_session, txid);
         super::query::select_into_rows_recycling(
             storage,
             txid,
             query,
             query_arena,
-            crate::sql::eval::NO_PARAMS,
+            execution.params,
             Some(scope),
             Some(&dry),
             &mut |values| {
@@ -12105,13 +12616,13 @@ where
         .map_err(|_| super::query::arena_full_pub())?;
     let mut at = 0usize;
     {
-        let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+        let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
         super::query::select_into_rows(
             storage,
             txid,
             query,
             query_arena,
-            crate::sql::eval::NO_PARAMS,
+            execution.params,
             Some(scope),
             Some(&live),
             &mut |values| {
@@ -12136,7 +12647,7 @@ fn materialize_trigger_for_record_query<'result, 'query>(
     query_arena: &'query Arena,
     result_arena: &'result Arena,
     txid: u32,
-    seq_session: &crate::sql::guc::SeqSession,
+    execution: TriggerQueryExecution<'_, '_, 'result>,
     scope: &TriggerLocalScope<'_, 'result>,
 ) -> Result<&'result [Datum<'result>], SqlError>
 where
@@ -12145,13 +12656,13 @@ where
     let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
     let width = super::query::describe_select(query, storage, txid, query_arena, &mut columns)?;
     let mut count = 0usize;
-    let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txid);
+    let dry = crate::sql::sequence::SeqEval::dry(storage, execution.seq_session, txid);
     super::query::select_into_rows_recycling(
         storage,
         txid,
         query,
         query_arena,
-        crate::sql::eval::NO_PARAMS,
+        execution.params,
         Some(scope),
         Some(&dry),
         &mut |values| {
@@ -12168,14 +12679,14 @@ where
     let rows = result_arena
         .alloc_slice_with(count, |_| Datum::Null)
         .map_err(|_| super::query::arena_full_pub())?;
-    let live = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+    let live = crate::sql::sequence::SeqEval::new(storage, execution.seq_session, txid);
     let mut at = 0usize;
     super::query::select_into_rows(
         storage,
         txid,
         query,
         query_arena,
-        crate::sql::eval::NO_PARAMS,
+        execution.params,
         Some(scope),
         Some(&live),
         &mut |values| {
@@ -12224,6 +12735,20 @@ fn execute_trigger_block<'a>(
 ) -> Result<Option<TriggerFlow>, SqlError> {
     for statement in block.statements {
         match *statement {
+            TriggerStatement::Null => {}
+            TriggerStatement::TransactionControl => {
+                return Err(if context.txn.is_explicit() {
+                    sql_err!(
+                        sqlstate::INVALID_TRANSACTION_TERMINATION,
+                        "invalid transaction termination"
+                    )
+                } else {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "PL/pgSQL transaction control is not supported"
+                    )
+                });
+            }
             TriggerStatement::Return(result) => return Ok(Some(TriggerFlow::Return(result))),
             TriggerStatement::Assign(assignment) => {
                 if !before || new.is_none() {
@@ -12379,7 +12904,7 @@ fn execute_trigger_block<'a>(
                     context.txn.txid,
                     query,
                     context.arena,
-                    crate::sql::eval::NO_PARAMS,
+                    context.params,
                     Some(&scope),
                     Some(&sequence),
                     &mut |values| {
@@ -12463,7 +12988,7 @@ fn execute_trigger_block<'a>(
                     context.txn.txid,
                     query,
                     context.arena,
-                    crate::sql::eval::NO_PARAMS,
+                    context.params,
                     Some(&scope),
                     Some(&sequence),
                     &mut |_| {
@@ -12782,7 +13307,10 @@ fn execute_trigger_block<'a>(
                             context.arena,
                             context.arena,
                             context.txn.txid,
-                            context.seq_session,
+                            TriggerQueryExecution {
+                                params: context.params,
+                                seq_session: context.seq_session,
+                            },
                             &scope,
                         )?)
                     }
@@ -12810,7 +13338,7 @@ fn execute_trigger_block<'a>(
                         scratch,
                         &statement,
                         context.arena,
-                        crate::sql::eval::NO_PARAMS,
+                        context.params,
                         context.seq_session,
                         responder,
                         None,
@@ -12856,7 +13384,7 @@ fn execute_trigger_block<'a>(
                                 context.storage,
                                 context.txn.txid,
                                 context.arena,
-                                crate::sql::eval::NO_PARAMS,
+                                context.params,
                                 relations,
                             )?
                         else {
@@ -12897,7 +13425,7 @@ fn execute_trigger_block<'a>(
                         scratch,
                         &statement,
                         context.arena,
-                        crate::sql::eval::NO_PARAMS,
+                        context.params,
                         context.seq_session,
                         responder,
                         None,
@@ -12948,7 +13476,7 @@ fn execute_trigger_block<'a>(
                                 context.storage,
                                 context.txn.txid,
                                 context.arena,
-                                crate::sql::eval::NO_PARAMS,
+                                context.params,
                                 relations,
                             )?
                         else {
@@ -12989,7 +13517,7 @@ fn execute_trigger_block<'a>(
                         scratch,
                         &statement,
                         context.arena,
-                        crate::sql::eval::NO_PARAMS,
+                        context.params,
                         context.seq_session,
                         responder,
                         None,
@@ -13031,6 +13559,9 @@ fn execute_trigger_block<'a>(
                         step,
                         reverse,
                     } => {
+                        // A numeric FOR target is an implicit loop-local that
+                        // shadows an existing declaration of the same name.
+                        let prior_target = local_values[target];
                         status.set_found(false);
                         let mut iterated = false;
                         let transition = TriggerTransition {
@@ -13070,14 +13601,17 @@ fn execute_trigger_block<'a>(
                             value <= upper
                         } {
                             iterated = true;
-                            assign_trigger_local(
+                            if let Err(error) = assign_trigger_local(
                                 locals,
                                 local_values,
                                 program.target,
                                 Datum::Int8(value),
                                 context.arena,
-                            )?;
-                            match execute_trigger_block(
+                            ) {
+                                local_values[target] = prior_target;
+                                return Err(error);
+                            }
+                            let flow = match execute_trigger_block(
                                 context,
                                 definition,
                                 invocation,
@@ -13090,16 +13624,25 @@ fn execute_trigger_block<'a>(
                                 program.block,
                                 status,
                                 exception,
-                            )? {
+                            ) {
+                                Ok(flow) => flow,
+                                Err(error) => {
+                                    local_values[target] = prior_target;
+                                    return Err(error);
+                                }
+                            };
+                            match flow {
                                 Some(TriggerFlow::Return(result)) => {
                                     return Ok(Some(TriggerFlow::Return(result)));
                                 }
                                 Some(TriggerFlow::Exit(0)) => break,
                                 Some(TriggerFlow::Continue(0)) | None => {}
                                 Some(TriggerFlow::Exit(unwind)) => {
+                                    local_values[target] = prior_target;
                                     return Ok(Some(TriggerFlow::Exit(unwind - 1)));
                                 }
                                 Some(TriggerFlow::Continue(unwind)) => {
+                                    local_values[target] = prior_target;
                                     return Ok(Some(TriggerFlow::Continue(unwind - 1)));
                                 }
                             }
@@ -13112,6 +13655,7 @@ fn execute_trigger_block<'a>(
                             };
                             value = next;
                         }
+                        local_values[target] = prior_target;
                         status.set_found(iterated);
                     }
                     TriggerForSource::Query(query) => {
@@ -13147,7 +13691,10 @@ fn execute_trigger_block<'a>(
                                     context.arena,
                                     context.arena,
                                     context.txn.txid,
-                                    context.seq_session,
+                                    TriggerQueryExecution {
+                                        params: context.params,
+                                        seq_session: context.seq_session,
+                                    },
                                     &scope,
                                 )?
                             } else {
@@ -13157,7 +13704,10 @@ fn execute_trigger_block<'a>(
                                     context.arena,
                                     context.arena,
                                     context.txn.txid,
-                                    context.seq_session,
+                                    TriggerQueryExecution {
+                                        params: context.params,
+                                        seq_session: context.seq_session,
+                                    },
                                     &scope,
                                 )?
                             }
@@ -13707,6 +14257,7 @@ fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
                     storage: &mut *context.storage,
                     txn: &mut *context.txn,
                     arena: context.arena,
+                    params: context.params,
                     seq_session: context.seq_session,
                     responder: &mut *context.responder,
                     scratch: context.scratch,
@@ -13787,6 +14338,7 @@ fn execute_deferred_trigger_event<'a>(
         storage,
         txn,
         arena,
+        params: crate::sql::eval::NO_PARAMS,
         seq_session,
         responder,
         scratch,
@@ -14016,6 +14568,7 @@ fn fire_partition_row_triggers<'a>(
                     storage,
                     txn,
                     arena,
+                    params: crate::sql::eval::NO_PARAMS,
                     seq_session,
                     responder,
                     scratch,
@@ -14283,11 +14836,14 @@ fn fire_statement_triggers_with_rows<'a>(
         let mut status = TriggerExecutionStatus::default();
         initialize_trigger_locals(
             &context,
-            definition,
             invocation,
-            None,
-            None,
+            TriggerTransition {
+                definition,
+                old: None,
+                new: None,
+            },
             program.locals,
+            &[],
             &mut local_values,
         )?;
         match execute_trigger_block(
@@ -14327,6 +14883,7 @@ fn fire_after_triggers_with_rows<'a>(
             storage: &mut *context.storage,
             txn: &mut *context.txn,
             arena: context.arena,
+            params: context.params,
             seq_session: context.seq_session,
             responder: &mut *context.responder,
             scratch: context.scratch,
@@ -15653,6 +16210,10 @@ pub fn create_routine(
         super::ast::RoutineBody::Return(body) => (crate::storage::RoutineBodyKind::Return, body),
         super::ast::RoutineBody::Atomic(body) => (crate::storage::RoutineBodyKind::Atomic, body),
     };
+    let language = match routine.language {
+        RoutineLanguage::Sql => crate::storage::RoutineLanguage::Sql,
+        RoutineLanguage::PlPgSql => crate::storage::RoutineLanguage::PlPgSql,
+    };
     if matches!(routine.kind, super::ast::RoutineCreateKind::Trigger)
         && routine.language != RoutineLanguage::PlPgSql
     {
@@ -15921,6 +16482,9 @@ pub fn create_routine(
             ));
         }
     }
+    let mut dependencies = crate::storage::StoredQueryDependencies::EMPTY;
+    let mut creation_path = StackStr::<128>::new();
+    let _formal_scope = enter_routine_parameter_types(&arguments[..argument_count]);
     match kind {
         crate::storage::RoutineKind::Function { .. } => {
             let returns_void = matches!(
@@ -15928,7 +16492,7 @@ pub fn create_routine(
                 crate::storage::RoutineKind::Function { result }
                     if result.ctype == ColType::Void
             );
-            if let Err(error) = super::query::parse_stored_routine_function_program(
+            let program = match super::query::parse_stored_routine_function_program(
                 body_kind,
                 body_text,
                 arena,
@@ -15936,7 +16500,20 @@ pub fn create_routine(
                 routine.name.name,
                 &arguments[..argument_count],
             ) {
-                return sql_fail(error);
+                Ok(program) => program,
+                Err(error) => return sql_fail(error),
+            };
+            if body_kind != crate::storage::RoutineBodyKind::String {
+                let raw_path = guc.search_path();
+                let user = super::eval::funcs::system::session_user_owned();
+                let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
+                dependencies = match super::query::stored_routine_dependencies(
+                    &program, storage, txn.txid, path, arena,
+                ) {
+                    Ok(dependencies) => dependencies,
+                    Err(error) => return sql_fail(error),
+                };
+                creation_path = StackStr::from_str(raw_path.as_str());
             }
         }
         crate::storage::RoutineKind::SetFunction { .. }
@@ -15947,7 +16524,7 @@ pub fn create_routine(
                 crate::storage::RoutineKind::SetFunction { result }
                     if result.ctype == ColType::Void
             );
-            if let Err(error) = super::query::parse_stored_routine_function_program(
+            let program = match super::query::parse_stored_routine_function_program(
                 body_kind,
                 body_text,
                 arena,
@@ -15955,7 +16532,20 @@ pub fn create_routine(
                 routine.name.name,
                 &arguments[..argument_count],
             ) {
-                return sql_fail(error);
+                Ok(program) => program,
+                Err(error) => return sql_fail(error),
+            };
+            if body_kind != crate::storage::RoutineBodyKind::String {
+                let raw_path = guc.search_path();
+                let user = super::eval::funcs::system::session_user_owned();
+                let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
+                dependencies = match super::query::stored_routine_dependencies(
+                    &program, storage, txn.txid, path, arena,
+                ) {
+                    Ok(dependencies) => dependencies,
+                    Err(error) => return sql_fail(error),
+                };
+                creation_path = StackStr::from_str(raw_path.as_str());
             }
         }
         crate::storage::RoutineKind::Trigger => {
@@ -15976,27 +16566,59 @@ pub fn create_routine(
                     "procedures cannot have a RETURN expression body"
                 ));
             }
-            let mut parser = match super::parser::Parser::new(body_text, arena).and_then(|parser| {
-                parser.with_routine_parameters(routine.name.name, &arguments[..argument_count])
-            }) {
-                Ok(parser) => parser,
-                Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
-            };
-            let mut statements = 0usize;
-            loop {
-                match parser.next_stmt() {
-                    Ok(Some(_)) => statements += 1,
-                    Ok(None) => break,
-                    Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+            if routine.language == RoutineLanguage::PlPgSql {
+                if body_kind != crate::storage::RoutineBodyKind::String {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "PL/pgSQL procedures require a string-literal body"
+                    ));
                 }
-            }
-            if statements == 0 {
-                return sql_fail(sql_err!(sqlstate::SYNTAX_ERROR, "procedure body is empty"));
+                let program =
+                    match parse_plpgsql_program(body_text, arena, PlpgsqlProgramKind::Procedure) {
+                        Ok(program) => program,
+                        Err(error) => return sql_fail(error),
+                    };
+                if let Err(error) = validate_plpgsql_procedure_namespace(
+                    &program,
+                    &parameters[..routine.arguments.len()],
+                ) {
+                    return sql_fail(error);
+                }
+            } else {
+                let program = match super::query::parse_stored_routine_function_program(
+                    body_kind,
+                    body_text,
+                    arena,
+                    true,
+                    routine.name.name,
+                    &arguments[..argument_count],
+                ) {
+                    Ok(program) => program,
+                    Err(error) => return sql_fail(error),
+                };
+                if body_kind != crate::storage::RoutineBodyKind::String {
+                    let raw_path = guc.search_path();
+                    let user = super::eval::funcs::system::session_user_owned();
+                    let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
+                    dependencies = match super::query::stored_routine_dependencies(
+                        &program, storage, txn.txid, path, arena,
+                    ) {
+                        Ok(dependencies) => dependencies,
+                        Err(error) => return sql_fail(error),
+                    };
+                    creation_path = StackStr::from_str(raw_path.as_str());
+                }
             }
         }
         crate::storage::RoutineKind::Aggregate(_) => {
             unreachable!("CREATE ROUTINE cannot construct an aggregate")
         }
+    }
+    if creation_path.is_truncated() {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "search_path is too long to store with a routine"
+        ));
     }
     let body = StackStr::<ROUTINE_SQL_MAX>::from_str(body_text);
     if body.is_truncated() {
@@ -16081,19 +16703,31 @@ pub fn create_routine(
                 kind,
                 result_columns,
                 result_column_count,
+                language,
                 attributes,
                 configs,
                 config_count: routine.configs.len(),
                 body_kind,
                 body,
+                creation_path,
+                dependency_slot: u32::MAX,
             };
-            let prior = match storage.replace_routine(slot, pending) {
+            let prior = match storage.replace_routine(slot, pending, dependencies) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
             let definition = storage.routine_for(slot, txn.txid);
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(definition)) {
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateRoutine {
+                    definition,
+                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                        storage.routine_dependencies_for(slot, txn.txid),
+                    ),
+                },
+            ) {
                 storage.rollback_routine_replace(slot, prior);
                 return sql_fail(error);
             }
@@ -16118,11 +16752,14 @@ pub fn create_routine(
                 kind,
                 result_columns,
                 result_column_count,
+                language,
                 attributes,
                 configs,
                 config_count: routine.configs.len(),
                 body_kind,
                 body,
+                creation_path,
+                dependencies,
             },
             txn.txid,
         ) {
@@ -16132,8 +16769,16 @@ pub fn create_routine(
     };
     if replaced.is_none() {
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(*storage.routine(slot)))
-        {
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::CreateRoutine {
+                definition: *storage.routine(slot),
+                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                    storage.routine_dependencies_for(slot, txn.txid),
+                ),
+            },
+        ) {
             storage.rollback_routine_create(slot);
             return sql_fail(error);
         }
@@ -16842,20 +17487,36 @@ pub fn create_aggregate(
                 kind,
                 result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
                 result_column_count: 0,
+                language: crate::storage::RoutineLanguage::Internal,
                 attributes: crate::storage::RoutineAttributes::AGGREGATE,
                 configs: [crate::storage::RoutineConfig::EMPTY;
                     crate::storage::MAX_ROUTINE_CONFIGS],
                 config_count: 0,
                 body_kind: crate::storage::RoutineBodyKind::String,
                 body,
+                creation_path: StackStr::new(),
+                dependency_slot: u32::MAX,
             };
-            let prior = match storage.replace_routine(slot, pending) {
+            let prior = match storage.replace_routine(
+                slot,
+                pending,
+                crate::storage::StoredQueryDependencies::EMPTY,
+            ) {
                 Ok(prior) => prior,
                 Err(error) => return sql_fail(error),
             };
             let durable = storage.routine_for(slot, txn.txid);
             let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(durable)) {
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateRoutine {
+                    definition: durable,
+                    dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                        storage.routine_dependencies_for(slot, txn.txid),
+                    ),
+                },
+            ) {
                 storage.rollback_routine_replace(slot, prior);
                 return sql_fail(error);
             }
@@ -16880,12 +17541,15 @@ pub fn create_aggregate(
                 kind,
                 result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
                 result_column_count: 0,
+                language: crate::storage::RoutineLanguage::Internal,
                 attributes: crate::storage::RoutineAttributes::AGGREGATE,
                 configs: [crate::storage::RoutineConfig::EMPTY;
                     crate::storage::MAX_ROUTINE_CONFIGS],
                 config_count: 0,
                 body_kind: crate::storage::RoutineBodyKind::String,
                 body,
+                creation_path: StackStr::new(),
+                dependencies: crate::storage::StoredQueryDependencies::EMPTY,
             },
             txn.txid,
         ) {
@@ -16895,8 +17559,16 @@ pub fn create_aggregate(
     };
     if replaced.is_none() {
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(*storage.routine(slot)))
-        {
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::CreateRoutine {
+                definition: *storage.routine(slot),
+                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                    storage.routine_dependencies_for(slot, txn.txid),
+                ),
+            },
+        ) {
             storage.rollback_routine_create(slot);
             return sql_fail(error);
         }
@@ -17951,19 +18623,32 @@ pub fn alter_routine(
             kind: routine.kind,
             result_columns: routine.result_columns,
             result_column_count: routine.result_column_count,
+            language: routine.language,
             attributes,
             configs,
             config_count,
             body_kind: routine.body_kind,
             body: routine.body,
+            creation_path: routine.creation_path,
+            dependency_slot: u32::MAX,
         };
-        let prior = match storage.replace_routine(slot, pending) {
+        let dependencies = *storage.routine_dependencies_for(slot, txn.txid);
+        let prior = match storage.replace_routine(slot, pending, dependencies) {
             Ok(prior) => prior,
             Err(error) => return sql_fail(error),
         };
         let durable = storage.routine_for(slot, txn.txid);
         let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(durable)) {
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::CreateRoutine {
+                definition: durable,
+                dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                    storage.routine_dependencies_for(slot, txn.txid),
+                ),
+            },
+        ) {
             storage.rollback_routine_replace(slot, prior);
             return sql_fail(error);
         }
@@ -18281,26 +18966,33 @@ pub fn drop_routine(
             return sql_fail(error);
         }
         let routine = *storage.routine(slot);
-        let (dependent_views, dependent_matviews) =
-            match stored_query_dependent_closure(storage, txn.txid, |dependency| {
-                dependency.class == crate::storage::DependencyClass::Routine
-                    && dependency.slot as usize == slot
-            }) {
-                Ok(dependents) => dependents,
-                Err(error) => return sql_fail(error),
-            };
+        let StoredDependencyClosure {
+            views: dependent_views,
+            matviews: dependent_matviews,
+            routines: mut dependent_routines,
+        } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
+            dependency.class == crate::storage::DependencyClass::Routine
+                && dependency.slot as usize == slot
+        }) {
+            Ok(dependents) => dependents,
+            Err(error) => return sql_fail(error),
+        };
+        // CREATE OR REPLACE can bind recursion to the routine's stable slot.
+        dependent_routines[slot] = false;
         let policy_root = PolicyDependencySelection::Catalog {
             class: crate::storage::DependencyClass::Routine,
             slot,
         };
         let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
             || dependent_matviews.iter().any(|selected| *selected)
+            || dependent_routines.iter().any(|selected| *selected)
             || policy_dependents_exist(
                 storage,
                 txn.txid,
                 policy_root,
                 &dependent_views,
                 &dependent_matviews,
+                &dependent_routines,
             );
         let dependency_suffix = match routine_dependency_suffix(storage, &routine) {
             Ok(suffix) => suffix,
@@ -18321,6 +19013,7 @@ pub fn drop_routine(
                 StoredQuerySelection {
                     views: &dependent_views,
                     matviews: &dependent_matviews,
+                    routines: &dependent_routines,
                     policy_root: Some(policy_root),
                 },
                 false,
@@ -18349,6 +19042,7 @@ pub fn drop_routine(
                 StoredQuerySelection {
                     views: &dependent_views,
                     matviews: &dependent_matviews,
+                    routines: &dependent_routines,
                     policy_root: Some(policy_root),
                 },
                 true,
@@ -18365,6 +19059,7 @@ pub fn drop_routine(
                 policy_root,
                 &dependent_views,
                 &dependent_matviews,
+                &dependent_routines,
             )
         {
             return sql_fail(error);
@@ -18376,6 +19071,7 @@ pub fn drop_routine(
                 txn,
                 &dependent_views,
                 &dependent_matviews,
+                &dependent_routines,
             )
         {
             return sql_fail(error);
@@ -19636,7 +20332,11 @@ pub fn drop_materialized_view(
             dependency.class == crate::storage::DependencyClass::Table
                 && dependency.slot as usize == idx
         });
-        let (dependent_views, dependent_matviews) = match closure {
+        let StoredDependencyClosure {
+            views: dependent_views,
+            matviews: dependent_matviews,
+            routines: dependent_routines,
+        } = match closure {
             Ok(closure) => closure,
             Err(error) => return sql_fail(error),
         };
@@ -19646,12 +20346,14 @@ pub fn drop_materialized_view(
         };
         let has_dependents = dependent_views.iter().any(|selected| *selected)
             || dependent_matviews.iter().any(|selected| *selected)
+            || dependent_routines.iter().any(|selected| *selected)
             || policy_dependents_exist(
                 storage,
                 txn.txid,
                 policy_root,
                 &dependent_views,
                 &dependent_matviews,
+                &dependent_routines,
             );
         if has_dependents && !cascade {
             return sql_fail(sql_err!(
@@ -19668,6 +20370,7 @@ pub fn drop_materialized_view(
                 policy_root,
                 &dependent_views,
                 &dependent_matviews,
+                &dependent_routines,
             ) {
                 return sql_fail(error);
             }
@@ -19677,6 +20380,7 @@ pub fn drop_materialized_view(
                 txn,
                 &dependent_views,
                 &dependent_matviews,
+                &dependent_routines,
             ) {
                 return sql_fail(error);
             }
@@ -20211,7 +20915,11 @@ pub fn drop_sequence(
             dependency.class == crate::storage::DependencyClass::Sequence
                 && dependency.slot as usize == slot
         });
-        let (dependent_views, dependent_matviews) = match closure {
+        let StoredDependencyClosure {
+            views: dependent_views,
+            matviews: dependent_matviews,
+            routines: dependent_routines,
+        } = match closure {
             Ok(closure) => closure,
             Err(error) => return sql_fail(error),
         };
@@ -20221,12 +20929,14 @@ pub fn drop_sequence(
         };
         let has_dependents = dependent_views.iter().any(|selected| *selected)
             || dependent_matviews.iter().any(|selected| *selected)
+            || dependent_routines.iter().any(|selected| *selected)
             || policy_dependents_exist(
                 storage,
                 txn.txid,
                 policy_root,
                 &dependent_views,
                 &dependent_matviews,
+                &dependent_routines,
             );
         if has_dependents && !cascade {
             if let Err(error) = report_stored_query_dependents(
@@ -20243,6 +20953,7 @@ pub fn drop_sequence(
                 StoredQuerySelection {
                     views: &dependent_views,
                     matviews: &dependent_matviews,
+                    routines: &dependent_routines,
                     policy_root: Some(policy_root),
                 },
                 false,
@@ -20271,6 +20982,7 @@ pub fn drop_sequence(
                 StoredQuerySelection {
                     views: &dependent_views,
                     matviews: &dependent_matviews,
+                    routines: &dependent_routines,
                     policy_root: Some(policy_root),
                 },
                 true,
@@ -20285,6 +20997,7 @@ pub fn drop_sequence(
                 policy_root,
                 &dependent_views,
                 &dependent_matviews,
+                &dependent_routines,
             ) {
                 return sql_fail(error);
             }
@@ -20294,6 +21007,7 @@ pub fn drop_sequence(
                 txn,
                 &dependent_views,
                 &dependent_matviews,
+                &dependent_routines,
             ) {
                 return sql_fail(error);
             }
@@ -20751,7 +21465,11 @@ fn drop_type_dependent_routines(
         }
     }
 
-    let (views, matviews) = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+    let StoredDependencyClosure {
+        views,
+        matviews,
+        routines: dependent_routines,
+    } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
         dependency.class == crate::storage::DependencyClass::Routine
             && selected
                 .get(usize::from(dependency.slot))
@@ -20770,10 +21488,14 @@ fn drop_type_dependent_routines(
                 },
                 &views,
                 &matviews,
+                &dependent_routines,
             )?;
         }
     }
-    drop_selected_stored_queries(storage, wal, txn, &views, &matviews)?;
+    for slot in 0..storage.routine_count() {
+        selected[slot] |= dependent_routines[slot];
+    }
+    drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &selected)?;
 
     loop {
         let dependency =
@@ -22096,11 +22818,14 @@ fn drop_composite_type(
         cascade,
     )?;
 
-    let (dependent_views, dependent_matviews) =
-        stored_query_dependent_closure(storage, txn.txid, |dependency| {
-            dependency.class == crate::storage::DependencyClass::Composite
-                && dependency.slot as usize == slot
-        })?;
+    let StoredDependencyClosure {
+        views: dependent_views,
+        matviews: dependent_matviews,
+        routines: dependent_routines,
+    } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        dependency.class == crate::storage::DependencyClass::Composite
+            && dependency.slot as usize == slot
+    })?;
     let policy_root = PolicyDependencySelection::Catalog {
         class: crate::storage::DependencyClass::Composite,
         slot,
@@ -22127,6 +22852,7 @@ fn drop_composite_type(
         policy_root,
         &dependent_views,
         &dependent_matviews,
+        &dependent_routines,
     );
     if has_dependents && !cascade {
         return Err(sql_err!(
@@ -22227,8 +22953,16 @@ fn drop_composite_type(
             policy_root,
             &dependent_views,
             &dependent_matviews,
+            &dependent_routines,
         )?;
-        drop_selected_stored_queries(storage, wal, txn, &dependent_views, &dependent_matviews)?;
+        drop_selected_stored_queries(
+            storage,
+            wal,
+            txn,
+            &dependent_views,
+            &dependent_matviews,
+            &dependent_routines,
+        )?;
         drop_domain_selection(
             storage,
             wal,
@@ -22542,7 +23276,11 @@ fn apply_type_drop_to_stored_queries(
         DependencyClass::Composite => selected_composite == Some(dependency.slot as usize),
         _ => false,
     };
-    let (views, matviews) = stored_query_dependent_closure(storage, txn.txid, root)?;
+    let StoredDependencyClosure {
+        views,
+        matviews,
+        routines: dependent_routines,
+    } = stored_query_dependent_closure(storage, txn.txid, root)?;
     let has_policies = storage
         .policies_with_slots_visible_to(txn.txid)
         .any(|(_, policy)| {
@@ -22555,10 +23293,12 @@ fn apply_type_drop_to_stored_queries(
                 selected_composite,
                 &views,
                 &matviews,
+                &dependent_routines,
             )
         });
     if !views.iter().any(|selected| *selected)
         && !matviews.iter().any(|selected| *selected)
+        && !dependent_routines.iter().any(|selected| *selected)
         && !has_policies
     {
         return Ok(());
@@ -22582,13 +23322,14 @@ fn apply_type_drop_to_stored_queries(
                     selected_composite,
                     &views,
                     &matviews,
+                    &dependent_routines,
                 )
         };
         if selected {
             drop_policy_slot(storage, wal, txn, slot)?;
         }
     }
-    drop_selected_stored_queries(storage, wal, txn, &views, &matviews)
+    drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &dependent_routines)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22601,6 +23342,7 @@ fn policy_depends_on_type_selection(
     selected_composite: Option<usize>,
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
 ) -> bool {
     let dependencies = &policy.definition_for(txid).dependencies;
     dependencies.entries().iter().any(|dependency| {
@@ -22614,26 +23356,34 @@ fn policy_depends_on_type_selection(
             DependencyClass::Composite => selected_composite == Some(usize::from(dependency.slot)),
             _ => false,
         }
-    }) || policy_depends_on_selected_stored_query(storage, txid, dependencies, views, matviews)
+    }) || policy_depends_on_selected_stored_query(
+        storage,
+        txid,
+        dependencies,
+        views,
+        matviews,
+        routines,
+    )
 }
 
 const MAX_DEPENDENT_STORED_QUERIES: usize = 64;
+
+struct StoredDependencyClosure {
+    views: [bool; MAX_DEPENDENT_STORED_QUERIES],
+    matviews: [bool; MAX_DEPENDENT_STORED_QUERIES],
+    routines: [bool; MAX_DEPENDENT_STORED_QUERIES],
+}
 
 fn stored_query_dependent_closure(
     storage: &Storage,
     txid: u32,
     root: impl Fn(&crate::storage::StoredQueryDependency) -> bool,
-) -> Result<
-    (
-        [bool; MAX_DEPENDENT_STORED_QUERIES],
-        [bool; MAX_DEPENDENT_STORED_QUERIES],
-    ),
-    SqlError,
-> {
+) -> Result<StoredDependencyClosure, SqlError> {
     use crate::storage::DependencyClass;
     if storage.view_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage.matview_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage.table_count() > MAX_DEPENDENT_STORED_QUERIES
+        || storage.routine_count() > MAX_DEPENDENT_STORED_QUERIES
     {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -22643,9 +23393,43 @@ fn stored_query_dependent_closure(
     }
     let mut views = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut matviews = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut matview_tables = [false; MAX_DEPENDENT_STORED_QUERIES];
     loop {
         let mut changed = false;
+        for slot in 0..storage.routine_count() {
+            let routine = storage.routine_for(slot, txid);
+            if routines[slot] || !routine.visible_to(txid) {
+                continue;
+            }
+            let dependency_hit = storage
+                .routine_dependencies_for(slot, txid)
+                .entries()
+                .iter()
+                .any(|dependency| {
+                    root(dependency)
+                        || (dependency.class == DependencyClass::View
+                            && views[dependency.slot as usize])
+                        || (dependency.class == DependencyClass::Table
+                            && matview_tables[dependency.slot as usize])
+                        || (dependency.class == DependencyClass::Routine
+                            && routines[dependency.slot as usize])
+                });
+            let aggregate_hit = matches!(
+                routine.kind,
+                crate::storage::RoutineKind::Aggregate(aggregate)
+                    if (0..storage.routine_count()).any(|support| {
+                        routines[support]
+                            && aggregate.uses_function_oid(crate::storage::routine_oid(
+                                &storage.routine_for(support, txid),
+                            ))
+                    })
+            );
+            if dependency_hit || aggregate_hit {
+                routines[slot] = true;
+                changed = true;
+            }
+        }
         for slot in 0..storage.view_count() {
             let view = storage.view(slot);
             if views[slot] || !view.visible_to(txid) {
@@ -22661,6 +23445,8 @@ fn stored_query_dependent_closure(
                             && views[dependency.slot as usize])
                         || (dependency.class == DependencyClass::Table
                             && matview_tables[dependency.slot as usize])
+                        || (dependency.class == DependencyClass::Routine
+                            && routines[dependency.slot as usize])
                 });
             if hit {
                 views[slot] = true;
@@ -22684,6 +23470,8 @@ fn stored_query_dependent_closure(
                             && views[dependency.slot as usize])
                         || (dependency.class == DependencyClass::Table
                             && matview_tables[dependency.slot as usize])
+                        || (dependency.class == DependencyClass::Routine
+                            && routines[dependency.slot as usize])
                 });
             if hit {
                 matviews[slot] = true;
@@ -22705,7 +23493,11 @@ fn stored_query_dependent_closure(
             break;
         }
     }
-    Ok((views, matviews))
+    Ok(StoredDependencyClosure {
+        views,
+        matviews,
+        routines,
+    })
 }
 
 fn dependency_references_table_column(
@@ -22724,12 +23516,17 @@ fn policy_depends_on_selected_stored_query(
     dependencies: &crate::storage::StoredQueryDependencies,
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
 ) -> bool {
     dependencies
         .entries()
         .iter()
         .any(|dependency| match dependency.class {
             crate::storage::DependencyClass::View => views
+                .get(usize::from(dependency.slot))
+                .copied()
+                .unwrap_or(false),
+            crate::storage::DependencyClass::Routine => routines
                 .get(usize::from(dependency.slot))
                 .copied()
                 .unwrap_or(false),
@@ -22764,6 +23561,7 @@ fn policy_depends_on_owned_selection(
     routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     dependent_views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     dependent_matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    dependent_routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
 ) -> bool {
     if tables
         .get(usize::from(policy.table))
@@ -22797,6 +23595,7 @@ fn policy_depends_on_owned_selection(
             &policy.definition_for(txid).dependencies,
             dependent_views,
             dependent_matviews,
+            dependent_routines,
         )
 }
 
@@ -22807,6 +23606,7 @@ fn policy_depends_on_dependency_drop(
     root: PolicyDependencySelection,
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
 ) -> bool {
     if matches!(
         root,
@@ -22825,7 +23625,14 @@ fn policy_depends_on_dependency_drop(
         PolicyDependencySelection::TableColumn { table, column } => {
             dependency_references_table_column(dependency, table, column)
         }
-    }) || policy_depends_on_selected_stored_query(storage, txid, dependencies, views, matviews)
+    }) || policy_depends_on_selected_stored_query(
+        storage,
+        txid,
+        dependencies,
+        views,
+        matviews,
+        routines,
+    )
 }
 
 fn policy_dependents_exist(
@@ -22834,11 +23641,14 @@ fn policy_dependents_exist(
     root: PolicyDependencySelection,
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
 ) -> bool {
     storage
         .policies_with_slots_visible_to(txid)
         .any(|(_, policy)| {
-            policy_depends_on_dependency_drop(storage, txid, policy, root, views, matviews)
+            policy_depends_on_dependency_drop(
+                storage, txid, policy, root, views, matviews, routines,
+            )
         })
 }
 
@@ -22849,13 +23659,14 @@ fn drop_policy_dependents(
     root: PolicyDependencySelection,
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
 ) -> Result<(), SqlError> {
     for slot in 0..storage.policy_count() {
         let selected = {
             let policy = storage.policy(slot);
             policy.visible_to(txn.txid)
                 && policy_depends_on_dependency_drop(
-                    storage, txn.txid, policy, root, views, matviews,
+                    storage, txn.txid, policy, root, views, matviews, routines,
                 )
         };
         if selected {
@@ -22877,14 +23688,25 @@ fn apply_column_drop_dependencies(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Result<(), SqlError> {
-    let (views, matviews) = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+    let StoredDependencyClosure {
+        views,
+        matviews,
+        routines: dependent_routines,
+    } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
         dependency_references_table_column(dependency, table, column)
     })?;
-    let has_stored_dependents =
-        views.iter().any(|selected| *selected) || matviews.iter().any(|selected| *selected);
+    let has_stored_dependents = views.iter().any(|selected| *selected)
+        || matviews.iter().any(|selected| *selected)
+        || dependent_routines.iter().any(|selected| *selected);
     let policy_root = PolicyDependencySelection::TableColumn { table, column };
-    let has_policy_dependents =
-        policy_dependents_exist(storage, txn.txid, policy_root, &views, &matviews);
+    let has_policy_dependents = policy_dependents_exist(
+        storage,
+        txn.txid,
+        policy_root,
+        &views,
+        &matviews,
+        &dependent_routines,
+    );
     let table_definition = *storage.table_def(table, txn.txid);
     let mut selected_statistics = [usize::MAX; crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
     let mut selected_statistics_count = 0usize;
@@ -22949,6 +23771,7 @@ fn apply_column_drop_dependencies(
         StoredQuerySelection {
             views: &views,
             matviews: &matviews,
+            routines: &dependent_routines,
             policy_root: Some(policy_root),
         },
         cascade,
@@ -22966,8 +23789,16 @@ fn apply_column_drop_dependencies(
     // Policies have no dependents of their own. Drop them before the stored
     // queries they reference so no transaction-visible definition can point
     // at an object already marked for deletion.
-    drop_policy_dependents(storage, wal, txn, policy_root, &views, &matviews)?;
-    drop_selected_stored_queries(storage, wal, txn, &views, &matviews)
+    drop_policy_dependents(
+        storage,
+        wal,
+        txn,
+        policy_root,
+        &views,
+        &matviews,
+        &dependent_routines,
+    )?;
+    drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &dependent_routines)
 }
 
 #[derive(Clone, Copy)]
@@ -23041,6 +23872,7 @@ fn routine_dependency_suffix(
 struct StoredQuerySelection<'a> {
     views: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
+    routines: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
     policy_root: Option<PolicyDependencySelection>,
 }
 
@@ -23069,13 +23901,23 @@ fn report_stored_query_dependents(
 
     let views = selection.views;
     let matviews = selection.matviews;
+    let routines = selection.routines;
     let policy_selected = |policy: &crate::storage::PolicyDef| {
         selection.policy_root.is_some_and(|root| {
-            policy_depends_on_dependency_drop(storage, txid, policy, root, views, matviews)
+            policy_depends_on_dependency_drop(
+                storage,
+                txid,
+                policy,
+                root,
+                views,
+                matviews,
+                selection.routines,
+            )
         })
     };
     let count = views.iter().filter(|selected| **selected).count()
         + matviews.iter().filter(|selected| **selected).count()
+        + routines.iter().filter(|selected| **selected).count()
         + storage
             .policies_with_slots_visible_to(txid)
             .filter(|(_, policy)| policy_selected(policy))
@@ -23089,8 +23931,73 @@ fn report_stored_query_dependents(
     // rendered in PostgreSQL's order.
     let mut view_depth = [0u8; MAX_DEPENDENT_STORED_QUERIES];
     let mut matview_depth = [0u8; MAX_DEPENDENT_STORED_QUERIES];
+    let mut routine_depth = [0u8; MAX_DEPENDENT_STORED_QUERIES];
     loop {
         let mut changed = false;
+        for slot in 0..storage.routine_count() {
+            if !routines[slot] || routine_depth[slot] != 0 {
+                continue;
+            }
+            let mut depth = 0u8;
+            for dependency in storage.routine_dependencies_for(slot, txid).entries() {
+                let parent_depth = match dependency.class {
+                    class if class == root.class && dependency.slot as usize == root.slot => 1,
+                    DependencyClass::View if view_depth[dependency.slot as usize] != 0 => {
+                        view_depth[dependency.slot as usize].saturating_add(1)
+                    }
+                    DependencyClass::Routine if routine_depth[dependency.slot as usize] != 0 => {
+                        routine_depth[dependency.slot as usize].saturating_add(1)
+                    }
+                    DependencyClass::Table => {
+                        let mut found = 0;
+                        for matview_slot in 0..storage.matview_count() {
+                            if !matviews[matview_slot] || matview_depth[matview_slot] == 0 {
+                                continue;
+                            }
+                            let matview = storage.matview(matview_slot);
+                            if storage.find_visible(
+                                matview.schema.as_str(),
+                                matview.name.as_str(),
+                                txid,
+                            ) == Some(dependency.slot as usize)
+                            {
+                                found = matview_depth[matview_slot].saturating_add(1);
+                                break;
+                            }
+                        }
+                        found
+                    }
+                    _ => 0,
+                };
+                if parent_depth != 0 {
+                    depth = parent_depth;
+                    break;
+                }
+            }
+            if depth == 0
+                && let crate::storage::RoutineKind::Aggregate(aggregate) =
+                    storage.routine_for(slot, txid).kind
+            {
+                for (support, &support_depth) in routine_depth
+                    .iter()
+                    .enumerate()
+                    .take(storage.routine_count())
+                {
+                    if support_depth != 0
+                        && aggregate.uses_function_oid(crate::storage::routine_oid(
+                            &storage.routine_for(support, txid),
+                        ))
+                    {
+                        depth = support_depth.saturating_add(1);
+                        break;
+                    }
+                }
+            }
+            if depth != 0 {
+                routine_depth[slot] = depth;
+                changed = true;
+            }
+        }
         for slot in 0..storage.view_count() {
             if !views[slot] || view_depth[slot] != 0 {
                 continue;
@@ -23122,6 +24029,9 @@ fn report_stored_query_dependents(
                         }
                         found
                     }
+                    DependencyClass::Routine if routine_depth[dependency.slot as usize] != 0 => {
+                        routine_depth[dependency.slot as usize].saturating_add(1)
+                    }
                     _ => 0,
                 };
                 if parent_depth != 0 {
@@ -23144,6 +24054,9 @@ fn report_stored_query_dependents(
                     class if class == root.class && dependency.slot as usize == root.slot => 1,
                     DependencyClass::View if view_depth[dependency.slot as usize] != 0 => {
                         view_depth[dependency.slot as usize].saturating_add(1)
+                    }
+                    DependencyClass::Routine if routine_depth[dependency.slot as usize] != 0 => {
+                        routine_depth[dependency.slot as usize].saturating_add(1)
                     }
                     _ => 0,
                 };
@@ -23187,6 +24100,20 @@ fn report_stored_query_dependents(
         let _ = write!(out, "materialized view ");
         write_name(out, &matview.schema, &matview.name);
     };
+    let describe_routine =
+        |slot: usize, out: &mut crate::util::StackStr<192>| -> Result<(), SqlError> {
+            let routine = storage.routine_for(slot, txid);
+            let noun = match routine.kind {
+                crate::storage::RoutineKind::Procedure => "procedure",
+                crate::storage::RoutineKind::Aggregate(_) => "aggregate",
+                _ => "function",
+            };
+            let _ = write!(out, "{} ", noun);
+            write_name(out, &routine.schema_for(txid), &routine.name_for(txid));
+            let suffix = routine_dependency_suffix(storage, &routine)?;
+            let _ = write!(out, "{}", suffix.as_str());
+            Ok(())
+        };
     let mut detail =
         crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
     let mut written = 0usize;
@@ -23231,6 +24158,87 @@ fn report_stored_query_dependents(
         written += 1;
     }
     for depth in 1..=MAX_DEPENDENT_STORED_QUERIES as u8 {
+        for slot in 0..storage.routine_count() {
+            if !routines[slot] || routine_depth[slot] != depth {
+                continue;
+            }
+            let mut object = crate::util::StackStr::<192>::new();
+            describe_routine(slot, &mut object)?;
+            let _ = write!(
+                detail,
+                "{}{}{}",
+                if written == 0 { "" } else { "\n" },
+                if cascade { "drop cascades to " } else { "" },
+                object.as_str()
+            );
+            if !cascade {
+                let mut parent = crate::util::StackStr::<192>::new();
+                if depth == 1 {
+                    if let Some(PolicyDependencySelection::TableColumn { table, column }) =
+                        selection.policy_root
+                    {
+                        let column = storage.table_def(table, txid).columns()[column];
+                        let _ = write!(parent, "column {} of table ", column.name.as_str());
+                    } else {
+                        let _ = write!(parent, "{} ", root.kind);
+                    }
+                    write_name(&mut parent, &root.schema, &root.name);
+                    if !matches!(
+                        selection.policy_root,
+                        Some(PolicyDependencySelection::TableColumn { .. })
+                    ) {
+                        let _ = write!(parent, "{}", root.suffix.as_str());
+                    }
+                } else {
+                    for dependency in storage.routine_dependencies_for(slot, txid).entries() {
+                        match dependency.class {
+                            DependencyClass::Routine
+                                if routine_depth[dependency.slot as usize] == depth - 1 =>
+                            {
+                                describe_routine(dependency.slot as usize, &mut parent)?;
+                            }
+                            DependencyClass::View
+                                if view_depth[dependency.slot as usize] == depth - 1 =>
+                            {
+                                describe_view(dependency.slot as usize, &mut parent);
+                            }
+                            _ => {}
+                        }
+                        if !parent.as_str().is_empty() {
+                            break;
+                        }
+                    }
+                    if parent.as_str().is_empty()
+                        && matches!(
+                            storage.routine_for(slot, txid).kind,
+                            crate::storage::RoutineKind::Aggregate(_)
+                        )
+                    {
+                        for (support, &support_depth) in routine_depth
+                            .iter()
+                            .enumerate()
+                            .take(storage.routine_count())
+                        {
+                            let crate::storage::RoutineKind::Aggregate(aggregate) =
+                                storage.routine_for(slot, txid).kind
+                            else {
+                                break;
+                            };
+                            if support_depth == depth - 1
+                                && aggregate.uses_function_oid(crate::storage::routine_oid(
+                                    &storage.routine_for(support, txid),
+                                ))
+                            {
+                                describe_routine(support, &mut parent)?;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = write!(detail, " depends on {}", parent.as_str());
+            }
+            written += 1;
+        }
         for slot in 0..storage.view_count() {
             if views[slot] && view_depth[slot] == depth {
                 let mut object = crate::util::StackStr::<192>::new();
@@ -23266,6 +24274,12 @@ fn report_stored_query_dependents(
                                 && view_depth[dependency.slot as usize] == depth - 1
                             {
                                 describe_view(dependency.slot as usize, &mut parent);
+                                break;
+                            }
+                            if dependency.class == DependencyClass::Routine
+                                && routine_depth[dependency.slot as usize] == depth - 1
+                            {
+                                describe_routine(dependency.slot as usize, &mut parent)?;
                                 break;
                             }
                             if dependency.class == DependencyClass::Table {
@@ -23326,16 +24340,21 @@ fn report_stored_query_dependents(
                         ) {
                             let _ = write!(parent, "{}", root.suffix.as_str());
                         }
-                    } else if let Some(dependency) = storage
-                        .matview_dependencies(slot)
-                        .entries()
-                        .iter()
-                        .find(|dependency| {
-                            dependency.class == DependencyClass::View
+                    } else {
+                        for dependency in storage.matview_dependencies(slot).entries() {
+                            if dependency.class == DependencyClass::View
                                 && view_depth[dependency.slot as usize] == depth - 1
-                        })
-                    {
-                        describe_view(dependency.slot as usize, &mut parent);
+                            {
+                                describe_view(dependency.slot as usize, &mut parent);
+                                break;
+                            }
+                            if dependency.class == DependencyClass::Routine
+                                && routine_depth[dependency.slot as usize] == depth - 1
+                            {
+                                describe_routine(dependency.slot as usize, &mut parent)?;
+                                break;
+                            }
+                        }
                     }
                     let _ = write!(detail, " depends on {}", parent.as_str());
                 }
@@ -23381,6 +24400,7 @@ fn drop_selected_stored_queries(
     txn: &mut TxnState,
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
 ) -> Result<(), SqlError> {
     // Dependents are already closed transitively. Reverse slot order avoids
     // immediately reusing a just-freed low slot while this plan is executing.
@@ -23392,6 +24412,67 @@ fn drop_selected_stored_queries(
     for slot in (0..storage.matview_count()).rev() {
         if matviews[slot] && storage.matview(slot).visible_to(txn.txid) {
             drop_matview_slot(storage, wal, txn, slot)?;
+        }
+    }
+    loop {
+        let dependency =
+            storage
+                .triggers_with_slots_visible_to(txn.txid)
+                .find_map(|(slot, trigger)| {
+                    routines[usize::from(trigger.function)].then_some((slot, trigger))
+                });
+        let Some((slot, trigger)) = dependency else {
+            break;
+        };
+        let (target, schema, relation) = match trigger.target {
+            crate::storage::TriggerTarget::Table(slot) => {
+                let table = storage.table_def(usize::from(slot), txn.txid);
+                (
+                    crate::wal::TriggerTargetKind::Table,
+                    table.schema,
+                    table.name,
+                )
+            }
+            crate::storage::TriggerTarget::View(slot) => {
+                let view = storage.view(usize::from(slot));
+                (crate::wal::TriggerTargetKind::View, view.schema, view.name)
+            }
+        };
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropTrigger {
+                name: trigger.name_to(txn.txid).as_str(),
+                target,
+                table_schema: schema.as_str(),
+                table: relation.as_str(),
+            },
+        )?;
+        storage.drop_trigger(slot, txn.txid);
+        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))?;
+    }
+    for slot in (0..storage.routine_count()).rev() {
+        if !routines[slot] || !storage.routine(slot).visible_to(txn.txid) {
+            continue;
+        }
+        let routine = storage.routine_for(slot, txn.txid);
+        let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
+        let signature = encode_routine_signature(routine.arguments(), &mut signature)?;
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropRoutine {
+                schema: routine.schema_for(txn.txid).as_str(),
+                name: routine.name_for(txn.txid).as_str(),
+                argument_signature: signature,
+            },
+        )?;
+        storage.drop_routine(slot, txn.txid);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32)) {
+            storage.rollback_routine_drop(slot, txn.txid);
+            return Err(error);
         }
     }
     Ok(())
@@ -25600,7 +26681,11 @@ pub fn drop_view(
                 dependency.class == crate::storage::DependencyClass::View
                     && dependency.slot as usize == slot
             });
-            let (dependent_views, dependent_matviews) = match closure {
+            let StoredDependencyClosure {
+                views: dependent_views,
+                matviews: dependent_matviews,
+                routines: dependent_routines,
+            } = match closure {
                 Ok(closure) => closure,
                 Err(error) => return sql_fail(error),
             };
@@ -25610,12 +26695,14 @@ pub fn drop_view(
             };
             let has_dependents = dependent_views.iter().any(|selected| *selected)
                 || dependent_matviews.iter().any(|selected| *selected)
+                || dependent_routines.iter().any(|selected| *selected)
                 || policy_dependents_exist(
                     storage,
                     txn.txid,
                     policy_root,
                     &dependent_views,
                     &dependent_matviews,
+                    &dependent_routines,
                 );
             let has_triggers = storage.triggers_for_view(slot, txn.txid).next().is_some();
             if (has_dependents || has_triggers) && !cascade {
@@ -25633,6 +26720,7 @@ pub fn drop_view(
                     policy_root,
                     &dependent_views,
                     &dependent_matviews,
+                    &dependent_routines,
                 ) {
                     return sql_fail(error);
                 }
@@ -25642,6 +26730,7 @@ pub fn drop_view(
                     txn,
                     &dependent_views,
                     &dependent_matviews,
+                    &dependent_routines,
                 ) {
                     return sql_fail(error);
                 }
@@ -28831,6 +29920,7 @@ pub fn copy_statement_begin(
             storage,
             txn,
             arena,
+            params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
             scratch: scratch as *mut _,
@@ -28884,6 +29974,7 @@ pub fn copy_statement_end(
             storage,
             txn,
             arena,
+            params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
             scratch: scratch as *mut _,
@@ -31737,6 +32828,75 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
             },
         }
     }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        self.column(qualifier, name).map(|column| column.ctype)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        self.column(qualifier, name)
+            .map(|column| column.collation)
+            .unwrap_or(crate::sql::ast::Collation::None)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        self.column(qualifier, name)
+            .and_then(|column| column.user_type)
+    }
+}
+
+impl<'d> MergeLookup<'d, '_> {
+    fn column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<&'d crate::storage::ColumnMeta> {
+        match qualifier {
+            Some(qualifier) if qualifier == self.target_alias => self
+                .target_def
+                .column_index(name)
+                .map(|index| &self.target_def.columns()[index]),
+            Some(qualifier) if qualifier == self.source_alias => self
+                .source_def
+                .column_index(name)
+                .map(|index| &self.source_def.columns()[index]),
+            Some(_) => None,
+            None => match (
+                self.target_def.column_index(name),
+                self.source_def.column_index(name),
+            ) {
+                (Some(index), None) => Some(&self.target_def.columns()[index]),
+                (None, Some(index)) => Some(&self.source_def.columns()[index]),
+                _ => None,
+            },
+        }
+    }
+}
+
+fn eval_merge_expression<'a, R: ColumnLookup<'a>>(
+    expression: &Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    seq_session: &crate::sql::guc::SeqSession,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &R,
+) -> Result<Datum<'a>, SqlError> {
+    let value = {
+        let catalog = super::query::storage_catalog(storage, arena, txid);
+        let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txid);
+        let hooks = EvalHooks {
+            catalog: Some(&catalog),
+            sequences: Some(&sequences),
+            ..NO_HOOKS
+        };
+        eval_full(expression, arena, params, row, &hooks)?
+    };
+    detached_trigger_datum(value, arena)
 }
 
 /// Proves the source fields a MERGE can observe without interpreting an
@@ -32063,6 +33223,7 @@ pub fn merge(
                     storage,
                     txn,
                     arena,
+                    params: crate::sql::eval::NO_PARAMS,
                     seq_session,
                     responder,
                     scratch: scratch as *mut _,
@@ -32425,7 +33586,15 @@ pub fn merge(
                 source_alias,
                 source: sv,
             };
-            match eval(statement.on, arena, params, &lookup) {
+            match eval_merge_expression(
+                statement.on,
+                storage,
+                txn.txid,
+                seq_session,
+                arena,
+                params,
+                &lookup,
+            ) {
                 Ok(Datum::Bool(true)) => {}
                 Ok(_) => continue,
                 Err(e) => return sql_fail(e),
@@ -32467,7 +33636,15 @@ pub fn merge(
                     }
                 }
                 if let Some(cond) = when.cond {
-                    match eval(cond, arena, params, &lookup) {
+                    match eval_merge_expression(
+                        cond,
+                        storage,
+                        txn.txid,
+                        seq_session,
+                        arena,
+                        params,
+                        &lookup,
+                    ) {
                         Ok(Datum::Bool(true)) => {}
                         Ok(_) => continue,
                         Err(e) => return sql_fail(e),
@@ -32554,7 +33731,15 @@ pub fn merge(
                                 return sql_fail(undefined_column(name));
                             };
                             action_update_columns |= 1u64 << ci;
-                            let v = match eval(expression, arena, params, &lookup) {
+                            let v = match eval_merge_expression(
+                                expression,
+                                storage,
+                                txn.txid,
+                                seq_session,
+                                arena,
+                                params,
+                                &lookup,
+                            ) {
                                 Ok(v) => v,
                                 Err(e) => return sql_fail(e),
                             };
@@ -32793,7 +33978,15 @@ pub fn merge(
             };
             for when in statement.whens.iter().filter(|w| !w.matched) {
                 if let Some(cond) = when.cond {
-                    match eval(cond, arena, params, &source_ctx) {
+                    match eval_merge_expression(
+                        cond,
+                        storage,
+                        txn.txid,
+                        seq_session,
+                        arena,
+                        params,
+                        &source_ctx,
+                    ) {
                         Ok(Datum::Bool(true)) => {}
                         Ok(_) => continue,
                         Err(e) => return sql_fail(e),
@@ -32853,6 +34046,7 @@ pub fn merge(
                     storage,
                     txn,
                     arena,
+                    params: crate::sql::eval::NO_PARAMS,
                     seq_session,
                     responder,
                     scratch: scratch as *mut _,
@@ -33389,6 +34583,7 @@ pub(crate) fn fire_view_statement_triggers(
             storage,
             txn,
             arena,
+            params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
             scratch: scratch as *mut _,
@@ -34012,6 +35207,7 @@ fn fire_view_row_trigger<'a>(
             storage,
             txn,
             arena,
+            params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
             scratch: scratch as *mut _,
@@ -34227,6 +35423,7 @@ where
             storage,
             txn,
             arena,
+            params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
             scratch: scratch as *mut _,
@@ -34245,6 +35442,7 @@ where
                 storage,
                 txn,
                 arena,
+                params: crate::sql::eval::NO_PARAMS,
                 seq_session,
                 responder,
                 scratch: scratch as *mut _,
@@ -34518,6 +35716,7 @@ where
                     storage,
                     txn,
                     arena,
+                    params: crate::sql::eval::NO_PARAMS,
                     seq_session,
                     responder,
                     scratch: scratch as *mut _,
@@ -34538,6 +35737,7 @@ where
                 storage,
                 txn,
                 arena,
+                params: crate::sql::eval::NO_PARAMS,
                 seq_session,
                 responder,
                 scratch: scratch as *mut _,
@@ -34746,6 +35946,7 @@ where
                 storage,
                 txn,
                 arena,
+                params: crate::sql::eval::NO_PARAMS,
                 seq_session,
                 responder,
                 scratch: scratch as *mut _,
@@ -34766,6 +35967,7 @@ where
             storage,
             txn,
             arena,
+            params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
             scratch: scratch as *mut _,
@@ -35148,6 +36350,7 @@ pub(crate) fn update<'a>(
             storage,
             txn,
             arena,
+            params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
             scratch: scratch as *mut _,
@@ -35794,6 +36997,7 @@ pub(crate) fn update<'a>(
             storage,
             txn,
             arena,
+            params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
             scratch: scratch as *mut _,
@@ -35894,6 +37098,7 @@ pub(crate) fn delete<'a>(
             storage,
             txn,
             arena,
+            params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
             scratch: scratch as *mut _,
@@ -36222,6 +37427,7 @@ pub(crate) fn delete<'a>(
             storage,
             txn,
             arena,
+            params: crate::sql::eval::NO_PARAMS,
             seq_session,
             responder,
             scratch: scratch as *mut _,
@@ -36363,6 +37569,7 @@ pub fn truncate(
                 storage,
                 txn,
                 arena,
+                params: crate::sql::eval::NO_PARAMS,
                 seq_session,
                 responder,
                 scratch: scratch as *mut _,
@@ -36459,6 +37666,7 @@ pub fn truncate(
                 storage,
                 txn,
                 arena,
+                params: crate::sql::eval::NO_PARAMS,
                 seq_session,
                 responder,
                 scratch: scratch as *mut _,
@@ -40137,6 +41345,45 @@ pub(crate) fn coerce<'a>(
         }
     })?;
     apply_typmod(v, col.ctype, col.type_mod, arena)
+}
+
+/// Coerces one evaluated call argument into its declared routine contract.
+/// Resolution has already established that an implicit cast exists; this
+/// boundary preserves user-defined type validation before the routine can see
+/// the value.
+pub(crate) fn coerce_routine_argument<'a>(
+    value: Datum<'a>,
+    argument: crate::storage::RoutineArgumentDef,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if let Some(identity) = argument.user_type
+        && !matches!(argument.ctype, ColType::Array(_))
+        && let Some(slot) =
+            storage.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+    {
+        return coerce_domain_value(storage, slot, value, txid, arena, &[]);
+    }
+    match argument.ctype {
+        ColType::Composite(slot) => match value {
+            Datum::CompositeText {
+                slot: actual, text, ..
+            } if actual == slot => decode_composite_text(text, slot, storage, txid, arena),
+            value => coerce_composite_value(value, slot, storage, txid, arena),
+        },
+        ColType::Enum(slot) => coerce_enum_value(value, slot, storage, txid, arena),
+        ColType::Array(
+            element @ (crate::sql::types::ArrElem::Enum(_)
+            | crate::sql::types::ArrElem::Composite(_)
+            | crate::sql::types::ArrElem::Domain { .. }),
+        ) => coerce_user_type_array(value, element, storage, txid, arena),
+        ctype if ctype.is_reg_object() => {
+            let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+            crate::sql::eval::regobject_cast(value, ctype, Some(&catalog), arena)
+        }
+        ctype => cast_to(value, ctype, arena),
+    }
 }
 
 /// Renders a composite in stable physical-attribute order for persistence.

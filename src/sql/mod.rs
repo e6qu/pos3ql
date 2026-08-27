@@ -6816,6 +6816,18 @@ impl Engine {
                     return Ok(Err(query::routine_forbidden_statement_error(forbidden)));
                 }
             };
+            let statement = match query::bind_stored_routine_statement(
+                statement,
+                &self.storage,
+                slot,
+                routine,
+                txn.txid,
+                arena,
+                arguments,
+            ) {
+                Ok(statement) => statement,
+                Err(error) => return Ok(Err(error)),
+            };
             self.work.reset();
             match self.execute_routine_stmt(
                 statement, arena, arguments, txn, sqlprep, cursors, guc, responder, None,
@@ -6851,9 +6863,11 @@ impl Engine {
             query::RoutineFunctionResult::Query(result_query) => loop {
                 self.work.reset();
                 nested_invocations.begin_attempt();
-                let outcome = query::execute_routine_query(
+                let outcome = query::execute_bound_routine_query(
                     result_query,
                     &self.storage,
+                    slot,
+                    routine,
                     txn.txid,
                     &self.work,
                     arguments,
@@ -6883,89 +6897,117 @@ impl Engine {
                     break Err(error);
                 }
             },
-            query::RoutineFunctionResult::DataModification(statement) => loop {
-                self.work.reset();
-                nested_invocations.begin_attempt();
-                has_result.set(false);
-                let mark =
-                    txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-                let outcome = self.execute_routine_stmt(
+            query::RoutineFunctionResult::DataModification(statement) => {
+                let statement = match query::bind_stored_routine_statement(
                     statement,
+                    &self.storage,
+                    slot,
+                    routine,
+                    txn.txid,
                     arena,
                     arguments,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                    Some(&mut capture_result),
-                )?;
-                let Err(error) = outcome else {
-                    responder.buffer.truncate_to(output_mark);
-                    break Ok(());
+                ) {
+                    Ok(statement) => statement,
+                    Err(error) => return Ok(Err(error)),
                 };
-                if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                loop {
+                    self.work.reset();
+                    nested_invocations.begin_attempt();
+                    has_result.set(false);
+                    let mark =
+                        txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+                    let outcome = self.execute_routine_stmt(
+                        statement,
+                        arena,
+                        arguments,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                        Some(&mut capture_result),
+                    )?;
+                    let Err(error) = outcome else {
+                        responder.buffer.truncate_to(output_mark);
+                        break Ok(());
+                    };
+                    if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                        responder.buffer.truncate_to(output_mark);
+                        break Err(error);
+                    }
+                    self.rollback_waiting_statement(txn, mark);
                     responder.buffer.truncate_to(output_mark);
-                    break Err(error);
+                    let Some(pending) = nested_invocations.take_pending() else {
+                        break Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "nested routine invocation yielded without a pending call"
+                        ));
+                    };
+                    if let Err(error) = self.complete_pending_routine(
+                        pending,
+                        &nested_invocations,
+                        arena,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                    )? {
+                        break Err(error);
+                    }
                 }
-                self.rollback_waiting_statement(txn, mark);
-                responder.buffer.truncate_to(output_mark);
-                let Some(pending) = nested_invocations.take_pending() else {
-                    break Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "nested routine invocation yielded without a pending call"
-                    ));
-                };
-                if let Err(error) = self.complete_pending_routine(
-                    pending,
-                    &nested_invocations,
+            }
+            query::RoutineFunctionResult::Void(statement) => {
+                let statement = match query::bind_stored_routine_statement(
+                    statement,
+                    &self.storage,
+                    slot,
+                    routine,
+                    txn.txid,
                     arena,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                )? {
-                    break Err(error);
-                }
-            },
-            query::RoutineFunctionResult::Void(statement) => loop {
-                self.work.reset();
-                nested_invocations.begin_attempt();
-                let mark =
-                    txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-                let outcome = self.execute_routine_stmt(
-                    statement, arena, arguments, txn, sqlprep, cursors, guc, responder, None,
-                )?;
-                let Err(error) = outcome else {
-                    responder.buffer.truncate_to(output_mark);
-                    break Ok(());
+                    arguments,
+                ) {
+                    Ok(statement) => statement,
+                    Err(error) => return Ok(Err(error)),
                 };
-                if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                loop {
+                    self.work.reset();
+                    nested_invocations.begin_attempt();
+                    let mark =
+                        txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+                    let outcome = self.execute_routine_stmt(
+                        statement, arena, arguments, txn, sqlprep, cursors, guc, responder, None,
+                    )?;
+                    let Err(error) = outcome else {
+                        responder.buffer.truncate_to(output_mark);
+                        break Ok(());
+                    };
+                    if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                        responder.buffer.truncate_to(output_mark);
+                        break Err(error);
+                    }
+                    self.rollback_waiting_statement(txn, mark);
                     responder.buffer.truncate_to(output_mark);
-                    break Err(error);
+                    let Some(pending) = nested_invocations.take_pending() else {
+                        break Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "nested routine invocation yielded without a pending call"
+                        ));
+                    };
+                    if let Err(error) = self.complete_pending_routine(
+                        pending,
+                        &nested_invocations,
+                        arena,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                    )? {
+                        break Err(error);
+                    }
                 }
-                self.rollback_waiting_statement(txn, mark);
-                responder.buffer.truncate_to(output_mark);
-                let Some(pending) = nested_invocations.take_pending() else {
-                    break Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "nested routine invocation yielded without a pending call"
-                    ));
-                };
-                if let Err(error) = self.complete_pending_routine(
-                    pending,
-                    &nested_invocations,
-                    arena,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                )? {
-                    break Err(error);
-                }
-            },
+            }
             query::RoutineFunctionResult::Forbidden(statement) => {
                 Err(query::routine_forbidden_statement_error(statement))
             }
@@ -7158,6 +7200,18 @@ impl Engine {
                 responder.buffer.truncate_to(output_mark);
                 return Ok(Err(query::routine_forbidden_statement_error(statement)));
             };
+            let statement = match query::bind_stored_routine_statement(
+                statement,
+                &self.storage,
+                pending.slot,
+                routine,
+                txn.txid,
+                arena,
+                &arguments[..pending.argument_count],
+            ) {
+                Ok(statement) => statement,
+                Err(error) => return Ok(Err(error)),
+            };
             self.work.reset();
             match self.execute_routine_stmt(
                 statement,
@@ -7237,9 +7291,11 @@ impl Engine {
                 self.work.reset();
                 nested_invocations.begin_attempt();
                 len.set(0);
-                let outcome = query::execute_routine_query(
+                let outcome = query::execute_bound_routine_query(
                     result,
                     &self.storage,
+                    pending.slot,
+                    routine,
                     txn.txid,
                     &self.work,
                     &arguments[..pending.argument_count],
@@ -7269,87 +7325,115 @@ impl Engine {
                     break Err(error);
                 }
             },
-            query::RoutineFunctionResult::DataModification(statement) => loop {
-                self.work.reset();
-                nested_invocations.begin_attempt();
-                len.set(0);
-                let mark =
-                    txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-                let outcome = self.execute_routine_stmt(
+            query::RoutineFunctionResult::DataModification(statement) => {
+                let statement = match query::bind_stored_routine_statement(
                     statement,
+                    &self.storage,
+                    pending.slot,
+                    routine,
+                    txn.txid,
                     arena,
                     &arguments[..pending.argument_count],
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                    Some(&mut capture_rows),
-                )?;
-                let Err(error) = outcome else { break Ok(()) };
-                if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
-                    break Err(error);
-                }
-                self.rollback_waiting_statement(txn, mark);
-                let Some(pending) = nested_invocations.take_pending() else {
-                    break Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "nested routine invocation yielded without a pending call"
-                    ));
+                ) {
+                    Ok(statement) => statement,
+                    Err(error) => return Ok(Err(error)),
                 };
-                if let Err(error) = self.complete_pending_routine(
-                    pending,
-                    &nested_invocations,
-                    arena,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                )? {
-                    break Err(error);
+                loop {
+                    self.work.reset();
+                    nested_invocations.begin_attempt();
+                    len.set(0);
+                    let mark =
+                        txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+                    let outcome = self.execute_routine_stmt(
+                        statement,
+                        arena,
+                        &arguments[..pending.argument_count],
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                        Some(&mut capture_rows),
+                    )?;
+                    let Err(error) = outcome else { break Ok(()) };
+                    if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                        break Err(error);
+                    }
+                    self.rollback_waiting_statement(txn, mark);
+                    let Some(pending) = nested_invocations.take_pending() else {
+                        break Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "nested routine invocation yielded without a pending call"
+                        ));
+                    };
+                    if let Err(error) = self.complete_pending_routine(
+                        pending,
+                        &nested_invocations,
+                        arena,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                    )? {
+                        break Err(error);
+                    }
                 }
-            },
-            query::RoutineFunctionResult::Void(statement) => loop {
-                self.work.reset();
-                nested_invocations.begin_attempt();
-                let mark =
-                    txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
-                let outcome = self.execute_routine_stmt(
+            }
+            query::RoutineFunctionResult::Void(statement) => {
+                let statement = match query::bind_stored_routine_statement(
                     statement,
+                    &self.storage,
+                    pending.slot,
+                    routine,
+                    txn.txid,
                     arena,
                     &arguments[..pending.argument_count],
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                    None,
-                )?;
-                let Err(error) = outcome else { break Ok(()) };
-                if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
-                    break Err(error);
-                }
-                self.rollback_waiting_statement(txn, mark);
-                let Some(pending) = nested_invocations.take_pending() else {
-                    break Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "nested routine invocation yielded without a pending call"
-                    ));
+                ) {
+                    Ok(statement) => statement,
+                    Err(error) => return Ok(Err(error)),
                 };
-                if let Err(error) = self.complete_pending_routine(
-                    pending,
-                    &nested_invocations,
-                    arena,
-                    txn,
-                    sqlprep,
-                    cursors,
-                    guc,
-                    responder,
-                )? {
-                    break Err(error);
+                loop {
+                    self.work.reset();
+                    nested_invocations.begin_attempt();
+                    let mark =
+                        txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+                    let outcome = self.execute_routine_stmt(
+                        statement,
+                        arena,
+                        &arguments[..pending.argument_count],
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                        None,
+                    )?;
+                    let Err(error) = outcome else { break Ok(()) };
+                    if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                        break Err(error);
+                    }
+                    self.rollback_waiting_statement(txn, mark);
+                    let Some(pending) = nested_invocations.take_pending() else {
+                        break Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "nested routine invocation yielded without a pending call"
+                        ));
+                    };
+                    if let Err(error) = self.complete_pending_routine(
+                        pending,
+                        &nested_invocations,
+                        arena,
+                        txn,
+                        sqlprep,
+                        cursors,
+                        guc,
+                        responder,
+                    )? {
+                        break Err(error);
+                    }
                 }
-            },
+            }
             query::RoutineFunctionResult::Forbidden(statement) => {
                 Err(query::routine_forbidden_statement_error(statement))
             }
@@ -7543,102 +7627,21 @@ impl Engine {
         body: &str,
         arena: &Arena,
         txn: &mut TxnState,
-        sqlprep: &mut SqlPreparedPool,
-        cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        let source = body.trim().trim_end_matches(';').trim();
-        if source
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("declare"))
-        {
-            return Ok(Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "anonymous-block declarations are not supported"
-            )));
+        match exec::execute_anonymous_plpgsql(
+            &mut self.storage,
+            txn,
+            &mut self.dml_scratch,
+            body,
+            arena,
+            guc.seq_session(),
+            responder,
+        ) {
+            Ok(()) => responder.command_complete("DO").map(|_| Ok(())),
+            Err(error) => Ok(Err(error)),
         }
-        let Some(after_begin) = source.get(5..).filter(|_| {
-            source
-                .get(..5)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("begin"))
-                && source.as_bytes().get(5).is_none_or(u8::is_ascii_whitespace)
-        }) else {
-            return Ok(Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "anonymous PL/pgSQL block must start with BEGIN"
-            )));
-        };
-        let after_begin = after_begin.trim();
-        let Some(end_at) = after_begin.char_indices().rev().find_map(|(at, _)| {
-            after_begin
-                .get(at..at + 3)
-                .filter(|word| word.eq_ignore_ascii_case("end"))
-                .filter(|_| after_begin[at + 3..].trim().is_empty())
-                .map(|_| at)
-        }) else {
-            return Ok(Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "anonymous PL/pgSQL block must end with END"
-            )));
-        };
-        let statements_source = after_begin[..end_at].trim();
-        let mut parser = match Parser::new(statements_source, arena) {
-            Ok(parser) => parser,
-            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
-        };
-        let output_mark = responder.buffer.mark();
-        loop {
-            let statement = match parser.next_stmt() {
-                Ok(Some(statement)) => statement,
-                Ok(None) => break,
-                Err(error) => {
-                    responder.buffer.truncate_to(output_mark);
-                    return Ok(Err(parse_error_to_sql(&error)));
-                }
-            };
-            if txn.is_explicit()
-                && matches!(
-                    statement,
-                    Stmt::Begin(_)
-                        | Stmt::Commit
-                        | Stmt::Rollback
-                        | Stmt::Savepoint(_)
-                        | Stmt::ReleaseSavepoint(_)
-                        | Stmt::RollbackToSavepoint(_)
-                )
-            {
-                responder.buffer.truncate_to(output_mark);
-                return Ok(Err(sql_err!(
-                    sqlstate::INVALID_TRANSACTION_TERMINATION,
-                    "invalid transaction termination"
-                )));
-            }
-            self.work.reset();
-            match self.execute_routine_stmt(
-                &statement,
-                arena,
-                &[],
-                txn,
-                sqlprep,
-                cursors,
-                guc,
-                responder,
-                None,
-            ) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    responder.buffer.truncate_to(output_mark);
-                    return Ok(Err(error));
-                }
-                Err(error) => {
-                    responder.buffer.truncate_to(output_mark);
-                    return Err(error);
-                }
-            }
-        }
-        responder.buffer.truncate_to(output_mark);
-        responder.command_complete("DO").map(|_| Ok(()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7853,6 +7856,18 @@ impl Engine {
                 txn.txid,
             )
             .expect("resolved procedure call has a valid polymorphic binding");
+        for (index, argument) in routine.arguments().iter().copied().enumerate() {
+            completed[index] = match exec::coerce_routine_argument(
+                completed[index],
+                argument,
+                &self.storage,
+                txn.txid,
+                arena,
+            ) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+        }
         let owner = self
             .storage
             .role_name(routine.ownership.owner_to(txn.txid).into(), txn.txid);
@@ -7864,6 +7879,69 @@ impl Engine {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
         };
+        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+            let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let output_count = match exec::execute_plpgsql_procedure(
+                &mut self.storage,
+                txn,
+                &mut self.dml_scratch,
+                &routine,
+                &completed[..declared.argument_count],
+                arena,
+                guc.seq_session(),
+                responder,
+                &mut output_values,
+            ) {
+                Ok(count) => count,
+                Err(error) => return Ok(Err(error)),
+            };
+            if output_count != 0 {
+                let mut description =
+                    [ColDesc::new("", types::oid::TEXT, -1); crate::storage::MAX_ROUTINE_ARGUMENTS];
+                let mut output_index = 0usize;
+                for parameter in routine.parameters() {
+                    if !parameter.mode.is_output() {
+                        continue;
+                    }
+                    let type_oid = match self.storage.routine_type_oid(
+                        parameter.ctype,
+                        parameter.user_type,
+                        txn.txid,
+                    ) {
+                        Some(oid) => oid,
+                        None => {
+                            return Ok(Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "procedure output type identity is unavailable"
+                            )));
+                        }
+                    };
+                    description[output_index] = ColDesc::new(
+                        match arena.alloc_str(parameter.name.as_str()) {
+                            Ok(name) => name,
+                            Err(_) => return Ok(Err(eval::arena_full())),
+                        },
+                        type_oid,
+                        parameter.ctype.typlen(),
+                    );
+                    output_values[output_index] =
+                        match eval::cast_to(output_values[output_index], parameter.ctype, arena) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                    output_index += 1;
+                }
+                responder.row_description(&description[..output_count])?;
+                responder.data_row(&output_values[..output_count])?;
+            }
+            return responder.command_complete("CALL").map(|_| Ok(()));
+        }
+        if routine.language != crate::storage::RoutineLanguage::Sql {
+            return Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "procedure language is not executable"
+            )));
+        }
         let body = routine.body;
         let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
         let mut parser = match Parser::new(body.as_str(), arena).and_then(|parser| {
@@ -7915,6 +7993,18 @@ impl Engine {
             .map(|statement| statement.as_ref().expect("parsed procedure statement"))
             .enumerate()
         {
+            let statement = match query::bind_stored_routine_statement(
+                statement,
+                &self.storage,
+                slot,
+                routine,
+                txn.txid,
+                arena,
+                &completed[..declared.argument_count],
+            ) {
+                Ok(statement) => statement,
+                Err(error) => return Ok(Err(error)),
+            };
             // A top-level CALL has no enclosing query workspace; reclaim each
             // suppressed internal result exactly as the ordinary dispatcher
             // did before routine dispatch gained a non-resetting mode.
@@ -7932,9 +8022,11 @@ impl Engine {
                         "SQL procedure with output parameters must end with a query"
                     )));
                 };
-                if let Err(error) = query::execute_routine_query(
+                if let Err(error) = query::execute_bound_routine_query(
                     &output_query,
                     &self.storage,
+                    slot,
+                    routine,
                     txn.txid,
                     arena,
                     &completed[..declared.argument_count],
@@ -8558,9 +8650,7 @@ impl Engine {
                 guc,
                 responder,
             ),
-            Stmt::Do { body } => {
-                self.execute_do(body, arena, txn, sqlprep, cursors, guc, responder)
-            }
+            Stmt::Do { body } => self.execute_do(body, arena, txn, guc, responder),
             Stmt::CreateLanguage(language) => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "{}",
@@ -12874,7 +12964,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_domain_drop(slot);
             }
         }
-        WalOp::CreateRoutine(definition) => storage.replay_create_routine(definition)?,
+        WalOp::CreateRoutine {
+            definition,
+            dependencies,
+        } => storage.replay_create_routine(definition, dependencies.materialize()?)?,
         WalOp::DropRoutine {
             schema,
             name,

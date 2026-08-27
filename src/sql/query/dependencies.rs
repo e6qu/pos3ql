@@ -1025,8 +1025,7 @@ pub(super) fn stored_routine_dependency_for_call(
     txid: u32,
     dependencies: &StoredQueryDependencies,
 ) -> Result<Option<StoredQueryDependency>, SqlError> {
-    let (referenced_schema, referenced_name) =
-        name.split_once('.').map_or(("", name), |parts| parts);
+    let (referenced_schema, referenced_name) = name.split_once('.').unwrap_or(("", name));
     let mut candidates = dependencies.entries().iter().copied().filter(|dependency| {
         dependency.class == DependencyClass::Routine
             && dependency.referenced_schema.as_str() == referenced_schema

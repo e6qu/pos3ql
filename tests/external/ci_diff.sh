@@ -231,6 +231,7 @@ if POS3QL_PORT=$P3_PORT POS3QL_EXTENSION_WIRE=1 \
 else bad "wire probes"; cat "$WORK/wire.out"; fi
 
 # --- psycopg driver (extended protocol, binary params) ---------------------
+restart_p3_fresh || exit 1
 echo "=== psycopg driver ==="
 if POS3QL_PORT=$P3_PORT "$PY" - <<EOF > "$WORK/driver.out" 2>&1
 import sys

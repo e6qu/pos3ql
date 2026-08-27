@@ -199,6 +199,7 @@ pub mod sqlstate {
     pub const INVALID_TABLESAMPLE_REPEAT: &str = "2202G";
     pub const INVALID_TABLESAMPLE_ARGUMENT: &str = "2202H";
     pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
+    pub const INVALID_TRANSACTION_TERMINATION: &str = "2D000";
     pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
     pub const DUPLICATE_COLUMN: &str = "42701";
     pub const DUPLICATE_ALIAS: &str = "42712";

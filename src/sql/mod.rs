@@ -347,7 +347,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Analyze(_)
         | Stmt::Listen(_)
         | Stmt::Unlisten(_) => false,
-        Stmt::Call { .. } => true,
+        Stmt::Call { .. } | Stmt::Do { .. } => true,
         Stmt::Copy(copy) => !copy.to,
         // A WITH wrapper exists only for a data-modifying main statement.
         Stmt::With { .. }
@@ -361,6 +361,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateView { .. }
         | Stmt::CreateRoutine(_)
         | Stmt::CreateAggregate(_)
+        | Stmt::CreateLanguage(_)
+        | Stmt::AlterLanguage { .. }
+        | Stmt::DropLanguage { .. }
         | Stmt::AlterRoutine { .. }
         | Stmt::AlterAggregate { .. }
         | Stmt::DropFunction { .. }
@@ -5241,6 +5244,42 @@ impl Engine {
                     self.infer_resolved_select_params(select, txid, arena, oids);
                 }
             }
+            Stmt::Call {
+                name,
+                arguments,
+                argument_names,
+                variadic,
+            } => {
+                let mut actual = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                if arguments.len() > actual.len() {
+                    return;
+                }
+                for (index, argument) in arguments.iter().copied().enumerate() {
+                    actual[index] = exec::infer_type_catalog(argument, None, &self.storage, txid)
+                        .map_or(types::oid::UNKNOWN, |inferred| inferred.0);
+                }
+                let qualified = match name.schema {
+                    Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
+                    None => stack_format!(260, "{}", name.name),
+                };
+                if let Some(expected) = self.storage.procedure_call_parameter_oids(
+                    qualified.as_str(),
+                    argument_names,
+                    *variadic,
+                    &actual[..arguments.len()],
+                    txid,
+                ) {
+                    for (argument, expected_oid) in arguments.iter().copied().zip(expected) {
+                        if let Expr::Param(index) = argument
+                            && expected_oid != types::oid::UNKNOWN
+                            && *index >= 1
+                            && (*index as usize) <= MAX_BIND_PARAMS
+                        {
+                            oids[*index as usize - 1] = expected_oid;
+                        }
+                    }
+                }
+            }
             Stmt::Explain { statement, .. } => {
                 self.infer_resolved_stmt_params(statement, txid, arena, oids);
             }
@@ -5353,6 +5392,33 @@ impl Engine {
             }
         };
         match expression {
+            Expr::Call {
+                name,
+                args,
+                argument_names,
+                variadic,
+                ..
+            } => {
+                let mut actual = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                if args.len() <= actual.len() {
+                    for (index, argument) in args.iter().copied().enumerate() {
+                        actual[index] = infer(argument).unwrap_or(types::oid::UNKNOWN);
+                    }
+                    if let Some(expected) = self.storage.function_call_parameter_oids(
+                        name,
+                        argument_names,
+                        *variadic,
+                        &actual[..args.len()],
+                        txid,
+                    ) {
+                        for (argument, expected_oid) in args.iter().copied().zip(expected) {
+                            if expected_oid != types::oid::UNKNOWN {
+                                assign(argument, expected_oid, oids);
+                            }
+                        }
+                    }
+                }
+            }
             Expr::Cast {
                 operand, type_name, ..
             } => {
@@ -6724,6 +6790,17 @@ impl Engine {
         if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
             return Ok(Err(error));
         }
+        let owner = self
+            .storage
+            .role_name(routine.ownership.owner_to(txn.txid).into(), txn.txid);
+        let _security = routine
+            .attributes
+            .security_definer
+            .then(|| eval::funcs::system::enter_current_user(owner.as_str()));
+        let _config = match guc.enter_routine_configs(routine.configs()) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
         let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
         let nested_invocations = query::RoutineInvocationState::new();
         nested_invocations.begin_attempt();
@@ -6950,7 +7027,8 @@ impl Engine {
                 )));
             }
         };
-        let program = match query::parse_routine_function_program(
+        let program = match query::parse_stored_routine_function_program(
+            routine.body_kind,
             body,
             arena,
             result_type == ColType::Void,
@@ -7010,6 +7088,17 @@ impl Engine {
         if let Err(error) = self.storage.require_routine_execute(pending.slot, txn.txid) {
             return Ok(Err(error));
         }
+        let owner = self
+            .storage
+            .role_name(routine.ownership.owner_to(txn.txid).into(), txn.txid);
+        let _security = routine
+            .attributes
+            .security_definer
+            .then(|| eval::funcs::system::enter_current_user(owner.as_str()));
+        let _config = match guc.enter_routine_configs(routine.configs()) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
         let body = match arena.alloc_str(routine.body.as_str()) {
             Ok(body) => body,
             Err(_) => {
@@ -7029,7 +7118,8 @@ impl Engine {
             }
         };
         let result_type = routine.kind.function_result().expect("set routine result");
-        let program = match query::parse_routine_function_program(
+        let program = match query::parse_stored_routine_function_program(
+            routine.body_kind,
             body,
             arena,
             result_type == ColType::Void,
@@ -7448,6 +7538,110 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn execute_do(
+        &mut self,
+        body: &str,
+        arena: &Arena,
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let source = body.trim().trim_end_matches(';').trim();
+        if source
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("declare"))
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "anonymous-block declarations are not supported"
+            )));
+        }
+        let Some(after_begin) = source.get(5..).filter(|_| {
+            source
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("begin"))
+                && source.as_bytes().get(5).is_none_or(u8::is_ascii_whitespace)
+        }) else {
+            return Ok(Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "anonymous PL/pgSQL block must start with BEGIN"
+            )));
+        };
+        let after_begin = after_begin.trim();
+        let Some(end_at) = after_begin.char_indices().rev().find_map(|(at, _)| {
+            after_begin
+                .get(at..at + 3)
+                .filter(|word| word.eq_ignore_ascii_case("end"))
+                .filter(|_| after_begin[at + 3..].trim().is_empty())
+                .map(|_| at)
+        }) else {
+            return Ok(Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "anonymous PL/pgSQL block must end with END"
+            )));
+        };
+        let statements_source = after_begin[..end_at].trim();
+        let mut parser = match Parser::new(statements_source, arena) {
+            Ok(parser) => parser,
+            Err(error) => return Ok(Err(parse_error_to_sql(&error))),
+        };
+        let output_mark = responder.buffer.mark();
+        loop {
+            let statement = match parser.next_stmt() {
+                Ok(Some(statement)) => statement,
+                Ok(None) => break,
+                Err(error) => {
+                    responder.buffer.truncate_to(output_mark);
+                    return Ok(Err(parse_error_to_sql(&error)));
+                }
+            };
+            if txn.is_explicit()
+                && matches!(
+                    statement,
+                    Stmt::Begin(_)
+                        | Stmt::Commit
+                        | Stmt::Rollback
+                        | Stmt::Savepoint(_)
+                        | Stmt::ReleaseSavepoint(_)
+                        | Stmt::RollbackToSavepoint(_)
+                )
+            {
+                responder.buffer.truncate_to(output_mark);
+                return Ok(Err(sql_err!(
+                    sqlstate::INVALID_TRANSACTION_TERMINATION,
+                    "invalid transaction termination"
+                )));
+            }
+            self.work.reset();
+            match self.execute_routine_stmt(
+                &statement,
+                arena,
+                &[],
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+                None,
+            ) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    responder.buffer.truncate_to(output_mark);
+                    return Ok(Err(error));
+                }
+                Err(error) => {
+                    responder.buffer.truncate_to(output_mark);
+                    return Err(error);
+                }
+            }
+        }
+        responder.buffer.truncate_to(output_mark);
+        responder.command_complete("DO").map(|_| Ok(()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn execute_call(
         &mut self,
         name: ast::QualName<'_>,
@@ -7659,6 +7853,17 @@ impl Engine {
                 txn.txid,
             )
             .expect("resolved procedure call has a valid polymorphic binding");
+        let owner = self
+            .storage
+            .role_name(routine.ownership.owner_to(txn.txid).into(), txn.txid);
+        let _security = routine
+            .attributes
+            .security_definer
+            .then(|| eval::funcs::system::enter_current_user(owner.as_str()));
+        let _config = match guc.enter_routine_configs(routine.configs()) {
+            Ok(scope) => scope,
+            Err(error) => return Ok(Err(error)),
+        };
         let body = routine.body;
         let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
         let mut parser = match Parser::new(body.as_str(), arena).and_then(|parser| {
@@ -7912,10 +8117,15 @@ impl Engine {
                 return Ok(Err(error));
             }
         }
-        let session_user = guc.session_user();
-        eval::funcs::system::set_session_user(session_user.as_str());
-        let current_role = guc.current_role();
-        eval::funcs::system::set_current_user(current_role.as_str());
+        let current_role = if reset_workspace {
+            let session_user = guc.session_user();
+            eval::funcs::system::set_session_user(session_user.as_str());
+            let current_role = guc.current_role();
+            eval::funcs::system::set_current_user(current_role.as_str());
+            current_role
+        } else {
+            eval::funcs::system::current_user_owned()
+        };
         let raw_path = guc.search_path();
         let path = self
             .storage
@@ -8215,6 +8425,7 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 routine,
+                guc,
                 arena,
                 responder,
             ),
@@ -8347,17 +8558,36 @@ impl Engine {
                 guc,
                 responder,
             ),
+            Stmt::Do { body } => {
+                self.execute_do(body, arena, txn, sqlprep, cursors, guc, responder)
+            }
+            Stmt::CreateLanguage(language) => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{}",
+                if language.handler.is_some() {
+                    "native procedural-language handlers are not supported"
+                } else {
+                    "handlerless CREATE LANGUAGE is not supported"
+                }
+            ))),
+            Stmt::AlterLanguage { .. } | Stmt::DropLanguage { .. } => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "procedural-language catalog mutation is not supported"
+            ))),
             Stmt::AlterRoutine {
                 kind,
                 routine,
-                action,
+                actions,
             } => exec::alter_routine(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                *kind,
-                routine,
-                *action,
+                exec::AlterRoutineCommand {
+                    kind: *kind,
+                    identity: routine,
+                    actions,
+                    guc: Some(guc),
+                },
                 responder,
             ),
             Stmt::AlterAggregate { aggregate, action } => exec::alter_aggregate(
@@ -9663,6 +9893,8 @@ impl Engine {
                                 )));
                             }
                         }
+                        guc::publish_active_setting(guc, name);
+                        responder.set_render(guc.render());
                         responder.command_complete("SET")?;
                         Ok(Ok(()))
                     }

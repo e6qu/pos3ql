@@ -3127,14 +3127,51 @@ pub fn function_def_text<'a>(
         crate::storage::RoutineParallel::Unsafe => Ok(()),
     }
     .map_err(|_| super::eval::arena_full())?;
-    write!(definition, " AS '").map_err(|_| super::eval::arena_full())?;
-    for character in routine.body.as_str().chars() {
-        write!(definition, "{character}").map_err(|_| super::eval::arena_full())?;
-        if character == '\'' {
+    if routine.attributes.security_definer {
+        write!(definition, " SECURITY DEFINER").map_err(|_| super::eval::arena_full())?;
+    }
+    if routine.attributes.leakproof {
+        write!(definition, " LEAKPROOF").map_err(|_| super::eval::arena_full())?;
+    }
+    if let Some(bits) = routine.attributes.cost_bits {
+        write!(definition, " COST {}", f64::from_bits(bits))
+            .map_err(|_| super::eval::arena_full())?;
+    }
+    if let Some(bits) = routine.attributes.rows_bits {
+        write!(definition, " ROWS {}", f64::from_bits(bits))
+            .map_err(|_| super::eval::arena_full())?;
+    }
+    for config in routine.configs() {
+        write!(definition, " SET {} TO '", config.name.as_str())
+            .map_err(|_| super::eval::arena_full())?;
+        for character in config.value.as_str().chars() {
+            write!(definition, "{character}").map_err(|_| super::eval::arena_full())?;
+            if character == '\'' {
+                write!(definition, "'").map_err(|_| super::eval::arena_full())?;
+            }
+        }
+        write!(definition, "'").map_err(|_| super::eval::arena_full())?;
+    }
+    match routine.body_kind {
+        crate::storage::RoutineBodyKind::String => {
+            write!(definition, " AS '").map_err(|_| super::eval::arena_full())?;
+            for character in routine.body.as_str().chars() {
+                write!(definition, "{character}").map_err(|_| super::eval::arena_full())?;
+                if character == '\'' {
+                    write!(definition, "'").map_err(|_| super::eval::arena_full())?;
+                }
+            }
             write!(definition, "'").map_err(|_| super::eval::arena_full())?;
         }
+        crate::storage::RoutineBodyKind::Return => {
+            write!(definition, " RETURN {}", routine.body.as_str())
+                .map_err(|_| super::eval::arena_full())?;
+        }
+        crate::storage::RoutineBodyKind::Atomic => {
+            write!(definition, " BEGIN ATOMIC\n{};\nEND", routine.body.as_str())
+                .map_err(|_| super::eval::arena_full())?;
+        }
     }
-    write!(definition, "'").map_err(|_| super::eval::arena_full())?;
     if definition.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -8651,6 +8688,36 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             ("lanacl", ColType::Array(super::types::ArrElem::Text)),
         ],
     );
+    let internal = row(
+        &[
+            Datum::Int4(2612),
+            Datum::Int4(12),
+            text("internal", arena)?,
+            Datum::Int4(10),
+            Datum::Bool(false),
+            Datum::Bool(false),
+            Datum::Int4(0),
+            Datum::Int4(2246),
+            Datum::Int4(0),
+            Datum::Null,
+        ],
+        arena,
+    )?;
+    let c = row(
+        &[
+            Datum::Int4(2612),
+            Datum::Int4(13),
+            text("c", arena)?,
+            Datum::Int4(10),
+            Datum::Bool(false),
+            Datum::Bool(false),
+            Datum::Int4(0),
+            Datum::Int4(2247),
+            Datum::Int4(0),
+            Datum::Null,
+        ],
+        arena,
+    )?;
     let sql = row(
         &[
             Datum::Int4(2612),
@@ -8681,7 +8748,7 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         ],
         arena,
     )?;
-    finish(definition, &[sql, plpgsql], arena)
+    finish(definition, &[internal, c, sql, plpgsql], arena)
 }
 
 fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
@@ -8696,7 +8763,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("prorettype", ColType::Oid),
             ("proretset", ColType::Bool),
             ("prokind", ColType::Bpchar),
-            ("proargtypes", ColType::Text),
+            ("proargtypes", ColType::OidVector),
             ("provolatile", ColType::Bpchar),
             ("proparallel", ColType::Bpchar),
             ("proowner", ColType::Oid),
@@ -8710,8 +8777,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("proconfig", ColType::Array(super::types::ArrElem::Text)),
             ("procost", ColType::Float8),
             ("prorows", ColType::Float8),
-            ("protrftypes", ColType::Array(super::types::ArrElem::Int4)),
-            ("prosupport", ColType::Text),
+            ("protrftypes", ColType::Array(super::types::ArrElem::Oid)),
+            ("prosupport", ColType::Regproc),
             ("pronargdefaults", ColType::Int4),
             ("provariadic", ColType::Oid),
             ("proallargtypes", ColType::Array(super::types::ArrElem::Oid)),
@@ -8724,6 +8791,26 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     const MAX_ROWS: usize = 512;
     let mut rows: [&[Datum]; MAX_ROWS] = [&[]; MAX_ROWS];
     for (index, routine) in INTRINSIC_ROUTINES.iter().enumerate() {
+        let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_count = 0usize;
+        for written in routine.argument_types.split_ascii_whitespace() {
+            if argument_count == argument_oids.len() {
+                return Err(catalog_capacity_exceeded("pg_proc.proargtypes"));
+            }
+            argument_oids[argument_count] = written.parse().map_err(|_| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "intrinsic routine has an invalid argument OID"
+                )
+            })?;
+            argument_count += 1;
+        }
+        if argument_count != routine.argument_count as usize {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "intrinsic routine argument count does not match its OID vector"
+            ));
+        }
         rows[index] = row(
             &[
                 Datum::Int4(1255),
@@ -8734,7 +8821,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(routine.result_oid),
                 Datum::Bool(false),
                 Datum::Bpchar("f"),
-                text(routine.argument_types, arena)?,
+                oidvector(&argument_oids[..argument_count], arena)?,
                 Datum::Bpchar(routine.volatility),
                 Datum::Bpchar(intrinsic_routine_parallel(*routine)),
                 Datum::Int4(10),
@@ -8749,14 +8836,18 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     },
                     arena,
                 )?,
-                text("", arena)?,
+                Datum::Null,
                 Datum::Bool(intrinsic_routine_is_strict(*routine)),
                 Datum::Bool(false),
                 Datum::Null,
                 Datum::Float8(1.0),
                 Datum::Float8(0.0),
                 Datum::Null,
-                text("-", arena)?,
+                Datum::RegObject {
+                    type_oid: super::types::oid::REGPROC,
+                    referenced_oid: 0,
+                    name: "-",
+                },
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Null,
@@ -8777,11 +8868,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_proc"));
         }
-        let mut argument_types = crate::util::StackStr::<128>::new();
+        let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (index, argument) in routine.arguments().iter().enumerate() {
-            if index > 0 {
-                let _ = core::fmt::Write::write_str(&mut argument_types, " ");
-            }
             let argument_oid = storage
                 .routine_type_oid(argument.ctype, argument.user_type, txid)
                 .unwrap_or_else(|| {
@@ -8790,8 +8878,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         routine.name.as_str()
                     )
                 });
-            let _ =
-                core::fmt::Write::write_fmt(&mut argument_types, format_args!("{argument_oid}"));
+            argument_oids[index] = argument_oid;
         }
         let mut all_argument_types = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut argument_modes = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -8846,6 +8933,17 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         if default_expressions.is_truncated() {
             return Err(catalog_capacity_exceeded("pg_proc.proargdefaults"));
         }
+        let mut routine_configs = [Datum::Null; crate::storage::MAX_ROUTINE_CONFIGS];
+        for (index, config) in routine.configs().iter().enumerate() {
+            let rendered = arena
+                .alloc_str_display(format_args!(
+                    "{}={}",
+                    config.name.as_str(),
+                    config.value.as_str()
+                ))
+                .map_err(|_| catalog_capacity_exceeded("pg_proc.proconfig"))?;
+            routine_configs[index] = Datum::Text(rendered);
+        }
         rows[count] = row(
             &[
                 Datum::Int4(1255),
@@ -8877,7 +8975,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 }),
                 Datum::Bool(routine.kind.is_set_returning()),
                 Datum::Bpchar(routine.kind.catalog_kind()),
-                text(argument_types.as_str(), arena)?,
+                oidvector(&argument_oids[..routine.argument_count], arena)?,
                 Datum::Bpchar(match routine.attributes.volatility {
                     crate::storage::RoutineVolatility::Immutable => "i",
                     crate::storage::RoutineVolatility::Stable => "s",
@@ -8896,7 +8994,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     },
                 }),
                 Datum::Int4(Storage::role_oid(routine.ownership.owner_to(txid) as usize)),
-                Datum::Bool(false),
+                Datum::Bool(routine.attributes.security_definer),
                 acl(storage, Storage::routine_access_object(slot), txid, arena)?,
                 Datum::Int4(match routine.kind {
                     crate::storage::RoutineKind::Trigger => 13563,
@@ -8906,19 +9004,50 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 text(
                     if matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_)) {
                         "aggregate_dummy"
+                    } else if routine.body_kind != crate::storage::RoutineBodyKind::String {
+                        ""
                     } else {
                         routine.body.as_str()
                     },
                     arena,
                 )?,
-                text("", arena)?,
+                Datum::Null,
                 Datum::Bool(routine.attributes.strict),
-                Datum::Bool(false),
+                Datum::Bool(routine.attributes.leakproof),
+                if routine.config_count == 0 {
+                    Datum::Null
+                } else {
+                    Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(&routine_configs[..routine.config_count], arena)?,
+                    }
+                },
+                Datum::Float8(
+                    routine
+                        .attributes
+                        .cost_bits
+                        .map(f64::from_bits)
+                        .unwrap_or(100.0),
+                ),
+                Datum::Float8(
+                    routine
+                        .attributes
+                        .rows_bits
+                        .map(f64::from_bits)
+                        .unwrap_or_else(|| {
+                            if routine.kind.is_set_returning() {
+                                1000.0
+                            } else {
+                                0.0
+                            }
+                        }),
+                ),
                 Datum::Null,
-                Datum::Float8(100.0),
-                Datum::Float8(0.0),
-                Datum::Null,
-                text("-", arena)?,
+                Datum::RegObject {
+                    type_oid: super::types::oid::REGPROC,
+                    referenced_oid: 0,
+                    name: "-",
+                },
                 Datum::Int4(default_count),
                 Datum::Oid(variadic_oid as u32),
                 if has_modes {
@@ -8959,7 +9088,13 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 } else {
                     text(default_expressions.as_str(), arena)?
                 },
-                Datum::Null,
+                if routine.body_kind == crate::storage::RoutineBodyKind::String
+                    || matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_))
+                {
+                    Datum::Null
+                } else {
+                    text(routine.body.as_str(), arena)?
+                },
             ],
             arena,
         )?;

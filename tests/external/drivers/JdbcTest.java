@@ -27,6 +27,7 @@ public class JdbcTest {
             ddlAndCrud(c);
             transactions(c);
             typedValuesAndPortalPaging(c);
+            standardRoutine(c);
             tableSampling(c);
             metadata(c);
         } catch (SQLException e) {
@@ -35,6 +36,36 @@ public class JdbcTest {
             System.exit(1);
         }
         System.out.print(out);
+    }
+
+    static void standardRoutine(Connection c) throws SQLException {
+        try (Statement s = c.createStatement()) {
+            s.execute("SET application_name TO 'outside'");
+            s.execute("DROP TABLE IF EXISTS jdbc_routine_log");
+            s.execute("CREATE TABLE jdbc_routine_log(value integer)");
+            s.execute("CREATE OR REPLACE FUNCTION jdbc_standard(value integer) RETURNS integer "
+                + "LANGUAGE SQL IMMUTABLE STRICT SET application_name TO 'driver' "
+                + "RETURN value + 1");
+            s.execute("CREATE OR REPLACE PROCEDURE jdbc_standard_proc(value integer) "
+                + "LANGUAGE SQL AS 'INSERT INTO jdbc_routine_log VALUES (value)'");
+        }
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT jdbc_standard(?), current_setting('application_name')")) {
+            ps.setInt(1, 41);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                line("standard routine " + rs.getInt(1) + "|" + rs.getString(2));
+            }
+        }
+        try (PreparedStatement ps = c.prepareStatement("CALL jdbc_standard_proc(?)")) {
+            ps.setInt(1, 43);
+            ps.execute();
+        }
+        try (Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT value FROM jdbc_routine_log")) {
+            rs.next();
+            line("standard procedure " + rs.getInt(1));
+        }
     }
 
     // Prepared-statement CRUD, the core of any driver's use.
@@ -153,6 +184,7 @@ public class JdbcTest {
 
     static void tableSampling(Connection c) throws SQLException {
         try (Statement s = c.createStatement()) {
+            s.execute("DROP TABLE IF EXISTS jdbc_sample_source");
             s.execute("CREATE TABLE jdbc_sample_source (id integer PRIMARY KEY)");
             s.execute("INSERT INTO jdbc_sample_source SELECT value FROM generate_series(1,20) value");
         }

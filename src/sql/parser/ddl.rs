@@ -661,6 +661,14 @@ impl<'a> Parser<'a> {
             if self.eat_ident("trigger")? {
                 return self.create_trigger(true, false);
             }
+            let trusted = self.eat_ident("trusted")?;
+            let _procedural = self.eat_ident("procedural")?;
+            if trusted || _procedural || self.eat_ident("language")? {
+                if trusted || _procedural {
+                    self.expect_ident("language")?;
+                }
+                return self.create_language(true, trusted);
+            }
             return Err(self.unexpected(
                 "expected VIEW, FUNCTION, PROCEDURE, AGGREGATE, or TRIGGER after CREATE OR REPLACE",
             ));
@@ -668,6 +676,14 @@ impl<'a> Parser<'a> {
         if self.eat_ident("unique")? {
             self.expect_ident("index")?;
             return self.create_index(true);
+        }
+        let trusted = self.eat_ident("trusted")?;
+        let procedural = self.eat_ident("procedural")?;
+        if trusted || procedural || self.eat_ident("language")? {
+            if trusted || procedural {
+                self.expect_ident("language")?;
+            }
+            return self.create_language(false, trusted);
         }
         if self.eat_ident("view")? {
             return self.create_view(false);
@@ -735,6 +751,47 @@ impl<'a> Parser<'a> {
             return self.create_role(false);
         }
         self.create_table()
+    }
+
+    fn create_language(&mut self, or_replace: bool, trusted: bool) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("language name")?;
+        let mut handler = None;
+        let mut inline = None;
+        let mut validator = None;
+        while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+            if self.eat_ident("handler")? {
+                if handler
+                    .replace(self.qual_name("language handler")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("HANDLER specified more than once"));
+                }
+            } else if self.eat_ident("inline")? {
+                if inline
+                    .replace(self.qual_name("language inline handler")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("INLINE specified more than once"));
+                }
+            } else if self.eat_ident("validator")? {
+                if validator
+                    .replace(self.qual_name("language validator")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("VALIDATOR specified more than once"));
+                }
+            } else {
+                return Err(self.unexpected("language option"));
+            }
+        }
+        Ok(Stmt::CreateLanguage(crate::sql::ast::CreateLanguage {
+            name,
+            or_replace,
+            trusted,
+            handler,
+            inline,
+            validator,
+        }))
     }
 
     fn extension_version(&mut self) -> Result<&'a str, ParseError> {
@@ -1837,6 +1894,15 @@ impl<'a> Parser<'a> {
         let mut strict_seen = false;
         let mut volatility_seen = false;
         let mut parallel_seen = false;
+        let mut security_seen = false;
+        let mut leakproof_seen = false;
+        let mut cost_seen = false;
+        let mut rows_seen = false;
+        let mut configs = [crate::sql::ast::RoutineConfigClause {
+            name: "",
+            value: crate::sql::ast::RoutineConfigValue::Current,
+        }; crate::storage::MAX_ROUTINE_CONFIGS];
+        let mut config_count = 0usize;
         while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
             if self.eat_ident("language")? {
                 if language.is_some() {
@@ -1862,7 +1928,50 @@ impl<'a> Parser<'a> {
                 if body.is_some() {
                     return Err(self.unexpected("one AS clause"));
                 }
-                body = Some(self.str_literal("function body")?);
+                let source = self.str_literal("function body")?;
+                if self.eat_op(",")? {
+                    let _symbol = self.str_literal("function link symbol")?;
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "native-library routine bodies are not supported"
+                        ),
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    });
+                }
+                body = Some(crate::sql::ast::RoutineBody::String(source));
+            } else if self.eat_ident("return")? {
+                if body.is_some() {
+                    return Err(self.unexpected("one routine body"));
+                }
+                let start = self.peek_at;
+                let _ = self.expression(0)?;
+                body = Some(crate::sql::ast::RoutineBody::Return(
+                    self.text[start..self.peek_at].trim(),
+                ));
+            } else if self.eat_ident("begin")? {
+                if body.is_some() {
+                    return Err(self.unexpected("one routine body"));
+                }
+                self.expect_ident("atomic")?;
+                let start = self.peek_at;
+                let end = loop {
+                    if self.peeked == Tok::Ident("end") {
+                        let end = self.peek_at;
+                        self.advance()?;
+                        break end;
+                    }
+                    if self.peeked == Tok::Eof {
+                        return Err(self.unexpected("END"));
+                    }
+                    let _ = self.statement()?;
+                    self.expect_op(";")?;
+                };
+                body = Some(crate::sql::ast::RoutineBody::Atomic(
+                    self.text[start..end]
+                        .trim_end_matches(|c: char| c.is_ascii_whitespace() || c == ';'),
+                ));
             } else if self.eat_ident("strict")? {
                 if strict_seen {
                     return Err(self.unexpected("one null-input clause"));
@@ -1919,11 +2028,182 @@ impl<'a> Parser<'a> {
                     self.expect_ident("unsafe")?;
                     crate::sql::ast::RoutineParallel::Unsafe
                 };
+            } else if self.eat_ident("security")? {
+                if security_seen {
+                    return Err(self.unexpected("one SECURITY clause"));
+                }
+                security_seen = true;
+                attributes.security_definer = if self.eat_ident("definer")? {
+                    true
+                } else {
+                    self.expect_ident("invoker")?;
+                    false
+                };
+            } else if self.eat_ident("external")? {
+                self.expect_ident("security")?;
+                if security_seen {
+                    return Err(self.unexpected("one SECURITY clause"));
+                }
+                security_seen = true;
+                attributes.security_definer = if self.eat_ident("definer")? {
+                    true
+                } else {
+                    self.expect_ident("invoker")?;
+                    false
+                };
+            } else if self.eat_ident("leakproof")? {
+                if leakproof_seen {
+                    return Err(self.unexpected("one LEAKPROOF clause"));
+                }
+                leakproof_seen = true;
+                attributes.leakproof = true;
+            } else if self.eat_ident("not")? {
+                self.expect_ident("leakproof")?;
+                if leakproof_seen {
+                    return Err(self.unexpected("one LEAKPROOF clause"));
+                }
+                leakproof_seen = true;
+                attributes.leakproof = false;
+            } else if self.eat_ident("cost")? {
+                if cost_seen {
+                    return Err(self.unexpected("one COST clause"));
+                }
+                cost_seen = true;
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.err_here("COST must be a positive number"));
+                };
+                attributes.cost = Some(
+                    raw.parse::<f64>()
+                        .ok()
+                        .and_then(crate::sql::ast::RoutineEstimate::new)
+                        .ok_or_else(|| self.err_here("COST must be a positive number"))?,
+                );
+                self.advance()?;
+            } else if self.eat_ident("rows")? {
+                if rows_seen {
+                    return Err(self.unexpected("one ROWS clause"));
+                }
+                rows_seen = true;
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.err_here("ROWS must be a positive number"));
+                };
+                attributes.rows = Some(
+                    raw.parse::<f64>()
+                        .ok()
+                        .and_then(crate::sql::ast::RoutineEstimate::new)
+                        .ok_or_else(|| self.err_here("ROWS must be a positive number"))?,
+                );
+                self.advance()?;
+            } else if self.eat_ident("window")? {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "user-defined window functions are not supported"),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            } else if self.eat_ident("transform")? {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "routine transforms are not supported"),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            } else if self.eat_ident("support")? {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "planner support functions are not supported"),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            } else if self.eat_ident("set")? {
+                let name_start = self.peek_at;
+                let _ = self.any_ident("configuration parameter")?;
+                while self.eat_op(".")? {
+                    let _ = self.any_ident("configuration parameter")?;
+                }
+                let config_name = self.text[name_start..self.peek_at].trim();
+                let value = if self.eat_ident("from")? {
+                    self.expect_ident("current")?;
+                    crate::sql::ast::RoutineConfigValue::Current
+                } else {
+                    if !self.eat_op("=")? {
+                        self.expect_ident("to")?;
+                    }
+                    let value_start = self.peek_at;
+                    loop {
+                        if matches!(self.peeked, Tok::Op("+") | Tok::Op("-")) {
+                            self.advance()?;
+                        }
+                        if !matches!(self.peeked, Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) {
+                            return Err(self.unexpected("configuration value"));
+                        }
+                        self.advance()?;
+                        if !self.eat_op(",")? {
+                            break;
+                        }
+                    }
+                    crate::sql::ast::RoutineConfigValue::Value(
+                        self.text[value_start..self.peek_at].trim(),
+                    )
+                };
+                if let Some(existing) = configs[..config_count]
+                    .iter_mut()
+                    .find(|config| config.name.eq_ignore_ascii_case(config_name))
+                {
+                    existing.value = value;
+                } else {
+                    if config_count == configs.len() {
+                        return Err(self.limit("routine configuration clauses", configs.len()));
+                    }
+                    configs[config_count] = crate::sql::ast::RoutineConfigClause {
+                        name: config_name,
+                        value,
+                    };
+                    config_count += 1;
+                }
             } else {
                 return Err(self.unexpected("routine option"));
             }
         }
         let language = language.ok_or_else(|| self.unexpected("LANGUAGE clause"))?;
+        if body.is_some_and(|body| {
+            !matches!(body, crate::sql::ast::RoutineBody::String(_))
+                && language != crate::sql::ast::RoutineLanguage::Sql
+        }) {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "SQL-standard bodies require LANGUAGE SQL"),
+                sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+            });
+        }
+        if !function
+            && (strict_seen
+                || volatility_seen
+                || parallel_seen
+                || leakproof_seen
+                || cost_seen
+                || rows_seen)
+        {
+            return Err(self.unexpected("procedure option"));
+        }
+        if attributes.rows.is_some()
+            && !matches!(
+                kind,
+                RoutineCreateKind::Function {
+                    set_returning: true,
+                    ..
+                } | RoutineCreateKind::OutputFunction {
+                    set_returning: true,
+                    ..
+                } | RoutineCreateKind::TableFunction { .. }
+            )
+        {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    96,
+                    "ROWS is not applicable when function does not return a set"
+                ),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
         if matches!(kind, RoutineCreateKind::Trigger)
             != matches!(language, crate::sql::ast::RoutineLanguage::PlPgSql)
         {
@@ -1942,7 +2222,8 @@ impl<'a> Parser<'a> {
             kind,
             language,
             attributes,
-            body: body.ok_or_else(|| self.unexpected("AS clause"))?,
+            configs: self.arena_slice(&configs[..config_count])?,
+            body: body.ok_or_else(|| self.unexpected("routine body"))?,
         }))
     }
 
@@ -3682,6 +3963,37 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::DropOwned { roles, cascade });
         }
+        if self.eat_ident("language")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = [""; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("languages", names.len()));
+                }
+                names[count] = self.col_ident("language name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropLanguage {
+                names: self.arena_slice(&names[..count])?,
+                if_exists,
+                cascade,
+            });
+        }
         if self.eat_ident("tablespace")? {
             let if_exists = if self.eat_ident("if")? {
                 self.expect_ident("exists")?;
@@ -4184,29 +4496,162 @@ impl<'a> Parser<'a> {
                 self.expect_op(",")?;
             }
         }
-        let action = if self.eat_ident("owner")? {
-            self.expect_ident("to")?;
-            AlterRoutineAction::SetOwner(self.any_ident("role name")?)
-        } else if self.eat_ident("rename")? {
-            self.expect_ident("to")?;
-            AlterRoutineAction::Rename(self.col_ident("routine name")?)
-        } else if self.eat_ident("set")? {
-            self.expect_ident("schema")?;
-            AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
-        } else if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
-            let enabled = !self.eat_ident("no")?;
-            self.expect_ident("depends")?;
-            self.expect_ident("on")?;
-            self.expect_ident("extension")?;
-            AlterRoutineAction::ExtensionDependency {
-                extension: self.col_ident("extension name")?,
-                enabled,
+        let mut actions = [AlterRoutineAction::SetStrict(false); 32];
+        let mut action_count = 0usize;
+        loop {
+            let action = if self.eat_ident("owner")? {
+                self.expect_ident("to")?;
+                AlterRoutineAction::SetOwner(self.any_ident("role name")?)
+            } else if self.eat_ident("rename")? {
+                self.expect_ident("to")?;
+                AlterRoutineAction::Rename(self.col_ident("routine name")?)
+            } else if self.eat_ident("set")? {
+                if self.eat_ident("schema")? {
+                    AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
+                } else {
+                    let name_start = self.peek_at;
+                    let _ = self.any_ident("configuration parameter")?;
+                    while self.eat_op(".")? {
+                        let _ = self.any_ident("configuration parameter")?;
+                    }
+                    let name = self.text[name_start..self.peek_at].trim();
+                    let value = if self.eat_ident("from")? {
+                        self.expect_ident("current")?;
+                        crate::sql::ast::RoutineConfigValue::Current
+                    } else {
+                        if !self.eat_op("=")? {
+                            self.expect_ident("to")?;
+                        }
+                        let start = self.peek_at;
+                        if matches!(self.peeked, Tok::Op("+") | Tok::Op("-")) {
+                            self.advance()?;
+                        }
+                        if !matches!(self.peeked, Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) {
+                            return Err(self.unexpected("configuration value"));
+                        }
+                        self.advance()?;
+                        while self.eat_op(",")? {
+                            if matches!(self.peeked, Tok::Op("+") | Tok::Op("-")) {
+                                self.advance()?;
+                            }
+                            if !matches!(self.peeked, Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) {
+                                return Err(self.unexpected("configuration value"));
+                            }
+                            self.advance()?;
+                        }
+                        crate::sql::ast::RoutineConfigValue::Value(
+                            self.text[start..self.peek_at].trim(),
+                        )
+                    };
+                    AlterRoutineAction::SetConfig { name, value }
+                }
+            } else if self.eat_ident("reset")? {
+                AlterRoutineAction::ResetConfig(if self.eat_ident("all")? {
+                    None
+                } else {
+                    Some(self.any_ident("configuration parameter")?)
+                })
+            } else if self.eat_ident("strict")? {
+                AlterRoutineAction::SetStrict(true)
+            } else if self.eat_ident("called")? {
+                self.expect_ident("on")?;
+                self.expect_ident("null")?;
+                self.expect_ident("input")?;
+                AlterRoutineAction::SetStrict(false)
+            } else if self.eat_ident("returns")? {
+                self.expect_ident("null")?;
+                self.expect_ident("on")?;
+                self.expect_ident("null")?;
+                self.expect_ident("input")?;
+                AlterRoutineAction::SetStrict(true)
+            } else if self.eat_ident("immutable")? {
+                AlterRoutineAction::SetVolatility(crate::sql::ast::RoutineVolatility::Immutable)
+            } else if self.eat_ident("stable")? {
+                AlterRoutineAction::SetVolatility(crate::sql::ast::RoutineVolatility::Stable)
+            } else if self.eat_ident("volatile")? {
+                AlterRoutineAction::SetVolatility(crate::sql::ast::RoutineVolatility::Volatile)
+            } else if self.eat_ident("leakproof")? {
+                AlterRoutineAction::SetLeakproof(true)
+            } else if self.eat_ident("not")? {
+                self.expect_ident("leakproof")?;
+                AlterRoutineAction::SetLeakproof(false)
+            } else if self.eat_ident("security")? {
+                AlterRoutineAction::SetSecurityDefiner(if self.eat_ident("definer")? {
+                    true
+                } else {
+                    self.expect_ident("invoker")?;
+                    false
+                })
+            } else if self.eat_ident("external")? {
+                self.expect_ident("security")?;
+                AlterRoutineAction::SetSecurityDefiner(if self.eat_ident("definer")? {
+                    true
+                } else {
+                    self.expect_ident("invoker")?;
+                    false
+                })
+            } else if self.eat_ident("parallel")? {
+                AlterRoutineAction::SetParallel(if self.eat_ident("safe")? {
+                    crate::sql::ast::RoutineParallel::Safe
+                } else if self.eat_ident("restricted")? {
+                    crate::sql::ast::RoutineParallel::Restricted
+                } else {
+                    self.expect_ident("unsafe")?;
+                    crate::sql::ast::RoutineParallel::Unsafe
+                })
+            } else if self.eat_ident("cost")? {
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.err_here("routine estimate must be a positive number"));
+                };
+                let value = raw
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(crate::sql::ast::RoutineEstimate::new)
+                    .ok_or_else(|| self.err_here("routine estimate must be a positive number"))?;
+                self.advance()?;
+                AlterRoutineAction::SetCost(value)
+            } else if self.eat_ident("rows")? {
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.err_here("routine estimate must be a positive number"));
+                };
+                let value = raw
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(crate::sql::ast::RoutineEstimate::new)
+                    .ok_or_else(|| self.err_here("routine estimate must be a positive number"))?;
+                self.advance()?;
+                AlterRoutineAction::SetRows(value)
+            } else if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
+                let enabled = !self.eat_ident("no")?;
+                self.expect_ident("depends")?;
+                self.expect_ident("on")?;
+                self.expect_ident("extension")?;
+                AlterRoutineAction::ExtensionDependency {
+                    extension: self.col_ident("extension name")?,
+                    enabled,
+                }
+            } else {
+                break;
+            };
+            if action_count == actions.len() {
+                return Err(self.limit("ALTER ROUTINE actions", actions.len()));
             }
-        } else {
-            return Err(
-                self.unexpected("expected OWNER, RENAME, SET SCHEMA, or [NO] DEPENDS ON EXTENSION")
-            );
-        };
+            actions[action_count] = action;
+            action_count += 1;
+            if matches!(
+                action,
+                AlterRoutineAction::SetOwner(_)
+                    | AlterRoutineAction::Rename(_)
+                    | AlterRoutineAction::SetSchema(_)
+                    | AlterRoutineAction::ExtensionDependency { .. }
+            ) {
+                break;
+            }
+        }
+        let _ = self.eat_ident("restrict")?;
+        if action_count == 0 {
+            return Err(self.unexpected("routine alteration action"));
+        }
         Ok(Stmt::AlterRoutine {
             kind,
             routine: RoutineIdentity {
@@ -4214,7 +4659,7 @@ impl<'a> Parser<'a> {
                 argument_types: self.arena_slice(&argument_types[..count])?,
                 signature_is_explicit,
             },
-            action,
+            actions: self.arena_slice(&actions[..action_count])?,
         })
     }
 

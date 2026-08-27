@@ -732,6 +732,31 @@ pub(crate) fn parse_routine_function_program<'a>(
     Ok(RoutineFunctionProgram { preceding, result })
 }
 
+pub(crate) fn parse_stored_routine_function_program<'a>(
+    body_kind: crate::storage::RoutineBodyKind,
+    body: &'a str,
+    arena: &'a Arena,
+    returns_void: bool,
+    routine_name: &'a str,
+    parameters: &[crate::storage::RoutineArgumentDef],
+) -> Result<RoutineFunctionProgram<'a>, SqlError> {
+    let executable = if body_kind == crate::storage::RoutineBodyKind::Return {
+        use core::fmt::Write;
+        let mut query = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX + 8 }>::new();
+        write!(query, "SELECT {body}").map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine definition exceeds {} bytes",
+                crate::storage::ROUTINE_SQL_MAX
+            )
+        })?;
+        arena.alloc_str(query.as_str()).map_err(|_| arena_full())?
+    } else {
+        body
+    };
+    parse_routine_function_program(executable, arena, returns_void, routine_name, parameters)
+}
+
 fn routine_statement_forbidden(statement: &Stmt<'_>) -> Option<&'static str> {
     Some(match statement {
         Stmt::Begin(_) => "BEGIN",
@@ -850,6 +875,16 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }
+        let owner = self
+            .storage
+            .role_name(routine.ownership.owner_to(self.txid).into(), self.txid);
+        let _security = routine
+            .attributes
+            .security_definer
+            .then(|| super::eval::funcs::system::enter_current_user(owner.as_str()));
+        let _config = (!routine.configs().is_empty())
+            .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+            .transpose()?;
         let (result_contract, record_columns) = match routine.kind {
             crate::storage::RoutineKind::Function { result }
             | crate::storage::RoutineKind::SetFunction { result } => (Some(result), None),
@@ -863,7 +898,8 @@ impl StorageCatalog<'_, '_, '_, '_> {
         };
         let result_type = result_contract.map_or(ColType::Record, |result| result.ctype);
         let _formal_scope = super::exec::enter_routine_parameter_types(routine.arguments());
-        let function_program = parse_routine_function_program(
+        let function_program = parse_stored_routine_function_program(
+            routine.body_kind,
             routine.body.as_str(),
             self.routine_workspace,
             result_type == ColType::Void,

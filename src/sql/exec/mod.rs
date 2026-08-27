@@ -820,6 +820,17 @@ fn execute_row_trigger_body<'a>(
     let routine = context
         .storage
         .routine_for(usize::from(trigger.function), context.txn.txid);
+    let owner = context.storage.role_name(
+        routine.ownership.owner_to(context.txn.txid).into(),
+        context.txn.txid,
+    );
+    let _security = routine
+        .attributes
+        .security_definer
+        .then(|| super::eval::funcs::system::enter_current_user(owner.as_str()));
+    let _config = (!routine.configs().is_empty())
+        .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+        .transpose()?;
     let invocation = TriggerInvocation::new(
         trigger,
         TriggerRelationIdentity {
@@ -14232,6 +14243,17 @@ fn fire_statement_triggers_with_rows<'a>(
         let routine = context
             .storage
             .routine_for(usize::from(trigger.function), context.txn.txid);
+        let owner = context.storage.role_name(
+            routine.ownership.owner_to(context.txn.txid).into(),
+            context.txn.txid,
+        );
+        let _security = routine
+            .attributes
+            .security_definer
+            .then(|| super::eval::funcs::system::enter_current_user(owner.as_str()));
+        let _config = (!routine.configs().is_empty())
+            .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+            .transpose()?;
         let invocation = TriggerInvocation::new(
             &trigger,
             TriggerRelationIdentity {
@@ -15622,9 +15644,15 @@ pub fn create_routine(
     wal: &mut Wal,
     txn: &mut TxnState,
     routine: &CreateRoutine<'_>,
+    guc: &crate::sql::guc::GucState,
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
+    let (body_kind, body_text) = match routine.body {
+        super::ast::RoutineBody::String(body) => (crate::storage::RoutineBodyKind::String, body),
+        super::ast::RoutineBody::Return(body) => (crate::storage::RoutineBodyKind::Return, body),
+        super::ast::RoutineBody::Atomic(body) => (crate::storage::RoutineBodyKind::Atomic, body),
+    };
     if matches!(routine.kind, super::ast::RoutineCreateKind::Trigger)
         && routine.language != RoutineLanguage::PlPgSql
     {
@@ -15900,8 +15928,9 @@ pub fn create_routine(
                 crate::storage::RoutineKind::Function { result }
                     if result.ctype == ColType::Void
             );
-            if let Err(error) = super::query::parse_routine_function_program(
-                routine.body,
+            if let Err(error) = super::query::parse_stored_routine_function_program(
+                body_kind,
+                body_text,
                 arena,
                 returns_void,
                 routine.name.name,
@@ -15918,8 +15947,9 @@ pub fn create_routine(
                 crate::storage::RoutineKind::SetFunction { result }
                     if result.ctype == ColType::Void
             );
-            if let Err(error) = super::query::parse_routine_function_program(
-                routine.body,
+            if let Err(error) = super::query::parse_stored_routine_function_program(
+                body_kind,
+                body_text,
                 arena,
                 returns_void,
                 routine.name.name,
@@ -15929,18 +15959,29 @@ pub fn create_routine(
             }
         }
         crate::storage::RoutineKind::Trigger => {
-            if let Err(error) = parse_trigger_program(routine.body, arena) {
+            if body_kind != crate::storage::RoutineBodyKind::String {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "trigger functions require a string-literal body"
+                ));
+            }
+            if let Err(error) = parse_trigger_program(body_text, arena) {
                 return sql_fail(error);
             }
         }
         crate::storage::RoutineKind::Procedure => {
-            let mut parser =
-                match super::parser::Parser::new(routine.body, arena).and_then(|parser| {
-                    parser.with_routine_parameters(routine.name.name, &arguments[..argument_count])
-                }) {
-                    Ok(parser) => parser,
-                    Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
-                };
+            if body_kind == crate::storage::RoutineBodyKind::Return {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "procedures cannot have a RETURN expression body"
+                ));
+            }
+            let mut parser = match super::parser::Parser::new(body_text, arena).and_then(|parser| {
+                parser.with_routine_parameters(routine.name.name, &arguments[..argument_count])
+            }) {
+                Ok(parser) => parser,
+                Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+            };
             let mut statements = 0usize;
             loop {
                 match parser.next_stmt() {
@@ -15957,13 +15998,46 @@ pub fn create_routine(
             unreachable!("CREATE ROUTINE cannot construct an aggregate")
         }
     }
-    let body = StackStr::<ROUTINE_SQL_MAX>::from_str(routine.body);
+    let body = StackStr::<ROUTINE_SQL_MAX>::from_str(body_text);
     if body.is_truncated() {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "routine definition exceeds {} bytes",
             ROUTINE_SQL_MAX
         ));
+    }
+    let mut configs = [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_ROUTINE_CONFIGS];
+    for (index, config) in routine.configs.iter().enumerate() {
+        let name = match SqlName::parse(config.name) {
+            Ok(name) => name,
+            Err(error) => return sql_fail(error),
+        };
+        let value = match config.value {
+            super::ast::RoutineConfigValue::Value(value) => {
+                match guc.canonical_routine_setting(config.name, value) {
+                    Ok(value) => StackStr::from_str(value.as_str()),
+                    Err(error) => return sql_fail(error),
+                }
+            }
+            super::ast::RoutineConfigValue::Current => match guc.get_owned(config.name) {
+                Some(value) => StackStr::from_str(value.as_str()),
+                None => {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "unrecognized configuration parameter \"{}\"",
+                        config.name
+                    ));
+                }
+            },
+        };
+        if value.is_truncated() {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine configuration value exceeds {} bytes",
+                crate::storage::ROUTINE_CONFIG_VALUE_MAX
+            ));
+        }
+        configs[index] = crate::storage::RoutineConfig { name, value };
     }
     let attributes = crate::storage::RoutineAttributes {
         strict: routine.attributes.strict,
@@ -15979,7 +16053,23 @@ pub fn create_routine(
             super::ast::RoutineParallel::Restricted => crate::storage::RoutineParallel::Restricted,
             super::ast::RoutineParallel::Unsafe => crate::storage::RoutineParallel::Unsafe,
         },
+        security_definer: routine.attributes.security_definer,
+        leakproof: routine.attributes.leakproof,
+        cost_bits: routine.attributes.cost.map(|value| value.get().to_bits()),
+        rows_bits: routine.attributes.rows.map(|value| value.get().to_bits()),
     };
+    if attributes.leakproof {
+        let current = super::eval::funcs::system::current_user_owned();
+        let superuser = storage
+            .find_role_visible(current.as_str(), txn.txid)
+            .is_some_and(|role| storage.role(role).attributes_to(txn.txid).superuser);
+        if !superuser {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "only superuser can define a leakproof function"
+            ));
+        }
+    }
     let slot = match replaced {
         Some(slot) => {
             let pending = crate::storage::PendingRoutineDefinition {
@@ -15992,6 +16082,9 @@ pub fn create_routine(
                 result_columns,
                 result_column_count,
                 attributes,
+                configs,
+                config_count: routine.configs.len(),
+                body_kind,
                 body,
             };
             let prior = match storage.replace_routine(slot, pending) {
@@ -16026,6 +16119,9 @@ pub fn create_routine(
                 result_columns,
                 result_column_count,
                 attributes,
+                configs,
+                config_count: routine.configs.len(),
+                body_kind,
                 body,
             },
             txn.txid,
@@ -16747,6 +16843,10 @@ pub fn create_aggregate(
                 result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
                 result_column_count: 0,
                 attributes: crate::storage::RoutineAttributes::AGGREGATE,
+                configs: [crate::storage::RoutineConfig::EMPTY;
+                    crate::storage::MAX_ROUTINE_CONFIGS],
+                config_count: 0,
+                body_kind: crate::storage::RoutineBodyKind::String,
                 body,
             };
             let prior = match storage.replace_routine(slot, pending) {
@@ -16781,6 +16881,10 @@ pub fn create_aggregate(
                 result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
                 result_column_count: 0,
                 attributes: crate::storage::RoutineAttributes::AGGREGATE,
+                configs: [crate::storage::RoutineConfig::EMPTY;
+                    crate::storage::MAX_ROUTINE_CONFIGS],
+                config_count: 0,
+                body_kind: crate::storage::RoutineBodyKind::String,
                 body,
             },
             txn.txid,
@@ -17550,13 +17654,16 @@ pub fn alter_aggregate(
         storage,
         wal,
         txn,
-        crate::sql::ast::RoutineTargetKind::Aggregate,
-        &super::ast::RoutineIdentity {
-            name: identity.name,
-            argument_types: &type_names[..total],
-            signature_is_explicit: true,
+        AlterRoutineCommand {
+            kind: crate::sql::ast::RoutineTargetKind::Aggregate,
+            identity: &super::ast::RoutineIdentity {
+                name: identity.name,
+                argument_types: &type_names[..total],
+                signature_is_explicit: true,
+            },
+            actions: core::slice::from_ref(&action),
+            guc: None,
         },
-        action,
         responder,
     )
 }
@@ -17584,15 +17691,32 @@ pub fn drop_aggregate(
     )
 }
 
+pub struct AlterRoutineCommand<'command, 'sql> {
+    pub kind: crate::sql::ast::RoutineTargetKind,
+    pub identity: &'command super::ast::RoutineIdentity<'sql>,
+    pub actions: &'command [crate::sql::ast::AlterRoutineAction<'sql>],
+    pub guc: Option<&'command crate::sql::guc::GucState>,
+}
+
 pub fn alter_routine(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    kind: crate::sql::ast::RoutineTargetKind,
-    identity: &super::ast::RoutineIdentity<'_>,
-    action: crate::sql::ast::AlterRoutineAction<'_>,
+    command: AlterRoutineCommand<'_, '_>,
     responder: &mut Responder,
 ) -> Outcome {
+    let AlterRoutineCommand {
+        kind,
+        identity,
+        actions,
+        guc,
+    } = command;
+    let Some(&action) = actions.first() else {
+        return sql_fail(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "ALTER ROUTINE has no action"
+        ));
+    };
     let schema = identity.name.schema.unwrap_or("public");
     let arguments = match resolve_routine_signature(storage, txn.txid, identity.argument_types) {
         Ok(arguments) => arguments,
@@ -17627,7 +17751,7 @@ pub fn alter_routine(
             ));
         }
     };
-    let routine = *storage.routine(slot);
+    let routine = storage.routine_for(slot, txn.txid);
     let actual_kind = match routine.kind {
         crate::storage::RoutineKind::Procedure => crate::sql::ast::RoutineTargetKind::Procedure,
         crate::storage::RoutineKind::Aggregate(_) => crate::sql::ast::RoutineTargetKind::Aggregate,
@@ -17643,6 +17767,220 @@ pub fn alter_routine(
     }
     if let Err(error) = storage.require_routine_owner(slot, txn.txid) {
         return sql_fail(error);
+    }
+    let definition_actions = actions.iter().all(|action| {
+        matches!(
+            action,
+            crate::sql::ast::AlterRoutineAction::SetStrict(_)
+                | crate::sql::ast::AlterRoutineAction::SetVolatility(_)
+                | crate::sql::ast::AlterRoutineAction::SetLeakproof(_)
+                | crate::sql::ast::AlterRoutineAction::SetSecurityDefiner(_)
+                | crate::sql::ast::AlterRoutineAction::SetParallel(_)
+                | crate::sql::ast::AlterRoutineAction::SetCost(_)
+                | crate::sql::ast::AlterRoutineAction::SetRows(_)
+                | crate::sql::ast::AlterRoutineAction::SetConfig { .. }
+                | crate::sql::ast::AlterRoutineAction::ResetConfig(_)
+        )
+    });
+    if definition_actions {
+        if matches!(routine.kind, crate::storage::RoutineKind::Aggregate(_)) {
+            return sql_fail(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "aggregate routine attributes cannot be altered with this command"
+            ));
+        }
+        let mut attributes = routine.attributes;
+        let mut configs = routine.configs;
+        let mut config_count = routine.config_count;
+        for action in actions {
+            let function_only = matches!(
+                action,
+                crate::sql::ast::AlterRoutineAction::SetStrict(_)
+                    | crate::sql::ast::AlterRoutineAction::SetVolatility(_)
+                    | crate::sql::ast::AlterRoutineAction::SetLeakproof(_)
+                    | crate::sql::ast::AlterRoutineAction::SetParallel(_)
+                    | crate::sql::ast::AlterRoutineAction::SetCost(_)
+                    | crate::sql::ast::AlterRoutineAction::SetRows(_)
+            );
+            if function_only && matches!(routine.kind, crate::storage::RoutineKind::Procedure) {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "procedure attributes support only SECURITY and configuration settings"
+                ));
+            }
+            match *action {
+                crate::sql::ast::AlterRoutineAction::SetStrict(value) => {
+                    attributes.strict = value;
+                }
+                crate::sql::ast::AlterRoutineAction::SetVolatility(value) => {
+                    attributes.volatility = match value {
+                        super::ast::RoutineVolatility::Immutable => {
+                            crate::storage::RoutineVolatility::Immutable
+                        }
+                        super::ast::RoutineVolatility::Stable => {
+                            crate::storage::RoutineVolatility::Stable
+                        }
+                        super::ast::RoutineVolatility::Volatile => {
+                            crate::storage::RoutineVolatility::Volatile
+                        }
+                    };
+                }
+                crate::sql::ast::AlterRoutineAction::SetLeakproof(value) => {
+                    if value {
+                        let current = super::eval::funcs::system::current_user_owned();
+                        let superuser = storage
+                            .find_role_visible(current.as_str(), txn.txid)
+                            .is_some_and(|role| {
+                                storage.role(role).attributes_to(txn.txid).superuser
+                            });
+                        if !superuser {
+                            return sql_fail(sql_err!(
+                                sqlstate::INSUFFICIENT_PRIVILEGE,
+                                "only superuser can define a leakproof function"
+                            ));
+                        }
+                    }
+                    attributes.leakproof = value;
+                }
+                crate::sql::ast::AlterRoutineAction::SetSecurityDefiner(value) => {
+                    attributes.security_definer = value;
+                }
+                crate::sql::ast::AlterRoutineAction::SetParallel(value) => {
+                    attributes.parallel = match value {
+                        super::ast::RoutineParallel::Safe => crate::storage::RoutineParallel::Safe,
+                        super::ast::RoutineParallel::Restricted => {
+                            crate::storage::RoutineParallel::Restricted
+                        }
+                        super::ast::RoutineParallel::Unsafe => {
+                            crate::storage::RoutineParallel::Unsafe
+                        }
+                    };
+                }
+                crate::sql::ast::AlterRoutineAction::SetCost(value) => {
+                    attributes.cost_bits = Some(value.get().to_bits());
+                }
+                crate::sql::ast::AlterRoutineAction::SetRows(value) => {
+                    if !routine.kind.is_set_returning() {
+                        return sql_fail(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "ROWS is not applicable when function does not return a set"
+                        ));
+                    }
+                    attributes.rows_bits = Some(value.get().to_bits());
+                }
+                crate::sql::ast::AlterRoutineAction::SetConfig { name, value } => {
+                    let Some(guc) = guc else {
+                        return sql_fail(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "routine configuration state is unavailable"
+                        ));
+                    };
+                    let stored_name = match SqlName::parse(name) {
+                        Ok(name) => name,
+                        Err(error) => return sql_fail(error),
+                    };
+                    let stored_value = match value {
+                        super::ast::RoutineConfigValue::Value(value) => {
+                            match guc.canonical_routine_setting(name, value) {
+                                Ok(value) => StackStr::from_str(value.as_str()),
+                                Err(error) => return sql_fail(error),
+                            }
+                        }
+                        super::ast::RoutineConfigValue::Current => match guc.get_owned(name) {
+                            Some(value) => StackStr::from_str(value.as_str()),
+                            None => {
+                                return sql_fail(sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "unrecognized configuration parameter \"{}\"",
+                                    name
+                                ));
+                            }
+                        },
+                    };
+                    if stored_value.is_truncated() {
+                        return sql_fail(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "routine configuration value exceeds {} bytes",
+                            crate::storage::ROUTINE_CONFIG_VALUE_MAX
+                        ));
+                    }
+                    if let Some(index) = configs[..config_count]
+                        .iter()
+                        .position(|config| config.name == stored_name)
+                    {
+                        configs[index].value = stored_value;
+                    } else {
+                        if config_count == configs.len() {
+                            return sql_fail(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "too many routine configuration settings (limit {})",
+                                configs.len()
+                            ));
+                        }
+                        configs[config_count] = crate::storage::RoutineConfig {
+                            name: stored_name,
+                            value: stored_value,
+                        };
+                        config_count += 1;
+                    }
+                }
+                crate::sql::ast::AlterRoutineAction::ResetConfig(name) => {
+                    if let Some(name) = name {
+                        if let Some(index) = configs[..config_count]
+                            .iter()
+                            .position(|config| config.name.as_str().eq_ignore_ascii_case(name))
+                        {
+                            configs.copy_within(index + 1..config_count, index);
+                            config_count -= 1;
+                            configs[config_count] = crate::storage::RoutineConfig::EMPTY;
+                        }
+                    } else {
+                        configs.fill(crate::storage::RoutineConfig::EMPTY);
+                        config_count = 0;
+                    }
+                }
+                _ => unreachable!("definition action set is closed above"),
+            }
+        }
+        let pending = crate::storage::PendingRoutineDefinition {
+            txid: txn.txid,
+            arguments: routine.arguments,
+            argument_count: routine.argument_count,
+            parameters: routine.parameters,
+            parameter_count: routine.parameter_count,
+            kind: routine.kind,
+            result_columns: routine.result_columns,
+            result_column_count: routine.result_column_count,
+            attributes,
+            configs,
+            config_count,
+            body_kind: routine.body_kind,
+            body: routine.body,
+        };
+        let prior = match storage.replace_routine(slot, pending) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        let durable = storage.routine_for(slot, txn.txid);
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateRoutine(durable)) {
+            storage.rollback_routine_replace(slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineReplaced {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_routine_replace(slot, prior);
+            return sql_fail(error);
+        }
+        responder.command_complete(match kind {
+            crate::sql::ast::RoutineTargetKind::Function => "ALTER FUNCTION",
+            crate::sql::ast::RoutineTargetKind::Procedure => "ALTER PROCEDURE",
+            crate::sql::ast::RoutineTargetKind::Aggregate => "ALTER AGGREGATE",
+            crate::sql::ast::RoutineTargetKind::Either => "ALTER ROUTINE",
+        })?;
+        return sql_ok();
     }
     if let crate::sql::ast::AlterRoutineAction::ExtensionDependency { extension, enabled } = action
     {
@@ -17749,7 +18087,16 @@ pub fn alter_routine(
             (schema, routine.name_for(txn.txid))
         }
         crate::sql::ast::AlterRoutineAction::SetOwner(_)
-        | crate::sql::ast::AlterRoutineAction::ExtensionDependency { .. } => unreachable!(),
+        | crate::sql::ast::AlterRoutineAction::ExtensionDependency { .. }
+        | crate::sql::ast::AlterRoutineAction::SetStrict(_)
+        | crate::sql::ast::AlterRoutineAction::SetVolatility(_)
+        | crate::sql::ast::AlterRoutineAction::SetLeakproof(_)
+        | crate::sql::ast::AlterRoutineAction::SetSecurityDefiner(_)
+        | crate::sql::ast::AlterRoutineAction::SetParallel(_)
+        | crate::sql::ast::AlterRoutineAction::SetCost(_)
+        | crate::sql::ast::AlterRoutineAction::SetRows(_)
+        | crate::sql::ast::AlterRoutineAction::SetConfig { .. }
+        | crate::sql::ast::AlterRoutineAction::ResetConfig(_) => unreachable!(),
     };
     let old_schema = routine.schema_for(txn.txid);
     let old_name = routine.name_for(txn.txid);

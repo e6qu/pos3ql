@@ -299,6 +299,21 @@ pub enum Stmt<'a> {
         argument_names: &'a [Option<&'a str>],
         variadic: bool,
     },
+    /// An anonymous PL/pgSQL block. Unsupported languages are rejected before
+    /// this node is constructed.
+    Do {
+        body: &'a str,
+    },
+    CreateLanguage(CreateLanguage<'a>),
+    AlterLanguage {
+        name: &'a str,
+        action: AlterLanguageAction<'a>,
+    },
+    DropLanguage {
+        names: &'a [&'a str],
+        if_exists: bool,
+        cascade: bool,
+    },
     DropFunction {
         functions: &'a [RoutineIdentity<'a>],
         if_exists: bool,
@@ -325,7 +340,7 @@ pub enum Stmt<'a> {
     AlterRoutine {
         kind: RoutineTargetKind,
         routine: RoutineIdentity<'a>,
-        action: AlterRoutineAction<'a>,
+        actions: &'a [AlterRoutineAction<'a>],
     },
     AlterAggregate {
         aggregate: AggregateIdentity<'a>,
@@ -2353,7 +2368,44 @@ pub struct CreateRoutine<'a> {
     pub kind: RoutineCreateKind<'a>,
     pub language: RoutineLanguage,
     pub attributes: RoutineAttributes,
-    pub body: &'a str,
+    pub configs: &'a [RoutineConfigClause<'a>],
+    pub body: RoutineBody<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutineConfigClause<'a> {
+    pub name: &'a str,
+    pub value: RoutineConfigValue<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineConfigValue<'a> {
+    Value(&'a str),
+    Current,
+}
+
+/// The three PostgreSQL SQL-routine body forms have different binding and
+/// catalog semantics, so the body spelling cannot safely stand in for its
+/// form. `Return` stores the expression text; `Atomic` stores the statements
+/// between BEGIN ATOMIC and END.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineBody<'a> {
+    String(&'a str),
+    Return(&'a str),
+    Atomic(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutineEstimate(u64);
+
+impl RoutineEstimate {
+    pub fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && value > 0.0).then_some(Self(value.to_bits()))
+    }
+
+    pub fn get(self) -> f64 {
+        f64::from_bits(self.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2361,6 +2413,10 @@ pub struct RoutineAttributes {
     pub strict: bool,
     pub volatility: RoutineVolatility,
     pub parallel: RoutineParallel,
+    pub security_definer: bool,
+    pub leakproof: bool,
+    pub cost: Option<RoutineEstimate>,
+    pub rows: Option<RoutineEstimate>,
 }
 
 impl Default for RoutineAttributes {
@@ -2369,6 +2425,10 @@ impl Default for RoutineAttributes {
             strict: false,
             volatility: RoutineVolatility::Volatile,
             parallel: RoutineParallel::Unsafe,
+            security_definer: false,
+            leakproof: false,
+            cost: None,
+            rows: None,
         }
     }
 }
@@ -2386,6 +2446,22 @@ pub enum RoutineVolatility {
 pub enum RoutineLanguage {
     Sql,
     PlPgSql,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateLanguage<'a> {
+    pub name: &'a str,
+    pub or_replace: bool,
+    pub trusted: bool,
+    pub handler: Option<QualName<'a>>,
+    pub inline: Option<QualName<'a>>,
+    pub validator: Option<QualName<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterLanguageAction<'a> {
+    Rename(&'a str),
+    SetOwner(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2413,7 +2489,22 @@ pub enum AlterRoutineAction<'a> {
     SetOwner(&'a str),
     Rename(&'a str),
     SetSchema(&'a str),
-    ExtensionDependency { extension: &'a str, enabled: bool },
+    ExtensionDependency {
+        extension: &'a str,
+        enabled: bool,
+    },
+    SetStrict(bool),
+    SetVolatility(RoutineVolatility),
+    SetLeakproof(bool),
+    SetSecurityDefiner(bool),
+    SetParallel(RoutineParallel),
+    SetCost(RoutineEstimate),
+    SetRows(RoutineEstimate),
+    SetConfig {
+        name: &'a str,
+        value: RoutineConfigValue<'a>,
+    },
+    ResetConfig(Option<&'a str>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -855,6 +855,7 @@ impl<'a> Parser<'a> {
             Tok::Ident("delete") => self.delete(),
             Tok::Ident("merge") => self.merge(),
             Tok::Ident("call") => self.call_procedure(),
+            Tok::Ident("do") => self.do_block(),
             Tok::Ident("comment") => self.comment(),
             Tok::Ident("truncate") => self.truncate(),
             Tok::Ident("lock") => self.lock_table(),
@@ -1133,6 +1134,34 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.unexpected("expected a statement")),
         }
+    }
+
+    fn do_block(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("do")?;
+        let mut language = None;
+        if self.eat_ident("language")? {
+            language = Some(self.any_ident("procedural language")?);
+        }
+        let body = self.str_literal("anonymous code block")?;
+        if self.eat_ident("language")? {
+            if language.is_some() {
+                return Err(self.unexpected("one LANGUAGE clause"));
+            }
+            language = Some(self.any_ident("procedural language")?);
+        }
+        let language = language.unwrap_or("plpgsql");
+        if !language.eq_ignore_ascii_case("plpgsql") {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    96,
+                    "language \"{}\" does not support inline code execution",
+                    language
+                ),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
+        Ok(Stmt::Do { body })
     }
 
     fn call_procedure(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -3856,6 +3885,18 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("extension")? {
             return self.alter_extension();
+        }
+        if self.eat_ident("language")? {
+            let name = self.col_ident("language name")?;
+            let action = if self.eat_ident("rename")? {
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterLanguageAction::Rename(self.col_ident("new language name")?)
+            } else {
+                self.expect_ident("owner")?;
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterLanguageAction::SetOwner(self.any_ident("role name")?)
+            };
+            return Ok(Stmt::AlterLanguage { name, action });
         }
         if self.eat_ident("aggregate")? {
             return self.alter_aggregate();

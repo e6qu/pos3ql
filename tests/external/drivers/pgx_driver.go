@@ -49,6 +49,8 @@ func main() {
 	must("drop pgx_drv", err)
 	_, err = conn.Exec(ctx, "DROP TABLE IF EXISTS pgx_types")
 	must("drop pgx_types", err)
+	_, err = conn.Exec(ctx, "DROP TABLE IF EXISTS pgx_sample_source")
+	must("drop pgx_sample_source", err)
 	exec("CREATE TABLE pgx_drv (id int PRIMARY KEY, name text, score float8)")
 	// Binary-encoded parameters (pgx default).
 	exec("INSERT INTO pgx_drv VALUES ($1,$2,$3)", 1, "ada", 9.5)
@@ -85,6 +87,21 @@ func main() {
 		Scan(&label, &amount, &ids, &note, &span, &key)
 	must("scan typed row", err)
 	fmt.Printf("typed %s|%s|%v|%s|%s|%s\n", label, amount, ids, note, span, key)
+
+	exec("SET application_name TO 'outside'")
+	exec("DROP TABLE IF EXISTS pgx_routine_log")
+	exec("CREATE TABLE pgx_routine_log(value integer)")
+	exec("CREATE OR REPLACE FUNCTION pgx_standard(value integer) RETURNS integer LANGUAGE SQL IMMUTABLE STRICT SET application_name TO 'driver' RETURN value + 1")
+	exec("CREATE OR REPLACE PROCEDURE pgx_standard_proc(value integer) LANGUAGE SQL AS 'INSERT INTO pgx_routine_log VALUES (value)'")
+	var routineValue int
+	var applicationName string
+	must("standard routine", conn.QueryRow(ctx,
+		"SELECT pgx_standard($1), current_setting('application_name')", 41).
+		Scan(&routineValue, &applicationName))
+	fmt.Printf("standard routine %d|%s\n", routineValue, applicationName)
+	exec("CALL pgx_standard_proc($1)", 43)
+	must("standard procedure", conn.QueryRow(ctx, "SELECT value FROM pgx_routine_log").Scan(&routineValue))
+	fmt.Printf("standard procedure %d\n", routineValue)
 
 	// Transaction rollback must not persist.
 	tx, err := conn.Begin(ctx)

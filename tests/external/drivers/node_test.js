@@ -18,6 +18,7 @@ async function main() {
   try {
     await c.query('DROP TABLE IF EXISTS node_drv');
     await c.query('DROP TABLE IF EXISTS node_types');
+    await c.query('DROP TABLE IF EXISTS node_sample_source');
     await c.query('CREATE TABLE node_drv (id int PRIMARY KEY, name text, score float8)');
 
     // Parameterized inserts (extended protocol).
@@ -45,6 +46,21 @@ async function main() {
       'SELECT label, amount, ids, note, span::text, key::text FROM node_types')).rows[0];
     line(`typed ${typed.label}|${typed.amount}|${JSON.stringify(typed.ids)}|` +
       `${JSON.stringify(typed.note)}|${typed.span}|${typed.key}`);
+
+    await c.query("SET application_name TO 'outside'");
+    await c.query("DROP TABLE IF EXISTS node_routine_log");
+    await c.query("CREATE TABLE node_routine_log(value integer)");
+    await c.query("CREATE OR REPLACE FUNCTION node_standard(value integer) RETURNS integer " +
+      "LANGUAGE SQL IMMUTABLE STRICT SET application_name TO 'driver' RETURN value + 1");
+    await c.query("CREATE OR REPLACE PROCEDURE node_standard_proc(value integer) " +
+      "LANGUAGE SQL AS 'INSERT INTO node_routine_log VALUES (value)'");
+    const routine = await c.query(
+      "SELECT node_standard($1) AS value, current_setting('application_name') AS application_name",
+      [41]);
+    line(`standard routine ${routine.rows[0].value}|${routine.rows[0].application_name}`);
+    await c.query("CALL node_standard_proc($1)", [43]);
+    const procedure = await c.query("SELECT value FROM node_routine_log");
+    line(`standard procedure ${procedure.rows[0].value}`);
 
     // Transaction rollback must not persist.
     await c.query('BEGIN');

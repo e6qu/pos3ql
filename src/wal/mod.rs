@@ -2261,6 +2261,15 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::CreateRoutine(def) => {
             8 + 2
                 + 3
+                + 3
+                + def.attributes.cost_bits.map_or(1, |_| 9)
+                + def.attributes.rows_bits.map_or(1, |_| 9)
+                + 1
+                + def
+                    .configs()
+                    .iter()
+                    .map(|config| 1 + config.name.as_str().len() + 2 + config.value.as_str().len())
+                    .sum::<usize>()
                 + 1
                 + def.name.as_str().len()
                 + 1
@@ -3517,7 +3526,24 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 u8::from(def.attributes.strict),
                 def.attributes.volatility.code(),
                 def.attributes.parallel.code(),
+                def.body_kind.code(),
+                u8::from(def.attributes.security_definer),
+                u8::from(def.attributes.leakproof),
             ]);
+            for estimate in [def.attributes.cost_bits, def.attributes.rows_bits] {
+                match estimate {
+                    Some(bits) => {
+                        ok &= buffer.append(&[1]) && buffer.append(&bits.to_le_bytes());
+                    }
+                    None => ok &= buffer.append(&[0]),
+                }
+            }
+            ok &= buffer.append(&[def.config_count as u8]);
+            for config in def.configs() {
+                ok &= name_bytes(buffer, config.name.as_str());
+                let value = config.value.as_str().as_bytes();
+                ok &= buffer.append(&(value.len() as u16).to_le_bytes()) && buffer.append(value);
+            }
             ok &= buffer.append(&[def.kind.wire_code()]);
             if matches!(
                 def.kind,
@@ -5929,8 +5955,70 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 },
                 volatility: crate::storage::RoutineVolatility::from_code(*payload.get(at + 1)?)?,
                 parallel: crate::storage::RoutineParallel::from_code(*payload.get(at + 2)?)?,
+                security_definer: false,
+                leakproof: false,
+                cost_bits: None,
+                rows_bits: None,
             };
             at += 3;
+            let body_kind = crate::storage::RoutineBodyKind::from_code(*payload.get(at)?)?;
+            let security_definer = match *payload.get(at + 1)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let leakproof = match *payload.get(at + 2)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 3;
+            let mut estimates = [None; 2];
+            for estimate in &mut estimates {
+                *estimate = match *payload.get(at)? {
+                    0 => {
+                        at += 1;
+                        None
+                    }
+                    1 => {
+                        at += 1;
+                        let bits = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+                        at += 8;
+                        let value = f64::from_bits(bits);
+                        Some((value.is_finite() && value > 0.0).then_some(bits)?)
+                    }
+                    _ => return None,
+                };
+            }
+            let attributes = crate::storage::RoutineAttributes {
+                security_definer,
+                leakproof,
+                cost_bits: estimates[0],
+                rows_bits: estimates[1],
+                ..attributes
+            };
+            let config_count = *payload.get(at)? as usize;
+            at += 1;
+            if config_count > crate::storage::MAX_ROUTINE_CONFIGS {
+                return None;
+            }
+            let mut configs =
+                [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_ROUTINE_CONFIGS];
+            for config in &mut configs[..config_count] {
+                let name = SqlName::parse(take_name(&mut at)?).ok()?;
+                let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                at += 2;
+                if len > crate::storage::ROUTINE_CONFIG_VALUE_MAX {
+                    return None;
+                }
+                let value = core::str::from_utf8(payload.get(at..at + len)?).ok()?;
+                at += len;
+                let value = crate::util::StackStr::from_str(value);
+                if value.is_truncated() {
+                    return None;
+                }
+                *config = crate::storage::RoutineConfig { name, value };
+            }
             let mut result_columns =
                 [crate::storage::RoutineArgumentDef::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
             let mut result_column_count = 0;
@@ -5988,6 +6076,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 result_columns,
                 result_column_count,
                 attributes,
+                configs,
+                config_count,
+                body_kind,
                 body: crate::util::StackStr::from_str(body),
                 ownership: crate::storage::Ownership {
                     owner,

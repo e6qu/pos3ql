@@ -25,3 +25,9 @@ SELECT oid, proname, proargtypes, proisstrict, provolatile, proparallel
   FROM pg_proc
  WHERE oid IN (1081, 1402, 1641, 2078, 2730, 3086)
  ORDER BY oid;
+
+SELECT oid, lanname, lanowner, lanpltrusted, lanispl,
+       lanplcallfoid, laninline, lanvalidator, lanacl IS NULL
+  FROM pg_language
+ WHERE oid IN (12, 13, 14)
+ ORDER BY oid;

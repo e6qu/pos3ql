@@ -1098,7 +1098,7 @@ fn instead_of_view_triggers_drive_insert_update_delete_and_returning() {
                FROM pg_proc p JOIN pg_language language ON language.oid = p.prolang \
               WHERE p.proname = 'view_trigger_write'"
         )),
-        ["||trigger||plpgsql"]
+        ["||trigger|NULL|plpgsql"]
     );
     let insert_select = run_with(
         &mut engine,
@@ -4081,7 +4081,13 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         &mut budget,
         "CREATE TYPE protocol_state AS ENUM ('ready'); \
          CREATE DOMAIN protocol_count AS integer CHECK (VALUE > 0); \
-         CREATE TABLE protocol_types (state protocol_state, count protocol_count)",
+         CREATE TABLE protocol_types (state protocol_state, count protocol_count); \
+         CREATE FUNCTION protocol_increment(value integer) RETURNS integer \
+           LANGUAGE SQL RETURN value + 1; \
+         CREATE PROCEDURE protocol_record(value integer) \
+           LANGUAGE SQL AS 'SELECT value'; \
+         CREATE PROCEDURE protocol_output(IN value integer, OUT doubled integer) \
+           LANGUAGE SQL AS 'SELECT value * 2'",
     );
     let enum_oid = crate::sql::types::oid::enum_oid(
         engine
@@ -4142,6 +4148,30 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         &[0; MAX_BIND_PARAMS],
     );
     assert_eq!(inferred[..2], [crate::sql::types::oid::INT8, enum_oid]);
+    let inferred = engine.infer_param_types(
+        "SELECT protocol_increment($1)",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(inferred[0], crate::sql::types::oid::INT4);
+    let inferred = engine.infer_param_types(
+        "CALL protocol_record($1)",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(inferred[0], crate::sql::types::oid::INT4);
+    let inferred = engine.infer_param_types(
+        "CALL protocol_output($1, $2)",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(
+        inferred[..2],
+        [crate::sql::types::oid::INT4, crate::sql::types::oid::INT4]
+    );
 }
 
 #[test]
@@ -14074,6 +14104,204 @@ fn routine_parameter_contracts_drive_defaults_outputs_and_catalog_text() {
         String::from_utf8_lossy(&recovered_output)
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
+    let mut config = test_config("routine_body_attributes");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("routine-body-attributes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_attribute_log(value text);
+         CREATE FUNCTION standard_return(a integer) RETURNS integer
+             LANGUAGE SQL IMMUTABLE PARALLEL SAFE COST 2
+             SET application_name TO 'inside' RETURN a + 1;
+         CREATE FUNCTION standard_atomic(a integer) RETURNS integer
+             LANGUAGE SQL ROWS 3 BEGIN ATOMIC SELECT a + 2; END;",
+    );
+    assert!(
+        String::from_utf8_lossy(&created).contains("ROWS is not applicable"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_attribute_log(value text);
+         CREATE FUNCTION standard_return(a integer) RETURNS integer
+             LANGUAGE SQL IMMUTABLE PARALLEL SAFE COST 2
+             SET application_name TO 'inside' RETURN a + 1;
+         CREATE FUNCTION standard_atomic(a integer) RETURNS integer
+             LANGUAGE SQL BEGIN ATOMIC SELECT a + 2; END;
+         CREATE FUNCTION configured_user() RETURNS text
+             LANGUAGE SQL SECURITY DEFINER SET application_name TO 'inside'
+             AS 'SELECT current_user || '':'' || current_setting(''application_name'')';
+         CREATE FUNCTION standard_mutable() RETURNS text
+             LANGUAGE SQL SECURITY DEFINER SET application_name TO 'mutable scope'
+             BEGIN ATOMIC
+               INSERT INTO routine_attribute_log
+                 VALUES (current_user || ':' || current_setting('application_name'))
+                 RETURNING current_user || ':' || current_setting('application_name');
+             END;
+         CREATE FUNCTION standard_mutable_rows() RETURNS TABLE(value text)
+             LANGUAGE SQL SECURITY DEFINER SET application_name TO 'table scope'
+             BEGIN ATOMIC
+               INSERT INTO routine_attribute_log
+                 VALUES (current_user || ':' || current_setting('application_name'))
+                 RETURNING current_user || ':' || current_setting('application_name');
+             END;
+         CREATE FUNCTION inner_config() RETURNS text
+             LANGUAGE SQL SET application_name TO 'inner'
+             RETURN current_setting('application_name');
+         CREATE FUNCTION nested_config() RETURNS text
+             LANGUAGE SQL SET application_name TO 'outer'
+             RETURN current_setting('application_name') || ':' || inner_config()
+                    || ':' || current_setting('application_name');
+         CREATE FUNCTION persistent_config() RETURNS text
+             LANGUAGE SQL SET application_name TO 'temporary'
+             AS 'SET application_name TO ''persisted'';
+                 SELECT current_setting(''application_name'')';
+         CREATE ROLE routine_caller;
+         SET application_name = 'outside';
+         SET ROLE routine_caller;
+         SELECT standard_return(4), standard_atomic(4), configured_user(),
+                current_setting('application_name');
+         SELECT standard_mutable(), current_setting('application_name');
+         SELECT value, current_setting('application_name') FROM standard_mutable_rows();
+         RESET ROLE;
+         SELECT nested_config(), current_setting('application_name');
+         SELECT persistent_config(), current_setting('application_name');
+         SET application_name TO 'outside';
+         SET application_name TO 'captured';
+         ALTER FUNCTION standard_atomic(integer) SET application_name FROM CURRENT;
+         SET application_name TO 'outside';
+         SELECT proconfig::text FROM pg_proc WHERE proname = 'standard_atomic';
+         ALTER FUNCTION standard_atomic(integer) RESET application_name;
+         SELECT proconfig IS NULL FROM pg_proc WHERE proname = 'standard_atomic';
+         ALTER FUNCTION standard_mutable_rows() ROWS 12 COST 3;
+         SELECT procost, prorows FROM pg_proc WHERE proname = 'standard_mutable_rows';
+         ALTER FUNCTION standard_return(integer)
+             VOLATILE PARALLEL RESTRICTED COST 7 SET application_name TO 'altered';
+         SELECT standard_return(9), current_setting('application_name');
+         SELECT pg_get_functiondef('standard_return(integer)'::regprocedure)
+                    LIKE '%SET application_name TO ''altered''%';
+         SELECT provolatile, proparallel, prosecdef, proleakproof, procost, prorows,
+                proconfig::text, prosqlbody IS NULL
+           FROM pg_proc WHERE proname = 'standard_return';
+         SELECT pg_typeof(proargtypes)::text, pg_typeof(protrftypes)::text,
+                pg_typeof(prosupport)::text, probin IS NULL, prosupport::oid
+           FROM pg_proc WHERE proname = 'standard_return';
+         SELECT proparallel, proowner, probin IS NULL, pg_typeof(proargtypes)::text
+           FROM pg_proc WHERE proname = 'version';
+         SELECT value FROM routine_attribute_log ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&created),
+        [
+            "5|6|postgres:inside|outside",
+            "postgres:mutable scope|outside",
+            "postgres:table scope|outside",
+            "outer:inner:outer|outside",
+            "persisted|persisted",
+            "{application_name=captured}",
+            "t",
+            "3|12",
+            "10|outside",
+            "t",
+            "v|r|f|f|7|0|{application_name=altered}|f",
+            "oidvector|oid[]|regproc|t|0",
+            "s|10|t|oidvector",
+            "postgres:mutable scope",
+            "postgres:table scope",
+        ],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let recovered = run_with(
+        &mut engine,
+        &mut budget,
+        "SET application_name = 'recovered';
+         SELECT standard_return(2), standard_atomic(2), current_setting('application_name');
+         SELECT procost, proconfig::text, prosqlbody IS NULL
+           FROM pg_proc WHERE proname = 'standard_return';",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        ["3|4|recovered", "7|{application_name=altered}|f"],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    let anonymous = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE anonymous_log(value integer);
+         DO 'BEGIN INSERT INTO anonymous_log VALUES (1); INSERT INTO anonymous_log VALUES (2); END';
+         SELECT value FROM anonymous_log ORDER BY value;",
+    );
+    assert_eq!(data_rows(&anonymous), ["1", "2"]);
+    let explicit_termination = run_with(&mut engine, &mut budget, "BEGIN; DO 'BEGIN COMMIT; END';");
+    assert!(
+        String::from_utf8_lossy(&explicit_termination).contains("2D000"),
+        "{}",
+        String::from_utf8_lossy(&explicit_termination)
+    );
+    let unsupported_language = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRUSTED PROCEDURAL LANGUAGE routine_native HANDLER standard_return;",
+    );
+    assert!(
+        String::from_utf8_lossy(&unsupported_language).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&unsupported_language)
+    );
+    let handlerless_language = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE LANGUAGE routine_handlerless;",
+    );
+    assert!(
+        String::from_utf8_lossy(&handlerless_language).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&handlerless_language)
+    );
+    let altered_language = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER LANGUAGE plpgsql RENAME TO renamed_plpgsql;",
+    );
+    assert!(
+        String::from_utf8_lossy(&altered_language).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&altered_language)
+    );
+    let dropped_language = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP LANGUAGE IF EXISTS renamed_plpgsql CASCADE;",
+    );
+    assert!(
+        String::from_utf8_lossy(&dropped_language).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&dropped_language)
+    );
+    let unsupported_do = run_with(&mut engine, &mut budget, "DO LANGUAGE sql 'SELECT 1';");
+    assert!(
+        String::from_utf8_lossy(&unsupported_do).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&unsupported_do)
+    );
 }
 
 #[test]

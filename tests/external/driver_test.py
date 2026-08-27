@@ -259,7 +259,7 @@ print("record field metadata ok")
 cur.execute("CREATE DOMAIN drv_srf_count AS integer CHECK (VALUE > 0)")
 cur.execute(
     "CREATE FUNCTION drv_srf_scalar(value drv_srf_count) RETURNS drv_srf_count "
-    "LANGUAGE SQL AS 'SELECT $1'"
+    "LANGUAGE SQL RETURN value"
 )
 cur.execute(
     "CREATE FUNCTION drv_srf_record(value integer) "

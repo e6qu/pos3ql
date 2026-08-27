@@ -3912,7 +3912,52 @@ pub(crate) struct RoutineSpec {
     pub result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub result_column_count: usize,
     pub attributes: RoutineAttributes,
+    pub configs: [RoutineConfig; MAX_ROUTINE_CONFIGS],
+    pub config_count: usize,
+    pub body_kind: RoutineBodyKind,
     pub body: StackStr<ROUTINE_SQL_MAX>,
+}
+
+pub(crate) const MAX_ROUTINE_CONFIGS: usize = 16;
+pub(crate) const ROUTINE_CONFIG_VALUE_MAX: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoutineConfig {
+    pub name: SqlName,
+    pub value: StackStr<ROUTINE_CONFIG_VALUE_MAX>,
+}
+
+impl RoutineConfig {
+    pub(crate) const EMPTY: Self = Self {
+        name: SqlName::EMPTY,
+        value: StackStr::new(),
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutineBodyKind {
+    String,
+    Return,
+    Atomic,
+}
+
+impl RoutineBodyKind {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::String => 0,
+            Self::Return => 1,
+            Self::Atomic => 2,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::String),
+            1 => Some(Self::Return),
+            2 => Some(Self::Atomic),
+            _ => None,
+        }
+    }
 }
 
 /// A routine's invocation contract. Keeping a function result inside the
@@ -4012,6 +4057,10 @@ pub(crate) struct RoutineAttributes {
     pub strict: bool,
     pub volatility: RoutineVolatility,
     pub parallel: RoutineParallel,
+    pub security_definer: bool,
+    pub leakproof: bool,
+    pub cost_bits: Option<u64>,
+    pub rows_bits: Option<u64>,
 }
 
 impl RoutineAttributes {
@@ -4019,6 +4068,10 @@ impl RoutineAttributes {
         strict: false,
         volatility: RoutineVolatility::Volatile,
         parallel: RoutineParallel::Unsafe,
+        security_definer: false,
+        leakproof: false,
+        cost_bits: None,
+        rows_bits: None,
     };
 
     pub(crate) const AGGREGATE: Self = Self::DEFAULT;
@@ -4532,6 +4585,9 @@ pub(crate) struct RoutineDef {
     pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) result_column_count: usize,
     pub attributes: RoutineAttributes,
+    pub configs: [RoutineConfig; MAX_ROUTINE_CONFIGS],
+    pub config_count: usize,
+    pub body_kind: RoutineBodyKind,
     pub body: StackStr<ROUTINE_SQL_MAX>,
     pub ownership: Ownership,
     pub ddl_state: CatalogDdlState,
@@ -4551,6 +4607,9 @@ pub(crate) struct PendingRoutineDefinition {
     pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) result_column_count: usize,
     pub(crate) attributes: RoutineAttributes,
+    pub(crate) configs: [RoutineConfig; MAX_ROUTINE_CONFIGS],
+    pub(crate) config_count: usize,
+    pub(crate) body_kind: RoutineBodyKind,
     pub(crate) body: StackStr<ROUTINE_SQL_MAX>,
 }
 
@@ -4571,6 +4630,9 @@ impl RoutineDef {
         result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
         result_column_count: 0,
         attributes: RoutineAttributes::DEFAULT,
+        configs: [RoutineConfig::EMPTY; MAX_ROUTINE_CONFIGS],
+        config_count: 0,
+        body_kind: RoutineBodyKind::String,
         body: StackStr::new(),
         ownership: Ownership::BOOTSTRAP,
         ddl_state: CatalogDdlState::Absent,
@@ -4586,6 +4648,10 @@ impl RoutineDef {
 
     pub(crate) fn parameters(&self) -> &[RoutineParameterDef] {
         &self.parameters[..self.parameter_count]
+    }
+
+    pub(crate) fn configs(&self) -> &[RoutineConfig] {
+        &self.configs[..self.config_count]
     }
 
     pub(crate) fn required_argument_count(&self) -> usize {
@@ -4728,6 +4794,9 @@ impl RoutineDef {
                 result_columns: pending.result_columns,
                 result_column_count: pending.result_column_count,
                 attributes: pending.attributes,
+                configs: pending.configs,
+                config_count: pending.config_count,
+                body_kind: pending.body_kind,
                 body: pending.body,
                 pending_definition: None,
                 ..*self
@@ -20357,6 +20426,114 @@ impl Storage {
         self.routine_for_bound_call(slot, &completed[..routine.argument_count], txid)
     }
 
+    /// Resolves the declared input OIDs for a function call that still has
+    /// untyped protocol parameters. Only a unique overload may supply the
+    /// contract; an unknown argument is never guessed from one of several
+    /// candidates.
+    pub(crate) fn function_call_parameter_oids(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        explicit_variadic: bool,
+        actual_oids: &[i32],
+        txid: u32,
+    ) -> Option<[i32; MAX_ROUTINE_ARGUMENTS]> {
+        if actual_oids.len() > MAX_ROUTINE_ARGUMENTS
+            || (!argument_names.is_empty() && argument_names.len() != actual_oids.len())
+        {
+            return None;
+        }
+        let resolve = |schema: &str, routine_name: &str| {
+            let mut found = None;
+            for (slot, stored) in self.routines.iter().enumerate() {
+                let routine = stored.definition_for(txid);
+                if !stored.visible_to(txid)
+                    || !matches!(
+                        routine.kind,
+                        RoutineKind::Function { .. }
+                            | RoutineKind::SetFunction { .. }
+                            | RoutineKind::RecordFunction { .. }
+                            | RoutineKind::TableFunction
+                    )
+                    || routine.schema_for(txid).as_str() != schema
+                    || routine.name_for(txid).as_str() != routine_name
+                {
+                    continue;
+                }
+                let Some(mapping) = routine.call_input_mapping(
+                    argument_names,
+                    actual_oids.len(),
+                    explicit_variadic,
+                ) else {
+                    continue;
+                };
+                let variadic_input =
+                    routine
+                        .arguments()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(input_index, _)| {
+                            matches!(
+                                routine.parameter_for_input(input_index)?.mode,
+                                RoutineParameterMode::Variadic { .. }
+                            )
+                            .then_some(input_index)
+                        });
+                let mut expected = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+                let mut matches = true;
+                for (call_index, actual_oid) in actual_oids.iter().copied().enumerate() {
+                    let input_index = usize::from(mapping[call_index]);
+                    let argument = routine.arguments()[input_index];
+                    let expected_oid = if !explicit_variadic && variadic_input == Some(input_index)
+                    {
+                        match argument.ctype {
+                            ColType::Array(element) => Some(element.element_oid()),
+                            _ => None,
+                        }
+                    } else {
+                        self.routine_argument_oid(&argument, txid)
+                    };
+                    let Some(expected_oid) = expected_oid else {
+                        matches = false;
+                        break;
+                    };
+                    expected[call_index] = if argument.polymorphic_type().is_some() {
+                        actual_oid
+                    } else {
+                        expected_oid
+                    };
+                    if actual_oid != crate::sql::types::oid::UNKNOWN
+                        && argument.polymorphic_type().is_none()
+                        && actual_oid != expected_oid
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+                if !matches {
+                    continue;
+                }
+                if found.replace((slot, expected)).is_some() {
+                    return None;
+                }
+            }
+            found.map(|(_, expected)| expected)
+        };
+        if let Some((schema, routine_name)) = name.split_once('.') {
+            return resolve(schema, routine_name);
+        }
+        for entry in self.path.entries() {
+            let PathEntry::Schema(schema_slot) = entry else {
+                continue;
+            };
+            let schema = self.schemas[*schema_slot as usize].name;
+            if let Some(expected) = resolve(schema.as_str(), name) {
+                return Some(expected);
+            }
+        }
+        None
+    }
+
     pub(crate) fn routine_for_bound_call(
         &self,
         slot: usize,
@@ -20637,6 +20814,138 @@ impl Storage {
             };
             resolve(self.schemas[*slot as usize].name.as_str(), name)
         })
+    }
+
+    /// Resolves protocol parameter OIDs for a CALL before its Bind values
+    /// exist. OUT placeholders and input arguments both derive their type from
+    /// the unique procedure declaration.
+    pub(crate) fn procedure_call_parameter_oids(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        explicit_variadic: bool,
+        actual_oids: &[i32],
+        txid: u32,
+    ) -> Option<[i32; MAX_ROUTINE_ARGUMENTS]> {
+        if actual_oids.len() > MAX_ROUTINE_ARGUMENTS
+            || (!argument_names.is_empty() && argument_names.len() != actual_oids.len())
+        {
+            return None;
+        }
+        let resolve = |schema: &str, routine_name: &str| {
+            let mut found = None;
+            for stored in self.routines.iter() {
+                let routine = stored.definition_for(txid);
+                if !stored.visible_to(txid)
+                    || !matches!(routine.kind, RoutineKind::Procedure)
+                    || routine.schema_for(txid).as_str() != schema
+                    || routine.name_for(txid).as_str() != routine_name
+                {
+                    continue;
+                }
+                let output_call = routine
+                    .parameters()
+                    .iter()
+                    .any(|parameter| parameter.mode.is_output());
+                let input_mapping = if output_call {
+                    let Some(mapping) =
+                        routine.procedure_call_mapping(argument_names, actual_oids.len())
+                    else {
+                        continue;
+                    };
+                    mapping
+                } else {
+                    let Some(mapping) = routine.call_input_mapping(
+                        argument_names,
+                        actual_oids.len(),
+                        explicit_variadic,
+                    ) else {
+                        continue;
+                    };
+                    mapping
+                };
+                let variadic_input =
+                    routine
+                        .arguments()
+                        .iter()
+                        .enumerate()
+                        .find_map(|(input_index, _)| {
+                            matches!(
+                                routine.parameter_for_input(input_index)?.mode,
+                                RoutineParameterMode::Variadic { .. }
+                            )
+                            .then_some(input_index)
+                        });
+                let mut expected = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+                let mut matches = true;
+                for (call_index, actual_oid) in actual_oids.iter().copied().enumerate() {
+                    let (polymorphic, expected_oid) =
+                        if output_call && input_mapping[call_index] == u8::MAX {
+                            let parameter_index =
+                                match argument_names.get(call_index).copied().flatten() {
+                                    Some(name) => {
+                                        routine.parameters().iter().position(|parameter| {
+                                            parameter.name.as_str().eq_ignore_ascii_case(name)
+                                        })?
+                                    }
+                                    None => call_index,
+                                };
+                            let parameter = *routine.parameters().get(parameter_index)?;
+                            let expected_oid =
+                                self.routine_type_oid(parameter.ctype, parameter.user_type, txid)?;
+                            (
+                                polymorphic_type(parameter.ctype, parameter.user_type),
+                                expected_oid,
+                            )
+                        } else {
+                            let input_index = usize::from(input_mapping[call_index]);
+                            let argument = routine.arguments()[input_index];
+                            let expected_oid =
+                                if !explicit_variadic && variadic_input == Some(input_index) {
+                                    match argument.ctype {
+                                        ColType::Array(element) => element.element_oid(),
+                                        _ => return None,
+                                    }
+                                } else {
+                                    self.routine_argument_oid(&argument, txid)?
+                                };
+                            (argument.polymorphic_type(), expected_oid)
+                        };
+                    expected[call_index] = if polymorphic.is_some() {
+                        actual_oid
+                    } else {
+                        expected_oid
+                    };
+                    if actual_oid != crate::sql::types::oid::UNKNOWN
+                        && polymorphic.is_none()
+                        && actual_oid != expected_oid
+                    {
+                        matches = false;
+                        break;
+                    }
+                }
+                if !matches {
+                    continue;
+                }
+                if found.replace(expected).is_some() {
+                    return None;
+                }
+            }
+            found
+        };
+        if let Some((schema, routine_name)) = name.split_once('.') {
+            return resolve(schema, routine_name);
+        }
+        for entry in self.path.entries() {
+            let PathEntry::Schema(schema_slot) = entry else {
+                continue;
+            };
+            let schema = self.schemas[*schema_slot as usize].name;
+            if let Some(expected) = resolve(schema.as_str(), name) {
+                return Some(expected);
+            }
+        }
+        None
     }
 
     pub(crate) fn trigger_slot_for_call(&self, name: &str, txid: u32) -> Option<usize> {
@@ -21173,8 +21482,26 @@ impl Storage {
             result_columns,
             result_column_count,
             attributes,
+            configs,
+            config_count,
+            body_kind,
             body,
         } = spec;
+        if config_count > configs.len()
+            || configs[..config_count]
+                .iter()
+                .enumerate()
+                .any(|(index, config)| {
+                    configs[..index]
+                        .iter()
+                        .any(|prior| prior.name == config.name)
+                })
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "routine configuration contract is invalid"
+            ));
+        }
         if parameter_count > parameters.len()
             || parameters[..parameter_count]
                 .iter()
@@ -21340,6 +21667,9 @@ impl Storage {
             result_columns,
             result_column_count,
             attributes,
+            configs,
+            config_count,
+            body_kind,
             body,
             ownership,
             ddl_state: CatalogDdlState::PendingCreate { txid },
@@ -21392,6 +21722,9 @@ impl Storage {
             routine.result_columns = pending.result_columns;
             routine.result_column_count = pending.result_column_count;
             routine.attributes = pending.attributes;
+            routine.configs = pending.configs;
+            routine.config_count = pending.config_count;
+            routine.body_kind = pending.body_kind;
             routine.body = pending.body;
             routine.pending_definition = None;
         }
@@ -22213,6 +22546,9 @@ impl Storage {
                 self.routines[slot].result_columns = definition.result_columns;
                 self.routines[slot].result_column_count = definition.result_column_count;
                 self.routines[slot].attributes = definition.attributes;
+                self.routines[slot].configs = definition.configs;
+                self.routines[slot].config_count = definition.config_count;
+                self.routines[slot].body_kind = definition.body_kind;
                 self.routines[slot].body = definition.body;
                 self.routines[slot].ownership = definition.ownership;
                 self.routines[slot].pending_definition = None;
@@ -22237,6 +22573,9 @@ impl Storage {
                 result_columns: definition.result_columns,
                 result_column_count: definition.result_column_count,
                 attributes: definition.attributes,
+                configs: definition.configs,
+                config_count: definition.config_count,
+                body_kind: definition.body_kind,
                 body: definition.body,
             },
             0,

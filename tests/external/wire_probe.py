@@ -872,6 +872,55 @@ def test_bind_rejects_mismatched_result_format_count():
     s.close()
 
 
+def test_routine_contract_infers_untyped_parse_parameter():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE OR REPLACE FUNCTION wire_inferred_standard(value integer) "
+        "RETURNS integer LANGUAGE SQL RETURN value + 1",
+    )
+    check(
+        "routine parameter inference setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    query = "SELECT wire_inferred_standard($1)"
+    parse = frontend_message(
+        b"P",
+        b"wire_inferred_statement\x00" + query.encode() + b"\x00" + struct.pack("!h", 0),
+    )
+    describe = frontend_message(b"D", b"Swire_inferred_statement\x00")
+    bind_body = b"wire_inferred_portal\x00wire_inferred_statement\x00"
+    bind_body += struct.pack("!hh", 1, 1)
+    bind_body += struct.pack("!hi", 1, 4) + struct.pack("!i", 41)
+    bind_body += struct.pack("!hh", 1, 1)
+    bind = frontend_message(b"B", bind_body)
+    execute = frontend_message(b"E", b"wire_inferred_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + describe + bind + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    parameter_description = next((payload for kind, payload in output if kind == b"t"), None)
+    row = next((payload for kind, payload in output if kind == b"D"), None)
+    check(
+        "routine declaration determines ParameterDescription OID",
+        parameter_description == struct.pack("!hi", 1, 23),
+        output,
+    )
+    check(
+        "inferred routine parameter accepts binary integer Bind",
+        not any(kind == b"E" for kind, _ in output)
+        and row == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", 42),
+        output,
+    )
+    s.close()
+
+
 def test_portal_describe_preserves_type_modifier():
     s = connect()
     s.sendall(startup_payload(0))
@@ -1908,14 +1957,13 @@ def test_catalog_aware_binary_bind_parameters():
         "CREATE DOMAIN wire_binary_coordinate_domain AS wire_binary_coordinate; "
         "CREATE TABLE wire_binary_regclass (id integer, state wire_binary_state, positive wire_binary_positive, coordinate wire_binary_coordinate); "
         "INSERT INTO wire_binary_regclass VALUES (1, 'ready', 7, ROW(4,8)::wire_binary_coordinate); "
-        "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL "
-        "AS 'SELECT value'; "
-        "CREATE FUNCTION wire_binary_state_echo(value wire_binary_state) RETURNS wire_binary_state LANGUAGE SQL AS 'SELECT $1'; "
-        "CREATE FUNCTION wire_binary_positive_echo(value wire_binary_positive) RETURNS wire_binary_positive LANGUAGE SQL AS 'SELECT $1'; "
-        "CREATE FUNCTION wire_binary_coordinate_echo(value wire_binary_coordinate) RETURNS wire_binary_coordinate LANGUAGE SQL AS 'SELECT $1'; "
-        "CREATE FUNCTION wire_binary_state_array_echo(value wire_binary_state[]) RETURNS wire_binary_state[] LANGUAGE SQL AS 'SELECT $1'; "
-        "CREATE FUNCTION wire_binary_positive_array_echo(value wire_binary_positive[]) RETURNS wire_binary_positive[] LANGUAGE SQL AS 'SELECT $1'; "
-        "CREATE FUNCTION wire_binary_coordinate_array_echo(value wire_binary_coordinate[]) RETURNS wire_binary_coordinate[] LANGUAGE SQL AS 'SELECT $1'",
+        "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_state_echo(value wire_binary_state) RETURNS wire_binary_state LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_positive_echo(value wire_binary_positive) RETURNS wire_binary_positive LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_coordinate_echo(value wire_binary_coordinate) RETURNS wire_binary_coordinate LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_state_array_echo(value wire_binary_state[]) RETURNS wire_binary_state[] LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_positive_array_echo(value wire_binary_positive[]) RETURNS wire_binary_positive[] LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_coordinate_array_echo(value wire_binary_coordinate[]) RETURNS wire_binary_coordinate[] LANGUAGE SQL RETURN value",
     )
 
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_state'")))

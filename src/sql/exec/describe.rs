@@ -601,11 +601,7 @@ fn describe_record_star<'q>(
 /// scalar, range, and array identities; this boundary adds only PostgreSQL's
 /// internal `"char"` catalog type.
 pub(crate) fn coltype_of_oid(o: i32) -> Option<ColType> {
-    if o == 18 {
-        Some(ColType::Text)
-    } else {
-        ColType::from_oid(o)
-    }
+    ColType::from_oid(o)
 }
 
 /// Unifies two types by PostgreSQL's numeric preference (int4<int8<numeric<
@@ -3355,7 +3351,8 @@ pub fn infer_type_res(
             "current_user" | "session_user" | "user" | "current_role" | "current_schema"
             | "current_database" | "current_catalog" => of(ColType::Name),
             // current_setting(name [, missing_ok]) returns the value as text.
-            "current_setting" | "set_config" | "acldefault" => of(ColType::Text),
+            "current_setting" | "set_config" => of(ColType::Text),
+            "acldefault" => of(ColType::Array(crate::sql::types::ArrElem::AclItem)),
             "current_time" => of(ColType::Timetz),
             "localtime" => of(ColType::Time),
             "localtimestamp" => of(ColType::Timestamp),

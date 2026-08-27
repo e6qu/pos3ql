@@ -3254,6 +3254,9 @@ impl<'a> Parser<'a> {
                     | "create"
                     | "execute"
                     | "maintain"
+                    | "connect"
+                    | "temporary"
+                    | "temp"
             )
         )
     }
@@ -3275,11 +3278,18 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
+        let grantor = if self.eat_ident("granted")? {
+            self.expect_ident("by")?;
+            Some(self.any_ident("grantor role name")?)
+        } else {
+            None
+        };
         Ok(Stmt::GrantPrivileges {
             privileges,
             target,
             grantees,
             grant_option,
+            grantor,
         })
     }
 
@@ -3287,38 +3297,63 @@ impl<'a> Parser<'a> {
         let roles = self.role_name_list("role name")?;
         self.expect_ident("to")?;
         let members = self.role_name_list("member role name")?;
-        let mut options = crate::sql::ast::RoleGrantOptions::DEFAULT;
+        let mut options = crate::sql::ast::RoleMembershipPatch::EMPTY;
         if self.eat_ident("with")? {
             loop {
                 if self.eat_ident("admin")? {
-                    let _ = self.eat_ident("option")?;
-                    options.admin = true;
+                    if options.admin.is_some() {
+                        return Err(self.err_here("ADMIN option specified more than once"));
+                    }
+                    options.admin = Some(
+                        if self.peeked == Tok::Ident("true") || self.peeked == Tok::Ident("false") {
+                            self.role_option_boolean()?
+                        } else {
+                            let _ = self.eat_ident("option")?;
+                            true
+                        },
+                    );
                 } else if self.eat_ident("inherit")? {
-                    options.inherit = self.role_option_boolean()?;
+                    if options.inherit.is_some() {
+                        return Err(self.err_here("INHERIT option specified more than once"));
+                    }
+                    options.inherit = Some(self.role_option_boolean()?);
                 } else if self.eat_ident("set")? {
-                    options.set = self.role_option_boolean()?;
+                    if options.set.is_some() {
+                        return Err(self.err_here("SET option specified more than once"));
+                    }
+                    options.set = Some(self.role_option_boolean()?);
                 } else {
                     break;
                 }
                 let _ = self.eat_op(",")?;
             }
         }
+        let grantor = if self.eat_ident("granted")? {
+            self.expect_ident("by")?;
+            Some(self.any_ident("grantor role name")?)
+        } else {
+            None
+        };
         Ok(Stmt::GrantRole {
             roles,
             members,
             options,
+            grantor,
         })
     }
 
-    fn privilege_list(&mut self) -> Result<&'a [crate::sql::ast::Privilege], ParseError> {
-        use crate::sql::ast::Privilege;
-        let mut privileges = [Privilege::All; 12];
+    fn privilege_list(&mut self) -> Result<&'a [crate::sql::ast::PrivilegeSpec<'a>], ParseError> {
+        use crate::sql::ast::{Privilege, PrivilegeSpec};
+        let mut privileges = [PrivilegeSpec {
+            privilege: Privilege::All,
+            columns: &[],
+        }; 14];
         let mut count = 0usize;
         loop {
             if count == privileges.len() {
                 return Err(self.limit("privileges", privileges.len()));
             }
-            privileges[count] = if self.eat_ident("all")? {
+            let privilege = if self.eat_ident("all")? {
                 let _ = self.eat_ident("privileges")?;
                 Privilege::All
             } else if self.eat_ident("select")? {
@@ -3343,15 +3378,60 @@ impl<'a> Parser<'a> {
                 Privilege::Execute
             } else if self.eat_ident("maintain")? {
                 Privilege::Maintain
+            } else if self.eat_ident("connect")? {
+                Privilege::Connect
+            } else if self.eat_ident("temporary")? || self.eat_ident("temp")? {
+                Privilege::Temporary
             } else {
                 return Err(self.unexpected("expected an object privilege"));
             };
+            let columns = if self.eat_op("(")? {
+                if !matches!(
+                    privilege,
+                    Privilege::All
+                        | Privilege::Select
+                        | Privilege::Insert
+                        | Privilege::Update
+                        | Privilege::References
+                ) {
+                    return Err(self.err_here("privilege does not support a column list"));
+                }
+                let mut columns = [""; MAX_LIST];
+                let mut column_count = 0usize;
+                loop {
+                    if column_count == columns.len() {
+                        return Err(self.limit("privilege columns", columns.len()));
+                    }
+                    columns[column_count] = self.col_ident("column name")?;
+                    column_count += 1;
+                    if self.eat_op(")")? {
+                        break;
+                    }
+                    self.expect_op(",")?;
+                }
+                self.arena_slice(&columns[..column_count])?
+            } else {
+                &[]
+            };
+            privileges[count] = PrivilegeSpec { privilege, columns };
             count += 1;
             if !self.eat_op(",")? {
                 break;
             }
         }
         self.arena_slice(&privileges[..count])
+    }
+
+    fn default_privilege_list(&mut self) -> Result<&'a [crate::sql::ast::Privilege], ParseError> {
+        let specifications = self.privilege_list()?;
+        let mut privileges = [crate::sql::ast::Privilege::All; 12];
+        for (index, specification) in specifications.iter().enumerate() {
+            if !specification.columns.is_empty() {
+                return Err(self.err_here("default privileges cannot name columns"));
+            }
+            privileges[index] = specification.privilege;
+        }
+        self.arena_slice(&privileges[..specifications.len()])
     }
 
     fn privilege_target(&mut self) -> Result<crate::sql::ast::PrivilegeTarget<'a>, ParseError> {
@@ -3386,6 +3466,8 @@ impl<'a> Parser<'a> {
             PrivilegeObjectKind::Schema
         } else if self.eat_ident("tablespace")? {
             PrivilegeObjectKind::Tablespace
+        } else if self.eat_ident("database")? {
+            PrivilegeObjectKind::Database
         } else if self.eat_ident("type")? || self.eat_ident("domain")? {
             PrivilegeObjectKind::Type
         } else {
@@ -3402,6 +3484,7 @@ impl<'a> Parser<'a> {
                 kind,
                 PrivilegeObjectKind::Schema
                     | PrivilegeObjectKind::Tablespace
+                    | PrivilegeObjectKind::Database
                     | PrivilegeObjectKind::AllTablesInSchema
                     | PrivilegeObjectKind::AllSequencesInSchema
                     | PrivilegeObjectKind::AllFunctionsInSchema
@@ -3481,10 +3564,16 @@ impl<'a> Parser<'a> {
 
     fn revoke_statement(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("revoke")?;
-        if self.eat_ident("admin")? {
-            self.expect_ident("option")?;
-            self.expect_ident("for")?;
-            return self.revoke_role_after_keyword(true);
+        for (name, option) in [
+            ("admin", crate::sql::ast::RoleMembershipOption::Admin),
+            ("inherit", crate::sql::ast::RoleMembershipOption::Inherit),
+            ("set", crate::sql::ast::RoleMembershipOption::Set),
+        ] {
+            if self.eat_ident(name)? {
+                self.expect_ident("option")?;
+                self.expect_ident("for")?;
+                return self.revoke_role_after_keyword(Some(option));
+            }
         }
         let grant_option_only = if self.eat_ident("grant")? {
             self.expect_ident("option")?;
@@ -3494,13 +3583,19 @@ impl<'a> Parser<'a> {
             false
         };
         if !self.privilege_start() {
-            return self.revoke_role_after_keyword(false);
+            return self.revoke_role_after_keyword(None);
         }
         let privileges = self.privilege_list()?;
         self.expect_ident("on")?;
         let target = self.privilege_target()?;
         self.expect_ident("from")?;
         let grantees = self.role_name_list("grantee")?;
+        let grantor = if self.eat_ident("granted")? {
+            self.expect_ident("by")?;
+            Some(self.any_ident("grantor role name")?)
+        } else {
+            None
+        };
         let cascade = if self.eat_ident("cascade")? {
             true
         } else {
@@ -3512,22 +3607,36 @@ impl<'a> Parser<'a> {
             privileges,
             target,
             grantees,
+            grantor,
             cascade,
         })
     }
 
     fn revoke_role_after_keyword(
         &mut self,
-        admin_option_only: bool,
+        option: Option<crate::sql::ast::RoleMembershipOption>,
     ) -> Result<Stmt<'a>, ParseError> {
         let roles = self.role_name_list("role name")?;
         self.expect_ident("from")?;
         let members = self.role_name_list("member role name")?;
-        let _ = self.eat_ident("cascade")? || self.eat_ident("restrict")?;
+        let grantor = if self.eat_ident("granted")? {
+            self.expect_ident("by")?;
+            Some(self.any_ident("grantor role name")?)
+        } else {
+            None
+        };
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
         Ok(Stmt::RevokeRole {
             roles,
             members,
-            admin_option_only,
+            option,
+            grantor,
+            cascade,
         })
     }
 
@@ -4164,7 +4273,7 @@ impl<'a> Parser<'a> {
         } else {
             false
         };
-        let privileges = self.privilege_list()?;
+        let privileges = self.default_privilege_list()?;
         self.expect_ident("on")?;
         let kind = if self.eat_ident("tables")? {
             DefaultPrivilegeObjectKind::Tables
@@ -5100,6 +5209,7 @@ impl<'a> Parser<'a> {
     /// `(...)`). varchar/char carry a length; numeric/decimal carry
     /// (precision[, scale]); any other type with a modifier is a loud error.
     fn type_name_mod(&mut self) -> Result<(&'a str, i32), ParseError> {
+        let mut quoted = matches!(self.peeked, Tok::QuotedIdent(_));
         let mut name = self.any_ident("type name")?;
         // System-qualified built-ins normalize to their bare spelling. A user
         // schema is part of the type identity and must survive parsing; dropping
@@ -5107,14 +5217,22 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Op(".") {
             let schema = name;
             self.advance()?;
+            let base_quoted = matches!(self.peeked, Tok::QuotedIdent(_));
             let base = self.any_ident("type name")?;
             name = if schema == "pg_catalog" || schema == "information_schema" {
+                quoted = base_quoted;
                 base
             } else {
+                quoted = false;
                 self.arena
                     .alloc_str(stack_format!(128, "{}.{}", schema, base).as_str())
                     .map_err(|_| self.err_here("type name too long"))?
             };
+        }
+        // SQL `char` is the blank-padded character type. Only the quoted
+        // catalog spelling names PostgreSQL's distinct one-byte OID 18 type.
+        if quoted && name == "char" {
+            name = "\"char\"";
         }
         if name == "double" {
             self.expect_ident("precision")?;
@@ -6342,6 +6460,80 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn role_membership_options_are_typed_as_patches() {
+        with_parser(
+            "GRANT parent TO child WITH ADMIN FALSE, INHERIT FALSE, SET TRUE GRANTED BY manager; \
+             REVOKE INHERIT OPTION FOR parent FROM child GRANTED BY manager CASCADE; \
+             ALTER ROLE child IN DATABASE postgres SET search_path TO app, public; \
+             ALTER ROLE ALL IN DATABASE postgres RESET ALL; \
+             GRANT SELECT (id, payload), UPDATE (payload) ON orders TO child",
+            |parser| {
+                let Some(Stmt::GrantRole {
+                    options, grantor, ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("role grant did not parse")
+                };
+                assert_eq!(options.admin, Some(false));
+                assert_eq!(options.inherit, Some(false));
+                assert_eq!(options.set, Some(true));
+                assert_eq!(grantor, Some("manager"));
+
+                let Some(Stmt::RevokeRole {
+                    option,
+                    grantor,
+                    cascade,
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("role revoke did not parse")
+                };
+                assert_eq!(option, Some(crate::sql::ast::RoleMembershipOption::Inherit));
+                assert_eq!(grantor, Some("manager"));
+                assert!(cascade);
+
+                let Some(Stmt::AlterRoleSetting {
+                    role,
+                    database,
+                    action: crate::sql::ast::RoleSettingAction::Set { name, value },
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("role setting did not parse")
+                };
+                assert_eq!(role, Some("child"));
+                assert_eq!(database, Some("postgres"));
+                assert_eq!(name, "search_path");
+                assert_eq!(
+                    value,
+                    crate::sql::ast::RoutineConfigValue::Value("app, public")
+                );
+
+                let Some(Stmt::AlterRoleSetting {
+                    role: None,
+                    database: Some("postgres"),
+                    action: crate::sql::ast::RoleSettingAction::Reset(None),
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("all-role setting reset did not parse")
+                };
+
+                let Some(Stmt::GrantPrivileges { privileges, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("column privileges did not parse")
+                };
+                assert_eq!(privileges.len(), 2);
+                assert_eq!(privileges[0].privilege, crate::sql::ast::Privilege::Select);
+                assert_eq!(privileges[0].columns, ["id", "payload"]);
+                assert_eq!(privileges[1].privilege, crate::sql::ast::Privilege::Update);
+                assert_eq!(privileges[1].columns, ["payload"]);
+            },
+        );
+        with_parser("GRANT DELETE (id) ON orders TO child", |parser| {
+            assert!(parser.next_stmt().is_err());
+        });
     }
 
     #[test]

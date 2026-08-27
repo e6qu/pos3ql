@@ -1595,18 +1595,35 @@ impl Checkpointer {
                             .ok_or(CheckpointSetupError::Corrupt("rol server key missing"))?,
                     )?;
                     let iterations: u32 = parse_field(words.next(), "rol iterations")?;
-                    let valid_until = match words
+                    let valid_until_encoded = words
                         .next()
-                        .ok_or(CheckpointSetupError::Corrupt("rol valid-until missing"))?
-                    {
-                        "-" => String::new(),
-                        "0" => String::new(),
-                        encoded => decode_hex_name(encoded)?,
+                        .ok_or(CheckpointSetupError::Corrupt("rol valid-until missing"))?;
+                    let password_present = flags & (1 << 7) != 0;
+                    let valid_until_present = flags & (1 << 8) != 0;
+                    let password = crate::storage::RolePassword {
+                        salt,
+                        stored_key,
+                        server_key,
+                        iterations,
+                    };
+                    let valid_until = match (valid_until_present, valid_until_encoded) {
+                        (false, "-") => None,
+                        (true, "0") => Some(crate::util::StackStr::new()),
+                        (true, encoded) => {
+                            let decoded = decode_hex_name(encoded)?;
+                            if decoded.len() > crate::storage::ROLE_VALID_UNTIL_MAX {
+                                return Err(CheckpointSetupError::Corrupt("invalid rol record"));
+                            }
+                            Some(crate::util::StackStr::from_str(&decoded))
+                        }
+                        (false, _) => {
+                            return Err(CheckpointSetupError::Corrupt("invalid rol record"));
+                        }
                     };
                     if words.next().is_some()
                         || flags & !0x01ff != 0
-                        || valid_until.len() > crate::storage::ROLE_VALID_UNTIL_MAX
-                        || (flags & (1 << 7) != 0 && iterations == 0)
+                        || (password_present && iterations == 0)
+                        || (!password_present && password != crate::storage::RolePassword::EMPTY)
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid rol record"));
                     }
@@ -1622,15 +1639,8 @@ impl Checkpointer {
                                 replication: flags & (1 << 5) != 0,
                                 bypass_row_level_security: flags & (1 << 6) != 0,
                                 connection_limit,
-                                password: crate::storage::RolePassword {
-                                    salt,
-                                    stored_key,
-                                    server_key,
-                                    iterations,
-                                },
-                                has_password: flags & (1 << 7) != 0,
-                                valid_until: crate::util::StackStr::from_str(&valid_until),
-                                has_valid_until: flags & (1 << 8) != 0,
+                                password: password_present.then_some(password),
+                                valid_until,
                             },
                         )
                         .map_err(|error| {
@@ -1667,6 +1677,59 @@ impl Checkpointer {
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest role membership rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("rset") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let scope: u8 = parse_field(words.next(), "rset scope")?;
+                    let role = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rset role missing"))?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("rset name missing"))?,
+                    )?;
+                    let encoded_value = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rset value missing"))?;
+                    let value = if encoded_value == "0" {
+                        String::new()
+                    } else {
+                        decode_hex_name(encoded_value)?
+                    };
+                    if words.next().is_some()
+                        || value.len() > crate::storage::ROLE_SETTING_VALUE_MAX
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid rset record"));
+                    }
+                    let scope = match scope {
+                        0 | 1 => {
+                            let role = decode_hex_name(role)?;
+                            let slot = storage
+                                .find_role(&role)
+                                .ok_or(CheckpointSetupError::Corrupt("rset role does not exist"))?
+                                as u16;
+                            if scope == 0 {
+                                crate::storage::RoleSettingScope::RoleAllDatabases(slot)
+                            } else {
+                                crate::storage::RoleSettingScope::RoleInDatabase(slot)
+                            }
+                        }
+                        2 if role == "-" => crate::storage::RoleSettingScope::AllRolesInDatabase,
+                        _ => return Err(CheckpointSetupError::Corrupt("invalid rset scope")),
+                    };
+                    storage
+                        .install_role_setting(
+                            scope,
+                            sql_name(&name)?,
+                            Some(crate::util::StackStr::from_str(&value)),
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest role setting rejected: {}",
                                 error.message.as_str()
                             ))
                         })?;
@@ -1736,7 +1799,7 @@ impl Checkpointer {
                     let privileges: u16 = parse_field(words.next(), "acl privileges")?;
                     let grant_options: u16 = parse_field(words.next(), "acl grant options")?;
                     if words.next().is_some()
-                        || privileges & !0x07ff != 0
+                        || privileges & !crate::storage::all_object_privileges(class).0 != 0
                         || grant_options & !privileges != 0
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid acl record"));
@@ -1777,6 +1840,85 @@ impl Checkpointer {
                             ))
                         })?;
                 }
+                Some("cacl") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let class: u8 = parse_field(words.next(), "cacl class")?;
+                    let class = crate::storage::AccessClass::from_u8(class)
+                        .filter(|class| {
+                            matches!(
+                                class,
+                                crate::storage::AccessClass::Table
+                                    | crate::storage::AccessClass::MaterializedView
+                            )
+                        })
+                        .ok_or(CheckpointSetupError::Corrupt("invalid cacl class"))?;
+                    let decode = |word: Option<&str>, missing: &'static str| {
+                        word.ok_or(CheckpointSetupError::Corrupt(missing))
+                            .and_then(decode_hex_name)
+                    };
+                    let schema = decode(words.next(), "cacl schema missing")?;
+                    let name = decode(words.next(), "cacl name missing")?;
+                    let column: u16 = parse_field(words.next(), "cacl column")?;
+                    let grantee = decode(words.next(), "cacl grantee missing")?;
+                    let grantor = decode(words.next(), "cacl grantor missing")?;
+                    let privileges: u16 = parse_field(words.next(), "cacl privileges")?;
+                    let grant_options: u16 = parse_field(words.next(), "cacl grant options")?;
+                    let allowed = (crate::storage::PrivilegeSet::SELECT
+                        .union(crate::storage::PrivilegeSet::INSERT)
+                        .union(crate::storage::PrivilegeSet::UPDATE)
+                        .union(crate::storage::PrivilegeSet::REFERENCES))
+                    .0;
+                    if words.next().is_some()
+                        || privileges & !allowed != 0
+                        || grant_options & !privileges != 0
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid cacl record"));
+                    }
+                    let relation = storage
+                        .resolve_access_object(class, &schema, &name, 0)
+                        .ok_or(CheckpointSetupError::Corrupt("cacl target does not exist"))?;
+                    let column_count = match class {
+                        crate::storage::AccessClass::Table => {
+                            Some(storage.table_def(relation.slot as usize, 0).n_columns)
+                        }
+                        crate::storage::AccessClass::MaterializedView => storage
+                            .find_table(&schema, &name)
+                            .map(|table| storage.table_def(table, 0).n_columns),
+                        _ => unreachable!("cacl class was restricted above"),
+                    };
+                    if column_count.is_some_and(|count| column as usize >= count) {
+                        return Err(CheckpointSetupError::Corrupt("cacl column does not exist"));
+                    }
+                    let target = crate::storage::ColumnPrivilegeTarget::new(relation, column)
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid cacl target"))?;
+                    let grantee = if grantee == "PUBLIC" {
+                        crate::storage::PUBLIC_ROLE
+                    } else {
+                        storage
+                            .find_role(&grantee)
+                            .ok_or(CheckpointSetupError::Corrupt("cacl grantee does not exist"))?
+                            as u16
+                    };
+                    let grantor = storage
+                        .find_role(&grantor)
+                        .ok_or(CheckpointSetupError::Corrupt("cacl grantor does not exist"))?
+                        as u16;
+                    storage
+                        .change_column_acl(
+                            target,
+                            grantee,
+                            grantor,
+                            crate::storage::PrivilegeSet(privileges),
+                            crate::storage::PrivilegeSet(grant_options),
+                            0,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest column ACL rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
                 Some("dacl") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let decode = |word: Option<&str>, missing: &'static str| {
@@ -1792,7 +1934,7 @@ impl Checkpointer {
                     let privileges: u16 = parse_field(words.next(), "dacl privileges")?;
                     let grant_options: u16 = parse_field(words.next(), "dacl grant options")?;
                     if words.next().is_some()
-                        || privileges & !0x07ff != 0
+                        || privileges & !class.all_privileges().0 != 0
                         || grant_options & !privileges != 0
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid dacl record"));
@@ -3761,6 +3903,9 @@ impl Checkpointer {
         for (_, role) in storage.live_roles() {
             use core::fmt::Write;
             let attributes = role.attributes;
+            let password = attributes
+                .password
+                .unwrap_or(crate::storage::RolePassword::EMPTY);
             let mut name = StackStr::<130>::new();
             for byte in role.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
@@ -3768,21 +3913,21 @@ impl Checkpointer {
             let mut salt = StackStr::<32>::new();
             let mut stored_key = StackStr::<64>::new();
             let mut server_key = StackStr::<64>::new();
-            for byte in attributes.password.salt {
+            for byte in password.salt {
                 let _ = write!(salt, "{byte:02x}");
             }
-            for byte in attributes.password.stored_key {
+            for byte in password.stored_key {
                 let _ = write!(stored_key, "{byte:02x}");
             }
-            for byte in attributes.password.server_key {
+            for byte in password.server_key {
                 let _ = write!(server_key, "{byte:02x}");
             }
             let mut valid_until = StackStr::<{ 2 * crate::storage::ROLE_VALID_UNTIL_MAX }>::new();
-            if attributes.has_valid_until {
-                if attributes.valid_until.as_str().is_empty() {
+            if let Some(value) = attributes.valid_until.as_ref() {
+                if value.as_str().is_empty() {
                     let _ = write!(valid_until, "0");
                 } else {
-                    for byte in attributes.valid_until.as_str().as_bytes() {
+                    for byte in value.as_str().as_bytes() {
                         let _ = write!(valid_until, "{byte:02x}");
                     }
                 }
@@ -3796,8 +3941,8 @@ impl Checkpointer {
                 | (u16::from(attributes.can_login) << 4)
                 | (u16::from(attributes.replication) << 5)
                 | (u16::from(attributes.bypass_row_level_security) << 6)
-                | (u16::from(attributes.has_password) << 7)
-                | (u16::from(attributes.has_valid_until) << 8);
+                | (u16::from(attributes.password.is_some()) << 7)
+                | (u16::from(attributes.valid_until.is_some()) << 8);
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
@@ -3808,7 +3953,7 @@ impl Checkpointer {
                     salt.as_str(),
                     stored_key.as_str(),
                     server_key.as_str(),
-                    attributes.password.iterations,
+                    password.iterations,
                     valid_until.as_str()
                 ),
             )?;
@@ -3853,6 +3998,47 @@ impl Checkpointer {
                     member.as_str(),
                     grantor.as_str(),
                     flags
+                ),
+            )?;
+        }
+        for (_, setting) in storage.role_settings() {
+            if !setting.live {
+                continue;
+            }
+            use core::fmt::Write;
+            let (scope, role_slot) = match setting.scope {
+                crate::storage::RoleSettingScope::RoleAllDatabases(role) => (0, Some(role)),
+                crate::storage::RoleSettingScope::RoleInDatabase(role) => (1, Some(role)),
+                crate::storage::RoleSettingScope::AllRolesInDatabase => (2, None),
+            };
+            let mut role = StackStr::<130>::new();
+            if let Some(slot) = role_slot {
+                for byte in storage.role(slot as usize).name.as_str().as_bytes() {
+                    let _ = write!(role, "{byte:02x}");
+                }
+            } else {
+                let _ = write!(role, "-");
+            }
+            let mut name = StackStr::<130>::new();
+            for byte in setting.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            let mut value = StackStr::<{ crate::storage::ROLE_SETTING_VALUE_MAX * 2 }>::new();
+            if setting.value.as_str().is_empty() {
+                let _ = write!(value, "0");
+            } else {
+                for byte in setting.value.as_str().as_bytes() {
+                    let _ = write!(value, "{byte:02x}");
+                }
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "rset {} {} {} {}",
+                    scope,
+                    role.as_str(),
+                    name.as_str(),
+                    value.as_str()
                 ),
             )?;
         }
@@ -5819,6 +6005,50 @@ impl Checkpointer {
                     ),
                 )?;
             }
+        }
+        for (_, acl) in storage.live_column_acls() {
+            if !storage.access_object_is_live(acl.target.relation()) {
+                continue;
+            }
+            use core::fmt::Write;
+            let relation = acl.target.relation();
+            let (schema, name) = storage.access_object_name(relation);
+            let grantee = if acl.grantee == crate::storage::PUBLIC_ROLE {
+                crate::storage::SqlName::parse("PUBLIC").expect("PUBLIC fits")
+            } else {
+                storage.role(acl.grantee as usize).name
+            };
+            let grantor = storage.role(acl.grantor as usize).name;
+            let mut schema_hex = StackStr::<130>::new();
+            let mut name_hex = StackStr::<130>::new();
+            let mut grantee_hex = StackStr::<130>::new();
+            let mut grantor_hex = StackStr::<130>::new();
+            for byte in schema.as_str().as_bytes() {
+                let _ = write!(schema_hex, "{byte:02x}");
+            }
+            for byte in name.as_str().as_bytes() {
+                let _ = write!(name_hex, "{byte:02x}");
+            }
+            for byte in grantee.as_str().as_bytes() {
+                let _ = write!(grantee_hex, "{byte:02x}");
+            }
+            for byte in grantor.as_str().as_bytes() {
+                let _ = write!(grantor_hex, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "cacl {} {} {} {} {} {} {} {}",
+                    relation.class as u8,
+                    schema_hex.as_str(),
+                    name_hex.as_str(),
+                    acl.target.column(),
+                    grantee_hex.as_str(),
+                    grantor_hex.as_str(),
+                    acl.privileges.0,
+                    acl.grant_options.0
+                ),
+            )?;
         }
         for (_, acl) in storage.live_default_acls() {
             use core::fmt::Write;

@@ -1028,29 +1028,6 @@ fn attach_fkey(
         };
         *storage.table_def(pi, txid)
     };
-    if !self_ref {
-        let parent_slot = resolved.expect("non-self foreign key resolved above");
-        storage.require_schema_usage(parent_def.schema.as_str(), txid)?;
-        let role = storage.current_role_slot(txid).ok_or_else(|| {
-            sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "current role is not present in the role catalog"
-            )
-        })?;
-        if !storage.has_object_privilege(
-            storage.table_access_object(parent_slot, txid),
-            role,
-            crate::storage::PrivilegeSet::REFERENCES,
-            txid,
-        ) {
-            return Err(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied for table {}",
-                parent_def.name.as_str()
-            ));
-        }
-    }
-
     // Referenced columns default to the parent's primary key.
     let mut pcol_names: [&str; MAX_INDEX_COLS] = [""; MAX_INDEX_COLS];
     let n_parent;
@@ -1078,6 +1055,39 @@ fn attach_fkey(
         ));
     }
     let (parent_idxs, _) = resolve_cols(&parent_def, &pcol_names[..n_parent])?;
+    if !self_ref {
+        let parent_slot = resolved.expect("non-self foreign key resolved above");
+        storage.require_schema_usage(parent_def.schema.as_str(), txid)?;
+        let role = storage.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let object = storage.table_access_object(parent_slot, txid);
+        let allowed = storage.has_object_privilege(
+            object,
+            role,
+            crate::storage::PrivilegeSet::REFERENCES,
+            txid,
+        ) || parent_idxs[..n_parent].iter().all(|column| {
+            crate::storage::ColumnPrivilegeTarget::new(object, *column).is_ok_and(|target| {
+                storage.has_column_privilege(
+                    target,
+                    role,
+                    crate::storage::PrivilegeSet::REFERENCES,
+                    txid,
+                )
+            })
+        });
+        if !allowed {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for table {}",
+                parent_def.name.as_str()
+            ));
+        }
+    }
 
     // The referenced columns must be a unique key of the parent (PG 42830).
     if !is_unique_key(&parent_def, &parent_idxs[..n_parent]) {

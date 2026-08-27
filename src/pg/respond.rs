@@ -1147,12 +1147,7 @@ impl<'b> Responder<'b> {
                     m.bytes(label.as_bytes());
                 }
                 Datum::Array { element, raw } => {
-                    let elem_oid = match element {
-                        crate::sql::types::ArrElem::Domain { slot, .. } => {
-                            crate::sql::types::oid::domain_oid(*slot)
-                        }
-                        _ => element.to_coltype().oid(),
-                    };
+                    let elem_oid = element.element_oid();
                     let shape = crate::sql::array::shape(raw).expect("array datum invariant");
                     let count = shape.element_count();
                     m.field(|m| {

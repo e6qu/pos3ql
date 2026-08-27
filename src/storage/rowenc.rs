@@ -303,7 +303,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             let header = bytes.get(..7).ok_or_else(corrupt)?;
             Some(7 + u16::from_le_bytes([header[5], header[6]]) as usize * 2)
         }
-        ColType::Text
+        ColType::Char
+        | ColType::Text
         | ColType::Name
         | ColType::Varchar
         | ColType::Bpchar
@@ -510,7 +511,7 @@ pub(crate) fn decode<'a>(
                 };
                 at += 8;
             }
-            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
+            ColType::Char | ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
                 at += 4;

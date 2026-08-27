@@ -728,6 +728,11 @@ pub enum Stmt<'a> {
         name: &'a str,
         new_name: &'a str,
     },
+    AlterRoleSetting {
+        role: Option<&'a str>,
+        database: Option<&'a str>,
+        action: RoleSettingAction<'a>,
+    },
     /// DROP ROLE / USER / GROUP [IF EXISTS] name [, ...].
     DropRole {
         names: &'a [&'a str],
@@ -736,24 +741,29 @@ pub enum Stmt<'a> {
     GrantRole {
         roles: &'a [&'a str],
         members: &'a [&'a str],
-        options: RoleGrantOptions,
+        options: RoleMembershipPatch,
+        grantor: Option<&'a str>,
     },
     RevokeRole {
         roles: &'a [&'a str],
         members: &'a [&'a str],
-        admin_option_only: bool,
+        option: Option<RoleMembershipOption>,
+        grantor: Option<&'a str>,
+        cascade: bool,
     },
     GrantPrivileges {
-        privileges: &'a [Privilege],
+        privileges: &'a [PrivilegeSpec<'a>],
         target: PrivilegeTarget<'a>,
         grantees: &'a [&'a str],
         grant_option: bool,
+        grantor: Option<&'a str>,
     },
     RevokePrivileges {
         grant_option_only: bool,
-        privileges: &'a [Privilege],
+        privileges: &'a [PrivilegeSpec<'a>],
         target: PrivilegeTarget<'a>,
         grantees: &'a [&'a str],
+        grantor: Option<&'a str>,
         cascade: bool,
     },
     AlterDefaultPrivileges {
@@ -1282,6 +1292,15 @@ pub enum Privilege {
     Create,
     Execute,
     Maintain,
+    Connect,
+    Temporary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrivilegeSpec<'a> {
+    pub privilege: Privilege,
+    /// A non-empty list is a column privilege and can only target a relation.
+    pub columns: &'a [&'a str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1316,6 +1335,7 @@ pub enum PrivilegeObjectKind {
     Sequence,
     Schema,
     Tablespace,
+    Database,
     Type,
     AllTablesInSchema,
     AllSequencesInSchema,
@@ -1356,10 +1376,19 @@ impl RoutineTargetKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RoleGrantOptions {
-    pub admin: bool,
-    pub inherit: bool,
-    pub set: bool,
+pub enum RoleMembershipOption {
+    Admin,
+    Inherit,
+    Set,
+}
+
+/// Membership option changes are patches. PostgreSQL preserves an existing
+/// option when it is omitted; defaults are applied only to a new edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleMembershipPatch {
+    pub admin: Option<bool>,
+    pub inherit: Option<bool>,
+    pub set: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1372,11 +1401,20 @@ pub struct RoleMembershipClauses<'a> {
     pub admin_members: &'a [&'a str],
 }
 
-impl RoleGrantOptions {
-    pub const DEFAULT: Self = Self {
-        admin: false,
-        inherit: true,
-        set: true,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleSettingAction<'a> {
+    Set {
+        name: &'a str,
+        value: RoutineConfigValue<'a>,
+    },
+    Reset(Option<&'a str>),
+}
+
+impl RoleMembershipPatch {
+    pub const EMPTY: Self = Self {
+        admin: None,
+        inherit: None,
+        set: None,
     };
 }
 

@@ -419,6 +419,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateRole { .. }
         | Stmt::AlterRole { .. }
         | Stmt::AlterRoleRename { .. }
+        | Stmt::AlterRoleSetting { .. }
         | Stmt::DropRole { .. } => true,
         Stmt::GrantRole { .. }
         | Stmt::RevokeRole { .. }
@@ -1664,13 +1665,11 @@ impl Engine {
     pub(crate) fn role_login(&self, name: &str) -> Option<RoleLogin> {
         let slot = self.storage.find_role(name)?;
         let attributes = self.storage.role(slot).attributes;
-        let valid = !attributes.has_valid_until
-            || attributes
-                .valid_until
-                .as_str()
-                .eq_ignore_ascii_case("infinity")
-            || crate::sql::datetime::parse_timestamp(attributes.valid_until.as_str(), true)
-                .is_ok_and(|deadline| deadline >= crate::sql::datetime::now_micros());
+        let valid = attributes.valid_until.as_ref().is_none_or(|valid_until| {
+            valid_until.as_str().eq_ignore_ascii_case("infinity")
+                || crate::sql::datetime::parse_timestamp(valid_until.as_str(), true)
+                    .is_ok_and(|deadline| deadline >= crate::sql::datetime::now_micros())
+        });
         Some(RoleLogin {
             slot: slot as u16,
             can_login: attributes.can_login,
@@ -1678,8 +1677,29 @@ impl Engine {
             superuser: attributes.superuser,
             replication: attributes.replication,
             connection_limit: attributes.connection_limit,
-            password: attributes.has_password.then_some(attributes.password),
+            password: attributes.password,
         })
+    }
+
+    pub(crate) fn apply_role_settings(&self, role: u16, guc: &GucState) -> Result<(), SqlError> {
+        use crate::storage::RoleSettingScope;
+        for scope in [
+            RoleSettingScope::AllRolesInDatabase,
+            RoleSettingScope::RoleAllDatabases(role),
+            RoleSettingScope::RoleInDatabase(role),
+        ] {
+            for (_, setting) in self.storage.role_settings() {
+                if setting.live && setting.scope == scope {
+                    guc.set(setting.name.as_str(), setting.value.as_str(), false)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn role_can_connect(&self, role: u16) -> bool {
+        self.storage
+            .has_current_database_connect_privilege(role as usize, 0)
     }
 
     pub(crate) fn reserve_role_connection(&mut self, login: RoleLogin) -> bool {
@@ -3398,6 +3418,68 @@ impl Engine {
             self.storage.set_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
+            let DdlUndo::ColumnAclChanged { slot, .. } = *undo else {
+                continue;
+            };
+            if txn.ddl()[position + 1..].iter().any(
+                |later| matches!(later, DdlUndo::ColumnAclChanged { slot: later, .. } if *later == slot),
+            ) {
+                continue;
+            }
+            let entry = *self.storage.column_acl_entry(slot as usize);
+            let relation = entry.target.relation();
+            if !self.storage.access_object_visible_to(relation, txn.txid) {
+                continue;
+            }
+            let (grantee, grantor) = self.storage.column_acl_identity(slot as usize, txn.txid);
+            if txn.ddl()[..position].iter().any(|earlier| {
+                let DdlUndo::ColumnAclChanged {
+                    slot: earlier_slot, ..
+                } = *earlier
+                else {
+                    return false;
+                };
+                if earlier_slot == slot {
+                    return false;
+                }
+                let earlier_entry = self.storage.column_acl_entry(earlier_slot as usize);
+                earlier_entry.target == entry.target
+                    && self
+                        .storage
+                        .column_acl_identity(earlier_slot as usize, txn.txid)
+                        == (grantee, grantor)
+            }) {
+                continue;
+            }
+            let (privileges, grant_options) =
+                self.storage
+                    .column_acl_from(entry.target, grantee, grantor, txn.txid);
+            let (schema, name) = self.storage.access_object_name_to(relation, txn.txid);
+            let column = entry.target.column();
+            let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
+                .then(|| self.storage.role_name(grantee as usize, txn.txid));
+            let grantor_name = self.storage.role_name(grantor as usize, txn.txid);
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetColumnAcl {
+                    class: relation.class as u8,
+                    schema: schema.as_str(),
+                    name: name.as_str(),
+                    column,
+                    grantee: grantee_name.as_ref().map_or("PUBLIC", |role| role.as_str()),
+                    grantor: grantor_name.as_str(),
+                    privileges,
+                    grant_options,
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
+        for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::DefaultAclChanged { slot, .. } = *undo else {
                 continue;
             };
@@ -3801,11 +3883,17 @@ impl Engine {
                 DdlUndo::RoleMembershipChanged { slot, .. } => {
                     self.storage.commit_role_membership_change(*slot as usize);
                 }
+                DdlUndo::RoleSettingChanged { slot, .. } => {
+                    self.storage.commit_role_setting(*slot as usize);
+                }
                 DdlUndo::ObjectOwnerChanged { object, .. } => {
                     self.storage.commit_object_owner(*object, txn.txid);
                 }
                 DdlUndo::ObjectAclChanged { slot, .. } => {
                     self.storage.commit_acl(*slot as usize, txn.txid);
+                }
+                DdlUndo::ColumnAclChanged { slot, .. } => {
+                    self.storage.commit_column_acl(*slot as usize, txn.txid);
                 }
                 DdlUndo::DefaultAclChanged { slot, .. } => {
                     self.storage.commit_default_acl(*slot as usize, txn.txid);
@@ -4120,11 +4208,18 @@ impl Engine {
                 self.storage
                     .rollback_role_membership_change(slot as usize, prior);
             }
+            DdlUndo::RoleSettingChanged { slot, prior } => {
+                self.storage.rollback_role_setting(slot as usize, prior);
+            }
             DdlUndo::ObjectOwnerChanged { object, prior } => {
                 self.storage.restore_object_owner(object, prior);
             }
             DdlUndo::ObjectAclChanged { slot, prior } => {
                 self.storage.restore_acl_pending(slot as usize, prior);
+            }
+            DdlUndo::ColumnAclChanged { slot, prior } => {
+                self.storage
+                    .restore_column_acl_pending(slot as usize, prior);
             }
             DdlUndo::DefaultAclChanged { slot, prior } => {
                 self.storage
@@ -9514,6 +9609,20 @@ impl Engine {
                 new_name,
                 responder,
             ),
+            Stmt::AlterRoleSetting {
+                role,
+                database,
+                action,
+            } => exec::alter_role_setting(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *role,
+                *database,
+                *action,
+                guc,
+                responder,
+            ),
             Stmt::DropRole { names, if_exists } => exec::drop_role(
                 &mut self.storage,
                 &mut self.wal,
@@ -9540,26 +9649,36 @@ impl Engine {
                 roles,
                 members,
                 options,
+                grantor,
             } => exec::grant_role(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                roles,
-                members,
-                *options,
+                exec::GrantRoleRequest {
+                    roles,
+                    members,
+                    options: *options,
+                    grantor: *grantor,
+                },
                 responder,
             ),
             Stmt::RevokeRole {
                 roles,
                 members,
-                admin_option_only,
+                option,
+                grantor,
+                cascade,
             } => exec::revoke_role(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                roles,
-                members,
-                *admin_option_only,
+                exec::RevokeRoleRequest {
+                    roles,
+                    members,
+                    option: *option,
+                    grantor: *grantor,
+                    cascade: *cascade,
+                },
                 responder,
             ),
             Stmt::GrantPrivileges {
@@ -9567,6 +9686,7 @@ impl Engine {
                 target,
                 grantees,
                 grant_option,
+                grantor,
             } => exec::grant_privileges(
                 &mut self.storage,
                 txn,
@@ -9574,6 +9694,7 @@ impl Engine {
                 *target,
                 grantees,
                 *grant_option,
+                *grantor,
                 responder,
             ),
             Stmt::RevokePrivileges {
@@ -9581,6 +9702,7 @@ impl Engine {
                 privileges,
                 target,
                 grantees,
+                grantor,
                 cascade,
             } => exec::revoke_privileges(
                 &mut self.storage,
@@ -9589,6 +9711,7 @@ impl Engine {
                 privileges,
                 *target,
                 grantees,
+                *grantor,
                 *cascade,
                 responder,
             ),
@@ -11188,7 +11311,9 @@ impl Engine {
                 }
                 ""
             }
-            crate::storage::AccessClass::Tablespace | crate::storage::AccessClass::Extension => {
+            crate::storage::AccessClass::Tablespace
+            | crate::storage::AccessClass::Extension
+            | crate::storage::AccessClass::Database => {
                 return Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "unsupported extension member class"
@@ -13634,6 +13759,54 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::DropRoleMembership { role, member } => {
             storage.remove_role_membership(role, member);
         }
+        WalOp::SetRoleSetting {
+            role,
+            database,
+            name,
+            value,
+        } => {
+            let scope = match (role, database) {
+                (Some(role), false) => crate::storage::RoleSettingScope::RoleAllDatabases(
+                    storage.find_role(role).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "journal configures unknown role \"{}\"",
+                            role
+                        )
+                    })? as u16,
+                ),
+                (Some(role), true) => crate::storage::RoleSettingScope::RoleInDatabase(
+                    storage.find_role(role).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "journal configures unknown role \"{}\"",
+                            role
+                        )
+                    })? as u16,
+                ),
+                (None, true) => crate::storage::RoleSettingScope::AllRolesInDatabase,
+                (None, false) => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "corrupt WAL role setting scope"
+                    ));
+                }
+            };
+            let value = value
+                .map(|value| {
+                    let stored = crate::util::StackStr::from_str(value);
+                    if stored.is_truncated() {
+                        Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "corrupt WAL role setting value"
+                        ))
+                    } else {
+                        Ok(stored)
+                    }
+                })
+                .transpose()?;
+            storage.install_role_setting(scope, crate::storage::SqlName::parse(name)?, value)?;
+        }
         WalOp::SetObjectOwner {
             class,
             object_oid,
@@ -13679,6 +13852,30 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 let (grantee, grantor) = storage.acl_identity(slot, 0);
                 if grantee == old_owner || grantor == old_owner {
                     storage.change_acl_identity(
+                        slot,
+                        if grantee == old_owner {
+                            owner as u16
+                        } else {
+                            grantee
+                        },
+                        if grantor == old_owner {
+                            owner as u16
+                        } else {
+                            grantor
+                        },
+                        0,
+                    );
+                }
+            }
+            let column_acl_count = storage.column_acl_entries().count();
+            for slot in 0..column_acl_count {
+                let entry = *storage.column_acl_entry(slot);
+                if entry.target.relation() != object {
+                    continue;
+                }
+                let (grantee, grantor) = storage.column_acl_identity(slot, 0);
+                if grantee == old_owner || grantor == old_owner {
+                    storage.change_column_acl_identity(
                         slot,
                         if grantee == old_owner {
                             owner as u16
@@ -13760,6 +13957,94 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             };
             let grantor = grantor_slot as u16;
             storage.change_acl(object, grantee, grantor, privileges, grant_options, 0)?;
+        }
+        WalOp::SetColumnAcl {
+            class,
+            schema,
+            name,
+            column,
+            grantee,
+            grantor,
+            privileges,
+            grant_options,
+        } => {
+            let class = crate::storage::AccessClass::from_u8(class).ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL column ACL class")
+            })?;
+            if !matches!(
+                class,
+                crate::storage::AccessClass::Table | crate::storage::AccessClass::MaterializedView
+            ) {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "corrupt WAL column ACL class"
+                ));
+            }
+            let relation = storage.resolve_access_object(class, schema, name, 0);
+            let Some(relation) = relation else {
+                if privileges.0 == 0 {
+                    storage.set_lsn(lsn);
+                    return Ok(());
+                }
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "WAL column privilege target \"{}.{}\" does not exist",
+                    schema,
+                    name
+                ));
+            };
+            let column_count = match class {
+                crate::storage::AccessClass::Table => {
+                    Some(storage.table_def(relation.slot as usize, 0).n_columns)
+                }
+                crate::storage::AccessClass::MaterializedView => storage
+                    .find_table(schema, name)
+                    .map(|table| storage.table_def(table, 0).n_columns),
+                _ => unreachable!("column ACL WAL decoder restricts object classes"),
+            };
+            if column_count.is_some_and(|count| column as usize >= count) {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "WAL column privilege target {} does not exist",
+                    column + 1
+                ));
+            }
+            let target = crate::storage::ColumnPrivilegeTarget::new(relation, column)?;
+            let grantee = if grantee == "PUBLIC" {
+                crate::storage::PUBLIC_ROLE
+            } else {
+                let Some(role) = storage.find_role(grantee) else {
+                    if privileges.0 == 0 {
+                        storage.set_lsn(lsn);
+                        return Ok(());
+                    }
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "WAL grantee role \"{}\" does not exist",
+                        grantee
+                    ));
+                };
+                role as u16
+            };
+            let Some(grantor) = storage.find_role(grantor) else {
+                if privileges.0 == 0 {
+                    storage.set_lsn(lsn);
+                    return Ok(());
+                }
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "WAL grantor role \"{}\" does not exist",
+                    grantor
+                ));
+            };
+            storage.change_column_acl(
+                target,
+                grantee,
+                grantor as u16,
+                privileges,
+                grant_options,
+                0,
+            )?;
         }
         WalOp::SetDefaultAcl {
             owner,

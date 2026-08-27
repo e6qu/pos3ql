@@ -130,6 +130,8 @@ const KIND_SET_EXTENSION_DEPENDENCY: u8 = 80;
 const KIND_SET_SEQUENCE_SCHEMA: u8 = 81;
 const KIND_SET_VIEW_SCHEMA: u8 = 82;
 const KIND_SET_EXTENSION_CONFIG: u8 = 83;
+const KIND_SET_ROLE_SETTING: u8 = 84;
+const KIND_SET_COLUMN_ACL: u8 = 85;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -137,7 +139,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_SET_EXTENSION_CONFIG;
+const LAST_KIND: u8 = KIND_SET_COLUMN_ACL;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -954,6 +956,12 @@ pub(crate) enum WalOp<'a> {
         role: &'a str,
         member: &'a str,
     },
+    SetRoleSetting {
+        role: Option<&'a str>,
+        database: bool,
+        name: &'a str,
+        value: Option<&'a str>,
+    },
     SetObjectOwner {
         class: u8,
         /// Stable identity for overloaded routines; zero for name-unique classes.
@@ -968,6 +976,16 @@ pub(crate) enum WalOp<'a> {
         object_oid: i32,
         schema: &'a str,
         name: &'a str,
+        grantee: &'a str,
+        grantor: &'a str,
+        privileges: crate::storage::PrivilegeSet,
+        grant_options: crate::storage::PrivilegeSet,
+    },
+    SetColumnAcl {
+        class: u8,
+        schema: &'a str,
+        name: &'a str,
+        column: u16,
         grantee: &'a str,
         grantor: &'a str,
         privileges: crate::storage::PrivilegeSet,
@@ -1690,8 +1708,10 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropRole { .. } => KIND_DROP_ROLE,
         WalOp::UpsertRoleMembership { .. } => KIND_UPSERT_ROLE_MEMBERSHIP,
         WalOp::DropRoleMembership { .. } => KIND_DROP_ROLE_MEMBERSHIP,
+        WalOp::SetRoleSetting { .. } => KIND_SET_ROLE_SETTING,
         WalOp::SetObjectOwner { .. } => KIND_SET_OBJECT_OWNER,
         WalOp::SetObjectAcl { .. } => KIND_SET_OBJECT_ACL,
+        WalOp::SetColumnAcl { .. } => KIND_SET_COLUMN_ACL,
         WalOp::BeginTableRewrite { .. } => KIND_REWRITE_TABLE,
         WalOp::SetDefaultAcl { .. } => KIND_SET_DEFAULT_ACL,
     }
@@ -2441,7 +2461,18 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             statistics,
         } => 1 + schema.len() + 1 + name.len() + statistics.encoded_len(),
         WalOp::UpsertRole { name, attributes } => {
-            1 + name.len() + 2 + 4 + 16 + 32 + 32 + 4 + 1 + attributes.valid_until.as_str().len()
+            1 + name.len()
+                + 2
+                + 4
+                + 16
+                + 32
+                + 32
+                + 4
+                + 1
+                + attributes
+                    .valid_until
+                    .as_ref()
+                    .map_or(0, |value| value.as_str().len())
         }
         WalOp::DropRole { name } => 1 + name.len(),
         WalOp::UpsertRoleMembership {
@@ -2451,6 +2482,14 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             ..
         } => 1 + role.len() + 1 + member.len() + 1 + grantor.len() + 1,
         WalOp::DropRoleMembership { role, member } => 1 + role.len() + 1 + member.len(),
+        WalOp::SetRoleSetting {
+            role, name, value, ..
+        } => {
+            1 + role.map_or(0, |role| 1 + role.len())
+                + 1
+                + name.len()
+                + value.map_or(0, |value| 2 + value.len())
+        }
         WalOp::SetObjectOwner {
             class,
             schema,
@@ -2485,6 +2524,13 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + grantor.len()
                 + 4
         }
+        WalOp::SetColumnAcl {
+            schema,
+            name,
+            grantee,
+            grantor,
+            ..
+        } => 1 + 1 + schema.len() + 1 + name.len() + 2 + 1 + grantee.len() + 1 + grantor.len() + 4,
         WalOp::SetDefaultAcl {
             owner,
             schema,
@@ -3647,6 +3693,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::UpsertRole { name, attributes } => {
+            let password = attributes
+                .password
+                .unwrap_or(crate::storage::RolePassword::EMPTY);
             let flags = u16::from(attributes.superuser)
                 | (u16::from(attributes.inherit) << 1)
                 | (u16::from(attributes.create_role) << 2)
@@ -3654,16 +3703,22 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 | (u16::from(attributes.can_login) << 4)
                 | (u16::from(attributes.replication) << 5)
                 | (u16::from(attributes.bypass_row_level_security) << 6)
-                | (u16::from(attributes.has_password) << 7)
-                | (u16::from(attributes.has_valid_until) << 8);
+                | (u16::from(attributes.password.is_some()) << 7)
+                | (u16::from(attributes.valid_until.is_some()) << 8);
             name_bytes(buffer, name)
                 && buffer.append(&flags.to_le_bytes())
                 && buffer.append(&attributes.connection_limit.to_le_bytes())
-                && buffer.append(&attributes.password.salt)
-                && buffer.append(&attributes.password.stored_key)
-                && buffer.append(&attributes.password.server_key)
-                && buffer.append(&attributes.password.iterations.to_le_bytes())
-                && name_bytes(buffer, attributes.valid_until.as_str())
+                && buffer.append(&password.salt)
+                && buffer.append(&password.stored_key)
+                && buffer.append(&password.server_key)
+                && buffer.append(&password.iterations.to_le_bytes())
+                && name_bytes(
+                    buffer,
+                    attributes
+                        .valid_until
+                        .as_ref()
+                        .map_or("", |value| value.as_str()),
+                )
         }
         WalOp::DropRole { name } => name_bytes(buffer, name),
         WalOp::UpsertRoleMembership {
@@ -3682,6 +3737,23 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         }
         WalOp::DropRoleMembership { role, member } => {
             name_bytes(buffer, role) && name_bytes(buffer, member)
+        }
+        WalOp::SetRoleSetting {
+            role,
+            database,
+            name,
+            value,
+        } => {
+            let flags = u8::from(*database)
+                | (u8::from(role.is_some()) << 1)
+                | (u8::from(value.is_some()) << 2);
+            buffer.append(&[flags])
+                && role.is_none_or(|role| name_bytes(buffer, role))
+                && name_bytes(buffer, name)
+                && value.is_none_or(|value| {
+                    buffer.append(&(value.len() as u16).to_le_bytes())
+                        && buffer.append(value.as_bytes())
+                })
         }
         WalOp::SetObjectOwner {
             class,
@@ -3712,6 +3784,25 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     || buffer.append(&object_oid.to_le_bytes()))
                 && name_bytes(buffer, schema)
                 && name_bytes(buffer, name)
+                && name_bytes(buffer, grantee)
+                && name_bytes(buffer, grantor)
+                && buffer.append(&privileges.0.to_le_bytes())
+                && buffer.append(&grant_options.0.to_le_bytes())
+        }
+        WalOp::SetColumnAcl {
+            class,
+            schema,
+            name,
+            column,
+            grantee,
+            grantor,
+            privileges,
+            grant_options,
+        } => {
+            buffer.append(&[*class])
+                && name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && buffer.append(&column.to_le_bytes())
                 && name_bytes(buffer, grantee)
                 && name_bytes(buffer, grantor)
                 && buffer.append(&privileges.0.to_le_bytes())
@@ -6430,9 +6521,19 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let iterations = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
             let valid_until = take_name(&mut at)?;
+            let password_present = flags & (1 << 7) != 0;
+            let valid_until_present = flags & (1 << 8) != 0;
+            let password = crate::storage::RolePassword {
+                salt,
+                stored_key,
+                server_key,
+                iterations,
+            };
             if at != payload.len()
                 || valid_until.len() > crate::storage::ROLE_VALID_UNTIL_MAX
-                || (flags & (1 << 7) != 0 && iterations == 0)
+                || (password_present && iterations == 0)
+                || (!password_present && password != crate::storage::RolePassword::EMPTY)
+                || (valid_until_present == valid_until.is_empty())
             {
                 return None;
             }
@@ -6447,15 +6548,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     replication: flags & (1 << 5) != 0,
                     bypass_row_level_security: flags & (1 << 6) != 0,
                     connection_limit,
-                    password: crate::storage::RolePassword {
-                        salt,
-                        stored_key,
-                        server_key,
-                        iterations,
-                    },
-                    has_password: flags & (1 << 7) != 0,
-                    valid_until: crate::util::StackStr::from_str(valid_until),
-                    has_valid_until: flags & (1 << 8) != 0,
+                    password: password_present.then_some(password),
+                    valid_until: valid_until_present
+                        .then(|| crate::util::StackStr::from_str(valid_until)),
                 },
             })
         }
@@ -6488,6 +6583,34 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let member = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropRoleMembership { role, member })
         }
+        KIND_SET_ROLE_SETTING => {
+            let flags = *payload.get(at)?;
+            at += 1;
+            if flags & !0x07 != 0 || flags & 0x02 == 0 && flags & 0x01 == 0 {
+                return None;
+            }
+            let role = if flags & 0x02 != 0 {
+                Some(take_name(&mut at)?)
+            } else {
+                None
+            };
+            let name = take_name(&mut at)?;
+            let value = if flags & 0x04 != 0 {
+                let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                at += 2;
+                let value = core::str::from_utf8(payload.get(at..at + len)?).ok()?;
+                at += len;
+                Some(value)
+            } else {
+                None
+            };
+            (at == payload.len()).then_some(WalOp::SetRoleSetting {
+                role,
+                database: flags & 0x01 != 0,
+                name,
+                value,
+            })
+        }
         KIND_SET_OBJECT_OWNER => {
             let class = *payload.get(at)?;
             at += 1;
@@ -6513,8 +6636,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_SET_OBJECT_ACL => {
             let class = *payload.get(at)?;
             at += 1;
-            crate::storage::AccessClass::from_u8(class)?;
-            let object_oid = if class == crate::storage::AccessClass::Routine as u8 {
+            let class = crate::storage::AccessClass::from_u8(class)?;
+            let object_oid = if class == crate::storage::AccessClass::Routine {
                 let object_oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
                 at += 4;
                 object_oid
@@ -6529,11 +6652,54 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 2;
             let grant_options = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
+            if privileges & !crate::storage::all_object_privileges(class).0 != 0
+                || grant_options & !privileges != 0
+            {
+                return None;
+            }
             (at == payload.len()).then_some(WalOp::SetObjectAcl {
-                class,
+                class: class as u8,
                 object_oid,
                 schema,
                 name,
+                grantee,
+                grantor,
+                privileges: crate::storage::PrivilegeSet(privileges),
+                grant_options: crate::storage::PrivilegeSet(grant_options),
+            })
+        }
+        KIND_SET_COLUMN_ACL => {
+            let class = *payload.get(at)?;
+            at += 1;
+            let class = crate::storage::AccessClass::from_u8(class)?;
+            if !matches!(
+                class,
+                crate::storage::AccessClass::Table | crate::storage::AccessClass::MaterializedView
+            ) {
+                return None;
+            }
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let grantee = take_name(&mut at)?;
+            let grantor = take_name(&mut at)?;
+            let privileges = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let grant_options = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let allowed = crate::storage::PrivilegeSet::SELECT
+                .union(crate::storage::PrivilegeSet::INSERT)
+                .union(crate::storage::PrivilegeSet::UPDATE)
+                .union(crate::storage::PrivilegeSet::REFERENCES);
+            if privileges & !allowed.0 != 0 || grant_options & !privileges != 0 {
+                return None;
+            }
+            (at == payload.len()).then_some(WalOp::SetColumnAcl {
+                class: class as u8,
+                schema,
+                name,
+                column,
                 grantee,
                 grantor,
                 privileges: crate::storage::PrivilegeSet(privileges),
@@ -6545,7 +6711,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let schema = take_name(&mut at)?;
             let class = *payload.get(at)?;
             at += 1;
-            crate::storage::DefaultPrivilegeClass::from_u8(class)?;
+            let typed_class = crate::storage::DefaultPrivilegeClass::from_u8(class)?;
             let grantee = take_name(&mut at)?;
             let defined = match *payload.get(at)? {
                 0 => false,
@@ -6557,6 +6723,10 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 2;
             let grant_options = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
+            if privileges & !typed_class.all_privileges().0 != 0 || grant_options & !privileges != 0
+            {
+                return None;
+            }
             (at == payload.len()).then_some(WalOp::SetDefaultAcl {
                 owner,
                 schema,
@@ -7365,6 +7535,86 @@ mod tests {
             panic!("expected object ACL WAL operation");
         };
         assert_eq!(object_oid, 16_401);
+
+        let mut invalid_budget = Budget::new(1024);
+        let mut invalid =
+            FixedBuf::new(&mut invalid_budget, "invalid object acl wal", 1024).unwrap();
+        assert!(append_payload(
+            &mut invalid,
+            &WalOp::SetObjectAcl {
+                class: crate::storage::AccessClass::Table as u8,
+                object_oid: 0,
+                schema: "public",
+                name: "documents",
+                grantee: "reader",
+                grantor: "postgres",
+                privileges: crate::storage::PrivilegeSet::EXECUTE,
+                grant_options: crate::storage::PrivilegeSet::NONE,
+            }
+        ));
+        assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_none());
+    }
+
+    #[test]
+    fn newest_role_and_column_acl_records_replay_from_the_journal() {
+        let dir = temp_dir("role-column-acl-replay");
+        let config = test_config(&dir);
+        let mut budget = Budget::new(1 << 20);
+        {
+            let mut wal = Wal::open(&config, &mut budget).unwrap();
+            wal.append_committed(
+                1,
+                &WalOp::SetRoleSetting {
+                    role: Some("reader"),
+                    database: true,
+                    name: "application_name",
+                    value: Some("durable"),
+                },
+            )
+            .unwrap();
+            wal.append_committed(
+                2,
+                &WalOp::SetColumnAcl {
+                    class: crate::storage::AccessClass::Table as u8,
+                    schema: "public",
+                    name: "documents",
+                    column: 3,
+                    grantee: "reader",
+                    grantor: "postgres",
+                    privileges: crate::storage::PrivilegeSet::SELECT,
+                    grant_options: crate::storage::PrivilegeSet::NONE,
+                },
+            )
+            .unwrap();
+            wal.commit();
+        }
+        let mut replay_budget = Budget::new(1 << 20);
+        let mut wal = Wal::open(&config, &mut replay_budget).unwrap();
+        let seen = collect_replay(&mut wal);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].contains("SetRoleSetting"), "{}", seen[0]);
+        assert!(seen[1].contains("SetColumnAcl"), "{}", seen[1]);
+        assert!(seen[1].contains("column: 3"), "{}", seen[1]);
+    }
+
+    #[test]
+    fn column_acl_codec_rejects_unexecutable_relation_classes() {
+        let mut budget = Budget::new(1024);
+        let mut payload = FixedBuf::new(&mut budget, "view column acl wal", 1024).unwrap();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::SetColumnAcl {
+                class: crate::storage::AccessClass::View as u8,
+                schema: "public",
+                name: "documents_view",
+                column: 0,
+                grantee: "reader",
+                grantor: "postgres",
+                privileges: crate::storage::PrivilegeSet::SELECT,
+                grant_options: crate::storage::PrivilegeSet::NONE,
+            }
+        ));
+        assert!(decode_op(KIND_SET_COLUMN_ACL, payload.readable()).is_none());
     }
 
     #[test]

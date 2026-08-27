@@ -56,6 +56,63 @@ impl CatalogOid {
     }
 }
 
+/// PostgreSQL's closed one-byte object-class protocol for `acldefault`.
+#[derive(Clone, Copy)]
+enum AclDefaultObject {
+    Column,
+    Database,
+    ForeignDataWrapper,
+    ForeignServer,
+    Function,
+    Language,
+    LargeObject,
+    Parameter,
+    Relation,
+    Schema,
+    Sequence,
+    Tablespace,
+    Type,
+}
+
+impl AclDefaultObject {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value.as_bytes() {
+            b"c" => Self::Column,
+            b"d" => Self::Database,
+            b"F" => Self::ForeignDataWrapper,
+            b"S" => Self::ForeignServer,
+            b"f" => Self::Function,
+            b"l" => Self::Language,
+            b"L" => Self::LargeObject,
+            b"p" => Self::Parameter,
+            b"r" => Self::Relation,
+            b"n" => Self::Schema,
+            b"s" => Self::Sequence,
+            b"t" => Self::Tablespace,
+            b"T" => Self::Type,
+            _ => return None,
+        })
+    }
+
+    /// Owner privileges followed by PUBLIC privileges. PostgreSQL orders the
+    /// PUBLIC aclitem first when both exist.
+    fn privileges(self) -> (Option<&'static str>, Option<&'static str>) {
+        match self {
+            Self::Column => (None, None),
+            Self::Database => (Some("CTc"), Some("Tc")),
+            Self::ForeignDataWrapper | Self::ForeignServer => (Some("U"), None),
+            Self::Function => (Some("X"), Some("X")),
+            Self::Language | Self::Type => (Some("U"), Some("U")),
+            Self::LargeObject => (Some("rw"), None),
+            Self::Parameter => (Some("sA"), None),
+            Self::Relation => (Some("arwdDxtm"), None),
+            Self::Schema => (Some("UC"), None),
+            Self::Sequence => (Some("rwU"), None),
+            Self::Tablespace => (Some("C"), None),
+        }
+    }
+}
+
 fn privilege_role_name<'a>(
     value: Datum<'a>,
     catalog: &dyn super::super::CatalogAccess,
@@ -92,7 +149,9 @@ fn privilege_object_name<'a>(
             } else if function == "has_schema_privilege" {
                 catalog.schema_name(oid, arena)
             } else if function == "has_database_privilege" {
-                Ok(Some("pos3ql"))
+                catalog.database_name(oid, arena)
+            } else if function == "has_tablespace_privilege" {
+                catalog.tablespace_name(oid, arena)
             } else {
                 catalog.relname(oid, arena)
             }
@@ -313,11 +372,13 @@ pub(crate) fn dispatch<'a>(
             | "pg_collation_is_visible"
             | "has_table_privilege"
             | "has_column_privilege"
+            | "has_any_column_privilege"
             | "has_sequence_privilege"
             | "has_schema_privilege"
             | "has_type_privilege"
             | "has_function_privilege"
             | "has_database_privilege"
+            | "has_tablespace_privilege"
             | "pg_relation_is_publishable"
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
@@ -385,11 +446,68 @@ pub(crate) fn dispatch<'a>(
                     "pg_extension_config_dump() can only be called from an SQL script executed by CREATE EXTENSION"
                 ))
             }
-            // There are no grantable ACLs yet. Catalog rows therefore have the
-            // same empty default ACL for every supported object kind.
             "acldefault" => {
                 arity(2)?;
-                Ok(Datum::Text("{}"))
+                let object_type = match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Text(value) => value,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "function acldefault(...) with these argument types does not exist"
+                        ));
+                    }
+                };
+                let owner_oid = match eval_full(args[1], arena, params, row, hooks)? {
+                    Datum::Oid(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "role OID is out of range")
+                    })?,
+                    Datum::Int4(value) => value,
+                    Datum::Int8(value) => i32::try_from(value).map_err(|_| {
+                        sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "role OID is out of range")
+                    })?,
+                    Datum::Null => return Ok(Datum::Null),
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "acldefault() requires a role OID"
+                        ));
+                    }
+                };
+                let Some(catalog) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let Some(owner) = catalog.role_name(owner_oid, arena)? else {
+                    return Ok(Datum::Null);
+                };
+                let object = AclDefaultObject::parse(object_type).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "unrecognized object type abbreviation: {}",
+                        object_type
+                    )
+                })?;
+                let owner = crate::sql::types::acl_identifier(owner);
+                let (owner_privileges, public_privileges) = object.privileges();
+                let mut values = [Datum::Null; 2];
+                let mut count = 0;
+                if let Some(privileges) = public_privileges {
+                    let acl = stack_format!(256, "={}/{}", privileges, owner.as_str());
+                    values[count] =
+                        Datum::Text(arena.alloc_str(acl.as_str()).map_err(|_| arena_full())?);
+                    count += 1;
+                }
+                if let Some(privileges) = owner_privileges {
+                    let acl =
+                        stack_format!(256, "{}={}/{}", owner.as_str(), privileges, owner.as_str());
+                    values[count] =
+                        Datum::Text(arena.alloc_str(acl.as_str()).map_err(|_| arena_full())?);
+                    count += 1;
+                }
+                Ok(Datum::Array {
+                    element: crate::sql::types::ArrElem::AclItem,
+                    raw: crate::sql::array::build(&values[..count], arena)?,
+                })
             }
             "current_database" | "current_catalog" => {
                 arity(0)?;
@@ -566,11 +684,13 @@ pub(crate) fn dispatch<'a>(
             }
             "has_table_privilege"
             | "has_column_privilege"
+            | "has_any_column_privilege"
             | "has_sequence_privilege"
             | "has_schema_privilege"
             | "has_type_privilege"
             | "has_function_privilege"
-            | "has_database_privilege" => {
+            | "has_database_privilege"
+            | "has_tablespace_privilege" => {
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
@@ -603,16 +723,23 @@ pub(crate) fn dispatch<'a>(
                     Some(object) => object,
                     None => return Ok(Datum::Null),
                 };
-                if column {
-                    // Table-level privileges imply the corresponding column
-                    // privilege. Column-specific ACL entries are checked by
-                    // the same catalog hook when present.
+                let privilege_column = if column {
                     let column = eval_full(args[at], arena, params, row, hooks)?;
                     at += 1;
-                    if matches!(column, Datum::Null) {
-                        return Ok(Datum::Null);
-                    }
-                }
+                    Some(match column {
+                        Datum::Text(name) => super::super::PrivilegeColumn::Name(name),
+                        Datum::Int2(number) => super::super::PrivilegeColumn::Number(number),
+                        Datum::Null => return Ok(Datum::Null),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_FUNCTION,
+                                "function has_column_privilege(...) does not exist"
+                            ));
+                        }
+                    })
+                } else {
+                    None
+                };
                 let privilege = match eval_full(args[at], arena, params, row, hooks)? {
                     Datum::Text(privilege) => privilege,
                     Datum::Null => return Ok(Datum::Null),
@@ -625,8 +752,15 @@ pub(crate) fn dispatch<'a>(
                     }
                 };
                 let answer = match name {
-                    "has_table_privilege" | "has_column_privilege" => {
-                        cat.has_table_privilege(role, object, privilege)?
+                    "has_table_privilege" => cat.has_table_privilege(role, object, privilege)?,
+                    "has_column_privilege" => cat.has_column_privilege(
+                        role,
+                        object,
+                        privilege_column.expect("column function parsed a column"),
+                        privilege,
+                    )?,
+                    "has_any_column_privilege" => {
+                        cat.has_any_column_privilege(role, object, privilege)?
                     }
                     "has_sequence_privilege" => {
                         cat.has_sequence_privilege(role, object, privilege)?
@@ -636,7 +770,12 @@ pub(crate) fn dispatch<'a>(
                     "has_function_privilege" => {
                         cat.has_function_privilege(role, object, privilege)?
                     }
-                    "has_database_privilege" => cat.has_database_privilege(role, privilege)?,
+                    "has_database_privilege" => {
+                        cat.has_database_privilege(role, object, privilege)?
+                    }
+                    "has_tablespace_privilege" => {
+                        cat.has_tablespace_privilege(role, object, privilege)?
+                    }
                     _ => unreachable!(),
                 };
                 Ok(answer.map(Datum::Bool).unwrap_or(Datum::Null))

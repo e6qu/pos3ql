@@ -233,6 +233,19 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             };
             Datum::Float4(f)
         }
+        ColType::Char => {
+            let text = cast_to_text(v, arena)?;
+            let Some(byte) = text.as_bytes().first().copied() else {
+                return Ok(Datum::Text(""));
+            };
+            if !byte.is_ascii() {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "non-ASCII input for type \"char\" is not supported"
+                ));
+            }
+            Datum::Text(&text[..1])
+        }
         ColType::Text | ColType::Varchar | ColType::Bpchar => Datum::Text(cast_to_text(v, arena)?),
         ColType::Name => {
             // PostgreSQL truncates name input to NAMEDATALEN-1 = 63 bytes,

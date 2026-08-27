@@ -2272,7 +2272,56 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn alter_role(&mut self) -> Result<Stmt<'a>, ParseError> {
-        let name = self.any_ident("role name")?;
+        let written_name = self.any_ident("role name")?;
+        let role = (!written_name.eq_ignore_ascii_case("all")).then_some(written_name);
+        let database = if self.eat_ident("in")? {
+            self.expect_ident("database")?;
+            Some(self.any_ident("database name")?)
+        } else {
+            None
+        };
+        if self.eat_ident("set")? {
+            let name = self.any_ident("configuration parameter")?;
+            let value = if self.eat_ident("from")? {
+                self.expect_ident("current")?;
+                crate::sql::ast::RoutineConfigValue::Current
+            } else {
+                if !self.eat_op("=")? {
+                    self.expect_ident("to")?;
+                }
+                let start = self.peek_at;
+                while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+                    self.advance()?;
+                }
+                let value = self.text[start..self.peek_at].trim();
+                if value.is_empty() {
+                    return Err(self.unexpected("configuration value"));
+                }
+                crate::sql::ast::RoutineConfigValue::Value(value)
+            };
+            return Ok(Stmt::AlterRoleSetting {
+                role,
+                database,
+                action: crate::sql::ast::RoleSettingAction::Set { name, value },
+            });
+        }
+        if self.eat_ident("reset")? {
+            return Ok(Stmt::AlterRoleSetting {
+                role,
+                database,
+                action: crate::sql::ast::RoleSettingAction::Reset(
+                    (!self.eat_ident("all")?)
+                        .then(|| self.any_ident("configuration parameter"))
+                        .transpose()?,
+                ),
+            });
+        }
+        let Some(name) = role else {
+            return Err(self.unexpected("expected SET or RESET for ALTER ROLE ALL"));
+        };
+        if database.is_some() {
+            return Err(self.unexpected("expected SET or RESET after IN DATABASE"));
+        }
         if self.eat_ident("rename")? {
             self.expect_ident("to")?;
             return Ok(Stmt::AlterRoleRename {

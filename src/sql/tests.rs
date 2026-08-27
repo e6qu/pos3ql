@@ -1098,7 +1098,7 @@ fn instead_of_view_triggers_drive_insert_update_delete_and_returning() {
                FROM pg_proc p JOIN pg_language language ON language.oid = p.prolang \
               WHERE p.proname = 'view_trigger_write'"
         )),
-        ["||trigger||plpgsql"]
+        ["||trigger|NULL|plpgsql"]
     );
     let insert_select = run_with(
         &mut engine,
@@ -4081,7 +4081,13 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         &mut budget,
         "CREATE TYPE protocol_state AS ENUM ('ready'); \
          CREATE DOMAIN protocol_count AS integer CHECK (VALUE > 0); \
-         CREATE TABLE protocol_types (state protocol_state, count protocol_count)",
+         CREATE TABLE protocol_types (state protocol_state, count protocol_count); \
+         CREATE FUNCTION protocol_increment(value integer) RETURNS integer \
+           LANGUAGE SQL RETURN value + 1; \
+         CREATE PROCEDURE protocol_record(value integer) \
+           LANGUAGE SQL AS 'SELECT value'; \
+         CREATE PROCEDURE protocol_output(IN value integer, OUT doubled integer) \
+           LANGUAGE SQL AS 'SELECT value * 2'",
     );
     let enum_oid = crate::sql::types::oid::enum_oid(
         engine
@@ -4142,6 +4148,30 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         &[0; MAX_BIND_PARAMS],
     );
     assert_eq!(inferred[..2], [crate::sql::types::oid::INT8, enum_oid]);
+    let inferred = engine.infer_param_types(
+        "SELECT protocol_increment($1)",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(inferred[0], crate::sql::types::oid::INT4);
+    let inferred = engine.infer_param_types(
+        "CALL protocol_record($1)",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(inferred[0], crate::sql::types::oid::INT4);
+    let inferred = engine.infer_param_types(
+        "CALL protocol_output($1, $2)",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(
+        inferred[..2],
+        [crate::sql::types::oid::INT4, crate::sql::types::oid::INT4]
+    );
 }
 
 #[test]
@@ -13927,6 +13957,962 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
 }
 
 #[test]
+fn routine_parameter_contracts_drive_defaults_outputs_and_catalog_text() {
+    let mut config = test_config("routine_parameter_contracts");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("routine-parameter-contracts-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION f_defaults(a integer, b integer DEFAULT 2, c integer = 3) \
+             RETURNS integer LANGUAGE SQL AS 'SELECT a + b + c';
+         CREATE FUNCTION f_out(a integer, OUT doubled integer, OUT tripled integer) \
+             LANGUAGE SQL AS 'SELECT a * 2, a * 3';
+         CREATE FUNCTION f_variadic(prefix integer, VARIADIC vals integer[]) \
+             RETURNS integer LANGUAGE SQL AS 'SELECT prefix + cardinality(vals)';
+         CREATE FUNCTION f_named_rows(a integer, b integer DEFAULT 2) \
+             RETURNS TABLE(total integer) LANGUAGE SQL AS 'SELECT a + b';
+         CREATE FUNCTION f_variadic_rows(VARIADIC vals integer[]) \
+             RETURNS TABLE(total integer) LANGUAGE SQL AS 'SELECT cardinality(vals)';
+         CREATE TABLE procedure_log (a integer, b integer);
+         CREATE PROCEDURE p_defaults(a integer, b integer DEFAULT 2) \
+             LANGUAGE SQL AS 'INSERT INTO procedure_log VALUES (a, b)';
+         CREATE PROCEDURE p_out(IN a integer, OUT doubled integer, INOUT total integer, \
+                                IN b integer DEFAULT 2) \
+             LANGUAGE SQL AS 'SELECT a * 2, total + b';
+         CREATE PROCEDURE p_variadic(prefix integer, VARIADIC vals integer[]) \
+             LANGUAGE SQL AS 'INSERT INTO procedure_log VALUES (prefix, cardinality(vals))';
+         CALL p_defaults(3);
+         CALL p_defaults(b => 5, a => 4);
+         CALL p_variadic(7, 1, 2, 3);
+         CALL p_variadic(8, VARIADIC ARRAY[4, 5]);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT f_defaults(1), f_defaults(1, 10), f_defaults(1, 10, 20), \
+                f_defaults(c => 30, a => 1, b => 10); \
+         SELECT f_variadic(10, 1), f_variadic(10, 1, 2), \
+                f_variadic(10, VARIADIC ARRAY[1, 2, 3]); \
+         SELECT total FROM f_named_rows(b => 5, a => 3); \
+         SELECT total FROM f_variadic_rows(1, 2, 3); \
+         SELECT total FROM f_variadic_rows(VARIADIC ARRAY[1, 2]); \
+         SELECT (f_out(4)).doubled, (f_out(4)).tripled; \
+         SELECT pg_get_function_arguments('f_defaults(integer,integer,integer)'::regprocedure), \
+                pg_get_function_identity_arguments('f_out(integer)'::regprocedure), \
+                pg_get_function_result('f_out(integer)'::regprocedure); \
+         SELECT pronargdefaults, provariadic, proallargtypes::text, proargmodes::text, \
+                proargnames::text, proargdefaults::text, prosqlbody IS NULL \
+           FROM pg_proc WHERE proname = 'f_defaults'; \
+         SELECT pronargdefaults, provariadic, proallargtypes::text, proargmodes::text, \
+                proargnames::text, proargdefaults IS NULL, prosqlbody IS NULL \
+           FROM pg_proc WHERE proname = 'f_out'; \
+         SELECT pronargdefaults, provariadic, proallargtypes::text, proargmodes::text, \
+                proargnames::text \
+           FROM pg_proc WHERE proname = 'f_variadic'; \
+         CALL p_out(3, NULL, 10); \
+         SELECT a, b FROM procedure_log ORDER BY a;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "6|14|31|41",
+            "11|12|13",
+            "8",
+            "3",
+            "2",
+            "8|12",
+            "a integer, b integer DEFAULT 2, c integer DEFAULT 3|a integer, OUT doubled integer, OUT tripled integer|record",
+            "2|0|NULL|NULL|{a,b,c}|2, 3|t",
+            "0|0|{23,23,23}|{i,o,o}|{a,doubled,tripled}|t|t",
+            "0|23|{23,1007}|{i,v}|{prefix,vals}",
+            "6|12",
+            "3|2",
+            "4|5",
+            "7|3",
+            "8|2",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT f_defaults(c => 30, a => 1, b => 10)",
+        )),
+        [23]
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "CALL p_out(3, NULL, 10)",
+        )),
+        [23, 23]
+    );
+    let omitted_variadic = run_with(&mut engine, &mut budget, "SELECT f_variadic(10)");
+    assert!(
+        String::from_utf8_lossy(&omitted_variadic).contains("42883"),
+        "{}",
+        String::from_utf8_lossy(&omitted_variadic)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    let recovered_output = run_with(
+        &mut recovered,
+        &mut budget,
+        "SELECT f_defaults(10), (f_out(5)).doubled, (f_out(5)).tripled; \
+         SELECT f_variadic(20, 1, 2), f_variadic(20, VARIADIC ARRAY[1, 2, 3]); \
+         SELECT total FROM f_named_rows(b => 7, a => 3); \
+         SELECT total FROM f_variadic_rows(1, 2, 3, 4); \
+         CALL p_out(4, 1 / 0, 20); \
+         CALL p_variadic(9, 1, 2, 3, 4); \
+         CALL p_defaults(6); \
+         SELECT a, b FROM procedure_log ORDER BY a; \
+         SELECT pg_get_function_arguments('f_defaults(integer,integer,integer)'::regprocedure);",
+    );
+    assert_eq!(
+        data_rows(&recovered_output),
+        [
+            "15|10|15",
+            "22|23",
+            "10",
+            "4",
+            "8|22",
+            "3|2",
+            "4|5",
+            "6|2",
+            "7|3",
+            "8|2",
+            "9|4",
+            "a integer, b integer DEFAULT 2, c integer DEFAULT 3",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered_output)
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn routine_calls_apply_postgresql_implicit_argument_casts() {
+    let config = test_config("routine_implicit_argument_casts");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE implicit_call_log(value integer);
+         CREATE FUNCTION implicit_increment(value integer) RETURNS integer
+             LANGUAGE SQL AS 'SELECT value + 1';
+         CREATE PROCEDURE implicit_record(value integer) LANGUAGE SQL
+             AS 'INSERT INTO implicit_call_log VALUES (value + 1)';
+         SELECT implicit_increment(40::smallint), implicit_increment(40::integer);
+         CALL implicit_record(41::smallint);
+         SELECT value FROM implicit_call_log;",
+    );
+    assert_eq!(data_rows(&output), ["41|41", "42"]);
+}
+
+#[test]
+fn routine_body_attributes_and_configuration_are_typed_durable_contracts() {
+    let mut config = test_config("routine_body_attributes");
+    config.max_tables = 16;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("routine-body-attributes-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_attribute_log(value text);
+         CREATE FUNCTION standard_return(a integer) RETURNS integer
+             LANGUAGE SQL IMMUTABLE PARALLEL SAFE COST 2
+             SET application_name TO 'inside' RETURN a + 1;
+         CREATE FUNCTION standard_atomic(a integer) RETURNS integer
+             LANGUAGE SQL ROWS 3 BEGIN ATOMIC SELECT a + 2; END;",
+    );
+    assert!(
+        String::from_utf8_lossy(&created).contains("ROWS is not applicable"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_attribute_log(value text);
+         CREATE TABLE plpgsql_procedure_log(base integer, total integer, label text);
+         CREATE FUNCTION standard_return(a integer) RETURNS integer
+             LANGUAGE SQL IMMUTABLE PARALLEL SAFE COST 2
+             SET application_name TO 'inside' RETURN a + 1;
+         CREATE FUNCTION standard_atomic(a integer) RETURNS integer
+             LANGUAGE SQL BEGIN ATOMIC SELECT a + 2; END;
+         CREATE FUNCTION configured_user() RETURNS text
+             LANGUAGE SQL SECURITY DEFINER SET application_name TO 'inside'
+             AS 'SELECT current_user || '':'' || current_setting(''application_name'')';
+         CREATE FUNCTION standard_mutable() RETURNS text
+             LANGUAGE SQL SECURITY DEFINER SET application_name TO 'mutable scope'
+             BEGIN ATOMIC
+               INSERT INTO routine_attribute_log
+                 VALUES (current_user || ':' || current_setting('application_name'))
+                 RETURNING current_user || ':' || current_setting('application_name');
+             END;
+         CREATE FUNCTION standard_mutable_rows() RETURNS TABLE(value text)
+             LANGUAGE SQL SECURITY DEFINER SET application_name TO 'table scope'
+             BEGIN ATOMIC
+               INSERT INTO routine_attribute_log
+                 VALUES (current_user || ':' || current_setting('application_name'))
+                 RETURNING current_user || ':' || current_setting('application_name');
+             END;
+         CREATE FUNCTION inner_config() RETURNS text
+             LANGUAGE SQL SET application_name TO 'inner'
+             RETURN current_setting('application_name');
+         CREATE FUNCTION nested_config() RETURNS text
+             LANGUAGE SQL SET application_name TO 'outer'
+             RETURN current_setting('application_name') || ':' || inner_config()
+                    || ':' || current_setting('application_name');
+         CREATE FUNCTION persistent_config() RETURNS text
+             LANGUAGE SQL SET application_name TO 'temporary'
+             AS 'SET application_name TO ''persisted'';
+                 SELECT current_setting(''application_name'')';
+         CREATE PROCEDURE plpgsql_flow(IN base integer, INOUT total integer, OUT label text)
+             LANGUAGE plpgsql AS
+             'DECLARE step integer := 0;
+              BEGIN
+                WHILE step < base LOOP
+                  step := step + 1;
+                  total := total + 1;
+                END LOOP;
+                label := ''sum:'' || total;
+                INSERT INTO plpgsql_procedure_log VALUES ($1, total, label);
+                RETURN;
+              END';
+         CREATE ROLE routine_caller;
+         SET application_name = 'outside';
+         SET ROLE routine_caller;
+         SELECT standard_return(4), standard_atomic(4), configured_user(),
+                current_setting('application_name');
+         SELECT standard_mutable(), current_setting('application_name');
+         SELECT value, current_setting('application_name') FROM standard_mutable_rows();
+         RESET ROLE;
+         SELECT nested_config(), current_setting('application_name');
+         SELECT persistent_config(), current_setting('application_name');
+         SET application_name TO 'outside';
+         SET application_name TO 'captured';
+         ALTER FUNCTION standard_atomic(integer) SET application_name FROM CURRENT;
+         SET application_name TO 'outside';
+         SELECT proconfig::text FROM pg_proc WHERE proname = 'standard_atomic';
+         ALTER FUNCTION standard_atomic(integer) RESET application_name;
+         SELECT proconfig IS NULL FROM pg_proc WHERE proname = 'standard_atomic';
+         ALTER FUNCTION standard_mutable_rows() ROWS 12 COST 3;
+         SELECT procost, prorows FROM pg_proc WHERE proname = 'standard_mutable_rows';
+         ALTER FUNCTION standard_return(integer)
+             VOLATILE PARALLEL RESTRICTED COST 7 SET application_name TO 'altered';
+         SELECT standard_return(9), current_setting('application_name');
+         SELECT pg_get_functiondef('standard_return(integer)'::regprocedure)
+                    LIKE '%SET application_name TO ''altered''%';
+         SELECT provolatile, proparallel, prosecdef, proleakproof, procost, prorows,
+                proconfig::text, prosqlbody IS NULL
+           FROM pg_proc WHERE proname = 'standard_return';
+         SELECT pg_typeof(proargtypes)::text, pg_typeof(protrftypes)::text,
+                pg_typeof(prosupport)::text, probin IS NULL, prosupport::oid
+           FROM pg_proc WHERE proname = 'standard_return';
+         SELECT proparallel, proowner, probin IS NULL, pg_typeof(proargtypes)::text
+           FROM pg_proc WHERE proname = 'version';
+         SELECT value FROM routine_attribute_log ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&created),
+        [
+            "5|6|postgres:inside|outside",
+            "postgres:mutable scope|outside",
+            "postgres:table scope|outside",
+            "outer:inner:outer|outside",
+            "persisted|persisted",
+            "{application_name=captured}",
+            "t",
+            "3|12",
+            "10|outside",
+            "t",
+            "v|r|f|f|7|0|{application_name=altered}|f",
+            "oidvector|oid[]|regproc|t|0",
+            "s|10|t|oidvector",
+            "postgres:mutable scope",
+            "postgres:table scope",
+        ],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let recovered = run_with(
+        &mut engine,
+        &mut budget,
+        "SET application_name = 'recovered';
+         SELECT standard_return(2), standard_atomic(2), current_setting('application_name');
+         SELECT procost, proconfig::text, prosqlbody IS NULL
+           FROM pg_proc WHERE proname = 'standard_return';
+         CALL plpgsql_flow(3, 4, NULL);
+         SELECT base, total, label FROM plpgsql_procedure_log;",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "3|4|recovered",
+            "7|{application_name=altered}|f",
+            "7|sum:7",
+            "3|7|sum:7",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    let anonymous = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE anonymous_log(value integer);
+         DO 'BEGIN INSERT INTO anonymous_log VALUES (1); INSERT INTO anonymous_log VALUES (2); END';
+         SELECT value FROM anonymous_log ORDER BY value;",
+    );
+    assert_eq!(data_rows(&anonymous), ["1", "2"]);
+    let anonymous_control = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE anonymous_flow(value integer PRIMARY KEY, note text);
+         DO 'DECLARE
+               i integer := 0;
+               total integer := 0;
+             BEGIN
+               WHILE i < 3 LOOP
+                 i := i + 1;
+                 IF i = 2 THEN CONTINUE; END IF;
+                 total := total + i;
+               END LOOP;
+               CASE total
+                 WHEN 4 THEN INSERT INTO anonymous_flow VALUES (total, ''loop'');
+                 ELSE RAISE EXCEPTION ''wrong total'';
+               END CASE;
+               BEGIN
+                 INSERT INTO anonymous_flow VALUES (4, ''duplicate'');
+               EXCEPTION WHEN unique_violation THEN
+                 INSERT INTO anonymous_flow VALUES (5, ''caught'');
+               END;
+             END';
+         SELECT value, note FROM anonymous_flow ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&anonymous_control),
+        ["4|loop", "5|caught"],
+        "{}",
+        String::from_utf8_lossy(&anonymous_control)
+    );
+    let anonymous_trigger_state =
+        run_with(&mut engine, &mut budget, "DO 'BEGIN PERFORM TG_OP; END';");
+    assert!(
+        String::from_utf8_lossy(&anonymous_trigger_state).contains("42703"),
+        "{}",
+        String::from_utf8_lossy(&anonymous_trigger_state)
+    );
+    let explicit_termination = run_with(&mut engine, &mut budget, "BEGIN; DO 'BEGIN COMMIT; END';");
+    assert!(
+        String::from_utf8_lossy(&explicit_termination).contains("2D000"),
+        "{}",
+        String::from_utf8_lossy(&explicit_termination)
+    );
+    let unsupported_language = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRUSTED PROCEDURAL LANGUAGE routine_native HANDLER standard_return;",
+    );
+    assert!(
+        String::from_utf8_lossy(&unsupported_language).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&unsupported_language)
+    );
+    let handlerless_language = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE LANGUAGE routine_handlerless;",
+    );
+    assert!(
+        String::from_utf8_lossy(&handlerless_language).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&handlerless_language)
+    );
+    let altered_language = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER LANGUAGE plpgsql RENAME TO renamed_plpgsql;",
+    );
+    assert!(
+        String::from_utf8_lossy(&altered_language).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&altered_language)
+    );
+    let dropped_language = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP LANGUAGE IF EXISTS renamed_plpgsql CASCADE;",
+    );
+    assert!(
+        String::from_utf8_lossy(&dropped_language).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&dropped_language)
+    );
+    let unsupported_do = run_with(&mut engine, &mut budget, "DO LANGUAGE sql 'SELECT 1';");
+    assert!(
+        String::from_utf8_lossy(&unsupported_do).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&unsupported_do)
+    );
+}
+
+#[test]
+fn plpgsql_call_and_do_own_real_non_atomic_transaction_boundaries() {
+    let mut config = test_config("plpgsql_non_atomic_transactions");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace =
+        format!("plpgsql-non-atomic-transactions-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE transaction_log(step integer PRIMARY KEY, local_value integer);
+             CREATE PROCEDURE transaction_flow() LANGUAGE plpgsql AS
+             'DECLARE local_value integer := 1;
+              BEGIN
+                INSERT INTO transaction_log VALUES (1, local_value);
+                COMMIT AND CHAIN;
+                local_value := 2;
+                INSERT INTO transaction_log VALUES (2, local_value);
+                ROLLBACK AND NO CHAIN;
+                local_value := 3;
+                INSERT INTO transaction_log VALUES (3, local_value);
+                COMMIT;
+                local_value := 4;
+                INSERT INTO transaction_log VALUES (4, local_value);
+              END';
+             CREATE PROCEDURE forbidden_boundary() LANGUAGE plpgsql AS
+             'BEGIN INSERT INTO transaction_log VALUES (20, 20); COMMIT; END';
+             CREATE PROCEDURE definer_boundary() LANGUAGE plpgsql SECURITY DEFINER AS
+             'BEGIN COMMIT; END';
+             CREATE PROCEDURE configured_boundary() LANGUAGE plpgsql
+               SET application_name TO 'inside' AS 'BEGIN COMMIT; END';
+             CREATE PROCEDURE caught_boundary() LANGUAGE plpgsql AS
+             'BEGIN
+                BEGIN
+                  COMMIT;
+                EXCEPTION WHEN invalid_transaction_termination THEN
+                  INSERT INTO transaction_log VALUES (7, 7);
+                END;
+                INSERT INTO transaction_log VALUES (8, 8);
+              END';
+             CREATE PROCEDURE sql_boundary() LANGUAGE SQL AS
+             'INSERT INTO transaction_log VALUES (30, 30); COMMIT';",
+        );
+        assert!(
+            !String::from_utf8_lossy(&setup).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+
+        let called = run_with(&mut engine, &mut budget, "CALL transaction_flow()");
+        assert!(
+            !String::from_utf8_lossy(&called).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&called)
+        );
+        let anonymous = run_with(
+            &mut engine,
+            &mut budget,
+            "DO 'BEGIN
+                   INSERT INTO transaction_log VALUES (5, 5);
+                   COMMIT;
+                   INSERT INTO transaction_log VALUES (6, 6);
+                 END'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&anonymous).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&anonymous)
+        );
+        let caught = run_with(&mut engine, &mut budget, "CALL caught_boundary()");
+        assert!(
+            !String::from_utf8_lossy(&caught).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&caught)
+        );
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT step, local_value FROM transaction_log ORDER BY step",
+            )),
+            ["1|1", "3|3", "4|4", "5|5", "6|6", "7|7", "8|8"]
+        );
+
+        for (sql, state) in [
+            ("CALL forbidden_boundary(); SELECT 1", "2D000"),
+            ("CALL definer_boundary()", "2D000"),
+            ("CALL configured_boundary()", "2D000"),
+            ("CALL sql_boundary()", "0A000"),
+        ] {
+            let rejected = run_with(&mut engine, &mut budget, sql);
+            assert!(
+                String::from_utf8_lossy(&rejected).contains(state),
+                "{sql}: {}",
+                String::from_utf8_lossy(&rejected)
+            );
+        }
+        let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
+        assert!(run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN").contains("BEGIN"));
+        let explicit = run_txn(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            "CALL forbidden_boundary()",
+        );
+        assert!(explicit.contains("2D000"), "{explicit}");
+        assert!(
+            run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK",).contains("ROLLBACK")
+        );
+        assert!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT step FROM transaction_log WHERE step IN (20, 30)",
+            ))
+            .is_empty()
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT step, local_value FROM transaction_log ORDER BY step",
+        )),
+        ["1|1", "3|3", "4|4", "5|5", "6|6", "7|7", "8|8"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE procedure_wait_target(id integer PRIMARY KEY, value integer); \
+         CREATE TABLE procedure_wait_log(phase text); \
+         INSERT INTO procedure_wait_target VALUES (1, 10); \
+         CREATE PROCEDURE procedure_wait() LANGUAGE plpgsql AS \
+         'BEGIN \
+            INSERT INTO procedure_wait_log VALUES (''before''); \
+            COMMIT; \
+            UPDATE procedure_wait_target SET value = value + 1 WHERE id = 1; \
+            INSERT INTO procedure_wait_log VALUES (''after''); \
+          END'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let mut blocker = TxnState::new(&mut budget, 256).unwrap();
+    assert!(run_txn(&mut engine, &mut budget, &mut blocker, "BEGIN").contains("BEGIN"));
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut blocker,
+            "UPDATE procedure_wait_target SET value = 20 WHERE id = 1",
+        )
+        .contains("UPDATE 1")
+    );
+
+    let mut caller = TxnState::new(&mut budget, 256).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "procedure wait send", 1 << 18).unwrap();
+    let arena = Arena::new(&mut budget, "procedure wait SQL", 1 << 18).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut guc = GucState::new();
+    let mut cursors = test_cursors(&mut budget);
+    let call = "CALL procedure_wait()";
+    let rejected = engine
+        .execute_simple(
+            call,
+            &arena,
+            &mut caller,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut Responder::new(&mut send),
+            2,
+        )
+        .unwrap();
+    assert_eq!(rejected, ExecutionStatus::Complete);
+    let error = String::from_utf8_lossy(send.readable());
+    assert!(error.contains("0A000"), "{error}");
+    assert!(
+        error.contains("cannot suspend after transaction control"),
+        "{error}"
+    );
+
+    assert!(run_txn(&mut engine, &mut budget, &mut blocker, "COMMIT").contains("COMMIT"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT phase, count(*) FROM procedure_wait_log GROUP BY phase ORDER BY phase; \
+             SELECT value FROM procedure_wait_target",
+        )),
+        ["before|1", "20"]
+    );
+}
+
+#[test]
+fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
+    let mut config = test_config("routine_creation_dependencies");
+    config.max_tables = 16;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("routine-creation-dependencies-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE SCHEMA routine_origin;
+             CREATE SCHEMA routine_shadow;
+             CREATE TABLE routine_dependency_log(value integer);
+             SET search_path TO routine_origin, public;
+             CREATE FUNCTION shifted(value integer) RETURNS integer
+               LANGUAGE SQL RETURN value + 1;
+             CREATE PROCEDURE record_shift(value integer) LANGUAGE SQL
+               BEGIN ATOMIC
+                 INSERT INTO routine_dependency_log VALUES (shifted(value));
+               END;
+             RESET search_path;",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        let procedure_slot = engine
+            .storage
+            .procedure_slot_for_call_oids("routine_origin.record_shift", &[23], 0)
+            .unwrap();
+        let dependencies = engine.storage.routine_dependencies_for(procedure_slot, 0);
+        assert_eq!(
+            engine.storage.routine_for(procedure_slot, 0).body_kind,
+            crate::storage::RoutineBodyKind::Atomic
+        );
+        assert!(dependencies.entries().iter().any(|dependency| {
+            dependency.class == crate::storage::DependencyClass::Table
+                && dependency.referenced_name.as_str() == "routine_dependency_log"
+        }));
+        assert!(dependencies.entries().iter().any(|dependency| {
+            dependency.class == crate::storage::DependencyClass::Routine
+                && dependency.referenced_name.as_str() == "shifted"
+                && dependency.referenced_schema.as_str().is_empty()
+        }));
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "SET search_path TO routine_shadow, public;
+             CREATE FUNCTION shifted(value integer) RETURNS integer
+               LANGUAGE SQL RETURN value + 100;
+             RESET search_path;
+             ALTER FUNCTION routine_origin.shifted(integer) RENAME TO renamed_shift;
+             ALTER TABLE routine_dependency_log RENAME TO renamed_routine_dependency_log;
+             CALL routine_origin.record_shift(4);
+             SELECT value FROM renamed_routine_dependency_log;",
+        );
+        assert_eq!(
+            data_rows(&setup),
+            ["5"],
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let recovered = run_with(
+        &mut engine,
+        &mut budget,
+        "SET search_path TO routine_shadow, public;
+         CALL routine_origin.record_shift(8);
+         SELECT value FROM renamed_routine_dependency_log ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        ["5", "9"],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn sql_standard_routine_dependencies_enforce_drop_lifecycle() {
+    let mut budget = Budget::new(1 << 28);
+    let mut engine =
+        Engine::new(&test_config("routine_dependency_lifecycle"), &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_dependency_target(value integer);
+         CREATE FUNCTION routine_dependency_base(value integer) RETURNS integer
+           LANGUAGE SQL RETURN value + 1;
+         CREATE FUNCTION routine_dependency_wrapper(value integer) RETURNS integer
+           LANGUAGE SQL RETURN routine_dependency_base(value);
+         CREATE PROCEDURE routine_dependency_writer(value integer) LANGUAGE SQL
+           BEGIN ATOMIC
+             INSERT INTO routine_dependency_target
+               VALUES (routine_dependency_wrapper(value));
+           END;
+         CREATE VIEW routine_dependency_view AS
+           SELECT routine_dependency_wrapper(4) AS value;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+
+    let table_restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE routine_dependency_target RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&table_restrict).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&table_restrict)
+    );
+    let routine_restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION routine_dependency_base(integer) RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&routine_restrict).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&routine_restrict)
+    );
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION routine_dependency_base(integer) CASCADE;
+         SELECT count(*) FROM pg_proc
+          WHERE proname IN ('routine_dependency_base',
+                            'routine_dependency_wrapper',
+                            'routine_dependency_writer');",
+    );
+    assert_eq!(
+        data_rows(&cascaded),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&cascaded)
+    );
+    let dropped_view = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM routine_dependency_view",
+    );
+    assert!(
+        String::from_utf8_lossy(&dropped_view).contains("42P01"),
+        "{}",
+        String::from_utf8_lossy(&dropped_view)
+    );
+
+    let schema_created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA routine_dependency_schema;
+         CREATE FUNCTION routine_dependency_schema.source(value integer) RETURNS integer
+           LANGUAGE SQL RETURN value * 2;
+         CREATE FUNCTION public.routine_dependency_schema_user(value integer) RETURNS integer
+           LANGUAGE SQL RETURN routine_dependency_schema.source(value);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&schema_created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&schema_created)
+    );
+    let schema_restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA routine_dependency_schema RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&schema_restrict).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&schema_restrict)
+    );
+    let schema_cascade = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA routine_dependency_schema CASCADE;
+         SELECT count(*) FROM pg_proc
+          WHERE proname = 'routine_dependency_schema_user';",
+    );
+    assert_eq!(
+        data_rows(&schema_cascade),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&schema_cascade)
+    );
+}
+
+#[test]
+fn sql_standard_dml_bodies_bind_column_typed_overloads() {
+    let mut budget = Budget::new(1 << 28);
+    let mut engine =
+        Engine::new(&test_config("routine_dml_dependency_types"), &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_dml_scope(id integer PRIMARY KEY, value integer);
+         CREATE TABLE routine_dml_source(id integer, value integer);
+         CREATE FUNCTION routine_dml_pick(value integer) RETURNS integer
+           LANGUAGE SQL RETURN value + 1;
+         CREATE FUNCTION routine_dml_pick(value text) RETURNS integer
+           LANGUAGE SQL RETURN 900;
+         CREATE PROCEDURE routine_dml_upsert(input_id integer, input_value integer)
+           LANGUAGE SQL
+           BEGIN ATOMIC
+             INSERT INTO routine_dml_scope VALUES (input_id, input_value)
+               ON CONFLICT (id) DO UPDATE
+               SET value = routine_dml_pick(excluded.value);
+             UPDATE routine_dml_scope
+               SET value = routine_dml_pick(value)
+               WHERE id = input_id;
+           END;
+         CREATE PROCEDURE routine_dml_merge() LANGUAGE SQL
+           BEGIN ATOMIC
+             MERGE INTO routine_dml_scope AS target
+             USING routine_dml_source AS source
+             ON target.id = source.id
+             WHEN MATCHED THEN
+               UPDATE SET value = routine_dml_pick(source.value)
+             WHEN NOT MATCHED THEN
+               INSERT (id, value)
+               VALUES (source.id, routine_dml_pick(source.value));
+           END;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let procedure = engine
+        .storage
+        .procedure_slot_for_call_oids("routine_dml_upsert", &[23, 23], 0)
+        .unwrap();
+    let dependencies = engine.storage.routine_dependencies_for(procedure, 0);
+    let routine_dependencies = dependencies
+        .entries()
+        .iter()
+        .filter(|dependency| {
+            dependency.class == crate::storage::DependencyClass::Routine
+                && dependency.referenced_name.as_str() == "routine_dml_pick"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(routine_dependencies.len(), 1);
+    let selected = engine
+        .storage
+        .routine_for(usize::from(routine_dependencies[0].slot), 0);
+    assert_eq!(selected.arguments()[0].ctype, ColType::Int4);
+
+    let invoked = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER FUNCTION routine_dml_pick(integer) RENAME TO routine_dml_pick_integer;
+         CALL routine_dml_upsert(1, 4);
+         CALL routine_dml_upsert(1, 8);
+         INSERT INTO routine_dml_source VALUES (1, 20), (2, 30);
+         CALL routine_dml_merge();
+         SELECT value FROM routine_dml_scope ORDER BY id;",
+    );
+    assert_eq!(
+        data_rows(&invoked),
+        ["21", "31"],
+        "{}",
+        String::from_utf8_lossy(&invoked)
+    );
+    let restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION routine_dml_pick_integer(integer) RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&restrict).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restrict)
+    );
+    let column_restrict = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE routine_dml_source DROP COLUMN value RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&column_restrict).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&column_restrict)
+    );
+    let column_cascade = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE routine_dml_source DROP COLUMN value CASCADE;
+         SELECT count(*) FROM pg_proc WHERE proname = 'routine_dml_merge';",
+    );
+    assert_eq!(
+        data_rows(&column_cascade),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&column_cascade)
+    );
+}
+
+#[test]
 fn user_defined_aggregate_executes_typed_transition_final_and_ordering() {
     let mut config = test_config("user-defined-aggregate-execution");
     config.max_tables = 32;
@@ -18668,7 +19654,7 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
          CREATE TYPE routine_pair AS (value integer, label text); \
          CREATE FUNCTION echo_state(value routine_state) RETURNS routine_state LANGUAGE SQL AS 'SELECT $1'; \
          CREATE FUNCTION echo_count(value routine_count) RETURNS routine_count LANGUAGE SQL AS 'SELECT $1'; \
-         CREATE FUNCTION echo_counts(values routine_count[]) RETURNS routine_count[] LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE FUNCTION echo_counts(vals routine_count[]) RETURNS routine_count[] LANGUAGE SQL AS 'SELECT $1'; \
          CREATE FUNCTION echo_counts_unnamed(routine_count[]) RETURNS routine_count[] LANGUAGE SQL AS 'SELECT $1'; \
          CREATE FUNCTION echo_pair(value routine_pair) RETURNS routine_pair LANGUAGE SQL AS 'SELECT $1'; \
          CREATE FUNCTION routine_overload(value integer) RETURNS text LANGUAGE SQL AS 'SELECT ''integer'''; \
@@ -18811,7 +19797,7 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         data_rows(&moved_catalog),
         [
             "value routine_type_target.routine_count_moved|routine_type_target.routine_count_moved",
-            "values routine_type_target.routine_count_moved[]|routine_type_target.routine_count_moved[]",
+            "vals routine_type_target.routine_count_moved[]|routine_type_target.routine_count_moved[]",
         ],
         "{}",
         String::from_utf8_lossy(&moved_catalog)
@@ -18968,7 +19954,7 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
              CREATE DOMAIN recovered_count AS integer CHECK (VALUE > 0); \
              CREATE TYPE recovered_pair AS (value integer, label text); \
              CREATE FUNCTION recovered_state_echo(value recovered_state) RETURNS recovered_state LANGUAGE SQL AS 'SELECT $1'; \
-             CREATE FUNCTION recovered_counts_echo(values recovered_count[]) RETURNS recovered_count[] LANGUAGE SQL AS 'SELECT $1'; \
+             CREATE FUNCTION recovered_counts_echo(vals recovered_count[]) RETURNS recovered_count[] LANGUAGE SQL AS 'SELECT $1'; \
              CREATE FUNCTION recovered_pair_echo(value recovered_pair) RETURNS recovered_pair LANGUAGE SQL AS 'SELECT $1'; \
              CREATE FUNCTION recovered_overload(value integer) RETURNS text LANGUAGE SQL AS 'SELECT ''integer'''; \
              CREATE FUNCTION recovered_overload(value recovered_count) RETURNS text LANGUAGE SQL AS 'SELECT ''domain'''; \

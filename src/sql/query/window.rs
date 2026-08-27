@@ -215,6 +215,8 @@ pub(crate) fn rewrite_grouped_windows<'a>(
             alias: Some("?grouped"),
             subquery: Some(inner),
             func_args: None,
+            func_argument_names: &[],
+            func_variadic: false,
             rows_from: None,
             col_alias: None,
             inheritance: crate::sql::ast::RelationInheritance::Descendants,

@@ -872,6 +872,55 @@ def test_bind_rejects_mismatched_result_format_count():
     s.close()
 
 
+def test_routine_contract_infers_untyped_parse_parameter():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE OR REPLACE FUNCTION wire_inferred_standard(value integer) "
+        "RETURNS integer LANGUAGE SQL RETURN value + 1",
+    )
+    check(
+        "routine parameter inference setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    query = "SELECT wire_inferred_standard($1)"
+    parse = frontend_message(
+        b"P",
+        b"wire_inferred_statement\x00" + query.encode() + b"\x00" + struct.pack("!h", 0),
+    )
+    describe = frontend_message(b"D", b"Swire_inferred_statement\x00")
+    bind_body = b"wire_inferred_portal\x00wire_inferred_statement\x00"
+    bind_body += struct.pack("!hh", 1, 1)
+    bind_body += struct.pack("!hi", 1, 4) + struct.pack("!i", 41)
+    bind_body += struct.pack("!hh", 1, 1)
+    bind = frontend_message(b"B", bind_body)
+    execute = frontend_message(b"E", b"wire_inferred_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + describe + bind + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    parameter_description = next((payload for kind, payload in output if kind == b"t"), None)
+    row = next((payload for kind, payload in output if kind == b"D"), None)
+    check(
+        "routine declaration determines ParameterDescription OID",
+        parameter_description == struct.pack("!hi", 1, 23),
+        output,
+    )
+    check(
+        "inferred routine parameter accepts binary integer Bind",
+        not any(kind == b"E" for kind, _ in output)
+        and row == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", 42),
+        output,
+    )
+    s.close()
+
+
 def test_portal_describe_preserves_type_modifier():
     s = connect()
     s.sendall(startup_payload(0))
@@ -1759,6 +1808,189 @@ def test_row_trigger_body_over_raw_wire():
     s.close()
 
 
+def test_plpgsql_procedure_output_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE PROCEDURE wire_plpgsql_output(IN value integer, INOUT total integer, OUT note text) "
+        "LANGUAGE plpgsql AS 'DECLARE step integer := 0; BEGIN "
+        "WHILE step < value LOOP step := step + 1; total := total + step; END LOOP; "
+        "note := ''total:'' || total; END'",
+    )
+    check(
+        "raw wire: PL/pgSQL procedure setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    called = simple_query(s, "CALL wire_plpgsql_output(3, 4, NULL)")
+    description = next((payload for kind, payload in called if kind == b"T"), None)
+    row = next((payload for kind, payload in called if kind == b"D"), None)
+    check(
+        "raw wire: CALL describes and returns typed PL/pgSQL output parameters",
+        not any(kind == b"E" for kind, _ in called)
+        and description is not None
+        and row_description_type_oids(description) == [23, 25]
+        and row is not None
+        and text_row_fields(row) == ["10", "total:10"],
+        called,
+    )
+    s.close()
+
+
+def test_plpgsql_transaction_boundaries_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_plpgsql_transaction_log(value integer PRIMARY KEY); "
+        "CREATE PROCEDURE wire_plpgsql_simple_transaction() LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_plpgsql_transaction_log VALUES (1); COMMIT; "
+        "INSERT INTO wire_plpgsql_transaction_log VALUES (2); END'; "
+        "CREATE PROCEDURE wire_plpgsql_extended_transaction() LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_plpgsql_transaction_log VALUES (3); COMMIT; "
+        "INSERT INTO wire_plpgsql_transaction_log VALUES (4); END'; "
+        "CREATE PROCEDURE wire_plpgsql_forbidden_transaction() LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_plpgsql_transaction_log VALUES (5); COMMIT; END'; "
+        "CREATE TABLE wire_plpgsql_wait_target(id integer PRIMARY KEY, value integer); "
+        "CREATE TABLE wire_plpgsql_wait_log(phase text); "
+        "INSERT INTO wire_plpgsql_wait_target VALUES (1, 10); "
+        "CREATE PROCEDURE wire_plpgsql_wait_transaction() LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_plpgsql_wait_log VALUES (''before''); COMMIT; "
+        "UPDATE wire_plpgsql_wait_target SET value = value + 1 WHERE id = 1; "
+        "INSERT INTO wire_plpgsql_wait_log VALUES (''after''); END'",
+    )
+    check(
+        "raw wire: transaction procedure setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+
+    called = simple_query(s, "CALL wire_plpgsql_simple_transaction()")
+    check(
+        "raw wire: lone simple CALL crosses a real commit boundary",
+        [kind for kind, _ in called] == [b"C", b"Z"],
+        called,
+    )
+
+    query = "CALL wire_plpgsql_extended_transaction()"
+    parse = frontend_message(b"P", b"\x00" + query.encode() + b"\x00\x00\x00")
+    bind = frontend_message(b"B", b"\x00\x00\x00\x00\x00\x00\x00\x00")
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + execute + frontend_message(b"S"))
+    extended = []
+    while True:
+        item = read_message(s)
+        extended.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "raw wire: lone extended CALL crosses a real commit boundary",
+        [kind for kind, _ in extended] == [b"1", b"2", b"C", b"Z"],
+        extended,
+    )
+
+    rejected = simple_query(s, "CALL wire_plpgsql_forbidden_transaction(); SELECT 1")
+    check(
+        "raw wire: multi-statement CALL rejects transaction termination",
+        has_sqlstate(rejected, "2D000") and rejected[-1][0] == b"Z",
+        rejected,
+    )
+    check(
+        "raw wire: rejected boundary rolls back its procedure writes",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT string_agg(value::text, ',' ORDER BY value) "
+                "FROM wire_plpgsql_transaction_log",
+            )
+        )
+        == "1,2,3,4",
+    )
+
+    blocker = connect()
+    blocker.sendall(startup_payload(0))
+    drain_startup(blocker)
+    locked = simple_query(
+        blocker,
+        "BEGIN; UPDATE wire_plpgsql_wait_target SET value = 20 WHERE id = 1",
+    )
+    check(
+        "raw wire: concurrent transaction owns the procedure target row",
+        not any(kind == b"E" for kind, _ in locked),
+        locked,
+    )
+    waited = simple_query(s, "CALL wire_plpgsql_wait_transaction()")
+    check(
+        "raw wire: a post-boundary wait is rejected instead of replayed",
+        has_sqlstate(waited, "0A000") and waited[-1][0] == b"Z",
+        waited,
+    )
+    simple_query(blocker, "COMMIT")
+    blocker.close()
+    check(
+        "raw wire: the committed procedure prefix executes exactly once",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT count(*) FILTER (WHERE phase = 'before') || ':' || "
+                "count(*) FILTER (WHERE phase = 'after') FROM wire_plpgsql_wait_log",
+            )
+        )
+        == "1:0",
+    )
+
+    reset = simple_query(
+        s,
+        "TRUNCATE wire_plpgsql_wait_log; "
+        "UPDATE wire_plpgsql_wait_target SET value = 10 WHERE id = 1",
+    )
+    check(
+        "raw wire: extended wait replay setup succeeds",
+        not any(kind == b"E" for kind, _ in reset),
+        reset,
+    )
+    blocker = connect()
+    blocker.sendall(startup_payload(0))
+    drain_startup(blocker)
+    simple_query(
+        blocker,
+        "BEGIN; UPDATE wire_plpgsql_wait_target SET value = 30 WHERE id = 1",
+    )
+    query = "CALL wire_plpgsql_wait_transaction()"
+    parse = frontend_message(b"P", b"\x00" + query.encode() + b"\x00\x00\x00")
+    bind = frontend_message(b"B", b"\x00\x00\x00\x00\x00\x00\x00\x00")
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + execute + frontend_message(b"S"))
+    waited = []
+    while True:
+        item = read_message(s)
+        waited.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "raw wire: extended CALL never replays a committed prefix",
+        has_sqlstate(waited, "0A000") and waited[-1][0] == b"Z",
+        waited,
+    )
+    simple_query(blocker, "COMMIT")
+    blocker.close()
+    check(
+        "raw wire: extended CALL committed its prefix once",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT count(*) FILTER (WHERE phase = 'before') || ':' || "
+                "count(*) FILTER (WHERE phase = 'after') FROM wire_plpgsql_wait_log",
+            )
+        )
+        == "1:0",
+    )
+    s.close()
+
+
 def test_trigger_function_replacement_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))
@@ -1908,14 +2140,13 @@ def test_catalog_aware_binary_bind_parameters():
         "CREATE DOMAIN wire_binary_coordinate_domain AS wire_binary_coordinate; "
         "CREATE TABLE wire_binary_regclass (id integer, state wire_binary_state, positive wire_binary_positive, coordinate wire_binary_coordinate); "
         "INSERT INTO wire_binary_regclass VALUES (1, 'ready', 7, ROW(4,8)::wire_binary_coordinate); "
-        "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL "
-        "AS 'SELECT value'; "
-        "CREATE FUNCTION wire_binary_state_echo(value wire_binary_state) RETURNS wire_binary_state LANGUAGE SQL AS 'SELECT $1'; "
-        "CREATE FUNCTION wire_binary_positive_echo(value wire_binary_positive) RETURNS wire_binary_positive LANGUAGE SQL AS 'SELECT $1'; "
-        "CREATE FUNCTION wire_binary_coordinate_echo(value wire_binary_coordinate) RETURNS wire_binary_coordinate LANGUAGE SQL AS 'SELECT $1'; "
-        "CREATE FUNCTION wire_binary_state_array_echo(value wire_binary_state[]) RETURNS wire_binary_state[] LANGUAGE SQL AS 'SELECT $1'; "
-        "CREATE FUNCTION wire_binary_positive_array_echo(value wire_binary_positive[]) RETURNS wire_binary_positive[] LANGUAGE SQL AS 'SELECT $1'; "
-        "CREATE FUNCTION wire_binary_coordinate_array_echo(value wire_binary_coordinate[]) RETURNS wire_binary_coordinate[] LANGUAGE SQL AS 'SELECT $1'",
+        "CREATE FUNCTION wire_binary_routine(value integer) RETURNS integer LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_state_echo(value wire_binary_state) RETURNS wire_binary_state LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_positive_echo(value wire_binary_positive) RETURNS wire_binary_positive LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_coordinate_echo(value wire_binary_coordinate) RETURNS wire_binary_coordinate LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_state_array_echo(value wire_binary_state[]) RETURNS wire_binary_state[] LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_positive_array_echo(value wire_binary_positive[]) RETURNS wire_binary_positive[] LANGUAGE SQL RETURN value; "
+        "CREATE FUNCTION wire_binary_coordinate_array_echo(value wire_binary_coordinate[]) RETURNS wire_binary_coordinate[] LANGUAGE SQL RETURN value",
     )
 
     enum_oid = int(first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_binary_state'")))

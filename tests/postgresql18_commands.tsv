@@ -25,10 +25,10 @@ ALTER EVENT TRIGGER	missing	-
 ALTER EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native-library update execution is outside the architecture
 ALTER FOREIGN DATA WRAPPER	missing	-
 ALTER FOREIGN TABLE	missing	-
-ALTER FUNCTION	partial	90_routine_lifecycle.sql and 111_extension_lifecycle.sql
+ALTER FUNCTION	partial	90_routine_lifecycle.sql, 111_extension_lifecycle.sql, and 112_routine_bodies_attributes_do.sql
 ALTER GROUP	partial	83_roles_acl.sql
 ALTER INDEX	partial	107_index_lifecycle.sql and 111_extension_lifecycle.sql
-ALTER LANGUAGE	missing	-
+ALTER LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; custom executable handlers are outside the architecture)
 ALTER LARGE OBJECT	missing	-
 ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql and typed extension dependencies in 111_extension_lifecycle.sql
 ALTER OPERATOR	missing	-
@@ -59,7 +59,7 @@ ALTER USER MAPPING	missing	-
 ALTER VIEW	partial	76_stored_dependencies.sql
 ANALYZE	complete	48_vacuum_analyze.sql
 BEGIN	complete	05_transactions.sql
-CALL	partial	89_sql_procedures.sql
+CALL	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql (lone top-level PL/pgSQL transaction control, typed outputs, SQL procedures, and explicit rejection of post-boundary suspension)
 CHECKPOINT	complete	40_copy.sql
 CLOSE	complete	39_cursors.sql
 CLUSTER	missing	-
@@ -78,16 +78,16 @@ CREATE EVENT TRIGGER	missing	-
 CREATE EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native libraries are rejected
 CREATE FOREIGN DATA WRAPPER	missing	-
 CREATE FOREIGN TABLE	missing	-
-CREATE FUNCTION	partial	87_sql_routines.sql
+CREATE FUNCTION	partial	87_sql_routines.sql and 112_routine_bodies_attributes_do.sql
 CREATE GROUP	partial	83_roles_acl.sql
 CREATE INDEX	partial	43_indexes.sql, 107_index_lifecycle.sql, and 108_index_operator_classes.sql
-CREATE LANGUAGE	missing	-
+CREATE LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; native handlers are outside the architecture)
 CREATE MATERIALIZED VIEW	complete	53_materialized_view.sql
 CREATE OPERATOR	missing	-
 CREATE OPERATOR CLASS	missing	-
 CREATE OPERATOR FAMILY	missing	-
 CREATE POLICY	complete	106_row_level_security.sql
-CREATE PROCEDURE	partial	89_sql_procedures.sql
+CREATE PROCEDURE	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql
 CREATE PUBLICATION	partial	84_publication.sql
 CREATE ROLE	partial	83_roles_acl.sql
 CREATE RULE	missing	-
@@ -113,7 +113,7 @@ DEALLOCATE	complete	14_surface.sql
 DECLARE	partial	39_cursors.sql
 DELETE	complete	02_dml_returning.sql
 DISCARD	missing	-
-DO	missing	-
+DO	partial	100_plpgsql_procedures.sql and 112_routine_bodies_attributes_do.sql (bounded PL/pgSQL declarations, control flow, diagnostics, exceptions, queries, DML, and lone top-level transaction control)
 DROP ACCESS METHOD	missing	-
 DROP AGGREGATE	complete	110_user_defined_aggregates.sql
 DROP CAST	missing	-
@@ -128,7 +128,7 @@ DROP FOREIGN TABLE	missing	-
 DROP FUNCTION	partial	87_sql_routines.sql
 DROP GROUP	partial	83_roles_acl.sql
 DROP INDEX	complete	43_indexes.sql
-DROP LANGUAGE	missing	-
+DROP LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; builtin language mutation remains unsupported)
 DROP MATERIALIZED VIEW	complete	53_materialized_view.sql
 DROP OPERATOR	missing	-
 DROP OPERATOR CLASS	missing	-

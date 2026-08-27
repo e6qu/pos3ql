@@ -19,13 +19,13 @@ use crate::sql::ast::{
     ExtensionMemberIdentity, ExtensionRelationKind, IndexBuildMode, IndexStorageOptionNames,
     IndexStorageOptions, IndexTargetScope, PartitionBound, PartitionClause, PartitionStrategy,
     PolicyCommand, PolicyExpression, PolicyIdentity, PolicyPermissiveness, PolicyRole,
-    PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
-    RoutineIdentity, RoutineParallel, RoutineTargetKind, StatisticsExpression, StatisticsKey,
-    StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget, SubscriptionBehavior,
-    SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName,
-    SubscriptionSlotPlan, SubscriptionStreaming, SubscriptionSynchronousCommit,
-    TablespaceOptionNames, TablespaceOptions, TriggerEvent, TriggerIdentity, TriggerKind,
-    TriggerTiming, TriggerTransitionTables, ViewSecurity,
+    PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineArgumentMode,
+    RoutineCreateKind, RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind,
+    StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName,
+    StatisticsTarget, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
+    SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions, TriggerEvent,
+    TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables, ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -661,6 +661,14 @@ impl<'a> Parser<'a> {
             if self.eat_ident("trigger")? {
                 return self.create_trigger(true, false);
             }
+            let trusted = self.eat_ident("trusted")?;
+            let _procedural = self.eat_ident("procedural")?;
+            if trusted || _procedural || self.eat_ident("language")? {
+                if trusted || _procedural {
+                    self.expect_ident("language")?;
+                }
+                return self.create_language(true, trusted);
+            }
             return Err(self.unexpected(
                 "expected VIEW, FUNCTION, PROCEDURE, AGGREGATE, or TRIGGER after CREATE OR REPLACE",
             ));
@@ -668,6 +676,14 @@ impl<'a> Parser<'a> {
         if self.eat_ident("unique")? {
             self.expect_ident("index")?;
             return self.create_index(true);
+        }
+        let trusted = self.eat_ident("trusted")?;
+        let procedural = self.eat_ident("procedural")?;
+        if trusted || procedural || self.eat_ident("language")? {
+            if trusted || procedural {
+                self.expect_ident("language")?;
+            }
+            return self.create_language(false, trusted);
         }
         if self.eat_ident("view")? {
             return self.create_view(false);
@@ -735,6 +751,47 @@ impl<'a> Parser<'a> {
             return self.create_role(false);
         }
         self.create_table()
+    }
+
+    fn create_language(&mut self, or_replace: bool, trusted: bool) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("language name")?;
+        let mut handler = None;
+        let mut inline = None;
+        let mut validator = None;
+        while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+            if self.eat_ident("handler")? {
+                if handler
+                    .replace(self.qual_name("language handler")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("HANDLER specified more than once"));
+                }
+            } else if self.eat_ident("inline")? {
+                if inline
+                    .replace(self.qual_name("language inline handler")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("INLINE specified more than once"));
+                }
+            } else if self.eat_ident("validator")? {
+                if validator
+                    .replace(self.qual_name("language validator")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("VALIDATOR specified more than once"));
+                }
+            } else {
+                return Err(self.unexpected("language option"));
+            }
+        }
+        Ok(Stmt::CreateLanguage(crate::sql::ast::CreateLanguage {
+            name,
+            or_replace,
+            trusted,
+            handler,
+            inline,
+            validator,
+        }))
     }
 
     fn extension_version(&mut self) -> Result<&'a str, ParseError> {
@@ -847,13 +904,17 @@ impl<'a> Parser<'a> {
             }
             _ => true,
         };
-        let first = self.type_name()?;
-        let argument_type = if !matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
-            // The first identifier was the optional argument name. It cannot
-            // be retained in a routine identity, so parse and return the type.
-            self.type_name()?
+        let mark = self.lexer.mark();
+        let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+        let candidate_type = self.type_name()?;
+        let argument_type = if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
+            candidate_type
         } else {
-            first
+            self.lexer.reset(mark);
+            self.peeked = saved_peeked;
+            self.peek_at = saved_peek_at;
+            let _ = self.type_function_ident("routine argument name")?;
+            self.type_name()?
         };
         Ok((argument_type, input))
     }
@@ -1636,8 +1697,77 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// SQL-language routine definition. Its parsed kind makes omitting a
-    /// function return type or assigning one to a procedure impossible.
+    fn routine_argument(&mut self) -> Result<RoutineArgument<'a>, ParseError> {
+        #[derive(Clone, Copy)]
+        enum WrittenMode {
+            In,
+            Out,
+            InOut,
+            Variadic,
+        }
+
+        let written_mode = if self.eat_ident("in")? {
+            WrittenMode::In
+        } else if self.eat_ident("out")? {
+            WrittenMode::Out
+        } else if self.eat_ident("inout")? {
+            WrittenMode::InOut
+        } else if self.eat_ident("variadic")? {
+            WrittenMode::Variadic
+        } else {
+            WrittenMode::In
+        };
+
+        // A parameter name and a user type name occupy the same lexical
+        // category. Parse a type first and keep it only when the next token is
+        // a parameter boundary; otherwise restore and parse `name type`.
+        let mark = self.lexer.mark();
+        let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+        let candidate_type = self.type_name()?;
+        let candidate_is_complete = matches!(
+            self.peeked,
+            Tok::Op("," | ")" | "=") | Tok::Ident("default")
+        );
+        let (name, type_name) = if candidate_is_complete {
+            (None, candidate_type)
+        } else {
+            self.lexer.reset(mark);
+            self.peeked = saved_peeked;
+            self.peek_at = saved_peek_at;
+            let name = self.type_function_ident("routine argument name")?;
+            (Some(name), self.type_name()?)
+        };
+
+        let has_default = self.eat_ident("default")? || self.eat_op("=")?;
+        let default_text = if has_default {
+            let start = self.peek_at;
+            let _ = self.expression(0)?;
+            Some(self.arena_str(self.text[start..self.peek_at].trim_end())?)
+        } else {
+            None
+        };
+        let mode = match written_mode {
+            WrittenMode::In => RoutineArgumentMode::In { default_text },
+            WrittenMode::Out if default_text.is_none() => RoutineArgumentMode::Out,
+            WrittenMode::Out => {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "only input parameters can have default values"),
+                    sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                });
+            }
+            WrittenMode::InOut => RoutineArgumentMode::InOut { default_text },
+            WrittenMode::Variadic => RoutineArgumentMode::Variadic { default_text },
+        };
+        Ok(RoutineArgument {
+            mode,
+            name,
+            type_name,
+        })
+    }
+
+    /// SQL-language routine definition. The parsed parameter modes separate
+    /// call identity from output shape before catalog resolution.
     fn create_routine(&mut self, or_replace: bool, function: bool) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name(if function {
             "function name"
@@ -1646,32 +1776,47 @@ impl<'a> Parser<'a> {
         })?;
         self.expect_op("(")?;
         let mut arguments = [RoutineArgument {
-            name: "",
+            mode: RoutineArgumentMode::In { default_text: None },
+            name: None,
             type_name: "",
         }; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut count = 0;
+        let mut saw_default = false;
+        let mut saw_variadic = false;
+        let mut output_count = 0usize;
         if !self.eat_op(")")? {
             loop {
                 if count == arguments.len() {
                     return Err(self.limit("function arguments", arguments.len()));
                 }
-                let first = self.any_ident("function argument")?;
-                let type_name = if self.peeked == Tok::Op("[") {
-                    self.advance()?;
-                    self.expect_op("]")?;
-                    while self.peeked == Tok::Op("[") {
-                        self.advance()?;
-                        self.expect_op("]")?;
+                let argument = self.routine_argument()?;
+                if saw_variadic && !matches!(argument.mode, RoutineArgumentMode::Out) {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "VARIADIC parameter must be the last input parameter"
+                        ),
+                        sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                    });
+                }
+                if argument.mode.is_input() {
+                    if argument.mode.default_text().is_some() {
+                        saw_default = true;
+                    } else if saw_default {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                96,
+                                "input parameters after one with a default value must also have defaults"
+                            ),
+                            sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                        });
                     }
-                    self.arena_str(stack_format!(132, "{}[]", first).as_str())?
-                } else if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
-                    first
-                } else {
-                    let type_name = self.type_name()?;
-                    arguments[count].name = first;
-                    type_name
-                };
-                arguments[count].type_name = type_name;
+                }
+                saw_variadic |= matches!(argument.mode, RoutineArgumentMode::Variadic { .. });
+                output_count += usize::from(argument.mode.is_output());
+                arguments[count] = argument;
                 count += 1;
                 if self.eat_op(")")? {
                     break;
@@ -1680,12 +1825,25 @@ impl<'a> Parser<'a> {
             }
         }
         let kind = if function {
-            self.expect_ident("returns")?;
-            if self.eat_ident("trigger")? {
+            let has_returns = self.eat_ident("returns")?;
+            if has_returns && self.eat_ident("trigger")? {
+                if output_count != 0 {
+                    return Err(self.err_here("trigger functions cannot have OUT parameters"));
+                }
                 RoutineCreateKind::Trigger
-            } else if self.eat_ident("table")? {
+            } else if has_returns && self.eat_ident("table")? {
+                if output_count != 0 {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "OUT and INOUT arguments cannot be used with RETURNS TABLE"
+                        ),
+                        sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                    });
+                }
                 self.expect_op("(")?;
-                let mut columns = [RoutineArgument {
+                let mut columns = [RoutineResultColumn {
                     name: "",
                     type_name: "",
                 }; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -1694,7 +1852,7 @@ impl<'a> Parser<'a> {
                     if column_count == columns.len() {
                         return Err(self.limit("function result columns", columns.len()));
                     }
-                    columns[column_count] = RoutineArgument {
+                    columns[column_count] = RoutineResultColumn {
                         name: self.any_ident("function result column")?,
                         type_name: self.type_name()?,
                     };
@@ -1707,7 +1865,21 @@ impl<'a> Parser<'a> {
                 RoutineCreateKind::TableFunction {
                     columns: self.arena_slice(&columns[..column_count])?,
                 }
+            } else if output_count != 0 {
+                let set_returning = has_returns && self.eat_ident("setof")?;
+                let declared_result_type = if has_returns {
+                    Some(self.type_name()?)
+                } else {
+                    None
+                };
+                RoutineCreateKind::OutputFunction {
+                    declared_result_type,
+                    set_returning,
+                }
             } else {
+                if !has_returns {
+                    return Err(self.unexpected("RETURNS clause or OUT parameters"));
+                }
                 RoutineCreateKind::Function {
                     set_returning: self.eat_ident("setof")?,
                     result_type: self.type_name()?,
@@ -1722,6 +1894,15 @@ impl<'a> Parser<'a> {
         let mut strict_seen = false;
         let mut volatility_seen = false;
         let mut parallel_seen = false;
+        let mut security_seen = false;
+        let mut leakproof_seen = false;
+        let mut cost_seen = false;
+        let mut rows_seen = false;
+        let mut configs = [crate::sql::ast::RoutineConfigClause {
+            name: "",
+            value: crate::sql::ast::RoutineConfigValue::Current,
+        }; crate::storage::MAX_ROUTINE_CONFIGS];
+        let mut config_count = 0usize;
         while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
             if self.eat_ident("language")? {
                 if language.is_some() {
@@ -1747,7 +1928,50 @@ impl<'a> Parser<'a> {
                 if body.is_some() {
                     return Err(self.unexpected("one AS clause"));
                 }
-                body = Some(self.str_literal("function body")?);
+                let source = self.str_literal("function body")?;
+                if self.eat_op(",")? {
+                    let _symbol = self.str_literal("function link symbol")?;
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "native-library routine bodies are not supported"
+                        ),
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    });
+                }
+                body = Some(crate::sql::ast::RoutineBody::String(source));
+            } else if self.eat_ident("return")? {
+                if body.is_some() {
+                    return Err(self.unexpected("one routine body"));
+                }
+                let start = self.peek_at;
+                let _ = self.expression(0)?;
+                body = Some(crate::sql::ast::RoutineBody::Return(
+                    self.text[start..self.peek_at].trim(),
+                ));
+            } else if self.eat_ident("begin")? {
+                if body.is_some() {
+                    return Err(self.unexpected("one routine body"));
+                }
+                self.expect_ident("atomic")?;
+                let start = self.peek_at;
+                let end = loop {
+                    if self.peeked == Tok::Ident("end") {
+                        let end = self.peek_at;
+                        self.advance()?;
+                        break end;
+                    }
+                    if self.peeked == Tok::Eof {
+                        return Err(self.unexpected("END"));
+                    }
+                    let _ = self.statement()?;
+                    self.expect_op(";")?;
+                };
+                body = Some(crate::sql::ast::RoutineBody::Atomic(
+                    self.text[start..end]
+                        .trim_end_matches(|c: char| c.is_ascii_whitespace() || c == ';'),
+                ));
             } else if self.eat_ident("strict")? {
                 if strict_seen {
                     return Err(self.unexpected("one null-input clause"));
@@ -1804,21 +2028,198 @@ impl<'a> Parser<'a> {
                     self.expect_ident("unsafe")?;
                     crate::sql::ast::RoutineParallel::Unsafe
                 };
+            } else if self.eat_ident("security")? {
+                if security_seen {
+                    return Err(self.unexpected("one SECURITY clause"));
+                }
+                security_seen = true;
+                attributes.security_definer = if self.eat_ident("definer")? {
+                    true
+                } else {
+                    self.expect_ident("invoker")?;
+                    false
+                };
+            } else if self.eat_ident("external")? {
+                self.expect_ident("security")?;
+                if security_seen {
+                    return Err(self.unexpected("one SECURITY clause"));
+                }
+                security_seen = true;
+                attributes.security_definer = if self.eat_ident("definer")? {
+                    true
+                } else {
+                    self.expect_ident("invoker")?;
+                    false
+                };
+            } else if self.eat_ident("leakproof")? {
+                if leakproof_seen {
+                    return Err(self.unexpected("one LEAKPROOF clause"));
+                }
+                leakproof_seen = true;
+                attributes.leakproof = true;
+            } else if self.eat_ident("not")? {
+                self.expect_ident("leakproof")?;
+                if leakproof_seen {
+                    return Err(self.unexpected("one LEAKPROOF clause"));
+                }
+                leakproof_seen = true;
+                attributes.leakproof = false;
+            } else if self.eat_ident("cost")? {
+                if cost_seen {
+                    return Err(self.unexpected("one COST clause"));
+                }
+                cost_seen = true;
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.err_here("COST must be a positive number"));
+                };
+                attributes.cost = Some(
+                    raw.parse::<f64>()
+                        .ok()
+                        .and_then(crate::sql::ast::RoutineEstimate::new)
+                        .ok_or_else(|| self.err_here("COST must be a positive number"))?,
+                );
+                self.advance()?;
+            } else if self.eat_ident("rows")? {
+                if rows_seen {
+                    return Err(self.unexpected("one ROWS clause"));
+                }
+                rows_seen = true;
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.err_here("ROWS must be a positive number"));
+                };
+                attributes.rows = Some(
+                    raw.parse::<f64>()
+                        .ok()
+                        .and_then(crate::sql::ast::RoutineEstimate::new)
+                        .ok_or_else(|| self.err_here("ROWS must be a positive number"))?,
+                );
+                self.advance()?;
+            } else if self.eat_ident("window")? {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "user-defined window functions are not supported"),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            } else if self.eat_ident("transform")? {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "routine transforms are not supported"),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            } else if self.eat_ident("support")? {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "planner support functions are not supported"),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            } else if self.eat_ident("set")? {
+                let name_start = self.peek_at;
+                let _ = self.any_ident("configuration parameter")?;
+                while self.eat_op(".")? {
+                    let _ = self.any_ident("configuration parameter")?;
+                }
+                let config_name = self.text[name_start..self.peek_at].trim();
+                let value = if self.eat_ident("from")? {
+                    self.expect_ident("current")?;
+                    crate::sql::ast::RoutineConfigValue::Current
+                } else {
+                    if !self.eat_op("=")? {
+                        self.expect_ident("to")?;
+                    }
+                    let value_start = self.peek_at;
+                    loop {
+                        if matches!(self.peeked, Tok::Op("+") | Tok::Op("-")) {
+                            self.advance()?;
+                        }
+                        if !matches!(self.peeked, Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) {
+                            return Err(self.unexpected("configuration value"));
+                        }
+                        self.advance()?;
+                        if !self.eat_op(",")? {
+                            break;
+                        }
+                    }
+                    crate::sql::ast::RoutineConfigValue::Value(
+                        self.text[value_start..self.peek_at].trim(),
+                    )
+                };
+                if let Some(existing) = configs[..config_count]
+                    .iter_mut()
+                    .find(|config| config.name.eq_ignore_ascii_case(config_name))
+                {
+                    existing.value = value;
+                } else {
+                    if config_count == configs.len() {
+                        return Err(self.limit("routine configuration clauses", configs.len()));
+                    }
+                    configs[config_count] = crate::sql::ast::RoutineConfigClause {
+                        name: config_name,
+                        value,
+                    };
+                    config_count += 1;
+                }
             } else {
                 return Err(self.unexpected("routine option"));
             }
         }
         let language = language.ok_or_else(|| self.unexpected("LANGUAGE clause"))?;
-        if matches!(kind, RoutineCreateKind::Trigger)
-            != matches!(language, crate::sql::ast::RoutineLanguage::PlPgSql)
+        if body.is_some_and(|body| {
+            !matches!(body, crate::sql::ast::RoutineBody::String(_))
+                && language != crate::sql::ast::RoutineLanguage::Sql
+        }) {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "SQL-standard bodies require LANGUAGE SQL"),
+                sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+            });
+        }
+        if !function
+            && (strict_seen
+                || volatility_seen
+                || parallel_seen
+                || leakproof_seen
+                || cost_seen
+                || rows_seen)
         {
-            return Err(
-                self.unexpected(if matches!(kind, RoutineCreateKind::Trigger) {
-                    "trigger functions require LANGUAGE plpgsql"
-                } else {
-                    "only trigger functions support LANGUAGE plpgsql"
-                }),
-            );
+            return Err(self.unexpected("procedure option"));
+        }
+        if attributes.rows.is_some()
+            && !matches!(
+                kind,
+                RoutineCreateKind::Function {
+                    set_returning: true,
+                    ..
+                } | RoutineCreateKind::OutputFunction {
+                    set_returning: true,
+                    ..
+                } | RoutineCreateKind::TableFunction { .. }
+            )
+        {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    96,
+                    "ROWS is not applicable when function does not return a set"
+                ),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        if matches!(kind, RoutineCreateKind::Trigger)
+            && language != crate::sql::ast::RoutineLanguage::PlPgSql
+        {
+            return Err(self.unexpected("trigger functions require LANGUAGE plpgsql"));
+        }
+        if language == crate::sql::ast::RoutineLanguage::PlPgSql
+            && !matches!(
+                kind,
+                RoutineCreateKind::Trigger | RoutineCreateKind::Procedure
+            )
+        {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "PL/pgSQL function execution is not supported"),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
         }
         Ok(Stmt::CreateRoutine(CreateRoutine {
             name,
@@ -1827,7 +2228,8 @@ impl<'a> Parser<'a> {
             kind,
             language,
             attributes,
-            body: body.ok_or_else(|| self.unexpected("AS clause"))?,
+            configs: self.arena_slice(&configs[..config_count])?,
+            body: body.ok_or_else(|| self.unexpected("routine body"))?,
         }))
     }
 
@@ -3567,6 +3969,37 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::DropOwned { roles, cascade });
         }
+        if self.eat_ident("language")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = [""; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("languages", names.len()));
+                }
+                names[count] = self.col_ident("language name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropLanguage {
+                names: self.arena_slice(&names[..count])?,
+                if_exists,
+                cascade,
+            });
+        }
         if self.eat_ident("tablespace")? {
             let if_exists = if self.eat_ident("if")? {
                 self.expect_ident("exists")?;
@@ -4069,29 +4502,162 @@ impl<'a> Parser<'a> {
                 self.expect_op(",")?;
             }
         }
-        let action = if self.eat_ident("owner")? {
-            self.expect_ident("to")?;
-            AlterRoutineAction::SetOwner(self.any_ident("role name")?)
-        } else if self.eat_ident("rename")? {
-            self.expect_ident("to")?;
-            AlterRoutineAction::Rename(self.col_ident("routine name")?)
-        } else if self.eat_ident("set")? {
-            self.expect_ident("schema")?;
-            AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
-        } else if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
-            let enabled = !self.eat_ident("no")?;
-            self.expect_ident("depends")?;
-            self.expect_ident("on")?;
-            self.expect_ident("extension")?;
-            AlterRoutineAction::ExtensionDependency {
-                extension: self.col_ident("extension name")?,
-                enabled,
+        let mut actions = [AlterRoutineAction::SetStrict(false); 32];
+        let mut action_count = 0usize;
+        loop {
+            let action = if self.eat_ident("owner")? {
+                self.expect_ident("to")?;
+                AlterRoutineAction::SetOwner(self.any_ident("role name")?)
+            } else if self.eat_ident("rename")? {
+                self.expect_ident("to")?;
+                AlterRoutineAction::Rename(self.col_ident("routine name")?)
+            } else if self.eat_ident("set")? {
+                if self.eat_ident("schema")? {
+                    AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
+                } else {
+                    let name_start = self.peek_at;
+                    let _ = self.any_ident("configuration parameter")?;
+                    while self.eat_op(".")? {
+                        let _ = self.any_ident("configuration parameter")?;
+                    }
+                    let name = self.text[name_start..self.peek_at].trim();
+                    let value = if self.eat_ident("from")? {
+                        self.expect_ident("current")?;
+                        crate::sql::ast::RoutineConfigValue::Current
+                    } else {
+                        if !self.eat_op("=")? {
+                            self.expect_ident("to")?;
+                        }
+                        let start = self.peek_at;
+                        if matches!(self.peeked, Tok::Op("+") | Tok::Op("-")) {
+                            self.advance()?;
+                        }
+                        if !matches!(self.peeked, Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) {
+                            return Err(self.unexpected("configuration value"));
+                        }
+                        self.advance()?;
+                        while self.eat_op(",")? {
+                            if matches!(self.peeked, Tok::Op("+") | Tok::Op("-")) {
+                                self.advance()?;
+                            }
+                            if !matches!(self.peeked, Tok::Ident(_) | Tok::Num(_) | Tok::Str(_)) {
+                                return Err(self.unexpected("configuration value"));
+                            }
+                            self.advance()?;
+                        }
+                        crate::sql::ast::RoutineConfigValue::Value(
+                            self.text[start..self.peek_at].trim(),
+                        )
+                    };
+                    AlterRoutineAction::SetConfig { name, value }
+                }
+            } else if self.eat_ident("reset")? {
+                AlterRoutineAction::ResetConfig(if self.eat_ident("all")? {
+                    None
+                } else {
+                    Some(self.any_ident("configuration parameter")?)
+                })
+            } else if self.eat_ident("strict")? {
+                AlterRoutineAction::SetStrict(true)
+            } else if self.eat_ident("called")? {
+                self.expect_ident("on")?;
+                self.expect_ident("null")?;
+                self.expect_ident("input")?;
+                AlterRoutineAction::SetStrict(false)
+            } else if self.eat_ident("returns")? {
+                self.expect_ident("null")?;
+                self.expect_ident("on")?;
+                self.expect_ident("null")?;
+                self.expect_ident("input")?;
+                AlterRoutineAction::SetStrict(true)
+            } else if self.eat_ident("immutable")? {
+                AlterRoutineAction::SetVolatility(crate::sql::ast::RoutineVolatility::Immutable)
+            } else if self.eat_ident("stable")? {
+                AlterRoutineAction::SetVolatility(crate::sql::ast::RoutineVolatility::Stable)
+            } else if self.eat_ident("volatile")? {
+                AlterRoutineAction::SetVolatility(crate::sql::ast::RoutineVolatility::Volatile)
+            } else if self.eat_ident("leakproof")? {
+                AlterRoutineAction::SetLeakproof(true)
+            } else if self.eat_ident("not")? {
+                self.expect_ident("leakproof")?;
+                AlterRoutineAction::SetLeakproof(false)
+            } else if self.eat_ident("security")? {
+                AlterRoutineAction::SetSecurityDefiner(if self.eat_ident("definer")? {
+                    true
+                } else {
+                    self.expect_ident("invoker")?;
+                    false
+                })
+            } else if self.eat_ident("external")? {
+                self.expect_ident("security")?;
+                AlterRoutineAction::SetSecurityDefiner(if self.eat_ident("definer")? {
+                    true
+                } else {
+                    self.expect_ident("invoker")?;
+                    false
+                })
+            } else if self.eat_ident("parallel")? {
+                AlterRoutineAction::SetParallel(if self.eat_ident("safe")? {
+                    crate::sql::ast::RoutineParallel::Safe
+                } else if self.eat_ident("restricted")? {
+                    crate::sql::ast::RoutineParallel::Restricted
+                } else {
+                    self.expect_ident("unsafe")?;
+                    crate::sql::ast::RoutineParallel::Unsafe
+                })
+            } else if self.eat_ident("cost")? {
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.err_here("routine estimate must be a positive number"));
+                };
+                let value = raw
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(crate::sql::ast::RoutineEstimate::new)
+                    .ok_or_else(|| self.err_here("routine estimate must be a positive number"))?;
+                self.advance()?;
+                AlterRoutineAction::SetCost(value)
+            } else if self.eat_ident("rows")? {
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.err_here("routine estimate must be a positive number"));
+                };
+                let value = raw
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(crate::sql::ast::RoutineEstimate::new)
+                    .ok_or_else(|| self.err_here("routine estimate must be a positive number"))?;
+                self.advance()?;
+                AlterRoutineAction::SetRows(value)
+            } else if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
+                let enabled = !self.eat_ident("no")?;
+                self.expect_ident("depends")?;
+                self.expect_ident("on")?;
+                self.expect_ident("extension")?;
+                AlterRoutineAction::ExtensionDependency {
+                    extension: self.col_ident("extension name")?,
+                    enabled,
+                }
+            } else {
+                break;
+            };
+            if action_count == actions.len() {
+                return Err(self.limit("ALTER ROUTINE actions", actions.len()));
             }
-        } else {
-            return Err(
-                self.unexpected("expected OWNER, RENAME, SET SCHEMA, or [NO] DEPENDS ON EXTENSION")
-            );
-        };
+            actions[action_count] = action;
+            action_count += 1;
+            if matches!(
+                action,
+                AlterRoutineAction::SetOwner(_)
+                    | AlterRoutineAction::Rename(_)
+                    | AlterRoutineAction::SetSchema(_)
+                    | AlterRoutineAction::ExtensionDependency { .. }
+            ) {
+                break;
+            }
+        }
+        let _ = self.eat_ident("restrict")?;
+        if action_count == 0 {
+            return Err(self.unexpected("routine alteration action"));
+        }
         Ok(Stmt::AlterRoutine {
             kind,
             routine: RoutineIdentity {
@@ -4099,7 +4665,7 @@ impl<'a> Parser<'a> {
                 argument_types: self.arena_slice(&argument_types[..count])?,
                 signature_is_explicit,
             },
-            action,
+            actions: self.arena_slice(&actions[..action_count])?,
         })
     }
 

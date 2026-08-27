@@ -1278,6 +1278,8 @@ fn external_lateral_function_run<'a, C: ColumnLookup<'a>>(
         .alloc(Expr::Call {
             name: tref.table,
             args: tref.func_args.expect("table function"),
+            argument_names: tref.func_argument_names,
+            variadic: tref.func_variadic,
             star: false,
             distinct: false,
             order_by: &[],

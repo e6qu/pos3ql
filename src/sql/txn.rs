@@ -56,6 +56,7 @@ pub struct Savepoint {
 /// has no name and does not consume the savepoint pool.
 #[derive(Clone, Copy)]
 pub(crate) struct StatementMark {
+    txid: u32,
     pub touched: usize,
     pub truncates: usize,
     pub ddl: usize,
@@ -595,6 +596,10 @@ impl TxnState {
 
     pub fn is_explicit(&self) -> bool {
         self.mode == TxnMode::Explicit
+    }
+
+    pub(crate) fn has_savepoints(&self) -> bool {
+        !self.savepoints.is_empty()
     }
 
     /// The ReadyForQuery status byte: idle / in transaction / failed.
@@ -1370,6 +1375,7 @@ impl TxnState {
 
     pub(crate) fn statement_mark(&self, wal: usize, lock: u64) -> StatementMark {
         StatementMark {
+            txid: self.txid,
             touched: self.touched.len(),
             truncates: self.truncates.len(),
             ddl: self.ddl.len(),
@@ -1388,6 +1394,10 @@ impl TxnState {
             deferred_trigger_completions: self.completed_deferred_triggers.len(),
             deferred_trigger_bytes: self.deferred_trigger_bytes.mark(),
         }
+    }
+
+    pub(crate) fn owns_statement_mark(&self, mark: StatementMark) -> bool {
+        self.txid == mark.txid
     }
 
     /// Index of the most recent savepoint with this name.

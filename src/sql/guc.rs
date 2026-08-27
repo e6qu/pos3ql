@@ -81,13 +81,19 @@ pub fn set_active_config(
         // clears it on every exit. GucState mutation is behind RefCell.
         let guc = unsafe { &*pointer };
         let result = guc.set_config(name, value, local)?;
-        let render = guc.render();
-        ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(render));
-        if name.eq_ignore_ascii_case("timezone") {
-            crate::sql::timezone::set_session(guc.timezone());
-        }
+        publish_active_setting(guc, name);
         Ok(result)
     })
+}
+
+pub(crate) fn publish_active_setting(guc: &GucState, name: &str) {
+    if let Some(value) = guc.get_owned(name) {
+        crate::sql::eval::funcs::system::update_session_setting(name, value);
+    }
+    ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(guc.render()));
+    if name.eq_ignore_ascii_case("timezone") {
+        crate::sql::timezone::set_session(guc.timezone());
+    }
 }
 
 /// The `client_min_messages` severity threshold, ordered as PostgreSQL orders
@@ -322,6 +328,64 @@ pub struct GucState {
     seq_session: SeqSession,
 }
 
+pub(crate) struct RoutineConfigScope {
+    guc: *const GucState,
+    prior: GucValues,
+    session: GucValues,
+    names: [crate::storage::SqlName; crate::storage::MAX_ROUTINE_CONFIGS],
+    count: usize,
+}
+
+impl Drop for RoutineConfigScope {
+    fn drop(&mut self) {
+        // SAFETY: routine scopes are created only beneath the statement's
+        // EvalScope and are dropped before that scope releases the GucState.
+        let guc = unsafe { &*self.guc };
+        let mut state = guc.store.borrow_mut();
+        let changed = state.transaction.session;
+        let mut restored = self.prior;
+        merge_session_changes(&mut restored, &self.session, &changed);
+        state.current = restored;
+        drop(state);
+        for name in &self.names[..self.count] {
+            if let Some(value) = guc.get_owned(name.as_str()) {
+                crate::sql::eval::funcs::system::update_session_setting(name.as_str(), value);
+            }
+        }
+        ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(guc.render()));
+        crate::sql::timezone::set_session(guc.timezone());
+    }
+}
+
+fn merge_session_changes(target: &mut GucValues, before: &GucValues, after: &GucValues) {
+    macro_rules! changed {
+        ($field:ident) => {
+            if before.$field != after.$field {
+                target.$field = after.$field;
+            }
+        };
+    }
+    changed!(current_role);
+    changed!(session_authorization);
+    changed!(datestyle);
+    changed!(intervalstyle);
+    if before.timezone != after.timezone {
+        target.timezone = after.timezone;
+        target.parsed_timezone = after.parsed_timezone;
+    }
+    changed!(client_encoding);
+    changed!(application_name);
+    changed!(search_path);
+    changed!(default_tablespace);
+    changed!(client_min_messages);
+    changed!(extra_float_digits);
+    changed!(lock_timeout);
+    changed!(statement_timeout);
+    changed!(row_security);
+    changed!(bytea_escape);
+    changed!(check_function_bodies);
+}
+
 impl Default for GucState {
     fn default() -> Self {
         Self::new()
@@ -541,6 +605,91 @@ impl GucState {
             )
         })
     }
+
+    pub(crate) fn canonical_routine_setting(
+        &self,
+        name: &str,
+        raw: &str,
+    ) -> Result<StackStr<256>, SqlError> {
+        let prior = {
+            let mut state = self.store.borrow_mut();
+            let prior = state.current;
+            let mut values = state.current;
+            change_setting(&mut values, &state.defaults, name, raw)?;
+            state.current = values;
+            prior
+        };
+        let value = self.get_owned(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "unrecognized configuration parameter \"{}\"",
+                name
+            )
+        });
+        self.store.borrow_mut().current = prior;
+        value
+    }
+
+    pub(crate) fn enter_routine_configs(
+        &self,
+        configs: &[crate::storage::RoutineConfig],
+    ) -> Result<RoutineConfigScope, SqlError> {
+        let mut state = self.store.borrow_mut();
+        let prior = state.current;
+        let session = state.transaction.session;
+        let mut current = state.current;
+        for config in configs {
+            change_setting(
+                &mut current,
+                &state.defaults,
+                config.name.as_str(),
+                config.value.as_str(),
+            )?;
+        }
+        state.current = current;
+        drop(state);
+        for config in configs {
+            if let Some(value) = self.get_owned(config.name.as_str()) {
+                crate::sql::eval::funcs::system::update_session_setting(
+                    config.name.as_str(),
+                    value,
+                );
+            }
+        }
+        ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(self.render()));
+        crate::sql::timezone::set_session(self.timezone());
+        Ok(RoutineConfigScope {
+            guc: self as *const GucState,
+            prior,
+            session,
+            names: {
+                let mut names =
+                    [crate::storage::SqlName::EMPTY; crate::storage::MAX_ROUTINE_CONFIGS];
+                for (index, config) in configs.iter().enumerate() {
+                    names[index] = config.name;
+                }
+                names
+            },
+            count: configs.len(),
+        })
+    }
+}
+
+pub(crate) fn enter_active_routine_configs(
+    configs: &[crate::storage::RoutineConfig],
+) -> Result<RoutineConfigScope, SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "routine configuration is unavailable outside statement execution"
+            ));
+        }
+        // SAFETY: EvalScope owns this dynamic extent and every returned scope
+        // is consumed before evaluation returns.
+        unsafe { &*pointer }.enter_routine_configs(configs)
+    })
 }
 
 fn change_setting(

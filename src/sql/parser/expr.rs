@@ -134,6 +134,8 @@ impl<'a> Parser<'a> {
                 left = self.arena_expr(Expr::Call {
                     name: "timezone",
                     args: self.arena_slice(&[zone, left])?,
+                    argument_names: &[],
+                    variadic: false,
                     star: false,
                     distinct: false,
                     order_by: &[],
@@ -316,6 +318,8 @@ impl<'a> Parser<'a> {
                     let call = self.arena_expr(Expr::Call {
                         name: crate::sql::parser::SIMILAR_TO,
                         args,
+                        argument_names: &[],
+                        variadic: false,
                         star: false,
                         distinct: false,
                         order_by: &[],
@@ -631,6 +635,8 @@ impl<'a> Parser<'a> {
                 self.arena_expr(Expr::Call {
                     name: "extract",
                     args: self.arena_slice(&[field_lit, source])?,
+                    argument_names: &[],
+                    variadic: false,
                     star: false,
                     distinct: false,
                     filter: None,
@@ -890,6 +896,8 @@ impl<'a> Parser<'a> {
                     return self.arena_expr(Expr::Call {
                         name,
                         args,
+                        argument_names: &[],
+                        variadic: false,
                         star: false,
                         distinct: false,
                         order_by: &[],
@@ -991,6 +999,8 @@ impl<'a> Parser<'a> {
         self.arena_expr(Expr::Call {
             name,
             args,
+            argument_names: &[],
+            variadic: false,
             star: false,
             distinct: false,
             order_by: &[],
@@ -1180,6 +1190,8 @@ impl<'a> Parser<'a> {
             return self.arena_expr(Expr::Call {
                 name,
                 args: &[],
+                argument_names: &[],
+                variadic: false,
                 star: true,
                 distinct: false,
                 order_by: &[],
@@ -1189,13 +1201,51 @@ impl<'a> Parser<'a> {
         }
         let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
         let mut args: [&'a Expr<'a>; MAX_LIST] = [null_expr; MAX_LIST];
+        let mut argument_names = [None; MAX_LIST];
         let mut n = 0;
+        let mut saw_named = false;
+        let mut variadic = false;
         if self.peeked != Tok::Op(")") {
             loop {
                 if n == MAX_LIST {
                     return Err(self.limit("function arguments", MAX_LIST));
                 }
-                args[n] = self.expression(0)?;
+                let this_variadic = self.eat_ident("variadic")?;
+                if this_variadic && (n != 0 && saw_named) {
+                    return Err(self.err_here("VARIADIC argument cannot use named notation"));
+                }
+                let first = self.expression(0)?;
+                if self.eat_op("=>")? {
+                    let argument_name = match first {
+                        Expr::Column {
+                            qualifier: None,
+                            name,
+                        } => *name,
+                        _ => {
+                            return Err(
+                                self.err_here("routine argument name must be an identifier")
+                            );
+                        }
+                    };
+                    argument_names[n] = Some(argument_name);
+                    args[n] = self.expression(0)?;
+                    saw_named = true;
+                } else {
+                    if saw_named {
+                        return Err(
+                            self.err_here("positional argument cannot follow named argument")
+                        );
+                    }
+                    args[n] = first;
+                }
+                if this_variadic {
+                    variadic = true;
+                    n += 1;
+                    if self.peeked != Tok::Op(")") {
+                        return Err(self.err_here("VARIADIC argument must be last"));
+                    }
+                    break;
+                }
                 n += 1;
                 if !self.eat_op(",")? {
                     break;
@@ -1229,9 +1279,16 @@ impl<'a> Parser<'a> {
         let filter = self.parse_filter()?;
         let over = self.parse_over()?;
         let args = self.arena_slice(&args[..n])?;
+        let argument_names = if saw_named {
+            self.arena_slice(&argument_names[..n])?
+        } else {
+            &[]
+        };
         self.arena_expr(Expr::Call {
             name,
             args,
+            argument_names,
+            variadic,
             star: false,
             distinct,
             order_by,

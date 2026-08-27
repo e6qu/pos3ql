@@ -113,7 +113,7 @@ fn is_base_prefixed(text: &str) -> bool {
 /// `None` covers it.
 ///
 /// Provenance: `SELECT word, catcode FROM pg_get_keywords()` on PostgreSQL
-/// 18.4 (Homebrew).
+/// 18.6.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Keyword {
     /// `unreserved (cannot be function or type name)` — legal as a column or
@@ -177,6 +177,15 @@ pub(crate) fn is_column_name_keyword(word: &str) -> bool {
 /// expressions, so an expression position must let them through.
 pub(crate) fn is_reserved_keyword(word: &str) -> bool {
     matches!(keyword_category(word), Some(Keyword::Reserved))
+}
+
+/// Whether PostgreSQL rejects `word` in its `type_function_name` production,
+/// which routine parameter names use.
+pub(crate) fn is_type_function_name_keyword(word: &str) -> bool {
+    matches!(
+        keyword_category(word),
+        Some(Keyword::ColumnName | Keyword::Reserved)
+    )
 }
 
 /// Whether an identifier must be quoted to survive a round trip, mirroring
@@ -331,6 +340,23 @@ pub(crate) fn parse_type_name<'a>(
         return Err(to_sql("trailing tokens after type name"));
     }
     Ok(parsed)
+}
+
+pub(crate) fn parse_expression<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    let expression = parser
+        .expression(0)
+        .map_err(|error| super::parse_error_to_sql(&error))?;
+    if parser.peeked != Tok::Eof {
+        return Err(crate::sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "trailing tokens after routine parameter default"
+        ));
+    }
+    Ok(expression)
 }
 
 impl<'a> Parser<'a> {
@@ -829,6 +855,7 @@ impl<'a> Parser<'a> {
             Tok::Ident("delete") => self.delete(),
             Tok::Ident("merge") => self.merge(),
             Tok::Ident("call") => self.call_procedure(),
+            Tok::Ident("do") => self.do_block(),
             Tok::Ident("comment") => self.comment(),
             Tok::Ident("truncate") => self.truncate(),
             Tok::Ident("lock") => self.lock_table(),
@@ -1109,18 +1136,84 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn do_block(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("do")?;
+        let mut language = None;
+        if self.eat_ident("language")? {
+            language = Some(self.any_ident("procedural language")?);
+        }
+        let body = self.str_literal("anonymous code block")?;
+        if self.eat_ident("language")? {
+            if language.is_some() {
+                return Err(self.unexpected("one LANGUAGE clause"));
+            }
+            language = Some(self.any_ident("procedural language")?);
+        }
+        let language = language.unwrap_or("plpgsql");
+        if !language.eq_ignore_ascii_case("plpgsql") {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    96,
+                    "language \"{}\" does not support inline code execution",
+                    language
+                ),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
+        Ok(Stmt::Do { body })
+    }
+
     fn call_procedure(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.advance()?;
         let name = self.qual_name("procedure name")?;
         self.expect_op("(")?;
         let mut arguments = [&Expr::Null; MAX_LIST];
+        let mut argument_names = [None; MAX_LIST];
         let mut count = 0;
+        let mut saw_named = false;
+        let mut variadic = false;
         if !self.eat_op(")")? {
             loop {
                 if count == arguments.len() {
                     return Err(self.limit("procedure arguments", arguments.len()));
                 }
-                arguments[count] = self.expression(0)?;
+                let this_variadic = self.eat_ident("variadic")?;
+                if this_variadic && saw_named {
+                    return Err(self.err_here("VARIADIC argument cannot use named notation"));
+                }
+                let first = self.expression(0)?;
+                if self.eat_op("=>")? {
+                    argument_names[count] = Some(match first {
+                        Expr::Column {
+                            qualifier: None,
+                            name,
+                        } => *name,
+                        _ => {
+                            return Err(
+                                self.err_here("procedure argument name must be an identifier")
+                            );
+                        }
+                    });
+                    arguments[count] = self.expression(0)?;
+                    saw_named = true;
+                } else {
+                    if saw_named {
+                        return Err(
+                            self.err_here("positional argument cannot follow named argument")
+                        );
+                    }
+                    arguments[count] = first;
+                }
+                if this_variadic {
+                    variadic = true;
+                    count += 1;
+                    if self.peeked != Tok::Op(")") {
+                        return Err(self.err_here("VARIADIC argument must be last"));
+                    }
+                    self.advance()?;
+                    break;
+                }
                 count += 1;
                 if self.eat_op(")")? {
                     break;
@@ -1131,6 +1224,12 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Call {
             name,
             arguments: self.arena_slice(&arguments[..count])?,
+            argument_names: if saw_named {
+                self.arena_slice(&argument_names[..count])?
+            } else {
+                &[]
+            },
+            variadic,
         })
     }
 
@@ -2049,6 +2148,8 @@ impl<'a> Parser<'a> {
                 alias: None,
                 subquery: None,
                 func_args: None,
+                func_argument_names: &[],
+                func_variadic: false,
                 rows_from: None,
                 col_alias: None,
                 inheritance,
@@ -2135,6 +2236,8 @@ impl<'a> Parser<'a> {
                     alias: None,
                     subquery: None,
                     func_args: None,
+                    func_argument_names: &[],
+                    func_variadic: false,
                     rows_from: None,
                     col_alias: None,
                     inheritance: RelationInheritance::Descendants,
@@ -2191,6 +2294,8 @@ impl<'a> Parser<'a> {
                     alias,
                     subquery: None,
                     func_args: None,
+                    func_argument_names: &[],
+                    func_variadic: false,
                     rows_from: Some(self.arena_slice(&functions[..count])?),
                     col_alias,
                     inheritance: RelationInheritance::Descendants,
@@ -2232,6 +2337,8 @@ impl<'a> Parser<'a> {
                 alias: Some(word),
                 subquery: Some(boxed),
                 func_args: None,
+                func_argument_names: &[],
+                func_variadic: false,
                 rows_from: None,
                 col_alias,
                 inheritance: RelationInheritance::Descendants,
@@ -2257,16 +2364,54 @@ impl<'a> Parser<'a> {
         }
         // Table function: `func(args) [WITH ORDINALITY] [AS] alias`. Only valid
         // immediately after the (possibly schema-qualified) name.
+        let mut func_argument_names: &'a [Option<&'a str>] = &[];
+        let mut func_variadic = false;
         let func_args = if self.peeked == Tok::Op("(") {
             self.advance()?;
             let mut args: [&'a Expr<'a>; MAX_LIST] = [self.arena_expr(Expr::Null)?; MAX_LIST];
+            let mut names = [None; MAX_LIST];
             let mut n = 0;
+            let mut saw_named = false;
             if self.peeked != Tok::Op(")") {
                 loop {
                     if n == MAX_LIST {
                         return Err(self.limit("function arguments", MAX_LIST));
                     }
-                    args[n] = self.expression(0)?;
+                    let this_variadic = self.eat_ident("variadic")?;
+                    if this_variadic && saw_named {
+                        return Err(self.err_here("VARIADIC argument cannot use named notation"));
+                    }
+                    let first = self.expression(0)?;
+                    if self.eat_op("=>")? {
+                        names[n] = Some(match first {
+                            Expr::Column {
+                                qualifier: None,
+                                name,
+                            } => *name,
+                            _ => {
+                                return Err(
+                                    self.err_here("routine argument name must be an identifier")
+                                );
+                            }
+                        });
+                        args[n] = self.expression(0)?;
+                        saw_named = true;
+                    } else {
+                        if saw_named {
+                            return Err(
+                                self.err_here("positional argument cannot follow named argument")
+                            );
+                        }
+                        args[n] = first;
+                    }
+                    if this_variadic {
+                        func_variadic = true;
+                        n += 1;
+                        if self.peeked != Tok::Op(")") {
+                            return Err(self.err_here("VARIADIC argument must be last"));
+                        }
+                        break;
+                    }
                     n += 1;
                     if !self.eat_op(",")? {
                         break;
@@ -2274,6 +2419,9 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect_op(")")?;
+            if saw_named {
+                func_argument_names = self.arena_slice(&names[..n])?;
+            }
             Some(self.arena_slice(&args[..n])?)
         } else {
             None
@@ -2315,6 +2463,8 @@ impl<'a> Parser<'a> {
             alias,
             subquery: None,
             func_args,
+            func_argument_names,
+            func_variadic,
             rows_from: None,
             col_alias,
             inheritance,
@@ -2415,6 +2565,8 @@ impl<'a> Parser<'a> {
                 alias: None,
                 subquery: None,
                 func_args: None,
+                func_argument_names: &[],
+                func_variadic: false,
                 rows_from: None,
                 col_alias: None,
                 inheritance: RelationInheritance::Descendants,
@@ -3733,6 +3885,18 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("extension")? {
             return self.alter_extension();
+        }
+        if self.eat_ident("language")? {
+            let name = self.col_ident("language name")?;
+            let action = if self.eat_ident("rename")? {
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterLanguageAction::Rename(self.col_ident("new language name")?)
+            } else {
+                self.expect_ident("owner")?;
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterLanguageAction::SetOwner(self.any_ident("role name")?)
+            };
+            return Ok(Stmt::AlterLanguage { name, action });
         }
         if self.eat_ident("aggregate")? {
             return self.alter_aggregate();
@@ -5328,6 +5492,19 @@ impl<'a> Parser<'a> {
         self.any_ident(what)
     }
 
+    fn type_function_ident(&mut self, what: &str) -> Result<&'a str, ParseError> {
+        if let Tok::Ident(word) = self.peeked
+            && is_type_function_name_keyword(word)
+        {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "syntax error at or near \"{}\"", word),
+                sqlstate: sqlstate::SYNTAX_ERROR,
+            });
+        }
+        self.any_ident(what)
+    }
+
     /// Records a warning for the engine to emit before this statement runs.
     /// Overflowing the fixed buffer drops the extra warnings rather than
     /// failing the statement — PostgreSQL still executes it too.
@@ -6595,6 +6772,29 @@ mod tests {
             "ALTER TABLE t ADD CONSTRAINT positive CHECK (id > 0) NOT VALID",
             |parser| assert!(parser.next_stmt().unwrap().is_some()),
         );
+    }
+
+    #[test]
+    fn routine_parameter_names_obey_postgresql_column_identifier_grammar() {
+        for sql in [
+            "CREATE FUNCTION f(values integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE PROCEDURE p(VARIADIC values integer[]) LANGUAGE SQL AS 'SELECT 1'",
+            "ALTER FUNCTION f(values integer) RENAME TO g",
+            "DROP PROCEDURE p(values integer)",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().is_err(), "accepted {sql}")
+            });
+        }
+        for sql in [
+            "CREATE FUNCTION f(\"values\" integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f(begin integer, set text) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+            "CREATE FUNCTION f(left integer) RETURNS integer LANGUAGE SQL AS 'SELECT 1'",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().unwrap().is_some(), "rejected {sql}")
+            });
+        }
     }
 
     #[test]

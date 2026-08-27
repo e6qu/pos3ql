@@ -296,6 +296,23 @@ pub enum Stmt<'a> {
     Call {
         name: QualName<'a>,
         arguments: &'a [&'a Expr<'a>],
+        argument_names: &'a [Option<&'a str>],
+        variadic: bool,
+    },
+    /// An anonymous PL/pgSQL block. Unsupported languages are rejected before
+    /// this node is constructed.
+    Do {
+        body: &'a str,
+    },
+    CreateLanguage(CreateLanguage<'a>),
+    AlterLanguage {
+        name: &'a str,
+        action: AlterLanguageAction<'a>,
+    },
+    DropLanguage {
+        names: &'a [&'a str],
+        if_exists: bool,
+        cascade: bool,
     },
     DropFunction {
         functions: &'a [RoutineIdentity<'a>],
@@ -323,7 +340,7 @@ pub enum Stmt<'a> {
     AlterRoutine {
         kind: RoutineTargetKind,
         routine: RoutineIdentity<'a>,
-        action: AlterRoutineAction<'a>,
+        actions: &'a [AlterRoutineAction<'a>],
     },
     AlterAggregate {
         aggregate: AggregateIdentity<'a>,
@@ -1813,6 +1830,11 @@ pub struct TableRef<'a> {
     /// Table function: `FROM func(args) alias`. When set, `table` is the
     /// function name and these are its argument expressions.
     pub func_args: Option<&'a [&'a Expr<'a>]>,
+    /// Empty for positional function sources; otherwise parallel to
+    /// `func_args`. The parser constructs both together.
+    pub func_argument_names: &'a [Option<&'a str>],
+    /// The last function-source argument is an already-packed array.
+    pub func_variadic: bool,
     /// `ROWS FROM (f(...), g(...))`: each entry is a function-only table
     /// reference. The outer source owns the shared alias and ordinality, so a
     /// parsed table source is either one function or one non-empty function
@@ -2204,8 +2226,47 @@ pub struct CreateDomain<'a> {
     pub checks: &'a [DomainCheck<'a>],
 }
 
+/// An input-capable routine parameter either requires a call argument or owns
+/// a parsed default. Keeping `VARIADIC` separate prevents an INOUT/OUT
+/// parameter from accidentally acquiring variadic call semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineArgumentMode<'a> {
+    In { default_text: Option<&'a str> },
+    Out,
+    InOut { default_text: Option<&'a str> },
+    Variadic { default_text: Option<&'a str> },
+}
+
+impl<'a> RoutineArgumentMode<'a> {
+    pub const fn is_input(self) -> bool {
+        !matches!(self, Self::Out)
+    }
+
+    pub const fn is_output(self) -> bool {
+        matches!(self, Self::Out | Self::InOut { .. })
+    }
+
+    pub const fn default_text(self) -> Option<&'a str> {
+        match self {
+            Self::In { default_text }
+            | Self::InOut { default_text }
+            | Self::Variadic { default_text } => default_text,
+            Self::Out => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutineArgument<'a> {
+    pub mode: RoutineArgumentMode<'a>,
+    /// PostgreSQL permits unnamed input and output parameters. Absence is a
+    /// distinct state rather than an empty identifier accepted by accident.
+    pub name: Option<&'a str>,
+    pub type_name: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutineResultColumn<'a> {
     pub name: &'a str,
     pub type_name: &'a str,
 }
@@ -2307,7 +2368,44 @@ pub struct CreateRoutine<'a> {
     pub kind: RoutineCreateKind<'a>,
     pub language: RoutineLanguage,
     pub attributes: RoutineAttributes,
-    pub body: &'a str,
+    pub configs: &'a [RoutineConfigClause<'a>],
+    pub body: RoutineBody<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutineConfigClause<'a> {
+    pub name: &'a str,
+    pub value: RoutineConfigValue<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineConfigValue<'a> {
+    Value(&'a str),
+    Current,
+}
+
+/// The three PostgreSQL SQL-routine body forms have different binding and
+/// catalog semantics, so the body spelling cannot safely stand in for its
+/// form. `Return` stores the expression text; `Atomic` stores the statements
+/// between BEGIN ATOMIC and END.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineBody<'a> {
+    String(&'a str),
+    Return(&'a str),
+    Atomic(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutineEstimate(u64);
+
+impl RoutineEstimate {
+    pub fn new(value: f64) -> Option<Self> {
+        (value.is_finite() && value > 0.0).then_some(Self(value.to_bits()))
+    }
+
+    pub fn get(self) -> f64 {
+        f64::from_bits(self.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2315,6 +2413,10 @@ pub struct RoutineAttributes {
     pub strict: bool,
     pub volatility: RoutineVolatility,
     pub parallel: RoutineParallel,
+    pub security_definer: bool,
+    pub leakproof: bool,
+    pub cost: Option<RoutineEstimate>,
+    pub rows: Option<RoutineEstimate>,
 }
 
 impl Default for RoutineAttributes {
@@ -2323,6 +2425,10 @@ impl Default for RoutineAttributes {
             strict: false,
             volatility: RoutineVolatility::Volatile,
             parallel: RoutineParallel::Unsafe,
+            security_definer: false,
+            leakproof: false,
+            cost: None,
+            rows: None,
         }
     }
 }
@@ -2343,13 +2449,36 @@ pub enum RoutineLanguage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateLanguage<'a> {
+    pub name: &'a str,
+    pub or_replace: bool,
+    pub trusted: bool,
+    pub handler: Option<QualName<'a>>,
+    pub inline: Option<QualName<'a>>,
+    pub validator: Option<QualName<'a>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterLanguageAction<'a> {
+    Rename(&'a str),
+    SetOwner(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutineCreateKind<'a> {
     Function {
         result_type: &'a str,
         set_returning: bool,
     },
+    /// OUT/INOUT parameters define the result contract. An optional RETURNS
+    /// clause is retained only so execution can resolve and prove that it
+    /// agrees with the implied scalar/record type.
+    OutputFunction {
+        declared_result_type: Option<&'a str>,
+        set_returning: bool,
+    },
     TableFunction {
-        columns: &'a [RoutineArgument<'a>],
+        columns: &'a [RoutineResultColumn<'a>],
     },
     Trigger,
     Procedure,
@@ -2360,7 +2489,22 @@ pub enum AlterRoutineAction<'a> {
     SetOwner(&'a str),
     Rename(&'a str),
     SetSchema(&'a str),
-    ExtensionDependency { extension: &'a str, enabled: bool },
+    ExtensionDependency {
+        extension: &'a str,
+        enabled: bool,
+    },
+    SetStrict(bool),
+    SetVolatility(RoutineVolatility),
+    SetLeakproof(bool),
+    SetSecurityDefiner(bool),
+    SetParallel(RoutineParallel),
+    SetCost(RoutineEstimate),
+    SetRows(RoutineEstimate),
+    SetConfig {
+        name: &'a str,
+        value: RoutineConfigValue<'a>,
+    },
+    ResetConfig(Option<&'a str>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3169,6 +3313,12 @@ pub enum Expr<'a> {
     Call {
         name: &'a str,
         args: &'a [&'a Expr<'a>],
+        /// Empty for positional calls; otherwise parallel to `args` and
+        /// populated only for named notation parsed after positional inputs.
+        argument_names: &'a [Option<&'a str>],
+        /// The final argument was introduced by the `VARIADIC` keyword and is
+        /// already the declared array, rather than an element to pack.
+        variadic: bool,
         star: bool,
         distinct: bool,
         order_by: &'a [OrderBy<'a>],
@@ -3809,10 +3959,7 @@ impl Expr<'_> {
     /// Subqueries own their bindings and are visited by their enclosing query.
     pub fn for_each_column_reference(&self, f: &mut dyn FnMut(Option<&str>, &str)) {
         match self {
-            Expr::Column { qualifier, name }
-            | Expr::RoutineParam {
-                qualifier, name, ..
-            } => f(*qualifier, name),
+            Expr::Column { qualifier, name } => f(*qualifier, name),
             Expr::Null
             | Expr::Bool(_)
             | Expr::Int(_)
@@ -3824,6 +3971,7 @@ impl Expr<'_> {
             | Expr::SchemaColumn { .. }
             | Expr::RecursiveState { .. }
             | Expr::Param(_)
+            | Expr::RoutineParam { .. }
             | Expr::DefaultMarker
             | Expr::Subquery(_)
             | Expr::InSubquery { .. }

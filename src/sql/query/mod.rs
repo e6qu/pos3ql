@@ -62,7 +62,9 @@ pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
     rewrite_view_dml,
 };
-pub(crate) use cte::{expand_set_tree, expand_stored_query, expand_stored_query_exec};
+pub(crate) use cte::{
+    expand_set_tree, expand_stored_query, expand_stored_query_exec, expand_stored_statement_exec,
+};
 
 pub fn stored_query_dependencies(
     sql: &str,
@@ -72,6 +74,16 @@ pub fn stored_query_dependencies(
     arena: &Arena,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
     dependencies::collect(sql, storage, txid, path, arena)
+}
+
+pub(crate) fn stored_routine_dependencies(
+    program: &RoutineFunctionProgram<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    arena: &Arena,
+) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
+    dependencies::collect_routine_program(program, storage, txid, path, arena)
 }
 
 pub(crate) struct StoredQueryCompositeFieldRename<'a> {
@@ -732,6 +744,31 @@ pub(crate) fn parse_routine_function_program<'a>(
     Ok(RoutineFunctionProgram { preceding, result })
 }
 
+pub(crate) fn parse_stored_routine_function_program<'a>(
+    body_kind: crate::storage::RoutineBodyKind,
+    body: &'a str,
+    arena: &'a Arena,
+    returns_void: bool,
+    routine_name: &'a str,
+    parameters: &[crate::storage::RoutineArgumentDef],
+) -> Result<RoutineFunctionProgram<'a>, SqlError> {
+    let executable = if body_kind == crate::storage::RoutineBodyKind::Return {
+        use core::fmt::Write;
+        let mut query = crate::util::StackStr::<{ crate::storage::ROUTINE_SQL_MAX + 8 }>::new();
+        write!(query, "SELECT {body}").map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "routine definition exceeds {} bytes",
+                crate::storage::ROUTINE_SQL_MAX
+            )
+        })?;
+        arena.alloc_str(query.as_str()).map_err(|_| arena_full())?
+    } else {
+        body
+    };
+    parse_routine_function_program(executable, arena, returns_void, routine_name, parameters)
+}
+
 fn routine_statement_forbidden(statement: &Stmt<'_>) -> Option<&'static str> {
     Some(match statement {
         Stmt::Begin(_) => "BEGIN",
@@ -799,9 +836,138 @@ pub(crate) fn execute_routine_query<'a>(
     recycling: bool,
     emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    execute_routine_query_under(query, storage, txid, arena, params, recycling, None, emit)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored routine execution carries its durable identity and result sink"
+)]
+pub(crate) fn execute_bound_routine_query<'a>(
+    query: &RoutineQuery<'a>,
+    storage: &'a Storage,
+    routine_slot: usize,
+    routine: crate::storage::RoutineDef,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    recycling: bool,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if routine.body_kind == crate::storage::RoutineBodyKind::String {
+        return execute_routine_query(query, storage, txid, arena, params, recycling, emit);
+    }
+    let user = super::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid);
+    execute_routine_query_under(
+        query,
+        storage,
+        txid,
+        arena,
+        params,
+        recycling,
+        Some((path, storage.routine_dependencies_for(routine_slot, txid))),
+        emit,
+    )
+}
+
+pub(crate) fn bind_stored_routine_statement<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    routine_slot: usize,
+    routine: crate::storage::RoutineDef,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<&'a Stmt<'a>, SqlError> {
+    if routine.body_kind == crate::storage::RoutineBodyKind::String {
+        return Ok(statement);
+    }
+    let user = super::eval::funcs::system::session_user_owned();
+    let path = storage.compute_path(routine.creation_path.as_str(), user.as_str(), txid);
+    let dependencies = storage.routine_dependencies_for(routine_slot, txid);
+    let rebound = match statement {
+        Stmt::Select(select) => Stmt::Select(*expand_stored_query_exec(
+            select,
+            storage,
+            txid,
+            path,
+            dependencies,
+            arena,
+            params,
+            None,
+        )?),
+        Stmt::SetQuery(query) => {
+            let body = cte::expand_stored_set_tree_exec(
+                query.with,
+                query.body,
+                storage,
+                txid,
+                cte::StoredExecutionContext::new(path, dependencies, params, None),
+                arena,
+            )?;
+            Stmt::SetQuery(SetQuery {
+                with: &[],
+                body,
+                ..*query
+            })
+        }
+        Stmt::Insert(_)
+        | Stmt::Update(_)
+        | Stmt::Delete(_)
+        | Stmt::Merge(_)
+        | Stmt::With { .. } => {
+            return expand_stored_statement_exec(
+                statement,
+                storage,
+                txid,
+                path,
+                dependencies,
+                arena,
+                params,
+                None,
+            );
+        }
+        _ => return Ok(statement),
+    };
+    arena
+        .alloc(rebound)
+        .map(|statement| &*statement)
+        .map_err(|_| arena_full())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "routine query execution carries its optional creation-time binding"
+)]
+fn execute_routine_query_under<'a>(
+    query: &RoutineQuery<'a>,
+    storage: &'a Storage,
+    txid: u32,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    recycling: bool,
+    stored: Option<(
+        crate::storage::PathContext,
+        &'a crate::storage::StoredQueryDependencies,
+    )>,
+    emit: &mut dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
     match query {
         RoutineQuery::Select(select) => {
-            let select = expand_ctes_exec(select, storage, txid, arena, params, &[], None)?;
+            let select = match stored {
+                Some((path, dependencies)) => expand_stored_query_exec(
+                    select,
+                    storage,
+                    txid,
+                    path,
+                    dependencies,
+                    arena,
+                    params,
+                    None,
+                )?,
+                None => expand_ctes_exec(select, storage, txid, arena, params, &[], None)?,
+            };
             validate_locking(select)?;
             if recycling {
                 select_into_rows_recycling(storage, txid, select, arena, params, None, None, emit)
@@ -810,7 +976,26 @@ pub(crate) fn execute_routine_query<'a>(
             }
         }
         RoutineQuery::Set(query) => {
-            setops::set_query_into_rows(storage, txid, query, arena, params, None, emit)
+            let Some((path, dependencies)) = stored else {
+                return setops::set_query_into_rows(
+                    storage, txid, query, arena, params, None, emit,
+                );
+            };
+            let body = cte::expand_stored_set_tree_exec(
+                query.with,
+                query.body,
+                storage,
+                txid,
+                cte::StoredExecutionContext::new(path, dependencies, params, None),
+                arena,
+            )?;
+            let rebound = SetQuery {
+                with: &[],
+                body,
+                ..**query
+            };
+            let rebound = arena.alloc(rebound).map_err(|_| arena_full())?;
+            setops::set_query_into_rows(storage, txid, rebound, arena, params, None, emit)
         }
     }
 }
@@ -825,11 +1010,11 @@ pub(super) struct StorageCatalog<'storage, 'workspace, 'invocation, 'statement> 
     statement_arena: Option<&'statement Arena>,
 }
 
-pub(super) fn storage_catalog<'a>(
-    storage: &'a Storage,
-    routine_workspace: &'a Arena,
+pub(super) fn storage_catalog<'storage, 'workspace>(
+    storage: &'storage Storage,
+    routine_workspace: &'workspace Arena,
     txid: u32,
-) -> StorageCatalog<'a, 'a, 'static, 'static> {
+) -> StorageCatalog<'storage, 'workspace, 'static, 'static> {
     StorageCatalog {
         storage,
         routine_workspace,
@@ -850,14 +1035,31 @@ impl StorageCatalog<'_, '_, '_, '_> {
         if routine.attributes.strict && arguments.iter().any(Datum::is_null) {
             return Ok(Some(Datum::Null));
         }
-        let result_contract = match routine.kind {
+        let owner = self
+            .storage
+            .role_name(routine.ownership.owner_to(self.txid).into(), self.txid);
+        let _security = routine
+            .attributes
+            .security_definer
+            .then(|| super::eval::funcs::system::enter_current_user(owner.as_str()));
+        let _config = (!routine.configs().is_empty())
+            .then(|| super::guc::enter_active_routine_configs(routine.configs()))
+            .transpose()?;
+        let (result_contract, record_columns) = match routine.kind {
             crate::storage::RoutineKind::Function { result }
-            | crate::storage::RoutineKind::SetFunction { result } => result,
+            | crate::storage::RoutineKind::SetFunction { result } => (Some(result), None),
+            crate::storage::RoutineKind::RecordFunction {
+                set_returning: false,
+            } => (
+                None,
+                Some(&routine.result_columns[..routine.result_column_count]),
+            ),
             _ => unreachable!("routine call resolution returns functions only"),
         };
-        let result_type = result_contract.ctype;
+        let result_type = result_contract.map_or(ColType::Record, |result| result.ctype);
         let _formal_scope = super::exec::enter_routine_parameter_types(routine.arguments());
-        let function_program = parse_routine_function_program(
+        let function_program = parse_stored_routine_function_program(
+            routine.body_kind,
             routine.body.as_str(),
             self.routine_workspace,
             result_type == ColType::Void,
@@ -901,9 +1103,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 Stmt::SetQuery(query) => RoutineQuery::Set(query),
                 _ => unreachable!("mutable routine prelude was rejected above"),
             };
-            execute_routine_query(
+            execute_bound_routine_query(
                 &query,
                 self.storage,
+                slot,
+                routine,
                 self.txid,
                 self.routine_workspace,
                 &parameters[..arguments.len()],
@@ -931,9 +1135,11 @@ impl StorageCatalog<'_, '_, '_, '_> {
                         ));
                     }
                 };
-                execute_routine_query(
+                execute_bound_routine_query(
                     &query,
                     self.storage,
+                    slot,
+                    routine,
                     self.txid,
                     self.routine_workspace,
                     &parameters[..arguments.len()],
@@ -946,31 +1152,64 @@ impl StorageCatalog<'_, '_, '_, '_> {
                 return Err(routine_forbidden_statement_error(statement));
             }
         };
-        execute_routine_query(
+        execute_bound_routine_query(
             result_query,
             self.storage,
+            slot,
+            routine,
             self.txid,
             self.routine_workspace,
             &parameters[..arguments.len()],
             true,
             &mut |values| {
-                if values.len() != 1 {
+                let expected = record_columns.map_or(1, <[_]>::len);
+                if values.len() != expected {
                     return Err(sql_err!(
                         sqlstate::SYNTAX_ERROR,
-                        "SQL function query must return one column"
+                        "SQL function query returns {} columns but {} were declared",
+                        values.len(),
+                        expected
                     ));
                 }
                 if result.is_some() {
                     return Ok(());
                 }
                 let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
-                result = Some(crate::sql::exec::decode_projected_col_record(
-                    encoded, 0, arena,
-                )?);
+                result = Some(if let Some(columns) = record_columns {
+                    let fields = arena
+                        .alloc_slice_with(columns.len(), |_| super::types::RecordField {
+                            name: "",
+                            type_oid: super::types::oid::UNKNOWN,
+                            value: Datum::Null,
+                        })
+                        .map_err(|_| arena_full())?;
+                    for (index, (field, column)) in fields.iter_mut().zip(columns).enumerate() {
+                        field.name = arena
+                            .alloc_str(column.name.as_str())
+                            .map_err(|_| arena_full())?;
+                        field.type_oid = self
+                            .storage
+                            .routine_type_oid(column.ctype, column.user_type, self.txid)
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "routine result type identity is unavailable"
+                                )
+                            })?;
+                        field.value =
+                            crate::sql::exec::decode_projected_col_record(encoded, index, arena)?;
+                    }
+                    Datum::Record(fields)
+                } else {
+                    crate::sql::exec::decode_projected_col_record(encoded, 0, arena)?
+                });
                 Ok(())
             },
         )?;
         let result = result.unwrap_or(Datum::Null);
+        let Some(result_contract) = result_contract else {
+            return Ok(Some(result));
+        };
         if result_contract.polymorphic_type().is_some() {
             Ok(Some(result))
         } else {
@@ -1086,21 +1325,142 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         &self,
         name: &str,
         arguments: &[Datum<'a>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
         argument_type_oids: &[i32],
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
-        let Some(slot) =
-            self.storage
-                .routine_slot_for_call_oids(name, argument_type_oids, self.txid)
-        else {
+        let Some(slot) = (if argument_names.is_empty() {
+            self.storage.routine_slot_for_call_syntax_oids(
+                name,
+                argument_type_oids,
+                variadic,
+                self.txid,
+            )
+        } else {
+            self.storage.routine_slot_for_named_call_oids(
+                name,
+                argument_names,
+                argument_type_oids,
+                self.txid,
+            )
+        }) else {
             return Ok(None);
         };
         self.storage.require_routine_execute(slot, self.txid)?;
+        let declared = self.storage.routine_for(slot, self.txid);
+        let mut completed = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut completed_type_oids =
+            [super::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mapping = declared
+            .call_input_mapping(argument_names, arguments.len(), variadic)
+            .expect("resolved routine call has a valid argument mapping");
+        let mut provided = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut variadic_count = 0usize;
+        for (call_index, argument) in arguments.iter().enumerate() {
+            let input_index = usize::from(mapping[call_index]);
+            if !variadic
+                && matches!(
+                    declared
+                        .parameter_for_input(input_index)
+                        .expect("mapped input has a declared parameter")
+                        .mode,
+                    crate::storage::RoutineParameterMode::Variadic { .. }
+                )
+            {
+                variadic_values[variadic_count] = *argument;
+                variadic_count += 1;
+                provided[input_index] = true;
+                continue;
+            }
+            completed[input_index] = *argument;
+            completed_type_oids[input_index] = argument_type_oids[call_index];
+            provided[input_index] = true;
+        }
+        if variadic_count != 0 {
+            let input_index = declared.argument_count - 1;
+            let parameter = declared
+                .parameter_for_input(input_index)
+                .expect("variadic input has a declared parameter");
+            let ColType::Array(element) = parameter.ctype else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "variadic parameter is not an array"
+                ));
+            };
+            completed[input_index] = Datum::Array {
+                element,
+                raw: super::array::build(&variadic_values[..variadic_count], arena)?,
+            };
+            completed_type_oids[input_index] = self
+                .storage
+                .routine_type_oid(parameter.ctype, parameter.user_type, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "variadic parameter type identity is unavailable"
+                    )
+                })?;
+        }
+        for input_index in 0..declared.argument_count {
+            if provided[input_index] {
+                continue;
+            }
+            let parameter = declared
+                .parameter_for_input(input_index)
+                .expect("input signature has a declared parameter");
+            completed[input_index] = if let Some(default) = parameter.mode.default() {
+                let source = arena
+                    .alloc_str(default.as_str())
+                    .map_err(|_| arena_full())?;
+                let expression = super::parser::parse_expression(source, arena)?;
+                let hooks = EvalHooks {
+                    catalog: Some(self),
+                    ..super::eval::NO_HOOKS
+                };
+                let value = super::eval::eval_full(
+                    expression,
+                    arena,
+                    &[],
+                    &super::eval::NoColumns,
+                    &hooks,
+                )?;
+                super::eval::cast_to(value, parameter.ctype, arena)?
+            } else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "resolved routine is missing a required argument"
+                ));
+            };
+            completed_type_oids[input_index] = self
+                .storage
+                .routine_type_oid(parameter.ctype, parameter.user_type, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine parameter type identity is unavailable"
+                    )
+                })?;
+        }
         let routine = self
             .storage
-            .routine_for_bound_call(slot, argument_type_oids, self.txid)
+            .routine_for_bound_call(
+                slot,
+                &completed_type_oids[..declared.argument_count],
+                self.txid,
+            )
             .expect("resolved routine call has a valid polymorphic binding");
-        self.execute_routine(slot, routine, arguments, arena)
+        for (index, argument) in routine.arguments().iter().copied().enumerate() {
+            completed[index] = super::exec::coerce_routine_argument(
+                completed[index],
+                argument,
+                self.storage,
+                self.txid,
+                arena,
+            )?;
+        }
+        self.execute_routine(slot, routine, &completed[..declared.argument_count], arena)
     }
 
     fn call_routine_oid<'a>(
@@ -1137,10 +1497,28 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.execute_routine(slot, routine, arguments, arena)
     }
 
-    fn routine_result_oid(&self, name: &str, argument_type_oids: &[i32]) -> Option<i32> {
-        let routine = self
-            .storage
-            .function_for_call_oids(name, argument_type_oids, self.txid)?;
+    fn routine_result_oid(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        argument_type_oids: &[i32],
+    ) -> Option<i32> {
+        let routine = if argument_names.is_empty() {
+            self.storage.function_for_call_syntax_oids(
+                name,
+                argument_type_oids,
+                variadic,
+                self.txid,
+            )?
+        } else {
+            self.storage.function_for_named_call_oids(
+                name,
+                argument_names,
+                argument_type_oids,
+                self.txid,
+            )?
+        };
         self.storage
             .routine_function_result_oid(&routine, self.txid)
     }
@@ -3037,7 +3415,17 @@ fn rewrite_grouped_expr<'a>(
             };
             alloc(Expr::Case { operand, whens, otherwise, synthetic: *synthetic })
         }
-        Expr::Call { name, args, star, distinct, order_by, over, filter } => {
+        Expr::Call {
+            name,
+            args,
+            argument_names,
+            variadic,
+            star,
+            distinct,
+            order_by,
+            over,
+            filter,
+        } => {
             let mut rewritten = [&Expr::Null as &'a Expr<'a>; super::parser::MAX_LIST];
             for (i, a) in args.iter().enumerate() {
                 rewritten[i] = rewrite(a)?;
@@ -3093,6 +3481,8 @@ fn rewrite_grouped_expr<'a>(
             alloc(Expr::Call {
                 name,
                 args,
+                argument_names,
+                variadic: *variadic,
                 star: *star,
                 distinct: *distinct,
                 order_by,
@@ -3903,6 +4293,8 @@ fn over_one_row<'a>(
             alias: Some("?onerow"),
             subquery: Some(inner),
             func_args: None,
+            func_argument_names: &[],
+            func_variadic: false,
             rows_from: None,
             col_alias: None,
             inheritance: crate::sql::ast::RelationInheritance::Descendants,
@@ -6303,7 +6695,13 @@ fn describe_scope_record_star<'q>(
                 index += 1;
             }
         }
-        Expr::Call { name, args, .. } => {
+        Expr::Call {
+            name,
+            args,
+            argument_names,
+            variadic,
+            ..
+        } => {
             if args.len() > crate::storage::MAX_ROUTINE_ARGUMENTS {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -6320,6 +6718,8 @@ fn describe_scope_record_star<'q>(
             while let Some((field_name, meta)) = super::exec::ColTypeResolver::routine_record_field(
                 &resolver,
                 name,
+                argument_names,
+                *variadic,
                 &argument_oids[..args.len()],
                 index,
             ) {
@@ -6538,13 +6938,27 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
             .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
     }
 
-    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<super::exec::StaticTypeMeta> {
-        let result = self
-            .storage
-            .function_for_call_oids(name, arguments, self.txid)
+    fn routine_result(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<super::exec::StaticTypeMeta> {
+        let routine = if argument_names.is_empty() {
+            self.storage
+                .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
+        } else {
+            self.storage
+                .function_for_named_call_oids(name, argument_names, arguments, self.txid)
+        };
+        let result = routine
             .and_then(|routine| match routine.kind {
                 crate::storage::RoutineKind::Function { result }
                 | crate::storage::RoutineKind::SetFunction { result } => Some(result),
+                crate::storage::RoutineKind::RecordFunction { .. } => {
+                    Some(crate::storage::RoutineResult::builtin(ColType::Record))
+                }
                 _ => None,
             })
             .or_else(|| {
@@ -6570,12 +6984,27 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
     fn routine_record_field(
         &self,
         name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, super::exec::StaticTypeMeta)> {
-        let slot = self
-            .storage
-            .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
+        let slot = if argument_names.is_empty() {
+            if variadic {
+                self.storage
+                    .routine_slot_for_function_call_syntax_oids(name, arguments, true, self.txid)?
+            } else {
+                self.storage
+                    .routine_slot_for_function_call_oids(name, arguments, self.txid)?
+            }
+        } else {
+            self.storage.routine_slot_for_named_function_call_oids(
+                name,
+                argument_names,
+                arguments,
+                self.txid,
+            )?
+        };
         let routine = self.storage.routine_for(slot, self.txid);
         let column = routine.record_result_columns()?.get(index)?;
         Some((

@@ -2134,28 +2134,146 @@ impl Checkpointer {
                             })
                         };
                     }
-                    let attributes = crate::storage::RoutineAttributes {
-                        strict: match parse_field::<u8>(words.next(), "routine strictness")? {
+                    let parameter_count: usize =
+                        parse_field(words.next(), "routine parameter count")?;
+                    if parameter_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
+                        return Err(CheckpointSetupError::Corrupt("too many routine parameters"));
+                    }
+                    let mut parameters = [crate::storage::RoutineParameterDef::EMPTY;
+                        crate::storage::MAX_ROUTINE_ARGUMENTS];
+                    for parameter in &mut parameters[..parameter_count] {
+                        parameter.name = sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("routine parameter name missing"),
+                        )?)?)?;
+                        let type_code: u8 = parse_field(words.next(), "routine parameter type")?;
+                        parameter.ctype = ColType::from_code(type_code).ok_or(
+                            CheckpointSetupError::Corrupt("invalid routine parameter type"),
+                        )?;
+                        let schema = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "routine parameter type schema missing",
+                        ))?;
+                        let name = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "routine parameter type name missing",
+                        ))?;
+                        parameter.user_type = if schema == "-" && name == "-" {
+                            None
+                        } else {
+                            Some(crate::storage::UserTypeName {
+                                schema: sql_name(&decode_hex_name(schema)?)?,
+                                name: sql_name(&decode_hex_name(name)?)?,
+                            })
+                        };
+                        let mode: u8 = parse_field(words.next(), "routine parameter mode")?;
+                        let default_word = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "routine parameter default missing",
+                        ))?;
+                        let default = if default_word == "-" {
+                            None
+                        } else {
+                            let decoded = decode_hex_name(default_word)?;
+                            let stored = StackStr::from_str(&decoded);
+                            if stored.is_truncated() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "routine parameter default too long",
+                                ));
+                            }
+                            Some(stored)
+                        };
+                        parameter.mode =
+                            crate::storage::RoutineParameterMode::from_code(mode, default).ok_or(
+                                CheckpointSetupError::Corrupt("invalid routine parameter mode"),
+                            )?;
+                    }
+                    let config_count: usize =
+                        parse_field(words.next(), "routine configuration count")?;
+                    if config_count > crate::storage::MAX_ROUTINE_CONFIGS {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "too many routine configurations",
+                        ));
+                    }
+                    let mut configs =
+                        [crate::storage::RoutineConfig::EMPTY; crate::storage::MAX_ROUTINE_CONFIGS];
+                    for config in &mut configs[..config_count] {
+                        config.name = sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("routine configuration name missing"),
+                        )?)?)?;
+                        let decoded = decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("routine configuration value missing"),
+                        )?)?;
+                        config.value = StackStr::from_str(&decoded);
+                        if config.value.is_truncated() {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "routine configuration value too long",
+                            ));
+                        }
+                    }
+                    let strict = match parse_field::<u8>(words.next(), "routine strictness")? {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid routine strictness",
+                            ));
+                        }
+                    };
+                    let volatility = crate::storage::RoutineVolatility::from_code(parse_field(
+                        words.next(),
+                        "routine volatility",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid routine volatility"))?;
+                    let parallel = crate::storage::RoutineParallel::from_code(parse_field(
+                        words.next(),
+                        "routine parallel safety",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt(
+                        "invalid routine parallel safety",
+                    ))?;
+                    let body_kind = crate::storage::RoutineBodyKind::from_code(parse_field(
+                        words.next(),
+                        "routine body kind",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid routine body kind"))?;
+                    let language = crate::storage::RoutineLanguage::from_code(parse_field(
+                        words.next(),
+                        "routine language",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid routine language"))?;
+                    let security_definer =
+                        match parse_field::<u8>(words.next(), "routine security")? {
                             0 => false,
                             1 => true,
                             _ => {
                                 return Err(CheckpointSetupError::Corrupt(
-                                    "invalid routine strictness",
+                                    "invalid routine security",
                                 ));
                             }
-                        },
-                        volatility: crate::storage::RoutineVolatility::from_code(parse_field(
-                            words.next(),
-                            "routine volatility",
-                        )?)
-                        .ok_or(CheckpointSetupError::Corrupt("invalid routine volatility"))?,
-                        parallel: crate::storage::RoutineParallel::from_code(parse_field(
-                            words.next(),
-                            "routine parallel safety",
-                        )?)
-                        .ok_or(CheckpointSetupError::Corrupt(
-                            "invalid routine parallel safety",
-                        ))?,
+                        };
+                    let leakproof = match parse_field::<u8>(words.next(), "routine leakproof")? {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt("invalid routine leakproof"));
+                        }
+                    };
+                    let parse_estimate = |word: Option<&str>, missing| {
+                        let bits: u64 = parse_field(word, missing)?;
+                        if bits == 0 {
+                            return Ok(None);
+                        }
+                        let value = f64::from_bits(bits);
+                        if !value.is_finite() || value <= 0.0 {
+                            return Err(CheckpointSetupError::Corrupt("invalid routine estimate"));
+                        }
+                        Ok(Some(bits))
+                    };
+                    let attributes = crate::storage::RoutineAttributes {
+                        strict,
+                        volatility,
+                        parallel,
+                        security_definer,
+                        leakproof,
+                        cost_bits: parse_estimate(words.next(), "routine cost")?,
+                        rows_bits: parse_estimate(words.next(), "routine rows")?,
                     };
                     let mut result_columns = [crate::storage::RoutineArgumentDef::EMPTY;
                         crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -2184,7 +2302,7 @@ impl Checkpointer {
                     };
                     let code: u8 = parse_field(Some(kind_code), "routine kind")?;
                     let kind = {
-                        if code == 3 {
+                        if matches!(code, 3 | 6 | 7) {
                             result_column_count =
                                 parse_field(words.next(), "routine result column count")?;
                             if result_column_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
@@ -2220,35 +2338,33 @@ impl Checkpointer {
                                     })
                                 };
                             }
-                            if words.next().is_some() {
-                                return Err(CheckpointSetupError::Corrupt(
-                                    "malformed routine record",
-                                ));
-                            }
-                            crate::storage::RoutineKind::TableFunction
+                            crate::storage::RoutineKind::from_wire_code(code, result)
+                                .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?
                         } else if code == 5 {
                             let aggregate =
                                 crate::storage::AggregateRoutine::decode_wire(body.as_str())
                                     .ok_or(CheckpointSetupError::Corrupt(
                                         "invalid aggregate definition",
                                     ))?;
-                            if words.next().is_some() {
-                                return Err(CheckpointSetupError::Corrupt(
-                                    "malformed aggregate record",
-                                ));
-                            }
                             crate::storage::RoutineKind::Aggregate(aggregate)
                         } else {
-                            let kind = crate::storage::RoutineKind::from_wire_code(code, result)
-                                .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?;
-                            if words.next().is_some() {
-                                return Err(CheckpointSetupError::Corrupt(
-                                    "malformed routine record",
-                                ));
-                            }
-                            kind
+                            crate::storage::RoutineKind::from_wire_code(code, result)
+                                .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?
                         }
                     };
+                    let creation_path =
+                        StackStr::<128>::from_str(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("routine creation path missing"),
+                        )?)?);
+                    if creation_path.is_truncated() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "routine creation path too long",
+                        ));
+                    }
+                    let dependencies = parse_stored_query_dependencies(&mut words)?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("malformed routine record"));
+                    }
                     let owner = storage
                         .find_role(&owner)
                         .ok_or(CheckpointSetupError::Corrupt(
@@ -2268,11 +2384,19 @@ impl Checkpointer {
                                 name,
                                 arguments,
                                 argument_count,
+                                parameters,
+                                parameter_count,
                                 kind,
                                 result_columns,
                                 result_column_count,
+                                language,
                                 attributes,
+                                configs,
+                                config_count,
+                                body_kind,
                                 body: if code == 5 { StackStr::new() } else { body },
+                                creation_path,
+                                dependencies,
                             },
                             0,
                         )
@@ -4753,6 +4877,7 @@ impl Checkpointer {
             let mut schema = StackStr::<130>::new();
             let mut name = StackStr::<130>::new();
             let mut body = StackStr::<{ 2 * crate::storage::ROUTINE_SQL_MAX }>::new();
+            let mut creation_path = StackStr::<260>::new();
             for byte in storage
                 .role(routine.ownership.owner_to(0) as usize)
                 .name
@@ -4766,6 +4891,12 @@ impl Checkpointer {
             }
             for byte in routine.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
+            }
+            for byte in routine.creation_path.as_str().as_bytes() {
+                let _ = write!(creation_path, "{byte:02x}");
+            }
+            if creation_path.as_str().is_empty() {
+                let _ = creation_path.write_str("-");
             }
             let aggregate_body = match routine.kind {
                 crate::storage::RoutineKind::Aggregate(aggregate) => Some(aggregate.encode_wire()),
@@ -4782,6 +4913,9 @@ impl Checkpointer {
                 let mut argument_name = StackStr::<130>::new();
                 for byte in argument.name.as_str().as_bytes() {
                     let _ = write!(argument_name, "{byte:02x}");
+                }
+                if argument.name.as_str().is_empty() {
+                    let _ = write!(argument_name, "-");
                 }
                 let _ = write!(
                     arguments,
@@ -4803,14 +4937,75 @@ impl Checkpointer {
                     let _ = write!(arguments, " - -");
                 }
             }
+            let mut parameters = StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 660 }>::new();
+            let _ = write!(parameters, " {}", routine.parameter_count);
+            for parameter in routine.parameters() {
+                let mut parameter_name = StackStr::<130>::new();
+                for byte in parameter.name.as_str().as_bytes() {
+                    let _ = write!(parameter_name, "{byte:02x}");
+                }
+                if parameter.name.as_str().is_empty() {
+                    let _ = write!(parameter_name, "-");
+                }
+                let _ = write!(
+                    parameters,
+                    " {} {}",
+                    parameter_name.as_str(),
+                    parameter.ctype.code()
+                );
+                if let Some(identity) = parameter.user_type {
+                    let mut schema = StackStr::<130>::new();
+                    let mut name = StackStr::<130>::new();
+                    for byte in identity.schema.as_str().as_bytes() {
+                        let _ = write!(schema, "{byte:02x}");
+                    }
+                    for byte in identity.name.as_str().as_bytes() {
+                        let _ = write!(name, "{byte:02x}");
+                    }
+                    let _ = write!(parameters, " {} {}", schema.as_str(), name.as_str());
+                } else {
+                    let _ = write!(parameters, " - -");
+                }
+                let _ = write!(parameters, " {} ", parameter.mode.code());
+                if let Some(default) = parameter.mode.default() {
+                    for byte in default.as_str().as_bytes() {
+                        let _ = write!(parameters, "{byte:02x}");
+                    }
+                } else {
+                    let _ = write!(parameters, "-");
+                }
+            }
+            let mut configs = StackStr::<{ crate::storage::MAX_ROUTINE_CONFIGS * 390 + 8 }>::new();
+            let _ = write!(configs, " {}", routine.config_count);
+            for config in routine.configs() {
+                let _ = write!(configs, " ");
+                for byte in config.name.as_str().as_bytes() {
+                    let _ = write!(configs, "{byte:02x}");
+                }
+                let _ = write!(configs, " ");
+                if config.value.as_str().is_empty() {
+                    let _ = write!(configs, "-");
+                } else {
+                    for byte in config.value.as_str().as_bytes() {
+                        let _ = write!(configs, "{byte:02x}");
+                    }
+                }
+            }
             let mut result_columns =
                 StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 396 }>::new();
-            if matches!(routine.kind, crate::storage::RoutineKind::TableFunction) {
+            if matches!(
+                routine.kind,
+                crate::storage::RoutineKind::TableFunction
+                    | crate::storage::RoutineKind::RecordFunction { .. }
+            ) {
                 let _ = write!(result_columns, " {}", routine.result_column_count);
                 for column in &routine.result_columns[..routine.result_column_count] {
                     let mut column_name = StackStr::<130>::new();
                     for byte in column.name.as_str().as_bytes() {
                         let _ = write!(column_name, "{byte:02x}");
+                    }
+                    if column.name.as_str().is_empty() {
+                        let _ = write!(column_name, "-");
                     }
                     let _ = write!(
                         result_columns,
@@ -4857,7 +5052,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rtn {} {} {} {} {} {} {}{} {} {} {} {} {} {}{}",
+                    "rtn {} {} {} {} {} {} {}{}{}{} {} {} {} {} {} {} {} {} {} {} {} {}{} {} {}",
                     routine.created_at,
                     owner.as_str(),
                     match routine.kind {
@@ -4867,6 +5062,7 @@ impl Checkpointer {
                             aggregate.result_type.ctype
                         }
                         crate::storage::RoutineKind::TableFunction
+                        | crate::storage::RoutineKind::RecordFunction { .. }
                         | crate::storage::RoutineKind::Trigger
                         | crate::storage::RoutineKind::Procedure => ColType::Text,
                     }
@@ -4876,13 +5072,23 @@ impl Checkpointer {
                     name.as_str(),
                     body.as_str(),
                     arguments.as_str(),
+                    parameters.as_str(),
+                    configs.as_str(),
                     u8::from(routine.attributes.strict),
                     routine.attributes.volatility.code(),
                     routine.attributes.parallel.code(),
+                    routine.body_kind.code(),
+                    routine.language.code(),
+                    u8::from(routine.attributes.security_definer),
+                    u8::from(routine.attributes.leakproof),
+                    routine.attributes.cost_bits.unwrap_or(0),
+                    routine.attributes.rows_bits.unwrap_or(0),
                     routine.kind.wire_code(),
                     result_schema.as_str(),
                     result_name.as_str(),
                     result_columns.as_str(),
+                    creation_path.as_str(),
+                    ManifestDependencies(storage.routine_dependencies_for(slot, 0)),
                 ),
             )?;
         }

@@ -217,13 +217,27 @@ impl ColTypeResolver for CatalogCols<'_> {
             .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
     }
 
-    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<StaticTypeMeta> {
-        let result = self
-            .storage
-            .function_for_call_oids(name, arguments, self.txid)
+    fn routine_result(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<StaticTypeMeta> {
+        let routine = if argument_names.is_empty() {
+            self.storage
+                .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
+        } else {
+            self.storage
+                .function_for_named_call_oids(name, argument_names, arguments, self.txid)
+        };
+        let result = routine
             .and_then(|routine| match routine.kind {
                 crate::storage::RoutineKind::Function { result }
                 | crate::storage::RoutineKind::SetFunction { result } => Some(result),
+                crate::storage::RoutineKind::RecordFunction { .. } => {
+                    Some(crate::storage::RoutineResult::builtin(ColType::Record))
+                }
                 _ => None,
             })
             .or_else(|| {
@@ -249,12 +263,27 @@ impl ColTypeResolver for CatalogCols<'_> {
     fn routine_record_field(
         &self,
         name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        let slot = self
-            .storage
-            .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
+        let slot = if argument_names.is_empty() {
+            if variadic {
+                self.storage
+                    .routine_slot_for_function_call_syntax_oids(name, arguments, true, self.txid)?
+            } else {
+                self.storage
+                    .routine_slot_for_function_call_oids(name, arguments, self.txid)?
+            }
+        } else {
+            self.storage.routine_slot_for_named_function_call_oids(
+                name,
+                argument_names,
+                arguments,
+                self.txid,
+            )?
+        };
         let routine = self.storage.routine_for(slot, self.txid);
         let column = routine.record_result_columns()?.get(index)?;
         Some((
@@ -785,13 +814,21 @@ pub trait ColTypeResolver {
     /// identities. OIDs retain a domain identity that its runtime value does
     /// not carry.
     /// Plain column resolvers have no catalog and therefore expose none.
-    fn routine_result(&self, _name: &str, _arguments: &[i32]) -> Option<StaticTypeMeta> {
+    fn routine_result(
+        &self,
+        _name: &str,
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
+        _arguments: &[i32],
+    ) -> Option<StaticTypeMeta> {
         None
     }
 
     fn routine_record_field(
         &self,
         _name: &str,
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
         _arguments: &[i32],
         _index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
@@ -1531,7 +1568,13 @@ fn record_shape_metadata_dyn(
             }
             Some(count)
         }
-        Expr::Call { name, args, .. } => {
+        Expr::Call {
+            name,
+            args,
+            argument_names,
+            variadic,
+            ..
+        } => {
             let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
             if args.len() > argument_oids.len() {
                 return None;
@@ -1540,9 +1583,13 @@ fn record_shape_metadata_dyn(
                 argument_oids[index] = infer_routine_argument_oid(argument, columns).ok()?;
             }
             let mut count = 0usize;
-            while let Some((field_name, meta)) =
-                columns.routine_record_field(name, &argument_oids[..args.len()], count)
-            {
+            while let Some((field_name, meta)) = columns.routine_record_field(
+                name,
+                argument_names,
+                *variadic,
+                &argument_oids[..args.len()],
+                count,
+            ) {
                 visit(field_name.as_str(), meta);
                 count += 1;
             }
@@ -1708,7 +1755,13 @@ pub fn record_field_metadata(
             }
             found
         }
-        Expr::Call { name, args, .. } => {
+        Expr::Call {
+            name,
+            args,
+            argument_names,
+            variadic,
+            ..
+        } => {
             let mut argument_oids = [oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
             if args.len() > argument_oids.len() {
                 None
@@ -1718,9 +1771,13 @@ pub fn record_field_metadata(
                 }
                 let mut index = 0usize;
                 let mut found = None;
-                while let Some((name, meta)) =
-                    columns.routine_record_field(name, &argument_oids[..args.len()], index)
-                {
+                while let Some((name, meta)) = columns.routine_record_field(
+                    name,
+                    argument_names,
+                    *variadic,
+                    &argument_oids[..args.len()],
+                    index,
+                ) {
                     if name.as_str().eq_ignore_ascii_case(field) {
                         found = Some(meta);
                         break;
@@ -2220,6 +2277,8 @@ pub(crate) fn routine_result_metadata(
     let Expr::Call {
         name,
         args,
+        argument_names,
+        variadic,
         order_by,
         ..
     } = expression
@@ -2233,7 +2292,12 @@ pub(crate) fn routine_result_metadata(
     for (index, argument) in args.iter().enumerate() {
         argument_type_oids[index] = infer_routine_argument_oid(argument, columns).ok()?;
     }
-    if let Some(result) = columns.routine_result(name, &argument_type_oids[..args.len()]) {
+    if let Some(result) = columns.routine_result(
+        name,
+        argument_names,
+        *variadic,
+        &argument_type_oids[..args.len()],
+    ) {
         return Some(result);
     }
     if args.len() + order_by.len() > argument_type_oids.len() {
@@ -2243,7 +2307,12 @@ pub(crate) fn routine_result_metadata(
         argument_type_oids[args.len() + index] =
             infer_routine_argument_oid(ordering.expression, columns).ok()?;
     }
-    columns.routine_result(name, &argument_type_oids[..args.len() + order_by.len()])
+    columns.routine_result(
+        name,
+        argument_names,
+        *variadic,
+        &argument_type_oids[..args.len() + order_by.len()],
+    )
 }
 
 pub fn infer_type_res(

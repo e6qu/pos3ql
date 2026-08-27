@@ -215,7 +215,7 @@ fn session_setting(name: &str) -> Option<crate::util::StackStr<256>> {
     })
 }
 
-fn update_session_setting(name: &str, value: crate::util::StackStr<256>) {
+pub(crate) fn update_session_setting(name: &str, value: crate::util::StackStr<256>) {
     SESSION_SETTINGS.with(|settings| {
         let mut settings = settings.borrow_mut();
         if let Some(index) =
@@ -242,6 +242,22 @@ pub fn set_current_user(user: &str) {
     CURRENT_USER.with(|current| {
         *current.borrow_mut() = crate::util::StackStr::from_str(user);
     });
+}
+
+pub(crate) struct CurrentUserScope {
+    prior: crate::util::StackStr<64>,
+}
+
+impl Drop for CurrentUserScope {
+    fn drop(&mut self) {
+        set_current_user(self.prior.as_str());
+    }
+}
+
+pub(crate) fn enter_current_user(user: &str) -> CurrentUserScope {
+    let prior = current_user_owned();
+    set_current_user(user);
+    CurrentUserScope { prior }
 }
 
 pub fn session_user_owned() -> crate::util::StackStr<64> {
@@ -1053,6 +1069,7 @@ pub(crate) fn dispatch<'a>(
                 if let crate::sql::ast::Expr::Call {
                     name,
                     args,
+                    argument_names,
                     star: false,
                     ..
                 } = args[0]
@@ -1074,9 +1091,12 @@ pub(crate) fn dispatch<'a>(
                             .unwrap_or(crate::sql::types::oid::UNKNOWN),
                         };
                     }
-                    if let Some(referenced_oid) =
-                        cat.routine_result_oid(name, &argument_oids[..args.len()])
-                        && let Some(type_name) = cat.type_name(referenced_oid, arena)?
+                    if let Some(referenced_oid) = cat.routine_result_oid(
+                        name,
+                        argument_names,
+                        false,
+                        &argument_oids[..args.len()],
+                    ) && let Some(type_name) = cat.type_name(referenced_oid, arena)?
                     {
                         return Ok(regtype(referenced_oid, type_name));
                     }

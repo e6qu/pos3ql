@@ -7013,6 +7013,7 @@ pub(crate) enum AccessClass {
     Statistics = 11,
     Extension = 12,
     Trigger = 13,
+    Database = 14,
 }
 
 /// Object classes addressable by ALTER DEFAULT PRIVILEGES.
@@ -7074,6 +7075,7 @@ impl AccessClass {
             11 => Self::Statistics,
             12 => Self::Extension,
             13 => Self::Trigger,
+            14 => Self::Database,
             _ => return None,
         })
     }
@@ -7103,6 +7105,8 @@ impl PrivilegeSet {
     pub(crate) const CREATE: Self = Self(1 << 8);
     pub(crate) const EXECUTE: Self = Self(1 << 9);
     pub(crate) const MAINTAIN: Self = Self(1 << 10);
+    pub(crate) const CONNECT: Self = Self(1 << 11);
+    pub(crate) const TEMPORARY: Self = Self(1 << 12);
 
     pub(crate) const TABLE_ALL: Self = Self(
         Self::SELECT.0
@@ -7118,7 +7122,8 @@ impl PrivilegeSet {
     pub(crate) const SCHEMA_ALL: Self = Self(Self::USAGE.0 | Self::CREATE.0);
     pub(crate) const TYPE_ALL: Self = Self::USAGE;
     pub(crate) const FUNCTION_ALL: Self = Self::EXECUTE;
-
+    pub(crate) const DATABASE_ALL: Self =
+        Self(Self::CREATE.0 | Self::CONNECT.0 | Self::TEMPORARY.0);
     pub(crate) const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
@@ -7132,8 +7137,36 @@ impl PrivilegeSet {
     }
 }
 
+pub(crate) const fn default_public_object_privileges(class: AccessClass) -> PrivilegeSet {
+    match class {
+        AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => PrivilegeSet::USAGE,
+        AccessClass::Routine => PrivilegeSet::EXECUTE,
+        AccessClass::Database => PrivilegeSet::CONNECT.union(PrivilegeSet::TEMPORARY),
+        _ => PrivilegeSet::NONE,
+    }
+}
+
+pub(crate) const fn all_object_privileges(class: AccessClass) -> PrivilegeSet {
+    match class {
+        AccessClass::Table | AccessClass::View | AccessClass::MaterializedView => {
+            PrivilegeSet::TABLE_ALL
+        }
+        AccessClass::Sequence => PrivilegeSet::SEQUENCE_ALL,
+        AccessClass::Schema => PrivilegeSet::SCHEMA_ALL,
+        AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => PrivilegeSet::TYPE_ALL,
+        AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
+        AccessClass::Tablespace => PrivilegeSet::CREATE,
+        AccessClass::Database => PrivilegeSet::DATABASE_ALL,
+        AccessClass::Index
+        | AccessClass::Statistics
+        | AccessClass::Extension
+        | AccessClass::Trigger => PrivilegeSet::NONE,
+    }
+}
+
 pub(crate) const PUBLIC_ROLE: u16 = u16::MAX;
 pub(crate) const MAX_ACL_ENTRIES: usize = 512;
+pub(crate) const MAX_COLUMN_ACL_ENTRIES: usize = 1024;
 pub(crate) const MAX_DEFAULT_ACL_ENTRIES: usize = 256;
 pub(crate) const DEFAULT_ACL_ALL_SCHEMAS: u16 = u16::MAX;
 
@@ -7149,6 +7182,46 @@ pub(crate) struct PendingAcl {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AclEntry {
     pub object: AccessObject,
+    pub grantee: u16,
+    pub grantor: u16,
+    pub privileges: PrivilegeSet,
+    pub grant_options: PrivilegeSet,
+    pub live: bool,
+    pub pending: Option<PendingAcl>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ColumnPrivilegeTarget {
+    relation: AccessObject,
+    column: u16,
+}
+
+impl ColumnPrivilegeTarget {
+    pub(crate) fn new(relation: AccessObject, column: u16) -> Result<Self, SqlError> {
+        if !matches!(
+            relation.class,
+            AccessClass::Table | AccessClass::View | AccessClass::MaterializedView
+        ) {
+            return Err(sql_err!(
+                sqlstate::INVALID_GRANT_OPERATION,
+                "column privileges require a table or view"
+            ));
+        }
+        Ok(Self { relation, column })
+    }
+
+    pub(crate) const fn relation(self) -> AccessObject {
+        self.relation
+    }
+
+    pub(crate) const fn column(self) -> u16 {
+        self.column
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ColumnAclEntry {
+    pub target: ColumnPrivilegeTarget,
     pub grantee: u16,
     pub grantor: u16,
     pub privileges: PrivilegeSet,
@@ -7194,10 +7267,12 @@ pub(crate) struct DefaultAclEntry {
 /// it never lives in a process-global authentication side table.
 pub(crate) const MAX_ROLES: usize = 64;
 pub(crate) const MAX_ROLE_MEMBERSHIPS: usize = 256;
+pub(crate) const MAX_ROLE_SETTINGS: usize = 128;
+pub(crate) const ROLE_SETTING_VALUE_MAX: usize = 256;
 pub(crate) const ROLE_PASSWORD_MAX: usize = 128;
 pub(crate) const ROLE_VALID_UNTIL_MAX: usize = 64;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RolePassword {
     pub salt: [u8; 16],
     pub stored_key: [u8; 32],
@@ -7224,10 +7299,8 @@ pub struct RoleAttributes {
     pub replication: bool,
     pub bypass_row_level_security: bool,
     pub connection_limit: i32,
-    pub password: RolePassword,
-    pub has_password: bool,
-    pub valid_until: StackStr<ROLE_VALID_UNTIL_MAX>,
-    pub has_valid_until: bool,
+    pub password: Option<RolePassword>,
+    pub valid_until: Option<StackStr<ROLE_VALID_UNTIL_MAX>>,
 }
 
 impl RoleAttributes {
@@ -7240,10 +7313,8 @@ impl RoleAttributes {
         replication: false,
         bypass_row_level_security: false,
         connection_limit: -1,
-        password: RolePassword::EMPTY,
-        has_password: false,
-        valid_until: StackStr::new(),
-        has_valid_until: false,
+        password: None,
+        valid_until: None,
     };
 
     pub const BOOTSTRAP: Self = Self {
@@ -7297,7 +7368,7 @@ impl RoleDef {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoleMembershipOptions {
     pub admin: bool,
     pub inherit: bool,
@@ -7316,6 +7387,7 @@ impl RoleMembershipOptions {
 pub struct PendingRoleMembership {
     pub txid: u32,
     pub exists: bool,
+    pub grantor: u16,
     pub options: RoleMembershipOptions,
 }
 
@@ -7341,6 +7413,60 @@ impl RoleMembership {
         match self.pending {
             Some(pending) if pending.txid == txid && pending.exists => pending.options,
             _ => self.options,
+        }
+    }
+
+    pub fn grantor_to(&self, txid: u32) -> u16 {
+        match self.pending {
+            Some(pending) if pending.txid == txid && pending.exists => pending.grantor,
+            _ => self.grantor,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoleSettingScope {
+    RoleAllDatabases(u16),
+    RoleInDatabase(u16),
+    AllRolesInDatabase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingRoleSetting {
+    pub txid: u32,
+    pub exists: bool,
+    pub value: StackStr<ROLE_SETTING_VALUE_MAX>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RoleSetting {
+    pub scope: RoleSettingScope,
+    pub name: SqlName,
+    pub value: StackStr<ROLE_SETTING_VALUE_MAX>,
+    pub live: bool,
+    pub pending: Option<PendingRoleSetting>,
+}
+
+impl RoleSetting {
+    pub(crate) const EMPTY: Self = Self {
+        scope: RoleSettingScope::AllRolesInDatabase,
+        name: SqlName::EMPTY,
+        value: StackStr::new(),
+        live: false,
+        pending: None,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(pending) if pending.txid == txid => pending.exists,
+            _ => self.live,
+        }
+    }
+
+    pub(crate) fn value_to(&self, txid: u32) -> StackStr<ROLE_SETTING_VALUE_MAX> {
+        match self.pending {
+            Some(pending) if pending.txid == txid && pending.exists => pending.value,
+            _ => self.value,
         }
     }
 }
@@ -7633,8 +7759,11 @@ pub struct Storage {
     extension_script_source: FixedBuf,
     extension_package_source: ExtensionPackageSource,
     roles: FixedVec<RoleDef>,
+    database_ownership: Ownership,
     role_memberships: FixedVec<RoleMembership>,
+    role_settings: FixedVec<RoleSetting>,
     acl_entries: FixedVec<AclEntry>,
+    column_acl_entries: FixedVec<ColumnAclEntry>,
     default_acl_entries: FixedVec<DefaultAclEntry>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
@@ -8305,7 +8434,9 @@ impl Storage {
             + config.extension_script_bytes
             + MAX_ROLES * size_of::<RoleDef>()
             + MAX_ROLE_MEMBERSHIPS * size_of::<RoleMembership>()
+            + MAX_ROLE_SETTINGS * size_of::<RoleSetting>()
             + MAX_ACL_ENTRIES * size_of::<AclEntry>()
+            + MAX_COLUMN_ACL_ENTRIES * size_of::<ColumnAclEntry>()
             + MAX_DEFAULT_ACL_ENTRIES * size_of::<DefaultAclEntry>()
             + MAX_SEQUENCES * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
@@ -8693,6 +8824,12 @@ impl Storage {
                 })
                 .expect("sized to MAX_ROLE_MEMBERSHIPS");
         }
+        let mut role_settings = FixedVec::new(budget, "role_settings", MAX_ROLE_SETTINGS)?;
+        for _ in 0..MAX_ROLE_SETTINGS {
+            role_settings
+                .push(RoleSetting::EMPTY)
+                .expect("sized to MAX_ROLE_SETTINGS");
+        }
         let mut acl_entries = FixedVec::new(budget, "acl_entries", MAX_ACL_ENTRIES)?;
         acl_entries
             .push(AclEntry {
@@ -8710,6 +8847,8 @@ impl Storage {
             .expect("ACL pool has room for the public schema default");
         let default_acl_entries =
             FixedVec::new(budget, "default_acl_entries", MAX_DEFAULT_ACL_ENTRIES)?;
+        let column_acl_entries =
+            FixedVec::new(budget, "column_acl_entries", MAX_COLUMN_ACL_ENTRIES)?;
         let mut indexes = FixedVec::new(budget, "indexes", config.max_tables)?;
         for _ in 0..config.max_tables {
             indexes
@@ -8808,8 +8947,11 @@ impl Storage {
             extension_script_source,
             extension_package_source: ExtensionPackageSource::Durable,
             roles,
+            database_ownership: Ownership::BOOTSTRAP,
             role_memberships,
+            role_settings,
             acl_entries,
+            column_acl_entries,
             default_acl_entries,
             comments,
             path: PathContext::public_only(),
@@ -9321,7 +9463,27 @@ impl Storage {
     /// The current database is owned by the bootstrap role. `CREATEDB` is a
     /// cluster role attribute and must never stand in for database `CREATE`.
     pub(crate) fn has_current_database_create_privilege(&self, role: usize, txid: u32) -> bool {
-        role == 0 || self.role(role).attributes_to(txid).superuser
+        self.has_object_privilege(
+            AccessObject {
+                class: AccessClass::Database,
+                slot: 0,
+            },
+            role,
+            PrivilegeSet::CREATE,
+            txid,
+        )
+    }
+
+    pub(crate) fn has_current_database_connect_privilege(&self, role: usize, txid: u32) -> bool {
+        self.has_object_privilege(
+            AccessObject {
+                class: AccessClass::Database,
+                slot: 0,
+            },
+            role,
+            PrivilegeSet::CONNECT,
+            txid,
+        )
     }
 
     pub fn live_roles(&self) -> impl Iterator<Item = (usize, &RoleDef)> {
@@ -9345,6 +9507,10 @@ impl Storage {
     /// a deterministic catalog range.
     pub fn role_oid(slot: usize) -> i32 {
         if slot == 0 { 10 } else { 16_384 + slot as i32 }
+    }
+
+    pub fn role_membership_oid(slot: usize) -> i32 {
+        32_768 + slot as i32
     }
 
     pub(crate) fn role_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
@@ -9373,6 +9539,7 @@ impl Storage {
                 TriggerTarget::Table(table) => &self.tables[usize::from(table)].ownership,
                 TriggerTarget::View(view) => &self.views[usize::from(view)].ownership,
             },
+            AccessClass::Database => &self.database_ownership,
         }
     }
 
@@ -9395,6 +9562,7 @@ impl Storage {
             AccessClass::Trigger => {
                 unreachable!("triggers inherit relation ownership and cannot be reassigned")
             }
+            AccessClass::Database => &mut self.database_ownership,
         }
     }
 
@@ -9470,6 +9638,9 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics_slot(schema, name, txid),
             AccessClass::Extension => self.extension_slot(name, txid),
             AccessClass::Trigger => None,
+            AccessClass::Database => {
+                (schema.is_empty() && name.eq_ignore_ascii_case("postgres")).then_some(0)
+            }
         }?;
         u16::try_from(slot)
             .ok()
@@ -9544,6 +9715,10 @@ impl Storage {
                 };
                 (schema, trigger.name_to(txid))
             }
+            AccessClass::Database => (
+                SqlName::EMPTY,
+                SqlName::parse("postgres").expect("built-in database name is valid"),
+            ),
         }
     }
 
@@ -9568,6 +9743,7 @@ impl Storage {
             }
             AccessClass::Extension => self.extensions[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Trigger => self.triggers[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::Database => slot == 0,
         }
     }
 
@@ -9588,6 +9764,7 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics[slot].visible_to(txid),
             AccessClass::Extension => self.extensions[slot].visible_to(txid),
             AccessClass::Trigger => self.triggers[slot].visible_to(txid),
+            AccessClass::Database => slot == 0,
         }
     }
 
@@ -9607,6 +9784,7 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics.len(),
             AccessClass::Extension => self.extensions.len(),
             AccessClass::Trigger => self.triggers.len(),
+            AccessClass::Database => 1,
         }
     }
 
@@ -9622,6 +9800,15 @@ impl Storage {
                 entry.grant_options = PrivilegeSet::NONE;
                 entry.pending = None;
                 entry.object.slot = u16::MAX;
+            }
+        }
+        for entry in self.column_acl_entries.iter_mut() {
+            if entry.target.relation == object {
+                entry.live = false;
+                entry.privileges = PrivilegeSet::NONE;
+                entry.grant_options = PrivilegeSet::NONE;
+                entry.pending = None;
+                entry.target.relation.slot = u16::MAX;
             }
         }
     }
@@ -9663,6 +9850,27 @@ impl Storage {
             || self.default_acl_entries.iter().any(|entry| {
                 let (defined, _, _) = Self::default_acl_visible(entry, txid);
                 defined && (entry.owner == role as u16 || entry.grantee == role as u16)
+            })
+            || self.column_acl_entries.iter().any(|entry| {
+                let (visible, grantee, grantor, _, _) = match entry.pending {
+                    Some(pending) if pending.txid == txid => (
+                        pending.privileges.0 != 0,
+                        pending.grantee,
+                        pending.grantor,
+                        pending.privileges,
+                        pending.grant_options,
+                    ),
+                    _ => (
+                        entry.live,
+                        entry.grantee,
+                        entry.grantor,
+                        entry.privileges,
+                        entry.grant_options,
+                    ),
+                };
+                visible
+                    && self.access_object_visible_to(entry.target.relation, txid)
+                    && (grantee == role as u16 || grantor == role as u16)
             })
             || self
                 .policies_with_slots_visible_to(txid)
@@ -10205,14 +10413,313 @@ impl Storage {
         count
     }
 
+    fn column_acl_visible(
+        entry: &ColumnAclEntry,
+        txid: u32,
+    ) -> (bool, u16, u16, PrivilegeSet, PrivilegeSet) {
+        match entry.pending {
+            Some(pending) if pending.txid == txid => (
+                pending.privileges.0 != 0,
+                pending.grantee,
+                pending.grantor,
+                pending.privileges,
+                pending.grant_options,
+            ),
+            _ => (
+                entry.live,
+                entry.grantee,
+                entry.grantor,
+                entry.privileges,
+                entry.grant_options,
+            ),
+        }
+    }
+
+    pub(crate) fn change_column_acl(
+        &mut self,
+        target: ColumnPrivilegeTarget,
+        grantee: u16,
+        grantor: u16,
+        privileges: PrivilegeSet,
+        grant_options: PrivilegeSet,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingAcl>), SqlError> {
+        let slot = self
+            .column_acl_entries
+            .iter()
+            .position(|entry| {
+                let (_, visible_grantee, visible_grantor, _, _) =
+                    Self::column_acl_visible(entry, txid);
+                entry.target == target
+                    && visible_grantee == grantee
+                    && visible_grantor == grantor
+                    && (entry.live || entry.pending.is_some())
+            })
+            .or_else(|| {
+                self.column_acl_entries.iter().position(|entry| {
+                    entry.target.relation.slot == u16::MAX && !entry.live && entry.pending.is_none()
+                })
+            })
+            .unwrap_or(self.column_acl_entries.len());
+        if slot == self.column_acl_entries.len() {
+            self.column_acl_entries
+                .push(ColumnAclEntry {
+                    target,
+                    grantee,
+                    grantor,
+                    privileges: PrivilegeSet::NONE,
+                    grant_options: PrivilegeSet::NONE,
+                    live: false,
+                    pending: None,
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many column privilege entries (limit {})",
+                        MAX_COLUMN_ACL_ENTRIES
+                    )
+                })?;
+        } else if self.column_acl_entries[slot].target.relation.slot == u16::MAX {
+            let entry = &mut self.column_acl_entries[slot];
+            entry.target = target;
+            entry.grantee = grantee;
+            entry.grantor = grantor;
+        }
+        let entry = &mut self.column_acl_entries[slot];
+        let prior = entry.pending;
+        if txid == 0 {
+            entry.grantee = grantee;
+            entry.grantor = grantor;
+            entry.privileges = privileges;
+            entry.grant_options = grant_options;
+            entry.live = privileges.0 != 0;
+            entry.pending = None;
+        } else {
+            entry.pending = Some(PendingAcl {
+                txid,
+                grantee,
+                grantor,
+                privileges,
+                grant_options,
+            });
+        }
+        Ok((slot, prior))
+    }
+
+    pub(crate) fn column_acl_from(
+        &self,
+        target: ColumnPrivilegeTarget,
+        grantee: u16,
+        grantor: u16,
+        txid: u32,
+    ) -> (PrivilegeSet, PrivilegeSet) {
+        self.column_acl_entries
+            .iter()
+            .filter(|entry| {
+                let (_, visible_grantee, visible_grantor, _, _) =
+                    Self::column_acl_visible(entry, txid);
+                entry.target == target && visible_grantee == grantee && visible_grantor == grantor
+            })
+            .fold(
+                (PrivilegeSet::NONE, PrivilegeSet::NONE),
+                |(privileges, options), entry| {
+                    let (visible, _, _, entry_privileges, entry_options) =
+                        Self::column_acl_visible(entry, txid);
+                    if visible {
+                        (
+                            privileges.union(entry_privileges),
+                            options.union(entry_options),
+                        )
+                    } else {
+                        (privileges, options)
+                    }
+                },
+            )
+    }
+
+    fn column_acl_to(
+        &self,
+        target: ColumnPrivilegeTarget,
+        grantee: u16,
+        txid: u32,
+    ) -> (PrivilegeSet, PrivilegeSet) {
+        self.column_acl_entries
+            .iter()
+            .filter(|entry| {
+                let (_, visible_grantee, _, _, _) = Self::column_acl_visible(entry, txid);
+                entry.target == target && visible_grantee == grantee
+            })
+            .fold(
+                (PrivilegeSet::NONE, PrivilegeSet::NONE),
+                |(privileges, options), entry| {
+                    let (visible, _, _, entry_privileges, entry_options) =
+                        Self::column_acl_visible(entry, txid);
+                    if visible {
+                        (
+                            privileges.union(entry_privileges),
+                            options.union(entry_options),
+                        )
+                    } else {
+                        (privileges, options)
+                    }
+                },
+            )
+    }
+
+    pub(crate) fn column_acl_entries(&self) -> impl Iterator<Item = (usize, &ColumnAclEntry)> {
+        self.column_acl_entries.iter().enumerate()
+    }
+
+    pub(crate) fn live_column_acls(&self) -> impl Iterator<Item = (usize, &ColumnAclEntry)> {
+        self.column_acl_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.live)
+    }
+
+    pub(crate) fn dependent_column_acl_slots(
+        &self,
+        target: ColumnPrivilegeTarget,
+        grantor: u16,
+        privileges: PrivilegeSet,
+        txid: u32,
+        output: &mut [usize; MAX_COLUMN_ACL_ENTRIES],
+    ) -> usize {
+        let mut count = 0usize;
+        for (slot, entry) in self.column_acl_entries.iter().enumerate() {
+            let (visible, _, entry_grantor, entry_privileges, _) =
+                Self::column_acl_visible(entry, txid);
+            if visible
+                && entry.target == target
+                && entry_grantor == grantor
+                && entry_privileges.0 & privileges.0 != 0
+            {
+                output[count] = slot;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub(crate) fn column_acl_entry(&self, slot: usize) -> &ColumnAclEntry {
+        &self.column_acl_entries[slot]
+    }
+
+    pub(crate) fn column_acl_identity(&self, slot: usize, txid: u32) -> (u16, u16) {
+        let (_, grantee, grantor, _, _) =
+            Self::column_acl_visible(&self.column_acl_entries[slot], txid);
+        (grantee, grantor)
+    }
+
+    pub(crate) fn column_acl_state(&self, slot: usize, txid: u32) -> (PrivilegeSet, PrivilegeSet) {
+        let (visible, _, _, privileges, options) =
+            Self::column_acl_visible(&self.column_acl_entries[slot], txid);
+        if visible {
+            (privileges, options)
+        } else {
+            (PrivilegeSet::NONE, PrivilegeSet::NONE)
+        }
+    }
+
+    pub(crate) fn change_column_acl_identity(
+        &mut self,
+        slot: usize,
+        grantee: u16,
+        grantor: u16,
+        txid: u32,
+    ) -> Option<PendingAcl> {
+        let entry = &mut self.column_acl_entries[slot];
+        let prior = entry.pending;
+        let (_, _, _, privileges, grant_options) = Self::column_acl_visible(entry, txid);
+        if txid == 0 {
+            entry.grantee = grantee;
+            entry.grantor = grantor;
+            entry.pending = None;
+        } else {
+            entry.pending = Some(PendingAcl {
+                txid,
+                grantee,
+                grantor,
+                privileges,
+                grant_options,
+            });
+        }
+        prior
+    }
+
+    pub(crate) fn commit_column_acl(&mut self, slot: usize, txid: u32) {
+        let Some(pending) = self.column_acl_entries[slot]
+            .pending
+            .filter(|pending| pending.txid == txid)
+        else {
+            return;
+        };
+        let entry = &mut self.column_acl_entries[slot];
+        entry.grantee = pending.grantee;
+        entry.grantor = pending.grantor;
+        entry.privileges = pending.privileges;
+        entry.grant_options = pending.grant_options;
+        entry.live = pending.privileges.0 != 0;
+        entry.pending = None;
+        if !entry.live {
+            entry.target.relation.slot = u16::MAX;
+        }
+    }
+
+    pub(crate) fn restore_column_acl_pending(&mut self, slot: usize, prior: Option<PendingAcl>) {
+        self.column_acl_entries[slot].pending = prior;
+        if prior.is_none() && !self.column_acl_entries[slot].live {
+            self.column_acl_entries[slot].target.relation.slot = u16::MAX;
+        }
+    }
+
+    pub(crate) fn has_column_privilege(
+        &self,
+        target: ColumnPrivilegeTarget,
+        role: usize,
+        privilege: PrivilegeSet,
+        txid: u32,
+    ) -> bool {
+        if self.has_object_privilege(target.relation, role, privilege, txid) {
+            return true;
+        }
+        let mut roles = [false; MAX_ROLES];
+        self.inherited_roles(role, txid, &mut roles);
+        let mut effective = self.column_acl_to(target, PUBLIC_ROLE, txid).0;
+        for (slot, inherited) in roles.into_iter().enumerate() {
+            if inherited {
+                effective = effective.union(self.column_acl_to(target, slot as u16, txid).0);
+            }
+        }
+        effective.contains(privilege)
+    }
+
+    pub(crate) fn has_column_grant_option(
+        &self,
+        target: ColumnPrivilegeTarget,
+        role: usize,
+        privilege: PrivilegeSet,
+        txid: u32,
+    ) -> bool {
+        if self.has_object_grant_option(target.relation, role, privilege, txid) {
+            return true;
+        }
+        let mut roles = [false; MAX_ROLES];
+        self.inherited_roles(role, txid, &mut roles);
+        let mut effective = self.column_acl_to(target, PUBLIC_ROLE, txid).1;
+        for (slot, inherited) in roles.into_iter().enumerate() {
+            if inherited {
+                effective = effective.union(self.column_acl_to(target, slot as u16, txid).1);
+            }
+        }
+        effective.contains(privilege)
+    }
+
     fn inherited_roles(&self, member: usize, txid: u32, out: &mut [bool; MAX_ROLES]) {
         if out[member] {
             return;
         }
         out[member] = true;
-        if !self.role(member).attributes_to(txid).inherit {
-            return;
-        }
         for membership in self.role_memberships.iter() {
             if membership.visible_to(txid)
                 && membership.member as usize == member
@@ -10254,16 +10761,13 @@ impl Storage {
         }
         let mut roles = [false; MAX_ROLES];
         self.inherited_roles(role, txid, &mut roles);
-        let public_acl_defined = self.acl_entries.iter().any(|entry| {
-            let (_, grantee, _, _, _) = Self::acl_visible(entry, txid);
-            entry.object == object && grantee == PUBLIC_ROLE && entry.object.slot != u16::MAX
+        let acl_defined = self.acl_entries.iter().any(|entry| {
+            entry.object == object
+                && entry.object.slot != u16::MAX
+                && (entry.live || entry.pending.is_some())
         });
-        let mut effective = if !public_acl_defined {
-            match object.class {
-                AccessClass::Domain | AccessClass::Enum => PrivilegeSet::USAGE,
-                AccessClass::Routine => PrivilegeSet::EXECUTE,
-                _ => PrivilegeSet::NONE,
-            }
+        let mut effective = if !acl_defined {
+            default_public_object_privileges(object.class)
         } else {
             self.acl_to(object, PUBLIC_ROLE, txid).0
         };
@@ -10811,11 +11315,11 @@ impl Storage {
         if existing.is_none() {
             self.role_memberships[slot].role = role as u16;
             self.role_memberships[slot].member = member as u16;
-            self.role_memberships[slot].grantor = grantor as u16;
         }
         self.role_memberships[slot].pending = Some(PendingRoleMembership {
             txid,
             exists,
+            grantor: grantor as u16,
             options,
         });
         Ok((slot, prior))
@@ -10826,6 +11330,7 @@ impl Storage {
             return;
         };
         self.role_memberships[slot].live = pending.exists;
+        self.role_memberships[slot].grantor = pending.grantor;
         self.role_memberships[slot].options = pending.options;
         if !pending.exists {
             self.role_memberships[slot].role = 0;
@@ -10876,6 +11381,7 @@ impl Storage {
             )
         })?;
         if let Some(slot) = self.find_role_membership_visible(role, member, 0) {
+            self.role_memberships[slot].grantor = grantor as u16;
             self.role_memberships[slot].options = options;
             return Ok(slot);
         }
@@ -10899,6 +11405,128 @@ impl Storage {
             pending: None,
         };
         Ok(slot)
+    }
+
+    pub(crate) fn role_settings(&self) -> impl Iterator<Item = (usize, &RoleSetting)> {
+        self.role_settings.iter().enumerate()
+    }
+
+    pub(crate) fn role_setting(&self, slot: usize) -> &RoleSetting {
+        &self.role_settings[slot]
+    }
+
+    pub(crate) fn change_role_setting(
+        &mut self,
+        scope: RoleSettingScope,
+        name: SqlName,
+        value: Option<StackStr<ROLE_SETTING_VALUE_MAX>>,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingRoleSetting>), SqlError> {
+        let existing = self.role_settings.iter().position(|setting| {
+            (setting.live || setting.pending.is_some())
+                && setting.scope == scope
+                && setting.name == name
+        });
+        let slot = match existing {
+            Some(slot) => slot,
+            None if value.is_none() => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role setting does not exist"
+                ));
+            }
+            None => self
+                .role_settings
+                .iter()
+                .position(|setting| !setting.live && setting.pending.is_none())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many role settings (limit {})",
+                        MAX_ROLE_SETTINGS
+                    )
+                })?,
+        };
+        if let Some(pending) = self.role_settings[slot].pending
+            && pending.txid != txid
+        {
+            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent role setting DDL"
+            ));
+        }
+        let prior = self.role_settings[slot].pending;
+        if existing.is_none() {
+            self.role_settings[slot].scope = scope;
+            self.role_settings[slot].name = name;
+        }
+        self.role_settings[slot].pending = Some(PendingRoleSetting {
+            txid,
+            exists: value.is_some(),
+            value: value.unwrap_or_default(),
+        });
+        Ok((slot, prior))
+    }
+
+    pub(crate) fn commit_role_setting(&mut self, slot: usize) {
+        let Some(pending) = self.role_settings[slot].pending.take() else {
+            return;
+        };
+        self.role_settings[slot].live = pending.exists;
+        self.role_settings[slot].value = pending.value;
+        if !pending.exists {
+            self.role_settings[slot] = RoleSetting::EMPTY;
+        }
+    }
+
+    pub(crate) fn rollback_role_setting(&mut self, slot: usize, prior: Option<PendingRoleSetting>) {
+        self.role_settings[slot].pending = prior;
+        if !self.role_settings[slot].live && prior.is_none() {
+            self.role_settings[slot] = RoleSetting::EMPTY;
+        }
+    }
+
+    pub(crate) fn install_role_setting(
+        &mut self,
+        scope: RoleSettingScope,
+        name: SqlName,
+        value: Option<StackStr<ROLE_SETTING_VALUE_MAX>>,
+    ) -> Result<(), SqlError> {
+        if let Some(slot) = self
+            .role_settings
+            .iter()
+            .position(|setting| setting.live && setting.scope == scope && setting.name == name)
+        {
+            if let Some(value) = value {
+                self.role_settings[slot].value = value;
+            } else {
+                self.role_settings[slot] = RoleSetting::EMPTY;
+            }
+            return Ok(());
+        }
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let slot = self
+            .role_settings
+            .iter()
+            .position(|setting| !setting.live && setting.pending.is_none())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many role settings (limit {})",
+                    MAX_ROLE_SETTINGS
+                )
+            })?;
+        self.role_settings[slot] = RoleSetting {
+            scope,
+            name,
+            value,
+            live: true,
+            pending: None,
+        };
+        Ok(())
     }
 
     pub fn remove_role_membership(&mut self, role_name: &str, member_name: &str) {
@@ -10961,6 +11589,33 @@ impl Storage {
                 && membership.role as usize == target
                 && membership.options_to(txid).admin
                 && self.role_is_member_of(member, membership.member as usize, txid)
+        })
+    }
+
+    pub fn role_can_admin_excluding(
+        &self,
+        member: usize,
+        target: usize,
+        excluded: usize,
+        txid: u32,
+    ) -> bool {
+        self.role_memberships
+            .iter()
+            .enumerate()
+            .any(|(slot, membership)| {
+                slot != excluded
+                    && membership.visible_to(txid)
+                    && membership.role as usize == target
+                    && membership.options_to(txid).admin
+                    && self.role_is_member_of(member, membership.member as usize, txid)
+            })
+    }
+
+    pub fn role_has_grants_from(&self, role: usize, grantor: usize, txid: u32) -> bool {
+        self.role_memberships.iter().any(|membership| {
+            membership.visible_to(txid)
+                && membership.role as usize == role
+                && membership.grantor_to(txid) as usize == grantor
         })
     }
 
@@ -24619,6 +25274,7 @@ mod tests {
             AccessClass::Tablespace,
             AccessClass::Extension,
             AccessClass::Trigger,
+            AccessClass::Database,
         ] {
             assert_eq!(AccessClass::from_u8(class as u8), Some(class));
         }

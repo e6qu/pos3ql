@@ -1716,6 +1716,157 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         .map(Some)
     }
 
+    fn has_column_privilege(
+        &self,
+        role: Option<&str>,
+        relation: &str,
+        column: super::eval::PrivilegeColumn<'_>,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let (schema, name) = split_catalog_name(relation);
+        let (object, column) = match self.storage.resolve_relation(schema, name, self.txid) {
+            Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                let definition = self.storage.table_def(slot, self.txid);
+                let column = match column {
+                    super::eval::PrivilegeColumn::Name(name) => definition.column_index(name),
+                    super::eval::PrivilegeColumn::Number(number) if number > 0 => {
+                        let index = number as usize - 1;
+                        (index < definition.n_columns).then_some(index)
+                    }
+                    super::eval::PrivilegeColumn::Number(_) => None,
+                };
+                (self.storage.table_access_object(slot, self.txid), column)
+            }
+            Some(crate::storage::ResolvedRelation::View(slot)) => {
+                let object = crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::View,
+                    slot: slot as u16,
+                };
+                let view = self.storage.view(slot);
+                let mut descriptions = [ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+                let count = super::catalog::describe_view(
+                    self.storage,
+                    self.txid,
+                    view,
+                    self.routine_workspace,
+                    &mut descriptions,
+                )?;
+                let column = match column {
+                    super::eval::PrivilegeColumn::Name(name) => descriptions[..count]
+                        .iter()
+                        .position(|description| description.name.eq_ignore_ascii_case(name)),
+                    super::eval::PrivilegeColumn::Number(number) if number > 0 => {
+                        let index = number as usize - 1;
+                        (index < count).then_some(index)
+                    }
+                    super::eval::PrivilegeColumn::Number(_) => None,
+                };
+                (object, column)
+            }
+            Some(crate::storage::ResolvedRelation::Catalog) | None => return Ok(None),
+        };
+        let column =
+            column.ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column does not exist"))?;
+        let target = crate::storage::ColumnPrivilegeTarget::new(object, column as u16)?;
+        let all = crate::storage::PrivilegeSet::SELECT
+            .union(crate::storage::PrivilegeSet::INSERT)
+            .union(crate::storage::PrivilegeSet::UPDATE)
+            .union(crate::storage::PrivilegeSet::REFERENCES);
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            all,
+            |privilege| {
+                self.storage
+                    .has_column_privilege(target, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_column_grant_option(target, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
+    fn has_any_column_privilege(
+        &self,
+        role: Option<&str>,
+        relation: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let (schema, name) = split_catalog_name(relation);
+        let (object, columns) = match self.storage.resolve_relation(schema, name, self.txid) {
+            Some(crate::storage::ResolvedRelation::Table(slot)) => {
+                let definition = self.storage.table_def(slot, self.txid);
+                (
+                    self.storage.table_access_object(slot, self.txid),
+                    definition.n_columns,
+                )
+            }
+            Some(crate::storage::ResolvedRelation::View(slot)) => {
+                let view = self.storage.view(slot);
+                let mut descriptions = [ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+                let count = super::catalog::describe_view(
+                    self.storage,
+                    self.txid,
+                    view,
+                    self.routine_workspace,
+                    &mut descriptions,
+                )?;
+                (
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::View,
+                        slot: slot as u16,
+                    },
+                    count,
+                )
+            }
+            Some(crate::storage::ResolvedRelation::Catalog) | None => return Ok(None),
+        };
+        let all = crate::storage::PrivilegeSet::SELECT
+            .union(crate::storage::PrivilegeSet::INSERT)
+            .union(crate::storage::PrivilegeSet::UPDATE)
+            .union(crate::storage::PrivilegeSet::REFERENCES);
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            all,
+            |privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+                    || (0..columns).any(|column| {
+                        crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(
+                            |target| {
+                                self.storage
+                                    .has_column_privilege(target, role, privilege, self.txid)
+                            },
+                        )
+                    })
+            },
+            |privilege| {
+                self.storage
+                    .has_object_grant_option(object, role, privilege, self.txid)
+                    || (0..columns).any(|column| {
+                        crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(
+                            |target| {
+                                self.storage
+                                    .has_column_grant_option(target, role, privilege, self.txid)
+                            },
+                        )
+                    })
+            },
+        )
+        .map(Some)
+    }
+
     fn has_sequence_privilege(
         &self,
         role: Option<&str>,
@@ -1898,33 +2049,75 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn has_database_privilege(
         &self,
         role: Option<&str>,
+        database: &str,
         privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
         let role = match privilege_role(self.storage, role, self.txid) {
             Some(role) => role,
             None => return Ok(None),
         };
-        let mut result = true;
-        for written in privileges.split(',') {
-            let privilege = written.trim();
-            let allowed = if privilege.eq_ignore_ascii_case("connect")
-                || privilege.eq_ignore_ascii_case("temporary")
-                || privilege.eq_ignore_ascii_case("temp")
-            {
-                true
-            } else if privilege.eq_ignore_ascii_case("create") {
-                self.storage
-                    .has_current_database_create_privilege(role, self.txid)
-            } else {
-                return Err(sql_err!(
-                    sqlstate::INVALID_PARAMETER_VALUE,
-                    "unrecognized privilege type: \"{}\"",
-                    privilege
-                ));
-            };
-            result &= allowed;
+        if !database.eq_ignore_ascii_case("postgres") {
+            return Ok(None);
         }
-        Ok(Some(result))
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Database,
+            slot: 0,
+        };
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            crate::storage::PrivilegeSet::DATABASE_ALL,
+            |privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_object_grant_option(object, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
+    fn database_name<'a>(&self, oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok((oid == 5).then_some("postgres"))
+    }
+
+    fn has_tablespace_privilege(
+        &self,
+        role: Option<&str>,
+        tablespace: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let Some(slot) = self.storage.tablespace_slot(tablespace, self.txid) else {
+            return Ok(None);
+        };
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Tablespace,
+            slot: slot as u16,
+        };
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            crate::storage::PrivilegeSet::CREATE,
+            |privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_object_grant_option(object, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
+    fn tablespace_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::tablespace_name_by_oid(self.storage, self.txid, oid, arena)
     }
 
     fn comment<'a>(
@@ -2223,6 +2416,10 @@ fn privilege_query(
                 crate::storage::PrivilegeSet::EXECUTE
             } else if name.eq_ignore_ascii_case("maintain") {
                 crate::storage::PrivilegeSet::MAINTAIN
+            } else if name.eq_ignore_ascii_case("connect") {
+                crate::storage::PrivilegeSet::CONNECT
+            } else if name.eq_ignore_ascii_case("temporary") || name.eq_ignore_ascii_case("temp") {
+                crate::storage::PrivilegeSet::TEMPORARY
             } else {
                 return Err(sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,

@@ -47,6 +47,45 @@ fn reject_replication_login(mode: ReplicationMode, role: crate::sql::RoleLogin) 
     mode != ReplicationMode::None && !role.superuser && !role.replication
 }
 
+fn apply_startup_options(guc: &GucState, options: &str) -> Result<(), SqlError> {
+    let mut words = options.split_ascii_whitespace();
+    while let Some(word) = words.next() {
+        let assignment = if word == "-c" {
+            words.next().ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "-c in startup options requires a parameter assignment"
+                )
+            })?
+        } else if let Some(assignment) = word.strip_prefix("-c") {
+            assignment
+        } else if let Some(assignment) = word.strip_prefix("--") {
+            assignment
+        } else {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "unsupported startup option \"{}\"",
+                word
+            ));
+        };
+        let Some((name, value)) = assignment.split_once('=') else {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "startup option \"{}\" requires name=value",
+                assignment
+            ));
+        };
+        if name.is_empty() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "startup configuration parameter name is empty"
+            ));
+        }
+        guc.set(name, value, false)?;
+    }
+    Ok(())
+}
+
 struct Prepared {
     active: bool,
     name: SqlName,
@@ -241,6 +280,7 @@ pub struct Conn {
     login_verifier: LoginVerifier,
     auth_login: Option<crate::sql::RoleLogin>,
     authenticated_role: Option<u16>,
+    database: StackStr<64>,
     auth_password: StackStr<256>,
     auth_reject: bool,
     replication: ReplicationMode,
@@ -324,6 +364,7 @@ impl Conn {
             login_verifier: LoginVerifier::Rejected,
             auth_login: None,
             authenticated_role: None,
+            database: StackStr::new(),
             auth_password: StackStr::new(),
             auth_reject: false,
             replication: ReplicationMode::None,
@@ -376,6 +417,7 @@ impl Conn {
         self.login_verifier = LoginVerifier::Rejected;
         self.auth_login = None;
         self.authenticated_role = None;
+        self.database = StackStr::new();
         self.auth_password = StackStr::new();
         self.auth_reject = false;
         self.replication = ReplicationMode::None;
@@ -751,7 +793,6 @@ impl Conn {
         let mut unknown_protocol_options = [""; 8];
         let mut n_unknown = 0;
         let mut user_seen = false;
-        let mut guc_error: Option<crate::sql::eval::SqlError> = None;
         let mut msg = MsgIn::new(payload);
         loop {
             let Ok(key) = msg.cstr() else {
@@ -768,7 +809,18 @@ impl Conn {
                     user_seen = !value.is_empty();
                     self.guc.set_session_user(value);
                 }
-                "database" | "options" => {}
+                "database" => {
+                    self.database = StackStr::from_str(value);
+                    if self.database.is_truncated() {
+                        let mut responder = Responder::new(&mut self.send);
+                        let _ = responder.error(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "database name exceeds 64 bytes",
+                        );
+                        return Step::Close;
+                    }
+                }
+                "options" => {}
                 "replication" => {
                     self.replication = match value {
                         "database" => ReplicationMode::Logical,
@@ -784,26 +836,15 @@ impl Conn {
                         }
                     };
                 }
-                _ if key.starts_with("_pq_.") => {
-                    if n_unknown < unknown_protocol_options.len() {
-                        // The name outlives the buffer read only within this
-                        // call; NegotiateProtocolVersion is written before
-                        // the packet is consumed.
-                        unknown_protocol_options[n_unknown] = key;
-                        n_unknown += 1;
-                    }
+                _ if key.starts_with("_pq_.") && n_unknown < unknown_protocol_options.len() => {
+                    // The name outlives the buffer read only within this call;
+                    // negotiation is written before the packet is consumed.
+                    unknown_protocol_options[n_unknown] = key;
+                    n_unknown += 1;
                 }
-                // Recognized session GUCs (client_encoding, application_name,
-                // DateStyle, TimeZone, ...) are applied to the per-session
-                // store. A startup GUC we cannot honor rejects the connection,
-                // as PostgreSQL does — never silently left at a wrong default.
-                _ => {
-                    if guc_error.is_none()
-                        && let Err(e) = self.guc.set(key, value, false)
-                    {
-                        guc_error = Some(e);
-                    }
-                }
+                // Session GUCs are applied in a second pass after catalog role
+                // defaults, preserving PostgreSQL's startup precedence.
+                _ => {}
             }
         }
         if !user_seen {
@@ -814,10 +855,40 @@ impl Conn {
             );
             return Step::Close;
         }
-        if let Some(e) = guc_error {
+        if self.database.as_str().is_empty() {
+            self.database = self.guc.session_user();
+        }
+
+        let session_user = self.guc.session_user();
+        if let Some(role) = engine.role_login(session_user.as_str())
+            && let Err(error) = engine.apply_role_settings(role.slot, &self.guc)
+        {
             let mut responder = Responder::new(&mut self.send);
-            let _ = responder.error(e.sqlstate, e.message.as_str());
+            let _ = responder.error(error.sqlstate, error.message.as_str());
             return Step::Close;
+        }
+        let mut msg = MsgIn::new(payload);
+        loop {
+            let Ok(key) = msg.cstr() else {
+                return Step::Close;
+            };
+            if key.is_empty() {
+                break;
+            }
+            let Ok(value) = msg.cstr() else {
+                return Step::Close;
+            };
+            let result = match key {
+                "options" => apply_startup_options(&self.guc, value),
+                "user" | "database" | "replication" => Ok(()),
+                _ if key.starts_with("_pq_.") => Ok(()),
+                _ => self.guc.set(key, value, false),
+            };
+            if let Err(error) = result {
+                let mut responder = Responder::new(&mut self.send);
+                let _ = responder.error(error.sqlstate, error.message.as_str());
+                return Step::Close;
+            }
         }
 
         self.minor = requested_minor.min(wire::NEWEST_MINOR as u16);
@@ -826,7 +897,6 @@ impl Conn {
         self.role_scram = None;
         self.login_verifier = LoginVerifier::Rejected;
         self.auth_login = None;
-        let session_user = self.guc.session_user();
         if let Some(role) = engine.role_login(session_user.as_str()) {
             self.auth_login = Some(role);
             self.login_verifier =
@@ -894,10 +964,31 @@ impl Conn {
 
     /// AuthenticationOk, parameter statuses, key data, ReadyForQuery.
     fn finish_startup(&mut self, engine: &mut Engine, cancel_key: &[u8]) -> Step {
+        if !self.database.as_str().eq_ignore_ascii_case("postgres") {
+            let mut responder = Responder::new(&mut self.send);
+            let _ = responder.error(
+                sqlstate::INVALID_CATALOG_NAME,
+                stack_format!(
+                    128,
+                    "database \"{}\" does not exist",
+                    self.database.as_str()
+                )
+                .as_str(),
+            );
+            return Step::Close;
+        }
         if self.authenticated_role.is_none() {
             let Some(login) = self.auth_login else {
                 return Step::Close;
             };
+            if !engine.role_can_connect(login.slot) {
+                let mut responder = Responder::new(&mut self.send);
+                let _ = responder.error(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for database postgres",
+                );
+                return Step::Close;
+            }
             if !engine.reserve_role_connection(login) {
                 let mut responder = Responder::new(&mut self.send);
                 let _ = responder.error(
@@ -910,17 +1001,29 @@ impl Conn {
         }
         let minor = self.minor;
         let id = self.id;
+        let client_encoding = self
+            .guc
+            .get_owned("client_encoding")
+            .unwrap_or_else(|| StackStr::from_str("UTF8"));
+        let datestyle = self
+            .guc
+            .get_owned("datestyle")
+            .unwrap_or_else(|| StackStr::from_str("ISO, MDY"));
+        let timezone = self
+            .guc
+            .get_owned("timezone")
+            .unwrap_or_else(|| StackStr::from_str("UTC"));
         let mut responder = Responder::new(&mut self.send);
         let mut write_all = || -> Result<(), WireFull> {
             responder.auth_ok()?;
             for (k, v) in [
                 ("server_version", REPORTED_SERVER_VERSION),
                 ("server_encoding", "UTF8"),
-                ("client_encoding", "UTF8"),
-                ("DateStyle", "ISO, MDY"),
+                ("client_encoding", client_encoding.as_str()),
+                ("DateStyle", datestyle.as_str()),
                 ("integer_datetimes", "on"),
                 ("standard_conforming_strings", "on"),
-                ("TimeZone", "Etc/UTC"),
+                ("TimeZone", timezone.as_str()),
                 ("in_hot_standby", "off"),
             ] {
                 responder.parameter_status(k, v)?;

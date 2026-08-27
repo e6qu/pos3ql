@@ -1695,10 +1695,13 @@ fn role_catalog_replays_from_wal() {
     let output = run_with(
         &mut engine,
         &mut budget,
-        "CREATE ROLE durable LOGIN CREATEROLE CONNECTION LIMIT 7 PASSWORD 'never-store-this';
+        "CREATE ROLE durable LOGIN CREATEROLE CONNECTION LIMIT 7 \
+           PASSWORD 'never-store-this' VALID UNTIL 'infinity';
          ALTER ROLE durable NOINHERIT CREATEDB;
          CREATE ROLE durable_member;
-         GRANT durable TO durable_member WITH ADMIN OPTION;",
+         GRANT durable TO durable_member WITH ADMIN OPTION;
+         CREATE TABLE durable_column_acl (id integer, visible text, secret text);
+         GRANT SELECT (visible) ON durable_column_acl TO durable_member;",
     );
     assert!(!output.is_empty());
     drop(engine);
@@ -1721,11 +1724,22 @@ fn role_catalog_replays_from_wal() {
          SELECT parent.rolname, child.rolname, membership.admin_option
            FROM pg_auth_members membership
            JOIN pg_roles parent ON parent.oid = membership.roleid
-           JOIN pg_roles child ON child.oid = membership.member",
+           JOIN pg_roles child ON child.oid = membership.member;
+         SELECT rolpassword LIKE 'SCRAM-SHA-256$%', rolvaliduntil IS NULL
+           FROM pg_authid WHERE rolname = 'durable';
+         SELECT has_column_privilege(
+                  'durable_member', 'durable_column_acl', 'visible', 'SELECT'),
+                has_column_privilege(
+                  'durable_member', 'durable_column_acl', 'secret', 'SELECT')",
     );
     assert_eq!(
         data_rows(&output),
-        ["durable|f|t|t|t|7", "durable|durable_member|t"],
+        [
+            "durable|f|t|t|t|7",
+            "durable|durable_member|t",
+            "t|t",
+            "t|f"
+        ],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -1830,6 +1844,8 @@ fn object_ownership_and_acl_enforce_and_replay() {
         &mut budget,
         "CREATE ROLE app_owner;
          CREATE ROLE app_reader;
+         REVOKE CONNECT, TEMPORARY ON DATABASE postgres FROM PUBLIC;
+         GRANT CONNECT ON DATABASE postgres TO app_reader;
          GRANT CREATE ON SCHEMA public TO app_owner;
          SET ROLE app_owner;
          CREATE TABLE secured (id int PRIMARY KEY, value text);
@@ -1878,9 +1894,12 @@ fn object_ownership_and_acl_enforce_and_replay() {
         "SET ROLE app_reader;
          SELECT value FROM secured;
          INSERT INTO secured VALUES (2, 'owned');
-         SELECT count(*) FROM secured;",
+         SELECT count(*) FROM secured;
+         RESET ROLE;
+         SELECT has_database_privilege('app_reader', 'postgres', 'CONNECT'),
+                has_database_privilege('app_reader', 'postgres', 'TEMPORARY');",
     );
-    assert_eq!(data_rows(&output), ["visible", "2"]);
+    assert_eq!(data_rows(&output), ["visible", "2", "t|f"]);
 }
 
 #[test]
@@ -2607,6 +2626,601 @@ fn role_membership_controls_set_role_and_catalog_rows() {
 }
 
 #[test]
+fn role_membership_patches_defaults_grantors_and_dependencies_match_postgresql_18() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE membership_parent; \
+         CREATE ROLE membership_child NOINHERIT; \
+         CREATE ROLE membership_leaf; \
+         GRANT membership_parent TO membership_child; \
+         ALTER ROLE membership_child INHERIT; \
+         GRANT membership_parent TO membership_child WITH SET FALSE; \
+         GRANT membership_parent TO membership_child WITH ADMIN TRUE; \
+         SET ROLE membership_child; \
+         GRANT membership_parent TO membership_leaf; \
+         RESET ROLE; \
+         SELECT membership.oid > 0, membership.admin_option, \
+                membership.inherit_option, membership.set_option, grantor.rolname \
+           FROM pg_auth_members membership \
+           JOIN pg_roles member ON member.oid = membership.member \
+           JOIN pg_roles grantor ON grantor.oid = membership.grantor \
+          WHERE member.rolname = 'membership_child'",
+    );
+    assert_eq!(data_rows(&setup), ["t|t|f|f|postgres"]);
+
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE ADMIN OPTION FOR membership_parent FROM membership_child RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("dependent role privileges exist"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE ADMIN OPTION FOR membership_parent FROM membership_child CASCADE; \
+         SELECT member.rolname, membership.admin_option, membership.inherit_option, \
+                membership.set_option \
+           FROM pg_auth_members membership \
+           JOIN pg_roles member ON member.oid = membership.member \
+          WHERE membership.roleid = (SELECT oid FROM pg_roles \
+                                      WHERE rolname = 'membership_parent')",
+    );
+    assert_eq!(
+        data_rows(&cascaded),
+        ["membership_child|f|f|f"],
+        "{}",
+        String::from_utf8_lossy(&cascaded)
+    );
+}
+
+#[test]
+fn role_database_settings_are_transactional_catalogued_and_object_durable() {
+    let mut config = test_config("role-setting-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("role-settings-{}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE configured_login LOGIN; \
+         ALTER ROLE ALL IN DATABASE postgres SET application_name TO 'database-default'; \
+         ALTER ROLE configured_login SET application_name TO 'role-default'; \
+         ALTER ROLE configured_login IN DATABASE postgres \
+           SET application_name TO 'role-database-default'; \
+         ALTER ROLE configured_login SET search_path TO configured_login, public; \
+         SELECT setdatabase, setrole, setconfig::text \
+           FROM pg_db_role_setting ORDER BY setdatabase, setrole",
+    );
+    assert_eq!(
+        engine
+            .storage
+            .role_settings()
+            .filter(|(_, setting)| setting.live)
+            .count(),
+        4
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "0|16385|{application_name=role-default,\"search_path=configured_login, public\"}",
+            "5|0|{application_name=database-default}",
+            "5|16385|{application_name=role-database-default}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER ROLE configured_login SET statement_timeout TO '7s'; ROLLBACK",
+    );
+    let role = engine.role_login("configured_login").unwrap();
+    let mut guc = GucState::new();
+    guc.set_session_user("configured_login");
+    engine.apply_role_settings(role.slot, &guc).unwrap();
+    assert_eq!(
+        guc.get_owned("application_name").unwrap().as_str(),
+        "role-database-default"
+    );
+    assert_eq!(
+        guc.get_owned("search_path").unwrap().as_str(),
+        "configured_login, public"
+    );
+    assert_eq!(guc.get_owned("statement_timeout").unwrap().as_str(), "0");
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let role = recovered.role_login("configured_login").unwrap();
+    let mut recovered_guc = GucState::new();
+    recovered_guc.set_session_user("configured_login");
+    recovered
+        .apply_role_settings(role.slot, &recovered_guc)
+        .unwrap();
+    assert_eq!(
+        recovered_guc
+            .get_owned("application_name")
+            .unwrap()
+            .as_str(),
+        "role-database-default"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "DROP ROLE configured_login; SELECT count(*) FROM pg_db_role_setting"
+        )),
+        ["1"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
+    let mut config = test_config("column-acl-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("column-acls-{}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE column_writer; \
+         CREATE ROLE column_reader; \
+         CREATE ROLE column_leaf; \
+         CREATE ROLE column_owner; \
+         GRANT CREATE ON SCHEMA public TO column_writer, column_owner; \
+         CREATE TABLE column_acl_target ( \
+           id integer PRIMARY KEY, visible text, mutable text, secret text \
+         ); \
+         CREATE TABLE column_acl_merge_source (id integer, mutable text); \
+         INSERT INTO column_acl_target VALUES (1, 'shown', 'old', 'hidden'); \
+         INSERT INTO column_acl_merge_source VALUES (2, 'merged'); \
+         GRANT SELECT (id, visible), INSERT (id, visible, mutable), \
+               UPDATE (mutable), REFERENCES (id) \
+           ON column_acl_target TO column_writer; \
+         GRANT SELECT (id, mutable) ON column_acl_merge_source TO column_writer; \
+         GRANT SELECT (visible) ON column_acl_target TO column_reader \
+           WITH GRANT OPTION; \
+         SET ROLE column_owner; \
+         CREATE TABLE column_owned_target (id integer, visible text); \
+         GRANT SELECT (visible) ON column_owned_target TO column_writer; \
+         RESET ROLE; \
+         REASSIGN OWNED BY column_owner TO column_reader; \
+         ALTER TABLE column_owned_target DROP COLUMN id; \
+         SELECT has_column_privilege('column_writer', 'column_acl_target', 'visible', 'SELECT'), \
+                has_column_privilege('column_writer', 'column_acl_target', 4::smallint, 'SELECT'), \
+                has_column_privilege('column_writer', 'column_acl_target', 'mutable', 'UPDATE'), \
+                has_any_column_privilege('column_writer', 'column_acl_target', 'SELECT'), \
+                attacl::text \
+           FROM pg_attribute \
+          WHERE attrelid = 'column_acl_target'::regclass AND attname = 'visible'",
+    );
+    assert_eq!(
+        data_rows(&setup),
+        ["t|f|t|t|{column_writer=ar/postgres,column_reader=r*/postgres}"],
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attacl::text FROM pg_attribute \
+              WHERE attrelid = 'column_owned_target'::regclass AND attname = 'visible'"
+        )),
+        ["{column_writer=r/column_reader}"]
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attacl FROM pg_attribute \
+              WHERE attrelid = 'column_acl_target'::regclass AND attname = 'visible'",
+        )),
+        [crate::sql::types::oid::ACLITEM_ARRAY]
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT acldefault('r', oid) FROM pg_roles WHERE rolname = 'postgres'",
+        )),
+        [crate::sql::types::oid::ACLITEM_ARRAY]
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT p.proacl, i.initprivs \
+               FROM pg_proc p CROSS JOIN pg_init_privs i LIMIT 0",
+        )),
+        [
+            crate::sql::types::oid::ACLITEM_ARRAY,
+            crate::sql::types::oid::ACLITEM_ARRAY
+        ]
+    );
+    assert!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT p.oid FROM pg_proc p \
+               LEFT JOIN pg_init_privs i \
+                 ON p.oid = i.objoid AND i.classoid = 'pg_proc'::regclass \
+              WHERE p.proacl IS DISTINCT FROM i.initprivs"
+        ))
+        .is_empty()
+    );
+    assert_eq!(
+        row_description_type_oids(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 'r'::\"char\", 'r'::char",
+        )),
+        [crate::sql::types::oid::CHAR, crate::sql::types::oid::BPCHAR]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT acldefault('r', oid), acldefault('f', oid), \
+                    acldefault(CASE WHEN true THEN 's'::\"char\" \
+                                    ELSE 'r'::\"char\" END, oid), \
+                    has_database_privilege('postgres', 'postgres', 'CONNECT'), \
+                    has_database_privilege('postgres', 'missing', 'CONNECT') IS NULL \
+               FROM pg_roles WHERE rolname = 'postgres'"
+        )),
+        [
+            "{postgres=arwdDxtm/postgres}|{=X/postgres,postgres=X/postgres}|{postgres=rwU/postgres}|t|t"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT acldefault('F', oid)::text, acldefault('L', oid)::text, \
+                    acldefault('S', oid)::text, acldefault('T', oid)::text, \
+                    acldefault('c', oid)::text, acldefault('d', oid)::text, \
+                    acldefault('f', oid)::text, acldefault('l', oid)::text, \
+                    acldefault('n', oid)::text, acldefault('p', oid)::text, \
+                    acldefault('r', oid)::text, acldefault('s', oid)::text, \
+                    acldefault('t', oid)::text \
+               FROM pg_roles WHERE rolname = 'postgres'"
+        )),
+        [concat!(
+            "{postgres=U/postgres}|{postgres=rw/postgres}|{postgres=U/postgres}|",
+            "{=U/postgres,postgres=U/postgres}|{}|",
+            "{=Tc/postgres,postgres=CTc/postgres}|",
+            "{=X/postgres,postgres=X/postgres}|",
+            "{=U/postgres,postgres=U/postgres}|{postgres=UC/postgres}|",
+            "{postgres=sA/postgres}|{postgres=arwdDxtm/postgres}|",
+            "{postgres=rwU/postgres}|{postgres=C/postgres}"
+        )]
+    );
+    let sql_character_is_not_internal_char = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT acldefault('r'::char, oid) FROM pg_roles WHERE rolname = 'postgres'",
+    );
+    assert!(
+        String::from_utf8_lossy(&sql_character_is_not_internal_char).contains("42883"),
+        "{}",
+        String::from_utf8_lossy(&sql_character_is_not_internal_char)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE \"Odd/Role\"; \
+             GRANT SELECT (visible) ON column_acl_target TO \"Odd/Role\"; \
+             SELECT attacl::text FROM pg_attribute \
+              WHERE attrelid = 'column_acl_target'::regclass AND attname = 'visible'; \
+             SELECT acldefault('r', oid)::text FROM pg_roles WHERE rolname = 'Odd/Role'",
+        )),
+        [
+            "{column_writer=ar/postgres,column_reader=r*/postgres,\"\\\"Odd/Role\\\"=r/postgres\"}",
+            "{\"\\\"Odd/Role\\\"=arwdDxtm/\\\"Odd/Role\\\"\"}"
+        ]
+    );
+    let wrong_column_number_type = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT has_column_privilege( \
+           'column_writer', 'column_acl_target', 4, 'SELECT')",
+    );
+    assert!(
+        String::from_utf8_lossy(&wrong_column_number_type).contains("42883"),
+        "{}",
+        String::from_utf8_lossy(&wrong_column_number_type)
+    );
+
+    let allowed = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE column_writer; \
+         SELECT visible FROM column_acl_target; \
+         SELECT count(*) FROM column_acl_target; \
+         INSERT INTO column_acl_target (id, visible, mutable) VALUES (2, 'second', 'new'); \
+         UPDATE column_acl_target SET mutable = 'changed' WHERE id = 2; \
+         INSERT INTO column_acl_target (id, visible, mutable) VALUES (2, 'conflict', 'conflict') \
+           ON CONFLICT (id) DO UPDATE SET mutable = 'upserted' RETURNING visible; \
+         CREATE TABLE column_acl_child (parent integer REFERENCES column_acl_target(id)); \
+         RESET ROLE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&allowed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&allowed)
+    );
+    assert_eq!(data_rows(&allowed), ["shown", "1", "second"]);
+    let merged = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE column_writer; \
+         MERGE INTO column_acl_target AS target \
+           USING column_acl_merge_source AS source ON target.id = source.id \
+           WHEN MATCHED THEN UPDATE SET mutable = source.mutable \
+           WHEN NOT MATCHED THEN INSERT (id, mutable) VALUES (source.id, source.mutable); \
+         RESET ROLE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&merged).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&merged)
+    );
+    for denied in [
+        "SET ROLE column_writer; SELECT secret FROM column_acl_target",
+        "SET ROLE column_writer; INSERT INTO column_acl_target (id, secret) VALUES (3, 'no')",
+        "SET ROLE column_writer; UPDATE column_acl_target SET secret = 'no' WHERE id = 1",
+    ] {
+        let output = run_with(&mut engine, &mut budget, denied);
+        assert!(
+            String::from_utf8_lossy(&output).contains("42501"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        run_with(&mut engine, &mut budget, "RESET ROLE");
+    }
+
+    let delegated = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE column_reader; \
+         GRANT SELECT (visible) ON column_acl_target TO column_leaf; \
+         RESET ROLE; \
+         SELECT grantee, column_name, privilege_type, is_grantable \
+           FROM information_schema.column_privileges \
+          WHERE table_name = 'column_acl_target' \
+            AND grantee IN ('column_reader', 'column_leaf') \
+          ORDER BY grantee",
+    );
+    assert_eq!(
+        data_rows(&delegated),
+        [
+            "column_leaf|visible|SELECT|NO",
+            "column_reader|visible|SELECT|YES"
+        ]
+    );
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE GRANT OPTION FOR SELECT (visible) \
+           ON column_acl_target FROM column_reader RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("dependent privileges exist"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "REVOKE GRANT OPTION FOR SELECT (visible) \
+               ON column_acl_target FROM column_reader CASCADE; \
+             SELECT has_column_privilege( \
+               'column_leaf', 'column_acl_target', 'visible', 'SELECT')"
+        )),
+        ["f"]
+    );
+    let table_option_restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT SELECT ON column_acl_target TO column_reader WITH GRANT OPTION; \
+         SET ROLE column_reader; \
+         GRANT SELECT (secret) ON column_acl_target TO column_leaf; \
+         RESET ROLE; \
+         REVOKE GRANT OPTION FOR SELECT ON column_acl_target \
+           FROM column_reader RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&table_option_restricted).contains("dependent privileges exist"),
+        "{}",
+        String::from_utf8_lossy(&table_option_restricted)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "REVOKE GRANT OPTION FOR SELECT ON column_acl_target \
+               FROM column_reader CASCADE; \
+             SELECT has_column_privilege( \
+               'column_leaf', 'column_acl_target', 'secret', 'SELECT')"
+        )),
+        ["f"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW column_acl_view AS SELECT visible, secret FROM column_acl_target; \
+         GRANT SELECT ON column_acl_view TO column_writer",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT has_column_privilege( \
+               'column_writer', 'column_acl_view', 'visible', 'SELECT')"
+        )),
+        ["t"]
+    );
+    let view_column_grant = run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT SELECT (visible) ON column_acl_view TO column_writer",
+    );
+    assert!(String::from_utf8_lossy(&view_column_grant).contains("0A000"));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT has_column_privilege( \
+               'column_writer', 'column_acl_target', 'visible', 'SELECT'), \
+                    has_column_privilege( \
+               'column_writer', 'column_acl_target', 'secret', 'SELECT'); \
+             SELECT attacl::text FROM pg_attribute \
+              WHERE attrelid = 'column_owned_target'::regclass AND attname = 'visible'; \
+             SET ROLE column_writer; SELECT visible FROM column_acl_target; RESET ROLE"
+        )),
+        ["t|f", "{column_writer=r/column_reader}", "shown", "second"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "DROP OWNED BY column_reader CASCADE; \
+             SELECT has_column_privilege( \
+               'column_reader', 'column_acl_target', 'visible', 'SELECT')"
+        )),
+        ["f"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn column_acl_changes_have_transaction_owned_visibility() {
+    let (mut engine, mut budget) = test_engine();
+    let mut owner = TxnState::new(&mut budget, 256).unwrap();
+    let mut observer = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "CREATE ROLE staged_column_reader; \
+         CREATE TABLE staged_column_acl (visible text, secret text)",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "GRANT SELECT (visible) ON staged_column_acl TO staged_column_reader",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT has_column_privilege( \
+               'staged_column_reader', 'staged_column_acl', 'visible', 'SELECT')",
+        )),
+        ["t"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT has_column_privilege( \
+               'staged_column_reader', 'staged_column_acl', 'visible', 'SELECT')",
+        )),
+        ["f"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT has_any_column_privilege( \
+               'staged_column_reader', 'staged_column_acl', 'SELECT')",
+        )),
+        ["f"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "GRANT SELECT (visible) ON staged_column_acl TO staged_column_reader",
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT has_any_column_privilege( \
+               'staged_column_reader', 'staged_column_acl', 'SELECT')",
+        )),
+        ["t"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut owner,
+        "REVOKE SELECT (visible) ON staged_column_acl FROM staged_column_reader",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut owner,
+            "SELECT has_any_column_privilege( \
+               'staged_column_reader', 'staged_column_acl', 'SELECT')",
+        )),
+        ["f"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut observer,
+            "SELECT has_any_column_privilege( \
+               'staged_column_reader', 'staged_column_acl', 'SELECT')",
+        )),
+        ["t"]
+    );
+    run_txn(&mut engine, &mut budget, &mut owner, "ROLLBACK");
+}
+
+#[test]
 fn dropping_a_role_removes_memberships_transactionally() {
     let (mut engine, mut budget) = test_engine();
     let created = run_with(
@@ -2819,6 +3433,8 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
         "CREATE ROLE durable_owner;
          CREATE ROLE durable_reader IN ROLE durable_owner;
          CREATE ROLE unprivileged;
+         REVOKE CONNECT, TEMPORARY ON DATABASE postgres FROM PUBLIC;
+         GRANT CONNECT, CREATE ON DATABASE postgres TO durable_reader;
          REVOKE USAGE ON SCHEMA public FROM PUBLIC;
          GRANT USAGE, CREATE ON SCHEMA public TO durable_owner;
          GRANT USAGE ON SCHEMA public TO durable_reader;
@@ -2854,6 +3470,9 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
          INSERT INTO durable_default_after_restart VALUES ('default-authority');
          RESET ROLE;
          SET ROLE durable_reader;
+         CREATE SCHEMA durable_reader_schema;
+         RESET ROLE;
+         SET ROLE durable_reader;
          SELECT value FROM durable_exposed;
          SELECT value FROM durable_default_after_restart;
          SELECT nextval('durable_sequence');
@@ -2861,6 +3480,8 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
          SELECT has_schema_privilege('unprivileged', 'public', 'USAGE'),
                 has_table_privilege('durable_reader', 'durable_exposed', 'SELECT'),
                 has_type_privilege('unprivileged', 'durable_state', 'USAGE'),
+                has_database_privilege('durable_reader', 5::oid, 'CONNECT, CREATE'),
+                has_database_privilege('unprivileged', 'postgres', 'CONNECT'),
                 pg_get_userbyid(c.relowner)
            FROM pg_class c
           WHERE c.relname = 'durable_private';",
@@ -2871,7 +3492,7 @@ fn role_ownership_and_acl_survive_cold_object_store_recovery() {
             "object-authority",
             "default-authority",
             "1",
-            "f|t|f|durable_owner",
+            "f|t|f|t|f|durable_owner",
         ],
         "{}",
         String::from_utf8_lossy(&output)
@@ -2952,12 +3573,16 @@ fn user_defined_type_usage_defaults_to_public_and_can_be_revoked() {
         String::from_utf8_lossy(&output)
     );
     assert_eq!(data_rows(&output), ["t"]);
+    let revoked = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE USAGE ON TYPE deployment_state FROM PUBLIC",
+    );
+    assert!(!String::from_utf8_lossy(&revoked).contains("ERROR"));
     let output = run_with(
         &mut engine,
         &mut budget,
-        "REVOKE USAGE ON TYPE deployment_state FROM PUBLIC;
-         SET ROLE type_user;
-         CREATE TABLE denied_type_access (state deployment_state);",
+        "SET ROLE type_user; CREATE TABLE denied_type_access (state deployment_state);",
     );
     let rendered = String::from_utf8_lossy(&output);
     assert!(
@@ -32700,6 +33325,10 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
              WHERE spcname = 'lifecycle_space'; \
              SELECT array_to_string(spcacl, ',') FROM pg_tablespace \
              WHERE spcname = 'lifecycle_space'; \
+             SELECT has_tablespace_privilege( \
+               'lifecycle_builder', 'lifecycle_space', 'CREATE'), \
+                    has_tablespace_privilege( \
+               'lifecycle_builder', 'lifecycle_space', 'CREATE WITH GRANT OPTION'); \
              SELECT count(*) FROM pg_shdescription description JOIN pg_tablespace tablespace \
              ON tablespace.oid = description.objoid \
              WHERE tablespace.spcname = 'lifecycle_space'",
@@ -32710,6 +33339,7 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
             "lifecycle_space",
             "index placement namespace",
             "postgres=C/postgres,lifecycle_builder=C/postgres",
+            "t|f",
             "1",
         ]
     );

@@ -183,6 +183,162 @@ def test_protocol_32():
     s.close()
 
 
+def test_role_startup_defaults_database_and_options():
+    setup = connect()
+    setup.sendall(startup_payload(0))
+    drain_startup(setup)
+    result = simple_query(
+        setup,
+        "CREATE ROLE wire_startup_role LOGIN; "
+        "ALTER ROLE wire_startup_role SET datestyle TO 'ISO, DMY'; "
+        "ALTER ROLE wire_startup_role SET application_name TO 'role-default'",
+    )
+    check(
+        "startup role defaults: catalog setup succeeds",
+        not any(kind == b"E" for kind, _ in result),
+        result,
+    )
+
+    role = connect()
+    role.sendall(
+        startup_payload(
+            0,
+            user=b"wire_startup_role",
+            parameters=(
+                ("database", "postgres"),
+                ("options", "-c application_name=wire-option"),
+            ),
+        )
+    )
+    seen = drain_startup(role)
+    parameters = {}
+    for payload in seen.get(b"S", []):
+        key, value = payload.rstrip(b"\x00").split(b"\x00", 1)
+        parameters[key] = value
+    check(
+        "startup role defaults: catalog DateStyle reaches ParameterStatus",
+        parameters.get(b"DateStyle") == b"ISO, DMY",
+        parameters,
+    )
+    shown = simple_query(role, "SHOW application_name")
+    row = next((payload for kind, payload in shown if kind == b"D"), None)
+    check(
+        "startup role defaults: explicit options override the role default",
+        row is not None and text_row_fields(row) == ["wire-option"],
+        shown,
+    )
+    role.close()
+
+    missing = connect()
+    missing.sendall(
+        startup_payload(0, parameters=(("database", "missing_database"),))
+    )
+    kind, payload = read_message(missing)
+    check(
+        "startup database: unknown database is rejected as 3D000",
+        kind == b"E" and b"C3D000" in payload,
+        (kind, payload),
+    )
+    missing.close()
+
+    malformed = connect()
+    malformed.sendall(startup_payload(0, parameters=(("options", "-x ignored"),)))
+    kind, payload = read_message(malformed)
+    check(
+        "startup options: unsupported option is rejected rather than ignored",
+        kind == b"E" and b"C22023" in payload,
+        (kind, payload),
+    )
+    malformed.close()
+
+    denied_setup = simple_query(
+        setup,
+        "CREATE ROLE wire_database_denied LOGIN; "
+        "REVOKE CONNECT ON DATABASE postgres FROM PUBLIC",
+    )
+    check(
+        "startup database ACL: setup succeeds",
+        not any(kind == b"E" for kind, _ in denied_setup),
+        denied_setup,
+    )
+    denied = connect()
+    denied.sendall(
+        startup_payload(
+            0,
+            user=b"wire_database_denied",
+            parameters=(("database", "postgres"),),
+        )
+    )
+    kind, payload = read_message(denied)
+    check(
+        "startup database ACL: CONNECT is enforced after authentication",
+        kind == b"E" and b"C42501" in payload,
+        (kind, payload),
+    )
+    denied.close()
+    simple_query(
+        setup,
+        "GRANT CONNECT ON DATABASE postgres TO wire_database_denied; "
+        "GRANT CONNECT ON DATABASE postgres TO PUBLIC",
+    )
+    admitted = connect()
+    admitted.sendall(
+        startup_payload(
+            0,
+            user=b"wire_database_denied",
+            parameters=(("database", "postgres"),),
+        )
+    )
+    admitted_messages = drain_startup(admitted)
+    check(
+        "startup database ACL: an explicit CONNECT grant admits the role",
+        b"Z" in admitted_messages,
+        admitted_messages,
+    )
+    admitted.close()
+
+    simple_query(
+        setup,
+        "REVOKE CONNECT ON DATABASE postgres FROM wire_database_denied; "
+        "DROP ROLE wire_startup_role; DROP ROLE wire_database_denied",
+    )
+    setup.close()
+
+
+def test_aclitem_array_wire_identity():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE ROLE wire_acl_reader; "
+        "CREATE TABLE wire_acl_target (visible text); "
+        "GRANT SELECT (visible) ON wire_acl_target TO wire_acl_reader",
+    )
+    check(
+        "aclitem wire: setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    messages = extended_binary_result(
+        s,
+        "SELECT attacl FROM pg_attribute "
+        "WHERE attrelid = 'wire_acl_target'::regclass AND attname = 'visible'",
+    )
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    row = next((payload for kind, payload in messages if kind == b"D"), None)
+    expected = binary_array(1033, [b"wire_acl_reader=r/postgres"])
+    check(
+        "aclitem wire: Describe and binary array preserve PostgreSQL type identity",
+        description is not None
+        and row_description_type_oids(description) == [1034]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01" + struct.pack("!i", len(expected)) + expected,
+        messages,
+    )
+    s.close()
+
+
 def test_unknown_minor_negotiates():
     s = connect()
     s.sendall(startup_payload(7))  # 3.7 does not exist

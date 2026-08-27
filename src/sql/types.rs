@@ -10,6 +10,7 @@ use super::numeric::Numeric;
 pub mod oid {
     pub const BOOL: i32 = 16;
     pub const BYTEA: i32 = 17;
+    pub const CHAR: i32 = 18;
     pub const INT8: i32 = 20;
     pub const INT2: i32 = 21;
     pub const INT2VECTOR: i32 = 22;
@@ -24,6 +25,8 @@ pub mod oid {
     pub const OID: i32 = 26;
     pub const OID_ARRAY: i32 = 1028;
     pub const TEXT: i32 = 25;
+    pub const ACLITEM: i32 = 1033;
+    pub const ACLITEM_ARRAY: i32 = 1034;
     pub const NAME: i32 = 19;
     pub const FLOAT4: i32 = 700;
     pub const FLOAT8: i32 = 701;
@@ -130,6 +133,35 @@ pub mod oid {
     }
 }
 
+/// ACL text uses identifier quoting independent of SQL parsing. Returning a
+/// bounded value keeps role names containing spaces, capitals, quotes, `=`,
+/// or `/` from producing an ambiguous aclitem.
+pub(crate) fn acl_identifier(name: &str) -> crate::util::StackStr<132> {
+    if name.is_empty() {
+        return crate::util::StackStr::new();
+    }
+    let mut bytes = name.bytes();
+    let simple = bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'$')
+        });
+    if simple {
+        return crate::util::StackStr::from_str(name);
+    }
+    let mut quoted = crate::util::StackStr::<132>::new();
+    let _ = quoted.write_char('"');
+    for character in name.chars() {
+        if character == '"' {
+            let _ = quoted.write_char('"');
+        }
+        let _ = quoted.write_char(character);
+    }
+    let _ = quoted.write_char('"');
+    quoted
+}
+
 /// Column types the engine stores. A deliberately small, growing set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColType {
@@ -179,6 +211,10 @@ pub enum ColType {
     /// (`storage()` is Float8) and narrows to f32 at decode by schema.
     Float4,
     Float8,
+    /// PostgreSQL's internal one-byte `"char"` (OID 18), distinct from SQL
+    /// `char(n)`/`bpchar`. Values share text storage but retain this identity
+    /// at expression, catalog, and wire boundaries.
+    Char,
     Text,
     /// `name`: PostgreSQL's identifier type (OID 19, typlen 64). Text storage;
     /// input truncates to 63 bytes.
@@ -315,6 +351,7 @@ impl BtreeOperatorClass {
             | Regnamespace | Regrole => Self::Oid,
             Record | Composite(_) => Self::Record,
             Text | Varchar => Self::Text,
+            Char => return None,
             Time => Self::Time,
             Timestamp => Self::Timestamp,
             Timestamptz => Self::Timestamptz,
@@ -537,6 +574,7 @@ impl ColType {
             "bigint" | "int8" | "bigserial" | "serial8" => Self::Int8,
             "float8" | "float" | "double precision" => Self::Float8,
             "float4" | "real" => Self::Float4,
+            "\"char\"" => Self::Char,
             "text" => Self::Text,
             "regtype" => Self::Regtype,
             "regproc" => Self::Regproc,
@@ -598,6 +636,7 @@ impl ColType {
             Self::Int8 => oid::INT8,
             Self::Float4 => oid::FLOAT4,
             Self::Float8 => oid::FLOAT8,
+            Self::Char => oid::CHAR,
             Self::Text => oid::TEXT,
             Self::Name => oid::NAME,
             Self::Varchar => oid::VARCHAR,
@@ -657,6 +696,7 @@ impl ColType {
             oid::INT8 => Some(Self::Int8),
             oid::FLOAT4 => Some(Self::Float4),
             oid::FLOAT8 => Some(Self::Float8),
+            oid::CHAR => Some(Self::Char),
             oid::TEXT => Some(Self::Text),
             oid::NAME => Some(Self::Name),
             oid::VARCHAR => Some(Self::Varchar),
@@ -741,7 +781,7 @@ impl ColType {
     pub fn typlen(self) -> i16 {
         match self {
             Self::Void | Self::Internal => 4,
-            Self::Bool => 1,
+            Self::Bool | Self::Char => 1,
             Self::Int2 => 2,
             Self::Int2Vector
             | Self::OidVector
@@ -790,6 +830,7 @@ impl ColType {
     pub fn storage(self) -> ColType {
         match self {
             Self::Float4 => Self::Float8,
+            Self::Char => Self::Text,
             Self::Varchar
             | Self::Bpchar
             | Self::Name
@@ -838,6 +879,7 @@ impl ColType {
             Self::Int8 => "int8",
             Self::Float4 => "float4",
             Self::Float8 => "float8",
+            Self::Char => "char",
             Self::Text => "text",
             Self::Name => "name",
             Self::Varchar => "varchar",
@@ -905,6 +947,7 @@ impl ColType {
             Self::Int8 => "bigint",
             Self::Float4 => "real",
             Self::Float8 => "double precision",
+            Self::Char => "\"char\"",
             Self::Text => "text",
             Self::Name => "name",
             Self::Varchar => "character varying",
@@ -944,6 +987,7 @@ impl ColType {
             // Row encoding separately rejects pseudo-types.
             Self::Void => 57,
             Self::Internal => 73,
+            Self::Char => 74,
             Self::Bool => 1,
             Self::Int4 => 2,
             Self::Oid => 56,
@@ -1013,6 +1057,7 @@ impl ColType {
             1 => Self::Bool,
             57 => Self::Void,
             73 => Self::Internal,
+            74 => Self::Char,
             2 => Self::Int4,
             56 => Self::Oid,
             58 => Self::Regtype,
@@ -1084,6 +1129,9 @@ pub enum ArrElem {
     Int8,
     Float8,
     Text,
+    /// `aclitem[]` uses text-shaped values with PostgreSQL's distinct catalog
+    /// and wire identity. An individual aclitem is not a general stored type.
+    AclItem,
     Numeric,
     Date,
     Timestamp,
@@ -1152,7 +1200,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 49] = [
+    pub const BUILTIN: [Self; 50] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
@@ -1162,6 +1210,7 @@ impl ArrElem {
         Self::Float4,
         Self::Float8,
         Self::Text,
+        Self::AclItem,
         Self::Name,
         Self::Varchar,
         Self::Bpchar,
@@ -1229,6 +1278,7 @@ impl ArrElem {
             ArrElem::Int8 => "_int8",
             ArrElem::Float8 => "_float8",
             ArrElem::Text => "_text",
+            ArrElem::AclItem => "_aclitem",
             ArrElem::Numeric => "_numeric",
             ArrElem::Date => "_date",
             ArrElem::Timestamp => "_timestamp",
@@ -1294,6 +1344,7 @@ impl ArrElem {
             ArrElem::Int8 => "bigint[]",
             ArrElem::Float8 => "double precision[]",
             ArrElem::Text => "text[]",
+            ArrElem::AclItem => "aclitem[]",
             ArrElem::Numeric => "numeric[]",
             ArrElem::Date => "date[]",
             ArrElem::Timestamp => "timestamp[]",
@@ -1412,6 +1463,7 @@ impl ArrElem {
         // bpchar[] are their own array types), so match them before the
         // storage fold collapses them into text.
         match c {
+            ColType::Char => return Some(ArrElem::Char),
             ColType::Varchar => return Some(ArrElem::Varchar),
             ColType::Bpchar => return Some(ArrElem::Bpchar),
             ColType::Name => return Some(ArrElem::Name),
@@ -1464,12 +1516,13 @@ impl ArrElem {
     pub fn to_coltype(self) -> ColType {
         match self {
             ArrElem::Bool => ColType::Bool,
-            ArrElem::Char => ColType::Bpchar,
+            ArrElem::Char => ColType::Char,
             ArrElem::Int4 => ColType::Int4,
             ArrElem::Oid => ColType::Oid,
             ArrElem::Int8 => ColType::Int8,
             ArrElem::Float8 => ColType::Float8,
             ArrElem::Text => ColType::Text,
+            ArrElem::AclItem => ColType::Text,
             ArrElem::Numeric => ColType::Numeric,
             ArrElem::Date => ColType::Date,
             ArrElem::Timestamp => ColType::Timestamp,
@@ -1531,6 +1584,7 @@ impl ArrElem {
             ArrElem::Int8 => 1016,
             ArrElem::Float8 => 1022,
             ArrElem::Text => 1009,
+            ArrElem::AclItem => oid::ACLITEM_ARRAY,
             ArrElem::Numeric => 1231,
             ArrElem::Date => 1182,
             ArrElem::Timestamp => 1115,
@@ -1577,6 +1631,7 @@ impl ArrElem {
         match self {
             ArrElem::Domain { slot, .. } => oid::domain_oid(slot),
             ArrElem::Char => 18,
+            ArrElem::AclItem => oid::ACLITEM,
             _ => self.to_coltype().oid(),
         }
     }
@@ -1590,6 +1645,7 @@ impl ArrElem {
             ArrElem::Int8 => 2,
             ArrElem::Float8 => 3,
             ArrElem::Text => 4,
+            ArrElem::AclItem => 125,
             ArrElem::Numeric => 5,
             ArrElem::Date => 6,
             ArrElem::Timestamp => 7,
@@ -1638,6 +1694,7 @@ impl ArrElem {
             2 => ArrElem::Int8,
             3 => ArrElem::Float8,
             4 => ArrElem::Text,
+            125 => ArrElem::AclItem,
             5 => ArrElem::Numeric,
             6 => ArrElem::Date,
             7 => ArrElem::Timestamp,

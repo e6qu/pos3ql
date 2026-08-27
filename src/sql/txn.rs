@@ -77,7 +77,9 @@ pub(crate) struct StatementMark {
 }
 
 pub const MAX_SAVEPOINTS: usize = 16;
-pub const MAX_TRIGGER_NESTING: u16 = 32;
+// Trigger routines recurse through the bounded statement executor. Keep the
+// SQL limit below the smallest supported thread stack's native-frame limit.
+pub const MAX_TRIGGER_NESTING: u16 = 16;
 pub const MAX_TRUNCATE_TABLES: usize = 16;
 pub const MAX_TRUNCATE_WAL_TABLE_BYTES: usize = MAX_TRUNCATE_TABLES * 128;
 
@@ -376,11 +378,19 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingRoleMembership>,
     },
+    RoleSettingChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingRoleSetting>,
+    },
     ObjectOwnerChanged {
         object: crate::storage::AccessObject,
         prior: Option<crate::storage::PendingOwnership>,
     },
     ObjectAclChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingAcl>,
+    },
+    ColumnAclChanged {
         slot: u32,
         prior: Option<crate::storage::PendingAcl>,
     },

@@ -8,6 +8,15 @@ CREATE ROLE acl_managed;
 GRANT acl_managed TO acl_administrator WITH ADMIN OPTION;
 GRANT CREATE ON SCHEMA public TO acl_owner;
 
+SELECT acldefault('F', oid)::text, acldefault('L', oid)::text,
+       acldefault('S', oid)::text, acldefault('T', oid)::text,
+       acldefault('c', oid)::text, acldefault('d', oid)::text,
+       acldefault('f', oid)::text, acldefault('l', oid)::text,
+       acldefault('n', oid)::text, acldefault('p', oid)::text,
+       acldefault('r', oid)::text, acldefault('s', oid)::text,
+       acldefault('t', oid)::text
+  FROM pg_roles WHERE rolname = 'postgres';
+
 SET ROLE acl_owner;
 CREATE TABLE acl_private (id integer PRIMARY KEY, value text);
 INSERT INTO acl_private VALUES (1, 'visible-through-owner');
@@ -16,7 +25,7 @@ CREATE SEQUENCE acl_sequence;
 CREATE TYPE acl_state AS ENUM ('ready', 'blocked');
 RESET ROLE;
 
-GRANT SELECT ON acl_exposed TO acl_reader;
+GRANT SELECT ON acl_exposed TO acl_reader GRANTED BY CURRENT_USER;
 GRANT USAGE ON SEQUENCE acl_sequence TO acl_reader;
 SELECT grantor, grantee, table_name, privilege_type, is_grantable, with_hierarchy
 FROM information_schema.table_privileges
@@ -55,7 +64,7 @@ DROP TABLE acl_private;
 DROP SEQUENCE acl_sequence;
 DROP TYPE acl_state;
 REVOKE acl_managed FROM acl_administrator;
-REVOKE CREATE ON SCHEMA public FROM acl_renamed_owner;
+REVOKE CREATE ON SCHEMA public FROM acl_renamed_owner GRANTED BY CURRENT_USER;
 DROP ROLE acl_reader;
 DROP ROLE acl_renamed_owner;
 DROP ROLE acl_managed;
@@ -95,3 +104,110 @@ DROP OWNED BY owned_source;
 DROP ROLE owned_source;
 DROP OWNED BY owned_target CASCADE;
 DROP ROLE owned_target;
+
+CREATE ROLE membership_parent;
+CREATE ROLE membership_child NOINHERIT;
+CREATE ROLE membership_leaf;
+GRANT membership_parent TO membership_child;
+GRANT membership_parent TO membership_child WITH SET FALSE;
+GRANT membership_parent TO membership_child WITH ADMIN TRUE;
+SET ROLE membership_child;
+GRANT membership_parent TO membership_leaf;
+RESET ROLE;
+SELECT membership.oid > 0, member.rolname, grantor.rolname,
+       membership.admin_option, membership.inherit_option, membership.set_option
+  FROM pg_auth_members membership
+  JOIN pg_roles member ON member.oid = membership.member
+  JOIN pg_roles grantor ON grantor.oid = membership.grantor
+ WHERE membership.roleid = (SELECT oid FROM pg_roles
+                             WHERE rolname = 'membership_parent')
+ ORDER BY member.rolname;
+REVOKE ADMIN OPTION FOR membership_parent FROM membership_child CASCADE;
+SELECT member.rolname, membership.admin_option, membership.inherit_option,
+       membership.set_option
+  FROM pg_auth_members membership
+  JOIN pg_roles member ON member.oid = membership.member
+ WHERE membership.roleid = (SELECT oid FROM pg_roles
+                             WHERE rolname = 'membership_parent');
+
+ALTER ROLE ALL IN DATABASE postgres SET application_name TO 'database-default';
+ALTER ROLE membership_child SET application_name TO 'role-default';
+ALTER ROLE membership_child IN DATABASE postgres
+  SET application_name TO 'role-database-default';
+SELECT setdatabase <> 0, setrole <> 0, setconfig::text
+  FROM pg_db_role_setting
+ ORDER BY setdatabase, setrole;
+ALTER ROLE membership_child IN DATABASE postgres RESET application_name;
+ALTER ROLE membership_child RESET application_name;
+ALTER ROLE ALL IN DATABASE postgres RESET application_name;
+REVOKE membership_parent FROM membership_child;
+DROP ROLE membership_leaf;
+DROP ROLE membership_child;
+DROP ROLE membership_parent;
+
+CREATE ROLE database_actor;
+REVOKE CONNECT, TEMPORARY ON DATABASE postgres FROM PUBLIC;
+GRANT CONNECT, CREATE ON DATABASE postgres TO database_actor WITH GRANT OPTION;
+SELECT datacl::text FROM pg_database WHERE datname = 'postgres';
+SELECT has_database_privilege('database_actor', 'postgres', 'CONNECT, CREATE'),
+       has_database_privilege('database_actor', 5::oid, 'TEMPORARY'),
+       has_database_privilege('database_actor', 'postgres', 'CREATE WITH GRANT OPTION');
+SET ROLE database_actor;
+CREATE SCHEMA database_actor_schema;
+DROP SCHEMA database_actor_schema;
+RESET ROLE;
+REVOKE GRANT OPTION FOR CREATE ON DATABASE postgres FROM database_actor;
+REVOKE CONNECT, CREATE ON DATABASE postgres FROM database_actor;
+GRANT CONNECT, TEMPORARY ON DATABASE postgres TO PUBLIC;
+DROP ROLE database_actor;
+
+CREATE ROLE column_actor;
+CREATE ROLE column_delegate;
+CREATE ROLE column_leaf;
+GRANT CREATE ON SCHEMA public TO column_actor;
+CREATE TABLE column_privilege_target (
+  id integer PRIMARY KEY,
+  visible text,
+  mutable text,
+  secret text
+);
+INSERT INTO column_privilege_target VALUES (1, 'shown', 'old', 'hidden');
+GRANT SELECT (id, visible), INSERT (id, visible, mutable),
+      UPDATE (mutable), REFERENCES (id)
+  ON column_privilege_target TO column_actor;
+GRANT SELECT (visible) ON column_privilege_target TO column_delegate
+  WITH GRANT OPTION;
+SELECT has_column_privilege('column_actor', 'column_privilege_target', 'visible', 'SELECT'),
+       has_column_privilege('column_actor', 'column_privilege_target', 4::smallint, 'SELECT'),
+       has_column_privilege('column_actor', 'column_privilege_target', 'mutable', 'UPDATE'),
+       has_any_column_privilege('column_actor', 'column_privilege_target', 'SELECT');
+SELECT attname, attacl::text
+  FROM pg_attribute
+ WHERE attrelid = 'column_privilege_target'::regclass
+   AND attname IN ('visible', 'mutable')
+ ORDER BY attname;
+SELECT grantee, column_name, privilege_type, is_grantable
+  FROM information_schema.column_privileges
+ WHERE table_name = 'column_privilege_target'
+   AND grantee IN ('column_actor', 'column_delegate')
+ ORDER BY grantee, column_name, privilege_type;
+SET ROLE column_actor;
+SELECT visible FROM column_privilege_target;
+INSERT INTO column_privilege_target (id, visible, mutable)
+  VALUES (2, 'second', 'new');
+UPDATE column_privilege_target SET mutable = 'changed' WHERE id = 2;
+CREATE TABLE column_privilege_child (
+  parent_id integer REFERENCES column_privilege_target(id)
+);
+RESET ROLE;
+SET ROLE column_delegate;
+GRANT SELECT (visible) ON column_privilege_target TO column_leaf;
+RESET ROLE;
+REVOKE GRANT OPTION FOR SELECT (visible)
+  ON column_privilege_target FROM column_delegate CASCADE;
+SELECT has_column_privilege('column_leaf', 'column_privilege_target', 'visible', 'SELECT');
+DROP TABLE column_privilege_child;
+DROP TABLE column_privilege_target;
+DROP ROLE column_leaf;
+DROP ROLE column_delegate;
+DROP ROLE column_actor;

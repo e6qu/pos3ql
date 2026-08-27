@@ -1908,11 +1908,47 @@ fn scan_source_mode<'a>(
                 crate::storage::PrivilegeSet::SELECT,
                 txid,
             ) {
-                return Err(sql_err!(
-                    sqlstate::INSUFFICIENT_PRIVILEGE,
-                    "permission denied for table {}",
-                    definition.name.as_str()
-                ));
+                let demanded = pax_demand.selected_mask(table).unwrap_or_else(|| {
+                    if definition.n_columns == u64::BITS as usize {
+                        u64::MAX
+                    } else {
+                        (1u64 << definition.n_columns) - 1
+                    }
+                });
+                let mut allowed = demanded != 0;
+                if demanded == 0 {
+                    allowed = (0..definition.n_columns).any(|column| {
+                        crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(
+                            |target| {
+                                storage.has_column_privilege(
+                                    target,
+                                    authorization_role,
+                                    crate::storage::PrivilegeSet::SELECT,
+                                    txid,
+                                )
+                            },
+                        )
+                    });
+                }
+                for column in 0..definition.n_columns {
+                    if demanded & (1u64 << column) == 0 {
+                        continue;
+                    }
+                    let target = crate::storage::ColumnPrivilegeTarget::new(object, column as u16)?;
+                    allowed &= storage.has_column_privilege(
+                        target,
+                        authorization_role,
+                        crate::storage::PrivilegeSet::SELECT,
+                        txid,
+                    );
+                }
+                if !allowed {
+                    return Err(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "permission denied for table {}",
+                        definition.name.as_str()
+                    ));
+                }
             }
             storage.lock_table(
                 txid,

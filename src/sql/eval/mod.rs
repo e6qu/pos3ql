@@ -163,6 +163,7 @@ pub mod sqlstate {
     pub const OBJECT_NOT_IN_PREREQUISITE_STATE: &str = "55000";
     pub const AMBIGUOUS_ALIAS: &str = "42P09";
     pub const INVALID_SCHEMA_NAME: &str = "3F000";
+    pub const INVALID_CATALOG_NAME: &str = "3D000";
     pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
     pub const UNDEFINED_OBJECT: &str = "42704";
     pub const DATATYPE_MISMATCH: &str = "42804";
@@ -942,6 +943,23 @@ pub trait CatalogAccess {
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
+    fn has_column_privilege(
+        &self,
+        _role: Option<&str>,
+        _relation: &str,
+        _column: PrivilegeColumn<'_>,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn has_any_column_privilege(
+        &self,
+        _role: Option<&str>,
+        _relation: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
     fn has_sequence_privilege(
         &self,
         _role: Option<&str>,
@@ -977,8 +995,27 @@ pub trait CatalogAccess {
     fn has_database_privilege(
         &self,
         _role: Option<&str>,
+        _database: &str,
         _privileges: &str,
     ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn database_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    fn has_tablespace_privilege(
+        &self,
+        _role: Option<&str>,
+        _tablespace: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
+    fn tablespace_name<'a>(
+        &self,
+        _oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
     /// The comment text on the object with this OID and column `subid` (0 for
@@ -1074,6 +1111,12 @@ pub trait CatalogAccess {
     ) -> Option<i32> {
         None
     }
+}
+
+#[derive(Clone, Copy)]
+pub enum PrivilegeColumn<'a> {
+    Name(&'a str),
+    Number(i16),
 }
 
 /// A bounded membership source for an `IN (subquery)` result.

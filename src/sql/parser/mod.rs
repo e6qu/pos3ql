@@ -10,7 +10,7 @@ use crate::util::StackStr;
 
 use super::ast::*;
 use super::lexer::{LexError, Lexer, Tok};
-use super::types::{INTERVAL_FULL_RANGE, TypeMod};
+use super::types::{IntervalField, IntervalRange, TypeMod};
 
 /// Names for the calls a desugaring produces, for syntax PostgreSQL does not
 /// also expose as a function. A space cannot appear in an identifier, so a
@@ -819,7 +819,7 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self) -> Result<Stmt<'a>, ParseError> {
         match self.peeked {
-            Tok::Ident("select") | Tok::Ident("values") | Tok::Op("(") => self.query(),
+            Tok::Ident("select" | "table" | "values") | Tok::Op("(") => self.query(),
             Tok::Ident("explain") => self.explain(),
             Tok::Ident("with") => self.with_query(),
             Tok::Ident("create") => self.create(),
@@ -1265,11 +1265,18 @@ impl<'a> Parser<'a> {
             None
         };
         let where_clause = self.where_clause()?;
-        let (group_by, grouping_sets) = if self.eat_ident("group")? {
+        let (group_by, grouping_sets, grouping_set_quantifier) = if self.eat_ident("group")? {
             self.expect_ident("by")?;
-            self.group_by_clause()?
+            let quantifier = if self.eat_ident("distinct")? {
+                GroupingSetQuantifier::Distinct
+            } else {
+                let _ = self.eat_ident("all")?;
+                GroupingSetQuantifier::All
+            };
+            let (group_by, grouping_sets) = self.group_by_clause()?;
+            (group_by, grouping_sets, quantifier)
         } else {
-            (&[][..], &[][..])
+            (&[][..], &[][..], GroupingSetQuantifier::All)
         };
         let having = if self.eat_ident("having")? {
             Some(self.expression(0)?)
@@ -1288,6 +1295,7 @@ impl<'a> Parser<'a> {
             from,
             where_clause,
             group_by,
+            grouping_set_quantifier,
             grouping_sets,
             having,
             order_by: &[],
@@ -1360,12 +1368,7 @@ impl<'a> Parser<'a> {
                     return Err(self.limit("order by list", MAX_LIST));
                 }
                 let expression = self.expression(0)?;
-                let descending = if self.eat_ident("desc")? {
-                    true
-                } else {
-                    self.eat_ident("asc")?;
-                    false
-                };
+                let descending = self.order_direction()?;
                 // Optional NULLS FIRST/LAST; PostgreSQL defaults NULLS LAST
                 // for ASC and NULLS FIRST for DESC.
                 let nulls_first = if self.eat_ident("nulls")? {
@@ -1437,6 +1440,53 @@ impl<'a> Parser<'a> {
         Ok((order_by, limit, offset, with_ties))
     }
 
+    /// Parses ASC, DESC, or PostgreSQL's ordering-operator spelling shared by
+    /// query, aggregate, and window ORDER BY lists.
+    pub(super) fn order_direction(&mut self) -> Result<bool, ParseError> {
+        if self.eat_ident("using")? {
+            let (schema, operator) = if self.eat_ident("operator")? {
+                self.expect_op("(")?;
+                let first = self.any_op_token()?;
+                let pair = if self.eat_op(".")? {
+                    (Some(first), self.any_op_token()?)
+                } else {
+                    (None, first)
+                };
+                self.expect_op(")")?;
+                pair
+            } else {
+                (None, self.any_op_token()?)
+            };
+            if let Some(schema) = schema
+                && schema != "pg_catalog"
+            {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "operator {}.{} does not exist", schema, operator),
+                    sqlstate: sqlstate::UNDEFINED_FUNCTION,
+                });
+            }
+            match operator {
+                "<" => Ok(false),
+                ">" => Ok(true),
+                _ => Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(
+                        96,
+                        "operator {} is not a valid ordering operator",
+                        operator
+                    ),
+                    sqlstate: sqlstate::WRONG_OBJECT_TYPE,
+                }),
+            }
+        } else if self.eat_ident("desc")? {
+            Ok(true)
+        } else {
+            self.eat_ident("asc")?;
+            Ok(false)
+        }
+    }
+
     /// A subquery body: a set-operation tree of SELECTs, then the trailing
     /// ORDER BY / LIMIT / OFFSET applying to the whole result. A lone SELECT
     /// (no set operator) folds those clauses back into itself; a genuine
@@ -1471,6 +1521,7 @@ impl<'a> Parser<'a> {
             from: None,
             where_clause: None,
             group_by: &[],
+            grouping_set_quantifier: GroupingSetQuantifier::All,
             grouping_sets: &[],
             having: None,
             order_by,
@@ -1499,6 +1550,7 @@ impl<'a> Parser<'a> {
                 from: None,
                 where_clause: None,
                 group_by: &[],
+                grouping_set_quantifier: GroupingSetQuantifier::All,
                 grouping_sets: &[],
                 having: None,
                 order_by: query.order_by,
@@ -1590,6 +1642,7 @@ impl<'a> Parser<'a> {
                 from: None,
                 where_clause: None,
                 group_by: &[],
+                grouping_set_quantifier: GroupingSetQuantifier::All,
                 grouping_sets: &[],
                 having: None,
                 order_by: &[],
@@ -1606,6 +1659,8 @@ impl<'a> Parser<'a> {
             columns: &[],
             recursive: false,
             materialization: crate::sql::ast::CteMaterialization::Default,
+            search: None,
+            cycle: None,
             query: placeholder,
             dml: None,
         }; MAX_CTES];
@@ -1648,11 +1703,61 @@ impl<'a> Parser<'a> {
                 (&*boxed, None)
             };
             self.expect_op(")")?;
+            let search = if self.eat_ident("search")? {
+                let order = if self.eat_ident("breadth")? {
+                    crate::sql::ast::CteSearchOrder::BreadthFirst
+                } else {
+                    self.expect_ident("depth")?;
+                    crate::sql::ast::CteSearchOrder::DepthFirst
+                };
+                self.expect_ident("first")?;
+                self.expect_ident("by")?;
+                let columns = self.cte_clause_columns("SEARCH column")?;
+                self.expect_ident("set")?;
+                let sequence_column = self.col_ident("SEARCH sequence column")?;
+                Some(crate::sql::ast::CteSearch {
+                    order,
+                    columns,
+                    sequence_column,
+                })
+            } else {
+                None
+            };
+            let cycle = if self.eat_ident("cycle")? {
+                let columns = self.cte_clause_columns("CYCLE column")?;
+                self.expect_ident("set")?;
+                let mark_column = self.col_ident("CYCLE mark column")?;
+                let mark = if self.eat_ident("to")? {
+                    let value = self.expression(0)?;
+                    self.expect_ident("default")?;
+                    let default = self.expression(0)?;
+                    crate::sql::ast::CteCycleMark::Custom { value, default }
+                } else {
+                    crate::sql::ast::CteCycleMark::Boolean
+                };
+                self.expect_ident("using")?;
+                let path_column = self.col_ident("CYCLE path column")?;
+                Some(crate::sql::ast::CteCycle {
+                    columns,
+                    mark_column,
+                    mark,
+                    path_column,
+                })
+            } else {
+                None
+            };
+            if (search.is_some() || cycle.is_some()) && (!recursive || dml.is_some()) {
+                return Err(self.err_here(
+                    "SEARCH and CYCLE clauses require a recursive SELECT common table expression",
+                ));
+            }
             ctes[n] = Cte {
                 name,
                 columns,
                 recursive,
                 materialization,
+                search,
+                cycle,
                 query: boxed,
                 dml,
             };
@@ -1686,6 +1791,22 @@ impl<'a> Parser<'a> {
                     .err_here("WITH must be followed by SELECT, INSERT, UPDATE, DELETE, or MERGE"))
             }
         }
+    }
+
+    fn cte_clause_columns(&mut self, what: &'static str) -> Result<&'a [&'a str], ParseError> {
+        let mut columns: [&'a str; MAX_LIST] = [""; MAX_LIST];
+        let mut count = 0;
+        loop {
+            if count == MAX_LIST {
+                return Err(self.limit(what, MAX_LIST));
+            }
+            columns[count] = self.col_ident(what)?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.arena_slice(&columns[..count])
     }
 
     fn query(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -1813,6 +1934,7 @@ impl<'a> Parser<'a> {
                     from: None,
                     where_clause: None,
                     group_by: &[],
+                    grouping_set_quantifier: GroupingSetQuantifier::All,
                     grouping_sets: &[],
                     having: None,
                     order_by,
@@ -1868,6 +1990,7 @@ impl<'a> Parser<'a> {
                     from: None,
                     where_clause: None,
                     group_by: &[],
+                    grouping_set_quantifier: GroupingSetQuantifier::All,
                     grouping_sets: &[],
                     having: None,
                     order_by: &[],
@@ -1897,6 +2020,70 @@ impl<'a> Parser<'a> {
                 }
             }
             return Ok(tree.expect("at least one VALUES row"));
+        }
+        // Lower TABLE to a typed SELECT so every query consumer shares one
+        // execution path.
+        if self.peeked == Tok::Ident("table") {
+            self.advance()?;
+            let inheritance = if self.eat_ident("only")? {
+                RelationInheritance::Only
+            } else {
+                RelationInheritance::Descendants
+            };
+            let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
+            let first = self.col_ident("table name")?;
+            let (schema, table) = if self.eat_op(".")? {
+                (Some(first), self.col_ident("table name")?)
+            } else {
+                (None, first)
+            };
+            if parenthesized {
+                self.expect_op(")")?;
+            }
+            if inheritance == RelationInheritance::Descendants {
+                let _ = self.eat_op("*")?;
+            }
+            let source = TableRef {
+                schema,
+                table,
+                alias: None,
+                subquery: None,
+                func_args: None,
+                rows_from: None,
+                col_alias: None,
+                inheritance,
+                sample: None,
+                cte: None,
+                with_ordinality: false,
+                lateral: false,
+                authorization_role: None,
+            };
+            let select = Select {
+                items: self.arena_slice(&[SelectItem::Wildcard])?,
+                distinct: false,
+                distinct_on: &[],
+                from: Some(FromClause {
+                    base: source,
+                    joins: &[],
+                }),
+                where_clause: None,
+                group_by: &[],
+                grouping_set_quantifier: GroupingSetQuantifier::All,
+                grouping_sets: &[],
+                having: None,
+                order_by: &[],
+                limit: None,
+                offset: None,
+                with_ties: false,
+                with: &[],
+                set_body: None,
+                locking: &[],
+            };
+            return self.alloc_set(SetTree::Select(
+                self.arena
+                    .alloc(select)
+                    .map_err(|_| self.err_here("statement too large for SQL arena"))?,
+            ));
         }
         let core = self.select_core()?;
         let core = self
@@ -1928,6 +2115,11 @@ impl<'a> Parser<'a> {
         // reference the FROM items to its left. It applies to whichever kind of
         // item follows, so it is captured here and stamped on the result.
         let lateral = self.eat_ident("lateral")?;
+        let inheritance = if self.eat_ident("only")? {
+            RelationInheritance::Only
+        } else {
+            RelationInheritance::Descendants
+        };
         // ROWS FROM composes function scans in lockstep. Keep the member calls
         // typed as function-only TableRefs so ordinary relations, subqueries,
         // and nested groups cannot enter this state.
@@ -1945,6 +2137,8 @@ impl<'a> Parser<'a> {
                     func_args: None,
                     rows_from: None,
                     col_alias: None,
+                    inheritance: RelationInheritance::Descendants,
+                    sample: None,
                     cte: None,
                     with_ordinality: false,
                     lateral: false,
@@ -1999,6 +2193,8 @@ impl<'a> Parser<'a> {
                     func_args: None,
                     rows_from: Some(self.arena_slice(&functions[..count])?),
                     col_alias,
+                    inheritance: RelationInheritance::Descendants,
+                    sample: None,
                     cte: None,
                     with_ordinality,
                     lateral,
@@ -2038,18 +2234,27 @@ impl<'a> Parser<'a> {
                 func_args: None,
                 rows_from: None,
                 col_alias,
+                inheritance: RelationInheritance::Descendants,
+                sample: None,
                 cte: None,
                 with_ordinality: false,
                 lateral,
                 authorization_role: None,
             });
         }
+        let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
         let first = self.col_ident("table name")?;
         let (schema, table) = if self.eat_op(".")? {
             (Some(first), self.col_ident("table name")?)
         } else {
             (None, first)
         };
+        if parenthesized {
+            self.expect_op(")")?;
+        }
+        if inheritance == RelationInheritance::Descendants {
+            let _ = self.eat_op("*")?;
+        }
         // Table function: `func(args) [WITH ORDINALITY] [AS] alias`. Only valid
         // immediately after the (possibly schema-qualified) name.
         let func_args = if self.peeked == Tok::Op("(") {
@@ -2073,6 +2278,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        if func_args.is_some() && inheritance == RelationInheritance::Only {
+            return Err(self.err_here("ONLY requires a relation, not a function call"));
+        }
+        if lateral && func_args.is_none() {
+            return Err(self.err_here("LATERAL requires a subquery or function call"));
+        }
         // `WITH ORDINALITY` follows the argument list, before any alias.
         let with_ordinality = if func_args.is_some() && self.eat_ident("with")? {
             self.expect_ident("ordinality")?;
@@ -2092,11 +2303,9 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // A column-alias list `alias(col, ...)` after a table function renames
-        // its output columns (the count is validated against the function's
-        // arity at planning time, where PostgreSQL's 42P10 error is raised).
-        let col_alias = if func_args.is_some() {
-            self.column_alias_list()?
+        let col_alias = self.column_alias_list()?;
+        let sample = if func_args.is_none() && self.eat_ident("tablesample")? {
+            Some(self.table_sample()?)
         } else {
             None
         };
@@ -2108,10 +2317,65 @@ impl<'a> Parser<'a> {
             func_args,
             rows_from: None,
             col_alias,
+            inheritance,
+            sample,
             cte: None,
             with_ordinality,
             lateral,
             authorization_role: None,
+        })
+    }
+
+    fn table_sample(&mut self) -> Result<TableSample<'a>, ParseError> {
+        let method_at = self.peek_at;
+        let method_name = self.any_ident("TABLESAMPLE method")?;
+        let method = match method_name {
+            "system" => TableSampleMethod::System,
+            "bernoulli" => TableSampleMethod::Bernoulli,
+            _ => {
+                return Err(ParseError {
+                    at: method_at,
+                    message: stack_format!(96, "tablesample method {} does not exist", method_name),
+                    sqlstate: sqlstate::UNDEFINED_OBJECT,
+                });
+            }
+        };
+        self.expect_op("(")?;
+        let percentage = self.expression(0)?;
+        if self.eat_op(",")? {
+            let mut count = 1usize;
+            loop {
+                let _ = self.expression(0)?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            return Err(ParseError {
+                at: method_at,
+                message: stack_format!(
+                    96,
+                    "tablesample method {} requires 1 argument, not {}",
+                    method_name,
+                    count
+                ),
+                sqlstate: sqlstate::INVALID_TABLESAMPLE_ARGUMENT,
+            });
+        }
+        self.expect_op(")")?;
+        let repeatable = if self.eat_ident("repeatable")? {
+            self.expect_op("(")?;
+            let seed = self.expression(0)?;
+            self.expect_op(")")?;
+            Some(seed)
+        } else {
+            None
+        };
+        Ok(TableSample {
+            method,
+            percentage,
+            repeatable,
         })
     }
 
@@ -2153,6 +2417,8 @@ impl<'a> Parser<'a> {
                 func_args: None,
                 rows_from: None,
                 col_alias: None,
+                inheritance: RelationInheritance::Descendants,
+                sample: None,
                 cte: None,
                 with_ordinality: false,
                 lateral: false,
@@ -2160,7 +2426,7 @@ impl<'a> Parser<'a> {
             },
             kind: JoinKind::Inner,
             on: None,
-            using_columns: None,
+            using: None,
             natural: false,
         };
         let mut joins = [dummy; crate::sql::query::MAX_JOIN_TABLES - 1];
@@ -2216,7 +2482,7 @@ impl<'a> Parser<'a> {
                 return Err(self.limit("joins", joins.len()));
             }
             let table = self.table_ref()?;
-            let mut using_columns = None;
+            let mut using = None;
             let on = if natural || kind == JoinKind::Cross {
                 None
             } else if self.eat_ident("using")? {
@@ -2237,7 +2503,13 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect_op(")")?;
-                using_columns = Some(self.arena_slice(&cols[..n_cols])?);
+                let columns = self.arena_slice(&cols[..n_cols])?;
+                let alias = if self.eat_ident("as")? {
+                    Some(self.col_ident("join USING alias")?)
+                } else {
+                    None
+                };
+                using = Some(JoinUsing { columns, alias });
                 None
             } else {
                 self.expect_ident("on")?;
@@ -2247,7 +2519,7 @@ impl<'a> Parser<'a> {
                 table,
                 kind,
                 on,
-                using_columns,
+                using,
                 natural,
             };
             n += 1;
@@ -4150,12 +4422,15 @@ impl<'a> Parser<'a> {
         } else {
             crate::sql::ast::Overriding::None
         };
-        // Source is either VALUES (...), ... or a SELECT.
+        // Source is either VALUES (...), ... or any PostgreSQL query body.
         let mut rows: [&'a [&'a Expr<'a>]; MAX_ROWS] = [&[]; MAX_ROWS];
         let mut n_rows = 0;
         let mut select = None;
-        if self.peeked == Tok::Ident("select") {
-            let sel = self.select()?;
+        if matches!(
+            self.peeked,
+            Tok::Ident("select" | "table" | "with") | Tok::Op("(")
+        ) {
+            let sel = self.query_select()?;
             select = Some(
                 self.arena
                     .alloc(sel)
@@ -4689,7 +4964,12 @@ impl<'a> Parser<'a> {
         if (name == "character" || name == "char") && self.eat_ident("varying")? {
             name = "varchar";
         }
-        if name == "timestamp" || name == "time" {
+        let standard_temporal = name == "timestamp" || name == "time";
+        let mut leading_type_mod = None;
+        if standard_temporal && self.peeked == Tok::Op("(") {
+            leading_type_mod = Some(self.type_modifier(name)?);
+        }
+        if standard_temporal {
             if self.eat_ident("with")? {
                 self.expect_ident("time")?;
                 self.expect_ident("zone")?;
@@ -4703,8 +4983,17 @@ impl<'a> Parser<'a> {
                 self.expect_ident("zone")?;
             }
         }
-        let type_mod = if self.peeked == Tok::Op("(") {
+        let type_mod = if let Some(type_mod) = leading_type_mod {
+            type_mod
+        } else if standard_temporal && self.peeked == Tok::Op("(") {
+            return Err(self.unexpected("precision must precede WITH/WITHOUT TIME ZONE"));
+        } else if name == "float" && self.peeked == Tok::Op("(") {
+            name = self.float_precision_type()?;
+            -1
+        } else if self.peeked == Tok::Op("(") {
             self.type_modifier(name)?
+        } else if name == "interval" {
+            self.interval_range_modifier()?.unwrap_or(-1)
         } else if name == "char" || name == "character" {
             // Bare `char`/`character` is char(1) in PostgreSQL (`'ab'::char`
             // is 'a'); only the internal name `bpchar` means unlimited.
@@ -4727,6 +5016,85 @@ impl<'a> Parser<'a> {
             return Ok((array, type_mod));
         }
         Ok((name, type_mod))
+    }
+
+    /// SQL `float(p)` chooses one of two concrete PostgreSQL types; `p` is not
+    /// an atttypmod. Resolve the representation while parsing so execution and
+    /// catalogs never carry an unvalidated precision beside a float value.
+    fn float_precision_type(&mut self) -> Result<&'a str, ParseError> {
+        self.expect_op("(")?;
+        let Tok::Num(text) = self.peeked else {
+            return Err(self.unexpected("float precision must be an integer"));
+        };
+        let precision = text
+            .parse::<u32>()
+            .map_err(|_| self.unexpected("float precision must be an integer"))?;
+        self.advance()?;
+        self.expect_op(")")?;
+        if precision == 0 {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "precision for type float must be at least 1 bit"),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        if precision > 53 {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "precision for type float must be less than 54 bits"),
+                sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+            });
+        }
+        Ok(if precision <= 24 { "float4" } else { "float8" })
+    }
+
+    /// Parses the closed set of PostgreSQL interval field ranges after an
+    /// `interval` type name. The raw bit mask is produced only by
+    /// `IntervalRange::encode`, so invalid field combinations cannot enter a
+    /// stored or wire type modifier.
+    fn interval_range_modifier(&mut self) -> Result<Option<i32>, ParseError> {
+        let Tok::Ident(first_name) = self.peeked else {
+            return Ok(None);
+        };
+        let Some(first) = IntervalField::parse(first_name) else {
+            return Ok(None);
+        };
+        self.advance()?;
+        let last = if self.eat_ident("to")? {
+            let Tok::Ident(last_name) = self.peeked else {
+                return Err(self.unexpected("expected an interval field after TO"));
+            };
+            let Some(last) = IntervalField::parse(last_name) else {
+                return Err(self.unexpected("expected an interval field after TO"));
+            };
+            self.advance()?;
+            last
+        } else {
+            first
+        };
+        let Some(range) = IntervalRange::from_bounds(first, last) else {
+            return Err(self.unexpected("invalid interval field range"));
+        };
+        let precision = if self.peeked == Tok::Op("(") {
+            if last != IntervalField::Second {
+                return Err(self.unexpected(
+                    "interval precision is allowed only when SECOND is the trailing field",
+                ));
+            }
+            match TypeMod::decode(
+                super::types::ColType::Interval,
+                self.type_modifier("interval")?,
+            ) {
+                TypeMod::IntervalMod {
+                    precision: Some(precision),
+                    ..
+                } => Some(precision),
+                _ => unreachable!("interval precision parser returns an interval modifier"),
+            }
+        } else {
+            None
+        };
+        Ok(Some(TypeMod::IntervalMod { range, precision }.encode()))
     }
 
     /// A type name for a prepared-statement parameter: PostgreSQL parses and
@@ -4834,7 +5202,7 @@ impl<'a> Parser<'a> {
                 // precision; the other temporal types carry the precision bare.
                 if base == "interval" {
                     Ok(TypeMod::IntervalMod {
-                        range: INTERVAL_FULL_RANGE,
+                        range: IntervalRange::Full,
                         precision: Some(precision),
                     }
                     .encode())
@@ -5948,7 +6316,18 @@ mod tests {
             };
             assert_eq!(s.group_by.len(), 2);
             assert!(s.grouping_sets.is_empty());
+            assert_eq!(s.grouping_set_quantifier, GroupingSetQuantifier::All);
         });
+        with_parser(
+            "SELECT a FROM t GROUP BY DISTINCT GROUPING SETS ((a), (a))",
+            |p| {
+                let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert_eq!(s.grouping_set_quantifier, GroupingSetQuantifier::Distinct);
+                assert_eq!(s.grouping_sets, &[1, 1]);
+            },
+        );
         // ROLLUP(a, b) -> {a,b}, {a}, {} (bits index group_by = [a, b]).
         with_parser("SELECT a FROM t GROUP BY ROLLUP(a, b)", |p| {
             let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
@@ -6115,6 +6494,54 @@ mod tests {
                 assert_eq!(s.limit, Some(&Expr::Int(10)));
             },
         );
+        with_parser(
+            "SELECT a FROM t ORDER BY a USING > NULLS LAST, a USING OPERATOR(pg_catalog.<)",
+            |p| {
+                let Stmt::Select(s) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert!(s.order_by[0].descending);
+                assert!(!s.order_by[0].nulls_first);
+                assert!(!s.order_by[1].descending);
+                assert!(!s.order_by[1].nulls_first);
+            },
+        );
+        with_parser("SELECT a FROM t ORDER BY a USING =", |p| {
+            let error = p.next_stmt().unwrap_err();
+            assert_eq!(error.sqlstate, sqlstate::WRONG_OBJECT_TYPE);
+        });
+        with_parser(
+            "SELECT array_agg(a ORDER BY a USING >), \
+                    row_number() OVER (ORDER BY a USING OPERATOR(pg_catalog.<)) FROM t",
+            |p| {
+                let Stmt::Select(select) = p.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                let SelectItem::Expr {
+                    expression:
+                        Expr::Call {
+                            order_by: aggregate_order,
+                            ..
+                        },
+                    ..
+                } = select.items[0]
+                else {
+                    panic!()
+                };
+                assert!(aggregate_order[0].descending);
+                let SelectItem::Expr {
+                    expression:
+                        Expr::Call {
+                            over: Some(over), ..
+                        },
+                    ..
+                } = select.items[1]
+                else {
+                    panic!()
+                };
+                assert!(!over.order_by[0].descending);
+            },
+        );
     }
 
     #[test]
@@ -6271,6 +6698,65 @@ mod tests {
         ] {
             with_parser(sql, |parser| {
                 assert!(parser.next_stmt().is_err(), "accepted {sql}")
+            });
+        }
+    }
+
+    #[test]
+    fn table_sources_parse_into_closed_inheritance_and_sampling_states() {
+        with_parser(
+            "TABLE ONLY (app.events) UNION ALL TABLE archived_events *; \
+             SELECT event_id FROM app.events AS sampled(event_id, payload) \
+               TABLESAMPLE BERNOULLI ($1) REPEATABLE ($2)",
+            |parser| {
+                let Stmt::SetQuery(query) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected TABLE set query")
+                };
+                let SetTree::Op { left, right, .. } = query.body else {
+                    panic!("expected UNION ALL tree")
+                };
+                let SetTree::Select(left) = left else {
+                    panic!()
+                };
+                assert_eq!(
+                    left.from.unwrap().base.inheritance,
+                    RelationInheritance::Only
+                );
+                let SetTree::Select(right) = right else {
+                    panic!()
+                };
+                assert_eq!(
+                    right.from.unwrap().base.inheritance,
+                    RelationInheritance::Descendants
+                );
+
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected sampled SELECT")
+                };
+                let table = select.from.unwrap().base;
+                assert_eq!(table.col_alias.unwrap(), ["event_id", "payload"]);
+                let sample = table.sample.expect("typed TABLESAMPLE");
+                assert_eq!(sample.method, TableSampleMethod::Bernoulli);
+                assert!(matches!(sample.percentage, Expr::Param(1)));
+                assert!(matches!(sample.repeatable, Some(Expr::Param(2))));
+            },
+        );
+
+        for (sql, state) in [
+            (
+                "SELECT * FROM events TABLESAMPLE missing (10)",
+                sqlstate::UNDEFINED_OBJECT,
+            ),
+            (
+                "SELECT * FROM events TABLESAMPLE system (1, 2)",
+                sqlstate::INVALID_TABLESAMPLE_ARGUMENT,
+            ),
+            ("SELECT * FROM LATERAL events", sqlstate::SYNTAX_ERROR),
+            ("TABLE ONLY events *", sqlstate::SYNTAX_ERROR),
+        ] {
+            with_parser(sql, |parser| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(error.sqlstate, state, "{sql}");
             });
         }
     }

@@ -196,6 +196,8 @@ pub mod sqlstate {
     pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
     pub const STRING_DATA_LENGTH_MISMATCH: &str = "22026";
     pub const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";
+    pub const INVALID_TABLESAMPLE_REPEAT: &str = "2202G";
+    pub const INVALID_TABLESAMPLE_ARGUMENT: &str = "2202H";
     pub const IN_FAILED_SQL_TRANSACTION: &str = "25P02";
     pub const INVALID_SQL_STATEMENT_NAME: &str = "26000";
     pub const DUPLICATE_COLUMN: &str = "42701";
@@ -287,6 +289,14 @@ fn same_resolved_column<'a>(row: &impl ColumnLookup<'a>, a: &Expr, b: &Expr) -> 
 pub trait ColumnLookup<'a> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'a>, SqlError>;
 
+    fn recursive_state(&self, qualifier: &str, _index: usize) -> Result<Datum<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::INVALID_COLUMN_REFERENCE,
+            "recursive state for \"{}\" is unavailable",
+            qualifier
+        ))
+    }
+
     /// The scope-resolved identity of a column reference, when this lookup can
     /// name one — used to match a grouping key spelled `a` against a select
     /// item spelled `t.a` (PostgreSQL matches grouping keys semantically, not
@@ -309,6 +319,21 @@ pub trait ColumnLookup<'a> {
             "whole-row reference to \"{}\" is not supported in this context",
             table
         ))
+    }
+
+    /// Fields used by `(row).*` and `ROW(row.*, ...)`. Unlike a whole-row
+    /// value, expansion retains the declared shape of an outer-join null row.
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        self.whole_row_fields(table, arena)?.ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "null whole-row expansion lacks its declared shape"
+            )
+        })
     }
 
     /// A whole-row reference (`t.*` as a value): Ok(true) when the row is
@@ -534,6 +559,10 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         (**self).lookup(qualifier, name)
     }
 
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'a>, SqlError> {
+        (**self).recursive_state(qualifier, index)
+    }
+
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         (**self).whole_row_present(table)
     }
@@ -544,6 +573,14 @@ impl<'a, T: ColumnLookup<'a> + ?Sized> ColumnLookup<'a> for &T {
         arena: &'a Arena,
     ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
         (**self).whole_row_fields(table, arena)
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+        (**self).whole_row_expansion_fields(table, arena)
     }
 
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
@@ -689,6 +726,15 @@ pub trait CatalogAccess {
             sqlstate::FEATURE_NOT_SUPPORTED,
             "named composite catalog access is unavailable"
         ))
+    }
+    /// Produces the declared fields of a null named-composite value. `None`
+    /// means the OID is not a visible named composite.
+    fn null_composite_fields<'a>(
+        &self,
+        _type_oid: i32,
+        _arena: &'a Arena,
+    ) -> Result<Option<&'a [super::types::RecordField<'a>]>, SqlError> {
+        Ok(None)
     }
     /// Compares text with a resolved database collation. A query executor must
     /// supply this for the database default; an evaluator without a catalog
@@ -1136,6 +1182,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
         | Expr::RoutineParam { .. }
         | Expr::WholeRow(_)
         | Expr::SchemaColumn { .. }
+        | Expr::RecursiveState { .. }
         | Expr::Param(_)
         | Expr::DefaultMarker => Ok(None),
         // Boolean connectives short-circuit like PostgreSQL's folding: a FALSE
@@ -1454,6 +1501,9 @@ pub fn eval_full<'a>(
                 .map_err(|_| arena_full())?;
             materialize_named_composite(row.lookup(Some(composed), name)?, hooks, arena)
         }
+        Expr::RecursiveState {
+            qualifier, index, ..
+        } => row.recursive_state(qualifier, index as usize),
         Expr::Param(n) => params.get(n as usize - 1).copied().ok_or_else(|| {
             sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -4187,6 +4237,19 @@ pub fn record_star_expand<'a>(
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<&'a [super::types::RecordField<'a>], SqlError> {
+    if let Expr::WholeRow(table) = base {
+        return row.whole_row_expansion_fields(table, arena);
+    }
+    if let Expr::Column {
+        qualifier: None,
+        name,
+    } = base
+        && row
+            .lookup(None, name)
+            .is_err_and(|error| error.sqlstate == sqlstate::UNDEFINED_COLUMN)
+    {
+        return row.whole_row_expansion_fields(name, arena);
+    }
     match eval_full(base, arena, params, row, hooks)? {
         Datum::Record(fields) | Datum::Composite { fields, .. } => Ok(fields),
         Datum::CompositeText {
@@ -4206,6 +4269,31 @@ pub fn record_star_expand<'a>(
                 unreachable!("catalog materializes named composites")
             };
             Ok(fields)
+        }
+        Datum::Null => {
+            let ExpressionTypeIdentity::Known(type_oid) =
+                expression_type_identity(base, row, hooks)?
+            else {
+                return Err(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "record expansion of an untyped null value"
+                ));
+            };
+            hooks
+                .catalog
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "named composite catalog access is unavailable"
+                    )
+                })?
+                .null_composite_fields(type_oid, arena)?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "record expansion of a non-composite null value"
+                    )
+                })
         }
         other => Err(type_mismatch(
             "record expansion of a non-composite value",

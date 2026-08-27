@@ -187,7 +187,7 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
-        oid: 2731,
+        oid: 2730,
         name: "pg_get_triggerdef",
         result_oid: 25,
         argument_types: "26 16",
@@ -314,7 +314,115 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_count: 1,
         volatility: "s",
     },
+    IntrinsicRoutine {
+        oid: 1158,
+        name: "to_timestamp",
+        result_oid: 1184,
+        argument_types: "701",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 1768,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "1186 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1770,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "1184 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1772,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "1700 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1773,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "23 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1774,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "20 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1775,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "700 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1776,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "701 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1777,
+        name: "to_number",
+        result_oid: 1700,
+        argument_types: "25 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1778,
+        name: "to_timestamp",
+        result_oid: 1184,
+        argument_types: "25 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1780,
+        name: "to_date",
+        result_oid: 1082,
+        argument_types: "25 25",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 2049,
+        name: "to_char",
+        result_oid: 25,
+        argument_types: "1114 25",
+        argument_count: 2,
+        volatility: "s",
+    },
 ];
+
+fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
+    !matches!(routine.oid, 1081 | 2078)
+}
+
+fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
+    match routine.oid {
+        1402 | 1403 | 2078 | 3086 => "u",
+        1641 => "r",
+        _ => "s",
+    }
+}
 
 /// PostgreSQL 18.4 operator OIDs for the evaluator's scalar integer core.
 /// The resolver deliberately exposes only operations the engine evaluates;
@@ -8568,7 +8676,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bpchar("f"),
                 text(routine.argument_types, arena)?,
                 Datum::Bpchar(routine.volatility),
-                Datum::Bpchar("s"),
+                Datum::Bpchar(intrinsic_routine_parallel(*routine)),
                 Datum::Int4(10),
                 Datum::Bool(false),
                 Datum::Null,
@@ -8582,7 +8690,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     arena,
                 )?,
                 text("", arena)?,
-                Datum::Bool(false),
+                Datum::Bool(intrinsic_routine_is_strict(*routine)),
                 Datum::Bool(false),
                 Datum::Null,
                 Datum::Float8(1.0),
@@ -11192,7 +11300,7 @@ fn info_column_row<'a>(
                 (None, None, None, None, Some(precision as i32))
             }
             TypeMod::IntervalMod { precision, .. } => {
-                (None, None, None, None, precision.map(i32::from))
+                (None, None, None, None, Some(precision.map_or(6, i32::from)))
             }
             _ => match column.ctype {
                 ColType::Int2 => (None, Some(16), Some(2), Some(0), None),
@@ -11200,9 +11308,11 @@ fn info_column_row<'a>(
                 ColType::Int8 => (None, Some(64), Some(2), Some(0), None),
                 ColType::Float4 => (None, Some(24), Some(2), None, None),
                 ColType::Float8 => (None, Some(53), Some(2), None, None),
+                ColType::Interval => (None, None, None, None, Some(6)),
                 _ => (None, None, None, None, None),
             },
         };
+    let interval_type = information_schema_interval_type(type_mod);
     let user_type = column.user_type;
     let (udt_schema, udt_name) = if let Some(identity) = user_type {
         let mut type_name = StackStr::<64>::new();
@@ -11299,7 +11409,10 @@ fn info_column_row<'a>(
             numeric_radix.map_or(Datum::Null, Datum::Int4),
             numeric_scale.map_or(Datum::Null, Datum::Int4),
             datetime_precision.map_or(Datum::Null, Datum::Int4),
-            Datum::Null,
+            match interval_type {
+                Some(value) => text(value.as_str(), arena)?,
+                None => Datum::Null,
+            },
             Datum::Null,
             Datum::Null,
             Datum::Null,
@@ -12624,6 +12737,7 @@ fn info_domains<'a>(
         let type_mod = TypeMod::decode(domain.base, domain.base_type_mod);
         let (character_length, numeric_precision, numeric_radix, numeric_scale, datetime_precision) =
             information_schema_scalar_metadata(domain.base, type_mod);
+        let interval_type = information_schema_interval_type(type_mod);
         let (data_type, udt_schema, udt_name) = match domain.base_domain {
             Some(parent) => (
                 "USER-DEFINED",
@@ -12658,7 +12772,10 @@ fn info_domains<'a>(
                 numeric_radix.map_or(Datum::Null, Datum::Int4),
                 numeric_scale.map_or(Datum::Null, Datum::Int4),
                 datetime_precision.map_or(Datum::Null, Datum::Int4),
-                Datum::Null,
+                match interval_type {
+                    Some(value) => text(value.as_str(), arena)?,
+                    None => Datum::Null,
+                },
                 Datum::Null,
                 default,
                 text("postgres", arena)?,
@@ -13078,7 +13195,7 @@ fn information_schema_scalar_metadata(
         ),
         TypeMod::TemporalPrecision(precision) => (None, None, None, None, Some(precision as i32)),
         TypeMod::IntervalMod { precision, .. } => {
-            (None, None, None, None, precision.map(i32::from))
+            (None, None, None, None, Some(precision.map_or(6, i32::from)))
         }
         _ => match ctype {
             ColType::Int2 => (None, Some(16), Some(2), Some(0), None),
@@ -13086,9 +13203,23 @@ fn information_schema_scalar_metadata(
             ColType::Int8 => (None, Some(64), Some(2), Some(0), None),
             ColType::Float4 => (None, Some(24), Some(2), None, None),
             ColType::Float8 => (None, Some(53), Some(2), None, None),
+            ColType::Interval => (None, None, None, None, Some(6)),
             _ => (None, None, None, None, None),
         },
     }
+}
+
+fn information_schema_interval_type(type_mod: TypeMod) -> Option<StackStr<48>> {
+    use core::fmt::Write as _;
+    let TypeMod::IntervalMod { range, precision } = type_mod else {
+        return None;
+    };
+    let fields = range.information_schema_name()?;
+    let mut output = StackStr::<48>::from_str(fields);
+    if let Some(precision) = precision {
+        let _ = write!(output, "({})", precision);
+    }
+    Some(output)
 }
 
 fn info_schemata<'a>(

@@ -236,17 +236,40 @@ pub(crate) fn dispatch<'a>(
                 let Datum::Text(fmt) = f else {
                     return Err(type_mismatch(name, &f));
                 };
-                // Temporal values format via the date/time codes; numeric values via
-                // the number codes.
-                let micros = match v {
-                    Datum::Timestamp(t) | Datum::Timestamptz(t) => Some(t),
-                    Datum::Date(d) => Some(d as i64 * 86_400_000_000),
-                    Datum::Time(t) => Some(t),
-                    Datum::Timetz(t, _) => Some(t),
-                    _ => None,
-                };
-                if let Some(m) = micros {
-                    return Ok(Datum::Text(to_char::timestamp(m, fmt, arena)?));
+                match v {
+                    Datum::Timestamp(value) => {
+                        return Ok(Datum::Text(to_char::timestamp(value, fmt, arena)?));
+                    }
+                    Datum::Timestamptz(value) => {
+                        let (offset, abbreviation) = crate::sql::timezone::session().resolve(value);
+                        return Ok(Datum::Text(to_char::timestamptz(
+                            value,
+                            offset,
+                            abbreviation.as_str(),
+                            fmt,
+                            arena,
+                        )?));
+                    }
+                    Datum::Date(value) => {
+                        return Ok(Datum::Text(to_char::timestamp(
+                            i64::from(value) * 86_400_000_000,
+                            fmt,
+                            arena,
+                        )?));
+                    }
+                    Datum::Time(value) => {
+                        return Ok(Datum::Text(to_char::time(value, fmt, arena)?));
+                    }
+                    Datum::Interval(value) => {
+                        return Ok(Datum::Text(to_char::interval(value, fmt, arena)?));
+                    }
+                    Datum::Timetz(..) => {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "function to_char(time with time zone, text) does not exist"
+                        ));
+                    }
+                    _ => {}
                 }
                 // A float8 input keeps its own sign bit even when the value rounds
                 // to zero (covers -0.0 and small negatives) — PostgreSQL behavior.

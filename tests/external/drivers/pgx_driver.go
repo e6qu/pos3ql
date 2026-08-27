@@ -122,6 +122,18 @@ func main() {
 	}
 	trows.Close()
 	must("iterate typed columns", trows.Err())
+
+	exec("CREATE TABLE pgx_sample_source (id integer PRIMARY KEY)")
+	exec("INSERT INTO pgx_sample_source SELECT value FROM generate_series(1,20) value")
+	var sampled int
+	must("bernoulli sample", conn.QueryRow(ctx,
+		"SELECT count(*) FROM pgx_sample_source TABLESAMPLE BERNOULLI ($1) REPEATABLE ($2)",
+		100.0, 42.0).Scan(&sampled))
+	fmt.Printf("sample rows=%d\n", sampled)
+	must("system sample", conn.QueryRow(ctx,
+		"SELECT count(*) FROM pgx_sample_source TABLESAMPLE SYSTEM ($1) REPEATABLE ($2)",
+		0.0, 42.0).Scan(&sampled))
+	fmt.Printf("system sample rows=%d\n", sampled)
 }
 
 func firstLine(err error) string {

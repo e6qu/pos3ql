@@ -1,10 +1,6 @@
 //! Per-session configuration parameters (GUCs). `SET` writes them and `SHOW`
-//! reads them. A value we cannot honor is rejected loudly — never silently
-//! accepted-and-ignored. Parameters whose behavior is not yet implemented
-//! accept only the value(s) consistent with what the engine actually does, so
-//! a client that sets something we would not honor gets an error rather than a
-//! false success. As behavior lands (DateStyle formatting, non-UTC time zones)
-//! the accepted set widens here.
+//! reads them. A value we cannot honor is rejected loudly, so a client never
+//! receives false success for an ignored setting.
 
 use crate::sql::eval::sqlstate;
 use core::cell::{Cell, RefCell};
@@ -14,7 +10,7 @@ use crate::sql_err;
 use crate::storage::MAX_SEQUENCES;
 use crate::util::StackStr;
 
-use super::datetime::{DateFormat, DateStyle, FieldOrder};
+use super::datetime::{DateFormat, DateStyle, FieldOrder, IntervalStyle};
 use super::eval::SqlError;
 
 std::thread_local! {
@@ -160,6 +156,7 @@ impl MessageLevel {
 #[derive(Debug, Clone, Copy)]
 pub struct RenderContext {
     pub datestyle: DateStyle,
+    pub intervalstyle: IntervalStyle,
     /// The session time zone; resolves offset + abbreviation per timestamp so
     /// DST is honored.
     pub parsed_timezone: super::timezone::Timezone,
@@ -175,6 +172,7 @@ impl Default for RenderContext {
     fn default() -> Self {
         RenderContext {
             datestyle: DateStyle::default(),
+            intervalstyle: IntervalStyle::Postgres,
             parsed_timezone: super::timezone::Timezone::utc(),
             min_message_level: MessageLevel::Notice,
             bytea_escape: false,
@@ -237,6 +235,7 @@ struct GucValues {
     /// AUTHORIZATION changes this and current_role together.
     session_authorization: StackStr<64>,
     datestyle: StackStr<48>,
+    intervalstyle: IntervalStyle,
     timezone: StackStr<64>,
     /// Parsed current time zone, so rendering does not re-parse it.
     parsed_timezone: super::timezone::Timezone,
@@ -266,6 +265,7 @@ impl GucValues {
             current_role: StackStr::from_str("postgres"),
             session_authorization: StackStr::from_str("postgres"),
             datestyle: StackStr::new(),
+            intervalstyle: IntervalStyle::Postgres,
             timezone: StackStr::new(),
             parsed_timezone: super::timezone::Timezone::utc(),
             client_encoding: StackStr::new(),
@@ -429,8 +429,8 @@ impl GucState {
 
     /// Applies `SET name = raw`. `raw` is the raw source text of the value
     /// (surrounding single quotes and whitespace are stripped here). Returns an
-    /// error for an unknown parameter, a read-only parameter, or a value whose
-    /// behavior is not implemented.
+    /// error for an unknown parameter, a read-only parameter, or a value the
+    /// engine cannot honor.
     pub fn set(&self, name: &str, raw: &str, local: bool) -> Result<(), SqlError> {
         let mut state = self.store.borrow_mut();
         let mut values = state.current;
@@ -585,7 +585,7 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
     } else if name.eq_ignore_ascii_case("check_function_bodies") {
         values.check_function_bodies = defaults.check_function_bodies;
     } else if name.eq_ignore_ascii_case("intervalstyle") {
-        // Interval rendering is fixed to PostgreSQL's default style.
+        values.intervalstyle = defaults.intervalstyle;
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
@@ -706,13 +706,18 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         ));
     }
     if name.eq_ignore_ascii_case("intervalstyle") {
-        if is_default || v.eq_ignore_ascii_case("postgres") {
-            return Ok(());
-        }
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "IntervalStyle can only be postgres (other interval renderings are not supported)"
-        ));
+        values.intervalstyle = if is_default {
+            IntervalStyle::Postgres
+        } else {
+            IntervalStyle::parse(v).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid value for parameter \"IntervalStyle\": \"{}\"",
+                    v
+                )
+            })?
+        };
+        return Ok(());
     }
     if name.eq_ignore_ascii_case("synchronize_seqscans") {
         if is_default || v.eq_ignore_ascii_case("off") {
@@ -910,7 +915,7 @@ impl GucState {
         } else if name.eq_ignore_ascii_case("default_table_access_method") {
             Some(StackStr::from_str("heap"))
         } else if name.eq_ignore_ascii_case("intervalstyle") {
-            Some(StackStr::from_str("postgres"))
+            Some(StackStr::from_str(values.intervalstyle.as_str()))
         } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
             Some(StackStr::from_str("off"))
         } else {
@@ -935,6 +940,7 @@ impl GucState {
         };
         RenderContext {
             datestyle: DateStyle { format, order },
+            intervalstyle: values.intervalstyle,
             parsed_timezone: values.parsed_timezone,
             min_message_level: values.client_min_messages,
             bytea_escape: values.bytea_escape,

@@ -156,6 +156,11 @@ fn text_value_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usiz
             .as_str()
             .len()
         }
+        Datum::Interval(interval) => {
+            crate::sql::datetime::format_interval_styled(*interval, render.intervalstyle)
+                .as_str()
+                .len()
+        }
         other => display_len(other),
     }
 }
@@ -891,6 +896,14 @@ impl<'b> Responder<'b> {
                     m.i32(text.as_str().len() as i32);
                     m.bytes(text.as_str().as_bytes());
                 }
+                Datum::Interval(interval) => {
+                    let text = crate::sql::datetime::format_interval_styled(
+                        *interval,
+                        render.intervalstyle,
+                    );
+                    m.i32(text.as_str().len() as i32);
+                    m.bytes(text.as_str().as_bytes());
+                }
                 // Records, JSON, ranges, multiranges, bit strings — anything
                 // whose text can be arbitrarily wide: count the length, emit it,
                 // then stream Display straight to the send buffer (no fixed-size
@@ -987,6 +1000,12 @@ impl<'b> Responder<'b> {
                 );
                 arena.alloc_str(text.as_str()).map_err(|_| full())?
             }
+            Datum::Interval(interval) => arena
+                .alloc_str(
+                    crate::sql::datetime::format_interval_styled(*interval, render.intervalstyle)
+                        .as_str(),
+                )
+                .map_err(|_| full())?,
             other => arena.alloc_str_display(other).map_err(|_| full())?,
         }))
     }

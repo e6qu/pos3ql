@@ -8,13 +8,14 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{
-    Cte, CteMaterialization, Delete, Expr, FromClause, Insert, Join, JoinKind, MaterializedCte,
-    Merge, MergeAction, MergeWhen, OnConflict, OnConflictTarget, OrderBy, Select, SelectItem,
-    SetOp, SetQuery, SetTree, Stmt, TableRef, Update,
+    Collation, Cte, CteCycleMark, CteMaterialization, CteSearchOrder, Delete, Expr, FromClause,
+    Insert, Join, JoinKind, MaterializedCte, Merge, MergeAction, MergeWhen, OnConflict,
+    OnConflictTarget, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree, Stmt, TableRef,
+    Update,
 };
 use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
 use crate::sql::exec::MAX_PROJ;
-use crate::sql::types::{ColDesc, Datum};
+use crate::sql::types::{ArrElem, ColDesc, ColType, Datum, RecordField};
 use crate::sql_err;
 use crate::storage::Storage;
 
@@ -120,6 +121,7 @@ pub(crate) fn expand_stored_expression<'a>(
             dependencies: Some(dependencies),
             authorization_role: None,
             qualifier: None,
+            recursive_state: None,
             execution: None,
         },
         arena,
@@ -150,9 +152,11 @@ fn expand_ctes_with_path<'a>(
     // Resolve CTEs left-to-right so a CTE can reference earlier ones.
     let mut resolved: [(&'a str, &'a Select<'a>, &'a [&'a str]); crate::sql::parser::MAX_CTES] =
         [("", sel, &[]); crate::sql::parser::MAX_CTES];
-    let mut n = 0;
-    for cte in sel.with {
-        if resolved[..n].iter().any(|(name, _, _)| *name == cte.name) {
+    let mut materialized = [("", &EMPTY_CTE); crate::sql::parser::MAX_CTES];
+    let mut resolved_count = 0;
+    let mut materialized_count = 0;
+    for (index, cte) in sel.with.iter().enumerate() {
+        if sel.with[..index].iter().any(|prior| prior.name == cte.name) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_ALIAS,
                 "WITH query name \"{}\" specified more than once",
@@ -160,8 +164,8 @@ fn expand_ctes_with_path<'a>(
             ));
         }
         let context = Subst {
-            ctes: &resolved[..n],
-            materialized: &[],
+            ctes: &resolved[..resolved_count],
+            materialized: &materialized[..materialized_count],
             storage,
             txid,
             depth,
@@ -169,27 +173,35 @@ fn expand_ctes_with_path<'a>(
             dependencies,
             authorization_role,
             qualifier: None,
+            recursive_state: None,
             execution: None,
         };
-        // A self-referencing recursive CTE cannot be inlined; this schema-only
-        // path (Describe / view validation) binds its non-recursive term,
-        // which carries the CTE's column shape. Execution goes through
-        // `expand_ctes_exec`, which materializes the fixpoint.
-        let q = if cte.recursive && select_references(cte.query, cte.name) > 0 {
-            let (base, _, _) = recursive_parts(cte.query, cte.name)?;
-            let wrapped = wrap_set_tree(base, arena)?;
-            subst_select(wrapped, context, arena)?
+        let self_references = select_references(cte.query, cte.name);
+        if (cte.search.is_some() || cte.cycle.is_some()) && (!cte.recursive || self_references == 0)
+        {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "WITH query \"{}\" is not recursive",
+                cte.name
+            ));
+        }
+        if cte.recursive && self_references > 0 {
+            materialized[materialized_count] = (
+                cte.name,
+                describe_recursive_materialized(cte, context, storage, txid, arena)?,
+            );
+            materialized_count += 1;
         } else {
-            subst_select(cte.query, context, arena)?
-        };
-        resolved[n] = (cte.name, q, cte.columns);
-        n += 1;
+            let query = subst_select(cte.query, context, arena)?;
+            resolved[resolved_count] = (cte.name, query, cte.columns);
+            resolved_count += 1;
+        }
     }
     // Substitute the body against all CTEs (the WITH list is dropped by
     // subst_select, which never copies it) and expand any view references.
     let context = Subst {
-        ctes: &resolved[..n],
-        materialized: &[],
+        ctes: &resolved[..resolved_count],
+        materialized: &materialized[..materialized_count],
         storage,
         txid,
         depth,
@@ -197,6 +209,7 @@ fn expand_ctes_with_path<'a>(
         dependencies,
         authorization_role,
         qualifier: None,
+        recursive_state: None,
         execution: None,
     };
     subst_select_body(sel, context, arena)
@@ -259,6 +272,7 @@ pub(crate) fn bind_materialized_relations<'a>(
         dependencies: None,
         authorization_role: None,
         qualifier: None,
+        recursive_state: None,
         execution: None,
     };
     subst_select(select, context, arena)
@@ -395,6 +409,7 @@ pub fn rewrite_view_dml<'a>(
             to: base_name,
             to_schema: base_schema,
         }),
+        recursive_state: None,
         execution: None,
     };
     let expanded_returning =
@@ -565,43 +580,16 @@ fn with_exec_context<'a, 's, 'e, R>(
             ));
         }
         let mut scoped_ctes = [("", placeholder, &[] as &'a [&'a str]); MAX_VISIBLE_CTES];
-        let mut scoped_n = 0usize;
-        for binding in &resolved[..n] {
-            if scoped_n == scoped_ctes.len() {
-                return Err(too_many_visible_ctes());
-            }
-            scoped_ctes[scoped_n] = *binding;
-            scoped_n += 1;
-        }
-        for binding in inherited_ctes {
-            if with.iter().any(|local| local.name == binding.0) {
-                continue;
-            }
-            if scoped_n == scoped_ctes.len() {
-                return Err(too_many_visible_ctes());
-            }
-            scoped_ctes[scoped_n] = *binding;
-            scoped_n += 1;
-        }
         let mut scoped_materialized = [("", &EMPTY_CTE); MAX_VISIBLE_CTES];
-        let mut scoped_nm = 0usize;
-        for binding in &materialized[..nm] {
-            if scoped_nm == scoped_materialized.len() {
-                return Err(too_many_visible_ctes());
-            }
-            scoped_materialized[scoped_nm] = *binding;
-            scoped_nm += 1;
-        }
-        for binding in inherited_materialized {
-            if with.iter().any(|local| local.name == binding.0) {
-                continue;
-            }
-            if scoped_nm == scoped_materialized.len() {
-                return Err(too_many_visible_ctes());
-            }
-            scoped_materialized[scoped_nm] = *binding;
-            scoped_nm += 1;
-        }
+        let (scoped_n, scoped_nm) = fill_scoped_bindings(
+            with,
+            &resolved[..n],
+            inherited_ctes,
+            &materialized[..nm],
+            inherited_materialized,
+            &mut scoped_ctes,
+            &mut scoped_materialized,
+        )?;
         let context = Subst {
             ctes: &scoped_ctes[..scoped_n],
             materialized: &scoped_materialized[..scoped_nm],
@@ -612,8 +600,19 @@ fn with_exec_context<'a, 's, 'e, R>(
             dependencies,
             authorization_role,
             qualifier: None,
+            recursive_state: None,
             execution: Some(ExecutionSubst { params, sequences }),
         };
+        let self_references = select_references(cte.query, cte.name);
+        if (cte.search.is_some() || cte.cycle.is_some())
+            && (!cte.recursive || self_references == 0 || cte.dml.is_some())
+        {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "WITH query \"{}\" is not a recursive SELECT query",
+                cte.name
+            ));
+        }
         if cte.dml.is_some() {
             let materialized_cte = dml_mats
                 .iter()
@@ -628,7 +627,7 @@ fn with_exec_context<'a, 's, 'e, R>(
                 })?;
             materialized[nm] = (cte.name, materialized_cte);
             nm += 1;
-        } else if cte.recursive && select_references(cte.query, cte.name) > 0 {
+        } else if cte.recursive && self_references > 0 {
             let recursive =
                 materialize_recursive(cte, context, storage, txid, arena, params, sequences)?;
             materialized[nm] = (cte.name, recursive);
@@ -666,43 +665,16 @@ fn with_exec_context<'a, 's, 'e, R>(
         }
     }
     let mut scoped_ctes = [("", placeholder, &[] as &'a [&'a str]); MAX_VISIBLE_CTES];
-    let mut scoped_n = 0usize;
-    for binding in &resolved[..n] {
-        if scoped_n == scoped_ctes.len() {
-            return Err(too_many_visible_ctes());
-        }
-        scoped_ctes[scoped_n] = *binding;
-        scoped_n += 1;
-    }
-    for binding in inherited_ctes {
-        if with.iter().any(|local| local.name == binding.0) {
-            continue;
-        }
-        if scoped_n == scoped_ctes.len() {
-            return Err(too_many_visible_ctes());
-        }
-        scoped_ctes[scoped_n] = *binding;
-        scoped_n += 1;
-    }
     let mut scoped_materialized = [("", &EMPTY_CTE); MAX_VISIBLE_CTES];
-    let mut scoped_nm = 0usize;
-    for binding in &materialized[..nm] {
-        if scoped_nm == scoped_materialized.len() {
-            return Err(too_many_visible_ctes());
-        }
-        scoped_materialized[scoped_nm] = *binding;
-        scoped_nm += 1;
-    }
-    for binding in inherited_materialized {
-        if with.iter().any(|local| local.name == binding.0) {
-            continue;
-        }
-        if scoped_nm == scoped_materialized.len() {
-            return Err(too_many_visible_ctes());
-        }
-        scoped_materialized[scoped_nm] = *binding;
-        scoped_nm += 1;
-    }
+    let (scoped_n, scoped_nm) = fill_scoped_bindings(
+        with,
+        &resolved[..n],
+        inherited_ctes,
+        &materialized[..nm],
+        inherited_materialized,
+        &mut scoped_ctes,
+        &mut scoped_materialized,
+    )?;
     let context = Subst {
         ctes: &scoped_ctes[..scoped_n],
         materialized: &scoped_materialized[..scoped_nm],
@@ -713,9 +685,48 @@ fn with_exec_context<'a, 's, 'e, R>(
         dependencies,
         authorization_role,
         qualifier: None,
+        recursive_state: None,
         execution: Some(ExecutionSubst { params, sequences }),
     };
     build(context)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_scoped_bindings<'a>(
+    with: &[Cte<'a>],
+    resolved: &[(&'a str, &'a Select<'a>, &'a [&'a str])],
+    inherited_ctes: &CteBindings<'a>,
+    materialized: &[(&'a str, &'a MaterializedCte<'a>)],
+    inherited_materialized: &[(&'a str, &'a MaterializedCte<'a>)],
+    scoped_ctes: &mut [(&'a str, &'a Select<'a>, &'a [&'a str]); MAX_VISIBLE_CTES],
+    scoped_materialized: &mut [(&'a str, &'a MaterializedCte<'a>); MAX_VISIBLE_CTES],
+) -> Result<(usize, usize), SqlError> {
+    let mut scoped_n = 0;
+    for binding in resolved.iter().chain(
+        inherited_ctes
+            .iter()
+            .filter(|binding| !with.iter().any(|local| local.name == binding.0)),
+    ) {
+        if scoped_n == scoped_ctes.len() {
+            return Err(too_many_visible_ctes());
+        }
+        scoped_ctes[scoped_n] = *binding;
+        scoped_n += 1;
+    }
+
+    let mut scoped_nm = 0;
+    for binding in materialized.iter().chain(
+        inherited_materialized
+            .iter()
+            .filter(|binding| !with.iter().any(|local| local.name == binding.0)),
+    ) {
+        if scoped_nm == scoped_materialized.len() {
+            return Err(too_many_visible_ctes());
+        }
+        scoped_materialized[scoped_nm] = *binding;
+        scoped_nm += 1;
+    }
+    Ok((scoped_n, scoped_nm))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -774,8 +785,7 @@ fn materialize_query_cte<'a>(
             column_names,
             column_types,
             column_collations,
-            rows,
-            external_run: None,
+            source: crate::sql::ast::MaterializedCteSource::Inline(rows),
         })
         .map(|relation| &*relation)
         .map_err(|_| arena_full())
@@ -846,6 +856,7 @@ fn wrap_set_tree_with<'a>(
         from: None,
         where_clause: None,
         group_by: &[],
+        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
         grouping_sets: &[],
         having: None,
         order_by: &[],
@@ -863,8 +874,7 @@ static EMPTY_CTE: MaterializedCte<'static> = MaterializedCte {
     column_names: &[],
     column_types: &[],
     column_collations: &[],
-    rows: &[],
-    external_run: None,
+    source: crate::sql::ast::MaterializedCteSource::Inline(&[]),
 };
 
 static EMPTY_SELECT: Select<'static> = Select {
@@ -874,6 +884,7 @@ static EMPTY_SELECT: Select<'static> = Select {
     from: None,
     where_clause: None,
     group_by: &[],
+    grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
     grouping_sets: &[],
     having: None,
     order_by: &[],
@@ -921,6 +932,7 @@ struct Subst<'c, 'a, 's, 'e> {
     /// DML on an auto-updatable view is executed against its base table.
     /// Qualified target references must follow that rewrite too.
     qualifier: Option<ViewQualifier<'a>>,
+    recursive_state: Option<RecursiveStateSubst<'a>>,
     execution: Option<ExecutionSubst<'e, 'a>>,
 }
 
@@ -935,6 +947,13 @@ struct ViewQualifier<'a> {
     from: &'a str,
     to: &'a str,
     to_schema: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct RecursiveStateSubst<'a> {
+    qualifier: &'a str,
+    names: &'a [&'a str],
+    types: &'a [ColType],
 }
 
 const MAX_VIEW_DEPTH: u32 = 12;
@@ -1133,8 +1152,15 @@ fn tref_references(t: &TableRef, name: &str) -> usize {
             .map(|function| tref_references(function, name))
             .sum()
     });
+    let sample_references = t.sample.map_or(0, |sample| {
+        expr_references(sample.percentage, name)
+            + sample
+                .repeatable
+                .map_or(0, |repeatable| expr_references(repeatable, name))
+    });
     argument_references
         + grouped_references
+        + sample_references
         + usize::from(t.schema.is_none() && !t.is_function_source() && t.table == name)
 }
 
@@ -1260,6 +1286,136 @@ fn frame_bound_references(bound: crate::sql::ast::FrameBound<'_>, name: &str) ->
     }
 }
 
+fn select_mentions_column(select: &Select<'_>, qualifier: &str, name: &str) -> bool {
+    select.items.iter().any(|item| match item {
+        SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+            expr_mentions_column(expression, qualifier, name)
+        }
+        SelectItem::Wildcard | SelectItem::TableWildcard(_) => false,
+    }) || select
+        .where_clause
+        .is_some_and(|expression| expr_mentions_column(expression, qualifier, name))
+        || select
+            .having
+            .is_some_and(|expression| expr_mentions_column(expression, qualifier, name))
+        || select
+            .group_by
+            .iter()
+            .chain(select.distinct_on)
+            .any(|expression| expr_mentions_column(expression, qualifier, name))
+        || select
+            .order_by
+            .iter()
+            .any(|order| expr_mentions_column(order.expression, qualifier, name))
+        || select
+            .limit
+            .is_some_and(|expression| expr_mentions_column(expression, qualifier, name))
+        || select
+            .offset
+            .is_some_and(|expression| expr_mentions_column(expression, qualifier, name))
+        || select.from.is_some_and(|from| {
+            from.joins.iter().any(|join| {
+                join.on
+                    .is_some_and(|expression| expr_mentions_column(expression, qualifier, name))
+            })
+        })
+}
+
+fn expr_mentions_column(expression: &Expr<'_>, qualifier: &str, name: &str) -> bool {
+    let child = |expression| expr_mentions_column(expression, qualifier, name);
+    match expression {
+        Expr::Column {
+            qualifier: written,
+            name: written_name,
+        } => *written_name == name && written.is_none_or(|written| written == qualifier),
+        Expr::Subquery(select) | Expr::Exists(select) | Expr::ArraySubquery(select) => {
+            select_mentions_column(select, qualifier, name)
+        }
+        Expr::InSubquery {
+            operand, select, ..
+        }
+        | Expr::QuantifiedSubquery {
+            operand, select, ..
+        } => child(operand) || select_mentions_column(select, qualifier, name),
+        Expr::Unary { operand, .. }
+        | Expr::Cast { operand, .. }
+        | Expr::Collate { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::Field { base: operand, .. } => child(operand),
+        Expr::Binary { left, right, .. } => child(left) || child(right),
+        Expr::Call {
+            args,
+            order_by,
+            over,
+            filter,
+            ..
+        } => {
+            args.iter().any(|expression| child(expression))
+                || order_by.iter().any(|order| child(order.expression))
+                || over.is_some_and(|window| {
+                    window
+                        .partition_by
+                        .iter()
+                        .any(|expression| child(expression))
+                        || window.order_by.iter().any(|order| child(order.expression))
+                        || window.frame.is_some_and(|frame| {
+                            frame_bound_mentions_column(frame.start, qualifier, name)
+                                || frame_bound_mentions_column(frame.end, qualifier, name)
+                        })
+                })
+                || filter.is_some_and(child)
+        }
+        Expr::InList { operand, list, .. } => {
+            child(operand) || list.iter().any(|expression| child(expression))
+        }
+        Expr::Between {
+            operand, low, high, ..
+        } => child(operand) || child(low) || child(high),
+        Expr::Like {
+            operand,
+            pattern,
+            escape,
+            ..
+        } => child(operand) || child(pattern) || escape.is_some_and(child),
+        Expr::Match {
+            operand, pattern, ..
+        } => child(operand) || child(pattern),
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+            ..
+        } => {
+            operand.is_some_and(child)
+                || whens
+                    .iter()
+                    .any(|(condition, result)| child(condition) || child(result))
+                || otherwise.is_some_and(child)
+        }
+        Expr::Array(items) => items.iter().any(|expression| child(expression)),
+        Expr::Subscript { base, index } => child(base) || child(index),
+        Expr::Slice { base, lower, upper } => {
+            child(base) || lower.is_some_and(child) || upper.is_some_and(child)
+        }
+        Expr::AnyAll { operand, array, .. } => child(operand) || child(array),
+        _ => false,
+    }
+}
+
+fn frame_bound_mentions_column(
+    bound: crate::sql::ast::FrameBound<'_>,
+    qualifier: &str,
+    name: &str,
+) -> bool {
+    match bound {
+        crate::sql::ast::FrameBound::Preceding(expression)
+        | crate::sql::ast::FrameBound::Following(expression) => {
+            expr_mentions_column(expression, qualifier, name)
+        }
+        _ => false,
+    }
+}
+
 fn expression_contains_volatile(expression: &Expr<'_>, storage: &Storage, txid: u32) -> bool {
     if expression.contains_volatile_function().is_some()
         || matches!(expression, Expr::Call { name, args, .. }
@@ -1337,6 +1493,10 @@ fn select_contains_volatile(select: &Select<'_>, storage: &Storage, txid: u32) -
                             .subquery
                             .is_some_and(|query| select_contains_volatile(query, storage, txid))
                     })
+                })
+                || table.sample.is_some_and(|sample| {
+                    expression_has_it(sample.percentage)
+                        || sample.repeatable.is_some_and(expression_has_it)
                 })
         };
         if table_has_it(&from.base)
@@ -1431,6 +1591,644 @@ fn recursive_parts<'a>(
     Ok((left, right, all))
 }
 
+#[derive(Clone, Copy)]
+struct RecursiveSearch<'a> {
+    order: CteSearchOrder,
+    keys: &'a [usize],
+    output: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RecursiveCycle<'a> {
+    keys: &'a [usize],
+    mark: usize,
+    path: usize,
+    mark_value: Datum<'a>,
+    mark_default: Datum<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct RecursiveDecoration<'a> {
+    visible: usize,
+    column_names: &'a [&'a str],
+    column_types: &'a [(i32, i16, i32)],
+    column_collations: &'a [Collation],
+    state_types: &'a [ColType],
+    search: Option<RecursiveSearch<'a>>,
+    cycle: Option<RecursiveCycle<'a>>,
+    name_collision: Option<(&'static str, &'a str)>,
+}
+
+fn recursive_key_columns<'a>(
+    requested: &[&str],
+    names: &[&str],
+    clause: &str,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    let mut resolved = [0usize; MAX_PROJ];
+    if requested.is_empty() || requested.len() > resolved.len() {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "recursive search key list is empty or too wide"
+        ));
+    }
+    for (index, requested) in requested.iter().enumerate() {
+        let mut matches = names
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| *candidate == requested);
+        let Some((column, _)) = matches.next() else {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "{} column \"{}\" not in WITH query column list",
+                clause,
+                requested
+            ));
+        };
+        if matches.next().is_some() {
+            return Err(sql_err!(
+                sqlstate::AMBIGUOUS_COLUMN,
+                "column reference \"{}\" is ambiguous",
+                requested
+            ));
+        }
+        if resolved[..index].contains(&column) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "{} column \"{}\" specified more than once",
+                clause,
+                requested
+            ));
+        }
+        resolved[index] = column;
+    }
+    arena
+        .alloc_slice_copy(&resolved[..requested.len()])
+        .map(|columns| &*columns)
+        .map_err(|_| arena_full())
+}
+
+fn prepare_recursive_decoration<'a>(
+    cte: &'a Cte<'a>,
+    base_names: &[&'a str],
+    base_types: &[(i32, i16, i32)],
+    base_collations: &[Collation],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<RecursiveDecoration<'a>, SqlError> {
+    let generated = usize::from(cte.search.is_some()) + usize::from(cte.cycle.is_some()) * 2;
+    if base_names.len() + generated > MAX_PROJ
+        || base_names.len() + generated > crate::storage::MAX_COLUMNS
+    {
+        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "too many columns"));
+    }
+    let mut names = [""; MAX_PROJ];
+    let mut types = [(0i32, 0i16, -1i32); MAX_PROJ];
+    let mut collations = [Collation::None; MAX_PROJ];
+    let visible = base_names.len();
+    names[..visible].copy_from_slice(base_names);
+    types[..visible].copy_from_slice(base_types);
+    collations[..visible].copy_from_slice(base_collations);
+    let mut next = visible;
+    let mut state_types = [ColType::Bool; 3];
+    let mut state_count = 0usize;
+    let mut name_collision = None;
+    let search = if let Some(search) = cte.search {
+        if names[..next].contains(&search.sequence_column) {
+            name_collision = Some(("search sequence", search.sequence_column));
+        }
+        let keys = recursive_key_columns(search.columns, base_names, "search", arena)?;
+        names[next] = search.sequence_column;
+        let ctype = match search.order {
+            CteSearchOrder::BreadthFirst => ColType::Record,
+            CteSearchOrder::DepthFirst => ColType::Array(ArrElem::Record),
+        };
+        types[next] = (ctype.oid(), ctype.typlen(), -1);
+        state_types[state_count] = ctype;
+        state_count += 1;
+        let output = next;
+        next += 1;
+        Some(RecursiveSearch {
+            order: search.order,
+            keys,
+            output,
+        })
+    } else {
+        None
+    };
+    let cycle = if let Some(cycle) = cte.cycle {
+        for generated_name in [cycle.mark_column, cycle.path_column] {
+            if names[..next].contains(&generated_name) {
+                name_collision.get_or_insert(("cycle", generated_name));
+            }
+        }
+        if cycle.mark_column == cycle.path_column {
+            name_collision.get_or_insert(("cycle", cycle.mark_column));
+        }
+        let keys = recursive_key_columns(cycle.columns, base_names, "cycle", arena)?;
+        let (mark_value, mark_default, mark_type) = match cycle.mark {
+            CteCycleMark::Boolean => (Datum::Bool(true), Datum::Bool(false), ColType::Bool),
+            CteCycleMark::Custom { value, default } => {
+                let value_type =
+                    crate::sql::exec::infer_type_catalog(value, None, storage, txid)?.0;
+                let default_type =
+                    crate::sql::exec::infer_type_catalog(default, None, storage, txid)?.0;
+                let value_type = (value_type != crate::sql::types::oid::UNKNOWN)
+                    .then(|| crate::sql::exec::catalog_column_type(storage, txid, value_type))
+                    .flatten()
+                    .map(|(ctype, _)| ctype);
+                let default_type = (default_type != crate::sql::types::oid::UNKNOWN)
+                    .then(|| crate::sql::exec::catalog_column_type(storage, txid, default_type))
+                    .flatten()
+                    .map(|(ctype, _)| ctype);
+                let mark_type = match (value_type, default_type) {
+                    (Some(left), Some(right)) => super::setops::unify_set_type(left, right),
+                    (Some(known), None) | (None, Some(known)) => Some(known),
+                    (None, None) => Some(ColType::Text),
+                }
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::DATATYPE_MISMATCH, "CYCLE types cannot be matched")
+                })?;
+                let catalog = super::storage_catalog(storage, arena, txid);
+                let hooks = crate::sql::eval::EvalHooks {
+                    catalog: Some(&catalog),
+                    ..crate::sql::eval::NO_HOOKS
+                };
+                let value = crate::sql::eval::eval_full(
+                    value,
+                    arena,
+                    crate::sql::eval::NO_PARAMS,
+                    &crate::sql::eval::NoColumns,
+                    &hooks,
+                )?;
+                let default = crate::sql::eval::eval_full(
+                    default,
+                    arena,
+                    crate::sql::eval::NO_PARAMS,
+                    &crate::sql::eval::NoColumns,
+                    &hooks,
+                )?;
+                (
+                    super::setops::coerce_set_value(value, mark_type, arena)?,
+                    super::setops::coerce_set_value(default, mark_type, arena)?,
+                    mark_type,
+                )
+            }
+        };
+        names[next] = cycle.mark_column;
+        types[next] = (mark_type.oid(), mark_type.typlen(), -1);
+        collations[next] = if mark_type.is_collatable() {
+            Collation::Default
+        } else {
+            Collation::None
+        };
+        let mark = next;
+        state_types[state_count] = mark_type;
+        state_count += 1;
+        next += 1;
+        names[next] = cycle.path_column;
+        let path_type = ColType::Array(ArrElem::Record);
+        types[next] = (path_type.oid(), path_type.typlen(), -1);
+        state_types[state_count] = path_type;
+        state_count += 1;
+        let path = next;
+        next += 1;
+        Some(RecursiveCycle {
+            keys,
+            mark,
+            path,
+            mark_value,
+            mark_default,
+        })
+    } else {
+        None
+    };
+    Ok(RecursiveDecoration {
+        visible,
+        column_names: arena
+            .alloc_slice_copy(&names[..next])
+            .map_err(|_| arena_full())?,
+        column_types: arena
+            .alloc_slice_copy(&types[..next])
+            .map_err(|_| arena_full())?,
+        column_collations: arena
+            .alloc_slice_copy(&collations[..next])
+            .map_err(|_| arena_full())?,
+        state_types: arena
+            .alloc_slice_copy(&state_types[..state_count])
+            .map_err(|_| arena_full())?,
+        search,
+        cycle,
+        name_collision,
+    })
+}
+
+fn reject_recursive_name_collision<'a>(
+    cte: &'a Cte<'a>,
+    recursive_tree: &'a SetTree<'a>,
+    decoration: RecursiveDecoration<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<(), SqlError> {
+    let Some((clause, name)) = decoration.name_collision else {
+        return Ok(());
+    };
+    if let SetTree::Select(select) = recursive_tree
+        && let Some(qualifier) = recursive_table_qualifier(select, cte.name)
+        && select_mentions_column(select, qualifier, name)
+    {
+        return Err(sql_err!(
+            sqlstate::AMBIGUOUS_COLUMN,
+            "column reference \"{}\" is ambiguous",
+            name
+        ));
+    }
+    // PostgreSQL resolves the recursive term against the rewritten output
+    // before reporting the clause-level duplicate. An explicit or unqualified
+    // reference to the duplicated name is therefore 42702; a term that never
+    // references it reaches the later 42601 clause error.
+    let relation = arena
+        .alloc(MaterializedCte {
+            column_names: decoration.column_names,
+            column_types: decoration.column_types,
+            column_collations: decoration.column_collations,
+            source: crate::sql::ast::MaterializedCteSource::Inline(&[]),
+        })
+        .map_err(|_| arena_full())?;
+    let binding = [(cte.name, &*relation)];
+    let rewritten = subst_set_tree(
+        recursive_tree,
+        Subst {
+            ctes: &[],
+            materialized: &binding,
+            storage,
+            txid,
+            depth: 0,
+            path: None,
+            dependencies: None,
+            authorization_role: None,
+            qualifier: None,
+            recursive_state: None,
+            execution: None,
+        },
+        arena,
+    )?;
+    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+    describe_set_body(storage, rewritten, txid, &mut columns, arena)?;
+    Err(sql_err!(
+        sqlstate::SYNTAX_ERROR,
+        "{} column name \"{}\" already used in WITH query column list",
+        clause,
+        name
+    ))
+}
+
+fn recursive_key<'a>(
+    row: &'a [u8],
+    keys: &[usize],
+    decoration: RecursiveDecoration<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let fields = arena
+        .alloc_slice_with(keys.len(), |_| RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        })
+        .map_err(|_| arena_full())?;
+    for (field, &column) in fields.iter_mut().zip(keys) {
+        field.name = decoration.column_names[column];
+        field.type_oid = decoration.column_types[column].0;
+        field.value = crate::sql::exec::decode_projected_col_record(row, column, arena)?;
+    }
+    Ok(Datum::Record(fields))
+}
+
+fn recursive_path<'a>(
+    parent: Option<Datum<'a>>,
+    key: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
+    let mut count = 0usize;
+    if let Some(Datum::Array {
+        element: ArrElem::Record,
+        raw,
+    }) = parent
+    {
+        count = crate::sql::array::len(raw);
+        if count >= values.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "recursive path exceeds the array limit"
+            ));
+        }
+        for (index, value) in values.iter_mut().enumerate().take(count) {
+            *value = crate::sql::array::get_record(raw, index, arena)?.unwrap_or(Datum::Null);
+        }
+    }
+    values[count] = key;
+    Ok(Datum::Array {
+        element: ArrElem::Record,
+        raw: crate::sql::array::build(&values[..=count], arena)?,
+    })
+}
+
+fn recursive_path_contains<'a>(
+    path: Datum<'a>,
+    key: &Datum<'a>,
+    arena: &'a Arena,
+) -> Result<bool, SqlError> {
+    let Datum::Array {
+        element: ArrElem::Record,
+        raw,
+    } = path
+    else {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "invalid recursive path state"
+        ));
+    };
+    for index in 0..crate::sql::array::len(raw) {
+        let member = crate::sql::array::get_record(raw, index, arena)?.unwrap_or(Datum::Null);
+        if crate::sql::eval::membership_eq(&member, key)? == Some(true) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn decorate_recursive_row<'a>(
+    source: &'a [u8],
+    decoration: RecursiveDecoration<'a>,
+    base: bool,
+    arena: &'a Arena,
+) -> Result<(&'a [u8], bool), SqlError> {
+    let mut values = [Datum::Null; MAX_PROJ];
+    for (column, value) in values.iter_mut().enumerate().take(decoration.visible) {
+        *value = crate::sql::exec::decode_projected_col_record(source, column, arena)?;
+    }
+    if let Some(search) = decoration.search {
+        let key = recursive_key(source, search.keys, decoration, arena)?;
+        values[search.output] = match search.order {
+            CteSearchOrder::DepthFirst => {
+                let parent = (!base).then(|| {
+                    crate::sql::exec::decode_projected_col_record(source, search.output, arena)
+                });
+                recursive_path(parent.transpose()?, key, arena)?
+            }
+            CteSearchOrder::BreadthFirst => {
+                let depth = if base {
+                    0
+                } else {
+                    let parent = crate::sql::exec::decode_projected_col_record(
+                        source,
+                        search.output,
+                        arena,
+                    )?;
+                    let Datum::Record(fields) = parent else {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "invalid breadth-first recursive state"
+                        ));
+                    };
+                    match fields.first().map(|field| field.value) {
+                        Some(Datum::Int8(depth)) => depth + 1,
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "invalid breadth-first recursive depth"
+                            ));
+                        }
+                    }
+                };
+                let Datum::Record(key_fields) = key else {
+                    unreachable!("recursive key is a record")
+                };
+                let fields = arena
+                    .alloc_slice_with(key_fields.len() + 1, |_| RecordField {
+                        name: "",
+                        type_oid: 0,
+                        value: Datum::Null,
+                    })
+                    .map_err(|_| arena_full())?;
+                fields[0] = RecordField {
+                    name: "*DEPTH*",
+                    type_oid: crate::sql::types::oid::INT8,
+                    value: Datum::Int8(depth),
+                };
+                fields[1..].copy_from_slice(key_fields);
+                Datum::Record(fields)
+            }
+        };
+    }
+    let mut is_cycle = false;
+    if let Some(cycle) = decoration.cycle {
+        let key = recursive_key(source, cycle.keys, decoration, arena)?;
+        let parent = if base {
+            None
+        } else {
+            Some(crate::sql::exec::decode_projected_col_record(
+                source, cycle.path, arena,
+            )?)
+        };
+        if let Some(path) = parent {
+            is_cycle = recursive_path_contains(path, &key, arena)?;
+        }
+        values[cycle.mark] = if is_cycle {
+            cycle.mark_value
+        } else {
+            cycle.mark_default
+        };
+        values[cycle.path] = recursive_path(parent, key, arena)?;
+    }
+    let row =
+        crate::sql::exec::encode_projected_pub(&values[..decoration.column_names.len()], arena)?;
+    Ok((row, is_cycle))
+}
+
+fn recursive_noncycle_rows<'a>(
+    rows: &'a [&'a [u8]],
+    decoration: RecursiveDecoration<'a>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    let Some(cycle) = decoration.cycle else {
+        return Ok(rows);
+    };
+    let output = arena
+        .alloc_slice_with(rows.len(), |_| &[] as &[u8])
+        .map_err(|_| arena_full())?;
+    let mut count = 0usize;
+    for &row in rows {
+        let mark = crate::sql::exec::decode_projected_col_record(row, cycle.mark, arena)?;
+        if crate::sql::eval::membership_eq(&mark, &cycle.mark_value)? != Some(true) {
+            output[count] = row;
+            count += 1;
+        }
+    }
+    Ok(&output[..count])
+}
+
+fn recursive_table_qualifier<'a>(select: &'a Select<'a>, name: &str) -> Option<&'a str> {
+    let matches = |table: &'a TableRef<'a>| {
+        (table.schema.is_none()
+            && table.subquery.is_none()
+            && !table.is_function_source()
+            && table.table == name)
+            .then_some(table.alias.unwrap_or(table.table))
+    };
+    let from = select.from.as_ref()?;
+    matches(&from.base).or_else(|| from.joins.iter().find_map(|join| matches(&join.table)))
+}
+
+fn append_recursive_state<'a>(
+    tree: &'a SetTree<'a>,
+    cte_name: &str,
+    decoration: RecursiveDecoration<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a SetTree<'a>, SqlError> {
+    let SetTree::Select(select) = tree else {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "with a SEARCH or CYCLE clause, the recursive query must be a UNION of two SELECT commands"
+        ));
+    };
+    let qualifier = recursive_table_qualifier(select, cte_name).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INVALID_RECURSION,
+            "recursive reference to query \"{}\" is not in the recursive term",
+            cte_name
+        )
+    })?;
+    let select = subst_select_body(
+        select,
+        Subst {
+            ctes: &[],
+            materialized: &[],
+            storage,
+            txid,
+            depth: 0,
+            path: None,
+            dependencies: None,
+            authorization_role: None,
+            qualifier: None,
+            recursive_state: Some(RecursiveStateSubst {
+                qualifier,
+                names: &decoration.column_names[decoration.visible..],
+                types: decoration.state_types,
+            }),
+            execution: None,
+        },
+        arena,
+    )?;
+    let state_count = decoration.column_names.len() - decoration.visible;
+    if select.items.len() + state_count > MAX_PROJ {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "select list is too wide"
+        ));
+    }
+    let mut items = [SelectItem::Wildcard; MAX_PROJ];
+    items[..select.items.len()].copy_from_slice(select.items);
+    for state in 0..state_count {
+        let ctype = decoration.state_types[state];
+        let expression = arena
+            .alloc(Expr::RecursiveState {
+                qualifier,
+                index: state as u8,
+                ctype,
+            })
+            .map_err(|_| arena_full())?;
+        items[select.items.len() + state] = SelectItem::Expr {
+            expression,
+            alias: None,
+        };
+    }
+    let items = arena
+        .alloc_slice_copy(&items[..select.items.len() + state_count])
+        .map_err(|_| arena_full())?;
+    let select = arena
+        .alloc(Select { items, ..*select })
+        .map_err(|_| arena_full())?;
+    arena
+        .alloc(SetTree::Select(&*select))
+        .map(|tree| &*tree)
+        .map_err(|_| arena_full())
+}
+
+fn describe_recursive_materialized<'a>(
+    cte: &'a Cte<'a>,
+    outer: Subst<'_, 'a, '_, '_>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a MaterializedCte<'a>, SqlError> {
+    let (base_tree, recursive_tree, _) = recursive_parts(cte.query, cte.name)?;
+    let base_tree = subst_set_tree(base_tree, outer, arena)?;
+    let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let ncols = describe_set_body(storage, base_tree, txid, &mut described, arena)?;
+    if cte.columns.len() > ncols {
+        return Err(sql_err!(
+            sqlstate::INVALID_COLUMN_REFERENCE,
+            "WITH query \"{}\" has {} columns available but {} columns specified",
+            cte.name,
+            ncols,
+            cte.columns.len()
+        ));
+    }
+    let mut names = [""; MAX_PROJ];
+    for (index, output) in names.iter_mut().enumerate().take(ncols) {
+        *output = arena
+            .alloc_str(
+                cte.columns
+                    .get(index)
+                    .copied()
+                    .unwrap_or(described[index].name),
+            )
+            .map_err(|_| arena_full())?;
+    }
+    let base_column_names = arena
+        .alloc_slice_copy(&names[..ncols])
+        .map_err(|_| arena_full())?;
+    let base_column_types = arena
+        .alloc_slice_with(ncols, |index| {
+            (
+                described[index].type_oid,
+                described[index].typlen,
+                described[index].type_mod,
+            )
+        })
+        .map_err(|_| arena_full())?;
+    let base_column_collations = arena
+        .alloc_slice_with(ncols, |index| described[index].collation)
+        .map_err(|_| arena_full())?;
+    let decoration = prepare_recursive_decoration(
+        cte,
+        base_column_names,
+        base_column_types,
+        base_column_collations,
+        storage,
+        txid,
+        arena,
+    )?;
+    let recursive_tree = subst_set_tree(recursive_tree, outer, arena)?;
+    reject_recursive_name_collision(cte, recursive_tree, decoration, storage, txid, arena)?;
+
+    arena
+        .alloc(MaterializedCte {
+            column_names: decoration.column_names,
+            column_types: decoration.column_types,
+            column_collations: decoration.column_collations,
+            source: crate::sql::ast::MaterializedCteSource::Inline(&[]),
+        })
+        .map(|relation| &*relation)
+        .map_err(|_| arena_full())
+}
+
 /// Wraps a set tree as a `Select` (a lone leaf is returned as-is).
 fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Select<'a>, SqlError> {
     if let SetTree::Select(s) = tree {
@@ -1443,6 +2241,7 @@ fn wrap_set_tree<'a>(tree: &'a SetTree<'a>, arena: &'a Arena) -> Result<&'a Sele
         from: None,
         where_clause: None,
         group_by: &[],
+        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
         grouping_sets: &[],
         having: None,
         order_by: &[],
@@ -1498,6 +2297,95 @@ fn external_recursive_tree(
                 .expect("recursive work table has a block store")
         },
     )?;
+    storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("recursive work table has a block store")
+}
+
+fn external_decorate_recursive_run(
+    storage: &Storage,
+    input: Option<crate::sql::external::ExternalRun>,
+    decoration: RecursiveDecoration<'_>,
+    base: bool,
+    sorted: bool,
+    exclude_cycles: bool,
+    arena: &Arena,
+) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    let mut reader = storage.external_run_reader()?;
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = |left: &[u8], right: &[u8]| {
+        Ok(if sorted {
+            left.cmp(right)
+        } else {
+            core::cmp::Ordering::Equal
+        })
+    };
+    storage
+        .with_block_store(|blocks| reader.start(blocks, input))
+        .expect("recursive work table has a block store")?;
+    while let Some(source) = reader.row() {
+        let mark = arena.mark();
+        let (row, is_cycle) = decorate_recursive_row(source, decoration, base, arena)?;
+        if !exclude_cycles || !is_cycle {
+            storage
+                .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
+                .expect("recursive work table has a block store")?;
+        }
+        storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("recursive work table has a block store")?;
+        // The external sorter copied the encoded row into its fixed buffer or
+        // an immutable run block. No decoded record/path scratch escapes.
+        unsafe { arena.rewind_to(mark) };
+    }
+    storage
+        .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
+        .expect("recursive work table has a block store")
+}
+
+fn external_recursive_noncycle_run(
+    storage: &Storage,
+    input: Option<crate::sql::external::ExternalRun>,
+    decoration: RecursiveDecoration<'_>,
+    sorted: bool,
+    arena: &Arena,
+) -> Result<Option<crate::sql::external::ExternalRun>, SqlError> {
+    let Some(cycle) = decoration.cycle else {
+        return Ok(input);
+    };
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    let mut reader = storage.external_run_reader()?;
+    let mut sorter = storage.external_sorter()?;
+    sorter.reset();
+    let mut compare = |left: &[u8], right: &[u8]| {
+        Ok(if sorted {
+            left.cmp(right)
+        } else {
+            core::cmp::Ordering::Equal
+        })
+    };
+    storage
+        .with_block_store(|blocks| reader.start(blocks, input))
+        .expect("recursive work table has a block store")?;
+    while let Some(row) = reader.row() {
+        let mark = arena.mark();
+        let cycle_mark = crate::sql::exec::decode_projected_col_record(row, cycle.mark, arena)?;
+        if crate::sql::eval::membership_eq(&cycle_mark, &cycle.mark_value)? != Some(true) {
+            storage
+                .with_block_store(|blocks| sorter.push_encoded(blocks, row, &mut compare))
+                .expect("recursive work table has a block store")?;
+        }
+        storage
+            .with_block_store(|blocks| reader.advance(blocks))
+            .expect("recursive work table has a block store")?;
+        unsafe { arena.rewind_to(mark) };
+    }
     storage
         .with_block_store(|blocks| sorter.finish(blocks, &mut compare))
         .expect("recursive work table has a block store")
@@ -1636,7 +2524,7 @@ fn materialize_recursive<'a>(
     // References to earlier CTEs inline now; the self-reference stays a bare
     // table name (it is not in `outer`'s bindings) for per-iteration binding.
     let base_tree = subst_set_tree(base_tree, outer, arena)?;
-    let recursive_tree = subst_set_tree(recursive_tree, outer, arena)?;
+    let mut recursive_tree = subst_set_tree(recursive_tree, outer, arena)?;
     let total = set_tree_references(recursive_tree, cte.name);
     let direct = direct_references(recursive_tree, cte.name);
     if total > direct {
@@ -1666,7 +2554,7 @@ fn materialize_recursive<'a>(
             cte.columns.len()
         ));
     }
-    let column_names: &'a [&'a str] = {
+    let base_column_names: &'a [&'a str] = {
         let mut names: [&str; MAX_PROJ] = [""; MAX_PROJ];
         for (i, slot) in names.iter_mut().enumerate().take(ncols) {
             let name = cte.columns.get(i).copied().unwrap_or(described[i].name);
@@ -1679,7 +2567,7 @@ fn materialize_recursive<'a>(
             .alloc_slice_copy(&names[..ncols])
             .map_err(|_| arena_full())?
     };
-    let column_types: &'a [(i32, i16, i32)] = {
+    let base_column_types: &'a [(i32, i16, i32)] = {
         let mut types = [(0i32, 0i16, -1i32); MAX_PROJ];
         for (i, slot) in types.iter_mut().enumerate().take(ncols) {
             *slot = (
@@ -1692,92 +2580,140 @@ fn materialize_recursive<'a>(
             .alloc_slice_copy(&types[..ncols])
             .map_err(|_| arena_full())?
     };
-    let column_collations = arena
+    let base_column_collations = arena
         .alloc_slice_with(ncols, |index| described[index].collation)
         .map_err(|_| arena_full())?;
+    let decoration = prepare_recursive_decoration(
+        cte,
+        base_column_names,
+        base_column_types,
+        base_column_collations,
+        storage,
+        txid,
+        arena,
+    )?;
+    reject_recursive_name_collision(cte, recursive_tree, decoration, storage, txid, arena)?;
+    let decorated = decoration.column_names.len() != decoration.visible;
+    if decorated {
+        recursive_tree =
+            append_recursive_state(recursive_tree, cte.name, decoration, storage, txid, arena)?;
+    }
+    let column_names = decoration.column_names;
+    let column_types = decoration.column_types;
+    let column_collations = decoration.column_collations;
 
     if storage.spill_attached() {
-        let base = external_recursive_tree(
+        let base_raw = external_recursive_tree(
             base_tree, storage, txid, arena, params, sequences, !union_all,
         )?;
+        let base = if decorated {
+            external_decorate_recursive_run(
+                storage, base_raw, decoration, true, !union_all, false, arena,
+            )?
+        } else {
+            base_raw
+        };
         let mut all = if union_all {
             base
         } else {
             external_unique_run(storage, base)?
         };
         let mut working = all;
-        while working.is_some_and(|run| run.rows() > 0) {
-            check_timeout()?;
-            let mark = arena.mark();
-            let working_cte = arena
-                .alloc(MaterializedCte {
-                    column_names,
-                    column_types,
-                    column_collations,
-                    rows: &[],
-                    external_run: working,
-                })
-                .map_err(|_| arena_full())?;
-            let binding = [(cte.name, &*working_cte)];
-            let context = Subst {
-                ctes: &[],
-                materialized: &binding,
-                storage,
-                txid: outer.txid,
-                depth: 0,
-                path: None,
-                dependencies: None,
-                authorization_role: None,
-                qualifier: None,
-                execution: outer.execution,
-            };
-            let step_tree = subst_set_tree(recursive_tree, context, arena)?;
-            let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
-            let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena)?;
-            if stepn != ncols {
+        let working_source = arena.alloc_atomic_usize(0).map_err(|_| arena_full())?;
+        let working_cte = arena
+            .alloc(MaterializedCte {
+                column_names: base_column_names,
+                column_types: base_column_types,
+                column_collations: base_column_collations,
+                source: crate::sql::ast::MaterializedCteSource::RecursiveExternal(working_source),
+            })
+            .map_err(|_| arena_full())?;
+        let binding = [(cte.name, &*working_cte)];
+        let context = Subst {
+            ctes: &[],
+            materialized: &binding,
+            storage,
+            txid: outer.txid,
+            depth: 0,
+            path: None,
+            dependencies: None,
+            authorization_role: None,
+            qualifier: None,
+            recursive_state: None,
+            execution: outer.execution,
+        };
+        let step_tree = subst_set_tree(recursive_tree, context, arena)?;
+        let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena)?;
+        let expected_step_columns = ncols + decoration.state_types.len();
+        if stepn != expected_step_columns {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "each UNION query must have the same number of columns"
+            ));
+        }
+        for column in 0..ncols {
+            if step_desc[column].type_oid != base_column_types[column].0 {
                 return Err(sql_err!(
-                    sqlstate::SYNTAX_ERROR,
-                    "each UNION query must have the same number of columns"
+                    sqlstate::DATATYPE_MISMATCH,
+                    "recursive query \"{}\" column {} has type {} in non-recursive term but type {} overall",
+                    cte.name,
+                    column + 1,
+                    base_column_types[column].0,
+                    step_desc[column].type_oid
                 ));
             }
-            for column in 0..ncols {
-                if step_desc[column].type_oid != column_types[column].0 {
-                    return Err(sql_err!(
-                        sqlstate::DATATYPE_MISMATCH,
-                        "recursive query \"{}\" column {} has type {} in non-recursive term but type {} overall",
-                        cte.name,
-                        column + 1,
-                        column_types[column].0,
-                        step_desc[column].type_oid
-                    ));
-                }
-            }
-            let candidates = external_recursive_tree(
+        }
+        while working.is_some_and(|run| run.rows() > 0) {
+            check_timeout()?;
+            let run = arena
+                .alloc(working.expect("loop condition requires a run"))
+                .map_err(|_| arena_full())?;
+            working_source.store(
+                run as *const crate::sql::external::ExternalRun as usize,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            let iteration_mark = arena.mark();
+            let raw_candidates = external_recursive_tree(
                 step_tree, storage, txid, arena, params, sequences, !union_all,
             )?;
+            let candidates = if decorated {
+                external_decorate_recursive_run(
+                    storage,
+                    raw_candidates,
+                    decoration,
+                    false,
+                    !union_all,
+                    false,
+                    arena,
+                )?
+            } else {
+                raw_candidates
+            };
             let fresh = if union_all {
                 candidates
             } else {
                 let unique = external_unique_run(storage, candidates)?;
                 external_recursive_difference(storage, unique, all)?
             };
-            // SAFETY: the substituted iteration tree and its materialized-CTE
-            // binding are dead. Completed immutable runs own only block
-            // identities and never borrow statement-arena bytes.
-            unsafe { arena.rewind_to(mark) };
             if fresh.is_none_or(|run| run.rows() == 0) {
+                unsafe { arena.rewind_to(iteration_mark) };
                 break;
             }
+            let next_working =
+                external_recursive_noncycle_run(storage, fresh, decoration, !union_all, arena)?;
             all = external_recursive_union(storage, all, fresh, !union_all)?;
-            working = fresh;
+            working = next_working;
+            // Completed runs retain only block identities; all query scopes,
+            // decoded records, and sorter scratch from this iteration are dead.
+            unsafe { arena.rewind_to(iteration_mark) };
         }
         return Ok(&*arena
             .alloc(MaterializedCte {
                 column_names,
                 column_types,
                 column_collations,
-                rows: &[],
-                external_run: all,
+                source: crate::sql::ast::MaterializedCteSource::External(all),
             })
             .map_err(|_| arena_full())?);
     }
@@ -1788,6 +2724,17 @@ fn materialize_recursive<'a>(
     let (base_rows, _, _) =
         materialize_set_body(storage, txid, base_tree, arena, params, sequences)?;
     const EMPTY: &[u8] = &[];
+    let base_rows = if decorated {
+        let rows = arena
+            .alloc_slice_with(base_rows.len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        for (output, &source) in rows.iter_mut().zip(base_rows) {
+            *output = decorate_recursive_row(source, decoration, true, arena)?.0;
+        }
+        &*rows
+    } else {
+        base_rows
+    };
     let mut all_rows: &'a [&'a [u8]] = if union_all {
         base_rows
     } else {
@@ -1805,57 +2752,81 @@ fn materialize_recursive<'a>(
     };
     let mut working: &'a [&'a [u8]] = all_rows;
 
-    while !working.is_empty() {
-        check_timeout()?;
-        // Bind the CTE name to the previous iteration's rows and evaluate the
-        // recursive term.
-        let working_cte = arena
-            .alloc(MaterializedCte {
-                column_names,
-                column_types,
-                column_collations,
-                rows: working,
-                external_run: None,
-            })
-            .map_err(|_| arena_full())?;
-        let binding = [(cte.name, &*working_cte)];
-        let context = Subst {
-            ctes: &[],
-            materialized: &binding,
-            storage,
-            txid: outer.txid,
-            depth: 0,
-            path: None,
-            dependencies: None,
-            authorization_role: None,
-            qualifier: None,
-            execution: outer.execution,
-        };
-        let step_tree = subst_set_tree(recursive_tree, context, arena)?;
-        // The recursive term's column types must agree with the non-recursive
-        // term's (PostgreSQL unifies them; a mismatch is a loud error).
-        let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
-        let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena)?;
-        if stepn != ncols {
+    // Bind the recursive reference once. Only the work-table row slice changes
+    // between iterations; rebuilding the substituted AST each time retains a
+    // full plan per iteration in the bump arena and makes shallow recursion
+    // exhaust memory before row capacity does.
+    let working_source = arena.alloc_atomic_usize(0).map_err(|_| arena_full())?;
+    let working_cte = arena
+        .alloc(MaterializedCte {
+            column_names: base_column_names,
+            column_types: base_column_types,
+            column_collations: base_column_collations,
+            source: crate::sql::ast::MaterializedCteSource::RecursiveInline(working_source),
+        })
+        .map_err(|_| arena_full())?;
+    let binding = [(cte.name, &*working_cte)];
+    let context = Subst {
+        ctes: &[],
+        materialized: &binding,
+        storage,
+        txid: outer.txid,
+        depth: 0,
+        path: None,
+        dependencies: None,
+        authorization_role: None,
+        qualifier: None,
+        recursive_state: None,
+        execution: outer.execution,
+    };
+    let step_tree = subst_set_tree(recursive_tree, context, arena)?;
+    let mut step_desc = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let stepn = describe_set_body(storage, step_tree, txid, &mut step_desc, arena)?;
+    let expected_step_columns = ncols + decoration.state_types.len();
+    if stepn != expected_step_columns {
+        return Err(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "each UNION query must have the same number of columns"
+        ));
+    }
+    for c in 0..ncols {
+        if step_desc[c].type_oid != base_column_types[c].0 {
             return Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "each UNION query must have the same number of columns"
+                sqlstate::DATATYPE_MISMATCH,
+                "recursive query \"{}\" column {} has type {} in non-recursive term but type {} overall",
+                cte.name,
+                c + 1,
+                base_column_types[c].0,
+                step_desc[c].type_oid
             ));
         }
-        for c in 0..ncols {
-            if step_desc[c].type_oid != column_types[c].0 {
-                return Err(sql_err!(
-                    sqlstate::DATATYPE_MISMATCH,
-                    "recursive query \"{}\" column {} has type {} in non-recursive term but type {} overall",
-                    cte.name,
-                    c + 1,
-                    column_types[c].0,
-                    step_desc[c].type_oid
-                ));
-            }
-        }
+    }
+
+    while !working.is_empty() {
+        check_timeout()?;
+        let source = arena
+            .alloc(crate::sql::ast::MaterializedCteInlineSource {
+                address: working.as_ptr() as usize,
+                length: working.len(),
+            })
+            .map_err(|_| arena_full())?;
+        working_source.store(
+            source as *const crate::sql::ast::MaterializedCteInlineSource as usize,
+            core::sync::atomic::Ordering::Relaxed,
+        );
         let (step_rows, _, _) =
             materialize_set_body(storage, txid, step_tree, arena, params, sequences)?;
+        let step_rows = if decorated {
+            let rows = arena
+                .alloc_slice_with(step_rows.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (output, &source) in rows.iter_mut().zip(step_rows) {
+                *output = decorate_recursive_row(source, decoration, false, arena)?.0;
+            }
+            &*rows
+        } else {
+            step_rows
+        };
         // Keep the rows this iteration added: all of them under UNION ALL, only
         // never-seen ones under UNION.
         let fresh: &'a [&'a [u8]] = if union_all {
@@ -1882,7 +2853,7 @@ fn materialize_recursive<'a>(
         combined[..all_rows.len()].copy_from_slice(all_rows);
         combined[all_rows.len()..].copy_from_slice(fresh);
         all_rows = combined;
-        working = fresh;
+        working = recursive_noncycle_rows(fresh, decoration, arena)?;
     }
 
     Ok(&*arena
@@ -1890,8 +2861,7 @@ fn materialize_recursive<'a>(
             column_names,
             column_types,
             column_collations,
-            rows: all_rows,
-            external_run: None,
+            source: crate::sql::ast::MaterializedCteSource::Inline(all_rows),
         })
         .map_err(|_| arena_full())?)
 }
@@ -2059,6 +3029,7 @@ fn subst_select_body<'a>(
         from,
         where_clause: opt_subst(s.where_clause, context, arena)?,
         group_by,
+        grouping_set_quantifier: s.grouping_set_quantifier,
         grouping_sets,
         having: opt_subst(s.having, context, arena)?,
         order_by,
@@ -2326,7 +3297,7 @@ fn subst_from<'a>(
         table: f.base,
         kind: JoinKind::Inner,
         on: None,
-        using_columns: None,
+        using: None,
         natural: false,
     };
     let mut joins = [dummy; MAX_JOIN_TABLES - 1];
@@ -2338,7 +3309,7 @@ fn subst_from<'a>(
             table: subst_tableref(&j.table, context, arena)?,
             kind: j.kind,
             on: opt_subst(j.on, context, arena)?,
-            using_columns: j.using_columns,
+            using: j.using,
             natural: j.natural,
         };
     }
@@ -2353,6 +3324,18 @@ fn subst_tableref<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<TableRef<'a>, SqlError> {
+    let rewritten = TableRef {
+        sample: match t.sample {
+            Some(sample) => Some(crate::sql::ast::TableSample {
+                method: sample.method,
+                percentage: subst_expr(sample.percentage, context, arena)?,
+                repeatable: opt_subst(sample.repeatable, context, arena)?,
+            }),
+            None => None,
+        },
+        ..*t
+    };
+    let t = &rewritten;
     if let Some(functions) = t.rows_from {
         let mut rewritten = [*t; crate::sql::parser::MAX_LIST];
         for (slot, function) in rewritten.iter_mut().zip(functions) {
@@ -2414,6 +3397,8 @@ fn subst_tableref<'a>(
             func_args: None,
             rows_from: None,
             col_alias: t.col_alias,
+            inheritance: t.inheritance,
+            sample: t.sample,
             cte: Some(m),
             with_ordinality: false,
             lateral: false,
@@ -2440,6 +3425,8 @@ fn subst_tableref<'a>(
             func_args: None,
             rows_from: None,
             col_alias: renames,
+            inheritance: t.inheritance,
+            sample: t.sample,
             cte: None,
             with_ordinality: false,
             lateral: false,
@@ -2574,6 +3561,8 @@ fn subst_tableref<'a>(
             func_args: None,
             rows_from: None,
             col_alias: None,
+            inheritance: t.inheritance,
+            sample: t.sample,
             cte: None,
             with_ordinality: false,
             lateral: false,
@@ -2843,7 +3832,11 @@ fn subst_expr<'a>(
     context: Subst<'_, 'a, '_, '_>,
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
-    if context.qualifier.is_none() && context.dependencies.is_none() && !expr_has_subquery(e) {
+    if context.qualifier.is_none()
+        && context.recursive_state.is_none()
+        && context.dependencies.is_none()
+        && !expr_has_subquery(e)
+    {
         return Ok(e);
     }
     let rebuilt = match e {
@@ -3077,13 +4070,28 @@ fn subst_expr<'a>(
             array: subst_expr(array, context, arena)?,
             all: *all,
         },
-        Expr::Column { qualifier, name } => Expr::Column {
-            qualifier: match (*qualifier, context.qualifier) {
-                (Some(written), Some(rewrite)) if written == rewrite.from => Some(rewrite.to),
-                _ => *qualifier,
-            },
-            name,
-        },
+        Expr::Column { qualifier, name } => {
+            if let Some(state) = context.recursive_state
+                && qualifier.is_none_or(|written| written == state.qualifier)
+                && let Some(index) = state.names.iter().position(|candidate| candidate == name)
+            {
+                Expr::RecursiveState {
+                    qualifier: state.qualifier,
+                    index: index as u8,
+                    ctype: state.types[index],
+                }
+            } else {
+                Expr::Column {
+                    qualifier: match (*qualifier, context.qualifier) {
+                        (Some(written), Some(rewrite)) if written == rewrite.from => {
+                            Some(rewrite.to)
+                        }
+                        _ => *qualifier,
+                    },
+                    name,
+                }
+            }
+        }
         Expr::WholeRow(qualifier) => Expr::WholeRow(match context.qualifier {
             Some(rewrite) if *qualifier == rewrite.from => rewrite.to,
             _ => qualifier,

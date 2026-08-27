@@ -3126,6 +3126,199 @@ def test_nested_materialized_cte_named_portal():
     s.close()
 
 
+def test_format_models_over_named_portal():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(s, "SET TimeZone='-05:00'")
+    check("raw wire: formatting session setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+    query = (
+        "SELECT to_number($1,$2)::text, to_char($3::timestamptz,$4), "
+        "to_char(interval '2 years 3 mons 15 days 36:07:05.123456',$5)"
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_format_statement\x00"
+        + query.encode()
+        + b"\x00"
+        + struct.pack("!hIIIII", 5, 25, 25, 1184, 25, 25),
+    )
+    values = [
+        b"XIV",
+        b"RN",
+        b"2024-02-29 23:07:05.123456-05",
+        b"YYYY-MM-DD HH24:MI:SS.US OF",
+        b"YYYY|MM|DDD|DD|HH24|MI|SS.MS",
+    ]
+    body = b"wire_format_portal\x00wire_format_statement\x00" + struct.pack("!hh", 0, len(values))
+    for value in values:
+        body += struct.pack("!i", len(value)) + value
+    body += struct.pack("!hhhh", 3, 1, 0, 1)
+    bind = frontend_message(b"B", body)
+    describe = frontend_message(b"D", b"Pwire_format_portal\x00")
+    execute = frontend_message(b"E", b"wire_format_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in output if kind == b"T"), None)
+    row = next((payload for kind, payload in output if kind == b"D"), None)
+    check(
+        "raw wire: parsed format models retain text OIDs and requested formats",
+        description is not None
+        and row_description_type_oids(description) == [25, 25, 25]
+        and row_description_formats(description) == [1, 0, 1],
+        output,
+    )
+    check(
+        "raw wire: named portal applies PostgreSQL numeric, zone, and interval models",
+        row is not None
+        and text_row_fields(row)
+        == [
+            "14",
+            "2024-03-01 09:07:05.123456 +05",
+            "0002|03|825|15|36|07|05.123",
+        ],
+        output,
+    )
+    s.close()
+
+
+def test_table_sample_binary_bind_and_named_portal():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_sample_source (id integer PRIMARY KEY); "
+        "INSERT INTO wire_sample_source SELECT value FROM generate_series(1,20) value",
+    )
+    check(
+        "raw wire: TABLESAMPLE source setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    query = (
+        "SELECT id FROM wire_sample_source "
+        "TABLESAMPLE BERNOULLI ($1) REPEATABLE ($2) ORDER BY id"
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_sample_statement\x00" + query.encode() + b"\x00" + struct.pack("!h", 0),
+    )
+    bind_body = (
+        b"wire_sample_portal\x00wire_sample_statement\x00"
+        + struct.pack("!hhh", 2, 1, 1)
+        + struct.pack("!h", 2)
+        + struct.pack("!if", 4, 100.0)
+        + struct.pack("!id", 8, 42.0)
+        + struct.pack("!hh", 1, 1)
+    )
+    bind = frontend_message(b"B", bind_body)
+    describe = frontend_message(b"D", b"Pwire_sample_portal\x00")
+    execute_first = frontend_message(b"E", b"wire_sample_portal\x00" + struct.pack("!i", 7))
+    execute_rest = frontend_message(b"E", b"wire_sample_portal\x00" + struct.pack("!i", 0))
+    s.sendall(parse + bind + describe + execute_first + execute_rest + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in output if kind == b"T"), None)
+    rows = [payload for kind, payload in output if kind == b"D"]
+    check(
+        "raw wire: inferred TABLESAMPLE parameters accept binary float4/float8 Bind values",
+        not any(kind == b"E" for kind, _ in output)
+        and description is not None
+        and row_description_type_oids(description) == [23]
+        and row_description_formats(description) == [1],
+        output,
+    )
+    check(
+        "raw wire: sampled named portal suspends and resumes without resampling",
+        len(rows) == 20
+        and b"s" in [kind for kind, _ in output]
+        and rows[0] == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", 1)
+        and rows[-1] == b"\x00\x01\x00\x00\x00\x04" + struct.pack("!i", 20),
+        output,
+    )
+    s.close()
+
+
+def test_join_using_alias_grouping_quantifier_binary_portal():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_using_left (id integer, payload text); "
+        "CREATE TABLE wire_using_right (id integer, payload text); "
+        "INSERT INTO wire_using_left VALUES (1,'a'),(1,'b'),(2,'c'); "
+        "INSERT INTO wire_using_right VALUES (1,'x'),(2,'y')",
+    )
+    check(
+        "raw wire: JOIN USING alias source setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    query = (
+        "SELECT merged.id, count(*) FROM wire_using_left "
+        "JOIN wire_using_right USING (id) AS merged "
+        "GROUP BY DISTINCT GROUPING SETS ((merged.id),(merged.id)) "
+        "HAVING count(*) >= $1 ORDER BY merged.id USING >"
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_using_statement\x00" + query.encode() + b"\x00" + struct.pack("!h", 0),
+    )
+    bind_body = b"wire_using_portal\x00wire_using_statement\x00"
+    bind_body += struct.pack("!hh", 1, 1)
+    bind_body += struct.pack("!hiq", 1, 8, 1)
+    bind_body += struct.pack("!hh", 1, 1)
+    bind = frontend_message(b"B", bind_body)
+    describe = frontend_message(b"D", b"Pwire_using_portal\x00")
+    execute_first = frontend_message(b"E", b"wire_using_portal\x00" + struct.pack("!i", 1))
+    execute_rest = frontend_message(b"E", b"wire_using_portal\x00" + struct.pack("!i", 0))
+    s.sendall(parse + bind + describe + execute_first + execute_rest + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in output if kind == b"T"), None)
+    rows = [payload for kind, payload in output if kind == b"D"]
+    check(
+        "raw wire: merged USING alias and grouping quantifier retain binary metadata",
+        not any(kind == b"E" for kind, _ in output)
+        and description is not None
+        and row_description_type_oids(description) == [23, 20]
+        and row_description_formats(description) == [1, 1],
+        output,
+    )
+    check(
+        "raw wire: merged grouping portal suspends and resumes in USING order",
+        len(rows) == 2
+        and b"s" in [kind for kind, _ in output]
+        and rows[0]
+        == b"\x00\x02\x00\x00\x00\x04"
+        + struct.pack("!i", 2)
+        + b"\x00\x00\x00\x08"
+        + struct.pack("!q", 1)
+        and rows[1]
+        == b"\x00\x02\x00\x00\x00\x04"
+        + struct.pack("!i", 1)
+        + b"\x00\x00\x00\x08"
+        + struct.pack("!q", 2),
+        output,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

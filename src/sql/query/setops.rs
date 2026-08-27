@@ -1130,12 +1130,7 @@ fn register_first_leaf_record_shapes(
             SelectItem::Wildcard => slot += scope.map_or(0, QueryScope::star_columns),
             SelectItem::TableWildcard(name) => {
                 slot += scope
-                    .and_then(|scope| {
-                        scope
-                            .table_index(name)
-                            .ok()
-                            .map(|table| scope.defs[table].expect("resolved").n_columns)
-                    })
+                    .and_then(|scope| scope.qualified_star_columns(name).ok())
                     .unwrap_or(0);
             }
             SelectItem::RecordStar(base) => {
@@ -1176,7 +1171,7 @@ fn register_first_leaf_record_shapes(
 
 /// The common type of two set-operation columns: equal types, the numeric
 /// tower, or (else) an error signalled by None.
-fn coerce_set_value<'a>(
+pub(crate) fn coerce_set_value<'a>(
     value: Datum<'a>,
     target: ColType,
     arena: &'a Arena,
@@ -1196,7 +1191,7 @@ fn coerce_set_value<'a>(
     }
 }
 
-fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
+pub(crate) fn unify_set_type(a: ColType, b: ColType) -> Option<ColType> {
     if a == b {
         return Some(a);
     }
@@ -1457,6 +1452,7 @@ fn eval_set_leaf<'a>(
     // Pass 1: count the rows. Pass 2: coerce to the target types and encode.
     let mut count = 0usize;
     let dry_sequences = sequences.map(DrySequence);
+    let dry_mark = arena.mark();
     select_into_rows(
         storage,
         txid,
@@ -1472,6 +1468,11 @@ fn eval_set_leaf<'a>(
             Ok(())
         },
     )?;
+    // The count pass cannot retain datums and uses a non-mutating sequence
+    // adapter. Recycle its executor scopes and row scratch before the real
+    // pass; otherwise every set leaf permanently consumes the work arena
+    // twice, and recursive terms compound that cost per iteration.
+    unsafe { arena.rewind_to(dry_mark) };
     let empty: &[u8] = &[];
     let rows = arena
         .alloc_slice_with(count, |_| empty)

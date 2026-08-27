@@ -362,6 +362,31 @@ assert cur.fetchone() == (20, 2)
 print("subpartition attach/detach extended protocol ok")
 cur.execute("DROP TABLE drv_partition_leaf, drv_partition_other, drv_partition_mid, drv_partition_tree")
 
+# TABLESAMPLE arguments are inferred/coerced at the source boundary, including
+# binary extended-protocol values selected by the driver.
+cur.execute("CREATE TABLE drv_sample_source (id integer PRIMARY KEY)")
+cur.execute("INSERT INTO drv_sample_source SELECT value FROM generate_series(1,20) value")
+cur.execute(
+    "SELECT count(*) FROM drv_sample_source "
+    "TABLESAMPLE BERNOULLI (%s) REPEATABLE (%s)",
+    (100.0, 42.0),
+)
+assert cur.fetchone() == (20,)
+bcur = conn.cursor(binary=True)
+bcur.execute(
+    "SELECT count(*) FROM drv_sample_source "
+    "TABLESAMPLE SYSTEM (%s) REPEATABLE (%s)",
+    (0.0, 42.0),
+)
+assert bcur.fetchone() == (0,)
+bcur.close()
+try:
+    cur.execute("SELECT * FROM drv_sample_source TABLESAMPLE BERNOULLI (%s)", (None,))
+    raise AssertionError("NULL TABLESAMPLE percentage was accepted")
+except psycopg.DatabaseError as error:
+    assert error.sqlstate == "2202H", error.sqlstate
+print("TABLESAMPLE extended protocol ok")
+
 conn.close()
 
 print("ALL DRIVER TESTS PASSED")

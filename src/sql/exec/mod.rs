@@ -2691,6 +2691,20 @@ pub fn drop_table(
                         return sql_fail(error);
                     }
                 }
+                let trigger_target = crate::storage::TriggerTarget::Table(index as u16);
+                loop {
+                    let trigger = storage.triggers_with_slots_visible_to(txn.txid).find_map(
+                        |(slot, trigger)| (trigger.target == trigger_target).then_some(slot),
+                    );
+                    let Some(slot) = trigger else { break };
+                    storage.drop_trigger(slot, txn.txid);
+                    if let Err(error) =
+                        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))
+                    {
+                        storage.rollback_trigger_drop(slot, txn.txid);
+                        return sql_fail(error);
+                    }
+                }
                 let lsn = storage.bump_lsn();
                 if let Err(e) = wal.stage(
                     txn.txid,
@@ -14120,8 +14134,7 @@ fn transition_relation<'a>(
             column_names: names,
             column_types: types,
             column_collations: collations,
-            rows,
-            external_run: None,
+            source: crate::sql::ast::MaterializedCteSource::Inline(rows),
         })
         .map(|relation| &*relation)
         .map_err(|_| super::query::arena_full_pub())
@@ -18590,6 +18603,14 @@ pub fn create_table_as(
         } else {
             rename[i]
         };
+        if matches!(ctype, ColType::Record | ColType::Array(ArrElem::Record)) {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                "column \"{}\" has pseudo-type {}",
+                col_name,
+                ctype.internal_name()
+            ));
+        }
         let parsed = match SqlName::parse(col_name) {
             Ok(n) => n,
             Err(e) => return sql_fail(e),
@@ -28018,7 +28039,8 @@ fn validate_copy_predicate(expression: &Expr, def: &TableDef) -> Result<(), SqlE
         | Expr::BitLit(_)
         | Expr::Param(_)
         | Expr::DefaultMarker
-        | Expr::WholeRow(_) => Ok(()),
+        | Expr::WholeRow(_)
+        | Expr::RecursiveState { .. } => Ok(()),
     }
 }
 
@@ -30950,13 +30972,18 @@ pub(crate) fn binary_field_plan<'a>(
         Datum::Array { element, raw }
             if matches!(
                 element.to_coltype(),
-                crate::sql::types::ColType::Composite(_)
+                crate::sql::types::ColType::Composite(_) | crate::sql::types::ColType::Record
             ) =>
         {
             let shape = crate::sql::array::shape(raw).expect("array datum invariant");
             let mut values = [Datum::Null; crate::sql::array::MAX_ELEMENTS];
             for (index, value) in values.iter_mut().take(shape.element_count()).enumerate() {
-                *value = match crate::sql::array::get(raw, *element, index) {
+                let decoded = if *element == crate::sql::types::ArrElem::Record {
+                    crate::sql::array::get_record(raw, index, arena)?
+                } else {
+                    crate::sql::array::get(raw, *element, index)
+                };
+                *value = match decoded {
                     Some(Datum::CompositeText {
                         slot,
                         physical_fields,
@@ -31609,6 +31636,7 @@ pub fn merge(
         from: Some(source_from),
         where_clause: None,
         group_by: &[],
+        grouping_set_quantifier: crate::sql::ast::GroupingSetQuantifier::All,
         grouping_sets: &[],
         having: None,
         order_by: &[],
@@ -39722,6 +39750,9 @@ fn coerce_composite_value_inner<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
     if let Datum::Composite { slot: actual, .. } = value {
         return if actual == slot {
             Ok(value)
@@ -40293,20 +40324,34 @@ pub fn apply_typmod<'a>(
         (_, TypeMod::TemporalPrecision(p), Datum::Timetz(t, zone)) => {
             Ok(Datum::Timetz(round_micros(t, p), zone))
         }
-        // An interval range form with no precision (`interval hour to minute`)
-        // rounds nothing — its `precision: None` cannot be mistaken for a
-        // number, where the packed 0xFFFF once could.
-        (
-            _,
-            TypeMod::IntervalMod {
-                precision: Some(p), ..
-            },
-            Datum::Interval(iv),
-        ) => Ok(Datum::Interval(crate::sql::types::Interval {
-            months: iv.months,
-            days: iv.days,
-            micros: round_micros(iv.micros, p),
-        })),
+        (_, TypeMod::IntervalMod { range, precision }, Datum::Interval(iv)) => {
+            use crate::sql::types::IntervalField;
+            let micros = match range.last() {
+                IntervalField::Year => 0,
+                IntervalField::Month => 0,
+                IntervalField::Day => 0,
+                IntervalField::Hour => iv.micros / 3_600_000_000 * 3_600_000_000,
+                IntervalField::Minute => iv.micros / 60_000_000 * 60_000_000,
+                IntervalField::Second => {
+                    precision.map_or(iv.micros, |p| round_micros(iv.micros, p))
+                }
+            };
+            let days = if matches!(range.last(), IntervalField::Year | IntervalField::Month) {
+                0
+            } else {
+                iv.days
+            };
+            let months = if range.last() == IntervalField::Year {
+                iv.months / 12 * 12
+            } else {
+                iv.months
+            };
+            Ok(Datum::Interval(crate::sql::types::Interval {
+                months,
+                days,
+                micros,
+            }))
+        }
         _ => Ok(v),
     }
 }

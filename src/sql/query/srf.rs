@@ -337,6 +337,8 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 func_args: Some(args),
                 rows_from: None,
                 col_alias: None,
+                inheritance: crate::sql::ast::RelationInheritance::Descendants,
+                sample: None,
                 cte: None,
                 with_ordinality: false,
                 lateral: false,
@@ -828,7 +830,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
                     match item {
                         SelectItem::Wildcard => slot += ss.star_columns(),
                         SelectItem::TableWildcard(q) => {
-                            slot += ss.defs[ss.table_index(q)?].expect("resolved").n_columns;
+                            slot += ss.qualified_star_columns(q)?;
                         }
                         SelectItem::RecordStar(base) => slot += record_star_width(base, &ss),
                         SelectItem::Expr { expression, .. } => {
@@ -888,9 +890,9 @@ pub(crate) fn synth_derived_def_outer<'a>(
                             }
                         }
                         SelectItem::TableWildcard(name) => {
-                            let table = ss.table_index(name)?;
-                            for column in ss.defs[table].expect("resolved").columns() {
-                                output_collations[slot] = column.collation;
+                            for index in 0..ss.qualified_star_columns(name)? {
+                                output_collations[slot] =
+                                    ss.output_collation(ss.qualified_star_entry(name, index)?);
                                 slot += 1;
                             }
                         }

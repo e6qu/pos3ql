@@ -49,12 +49,16 @@ SELECT a, sum(v) FROM (VALUES ('x',1),('y',2)) AS t(a,v) GROUP BY GROUPING SETS 
 SELECT sum(v) FROM (VALUES (1),(2),(3)) AS t(v) GROUP BY (); 
 SELECT a, b, count(*) FROM (VALUES (1,10),(1,20),(2,10)) AS t(a,b) GROUP BY GROUPING SETS (a, b) ORDER BY a, b;
 SELECT a, b, c, sum(v) FROM (VALUES (1,1,1,5),(1,2,1,7),(2,1,2,9)) AS t(a,b,c,v) GROUP BY a, ROLLUP(b, c) ORDER BY a, b, c;
+SELECT a, count(*) FROM (VALUES (1),(1),(2)) AS t(a) GROUP BY ALL GROUPING SETS ((a),(a)) ORDER BY a;
+SELECT a, count(*) FROM (VALUES (1),(1),(2)) AS t(a) GROUP BY DISTINCT GROUPING SETS ((a),(a)) ORDER BY a;
 -- grouping by parenthesized scalar expressions (must not be read as group lists)
 SELECT (v + 1) * 2 AS g, count(*) FROM (VALUES (1),(1),(3)) AS t(v) GROUP BY (v + 1) * 2 ORDER BY g;
 SELECT (v), sum(v) FROM (VALUES (1),(2),(2)) AS t(v) GROUP BY (v) ORDER BY 1;
 -- string_agg with DISTINCT and ORDER BY on the aggregated expression
 SELECT string_agg(DISTINCT v, ',' ORDER BY v) FROM (VALUES ('b'),('a'),('b'),('c'),('a')) AS t(v);
 SELECT string_agg(DISTINCT v, ',' ORDER BY v DESC) FROM (VALUES ('b'),('a'),('c'),('a')) AS t(v);
+SELECT array_agg(v ORDER BY v USING >), string_agg(v::text, ',' ORDER BY v USING OPERATOR(pg_catalog.<)) FROM (VALUES (2),(1),(3)) AS t(v);
+SELECT v, row_number() OVER (ORDER BY v USING >) FROM (VALUES (2),(1),(3)) AS t(v) ORDER BY v;
 -- DISTINCT with a different sort key is an error
 SELECT string_agg(DISTINCT v, ',' ORDER BY k) FROM (VALUES ('a', 1)) AS t(v, k);
 -- USING and NATURAL joins: merged output columns, ordering, resolution
@@ -82,6 +86,9 @@ SELECT * FROM ju_a JOIN ju_b USING (id) JOIN ju_d ON ju_d.k = ju_a.k;
 SELECT * FROM ju_b JOIN ju_a USING (k, id);
 SELECT count(*) FROM ju_a NATURAL JOIN ju_b WHERE k = 10;
 SELECT * FROM ju_a JOIN ju_b USING (id) WHERE k = 10;
+SELECT merged.*, merged.id FROM ju_a JOIN ju_b USING (id) AS merged ORDER BY merged.id;
+SELECT ROW(merged.*, 42)::text FROM ju_a JOIN ju_b USING (id) AS merged ORDER BY merged.id;
+SELECT merged.k FROM ju_a JOIN ju_b USING (id) AS merged;
 SELECT id, k FROM ju_a NATURAL FULL JOIN ju_b WHERE k > 5 ORDER BY 1, 2;
 -- error cases: ambiguous left column, missing right column
 SELECT * FROM ju_a JOIN ju_b USING (id) JOIN ju_d USING (k);
@@ -502,6 +509,13 @@ SELECT (json_each('{"a":1,"b":2}'::json)).*;
 SELECT (jsonb_each('{"b":1,"aa":2}'::jsonb)).key;
 SELECT (json_each_text('{"k":"v"}'::json)).value;
 SELECT (ROW(1,2,3)).*, 99 AS extra;
+SELECT ROW(rectest.*, 42)::text, (ROW(rectest.*, 42)).f4 FROM rectest ORDER BY a;
+CREATE TYPE null_rectest AS (a int, b text, c bool);
+SELECT (NULL::null_rectest).*, ROW((NULL::null_rectest).*, 42)::text;
+SELECT (right_row).*, ROW(right_row.*, 42)::text
+  FROM (VALUES (1)) left_row(id)
+  LEFT JOIN LATERAL (SELECT 2::int a, 'x'::text b WHERE false) right_row ON true;
+DROP TYPE null_rectest;
 SELECT count(*) FROM (SELECT (json_each('{"a":1,"b":2,"c":3}'::json)).*) s;
 DROP TABLE rectest;
 -- _pg_expandarray field access (driver introspection): direct and via a

@@ -29,6 +29,7 @@ except ImportError:
 
 DDL = """DROP TABLE IF EXISTS cb_composite;
 DROP TABLE IF EXISTS cb;
+DROP TABLE IF EXISTS cb_builtin_arrays;
 DROP TABLE IF EXISTS cb_references;
 DROP TABLE IF EXISTS cb_reference_relation;
 DROP FUNCTION IF EXISTS cb_reference_routine(integer);
@@ -381,7 +382,7 @@ def main():
             "numeric_multi", "date_multi", "timestamp_multi", "timestamptz_multi",
             "oid_values",
         )
-    ) + " FROM cb_builtin_arrays ORDER BY int4_values::text NULLS LAST"
+    ) + ' FROM cb_builtin_arrays ORDER BY int4_values::text COLLATE "C" NULLS LAST'
     pg_range_rows = pg.execute(range_text).fetchall()
     p3_range_rows = p3.execute(range_text).fetchall()
     if pg_range_rows == p3_range_rows:
@@ -389,6 +390,8 @@ def main():
     else:
         fails += 1
         print("DIVERGENCE: PostgreSQL built-in array COPY input rows differ")
+        print("  PostgreSQL: %r" % (pg_range_rows,))
+        print("  pos3ql:     %r" % (p3_range_rows,))
     pg.cursor().execute("DELETE FROM cb_builtin_arrays")
     load(pg, p3_range_dump, "cb_builtin_arrays")
     if pg.execute(range_text).fetchall() == p3_range_rows:
@@ -396,6 +399,8 @@ def main():
     else:
         fails += 1
         print("DIVERGENCE: pos3ql built-in array dump does not round-trip through PostgreSQL")
+        print("  PostgreSQL: %r" % (pg.execute(range_text).fetchall(),))
+        print("  pos3ql:     %r" % (p3_range_rows,))
 
     for c in (pg, p3):
         c.cursor().execute(REFERENCE_DDL)

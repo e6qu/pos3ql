@@ -19,10 +19,11 @@ use crate::storage::Storage;
 
 use super::setops::materialize_set_body;
 use super::{
-    Chained, MAX_AGGS, MAX_SUBQUERIES, MAX_WINDOWS, QueryScope, SUBQUERY_DEPTH, ScopeCols,
-    ScopeSchema, arena_full, cmp_key_rows, collect_aggs, collect_windows, fold_aggregates,
-    fromless_aggregate_hooks, pax_column_demand, scan_source_with_pax_columns, select_into_rows,
-    select_into_rows_recycling, where_passes,
+    Chained, MAX_AGGS, MAX_JOIN_TABLES, MAX_SUBQUERIES, MAX_WINDOWS, QueryScope, SUBQUERY_DEPTH,
+    ScopeCols, ScopeSchema, arena_full, cmp_key_rows, collect_aggs,
+    collect_table_sample_expressions, collect_windows, fold_aggregates, fromless_aggregate_hooks,
+    pax_column_demand, scan_source_with_pax_columns, select_into_rows, select_into_rows_recycling,
+    where_passes,
 };
 use crate::sql::exec::MAX_PROJ;
 
@@ -192,15 +193,15 @@ fn spooled_column_witness<'a>(
                     "SELECT * with no tables specified is not valid"
                 )
             })?;
-            let table = scope.table_index(qualifier)?;
-            let def = scope.defs[table].expect("resolved table wildcard");
-            if def.n_columns != 1 {
+            if scope.qualified_star_columns(qualifier)? != 1 {
                 return Err(sql_err!(
                     sqlstate::SYNTAX_ERROR,
                     "subquery must return only one column"
                 ));
             }
-            Ok(type_witness(def.columns()[0].ctype))
+            Ok(type_witness(
+                scope.output_type(scope.qualified_star_entry(qualifier, 0)?),
+            ))
         }
         _ => {
             if let Some((witness, _)) = scope_record_witness(item, scope, storage, txid, arena)? {
@@ -1051,10 +1052,9 @@ fn subquery_collations<'a>(
                         "SELECT * with no tables specified is not valid"
                     )
                 })?;
-                let table = scope.table_index(qualifier)?;
-                let definition = scope.defs[table].expect("resolved table wildcard");
-                for column in definition.columns() {
-                    output[count] = column.collation;
+                for index in 0..scope.qualified_star_columns(qualifier)? {
+                    output[count] =
+                        scope.output_collation(scope.qualified_star_entry(qualifier, index)?);
                     count += 1;
                 }
             }
@@ -1369,7 +1369,8 @@ fn subquery_exists<'a>(
     }
     // The projection list of EXISTS is irrelevant (only row presence matters),
     // but its expressions may carry subqueries; prepare them for the scan.
-    let mut item_exprs: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
+    let mut item_exprs: [Option<&Expr>; MAX_PROJ + 1 + 2 * MAX_JOIN_TABLES] =
+        [None; MAX_PROJ + 1 + 2 * MAX_JOIN_TABLES];
     let mut n_items = 0;
     for item in select.items {
         if let SelectItem::Expr { expression, .. } = item {
@@ -1377,22 +1378,12 @@ fn subquery_exists<'a>(
             n_items += 1;
         }
     }
-    let inner_subs = prepare_subqueries(
-        &{
-            let mut e = item_exprs;
-            // WHERE joins the set of expressions whose subqueries we prepare.
-            if n_items < MAX_PROJ {
-                e[n_items] = select.where_clause;
-            }
-            e
-        },
-        storage,
-        txid,
-        arena,
-        params,
-        depth - 1,
-        outer,
-    )?;
+    item_exprs[MAX_PROJ] = select.where_clause;
+    if let Some(from) = &select.from {
+        collect_table_sample_expressions(from, &mut item_exprs[MAX_PROJ + 1..]);
+    }
+    let inner_subs =
+        prepare_subqueries(&item_exprs, storage, txid, arena, params, depth - 1, outer)?;
     let catalog = super::storage_catalog(storage, arena, txid);
     let hooks = EvalHooks {
         group: None,
@@ -1627,6 +1618,16 @@ fn table_ref_has_outer_ref<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<bool, SqlError> {
+    if let Some(sample) = table.sample {
+        if expr_has_outer_ref(sample.percentage, chain, storage, txid, arena)? {
+            return Ok(true);
+        }
+        if let Some(repeatable) = sample.repeatable
+            && expr_has_outer_ref(repeatable, chain, storage, txid, arena)?
+        {
+            return Ok(true);
+        }
+    }
     if let Some(arguments) = table.func_args {
         for argument in arguments {
             if expr_has_outer_ref(argument, chain, storage, txid, arena)? {
@@ -2413,8 +2414,14 @@ fn run_subquery<'a>(
     }
 
     // Inner subqueries first.
+    let mut inner_expressions = [None; 2 + 2 * MAX_JOIN_TABLES];
+    inner_expressions[0] = Some(item);
+    inner_expressions[1] = select.where_clause;
+    if let Some(from) = &select.from {
+        collect_table_sample_expressions(from, &mut inner_expressions[2..]);
+    }
     let inner_subs = prepare_subqueries(
-        &[Some(item), select.where_clause],
+        &inner_expressions,
         storage,
         txid,
         arena,
@@ -2525,9 +2532,7 @@ fn run_subquery<'a>(
             })
             .map_err(|_| arena_full())?
     } else if let Some(q) = table_star {
-        let t = scope.table_index(q)?;
-        let def = scope.defs[t].expect("resolved");
-        if def.n_columns != 1 {
+        if scope.qualified_star_columns(q)? != 1 {
             return Err(sql_err!(
                 sqlstate::SYNTAX_ERROR,
                 "subquery must return only one column"
@@ -2536,7 +2541,7 @@ fn run_subquery<'a>(
         arena
             .alloc(Expr::Column {
                 qualifier: Some(q),
-                name: def.columns()[0].name.as_str(),
+                name: scope.output_name(scope.qualified_star_entry(q, 0)?),
             })
             .map_err(|_| arena_full())?
     } else {

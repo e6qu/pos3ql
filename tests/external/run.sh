@@ -245,7 +245,7 @@ else
 fi
 
 step "driver test (psycopg 3, extended protocol with binary parameters)"
-VENV="$ROOT/target/external-venv"
+VENV=${POS3QL_VENV:-$ROOT/target/external-venv}
 if [[ ! -x "$VENV/bin/python" ]]; then
   python3 -m venv "$VENV" && "$VENV/bin/pip" install --quiet 'psycopg[binary]'
 fi

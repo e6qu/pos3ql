@@ -14,15 +14,87 @@ use crate::sql::eval::{ColumnLookup, SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef, UserTypeName};
+use crate::util::StackStr;
 
 use super::{
-    Chained, MAX_JOIN_TABLES, arena_full, common_using_type, select_into_rows, synth_derived_def,
-    synth_derived_def_outer, table_func_def, table_func_def_outer, table_func_rows_outer,
+    Chained, MAX_AGGS, MAX_JOIN_TABLES, MAX_WINDOWS, arena_full, collect_aggs, collect_windows,
+    common_using_type, select_into_rows, synth_derived_def, synth_derived_def_outer,
+    table_func_def, table_func_def_outer, table_func_rows_outer,
 };
 
 /// Upper bound on distinct USING/NATURAL-merged columns across a join tree
 /// (chained merges of the same name allocate a fresh entry per join).
 pub const MAX_MERGED_COLUMNS: usize = 32;
+
+fn validate_table_sample(
+    storage: &Storage,
+    table: &TableRef<'_>,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let Some(sample) = table.sample else {
+        return Ok(());
+    };
+    for expression in [Some(sample.percentage), sample.repeatable]
+        .into_iter()
+        .flatten()
+    {
+        let mut reference: Option<(bool, StackStr<128>)> = None;
+        expression.for_each_column_reference(&mut |qualifier, name| {
+            if reference.is_none() {
+                reference = Some((
+                    qualifier.is_some(),
+                    StackStr::from_str(qualifier.unwrap_or(name)),
+                ));
+            }
+        });
+        if let Some((qualified, name)) = reference {
+            return Err(if qualified {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    name.as_str()
+                )
+            } else {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name.as_str()
+                )
+            });
+        }
+        let mut aggregates = [(core::ptr::null(), &Expr::Null); MAX_AGGS];
+        let mut aggregate_count = 0;
+        collect_aggs(
+            expression,
+            &mut aggregates,
+            &mut aggregate_count,
+            storage,
+            txid,
+        )?;
+        if aggregate_count != 0 {
+            return Err(sql_err!(
+                sqlstate::GROUPING_ERROR,
+                "aggregate functions are not allowed in functions in FROM"
+            ));
+        }
+        let mut windows = [&Expr::Null; MAX_WINDOWS];
+        let mut window_count = 0;
+        collect_windows(expression, &mut windows, &mut window_count, storage, txid)?;
+        if window_count != 0 {
+            return Err(sql_err!(
+                sqlstate::WINDOWING_ERROR,
+                "window functions are not allowed in functions in FROM"
+            ));
+        }
+        if super::srf::expression_has_project_set(expression, storage, txid) {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "argument of TABLESAMPLE must not return a set"
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// A `USING`/NATURAL join output column: the merged sides in join order. Its
 /// value is the first non-null contributor (PostgreSQL's join output
@@ -35,6 +107,13 @@ pub struct MergedColumn<'d> {
     pub n_parts: usize,
     /// The merged column's type: the common type of the contributors.
     pub ctype: ColType,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct UsingAlias<'d> {
+    pub name: &'d str,
+    pub first_merged: usize,
+    pub n_columns: usize,
 }
 
 /// A column name resolved against a query scope: a plain table column
@@ -78,6 +157,8 @@ pub struct QueryScope<'d> {
     /// USING/NATURAL-merged join columns (see `MergedColumn`).
     pub merged: &'d mut [MergedColumn<'d>],
     pub n_merged: usize,
+    /// Qualifiers introduced by `USING (...) AS alias`, indexed by join.
+    using_aliases: &'d mut [Option<UsingAlias<'d>>],
     /// The join tree's output columns in PostgreSQL's order — each
     /// USING/NATURAL join hoists its merged columns to the front and hides
     /// the per-side copies. `n_output == 0` means no merges anywhere: the
@@ -146,7 +227,7 @@ impl<'d> QueryScope<'d> {
                 if join.natural {
                     MAX_USING_COLUMNS
                 } else {
-                    join.using_columns.map_or(0, <[&str]>::len)
+                    join.using.map_or(0, |using| using.columns.len())
                 }
             })
             .sum::<usize>()
@@ -197,6 +278,9 @@ impl<'d> QueryScope<'d> {
         let join_on = arena
             .alloc_slice_with(from.joins.len().max(1), |_| None)
             .map_err(|_| arena_full())?;
+        let using_aliases = arena
+            .alloc_slice_with(from.joins.len().max(1), |_| None)
+            .map_err(|_| arena_full())?;
         Ok(QueryScope {
             names,
             defs,
@@ -209,6 +293,7 @@ impl<'d> QueryScope<'d> {
             n: 0,
             merged,
             n_merged: 0,
+            using_aliases,
             output,
             n_output: 0,
             join_on,
@@ -320,8 +405,8 @@ impl<'d> QueryScope<'d> {
         let def_reference = arena.alloc(def).map_err(|_| arena_full())?;
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(&*def_reference);
-        self.derived[self.n] = Some(if materialize { m.rows } else { &[] });
-        self.external_runs[self.n] = if materialize { m.external_run } else { None };
+        self.derived[self.n] = Some(if materialize { m.rows() } else { &[] });
+        self.external_runs[self.n] = if materialize { m.external_run() } else { None };
         self.slots[self.n] = usize::MAX;
         self.n += 1;
         Ok(())
@@ -340,6 +425,21 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
+        validate_table_sample(storage, tref, txid)?;
+        if tref.sample.is_some()
+            && (tref.cte.is_some()
+                || tref.is_function_source()
+                || tref.subquery.is_some()
+                || matches!(
+                    storage.resolve_relation(tref.schema, tref.table, txid),
+                    Some(crate::storage::ResolvedRelation::Catalog)
+                ))
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "TABLESAMPLE clause can only be applied to tables and materialized views"
+            ));
+        }
         if let Some(m) = tref.cte {
             return self.add_materialized(storage, tref, m, txid, arena, true);
         }
@@ -353,14 +453,7 @@ impl<'d> QueryScope<'d> {
             ) {
                 return self.add_catalog(storage, tref, txid, arena, true);
             }
-            return self.add(
-                storage,
-                tref.schema,
-                tref.table,
-                tref.alias,
-                tref.authorization_role,
-                txid,
-            );
+            return self.add(storage, tref, txid, arena);
         };
         let exposed = tref.alias.expect("parser requires a derived-table alias");
         if self.names[..self.n].contains(&exposed) {
@@ -505,6 +598,21 @@ impl<'d> QueryScope<'d> {
     where
         'a: 'd,
     {
+        validate_table_sample(storage, tref, txid)?;
+        if tref.sample.is_some()
+            && (tref.cte.is_some()
+                || tref.is_function_source()
+                || tref.subquery.is_some()
+                || matches!(
+                    storage.resolve_relation(tref.schema, tref.table, txid),
+                    Some(crate::storage::ResolvedRelation::Catalog)
+                ))
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "TABLESAMPLE clause can only be applied to tables and materialized views"
+            ));
+        }
         if let Some(m) = tref.cte {
             return self.add_materialized(storage, tref, m, txid, arena, false);
         }
@@ -518,14 +626,7 @@ impl<'d> QueryScope<'d> {
             ) {
                 return self.add_catalog(storage, tref, txid, arena, false);
             }
-            return self.add(
-                storage,
-                tref.schema,
-                tref.table,
-                tref.alias,
-                tref.authorization_role,
-                txid,
-            );
+            return self.add(storage, tref, txid, arena);
         };
         let exposed = tref.alias.expect("parser requires a derived-table alias");
         if self.names[..self.n].contains(&exposed) {
@@ -583,7 +684,24 @@ impl<'d> QueryScope<'d> {
                 exposed
             ));
         }
-        let def_reference = synth.def;
+        let def_reference = if let Some(aliases) = tref.col_alias {
+            if aliases.len() > synth.def.n_columns {
+                return Err(sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "table \"{}\" has {} columns available but {} columns specified",
+                    exposed,
+                    synth.def.n_columns,
+                    aliases.len()
+                ));
+            }
+            let mut renamed = *synth.def;
+            for (column, alias) in renamed.columns.iter_mut().zip(aliases) {
+                column.name = SqlName::parse(alias)?;
+            }
+            &*arena.alloc(renamed).map_err(|_| arena_full())?
+        } else {
+            synth.def
+        };
         let rows: &'a [&'a [u8]] = if materialize {
             const EMPTY: &[u8] = &[];
             let encoded = arena
@@ -686,33 +804,49 @@ impl<'d> QueryScope<'d> {
     pub(crate) fn add(
         &mut self,
         storage: &'d Storage,
-        schema: Option<&str>,
-        table: &str,
-        alias: Option<&'d str>,
-        authorization_role: Option<u16>,
+        tref: &'d TableRef<'d>,
         txid: u32,
+        arena: &'d Arena,
     ) -> Result<(), SqlError> {
         // `txid == 0` (schema-only / Describe) resolves against the committed
         // catalog; a real transaction sees its own uncommitted CREATE/DROP.
         let Some(crate::storage::ResolvedRelation::Table(slot)) =
-            storage.resolve_relation(schema, table, txid)
+            storage.resolve_relation(tref.schema, tref.table, txid)
         else {
-            return Err(match schema {
+            return Err(match tref.schema {
                 Some(s) => sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "relation \"{}.{}\" does not exist",
                     s,
-                    table
+                    tref.table
                 ),
                 None => sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "relation \"{}\" does not exist",
-                    table
+                    tref.table
                 ),
             });
         };
-        let def = storage.table_def(slot, txid);
-        let exposed = alias.unwrap_or(def.name.as_str());
+        let stored_def = storage.table_def(slot, txid);
+        let exposed = tref.alias.unwrap_or(stored_def.name.as_str());
+        let def = if let Some(aliases) = tref.col_alias {
+            if aliases.len() > stored_def.n_columns {
+                return Err(sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "table \"{}\" has {} columns available but {} columns specified",
+                    exposed,
+                    stored_def.n_columns,
+                    aliases.len()
+                ));
+            }
+            let mut renamed = *stored_def;
+            for (column, alias) in renamed.columns.iter_mut().zip(aliases) {
+                column.name = SqlName::parse(alias)?;
+            }
+            &*arena.alloc(renamed).map_err(|_| arena_full())?
+        } else {
+            stored_def
+        };
         // Two same-named entries coexist only when both are *unaliased base
         // tables of different schemas* (their references then need the
         // three-part spelling); any other duplicate — aliases, the same
@@ -721,7 +855,7 @@ impl<'d> QueryScope<'d> {
             if self.names[t] != exposed {
                 continue;
             }
-            let both_distinct_tables = alias.is_none()
+            let both_distinct_tables = tref.alias.is_none()
                 && self.defs[t].is_some_and(|d| {
                     self.slots[t] != usize::MAX
                         && d.name.as_str() == exposed
@@ -738,7 +872,7 @@ impl<'d> QueryScope<'d> {
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def);
         self.slots[self.n] = slot;
-        self.authorization_roles[self.n] = authorization_role;
+        self.authorization_roles[self.n] = tref.authorization_role;
         self.n += 1;
         Ok(())
     }
@@ -754,11 +888,7 @@ impl<'d> QueryScope<'d> {
         scratch_arena: &'d Arena,
         expression_arena: Option<&'d Arena>,
     ) -> Result<(), SqlError> {
-        if !from
-            .joins
-            .iter()
-            .any(|j| j.natural || j.using_columns.is_some())
-        {
+        if !from.joins.iter().any(|j| j.natural || j.using.is_some()) {
             return Ok(());
         }
         // The left join tree's output columns, updated join by join.
@@ -773,7 +903,7 @@ impl<'d> QueryScope<'d> {
         for (join_index, join) in from.joins.iter().enumerate() {
             let right_t = join_index + 1;
             let right_def = self.defs[right_t].expect("resolved");
-            if !(join.natural || join.using_columns.is_some()) {
+            if !(join.natural || join.using.is_some()) {
                 for c in 0..right_def.n_columns {
                     out[n_out] = ResolvedColumn::Table(right_t, c);
                     n_out += 1;
@@ -784,9 +914,9 @@ impl<'d> QueryScope<'d> {
             // output name the right table also has, in left output order.
             let mut using = [""; MAX_USING_COLUMNS];
             let mut n_using = 0usize;
-            if let Some(cols) = join.using_columns {
-                using[..cols.len()].copy_from_slice(cols);
-                n_using = cols.len();
+            if let Some(clause) = join.using {
+                using[..clause.columns.len()].copy_from_slice(clause.columns);
+                n_using = clause.columns.len();
             } else {
                 for entry in &out[..n_out] {
                     let name = self.output_name(*entry);
@@ -910,6 +1040,25 @@ impl<'d> QueryScope<'d> {
             // remaining left-tree output, then the right table's columns
             // minus the consumed ones.
             let n_new = self.n_merged - first_new_merge;
+            if let Some(alias) = join.using.and_then(|using| using.alias) {
+                if self.names[..self.n].contains(&alias)
+                    || self.using_aliases[..join_index]
+                        .iter()
+                        .flatten()
+                        .any(|prior| prior.name == alias)
+                {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_ALIAS,
+                        "table name \"{}\" specified more than once",
+                        alias
+                    ));
+                }
+                self.using_aliases[join_index] = Some(UsingAlias {
+                    name: alias,
+                    first_merged: first_new_merge,
+                    n_columns: n_new,
+                });
+            }
             out.copy_within(0..n_out, n_new);
             for (k, slot) in out[..n_new].iter_mut().enumerate() {
                 *slot = ResolvedColumn::Merged(first_new_merge + k);
@@ -1119,6 +1268,41 @@ impl<'d> QueryScope<'d> {
         })
     }
 
+    pub(super) fn using_alias(&self, name: &str) -> Option<UsingAlias<'d>> {
+        self.using_aliases
+            .iter()
+            .flatten()
+            .find(|a| a.name == name)
+            .copied()
+    }
+
+    /// Width of a qualified star, whether it names a FROM item or a merged
+    /// USING-column alias.
+    pub fn qualified_star_columns(&self, name: &str) -> Result<usize, SqlError> {
+        if let Some(alias) = self.using_alias(name) {
+            return Ok(alias.n_columns);
+        }
+        let table = self.table_index(name)?;
+        Ok(self.defs[table].expect("resolved").n_columns)
+    }
+
+    /// Resolved column at a qualified-star position.
+    pub fn qualified_star_entry(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Result<ResolvedColumn, SqlError> {
+        if let Some(alias) = self.using_alias(name) {
+            return (index < alias.n_columns)
+                .then_some(ResolvedColumn::Merged(alias.first_merged + index))
+                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column does not exist"));
+        }
+        let table = self.table_index(name)?;
+        (index < self.defs[table].expect("resolved").n_columns)
+            .then_some(ResolvedColumn::Table(table, index))
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_COLUMN, "column does not exist"))
+    }
+
     /// If `name` refers to a set-returning-function scan, the type of its single
     /// scalar output column — the type a whole-row reference to it carries. A
     /// storage- or subquery-derived table returns None (its whole-row reference
@@ -1139,6 +1323,20 @@ impl<'d> QueryScope<'d> {
     ) -> Result<ResolvedColumn, SqlError> {
         match qualifier {
             Some(q) => {
+                if let Some(alias) = self.using_alias(q) {
+                    return (0..alias.n_columns)
+                        .map(|index| alias.first_merged + index)
+                        .find(|&merged| self.merged[merged].name == name)
+                        .map(ResolvedColumn::Merged)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_COLUMN,
+                                "column {}.{} does not exist",
+                                q,
+                                name
+                            )
+                        });
+                }
                 let t = self.table_index(q)?;
                 match self.defs[t].expect("resolved").column_index(name) {
                     Some(c) => Ok(ResolvedColumn::Table(t, c)),

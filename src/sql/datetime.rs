@@ -118,6 +118,48 @@ const MONTH_FULL: [&str; 12] = [
     "november",
     "december",
 ];
+const WEEKDAY_ABBR: [&str; 7] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const WEEKDAY_FULL: [&str; 7] = [
+    "sunday",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+];
+
+fn expand_short_year(value: i64, width: u32) -> i64 {
+    let scale = 10i64.pow(width.max(2));
+    let mut year = 2020 - 2020 % scale + value;
+    if year - 2020 >= scale / 2 {
+        year -= scale;
+    } else if 2020 - year > scale / 2 {
+        year += scale;
+    }
+    year
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormatDateConvention {
+    Unset,
+    Gregorian,
+    IsoWeek,
+    Julian,
+}
+
+impl FormatDateConvention {
+    fn claim(self, next: Self) -> Result<Self, SqlError> {
+        if matches!(self, Self::Unset) || self == next {
+            Ok(next)
+        } else {
+            Err(sql_err!(
+                sqlstate::INVALID_DATETIME_FORMAT,
+                "invalid combination of date conventions"
+            ))
+        }
+    }
+}
 
 /// A fully resolved date/time format-model result. Parsing produces this
 /// typed state before either `to_date` or `to_timestamp` consumes it, so the
@@ -131,6 +173,7 @@ pub struct FormattedDateTime {
     pub minute: i64,
     pub second: i64,
     pub microsecond: i64,
+    pub timezone_offset_seconds: Option<i32>,
 }
 
 /// Parses `input` guided by a `to_date`/`to_timestamp` format string. Civil,
@@ -146,17 +189,27 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
     let (mut y, mut month, mut d, mut h, mut minute, mut s, mut us) =
         (2000i64, 1u32, 1u32, 0i64, 0i64, 0i64, 0i64);
     let mut ordinal = None;
-    let (mut iso_year, mut iso_week, mut iso_day) = (None, None, None);
+    let mut gregorian_year = None;
+    let mut century = None;
+    let (mut iso_year, mut iso_week, mut iso_day, mut iso_ordinal) = (None, None, None, None);
+    let mut julian = None;
+    let mut date_convention = FormatDateConvention::Unset;
+    let (mut timezone_sign, mut timezone_hour, mut timezone_minute) = (1i32, None, None);
     let mut twelve_hour = false;
     let mut pm = None;
     let mut bc = false;
     let input_bytes = input.as_bytes();
     let format_bytes = fmt.as_bytes();
     let mut input_position = 0usize;
-    let mut format_index = 0usize;
+    let starts_with_ci = |bytes: &[u8], at: usize, word: &[u8]| -> bool {
+        at + word.len() <= bytes.len() && bytes[at..at + word.len()].eq_ignore_ascii_case(word)
+    };
+    let exact = starts_with_ci(format_bytes, 0, b"FX");
+    let mut format_index = if exact { 2 } else { 0 };
     // Reads up to `width` decimal digits (skipping leading spaces) into an int.
     let read_num = |input_position: &mut usize, width: usize| -> Option<i64> {
-        while *input_position < input_bytes.len() && input_bytes[*input_position] == b' ' {
+        while !exact && *input_position < input_bytes.len() && input_bytes[*input_position] == b' '
+        {
             *input_position += 1;
         }
         let start = *input_position;
@@ -174,18 +227,37 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
             Some(v)
         }
     };
-    let starts_with_ci = |bytes: &[u8], at: usize, word: &[u8]| -> bool {
-        at + word.len() <= bytes.len() && bytes[at..at + word.len()].eq_ignore_ascii_case(word)
-    };
     while format_index < format_bytes.len() {
         let up = format_bytes[format_index].to_ascii_uppercase();
+        if format_bytes[format_index] == b'"' {
+            format_index += 1;
+            while format_index < format_bytes.len() && format_bytes[format_index] != b'"' {
+                if format_bytes[format_index] == b'\\' && format_index + 1 < format_bytes.len() {
+                    format_index += 1;
+                }
+                if input_position >= input_bytes.len() {
+                    return Err(bad());
+                }
+                input_position += 1;
+                format_index += 1;
+            }
+            if format_index < format_bytes.len() {
+                format_index += 1;
+            }
+            continue;
+        }
         if starts_with_ci(format_bytes, format_index, b"FM") {
             format_index += 2;
             continue;
         }
         // Longest field codes first.
         if starts_with_ci(format_bytes, format_index, b"IYYY") {
+            date_convention = date_convention.claim(FormatDateConvention::IsoWeek)?;
             iso_year = Some(read_num(&mut input_position, 4).ok_or_else(bad)?);
+            format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"IDDD") {
+            date_convention = date_convention.claim(FormatDateConvention::IsoWeek)?;
+            iso_ordinal = Some(read_num(&mut input_position, 3).ok_or_else(bad)?);
             format_index += 4;
         } else if starts_with_ci(format_bytes, format_index, b"HH24") {
             h = read_num(&mut input_position, 2).ok_or_else(bad)?;
@@ -194,6 +266,18 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
             h = read_num(&mut input_position, 2).ok_or_else(bad)?;
             twelve_hour = true;
             format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"SSSSS") {
+            let seconds = read_num(&mut input_position, 5).ok_or_else(bad)?;
+            if !(0..86_400).contains(&seconds) {
+                return Err(sql_err!(
+                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                    "date/time field value out of range"
+                ));
+            }
+            h = seconds / 3600;
+            minute = (seconds / 60) % 60;
+            s = seconds % 60;
+            format_index += 5;
         } else if starts_with_ci(format_bytes, format_index, b"SSSS") {
             let seconds = read_num(&mut input_position, 5).ok_or_else(bad)?;
             if !(0..86_400).contains(&seconds) {
@@ -207,43 +291,85 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
             s = seconds % 60;
             format_index += 4;
         } else if starts_with_ci(format_bytes, format_index, b"YYYY") {
-            y = read_num(&mut input_position, 4).ok_or_else(bad)?;
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            gregorian_year = Some((read_num(&mut input_position, 4).ok_or_else(bad)?, 4));
             format_index += 4;
+        } else if starts_with_ci(format_bytes, format_index, b"Y,YYY") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            let leading = read_num(&mut input_position, 3).ok_or_else(bad)?;
+            if input_position < input_bytes.len() && input_bytes[input_position] == b',' {
+                input_position += 1;
+            }
+            let trailing = read_num(&mut input_position, 3).ok_or_else(bad)?;
+            gregorian_year = Some((leading * 1000 + trailing, 4));
+            format_index += 5;
         } else if starts_with_ci(format_bytes, format_index, b"MONTH") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
             month = read_month(input, &mut input_position, false).ok_or_else(bad)?;
             format_index += 5;
         } else if starts_with_ci(format_bytes, format_index, b"MON") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
             month = read_month(input, &mut input_position, true).ok_or_else(bad)?;
             format_index += 3;
+        } else if starts_with_ci(format_bytes, format_index, b"DAY") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            read_weekday(input, &mut input_position, false).ok_or_else(bad)?;
+            format_index += 3;
         } else if starts_with_ci(format_bytes, format_index, b"YYY") {
-            y = read_num(&mut input_position, 3).ok_or_else(bad)?;
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            gregorian_year = Some((read_num(&mut input_position, 3).ok_or_else(bad)?, 3));
             format_index += 3;
         } else if starts_with_ci(format_bytes, format_index, b"DDD") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
             ordinal = Some(read_num(&mut input_position, 3).ok_or_else(bad)?);
             format_index += 3;
         } else if starts_with_ci(format_bytes, format_index, b"IYY") {
-            iso_year = Some(read_num(&mut input_position, 3).ok_or_else(bad)?);
+            date_convention = date_convention.claim(FormatDateConvention::IsoWeek)?;
+            iso_year = Some(expand_short_year(
+                read_num(&mut input_position, 3).ok_or_else(bad)?,
+                3,
+            ));
             format_index += 3;
         } else if up == b'H' && starts_with_ci(format_bytes, format_index, b"HH") {
             h = read_num(&mut input_position, 2).ok_or_else(bad)?;
             twelve_hour = true;
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"YY") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
             let v = read_num(&mut input_position, 2).ok_or_else(bad)?;
-            y = if v < 70 { 2000 + v } else { 1900 + v };
+            gregorian_year = Some((v, 2));
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"IY") {
+            date_convention = date_convention.claim(FormatDateConvention::IsoWeek)?;
             let v = read_num(&mut input_position, 2).ok_or_else(bad)?;
-            iso_year = Some(if v < 70 { 2000 + v } else { 1900 + v });
+            iso_year = Some(expand_short_year(v, 2));
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"IW") {
+            date_convention = date_convention.claim(FormatDateConvention::IsoWeek)?;
             iso_week = Some(read_num(&mut input_position, 2).ok_or_else(bad)?);
             format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"WW") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            let week = read_num(&mut input_position, 2).ok_or_else(bad)?;
+            if !(1..=53).contains(&week) {
+                return Err(sql_err!(
+                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                    "date/time field value out of range"
+                ));
+            }
+            ordinal = Some((week - 1) * 7 + 1);
+            format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"MM") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
             month = read_num(&mut input_position, 2).ok_or_else(bad)? as u32;
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"DD") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
             d = read_num(&mut input_position, 2).ok_or_else(bad)? as u32;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"DY") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            read_weekday(input, &mut input_position, true).ok_or_else(bad)?;
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"MI") {
             minute = read_num(&mut input_position, 2).ok_or_else(bad)?;
@@ -257,7 +383,16 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
         } else if starts_with_ci(format_bytes, format_index, b"US") {
             us = read_num(&mut input_position, 6).ok_or_else(bad)?;
             format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"FF")
+            && format_index + 2 < format_bytes.len()
+            && matches!(format_bytes[format_index + 2], b'1'..=b'6')
+        {
+            let width = usize::from(format_bytes[format_index + 2] - b'0');
+            us = read_num(&mut input_position, width).ok_or_else(bad)?
+                * 10i64.pow((6 - width) as u32);
+            format_index += 3;
         } else if starts_with_ci(format_bytes, format_index, b"RM") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
             month = read_roman_month(input, &mut input_position).ok_or_else(bad)?;
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"A.M.")
@@ -273,30 +408,139 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
         } else if starts_with_ci(format_bytes, format_index, b"A.D.")
             || starts_with_ci(format_bytes, format_index, b"B.C.")
         {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
             bc = read_era(input, &mut input_position, true).ok_or_else(bad)?;
             format_index += 4;
         } else if starts_with_ci(format_bytes, format_index, b"AD")
             || starts_with_ci(format_bytes, format_index, b"BC")
         {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
             bc = read_era(input, &mut input_position, false).ok_or_else(bad)?;
             format_index += 2;
         } else if starts_with_ci(format_bytes, format_index, b"ID") {
+            date_convention = date_convention.claim(FormatDateConvention::IsoWeek)?;
             iso_day = Some(read_num(&mut input_position, 1).ok_or_else(bad)?);
             format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"CC") {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            century = Some(read_num(&mut input_position, 2).ok_or_else(bad)?);
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"TZH") {
+            if input_position < input_bytes.len()
+                && matches!(input_bytes[input_position], b'+' | b'-')
+            {
+                timezone_sign = if input_bytes[input_position] == b'-' {
+                    -1
+                } else {
+                    1
+                };
+                input_position += 1;
+            }
+            timezone_hour = Some(read_num(&mut input_position, 2).ok_or_else(bad)? as i32);
+            format_index += 3;
+        } else if starts_with_ci(format_bytes, format_index, b"TZM") {
+            timezone_minute = Some(read_num(&mut input_position, 2).ok_or_else(bad)? as i32);
+            format_index += 3;
+        } else if starts_with_ci(format_bytes, format_index, b"TZ") {
+            while !exact
+                && input_position < input_bytes.len()
+                && input_bytes[input_position] == b' '
+            {
+                input_position += 1;
+            }
+            let start = input_position;
+            while input_position < input_bytes.len()
+                && input_bytes[input_position].is_ascii_alphabetic()
+            {
+                input_position += 1;
+            }
+            let name =
+                core::str::from_utf8(&input_bytes[start..input_position]).map_err(|_| bad())?;
+            let zone = if name.eq_ignore_ascii_case("UTC") || name.eq_ignore_ascii_case("GMT") {
+                super::timezone::Timezone::utc()
+            } else {
+                super::timezone::lookup(name).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "time zone \"{}\" not recognized",
+                        name
+                    )
+                })?
+            };
+            timezone_hour = Some(zone.resolve(0).0 / 3600);
+            timezone_minute = Some((zone.resolve(0).0.unsigned_abs() / 60 % 60) as i32);
+            timezone_sign = zone.resolve(0).0.signum();
+            format_index += 2;
+        } else if up == b'J' {
+            date_convention = date_convention.claim(FormatDateConvention::Julian)?;
+            julian = Some(read_num(&mut input_position, 7).ok_or_else(bad)?);
+            format_index += 1;
+        } else if up == b'Q' {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            let quarter = read_num(&mut input_position, 1).ok_or_else(bad)?;
+            if !(1..=4).contains(&quarter) {
+                return Err(sql_err!(
+                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                    "date/time field value out of range"
+                ));
+            }
+            format_index += 1;
+        } else if up == b'W' {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            let week = read_num(&mut input_position, 1).ok_or_else(bad)?;
+            if !(1..=5).contains(&week) {
+                return Err(sql_err!(
+                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                    "date/time field value out of range"
+                ));
+            }
+            ordinal = Some((week - 1) * 7 + 1);
+            format_index += 1;
+        } else if up == b'D' {
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            let weekday = read_num(&mut input_position, 1).ok_or_else(bad)?;
+            if !(1..=7).contains(&weekday) {
+                return Err(sql_err!(
+                    sqlstate::DATETIME_FIELD_OVERFLOW,
+                    "date/time field value out of range"
+                ));
+            }
+            format_index += 1;
         } else if up == b'Y' {
-            y = read_num(&mut input_position, 1).ok_or_else(bad)?;
+            date_convention = date_convention.claim(FormatDateConvention::Gregorian)?;
+            gregorian_year = Some((read_num(&mut input_position, 1).ok_or_else(bad)?, 1));
             format_index += 1;
         } else if up == b'I' {
-            iso_year = Some(read_num(&mut input_position, 1).ok_or_else(bad)?);
+            date_convention = date_convention.claim(FormatDateConvention::IsoWeek)?;
+            iso_year = Some(expand_short_year(
+                read_num(&mut input_position, 1).ok_or_else(bad)?,
+                1,
+            ));
             format_index += 1;
+        } else if starts_with_ci(format_bytes, format_index, b"TH") {
+            if input_position + 2 > input_bytes.len()
+                || !input_bytes[input_position..input_position + 2]
+                    .iter()
+                    .all(u8::is_ascii_alphabetic)
+            {
+                return Err(bad());
+            }
+            input_position += 2;
+            format_index += 2;
+        } else if starts_with_ci(format_bytes, format_index, b"SP") {
+            format_index += 2;
         } else if up.is_ascii_alphabetic() {
             return Err(sql_err!(
                 sqlstate::INVALID_DATETIME_FORMAT,
                 "unsupported to_date/to_timestamp code"
             ));
         } else {
-            // Separator: skip one non-alphanumeric input character if present.
-            if input_position < input_bytes.len()
+            if exact {
+                if input_position >= input_bytes.len() {
+                    return Err(bad());
+                }
+                input_position += 1;
+            } else if input_position < input_bytes.len()
                 && !input_bytes[input_position].is_ascii_alphanumeric()
             {
                 input_position += 1;
@@ -304,7 +548,40 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
             format_index += 1;
         }
     }
-    if let (Some(year), Some(week), Some(day)) = (iso_year, iso_week, iso_day) {
+    y = match (gregorian_year, century) {
+        (Some((value, width @ (1 | 2))), Some(century)) => {
+            (century - 1) * 100 + value % 10i64.pow(width)
+        }
+        (Some((value, width @ 1..=3)), _) => expand_short_year(value, width),
+        (Some((value, _)), _) => value,
+        (None, Some(century)) => (century - 1) * 100 + 1,
+        (None, None) => y,
+    };
+    if let Some(julian_day) = julian {
+        let days = julian_day - 2_440_588;
+        (y, month, d) = civil_from_days(days);
+    } else if let (Some(year), Some(day_of_year)) = (iso_year, iso_ordinal) {
+        if !(1..=371).contains(&day_of_year) {
+            return Err(sql_err!(
+                sqlstate::DATETIME_FIELD_OVERFLOW,
+                "date/time field value out of range"
+            ));
+        }
+        let jan4 = days_from_civil(year, 1, 4) - PG_EPOCH_DAYS;
+        let jan4_iso_day = ((day_of_week(jan4) + 6) % 7 + 1) as i64;
+        let days = jan4 - (jan4_iso_day - 1) + day_of_year - 1;
+        let (actual_iso_year, _, _) = {
+            let actual_iso_day = ((day_of_week(days) + 6) % 7 + 1) as i64;
+            civil_from_days(days + (4 - actual_iso_day) + PG_EPOCH_DAYS)
+        };
+        if actual_iso_year != year {
+            return Err(sql_err!(
+                sqlstate::DATETIME_FIELD_OVERFLOW,
+                "date/time field value out of range"
+            ));
+        }
+        (y, month, d) = civil_from_days(days + PG_EPOCH_DAYS);
+    } else if let (Some(year), Some(week), Some(day)) = (iso_year, iso_week, iso_day) {
         let jan4 = days_from_civil(year, 1, 4) - PG_EPOCH_DAYS;
         let jan4_iso_day = ((day_of_week(jan4) + 6) % 7 + 1) as i64;
         if !(1..=53).contains(&week) || !(1..=7).contains(&day) {
@@ -332,7 +609,8 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
             ));
         }
         (y, month, d) = civil_from_days(days + PG_EPOCH_DAYS);
-    } else if iso_year.is_some() || iso_week.is_some() || iso_day.is_some() {
+    } else if iso_year.is_some() || iso_week.is_some() || iso_day.is_some() || iso_ordinal.is_some()
+    {
         return Err(sql_err!(
             sqlstate::INVALID_DATETIME_FORMAT,
             "ISO week date requires IYYY, IW, and ID"
@@ -387,6 +665,20 @@ pub fn parse_formatted(input: &str, fmt: &str) -> Result<FormattedDateTime, SqlE
         minute,
         second: s,
         microsecond: us,
+        timezone_offset_seconds: match (timezone_hour, timezone_minute) {
+            (None, None) => None,
+            (hour, minute) => {
+                let hour = hour.unwrap_or(0);
+                let minute = minute.unwrap_or(0);
+                if hour.unsigned_abs() > 15 || !(0..=59).contains(&minute) {
+                    return Err(sql_err!(
+                        sqlstate::DATETIME_FIELD_OVERFLOW,
+                        "time zone displacement out of range"
+                    ));
+                }
+                Some(timezone_sign * (hour.unsigned_abs() as i32 * 3600 + minute * 60))
+            }
+        },
     })
 }
 
@@ -418,6 +710,22 @@ fn read_month(input: &str, input_position: &mut usize, abbr: bool) -> Option<u32
         {
             *input_position += name_bytes.len();
             return Some(i as u32 + 1);
+        }
+    }
+    None
+}
+
+fn read_weekday(input: &str, input_position: &mut usize, abbr: bool) -> Option<()> {
+    let bytes = input.as_bytes();
+    while *input_position < bytes.len() && bytes[*input_position] == b' ' {
+        *input_position += 1;
+    }
+    let table: &[&str] = if abbr { &WEEKDAY_ABBR } else { &WEEKDAY_FULL };
+    for name in table {
+        let end = *input_position + name.len();
+        if end <= bytes.len() && bytes[*input_position..end].eq_ignore_ascii_case(name.as_bytes()) {
+            *input_position = end;
+            return Some(());
         }
     }
     None
@@ -516,14 +824,18 @@ pub fn to_date(input: &str, fmt: &str) -> Result<i32, SqlError> {
 /// 2000-01-01.
 pub fn to_timestamp(input: &str, fmt: &str) -> Result<i64, SqlError> {
     let value = parse_formatted(input, fmt)?;
-    make_timestamp(
+    let local = make_timestamp(
         value.year,
         value.month as i64,
         value.day as i64,
         value.hour,
         value.minute,
         value.second as f64 + value.microsecond as f64 / 1_000_000.0,
-    )
+    )?;
+    let offset = value
+        .timezone_offset_seconds
+        .unwrap_or_else(|| super::timezone::session().resolve(local).0);
+    Ok(local - i64::from(offset) * 1_000_000)
 }
 
 /// Constructs a date (days since 2000-01-01) from year/month/day, validating
@@ -884,14 +1196,75 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
     let mut months = 0i64;
     let mut days = 0i64;
     let mut micros = 0i64;
+    let overflow = || {
+        sql_err!(
+            sqlstate::INTERVAL_FIELD_OVERFLOW,
+            "interval field value out of range: \"{}\"",
+            s
+        )
+    };
+    let add_micros = |total: &mut i64, value: f64| -> Result<(), SqlError> {
+        if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+            return Err(overflow());
+        }
+        *total = total
+            .checked_add(value.round() as i64)
+            .ok_or_else(overflow)?;
+        Ok(())
+    };
+    let add_days =
+        |day_total: &mut i64, micro_total: &mut i64, value: f64| -> Result<(), SqlError> {
+            if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+                return Err(overflow());
+            }
+            let whole = value.trunc();
+            *day_total = day_total.checked_add(whole as i64).ok_or_else(overflow)?;
+            add_micros(micro_total, (value - whole) * DAY_US as f64)
+        };
+    let add_months = |month_total: &mut i64,
+                      day_total: &mut i64,
+                      micro_total: &mut i64,
+                      value: f64|
+     -> Result<(), SqlError> {
+        if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+            return Err(overflow());
+        }
+        let whole = value.trunc();
+        *month_total = month_total.checked_add(whole as i64).ok_or_else(overflow)?;
+        add_days(day_total, micro_total, (value - whole) * 30.0)
+    };
     let mut it = s.split_whitespace().peekable();
     let mut saw = false;
     while let Some(tok) = it.next() {
         if tok.contains(':') {
-            // A bare clock time contributes to the microseconds field.
+            // Interval hours are a duration and are not restricted to a
+            // clock's 0..24 range.
             let neg = tok.starts_with('-');
             let t = tok.trim_start_matches(['-', '+']);
-            micros += if neg { -parse_time(t)? } else { parse_time(t)? };
+            let mut parts = t.splitn(3, ':');
+            let hour: i64 = parts
+                .next()
+                .and_then(|part| part.parse().ok())
+                .ok_or_else(bad)?;
+            let minute: i64 = parts
+                .next()
+                .and_then(|part| part.parse().ok())
+                .ok_or_else(bad)?;
+            let second: f64 = parts
+                .next()
+                .and_then(|part| part.parse().ok())
+                .ok_or_else(bad)?;
+            if !(0..60).contains(&minute) || !(0.0..60.0).contains(&second) {
+                return Err(overflow());
+            }
+            let clock = (hour as f64 * 3600.0 + minute as f64 * 60.0 + second) * 1_000_000.0;
+            if !clock.is_finite() || clock > i64::MAX as f64 {
+                return Err(overflow());
+            }
+            let clock = clock.round() as i64;
+            micros = micros
+                .checked_add(if neg { -clock } else { clock })
+                .ok_or_else(overflow)?;
             saw = true;
             continue;
         }
@@ -899,21 +1272,21 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
         // no unit is seconds, as PostgreSQL reads a bare `INTERVAL '90'`.
         let n: f64 = tok.parse().map_err(|_| bad())?;
         let Some(unit) = it.next() else {
-            micros += (n * 1_000_000.0) as i64;
+            add_micros(&mut micros, n * 1_000_000.0)?;
             saw = true;
             continue;
         };
         let u = unit.trim_end_matches('s'); // singular/plural
         match u {
-            "year" | "yr" => months += (n * 12.0) as i64,
-            "month" | "mon" => months += n as i64,
-            "week" | "wk" => days += (n * 7.0) as i64,
-            "day" | "d" => days += n as i64,
-            "hour" | "hr" | "h" => micros += (n * 3_600_000_000.0) as i64,
-            "minute" | "min" | "m" => micros += (n * 60_000_000.0) as i64,
-            "second" | "sec" | "s" => micros += (n * 1_000_000.0) as i64,
-            "millisecond" | "msec" | "ms" => micros += (n * 1_000.0) as i64,
-            "microsecond" | "usec" | "us" => micros += n as i64,
+            "year" | "yr" => add_months(&mut months, &mut days, &mut micros, n * 12.0)?,
+            "month" | "mon" => add_months(&mut months, &mut days, &mut micros, n)?,
+            "week" | "wk" => add_days(&mut days, &mut micros, n * 7.0)?,
+            "day" | "d" => add_days(&mut days, &mut micros, n)?,
+            "hour" | "hr" | "h" => add_micros(&mut micros, n * 3_600_000_000.0)?,
+            "minute" | "min" | "m" => add_micros(&mut micros, n * 60_000_000.0)?,
+            "second" | "sec" | "s" => add_micros(&mut micros, n * 1_000_000.0)?,
+            "millisecond" | "msec" | "ms" => add_micros(&mut micros, n * 1_000.0)?,
+            "microsecond" | "usec" | "us" => add_micros(&mut micros, n)?,
             _ => return Err(bad()),
         }
         saw = true;
@@ -922,19 +1295,65 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
         return Err(bad());
     }
     Ok(Interval {
-        months: months as i32,
-        days: days as i32,
+        months: months.try_into().map_err(|_| overflow())?,
+        days: days.try_into().map_err(|_| overflow())?,
         micros,
     })
 }
 
-/// Formats an `interval` exactly as PostgreSQL's default (postgres) style does:
-/// nonzero year/month/day fields with units, then a signed `HH:MM:SS[.ffffff]`
-/// time part (shown when microseconds are nonzero, or when the whole interval
-/// is zero).
-pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalStyle {
+    Postgres,
+    PostgresVerbose,
+    SqlStandard,
+    Iso8601,
+}
+
+impl IntervalStyle {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(if value.eq_ignore_ascii_case("postgres") {
+            Self::Postgres
+        } else if value.eq_ignore_ascii_case("postgres_verbose") {
+            Self::PostgresVerbose
+        } else if value.eq_ignore_ascii_case("sql_standard") {
+            Self::SqlStandard
+        } else if value.eq_ignore_ascii_case("iso_8601") {
+            Self::Iso8601
+        } else {
+            return None;
+        })
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::PostgresVerbose => "postgres_verbose",
+            Self::SqlStandard => "sql_standard",
+            Self::Iso8601 => "iso_8601",
+        }
+    }
+}
+
+pub fn format_interval(interval: super::types::Interval) -> StackStr<96> {
+    format_interval_styled(interval, IntervalStyle::Postgres)
+}
+
+pub fn format_interval_styled(
+    interval: super::types::Interval,
+    style: IntervalStyle,
+) -> StackStr<96> {
+    match style {
+        IntervalStyle::Postgres => format_interval_postgres(interval),
+        IntervalStyle::PostgresVerbose => format_interval_verbose(interval),
+        IntervalStyle::SqlStandard => format_interval_sql_standard(interval),
+        IntervalStyle::Iso8601 => format_interval_iso8601(interval),
+    }
+}
+
+/// PostgreSQL's default style: named calendar fields and a clock field.
+fn format_interval_postgres(interval: super::types::Interval) -> StackStr<96> {
     use core::fmt::Write;
-    let mut out = StackStr::<48>::new();
+    let mut out = StackStr::<96>::new();
     let years = interval.months / 12;
     let mons = interval.months % 12;
     let mut first = true;
@@ -943,14 +1362,14 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
     // all-positive fields stays bare. `prev_neg` tracks that immediately
     // preceding sign.
     let mut prev_neg = false;
-    let sep = |out: &mut StackStr<48>, first: &mut bool| {
+    let sep = |out: &mut StackStr<96>, first: &mut bool| {
         if !*first {
             let _ = write!(out, " ");
         }
         *first = false;
     };
     let unit =
-        |out: &mut StackStr<48>, first: &mut bool, prev_neg: &mut bool, n: i32, singular: &str| {
+        |out: &mut StackStr<96>, first: &mut bool, prev_neg: &mut bool, n: i32, singular: &str| {
             if n != 0 {
                 sep(out, first);
                 if n > 0 && *prev_neg {
@@ -971,7 +1390,7 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
         // before it was negative, `-` when it is itself negative.
         sep(&mut out, &mut first);
         let neg = interval.micros < 0;
-        let a = interval.micros.unsigned_abs() as i64;
+        let a = interval.micros.unsigned_abs();
         let seconds = a / 1_000_000;
         let frac = a % 1_000_000;
         let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
@@ -997,6 +1416,201 @@ pub fn format_interval(interval: super::types::Interval) -> StackStr<48> {
                 let _ = write!(out, "{d}");
             }
         }
+    }
+    out
+}
+
+fn write_fraction(out: &mut StackStr<96>, fraction: u64) {
+    use core::fmt::Write;
+    if fraction == 0 {
+        return;
+    }
+    let mut value = fraction;
+    let mut digits = [0_u8; 6];
+    for digit in digits.iter_mut().rev() {
+        *digit = (value % 10) as u8;
+        value /= 10;
+    }
+    let mut length = digits.len();
+    while digits[length - 1] == 0 {
+        length -= 1;
+    }
+    let _ = out.write_char('.');
+    for digit in &digits[..length] {
+        let _ = write!(out, "{digit}");
+    }
+}
+
+fn format_interval_verbose(interval: super::types::Interval) -> StackStr<96> {
+    use core::fmt::Write;
+    let before = interval.months < 0
+        || interval.months == 0 && interval.days < 0
+        || interval.months == 0 && interval.days == 0 && interval.micros < 0;
+    let direction = if before { -1_i64 } else { 1_i64 };
+    let months = i64::from(interval.months) * direction;
+    let days = i64::from(interval.days) * direction;
+    let micros = i128::from(interval.micros) * i128::from(direction);
+    let mut out = StackStr::<96>::from_str("@ ");
+    let mut wrote = false;
+    let mut unit = |value: i64, singular: &str| {
+        if value == 0 {
+            return;
+        }
+        if wrote {
+            let _ = out.write_char(' ');
+        }
+        let _ = write!(out, "{value} {singular}");
+        if value.unsigned_abs() != 1 {
+            let _ = out.write_char('s');
+        }
+        wrote = true;
+    };
+    unit(months / 12, "year");
+    unit(months % 12, "mon");
+    unit(days, "day");
+    let negative_time = micros < 0;
+    let absolute = micros.unsigned_abs();
+    let seconds = absolute / 1_000_000;
+    let fraction = (absolute % 1_000_000) as u64;
+    let hours = seconds / 3600;
+    let minutes = seconds % 3600 / 60;
+    let second = seconds % 60;
+    let sign = if negative_time { -1 } else { 1 };
+    unit((hours as i64) * sign, "hour");
+    unit((minutes as i64) * sign, "min");
+    if second != 0 || fraction != 0 {
+        if wrote {
+            let _ = out.write_char(' ');
+        }
+        if negative_time {
+            let _ = out.write_char('-');
+        }
+        let _ = write!(out, "{second}");
+        write_fraction(&mut out, fraction);
+        let _ = out.write_str(if second == 1 && fraction == 0 {
+            " sec"
+        } else {
+            " secs"
+        });
+        wrote = true;
+    }
+    if !wrote {
+        let _ = out.write_char('0');
+    }
+    if before {
+        let _ = out.write_str(" ago");
+    }
+    out
+}
+
+fn interval_signs(interval: super::types::Interval) -> (bool, bool) {
+    let negative = interval.months < 0 || interval.days < 0 || interval.micros < 0;
+    let positive = interval.months > 0 || interval.days > 0 || interval.micros > 0;
+    (negative, positive)
+}
+
+enum SqlClockSign {
+    Own,
+    Explicit,
+    SharedWithDay,
+}
+
+fn write_sql_clock(out: &mut StackStr<96>, micros: i64, sign: SqlClockSign) {
+    use core::fmt::Write;
+    match sign {
+        SqlClockSign::Own if micros < 0 => {
+            let _ = out.write_char('-');
+        }
+        SqlClockSign::Explicit => {
+            let _ = out.write_char(if micros < 0 { '-' } else { '+' });
+        }
+        SqlClockSign::Own | SqlClockSign::SharedWithDay => {}
+    }
+    let value = micros.unsigned_abs();
+    let seconds = value / 1_000_000;
+    let fraction = value % 1_000_000;
+    let _ = write!(
+        out,
+        "{}:{:02}:{:02}",
+        seconds / 3600,
+        seconds % 3600 / 60,
+        seconds % 60
+    );
+    write_fraction(out, fraction);
+}
+
+fn format_interval_sql_standard(interval: super::types::Interval) -> StackStr<96> {
+    use core::fmt::Write;
+    if interval.months == 0 && interval.days == 0 && interval.micros == 0 {
+        return StackStr::from_str("0");
+    }
+    let (negative, positive) = interval_signs(interval);
+    let separate_groups = negative && positive
+        || interval.months != 0 && (interval.days != 0 || interval.micros != 0);
+    let mut out = StackStr::<96>::new();
+    if separate_groups {
+        let month_sign = if interval.months < 0 { '-' } else { '+' };
+        let months = i64::from(interval.months).unsigned_abs();
+        let _ = write!(out, "{month_sign}{}-{}", months / 12, months % 12);
+        let day_sign = if interval.days < 0 { '-' } else { '+' };
+        let _ = write!(
+            out,
+            " {day_sign}{} ",
+            i64::from(interval.days).unsigned_abs()
+        );
+        write_sql_clock(&mut out, interval.micros, SqlClockSign::Explicit);
+    } else if interval.months != 0 {
+        if interval.months < 0 {
+            let _ = out.write_char('-');
+        }
+        let months = i64::from(interval.months).unsigned_abs();
+        let _ = write!(out, "{}-{}", months / 12, months % 12);
+    } else if interval.days != 0 {
+        let _ = write!(out, "{} ", interval.days);
+        write_sql_clock(&mut out, interval.micros, SqlClockSign::SharedWithDay);
+    } else {
+        write_sql_clock(&mut out, interval.micros, SqlClockSign::Own);
+    }
+    out
+}
+
+fn format_interval_iso8601(interval: super::types::Interval) -> StackStr<96> {
+    use core::fmt::Write;
+    let mut out = StackStr::<96>::from_str("P");
+    let years = interval.months / 12;
+    let months = interval.months % 12;
+    if years != 0 {
+        let _ = write!(out, "{years}Y");
+    }
+    if months != 0 {
+        let _ = write!(out, "{months}M");
+    }
+    if interval.days != 0 {
+        let _ = write!(out, "{}D", interval.days);
+    }
+    if interval.micros != 0 {
+        let _ = out.write_char('T');
+        let negative = interval.micros < 0;
+        let absolute = interval.micros.unsigned_abs();
+        let seconds = absolute / 1_000_000;
+        let fraction = absolute % 1_000_000;
+        let hours = seconds / 3600;
+        let minutes = seconds % 3600 / 60;
+        let second = seconds % 60;
+        let sign = if negative { "-" } else { "" };
+        if hours != 0 {
+            let _ = write!(out, "{sign}{hours}H");
+        }
+        if minutes != 0 {
+            let _ = write!(out, "{sign}{minutes}M");
+        }
+        if second != 0 || fraction != 0 {
+            let _ = write!(out, "{sign}{second}");
+            write_fraction(&mut out, fraction);
+            let _ = out.write_char('S');
+        }
+    } else if interval.months == 0 && interval.days == 0 {
+        let _ = out.write_str("T0S");
     }
     out
 }
@@ -1712,6 +2326,33 @@ mod tests {
             to_timestamp("46923", "SSSS").unwrap(),
             make_timestamp(2000, 1, 1, 13, 2, 3.0).unwrap()
         );
+        assert_eq!(
+            to_date("2460370", "J").unwrap(),
+            make_date(2024, 2, 29).unwrap()
+        );
+        assert_eq!(
+            to_date("2024-060", "IYYY-IDDD").unwrap(),
+            make_date(2024, 2, 29).unwrap()
+        );
+        let zoned = to_timestamp(
+            "2024-02-29 23:07:05.123456 -05:30",
+            "YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM",
+        )
+        .unwrap();
+        assert_eq!(zoned, make_timestamp(2024, 3, 1, 4, 37, 5.123456).unwrap());
+        assert!(to_date("2024  02 29", "FXYYYY MM DD").is_err());
+        assert_eq!(to_date("5", "Y").unwrap(), make_date(2005, 1, 1).unwrap());
+        assert_eq!(
+            to_date("999", "YYY").unwrap(),
+            make_date(1999, 1, 1).unwrap()
+        );
+        assert_eq!(
+            to_date("22-24-2nd-Monday", "CC-YY-Wth-DAY").unwrap(),
+            make_date(2124, 1, 8).unwrap()
+        );
+        assert_eq!(to_date("21", "CC").unwrap(), make_date(2001, 1, 1).unwrap());
+        assert!(to_date("2024-060", "YYYY-IDDD").is_err());
+        assert!(to_date("2460370-2024", "J-YYYY").is_err());
     }
 
     #[test]

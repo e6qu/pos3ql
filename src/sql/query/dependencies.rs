@@ -199,12 +199,11 @@ fn collect_select<'a>(
                         }
                     }
                     SelectItem::TableWildcard(name) => {
-                        let table = scope.table_index(name)?;
-                        for column in 0..scope.defs[table].expect("resolved").n_columns {
-                            dependencies.mark_referenced_column(
-                                DependencyClass::Table,
-                                scope.slots[table],
-                                column,
+                        for index in 0..scope.qualified_star_columns(name)? {
+                            mark_resolved_column(
+                                &scope,
+                                scope.qualified_star_entry(name, index)?,
+                                dependencies,
                             )?;
                         }
                     }
@@ -336,7 +335,7 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
 
     fn is_whole_row(&self, name: &str) -> bool {
         self.scope
-            .is_some_and(|scope| scope.table_index(name).is_ok())
+            .is_some_and(|scope| scope.qualified_star_columns(name).is_ok())
     }
 
     fn whole_row_scalar_type(&self, name: &str) -> Option<ColType> {
@@ -347,6 +346,14 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
         let scope = self.scope?;
         let table = scope.table_index(name).ok()?;
         Some(scope.defs[table]?.columns())
+    }
+
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        super::ScopeCols(self.scope?).whole_row_field(name, index)
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -572,6 +579,26 @@ fn collect_routine_dependencies_with_resolver(
     }
     if let Some(from) = select.from {
         for table in core::iter::once(&from.base).chain(from.joins.iter().map(|join| &join.table)) {
+            if let Some(sample) = table.sample {
+                visit_expr(
+                    sample.percentage,
+                    storage,
+                    txid,
+                    resolver,
+                    dependencies,
+                    &mut needs_scope,
+                )?;
+                if let Some(repeatable) = sample.repeatable {
+                    visit_expr(
+                        repeatable,
+                        storage,
+                        txid,
+                        resolver,
+                        dependencies,
+                        &mut needs_scope,
+                    )?;
+                }
+            }
             if let Some(args) = table.func_args {
                 record_table_call(
                     table,
@@ -677,7 +704,10 @@ fn record_relation_column_references<'a>(
                 source.slot = slot;
                 source.n_columns = definition.columns().len();
                 for column in 0..source.n_columns {
-                    source.columns[column] = definition.columns()[column].name.as_str();
+                    source.columns[column] = table
+                        .col_alias
+                        .and_then(|aliases| aliases.get(column).copied())
+                        .unwrap_or(definition.columns()[column].name.as_str());
                 }
             }
             ResolvedRelation::View(slot) => {
@@ -698,7 +728,10 @@ fn record_relation_column_references<'a>(
                     &mut described,
                 )?;
                 for (column, described) in described.iter().enumerate().take(source.n_columns) {
-                    source.columns[column] = described.name;
+                    source.columns[column] = table
+                        .col_alias
+                        .and_then(|aliases| aliases.get(column).copied())
+                        .unwrap_or(described.name);
                 }
             }
             _ => continue,
@@ -804,17 +837,33 @@ fn record_column_references(
                 return;
             }
         };
-        if let super::ResolvedColumn::Table(table, column) = resolved
-            && let Err(error) = dependencies.mark_referenced_column(
-                DependencyClass::Table,
-                scope.slots[table],
-                column,
-            )
-        {
+        if let Err(error) = mark_resolved_column(scope, resolved, dependencies) {
             failure = Some(error);
         }
     });
     failure.map_or(Ok(()), Err)
+}
+
+fn mark_resolved_column(
+    scope: &super::QueryScope<'_>,
+    resolved: super::ResolvedColumn,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    match resolved {
+        super::ResolvedColumn::Table(table, column) => {
+            dependencies.mark_referenced_column(DependencyClass::Table, scope.slots[table], column)
+        }
+        super::ResolvedColumn::Merged(merged) => {
+            for &(table, column) in &scope.merged[merged].parts[..scope.merged[merged].n_parts] {
+                dependencies.mark_referenced_column(
+                    DependencyClass::Table,
+                    scope.slots[table],
+                    column,
+                )?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn collect_set_tree<'a>(
@@ -885,6 +934,20 @@ fn collect_table_ref<'a>(
     if let Some(arguments) = table.func_args {
         for argument in arguments {
             collect_expression(argument, storage, txid, path, ctes, dependencies, arena)?;
+        }
+    }
+    if let Some(sample) = table.sample {
+        collect_expression(
+            sample.percentage,
+            storage,
+            txid,
+            path,
+            ctes,
+            dependencies,
+            arena,
+        )?;
+        if let Some(repeatable) = sample.repeatable {
+            collect_expression(repeatable, storage, txid, path, ctes, dependencies, arena)?;
         }
     }
     if let Some(functions) = table.rows_from {

@@ -505,6 +505,7 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
             *cols |= 1u64 << index;
         }
         Expr::RoutineParam { .. } => {}
+        Expr::RecursiveState { .. } => {}
         Expr::Subquery(_)
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. }

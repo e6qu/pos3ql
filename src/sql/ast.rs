@@ -2,6 +2,8 @@
 //! references, so an entire statement tree lives exactly as long as the
 //! per-statement arena and costs nothing to drop.
 
+use crate::sql::types::ColType;
+
 /// A possibly schema-qualified relation name, as written. `schema: None`
 /// means the statement spelled a bare name that resolves through the session
 /// search path; carrying the pair everywhere makes losing a qualifier
@@ -1537,6 +1539,9 @@ pub struct Select<'a> {
     pub from: Option<FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub group_by: &'a [&'a Expr<'a>],
+    /// Whether duplicate grouping sets are retained (`ALL`, PostgreSQL's
+    /// default) or collapsed before aggregation (`DISTINCT`).
+    pub grouping_set_quantifier: GroupingSetQuantifier,
     /// Grouping sets for `ROLLUP`/`CUBE`/`GROUPING SETS`. Each element is a
     /// bitmask over `group_by` indices selecting the columns that group in that
     /// set (bit *i* set = `group_by[i]` participates; a cleared bit means that
@@ -1560,6 +1565,12 @@ pub struct Select<'a> {
     /// `FOR UPDATE`/`FOR SHARE`/… row-locking clauses, in written order. Empty
     /// when the query carries none.
     pub locking: &'a [LockClause<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupingSetQuantifier {
+    All,
+    Distinct,
 }
 
 /// The strength of a `FOR ...` row-locking clause, strongest first (this order
@@ -1629,6 +1640,36 @@ pub enum CteMaterialization {
     NotMaterialized,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CteSearchOrder {
+    BreadthFirst,
+    DepthFirst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CteSearch<'a> {
+    pub order: CteSearchOrder,
+    pub columns: &'a [&'a str],
+    pub sequence_column: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CteCycle<'a> {
+    pub columns: &'a [&'a str],
+    pub mark_column: &'a str,
+    pub mark: CteCycleMark<'a>,
+    pub path_column: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CteCycleMark<'a> {
+    Boolean,
+    Custom {
+        value: &'a Expr<'a>,
+        default: &'a Expr<'a>,
+    },
+}
+
 /// One `WITH name [(col, ...)] AS (SELECT ...)` common table expression.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cte<'a> {
@@ -1639,6 +1680,8 @@ pub struct Cte<'a> {
     /// is executed by fixpoint iteration rather than inline expansion).
     pub recursive: bool,
     pub materialization: CteMaterialization,
+    pub search: Option<CteSearch<'a>>,
+    pub cycle: Option<CteCycle<'a>>,
     /// The CTE body as a query. For a data-modifying CTE (`dml` is `Some`) this
     /// is a placeholder and unused.
     pub query: &'a Select<'a>,
@@ -1658,8 +1701,74 @@ pub struct MaterializedCte<'a> {
     pub column_names: &'a [&'a str],
     pub column_types: &'a [(i32, i16, i32)],
     pub column_collations: &'a [Collation],
-    pub rows: &'a [&'a [u8]],
-    pub(crate) external_run: Option<crate::sql::external::ExternalRun>,
+    pub(crate) source: MaterializedCteSource<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MaterializedCteSource<'a> {
+    Inline(&'a [&'a [u8]]),
+    External(Option<crate::sql::external::ExternalRun>),
+    RecursiveInline(&'a core::sync::atomic::AtomicUsize),
+    RecursiveExternal(&'a core::sync::atomic::AtomicUsize),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MaterializedCteInlineSource {
+    pub address: usize,
+    pub length: usize,
+}
+
+impl PartialEq for MaterializedCteSource<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (Self::Inline(left), Self::Inline(right)) => left == right,
+            (Self::External(left), Self::External(right)) => left == right,
+            (Self::RecursiveInline(left), Self::RecursiveInline(right)) => {
+                core::ptr::eq(left, right)
+            }
+            (Self::RecursiveExternal(left), Self::RecursiveExternal(right)) => {
+                core::ptr::eq(left, right)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl<'a> MaterializedCte<'a> {
+    pub(crate) fn rows(&self) -> &'a [&'a [u8]] {
+        match self.source {
+            MaterializedCteSource::Inline(rows) => rows,
+            MaterializedCteSource::RecursiveInline(source) => {
+                let source = source.load(core::sync::atomic::Ordering::Relaxed);
+                if source == 0 {
+                    return &[];
+                }
+                // The selector names one immutable arena-owned descriptor, so
+                // an update cannot expose a pointer/length from different rows.
+                let source = unsafe { &*(source as *const MaterializedCteInlineSource) };
+                unsafe {
+                    core::slice::from_raw_parts(source.address as *const &'a [u8], source.length)
+                }
+            }
+            MaterializedCteSource::External(_) | MaterializedCteSource::RecursiveExternal(_) => &[],
+        }
+    }
+
+    pub(crate) fn external_run(&self) -> Option<crate::sql::external::ExternalRun> {
+        match self.source {
+            MaterializedCteSource::External(run) => run,
+            MaterializedCteSource::RecursiveExternal(address) => {
+                let address = address.load(core::sync::atomic::Ordering::Relaxed);
+                if address == 0 {
+                    None
+                } else {
+                    // Each address names an immutable arena-owned run value.
+                    Some(unsafe { *(address as *const crate::sql::external::ExternalRun) })
+                }
+            }
+            MaterializedCteSource::Inline(_) | MaterializedCteSource::RecursiveInline(_) => None,
+        }
+    }
 }
 
 /// A base table plus a chain of joins (nested-loop order).
@@ -1668,6 +1777,28 @@ pub struct FromClause<'a> {
     /// (table name, optional alias).
     pub base: TableRef<'a>,
     pub joins: &'a [Join<'a>],
+}
+
+/// Whether a relation source includes its inheritance/partition descendants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationInheritance {
+    Descendants,
+    Only,
+}
+
+/// The built-in PostgreSQL sampling methods pos3ql can execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableSampleMethod {
+    System,
+    Bernoulli,
+}
+
+/// A relation's typed `TABLESAMPLE` clause.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TableSample<'a> {
+    pub method: TableSampleMethod,
+    pub percentage: &'a Expr<'a>,
+    pub repeatable: Option<&'a Expr<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1687,10 +1818,12 @@ pub struct TableRef<'a> {
     /// parsed table source is either one function or one non-empty function
     /// group, never both.
     pub rows_from: Option<&'a [TableRef<'a>]>,
-    /// Column-alias list (`alias(c1, c2, ...)`): renames the output columns of a
-    /// derived table or a table function. A table function has a single output
-    /// column, so it accepts exactly one name.
+    /// Column-alias list (`alias(c1, c2, ...)`): renames leading output columns.
     pub col_alias: Option<&'a [&'a str]>,
+    /// Default inheritance traversal or explicit `ONLY` selection.
+    pub inheritance: RelationInheritance,
+    /// Sampling applies only to a physical table or materialized view.
+    pub sample: Option<TableSample<'a>>,
     /// Materialized recursive-CTE reference: when set, this FROM item reads the
     /// pre-computed row set instead of a table or subquery.
     pub cte: Option<&'a MaterializedCte<'a>>,
@@ -1724,13 +1857,20 @@ pub struct Join<'a> {
     /// equality predicate is synthesized at plan time, where the joined
     /// tables' columns are known).
     pub on: Option<&'a Expr<'a>>,
-    /// `USING (c1, ...)` column names. Each names one column of the left join
-    /// tree and one of the right table; the pair is merged into a single
-    /// output column.
-    pub using_columns: Option<&'a [&'a str]>,
+    /// Typed `USING` clause. Keeping its optional alias inside the clause
+    /// makes an alias without merged columns unrepresentable.
+    pub using: Option<JoinUsing<'a>>,
     /// NATURAL join: the using-column list is every common column name,
     /// resolved at plan time.
     pub natural: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct JoinUsing<'a> {
+    /// Each name resolves once on the left join tree and once on the right.
+    pub columns: &'a [&'a str],
+    /// Qualifies only the merged columns and shares the table-alias namespace.
+    pub alias: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3135,6 +3275,15 @@ pub enum Expr<'a> {
         table: &'a str,
         name: &'a str,
     },
+    /// Typed executor state carried after a recursive CTE row's visible
+    /// columns. The SQL grammar cannot construct this node; SEARCH/CYCLE
+    /// rewriting uses it to retain parent paths without exposing hidden
+    /// columns through `*`.
+    RecursiveState {
+        qualifier: &'a str,
+        index: u8,
+        ctype: ColType,
+    },
     /// `operand operator ANY/ALL (array)` — quantified comparison.
     AnyAll {
         operand: &'a Expr<'a>,
@@ -3191,6 +3340,7 @@ impl Expr<'_> {
             | Expr::BitLit(_) => true,
             Expr::WholeRow(_) | Expr::SchemaColumn { .. } => false,
             Expr::Column { .. }
+            | Expr::RecursiveState { .. }
             | Expr::RoutineParam { .. }
             | Expr::Param(_)
             | Expr::Subquery(_)
@@ -3280,6 +3430,7 @@ impl Expr<'_> {
             | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
+            | Expr::RecursiveState { .. }
             | Expr::Param(_)
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
@@ -3357,6 +3508,7 @@ impl Expr<'_> {
             | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
+            | Expr::RecursiveState { .. }
             | Expr::Param(_)
             | Expr::DefaultMarker => false,
             Expr::Unary { operand, .. }
@@ -3498,6 +3650,7 @@ impl Expr<'_> {
             | Expr::RoutineParam { .. }
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
+            | Expr::RecursiveState { .. }
             | Expr::Param(_)
             | Expr::DefaultMarker
             | Expr::Subquery(_)
@@ -3575,6 +3728,7 @@ impl Expr<'_> {
             | Expr::BitLit(_)
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
+            | Expr::RecursiveState { .. }
             | Expr::Param(_)
             | Expr::DefaultMarker
             | Expr::Subquery(_)
@@ -3668,6 +3822,7 @@ impl Expr<'_> {
             | Expr::BitLit(_)
             | Expr::WholeRow(_)
             | Expr::SchemaColumn { .. }
+            | Expr::RecursiveState { .. }
             | Expr::Param(_)
             | Expr::DefaultMarker
             | Expr::Subquery(_)

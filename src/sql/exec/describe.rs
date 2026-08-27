@@ -330,7 +330,7 @@ fn describe_record_star<'q>(
     push: &mut impl FnMut(ColDesc<'q>) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     match base {
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
+        Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
             let catalog_resolver;
             let aliased_resolver;
             let resolver: &dyn ColTypeResolver = match (def, storage) {
@@ -353,9 +353,26 @@ fn describe_record_star<'q>(
                 (None, None) => &NoCols,
             };
             check_row_field_types(base, resolver)?;
-            for (i, arg) in args.iter().take(RECORD_FIELD_NAMES.len()).enumerate() {
-                let (oid, typlen) = infer_type_res(arg, resolver)?;
-                push(ColDesc::new(RECORD_FIELD_NAMES[i], oid, typlen))?;
+            let mut error = None;
+            let mut index = 0usize;
+            record_shape_metadata(base, resolver, |_, meta| {
+                if error.is_none() {
+                    error = push(
+                        ColDesc::new(
+                            RECORD_FIELD_NAMES[index],
+                            meta.type_oid,
+                            meta.ctype.typlen(),
+                        )
+                        .with_type_mod(meta.type_mod)
+                        .with_collation(meta.collation),
+                    )
+                    .err();
+                }
+                index += 1;
+            })
+            .ok_or_else(|| could_not_identify("*"))?;
+            if let Some(error) = error {
+                return Err(error);
             }
             Ok(())
         }
@@ -798,6 +815,20 @@ pub trait ColTypeResolver {
     /// whole-row record's field shape (`(t).c`, `(t).*`). Defaults to None.
     fn table_columns(&self, _name: &str) -> Option<&[ColumnMeta]> {
         None
+    }
+
+    /// One field of a whole-row qualifier. Unlike `table_columns`, this also
+    /// represents synthetic row qualifiers such as `USING (...) AS alias`.
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        let column = self.table_columns(name)?.get(index)?;
+        Some((
+            crate::util::StackStr::from_str(column.name.as_str()),
+            self.column_meta(Some(name), column.name.as_str())?,
+        ))
     }
 
     /// The registered shape handle of a record-typed *column* (a derived
@@ -1251,35 +1282,20 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
     }; MAX_SHAPE_FIELDS];
     let mut n = 0usize;
     match expr {
-        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
-            if args.len() > MAX_SHAPE_FIELDS {
-                return None;
-            }
-            for (i, arg) in args.iter().enumerate() {
-                let meta = expression_static_metadata(arg, columns)?;
-                let ctype = meta.ctype;
-                // A nested ROW(...) is an *anonymous* record even inside a
-                // named shape — PostgreSQL refuses its fields — while a
-                // nested whole-row or record column keeps its named type.
-                let anonymous_nested =
-                    matches!(arg, Expr::Call { name, .. } if name.eq_ignore_ascii_case("row"));
-                let nested = if ctype == ColType::Record && !anonymous_nested {
-                    register_shape_for(arg, columns)?
-                } else {
-                    -1
-                };
-                let mut field_name = crate::util::StackStr::new();
-                let _ = core::fmt::Write::write_str(&mut field_name, RECORD_FIELD_NAMES[i]);
-                fields[i] = RecordShapeField {
-                    name: field_name,
-                    ctype,
-                    type_oid: meta.type_oid,
-                    type_mod: meta.type_mod,
-                    collation: meta.collation,
-                    nested,
-                };
-                n += 1;
-            }
+        Expr::Call { name, .. } if name.eq_ignore_ascii_case("row") => {
+            record_shape_metadata(expr, columns, |name, meta| {
+                if n < MAX_SHAPE_FIELDS {
+                    fields[n] = RecordShapeField {
+                        name: crate::util::StackStr::from_str(name),
+                        ctype: meta.ctype,
+                        type_oid: meta.type_oid,
+                        type_mod: meta.type_mod,
+                        collation: meta.collation,
+                        nested: -1,
+                    };
+                    n += 1;
+                }
+            })?;
         }
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
             let element = expand_array_element_metadata(args, columns)?;
@@ -1320,44 +1336,44 @@ pub fn register_shape_for(expr: &Expr, columns: &dyn ColTypeResolver) -> Option<
             }
         }
         Expr::WholeRow(table) => {
-            let cols = columns.table_columns(table)?;
-            if cols.len() > MAX_SHAPE_FIELDS {
-                return None;
-            }
-            for (i, c) in cols.iter().enumerate() {
-                let mut field_name = crate::util::StackStr::new();
-                let _ = core::fmt::Write::write_str(&mut field_name, c.name.as_str());
-                fields[i] = RecordShapeField {
-                    name: field_name,
-                    ctype: c.ctype,
-                    type_oid: columns.column_meta(Some(table), c.name.as_str())?.type_oid,
-                    type_mod: c.type_mod,
-                    collation: c.collation,
+            while let Some((name, meta)) = columns.whole_row_field(table, n) {
+                if n == MAX_SHAPE_FIELDS {
+                    return None;
+                }
+                fields[n] = RecordShapeField {
+                    name,
+                    ctype: meta.ctype,
+                    type_oid: meta.type_oid,
+                    type_mod: meta.type_mod,
+                    collation: meta.collation,
                     nested: -1,
                 };
                 n += 1;
+            }
+            if n == 0 {
+                return None;
             }
         }
         Expr::Column {
             qualifier: None,
             name,
         } if columns.is_whole_row(name) => {
-            let cols = columns.table_columns(name)?;
-            if cols.len() > MAX_SHAPE_FIELDS {
-                return None;
-            }
-            for (i, c) in cols.iter().enumerate() {
-                let mut field_name = crate::util::StackStr::new();
-                let _ = core::fmt::Write::write_str(&mut field_name, c.name.as_str());
-                fields[i] = RecordShapeField {
+            while let Some((field_name, meta)) = columns.whole_row_field(name, n) {
+                if n == MAX_SHAPE_FIELDS {
+                    return None;
+                }
+                fields[n] = RecordShapeField {
                     name: field_name,
-                    ctype: c.ctype,
-                    type_oid: columns.column_meta(Some(name), c.name.as_str())?.type_oid,
-                    type_mod: c.type_mod,
-                    collation: c.collation,
+                    ctype: meta.ctype,
+                    type_oid: meta.type_oid,
+                    type_mod: meta.type_mod,
+                    collation: meta.collation,
                     nested: -1,
                 };
                 n += 1;
+            }
+            if n == 0 {
+                return None;
             }
         }
         _ => return None,
@@ -1464,16 +1480,43 @@ fn record_shape_metadata(
     columns: &dyn ColTypeResolver,
     mut visit: impl FnMut(&str, StaticTypeMeta),
 ) -> Option<usize> {
+    record_shape_metadata_dyn(base, columns, &mut visit)
+}
+
+fn record_shape_metadata_dyn(
+    base: &Expr,
+    columns: &dyn ColTypeResolver,
+    visit: &mut dyn FnMut(&str, StaticTypeMeta),
+) -> Option<usize> {
     match base {
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("row") => {
-            let n = args.len().min(RECORD_FIELD_NAMES.len());
-            for (i, arg) in args[..n].iter().enumerate() {
-                visit(
-                    RECORD_FIELD_NAMES[i],
-                    expression_static_metadata(arg, columns)?,
-                );
+            let mut count = 0usize;
+            for arg in *args {
+                let expansion = match arg {
+                    Expr::WholeRow(_) => Some(*arg),
+                    Expr::Field { base, field: "*" } => Some(*base),
+                    _ => None,
+                };
+                if let Some(base) = expansion {
+                    let mut append = |_: &str, meta| {
+                        if count < RECORD_FIELD_NAMES.len() {
+                            visit(RECORD_FIELD_NAMES[count], meta);
+                            count += 1;
+                        }
+                    };
+                    record_shape_metadata_dyn(base, columns, &mut append)?;
+                } else {
+                    if count == RECORD_FIELD_NAMES.len() {
+                        return None;
+                    }
+                    visit(
+                        RECORD_FIELD_NAMES[count],
+                        expression_static_metadata(arg, columns)?,
+                    );
+                    count += 1;
+                }
             }
-            Some(n)
+            Some(count)
         }
         Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("_pg_expandarray") => {
             visit("x", expand_array_element_metadata(args, columns)?);
@@ -1579,14 +1622,12 @@ fn shape_from_columns_metadata(
     columns: &dyn ColTypeResolver,
     mut visit: impl FnMut(&str, StaticTypeMeta),
 ) -> Option<usize> {
-    let cols = columns.table_columns(table)?;
-    for col in cols {
-        visit(
-            col.name.as_str(),
-            columns.column_meta(Some(table), col.name.as_str())?,
-        );
+    let mut count = 0usize;
+    while let Some((name, meta)) = columns.whole_row_field(table, count) {
+        visit(name.as_str(), meta);
+        count += 1;
     }
-    Some(cols.len())
+    (count != 0).then_some(count)
 }
 
 /// PostgreSQL cannot form the composite type of a `ROW(...)` that contains a
@@ -2214,6 +2255,7 @@ pub fn infer_type_res(
         return Ok((result.type_oid, result.ctype.typlen()));
     }
     Ok(match expression {
+        Expr::RecursiveState { ctype, .. } => of(*ctype),
         Expr::Null | Expr::Str(_) => (oid::UNKNOWN, -2),
         Expr::Param(index) => bound_parameter_type_oid(*index)
             .map(|oid| (oid, coltype_of_oid(oid).map_or(-1, ColType::typlen)))

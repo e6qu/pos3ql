@@ -1005,16 +1005,16 @@ pub(crate) fn dispatch<'a>(
                             None => stack_format!(80, "{}({})", name, p),
                         }
                     }
-                    TypeMod::IntervalMod {
-                        precision: Some(p), ..
-                    } => {
-                        stack_format!(80, "interval({})", p)
-                    }
-                    // A range form with no precision renders bare; naming the
-                    // field range (`interval hour to minute`) is not built yet.
-                    TypeMod::IntervalMod {
-                        precision: None, ..
-                    } => stack_format!(80, "{}", name),
+                    TypeMod::IntervalMod { range, precision } => match range.name() {
+                        Some(fields) => match precision {
+                            Some(p) => stack_format!(80, "interval {}({})", fields, p),
+                            None => stack_format!(80, "interval {}", fields),
+                        },
+                        None => match precision {
+                            Some(p) => stack_format!(80, "interval({})", p),
+                            None => stack_format!(80, "interval"),
+                        },
+                    },
                 };
                 if array {
                     use core::fmt::Write as _;

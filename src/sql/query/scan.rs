@@ -10,7 +10,8 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{
-    BinaryOp, Collation, Expr, FromClause, JoinKind, Select, SelectItem, SetTree, TableRef,
+    BinaryOp, Collation, Expr, FromClause, JoinKind, RelationInheritance, Select, SelectItem,
+    SetTree, TableRef, TableSampleMethod,
 };
 use crate::sql::eval::{
     ColumnLookup, EvalHooks, SqlError, cast_to, compare_datums_collated, eval_full,
@@ -28,6 +29,73 @@ use super::{
     MAX_JOIN_TABLES, QueryScope, ResolvedColumn, arena_full, check_timeout, reorder_qual,
     simplify_qual, where_passes,
 };
+
+#[derive(Clone, Copy)]
+struct TableSamplePlan {
+    method: TableSampleMethod,
+    fraction: f64,
+    seed: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SampleIdentity(u64);
+
+impl TableSamplePlan {
+    fn includes(self, row: SampleIdentity) -> bool {
+        if self.fraction >= 1.0 {
+            return true;
+        }
+        if self.fraction <= 0.0 || self.fraction.is_nan() {
+            return false;
+        }
+        // SYSTEM makes one decision per provider-neutral logical scan block;
+        // BERNOULLI makes one decision per row. Neither depends on cache tier,
+        // object layout, or a provider SDK's multipart/block choices.
+        let unit = match self.method {
+            TableSampleMethod::System => row.0 / 128,
+            TableSampleMethod::Bernoulli => row.0,
+        };
+        let mixed = splitmix64(self.seed ^ unit);
+        let uniform = (mixed >> 11) as f64 * (1.0 / ((1u64 << 53) as f64));
+        uniform < self.fraction
+    }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn fresh_sample_seed() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(1);
+    let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    splitmix64(time ^ nonce.rotate_left(23) ^ u64::from(std::process::id()))
+}
+
+fn source_ref<'a>(from: &'a FromClause<'a>, source: usize) -> &'a TableRef<'a> {
+    if source == 0 {
+        &from.base
+    } else {
+        &from.joins[source - 1].table
+    }
+}
+
+fn sample_includes(plan: Option<TableSamplePlan>, rowid: Option<u64>) -> Result<bool, SqlError> {
+    let Some(plan) = plan else { return Ok(true) };
+    let rowid = rowid.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "sampled physical source has no durable row identity"
+        )
+    })?;
+    Ok(plan.includes(SampleIdentity(rowid)))
+}
 
 #[derive(Clone, Copy)]
 struct ActivePolicyTables {
@@ -306,7 +374,8 @@ fn refresh_catalog_object_names<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{PaxColumnDemand, PaxReadDemand};
+    use super::{PaxColumnDemand, PaxReadDemand, SampleIdentity, TableSamplePlan};
+    use crate::sql::ast::TableSampleMethod;
 
     #[test]
     fn selected_columns_require_a_proof() {
@@ -320,6 +389,41 @@ mod tests {
             PaxReadDemand::selected(proof).selected_mask(1),
             Some(1 << 3)
         );
+    }
+
+    #[test]
+    fn sampling_is_bounded_repeatable_and_method_shaped() {
+        let bernoulli = TableSamplePlan {
+            method: TableSampleMethod::Bernoulli,
+            fraction: 0.5,
+            seed: 42,
+        };
+        let first: [bool; 512] =
+            core::array::from_fn(|row| bernoulli.includes(SampleIdentity(row as u64)));
+        let second: [bool; 512] =
+            core::array::from_fn(|row| bernoulli.includes(SampleIdentity(row as u64)));
+        assert_eq!(first, second);
+        let selected = first.iter().filter(|selected| **selected).count();
+        assert!((200..=312).contains(&selected), "selected {selected} rows");
+
+        let system = TableSamplePlan {
+            method: TableSampleMethod::System,
+            ..bernoulli
+        };
+        for block in 0..4 {
+            let start = block * 128;
+            assert!((start..start + 128).all(|row| {
+                system.includes(SampleIdentity(row as u64))
+                    == system.includes(SampleIdentity(start as u64))
+            }));
+        }
+
+        crate::mem::guard::forbid_alloc(|| {
+            for row in 0..4096 {
+                let _ = bernoulli.includes(SampleIdentity(row));
+                let _ = system.includes(SampleIdentity(row));
+            }
+        });
     }
 }
 
@@ -454,6 +558,14 @@ fn pax_column_demand_bounded(
 ) -> Option<PaxColumnDemand> {
     let mut columns = PaxColumnDemand::empty();
     fn collect_table(table: &TableRef, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
+        if let Some(sample) = table.sample
+            && (!collect(sample.percentage, scope, columns)
+                || sample
+                    .repeatable
+                    .is_some_and(|repeatable| !collect(repeatable, scope, columns)))
+        {
+            return false;
+        }
         if let Some(arguments) = table.func_args
             && arguments
                 .iter()
@@ -816,6 +928,21 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         }
     }
 
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'v>, SqlError> {
+        let table = self.scope.table_index(qualifier)?;
+        let visible = self.scope.defs[table].expect("resolved").n_columns;
+        self.values[table]
+            .and_then(|values| values.get(visible + index))
+            .copied()
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_COLUMN_REFERENCE,
+                    "recursive state for \"{}\" is unavailable",
+                    qualifier
+                )
+            })
+    }
+
     fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<crate::sql::types::ColType> {
         let entry = self.scope.find_column(qualifier, name).ok()?;
         Some(self.scope.output_type(entry))
@@ -860,6 +987,9 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
     }
 
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
+        if self.scope.using_alias(table).is_some() {
+            return Ok(true);
+        }
         let t = self.scope.table_index(table)?;
         match self.values[t] {
             Some([]) => Ok(false), // outer-join null row
@@ -877,6 +1007,24 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
         table: &str,
         arena: &'v Arena,
     ) -> Result<Option<&'v [crate::sql::types::RecordField<'v>]>, SqlError> {
+        if let Some(alias) = self.scope.using_alias(table) {
+            let mut fields = [crate::sql::types::RecordField {
+                name: "",
+                type_oid: 0,
+                value: Datum::Null,
+            }; MAX_COLUMNS];
+            for (index, field) in fields.iter_mut().enumerate().take(alias.n_columns) {
+                let entry = self.scope.qualified_star_entry(table, index)?;
+                let name = self.scope.output_name(entry);
+                field.name = arena.alloc_str(name).map_err(|_| arena_full())?;
+                field.type_oid = self.scope.output_type(entry).oid();
+                field.value = self.lookup(Some(table), name)?;
+            }
+            return arena
+                .alloc_slice_copy(&fields[..alias.n_columns])
+                .map(|fields| Some(&*fields))
+                .map_err(|_| arena_full());
+        }
         let t = self.scope.table_index(table)?;
         let def = self.scope.defs[t].expect("resolved");
         let vals = match self.values[t] {
@@ -911,6 +1059,34 @@ impl<'v> ColumnLookup<'v> for JoinRow<'_, 'v, '_> {
             .map_err(|_| arena_full())?;
         Ok(Some(&*out))
     }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<&'v [crate::sql::types::RecordField<'v>], SqlError> {
+        if let Some(fields) = self.whole_row_fields(table, arena)? {
+            return Ok(fields);
+        }
+        let table = self.scope.table_index(table)?;
+        let definition = self.scope.defs[table].expect("resolved");
+        let columns = definition.columns();
+        let fields = arena
+            .alloc_slice_with(definition.n_columns, |index| {
+                crate::sql::types::RecordField {
+                    name: "",
+                    type_oid: columns[index].ctype.oid(),
+                    value: Datum::Null,
+                }
+            })
+            .map_err(|_| arena_full())?;
+        for (field, column) in fields.iter_mut().zip(columns) {
+            field.name = arena
+                .alloc_str(column.name.as_str())
+                .map_err(|_| arena_full())?;
+        }
+        Ok(fields)
+    }
 }
 
 /// Chains an inner row's column resolution to an optional outer row (for
@@ -921,6 +1097,16 @@ pub(crate) struct Chained<'r, 'a> {
     pub(crate) outer: Option<&'r dyn ColumnLookup<'a>>,
 }
 impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
+    fn recursive_state(&self, qualifier: &str, index: usize) -> Result<Datum<'a>, SqlError> {
+        match self.inner.recursive_state(qualifier, index) {
+            Ok(value) => Ok(value),
+            Err(error) => match self.outer {
+                Some(outer) => outer.recursive_state(qualifier, index),
+                None => Err(error),
+            },
+        }
+    }
+
     fn whole_row_present(&self, table: &str) -> Result<bool, SqlError> {
         match self.inner.whole_row_present(table) {
             Ok(v) => Ok(v),
@@ -941,6 +1127,20 @@ impl<'a> ColumnLookup<'a> for Chained<'_, 'a> {
             Err(e) => match self.outer {
                 Some(o) => o.whole_row_fields(table, arena),
                 None => Err(e),
+            },
+        }
+    }
+
+    fn whole_row_expansion_fields(
+        &self,
+        table: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a [crate::sql::types::RecordField<'a>], SqlError> {
+        match self.inner.whole_row_expansion_fields(table, arena) {
+            Ok(fields) => Ok(fields),
+            Err(error) => match self.outer {
+                Some(outer) => outer.whole_row_expansion_fields(table, arena),
+                None => Err(error),
             },
         }
     }
@@ -1721,6 +1921,60 @@ fn scan_source_mode<'a>(
             storage.record_serializable_read(txid, scope.slots[table]);
         }
     }
+    let sample_plans = arena
+        .alloc_slice_with(scope.n, |_| None::<TableSamplePlan>)
+        .map_err(|_| arena_full())?;
+    for (source, plan) in sample_plans.iter_mut().enumerate() {
+        let Some(sample) = source_ref(from, source).sample else {
+            continue;
+        };
+        let percentage = match cast_to(
+            eval_full(sample.percentage, arena, params, &NoColumns, hooks)?,
+            ColType::Float4,
+            arena,
+        )? {
+            Datum::Float4(value) => value,
+            Datum::Null => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_TABLESAMPLE_ARGUMENT,
+                    "TABLESAMPLE parameter cannot be null"
+                ));
+            }
+            _ => unreachable!("float4 cast returned a different type"),
+        };
+        if !percentage.is_finite() || !(0.0..=100.0).contains(&percentage) {
+            return Err(sql_err!(
+                sqlstate::INVALID_TABLESAMPLE_ARGUMENT,
+                "sample percentage must be between 0 and 100"
+            ));
+        }
+        let seed = if let Some(repeatable) = sample.repeatable {
+            match cast_to(
+                eval_full(repeatable, arena, params, &NoColumns, hooks)?,
+                ColType::Float8,
+                arena,
+            )? {
+                Datum::Float8(value) => {
+                    let normalized = if value == 0.0 { 0.0 } else { value };
+                    splitmix64(normalized.to_bits())
+                }
+                Datum::Null => {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_TABLESAMPLE_REPEAT,
+                        "TABLESAMPLE REPEATABLE parameter cannot be null"
+                    ));
+                }
+                _ => unreachable!("float8 cast returned a different type"),
+            }
+        } else {
+            fresh_sample_seed()
+        };
+        *plan = Some(TableSamplePlan {
+            method: sample.method,
+            fraction: f64::from(percentage) / 100.0,
+            seed,
+        });
+    }
     let security_plans = arena
         .alloc_slice_with(scope.n, |_| None::<RowSecurityPlan<'a>>)
         .map_err(|_| arena_full())?;
@@ -1935,19 +2189,27 @@ fn scan_source_mode<'a>(
             match bound[t] {
                 Some(BoundRow::Encoded(bytes)) => {
                     if scope.derived[t].is_some() {
-                        for (c, slot) in buffer.iter_mut().enumerate().take(def.n_columns) {
+                        let width = crate::sql::exec::projected_row_width(bytes);
+                        if width > buffer.len() {
+                            return Err(sql_err!(
+                                sqlstate::TOO_MANY_COLUMNS,
+                                "recursive row has too many columns"
+                            ));
+                        }
+                        for (c, slot) in buffer.iter_mut().enumerate().take(width) {
                             // Structural decode: a record column comes back
                             // as a `Datum::Record` (fields in the arena), so
                             // field access sees its shape.
                             *slot = crate::sql::exec::decode_projected_col_record(bytes, c, arena)?;
                         }
+                        values[t] = Some(&buffer[..width]);
                     } else {
                         let mut schema = [ColType::Bool; MAX_COLUMNS];
                         def.schema(&mut schema);
                         rowenc::decode(bytes, &schema[..def.n_columns], buffer)?;
                         refresh_catalog_object_names(storage, txid, buffer, arena)?;
+                        values[t] = Some(&buffer[..def.n_columns]);
                     }
-                    values[t] = Some(&buffer[..def.n_columns]);
                 }
                 Some(BoundRow::Values(row_values)) => values[t] = Some(row_values),
                 None => values[t] = Some(&[]), // outer-join null row
@@ -2535,6 +2797,7 @@ fn scan_source_mode<'a>(
         outer: Option<&dyn ColumnLookup<'a>>,
         depth: usize,
         index: usize,
+        sample_plans: &[Option<TableSamplePlan>],
         candidate: BoundRow<'a>,
         rowid: Option<u64>,
         bound: &mut [Option<BoundRow<'a>>],
@@ -2547,6 +2810,9 @@ fn scan_source_mode<'a>(
         decode_buffers: &mut [[Datum<'a>; MAX_COLUMNS]],
         on: Option<&'a Expr<'a>>,
     ) -> Result<bool, SqlError> {
+        if !sample_includes(sample_plans[order[depth]], rowid)? {
+            return Ok(false);
+        }
         bound[order[depth]] = Some(candidate);
         bound_rowids[order[depth]] = rowid;
         let source = order[depth];
@@ -2619,6 +2885,7 @@ fn scan_source_mode<'a>(
         security_plans: &[Option<RowSecurityPlan<'a>>],
         // Error-safe WHERE conjuncts to check at each depth (predicate pushdown).
         pushdown: &[&[&'a Expr<'a>]],
+        sample_plans: &[Option<TableSamplePlan>],
         // Execution order: `order[depth]` is the scope-table joined at this depth
         // (identity unless a cross join was cost-reordered).
         order: &[usize],
@@ -2673,6 +2940,7 @@ fn scan_source_mode<'a>(
                     outer,
                     depth,
                     $index,
+                    sample_plans,
                     $candidate,
                     $rowid,
                     bound,
@@ -2705,6 +2973,7 @@ fn scan_source_mode<'a>(
                         external_match_writer,
                         security_plans,
                         pushdown,
+                        sample_plans,
                         order,
                         indexed,
                         decode_buffers,
@@ -2866,7 +3135,9 @@ fn scan_source_mode<'a>(
             // the outermost scan is ordered — it drives output/error order, and
             // ordering an inner join scan would re-snapshot per outer row.
             let slot = scope.slots[order[depth]];
-            if storage.table_def(slot, txid).partition.is_partitioned() {
+            if source_ref(from, order[depth]).inheritance == RelationInheritance::Descendants
+                && storage.table_def(slot, txid).partition.is_partitioned()
+            {
                 let leaves = arena
                     .alloc_slice_with(storage.table_count(), |_| usize::MAX)
                     .map_err(|_| arena_full())?;
@@ -3030,6 +3301,7 @@ fn scan_source_mode<'a>(
                 external_match_writer,
                 security_plans,
                 pushdown,
+                sample_plans,
                 order,
                 indexed,
                 decode_buffers,
@@ -3164,7 +3436,11 @@ fn scan_source_mode<'a>(
         })
         .map_err(|_| arena_full())?;
 
-    let indexed = indexed_candidates(storage, scope, txid, where_clause, arena, params, hooks)?;
+    let indexed = if sample_plans.iter().any(Option::is_some) {
+        None
+    } else {
+        indexed_candidates(storage, scope, txid, where_clause, arena, params, hooks)?
+    };
     let bound = arena
         .alloc_slice_with(scope.n, |_| None)
         .map_err(|_| arena_full())?;
@@ -3177,7 +3453,10 @@ fn scan_source_mode<'a>(
     // A row-security predicate is a security barrier ahead of every user ON
     // and WHERE expression. The nested plan owns that ordering explicitly;
     // the hash plan is selected only when no protected source participates.
-    let hash_plan = if retain_match.is_none() && security_plans.iter().all(Option::is_none) {
+    let hash_plan = if retain_match.is_none()
+        && security_plans.iter().all(Option::is_none)
+        && sample_plans.iter().all(Option::is_none)
+    {
         select_hash_join_plan(storage, scope, from, planning_where_clause, order, txid)?
     } else {
         None
@@ -3230,6 +3509,7 @@ fn scan_source_mode<'a>(
             external_match_writer,
             security_plans,
             pushdown,
+            sample_plans,
             order,
             indexed.as_ref(),
             decode_buffers,
@@ -3344,6 +3624,7 @@ fn scan_source_mode<'a>(
                     external_match_writer,
                     security_plans,
                     pushdown,
+                    sample_plans,
                     order,
                     indexed.as_ref(),
                     decode_buffers,
@@ -3375,7 +3656,7 @@ fn scan_source_mode<'a>(
                             } else {
                                 local_matches.expect("local match map")[this].get()
                             };
-                            if already_matched {
+                            if !sample_includes(sample_plans[d], None)? || already_matched {
                                 Ok(true)
                             } else {
                                 let owned =
@@ -3402,7 +3683,7 @@ fn scan_source_mode<'a>(
                         } else {
                             local_matches.expect("local match map")[index].get()
                         };
-                        if already_matched {
+                        if !sample_includes(sample_plans[d], None)? || already_matched {
                             Ok(true)
                         } else {
                             emit_unmatched(BoundRow::Encoded(bytes), None, f)
@@ -3438,7 +3719,9 @@ fn scan_source_mode<'a>(
                                     } else {
                                         local_matches.expect("local match map")[this].get()
                                     };
-                                    if already_matched {
+                                    if !sample_includes(sample_plans[d], Some(spilled.rowid))?
+                                        || already_matched
+                                    {
                                         Ok(true)
                                     } else {
                                         emit_unmatched(
@@ -3487,7 +3770,7 @@ fn scan_source_mode<'a>(
                         } else {
                             local_matches.expect("local match map")[this].get()
                         };
-                        if already_matched {
+                        if !sample_includes(sample_plans[d], Some(rowid))? || already_matched {
                             Ok(true)
                         } else {
                             let bytes = storage.row_bytes(scope.slots[d], rowid, home, arena)?;

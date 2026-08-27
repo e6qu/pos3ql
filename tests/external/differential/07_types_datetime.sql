@@ -31,6 +31,12 @@ SELECT to_char(timestamp '2021-01-01 13:02:03.456789', 'IYYY-IW-ID|YYYY-CC-W-WW-
 SELECT to_char(timestamp '0001-01-01 BC', 'YYYY|YY|Y|CC|AD|A.D.|IYYY-IW-ID');
 SELECT to_date('2024-060', 'YYYY-DDD'), to_date('2020-53-5', 'IYYY-IW-ID'), to_date('XII-31-2024', 'RM-DD-YYYY');
 SELECT to_timestamp('2021-01-01 01:02:03.456789 PM', 'YYYY-MM-DD HH12:MI:SS.US AM') AT TIME ZONE 'UTC';
+SELECT to_char(timestamp '2024-02-29 23:07:05.123456',
+               'FF1|FF2|FF3|FF4|FF5|FF6|SSSSS|Y,YYY|IDDD|J|DDTH|"X"YYYY|TZH|TZM|OF');
+SELECT to_char(timestamptz '2024-02-29 23:07:05.123456-05',
+               'YYYY-MM-DD HH24:MI:SS.US TZ TZH:TZM OF');
+SELECT to_char(interval '2 years 3 mons 15 days 36:07:05.123456',
+               'YYYY|MM|DDD|DD|HH|HH24|MI|SS|MS|US|FF4|SSSSS|W|WW|CC|Q|RM|DDTH');
 -- AT TIME ZONE (timestamp <-> timestamptz), with DST and offset zones
 SELECT timestamp '2024-01-01 12:00' AT TIME ZONE 'UTC';
 SELECT timestamptz '2024-01-01 12:00+00' AT TIME ZONE 'America/New_York';
@@ -73,6 +79,29 @@ SELECT '2020-01-01'::timestamp(7), '12:00'::time(8);
 -- in range: no warning
 SELECT '2020-01-01'::timestamp(6);
 SELECT '2020-01-01'::timestamp(0);
+-- modifier-bearing typed constants and SQL-standard temporal zone ordering
+SELECT varchar(2) 'abc', numeric(3,1) '12.34', float(24) '1.2';
+SELECT timestamp(3) '2024-01-01 12:34:56.1236';
+SELECT timestamp(3) with time zone '2024-01-01 12:34:56.1236+00';
+SELECT time(3) '12:34:56.7894', time(3) with time zone '12:34:56.7894+00';
+SELECT interval(2) '1.234 seconds';
+CREATE TABLE precision_type_probe (
+  plain_time time(2),
+  zoned_time time(3) with time zone,
+  plain_stamp timestamp(4) without time zone,
+  zoned_stamp timestamp(5) with time zone,
+  low_float float(24),
+  high_float float(25)
+);
+SELECT attname, atttypid, atttypmod, format_type(atttypid, atttypmod)
+FROM pg_attribute
+WHERE attrelid = 'precision_type_probe'::regclass AND attnum > 0
+ORDER BY attnum;
+DROP TABLE precision_type_probe;
+SELECT 1::float(0);
+SELECT 1::float(54);
+SELECT interval(2) '1.234 seconds' second(1);
+SELECT interval(2) '1.234 seconds' day to second(1);
 -- timetz (time with time zone)
 SELECT '12:00:00'::timetz, '12:00:00+05'::timetz, '12:00:00-05:30'::timetz;
 SELECT '12:00:00.123456+02:00'::timetz, '12:00:00.1+02:00'::timetz, '12:00:00+05:45'::timetz;
@@ -125,6 +154,9 @@ SELECT localtime::text ~ '^[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?$';
 SELECT current_time(0)::text ~ '^[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}(:[0-9]{2})?$';
 SELECT localtime(0)::text ~ '^[0-9]{2}:[0-9]{2}:[0-9]{2}$';
 SELECT date_part('hour', localtime) = date_part('hour', current_time);
+SELECT to_date('5','Y'), to_date('999','YYY'), to_date('22-24','CC-YY'), to_date('21','CC');
+SELECT to_date('2024-2nd-Monday','YYYY-Wth-DAY'), to_date('2024-1','YYYY-Q'), to_date('2024-2','YYYY-D');
+SELECT to_char(timestamp '2024-06-15 14:07:09.123456', 'YYYY年"月"MM');
 SET TimeZone='Asia/Kolkata';
 SELECT right(current_time::text, 6);
 SELECT localtime = current_time::time;

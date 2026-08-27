@@ -1481,13 +1481,14 @@ fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Ve
     let mut buffer = crate::mem::FixedBuf::new(budget, "describe send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "describe sql", 1 << 18).unwrap();
     let transaction = TxnState::new(budget, 1024).unwrap();
-    let mut responder =
-        Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
-    assert!(
+    let described = {
+        let mut responder =
+            Responder::for_describe(&mut buffer, crate::pg::respond::ResultFmt::ALL_TEXT);
         engine
             .describe(sql_text, &arena, &transaction, None, &mut responder)
             .unwrap()
-    );
+    };
+    assert!(described, "{}", String::from_utf8_lossy(buffer.readable()));
     buffer.readable().to_vec()
 }
 
@@ -4132,6 +4133,15 @@ fn declared_user_types_survive_protocol_description_and_parameter_inference() {
         &[0; MAX_BIND_PARAMS],
     );
     assert_eq!(inferred[..2], [domain_oid, enum_oid]);
+    let inferred = engine.infer_param_types(
+        "SELECT p.state, count(*) FROM protocol_types p \
+         JOIN protocol_types q ON p.count = q.count \
+         WHERE p.state = $2 GROUP BY p.state HAVING count(*) >= $1",
+        &arena,
+        &transaction,
+        &[0; MAX_BIND_PARAMS],
+    );
+    assert_eq!(inferred[..2], [crate::sql::types::oid::INT8, enum_oid]);
 }
 
 #[test]
@@ -8583,7 +8593,12 @@ fn session_gucs_honored_or_rejected_faithfully() {
     assert!(run("SET lock_timeout = 5000; SHOW lock_timeout").contains("5000"));
     assert!(run("SET lock_timeout = '50ms'; SHOW lock_timeout").contains("50ms"));
     assert!(run("SET row_security = off; SHOW row_security").contains("off"));
-    assert!(run("SET intervalstyle = postgres; SHOW intervalstyle").contains("postgres"));
+    for style in ["postgres", "postgres_verbose", "sql_standard", "iso_8601"] {
+        assert!(
+            run(&format!("SET intervalstyle = {style}; SHOW intervalstyle")).contains(style),
+            "{style}"
+        );
+    }
     assert!(run("SET synchronize_seqscans = off; SHOW synchronize_seqscans").contains("off"));
     assert!(run("SET check_function_bodies = false; SHOW check_function_bodies").contains("off"));
     assert!(run("SET xmloption = content; SHOW xmloption").contains("content"));
@@ -8617,10 +8632,7 @@ fn session_gucs_honored_or_rejected_faithfully() {
         run("SET bytea_output = 'bogus'").contains("22023"),
         "unknown format"
     );
-    assert!(
-        run("SET intervalstyle = sql_standard").contains("0A000"),
-        "unsupported style"
-    );
+    assert!(run("SET intervalstyle = unknown").contains("22023"));
     assert!(
         run("SET synchronize_seqscans = on").contains("0A000"),
         "unsupported scan mode"
@@ -8734,12 +8746,70 @@ fn join_using_clause() {
     run("CREATE TABLE bb (id int, y text)");
     run("INSERT INTO a VALUES (1,'a1'),(2,'a2')");
     run("INSERT INTO bb VALUES (1,'b1'),(3,'b3')");
-    // JOIN ... USING (id) is desugared to ON a.id = bb.id.
     let out = run("SELECT a.x, bb.y FROM a JOIN bb USING (id)");
     assert!(out.contains("a1") && out.contains("b1"), "match: {out}");
     assert!(
         !out.contains("a2") && !out.contains("b3"),
         "non-match dropped: {out}"
+    );
+    let aliased = run("SELECT merged.*, merged.id, ROW(merged.*, 42)::text \
+           FROM a JOIN bb USING (id) AS merged ORDER BY merged.id");
+    assert!(aliased.contains("(1,42)"), "{aliased}");
+    let missing = run("SELECT merged.x FROM a JOIN bb USING (id) AS merged");
+    assert!(missing.contains("42703"), "{missing}");
+    let duplicate = run("SELECT 1 FROM a AS merged JOIN bb USING (id) AS merged");
+    assert!(duplicate.contains("42712"), "{duplicate}");
+    let outer_null = run("SELECT (bb).*, ROW(bb.*, 42)::text \
+           FROM a LEFT JOIN bb ON a.id = bb.id WHERE a.id = 2");
+    assert!(
+        !outer_null.contains("ERROR") && outer_null.contains("(,,42)"),
+        "{outer_null}"
+    );
+}
+
+#[test]
+fn grouping_set_quantifiers_control_duplicate_groups() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE grouping_quantifier_values(a integer); \
+         INSERT INTO grouping_quantifier_values VALUES (1),(1),(2)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT a, count(*) FROM grouping_quantifier_values \
+           GROUP BY ALL GROUPING SETS ((a),(a)) ORDER BY a; \
+         SELECT a, count(*) FROM grouping_quantifier_values \
+           GROUP BY DISTINCT GROUPING SETS ((a),(a)) ORDER BY a; \
+         SELECT a FROM grouping_quantifier_values ORDER BY a USING >; \
+         SELECT array_agg(a ORDER BY a USING >), \
+                string_agg(a::text, ',' ORDER BY a USING OPERATOR(pg_catalog.<)) \
+           FROM grouping_quantifier_values; \
+         SELECT a, row_number() OVER (ORDER BY a USING >) \
+           FROM grouping_quantifier_values ORDER BY a, 2",
+    );
+    assert_eq!(
+        data_rows(&rows),
+        [
+            "1|2",
+            "1|2",
+            "2|1",
+            "2|1",
+            "1|2",
+            "2|1",
+            "2",
+            "1",
+            "1",
+            "{2,1,1}|1,1,2",
+            "1|2",
+            "1|3",
+            "2|1",
+        ],
+        "{}",
+        String::from_utf8_lossy(&rows)
     );
 }
 
@@ -9579,6 +9649,86 @@ fn format_type_preserves_builtin_array_identity() {
 }
 
 #[test]
+fn temporal_and_float_precision_parse_to_concrete_postgresql_types() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE precision_types (
+           plain_time time(2),
+           zoned_time time(3) with time zone,
+           plain_stamp timestamp(4) without time zone,
+           zoned_stamp timestamp(5) with time zone,
+           low_float float(24),
+           high_float float(25));
+         SELECT attname,atttypid,atttypmod,format_type(atttypid,atttypmod)
+           FROM pg_attribute
+          WHERE attrelid='precision_types'::regclass AND attnum>0
+          ORDER BY attnum",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "plain_time|1083|2|time(2) without time zone",
+            "zoned_time|1266|3|time(3) with time zone",
+            "plain_stamp|1114|4|timestamp(4) without time zone",
+            "zoned_stamp|1184|5|timestamp(5) with time zone",
+            "low_float|700|-1|real",
+            "high_float|701|-1|double precision",
+        ]
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT 1::float(24),1::float(25),'2024-01-02 03:04:05.6789'::timestamp(3)"
+        )),
+        [
+            crate::sql::types::oid::FLOAT4,
+            crate::sql::types::oid::FLOAT8,
+            crate::sql::types::oid::TIMESTAMP,
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT varchar(2) 'abc', numeric(3,1) '12.34', float(24) '1.2',
+                    timestamp(3) '2024-01-02 03:04:05.6789',
+                    time(3) with time zone '03:04:05.6789+00',
+                    interval(2) '1.234 seconds'"
+        )),
+        ["ab|12.3|1.2|2024-01-02 03:04:05.679|03:04:05.679+00|00:00:01.23"]
+    );
+    for invalid in ["SELECT 1::float(0)", "SELECT 1::float(54)"] {
+        let response = run_with(&mut engine, &mut budget, invalid);
+        assert!(
+            String::from_utf8_lossy(&response).contains("22023"),
+            "{invalid}: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+    let invalid = "CREATE TABLE bad_temporal (value timestamp with time zone(3))";
+    let response = run_with(&mut engine, &mut budget, invalid);
+    assert!(
+        String::from_utf8_lossy(&response).contains("42601"),
+        "{invalid}: {}",
+        String::from_utf8_lossy(&response)
+    );
+    for invalid in [
+        "SELECT interval(2) '1.234 seconds' second(1)",
+        "SELECT interval(2) '1.234 seconds' day to second(1)",
+    ] {
+        let response = run_with(&mut engine, &mut budget, invalid);
+        assert!(
+            String::from_utf8_lossy(&response).contains("42601"),
+            "{invalid}: {}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+}
+
+#[test]
 fn json_and_jsonb_types() {
     // Output/normalization/operators verified against PostgreSQL 18.4.
     let (mut e, mut b) = test_engine();
@@ -9656,6 +9806,427 @@ fn interval_type() {
     assert!(
         run("SELECT '1 day 2 hours'::interval - '3 hours'::interval").contains("1 day -01:00:00")
     );
+}
+
+#[test]
+fn intervalstyle_formats_scalars_nested_values_json_and_copy() {
+    let (mut engine, mut budget) = test_engine();
+    let literal = "'1 year 2 mons 3 days 04:05:06.789'::interval";
+    for (style, expected) in [
+        (
+            "postgres",
+            "1 year 2 mons 3 days 04:05:06.789|{\"1 year 2 mons 3 days 04:05:06.789\"}|(\"1 year 2 mons 3 days 04:05:06.789\")|\"1 year 2 mons 3 days 04:05:06.789\"",
+        ),
+        (
+            "postgres_verbose",
+            "@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs|{\"@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs\"}|(\"@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs\")|\"@ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs\"",
+        ),
+        (
+            "sql_standard",
+            "+1-2 +3 +4:05:06.789|{\"+1-2 +3 +4:05:06.789\"}|(\"+1-2 +3 +4:05:06.789\")|\"+1-2 +3 +4:05:06.789\"",
+        ),
+        (
+            "iso_8601",
+            "P1Y2M3DT4H5M6.789S|{P1Y2M3DT4H5M6.789S}|(P1Y2M3DT4H5M6.789S)|\"P1Y2M3DT4H5M6.789S\"",
+        ),
+    ] {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "SET intervalstyle={style}; SELECT v::text,ARRAY[v]::text,ROW(v)::text,to_json(v)::text FROM (VALUES ({literal})) q(v)"
+            ),
+        );
+        assert_eq!(
+            data_rows(&output),
+            [expected],
+            "{style}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    for (literal, verbose, standard, iso) in [
+        ("0", "@ 0", "0", "PT0S"),
+        (
+            "-1 mon 5 days -06:07:08.9",
+            "@ 1 mon -5 days 6 hours 7 mins 8.9 secs ago",
+            "-0-1 +5 -6:07:08.9",
+            "P-1M5DT-6H-7M-8.9S",
+        ),
+        (
+            "1 mon -5 days 06:07:08.9",
+            "@ 1 mon -5 days 6 hours 7 mins 8.9 secs",
+            "+0-1 -5 +6:07:08.9",
+            "P1M-5DT6H7M8.9S",
+        ),
+        (
+            "-1 day 02:00:00",
+            "@ 1 day -2 hours ago",
+            "+0-0 -1 +2:00:00",
+            "P-1DT2H",
+        ),
+    ] {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "SET intervalstyle=postgres_verbose; SELECT '{literal}'::interval; \
+                 SET intervalstyle=sql_standard; SELECT '{literal}'::interval; \
+                 SET intervalstyle=iso_8601; SELECT '{literal}'::interval"
+            ),
+        );
+        assert_eq!(data_rows(&output), [verbose, standard, iso], "{literal}");
+    }
+
+    let copied = run_with(
+        &mut engine,
+        &mut budget,
+        &format!("SET intervalstyle=iso_8601; COPY (SELECT {literal}) TO STDOUT"),
+    );
+    assert_eq!(copy_data_rows(&copied), ["P1Y2M3DT4H5M6.789S"]);
+}
+
+#[test]
+fn interval_field_ranges_are_typed_and_enforced_at_every_boundary() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE interval_ranges (
+           y interval year,
+           m interval month,
+           ym interval year to month,
+           d interval day,
+           h interval hour,
+           mi interval minute,
+           s interval second,
+           ds interval day to second(3),
+           fp interval(4));
+         INSERT INTO interval_ranges VALUES (
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 year 2 mons 3 days 04:05:06.789',
+           '1 day 02:03:04.56789',
+           '1 day 02:03:04.56789');
+         CREATE DOMAIN interval_domain AS interval day to second(2)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let values = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT y::text,m::text,ym::text,d::text,h::text,mi::text,s::text,ds::text,fp::text FROM interval_ranges",
+    );
+    assert_eq!(
+        data_rows(&values),
+        [
+            "1 year|1 year 2 mons|1 year 2 mons|1 year 2 mons 3 days|1 year 2 mons 3 days 04:00:00|1 year 2 mons 3 days 04:05:00|1 year 2 mons 3 days 04:05:06.789|1 day 02:03:04.568|1 day 02:03:04.5679"
+        ]
+    );
+
+    let descriptions = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT string_agg(format_type(atttypid,atttypmod),',' ORDER BY attnum) FROM pg_attribute WHERE attrelid='interval_ranges'::regclass AND attnum>0",
+    );
+    assert_eq!(
+        data_rows(&descriptions),
+        [
+            "interval year,interval month,interval year to month,interval day,interval hour,interval minute,interval second,interval day to second(3),interval(4)"
+        ]
+    );
+    let information_schema = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT column_name,datetime_precision,interval_type,interval_precision IS NULL FROM information_schema.columns WHERE table_name='interval_ranges' ORDER BY ordinal_position",
+    );
+    assert_eq!(
+        data_rows(&information_schema),
+        [
+            "y|6|YEAR|t",
+            "m|6|MONTH|t",
+            "ym|6|YEAR TO MONTH|t",
+            "d|6|DAY|t",
+            "h|6|HOUR|t",
+            "mi|6|MINUTE|t",
+            "s|6|SECOND|t",
+            "ds|3|DAY TO SECOND(3)|t",
+            "fp|4|NULL|t",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT datetime_precision,interval_type,interval_precision IS NULL FROM information_schema.domains WHERE domain_name='interval_domain'"
+        )),
+        ["2|DAY TO SECOND(2)|t"]
+    );
+
+    let literals = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT
+           interval '1 year 2 mons 3 days 04:05:06.789' YEAR,
+           interval '1 year 2 mons 3 days 04:05:06.789' MONTH,
+           interval '1 year 2 mons 3 days 04:05:06.789' DAY,
+           interval '1 year 2 mons 3 days 04:05:06.789' HOUR,
+           interval '1 year 2 mons 3 days 04:05:06.789' MINUTE,
+           interval '1 year 2 mons 3 days 04:05:06.789' SECOND(2),
+           CAST('1 day 02:03:04.567' AS interval hour to minute)",
+    );
+    assert_eq!(
+        data_rows(&literals),
+        [
+            "1 year|1 year 2 mons|1 year 2 mons 3 days|1 year 2 mons 3 days 04:00:00|1 year 2 mons 3 days 04:05:00|1 year 2 mons 3 days 04:05:06.79|1 day 02:03:00"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT '1.5 years'::interval,'1.5 months'::interval,'1.5 weeks'::interval,'1.5 days'::interval,'1.1234567 seconds'::interval"
+        )),
+        ["1 year 6 mons|1 mon 15 days|10 days 12:00:00|1 day 12:00:00|00:00:01.123457"]
+    );
+
+    assert_eq!(
+        row_description_type_modifiers(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT ds,fp FROM interval_ranges"
+        )),
+        [
+            crate::sql::types::TypeMod::IntervalMod {
+                range: crate::sql::types::IntervalRange::DayToSecond,
+                precision: Some(3),
+            }
+            .encode(),
+            crate::sql::types::TypeMod::IntervalMod {
+                range: crate::sql::types::IntervalRange::Full,
+                precision: Some(4),
+            }
+            .encode(),
+        ]
+    );
+
+    let copied = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT ds,fp FROM interval_ranges) TO STDOUT",
+    );
+    assert_eq!(
+        copy_data_rows(&copied),
+        ["1 day 02:03:04.568\t1 day 02:03:04.5679"]
+    );
+    let formatted = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT
+           to_number('12abc34','99L99')::text,
+           to_char(ds,'DD|HH24|MI|SS.MS'),
+           to_char(timestamp '2024-02-29 23:07:05.123456','IYYY-IW-ID|FF6|J|DDTH')
+         FROM interval_ranges)
+         TO STDOUT",
+    );
+    assert_eq!(
+        copy_data_rows(&formatted),
+        ["12\t01|02|03|04.568\t2024-09-4|123456|2460370|29TH"],
+        "{}",
+        String::from_utf8_lossy(&formatted)
+    );
+    let copied = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT ds,fp FROM interval_ranges) TO STDOUT (FORMAT binary)",
+    );
+    assert!(
+        !message_types(&copied).contains(&b'E')
+            && copied
+                .windows(crate::sql::copy::BINARY_SIGNATURE.len())
+                .any(|bytes| bytes == crate::sql::copy::BINARY_SIGNATURE),
+        "{copied:?}"
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE interval_copy_input (value interval day to minute)",
+    );
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "interval copy send", 1 << 18).unwrap();
+    let mut arena = Arena::new(&mut budget, "interval copy sql", 1 << 18).unwrap();
+    let mut transaction = TxnState::new(&mut budget, 128).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    let mut guc = GucState::new();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY interval_copy_input FROM STDIN",
+                &arena,
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine
+        .take_pending_copy()
+        .expect("COPY enters text streaming mode");
+    arena.reset();
+    copy_line(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut transaction,
+        guc.seq_session(),
+        &arena,
+        b"2 days 03:04:05.6",
+    )
+    .unwrap();
+    finish_copy(&mut engine, &mut budget, &setup, &mut transaction, &guc).unwrap();
+
+    arena.reset();
+    send.clear();
+    {
+        let mut responder = Responder::new(&mut send);
+        engine
+            .execute_simple(
+                "COPY interval_copy_input FROM STDIN (FORMAT binary)",
+                &arena,
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+            )
+            .unwrap();
+    }
+    let setup = engine
+        .take_pending_copy()
+        .expect("COPY enters binary streaming mode");
+    let mut binary_row = Vec::new();
+    binary_row.extend_from_slice(&1_i16.to_be_bytes());
+    binary_row.extend_from_slice(&16_i32.to_be_bytes());
+    binary_row.extend_from_slice(&3_723_456_789_i64.to_be_bytes());
+    binary_row.extend_from_slice(&1_i32.to_be_bytes());
+    binary_row.extend_from_slice(&0_i32.to_be_bytes());
+    copy_binary_row(
+        &mut engine,
+        &mut budget,
+        &setup,
+        &mut transaction,
+        guc.seq_session(),
+        &arena,
+        &binary_row,
+    )
+    .unwrap();
+    finish_copy(&mut engine, &mut budget, &setup, &mut transaction, &guc).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value::text FROM interval_copy_input ORDER BY value"
+        )),
+        ["1 day 01:02:00", "2 days 03:04:00"]
+    );
+}
+
+#[test]
+fn interval_field_ranges_survive_checkpoint_and_object_store_cold_start() {
+    let mut config = test_config("interval-range-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("interval-range-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE DOMAIN durable_interval AS interval hour to second(2);
+             CREATE TABLE durable_intervals (
+               id integer PRIMARY KEY,
+               value interval day to minute,
+               domain_value durable_interval);
+             INSERT INTO durable_intervals VALUES
+               (1, '2 days 03:04:05.6', '6:07:08.129'),
+               (2, '-1 day -02:03:04', '-4:05:06.125');
+             CREATE VIEW durable_interval_formatting AS
+               SELECT id,
+                      to_char(value,'DD|HH24|MI') AS value_format,
+                      to_char(domain_value,'HH24|MI|SS.MS') AS domain_format
+                 FROM durable_intervals;
+             CHECKPOINT",
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        engine.commit_wal().unwrap();
+    }
+
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT id,value::text,domain_value::text FROM durable_intervals ORDER BY id"
+        )),
+        [
+            "1|2 days 03:04:00|06:07:08.13",
+            "2|-1 days -02:03:00|-04:05:06.13"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT format_type(a.atttypid,a.atttypmod) FROM pg_attribute a WHERE a.attrelid='durable_intervals'::regclass AND a.attname='value'"
+        )),
+        ["interval day to minute"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT datetime_precision,interval_type FROM information_schema.domains WHERE domain_name='durable_interval'"
+        )),
+        ["2|HOUR TO SECOND(2)"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT id,value_format,domain_format FROM durable_interval_formatting ORDER BY id"
+        )),
+        ["1|02|03|04|06|07|08.130", "2|-01|-02|-03|-04|-05|-06.-130"]
+    );
+    assert_eq!(
+        copy_data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "COPY (SELECT value_format,domain_format FROM durable_interval_formatting ORDER BY id) TO STDOUT"
+        )),
+        ["02|03|04\t06|07|08.130", "-01|-02|-03\t-04|-05|-06.-130"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
 #[test]
@@ -17137,9 +17708,26 @@ fn create_or_replace_trigger_preserves_oid_comment_and_transaction_identity() {
           WHERE t.tgname = 'renamed_trigger';
          COMMENT ON TRIGGER renamed_trigger ON replace_trigger_target IS 'drop with trigger';
          DROP TRIGGER renamed_trigger ON replace_trigger_target;
-         SELECT count(*) FROM pg_description WHERE description = 'drop with trigger';",
+         SELECT count(*) FROM pg_description WHERE description = 'drop with trigger';
+         CREATE TABLE trigger_comment_cascade (id integer);
+         CREATE TRIGGER trigger_comment_cascade BEFORE INSERT ON trigger_comment_cascade
+           FOR EACH ROW EXECUTE FUNCTION replace_trigger_first();
+         COMMENT ON TRIGGER trigger_comment_cascade ON trigger_comment_cascade IS 'drop with table';
+         DROP TABLE trigger_comment_cascade;
+         SELECT count(*) FROM pg_trigger WHERE tgname = 'trigger_comment_cascade';
+         SELECT count(*) FROM pg_description WHERE description = 'drop with table';
+         CREATE TABLE trigger_comment_cascade (id integer);
+         CREATE TRIGGER trigger_comment_cascade BEFORE INSERT ON trigger_comment_cascade
+           FOR EACH ROW EXECUTE FUNCTION replace_trigger_first();
+         COMMENT ON TRIGGER trigger_comment_cascade ON trigger_comment_cascade IS 'drop with table';
+         SELECT count(*) FROM pg_description WHERE description = 'drop with table';",
     );
-    assert_eq!(data_rows(&lifecycle), ["stable comment", "0", "0"]);
+    assert_eq!(
+        data_rows(&lifecycle),
+        ["stable comment", "0", "0", "0", "0", "1"],
+        "{}",
+        String::from_utf8_lossy(&lifecycle)
+    );
 }
 
 #[test]
@@ -23231,6 +23819,17 @@ fn named_composite_type_is_transactional_and_catalog_visible() {
     assert_eq!(
         data_rows(&bytes),
         ["Road|7"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT (NULL::address).*, ROW((NULL::address).*, 42)::text",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["NULL|NULL|(,,42)"],
         "{}",
         String::from_utf8_lossy(&bytes)
     );
@@ -33915,6 +34514,54 @@ fn common_table_expressions() {
         "{}",
         String::from_utf8_lossy(&recursive)
     );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) \
+             SEARCH DEPTH FIRST BY n SET ord SELECT n, ord, pg_typeof(ord) FROM c ORDER BY ord"
+        )),
+        [
+            "1|{(1)}|record[]",
+            "2|{(1),(2)}|record[]",
+            "3|{(1),(2),(3)}|record[]"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "WITH RECURSIVE c(n) AS (\
+               SELECT 1 UNION ALL SELECT CASE WHEN n = 3 THEN 1 ELSE n + 1 END FROM c\
+             ) CYCLE n SET cyc USING path \
+             SELECT n, cyc, path, pg_typeof(cyc), pg_typeof(path) FROM c"
+        )),
+        [
+            "1|f|{(1)}|boolean|record[]",
+            "2|f|{(1),(2)}|boolean|record[]",
+            "3|f|{(1),(2),(3)}|boolean|record[]",
+            "1|t|{(1),(2),(3),(1)}|boolean|record[]"
+        ]
+    );
+    let breadth = run_with(
+        &mut e,
+        &mut b,
+        "WITH RECURSIVE c(n, label) AS (\
+               SELECT 1, 'a'::text UNION ALL SELECT n + 1, label || 'x' FROM c WHERE n < 3\
+             ) SEARCH BREADTH FIRST BY n, label SET ord \
+               CYCLE n, label SET cyc TO 'Y' DEFAULT 'N' USING path \
+             SELECT n, label, ord, cyc, path, pg_typeof(ord), pg_typeof(cyc) FROM c ORDER BY ord",
+    );
+    assert_eq!(
+        data_rows(&breadth),
+        [
+            "1|a|(0,1,a)|N|{\"(1,a)\"}|record|text",
+            "2|ax|(1,2,ax)|N|{\"(1,a)\",\"(2,ax)\"}|record|text",
+            "3|axx|(2,3,axx)|N|{\"(1,a)\",\"(2,ax)\",\"(3,axx)\"}|record|text"
+        ],
+        "{}",
+        String::from_utf8_lossy(&breadth)
+    );
     // UNION (deduplicating) terminates a cyclic recursion.
     assert_eq!(
         data_rows(&run_with(
@@ -34026,6 +34673,205 @@ fn common_table_expressions() {
         ))
         .contains("42P19")
     );
+}
+
+#[test]
+fn recursive_cte_search_and_cycle() {
+    let (mut e, mut b) = test_engine();
+    let generated_state = run_with(
+        &mut e,
+        &mut b,
+        "WITH RECURSIVE c(n) AS (\
+           SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3 AND c.ord IS NOT NULL\
+         ) SEARCH DEPTH FIRST BY n SET ord SELECT n, ord FROM c ORDER BY n",
+    );
+    assert_eq!(
+        data_rows(&generated_state),
+        ["1|{(1)}", "2|{(1),(2)}", "3|{(1),(2),(3)}"],
+        "{}",
+        String::from_utf8_lossy(&generated_state)
+    );
+
+    let described = describe_with(
+        &mut e,
+        &mut b,
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2) \
+         SEARCH BREADTH FIRST BY n SET ord CYCLE n SET cyc USING path \
+         SELECT n, ord, cyc, path FROM c",
+    );
+    assert_eq!(
+        row_description_type_oids(&described),
+        [
+            crate::sql::types::oid::INT4,
+            crate::sql::types::oid::RECORD,
+            crate::sql::types::oid::BOOL,
+            crate::sql::types::oid::RECORD_ARRAY,
+        ]
+    );
+    assert_eq!(
+        row_description_names(&described),
+        ["n", "ord", "cyc", "path"]
+    );
+
+    for query in [
+        "WITH c(n) AS (SELECT 1) SEARCH DEPTH FIRST BY n SET ord SELECT * FROM c",
+        "WITH RECURSIVE c(n) AS (SELECT 1) CYCLE n SET cyc USING path SELECT * FROM c",
+        "WITH RECURSIVE c(n) AS (INSERT INTO missing VALUES (1) RETURNING n) \
+         SEARCH DEPTH FIRST BY n SET ord SELECT * FROM c",
+    ] {
+        let rejected = run_with(&mut e, &mut b, query);
+        assert!(
+            String::from_utf8_lossy(&rejected).contains("ERROR"),
+            "{query}: {}",
+            String::from_utf8_lossy(&rejected)
+        );
+    }
+
+    let quoted = run_with(
+        &mut e,
+        &mut b,
+        "WITH RECURSIVE c(\"N\") AS (SELECT 1 UNION ALL SELECT \"N\" + 1 FROM c WHERE \"N\" < 2) \
+         SEARCH DEPTH FIRST BY \"N\" SET \"Path\" SELECT \"N\", \"Path\" FROM c",
+    );
+    assert_eq!(
+        data_rows(&quoted),
+        ["1|{(1)}", "2|{(1),(2)}"],
+        "{}",
+        String::from_utf8_lossy(&quoted)
+    );
+
+    let arena = Arena::new(&mut b, "recursive SEARCH/CYCLE binary", 1 << 18).unwrap();
+    let mut buffer = crate::mem::FixedBuf::new(&mut b, "recursive binary send", 1 << 18).unwrap();
+    let mut transaction = TxnState::new(&mut b, 128).unwrap();
+    let mut pool = test_pool(&mut b);
+    let mut cursors = test_cursors(&mut b);
+    let mut guc = GucState::new();
+    {
+        let mut responder =
+            Responder::for_execute(&mut buffer, crate::pg::respond::ResultFmt::ALL_BINARY);
+        assert!(matches!(
+            e.execute_extended(
+                "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2) \
+                 SEARCH BREADTH FIRST BY n SET ord CYCLE n SET cyc USING path \
+                 SELECT ord, path FROM c WHERE n = 1",
+                &arena,
+                &[],
+                &[],
+                &mut transaction,
+                &mut pool,
+                &mut cursors,
+                &mut guc,
+                &mut responder,
+                1,
+                false,
+            )
+            .unwrap(),
+            ExtendedExecutionStatus::Complete(true)
+        ));
+    }
+    let binary = buffer.readable();
+    let row_at = binary.iter().position(|byte| *byte == b'D').unwrap();
+    let payload = &binary[row_at + 5..];
+    assert_eq!(i16::from_be_bytes(payload[..2].try_into().unwrap()), 2);
+    assert_eq!(i32::from_be_bytes(payload[2..6].try_into().unwrap()), 32);
+    assert_eq!(i32::from_be_bytes(payload[6..10].try_into().unwrap()), 2);
+    assert_eq!(i32::from_be_bytes(payload[10..14].try_into().unwrap()), 20);
+    assert_eq!(i32::from_be_bytes(payload[26..30].try_into().unwrap()), 23);
+    assert_eq!(i32::from_be_bytes(payload[38..42].try_into().unwrap()), 40);
+    assert_eq!(
+        i32::from_be_bytes(payload[50..54].try_into().unwrap()),
+        2249
+    );
+}
+
+#[test]
+fn recursive_cte_search_cycle_uses_provider_neutral_spill() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_NAMESPACE.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("recursive-search-cycle-spill-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!(
+        "recursive-search-cycle-spill-{}-{sequence}",
+        std::process::id()
+    );
+    config.object_store_response_bytes = 1 << 20;
+    config.work_arena_bytes = 1 << 20;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH RECURSIVE c(n) AS (\
+           SELECT 1 UNION ALL SELECT CASE WHEN n = 8 THEN 1 ELSE n + 1 END FROM c\
+         ) SEARCH DEPTH FIRST BY n SET ord CYCLE n SET cyc USING path \
+         SELECT n, cyc, cardinality(path) FROM c",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1|f|1", "2|f|2", "3|f|3", "4|f|4", "5|f|5", "6|f|6", "7|f|7", "8|f|8", "1|t|9",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    for statement in [
+        "CREATE VIEW invalid_search_view AS \
+           WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2) \
+           SEARCH DEPTH FIRST BY n SET ord SELECT n, ord FROM c",
+        "CREATE TABLE invalid_cycle_table AS \
+           WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2) \
+           CYCLE n SET cyc USING path SELECT n, path FROM c",
+        "CREATE MATERIALIZED VIEW invalid_cycle_materialized AS \
+           WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 2) \
+           CYCLE n SET cyc USING path SELECT n, path FROM c",
+    ] {
+        let rejected = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&rejected).contains("record[]"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&rejected)
+        );
+    }
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW durable_cycle_view AS \
+           WITH RECURSIVE c(n) AS (\
+             SELECT 1 UNION ALL SELECT CASE WHEN n = 3 THEN 1 ELSE n + 1 END FROM c\
+           ) SEARCH DEPTH FIRST BY n SET ord CYCLE n SET cyc USING path \
+           SELECT n, cyc FROM c",
+    );
+    assert!(
+        String::from_utf8_lossy(&created).contains("CREATE VIEW"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_rows = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT n, cyc FROM durable_cycle_view",
+    );
+    assert_eq!(
+        data_rows(&recovered_rows),
+        ["1|f", "2|f", "3|f", "1|t"],
+        "{}",
+        String::from_utf8_lossy(&recovered_rows)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]
@@ -34894,6 +35740,56 @@ fn insert_select() {
 }
 
 #[test]
+fn dml_query_sources_expand_views_before_writes() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE dml_view_source_base (id integer PRIMARY KEY, value integer); \
+         INSERT INTO dml_view_source_base VALUES (1, 10), (2, 20); \
+         CREATE VIEW dml_view_source AS TABLE dml_view_source_base; \
+         CREATE TABLE dml_view_insert_target (id integer PRIMARY KEY, value integer); \
+         CREATE TABLE dml_view_update_target (id integer PRIMARY KEY, value integer); \
+         INSERT INTO dml_view_update_target VALUES (1, 0), (2, 0), (3, 0); \
+         CREATE TABLE dml_view_merge_target (id integer PRIMARY KEY, value integer); \
+         INSERT INTO dml_view_merge_target VALUES (1, 1), (3, 3)",
+    );
+    let insert = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO dml_view_insert_target TABLE dml_view_source; \
+         SELECT id, value FROM dml_view_insert_target ORDER BY id",
+    );
+    let update_delete = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE dml_view_update_target AS target SET value = source.value \
+           FROM dml_view_source AS source WHERE target.id = source.id; \
+         DELETE FROM dml_view_update_target AS target USING dml_view_source AS source \
+           WHERE target.id = source.id AND source.id = 2; \
+         SELECT id, value FROM dml_view_update_target ORDER BY id",
+    );
+    let merge = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "MERGE INTO dml_view_merge_target AS target USING dml_view_source AS source \
+           ON target.id = source.id \
+           WHEN MATCHED THEN UPDATE SET value = source.value \
+           WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value); \
+         SELECT id, value FROM dml_view_merge_target ORDER BY id",
+        1 << 20,
+    );
+    assert_eq!(data_rows(&insert), ["1|10", "2|20"]);
+    assert_eq!(data_rows(&update_delete), ["1|10", "3|0"]);
+    assert_eq!(
+        data_rows(&merge),
+        ["1|10", "2|20", "3|3"],
+        "{}",
+        String::from_utf8_lossy(&merge)
+    );
+}
+
+#[test]
 fn insert_select_column_count_mismatch() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE src (a int, b int)");
@@ -34996,8 +35892,7 @@ fn empty_outer_query_does_not_hide_invalid_subquery_source() {
 #[test]
 fn copy_formats_and_unsupported() {
     // The engine speaks COPY's text, CSV and binary formats. CSV-only options
-    // misused in text mode, and binary of a type whose binary codec is not yet
-    // emitted, refuse loudly rather than mis-read or corrupt a stream.
+    // misused in text mode refuse loudly rather than mis-read a stream.
     let (mut engine, mut budget) = test_engine();
     let ok = run_with(&mut engine, &mut budget, "CREATE TABLE c (a int, b text)");
     assert!(!message_types(&ok).contains(&b'E'));
@@ -36103,6 +36998,341 @@ fn external_in_subquery_preserves_wildcard_column_coercion() {
             "7|10|520", "8|10|530", "9|10|540"
         ]
     );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn table_query_inheritance_alias_and_sampling_are_one_typed_source_boundary() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE sampled_source (id integer, label text)",
+    );
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO sampled_source SELECT value, 'row-' || value FROM generate_series(1,100) value",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "TABLE sampled_source ORDER BY id DESC LIMIT 2; \
+         WITH copied AS (TABLE sampled_source) SELECT count(*) FROM copied; \
+         SELECT renamed_id, renamed_label FROM sampled_source AS renamed(renamed_id, renamed_label) \
+           ORDER BY renamed_id LIMIT 1; \
+         SELECT count(*) FROM sampled_source TABLESAMPLE BERNOULLI (100); \
+         SELECT count(*) FROM sampled_source TABLESAMPLE SYSTEM (0); \
+         SELECT count(*) FROM sampled_source TABLESAMPLE SYSTEM ((SELECT 100));",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "100|row-100",
+            "99|row-99",
+            "100",
+            "1|row-1",
+            "100",
+            "0",
+            "100"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE sampled_partition (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE sampled_partition_leaf PARTITION OF sampled_partition FOR VALUES FROM (0) TO (10); \
+         INSERT INTO sampled_partition VALUES (1), (2)",
+    );
+    let inheritance = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM sampled_partition; \
+         SELECT count(*) FROM ONLY sampled_partition; \
+         SELECT count(*) FROM (TABLE ONLY sampled_partition) AS parent_rows",
+    );
+    assert_eq!(
+        data_rows(&inheritance),
+        ["2", "0", "0"],
+        "{}",
+        String::from_utf8_lossy(&inheritance)
+    );
+
+    let first = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_agg(id ORDER BY id)::text \
+           FROM sampled_source TABLESAMPLE BERNOULLI (35) REPEATABLE (42)",
+    );
+    let second = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_agg(id ORDER BY id)::text \
+           FROM sampled_source TABLESAMPLE BERNOULLI (35) REPEATABLE (42)",
+    );
+    assert_eq!(data_rows(&first), data_rows(&second));
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE sample_join_left (id integer); INSERT INTO sample_join_left VALUES (1), (2)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM sample_join_left AS left_side \
+               LEFT JOIN sampled_source AS impossible TABLESAMPLE BERNOULLI (0) \
+                 ON impossible.id = left_side.id; \
+             SELECT count(*) FROM sample_join_left AS left_side \
+               RIGHT JOIN sampled_source AS impossible TABLESAMPLE BERNOULLI (0) \
+                 ON impossible.id = left_side.id; \
+             SELECT count(*) FROM sample_join_left AS left_side \
+               FULL JOIN sampled_source AS impossible TABLESAMPLE BERNOULLI (0) \
+                 ON impossible.id = left_side.id",
+        )),
+        ["2", "0", "2"]
+    );
+
+    for (sql, state, message) in [
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE BERNOULLI (NULL)",
+            "2202H",
+            "TABLESAMPLE parameter cannot be null",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE SYSTEM (101)",
+            "2202H",
+            "sample percentage must be between 0 and 100",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE BERNOULLI (10) REPEATABLE (NULL)",
+            "2202G",
+            "TABLESAMPLE REPEATABLE parameter cannot be null",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE missing (10)",
+            "42704",
+            "tablesample method missing does not exist",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE SYSTEM (id)",
+            "42703",
+            "column \"id\" does not exist",
+        ),
+        (
+            "SELECT * FROM sampled_source AS sampled TABLESAMPLE SYSTEM (sampled.id)",
+            "42P01",
+            "invalid reference to FROM-clause entry for table \"sampled\"",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE SYSTEM (count(*))",
+            "42803",
+            "aggregate functions are not allowed in functions in FROM",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE SYSTEM (row_number() OVER ())",
+            "42P20",
+            "window functions are not allowed in functions in FROM",
+        ),
+        (
+            "SELECT * FROM sampled_source TABLESAMPLE SYSTEM (generate_series(1, 2))",
+            "42804",
+            "argument of TABLESAMPLE must not return a set",
+        ),
+    ] {
+        let error = run_with(&mut engine, &mut budget, sql);
+        let text = String::from_utf8_lossy(&error);
+        assert!(text.contains(state) && text.contains(message), "{text}");
+    }
+}
+
+#[test]
+fn table_sources_survive_stored_queries_copy_cursors_and_object_cold_recovery() {
+    let mut config = test_config("table-source-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("table-source-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_sample_source (id integer PRIMARY KEY, label text)",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO durable_sample_source \
+           SELECT value, 'durable-' || value FROM generate_series(1,50) value",
+    );
+    let definitions = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW durable_table_view AS TABLE durable_sample_source; \
+         CREATE VIEW durable_sample_view AS \
+           SELECT id, label FROM durable_sample_source \
+             TABLESAMPLE BERNOULLI (40) REPEATABLE (73); \
+         CREATE TABLE durable_table_copy AS TABLE durable_sample_source WITH DATA; \
+         CREATE TABLE durable_insert_copy (id integer PRIMARY KEY, label text); \
+         INSERT INTO durable_insert_copy TABLE durable_table_view",
+    );
+    assert!(
+        !String::from_utf8_lossy(&definitions).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&definitions)
+    );
+    let before = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT array_agg(id ORDER BY id)::text FROM durable_sample_view; \
+         SELECT count(*) FROM durable_table_view; \
+         SELECT count(*) FROM durable_table_copy; \
+         SELECT count(*) FROM durable_insert_copy; \
+         BEGIN; DECLARE durable_table_cursor CURSOR FOR TABLE durable_table_view; \
+         FETCH FORWARD 2 FROM durable_table_cursor; COMMIT",
+    ));
+    assert_eq!(before[1..4], ["50", "50", "50"]);
+    assert_eq!(before[4..], ["1|durable-1", "2|durable-2"]);
+    let copy_before = copy_data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (TABLE durable_sample_view) TO STDOUT",
+    ));
+    assert!(!copy_before.is_empty());
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let after = data_rows(&run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT array_agg(id ORDER BY id)::text FROM durable_sample_view; \
+         SELECT count(*) FROM durable_table_view; \
+         SELECT count(*) FROM durable_table_copy; \
+         SELECT count(*) FROM durable_insert_copy",
+    ));
+    assert_eq!(after, before[..4]);
+    assert_eq!(
+        copy_data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "COPY (TABLE durable_sample_view) TO STDOUT",
+        )),
+        copy_before
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn grouping_and_using_alias_semantics_survive_stored_queries_and_cold_recovery() {
+    let mut config = test_config("grouping-using-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("grouping-using-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_using_left (id integer, value text); \
+         CREATE TABLE durable_using_right (id integer, label text); \
+         CREATE TYPE durable_null_record AS (id integer, label text); \
+         INSERT INTO durable_using_left VALUES (1,'a'),(1,'b'),(2,'c'); \
+         INSERT INTO durable_using_right VALUES (1,'x'),(2,'y'); \
+         CREATE VIEW durable_using_view AS \
+           SELECT merged.*, ROW(merged.*, 42)::text AS expanded \
+             FROM durable_using_left JOIN durable_using_right USING (id) AS merged; \
+         CREATE MATERIALIZED VIEW durable_grouping_view AS \
+           SELECT merged.id, count(*) AS matches \
+             FROM durable_using_left JOIN durable_using_right USING (id) AS merged \
+             GROUP BY DISTINCT GROUPING SETS ((merged.id),(merged.id)) \
+             WITH DATA; \
+         CREATE VIEW durable_null_record_view AS \
+           SELECT (NULL::durable_null_record).*, \
+                  ROW((NULL::durable_null_record).*, 42)::text AS expanded; \
+         CREATE VIEW durable_outer_record_view AS \
+           SELECT (right_row).*, ROW(right_row.*, 42)::text AS expanded \
+             FROM (SELECT 3::integer AS id) left_row \
+             LEFT JOIN durable_using_right right_row ON right_row.id = left_row.id",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let before_output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM durable_grouping_view ORDER BY id USING >; \
+         SELECT * FROM durable_using_view ORDER BY id USING >; \
+         SELECT * FROM durable_null_record_view; \
+         SELECT * FROM durable_outer_record_view",
+    );
+    let before = data_rows(&before_output);
+    assert_eq!(
+        before,
+        [
+            "2|1",
+            "1|2",
+            "2|(2,42)",
+            "1|(1,42)",
+            "1|(1,42)",
+            "NULL|NULL|(,,42)",
+            "NULL|NULL|(,,42)",
+        ],
+        "{}",
+        String::from_utf8_lossy(&before_output)
+    );
+    let copy = run_with(
+        &mut engine,
+        &mut budget,
+        "COPY (SELECT * FROM durable_grouping_view ORDER BY id USING >) \
+           TO STDOUT (FORMAT binary)",
+    );
+    assert!(
+        !message_types(&copy).contains(&b'E') && copy.windows(6).any(|bytes| bytes == b"PGCOPY"),
+        "{}",
+        String::from_utf8_lossy(&copy)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let after = data_rows(&run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT * FROM durable_grouping_view ORDER BY id USING >; \
+         SELECT * FROM durable_using_view ORDER BY id USING >; \
+         SELECT * FROM durable_null_record_view; \
+         SELECT * FROM durable_outer_record_view",
+    ));
+    assert_eq!(after, before);
+    drop(cold);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

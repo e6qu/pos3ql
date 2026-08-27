@@ -325,9 +325,7 @@ where
         match item {
             SelectItem::Wildcard => slot += scope.star_columns(),
             SelectItem::TableWildcard(q) => {
-                slot += scope.defs[scope.table_index(q)?]
-                    .expect("resolved")
-                    .n_columns;
+                slot += scope.qualified_star_columns(q)?;
             }
             SelectItem::RecordStar(base) => slot += record_star_width(base, scope),
             SelectItem::Expr { expression, .. } => {
@@ -388,9 +386,9 @@ fn projected_collations<'a>(
                 }
             }
             SelectItem::TableWildcard(qualifier) => {
-                let table = scope.table_index(qualifier)?;
-                for column in scope.defs[table].expect("resolved").columns() {
-                    collations[width] = column.collation;
+                for index in 0..scope.qualified_star_columns(qualifier)? {
+                    collations[width] =
+                        scope.output_collation(scope.qualified_star_entry(qualifier, index)?);
                     width += 1;
                 }
             }
@@ -508,11 +506,7 @@ fn prepare_materialization<'a>(
     for item in statement.items {
         width += match item {
             SelectItem::Wildcard => scope.star_columns(),
-            SelectItem::TableWildcard(qualifier) => {
-                scope.defs[scope.table_index(qualifier)?]
-                    .expect("resolved")
-                    .n_columns
-            }
+            SelectItem::TableWildcard(qualifier) => scope.qualified_star_columns(qualifier)?,
             SelectItem::RecordStar(base) => record_star_width(base, scope),
             SelectItem::Expr { .. } => 1,
         };

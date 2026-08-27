@@ -14525,6 +14525,80 @@ fn plpgsql_call_and_do_own_real_non_atomic_transaction_boundaries() {
 }
 
 #[test]
+fn plpgsql_non_atomic_call_never_replays_across_a_committed_boundary() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE procedure_wait_target(id integer PRIMARY KEY, value integer); \
+         CREATE TABLE procedure_wait_log(phase text); \
+         INSERT INTO procedure_wait_target VALUES (1, 10); \
+         CREATE PROCEDURE procedure_wait() LANGUAGE plpgsql AS \
+         'BEGIN \
+            INSERT INTO procedure_wait_log VALUES (''before''); \
+            COMMIT; \
+            UPDATE procedure_wait_target SET value = value + 1 WHERE id = 1; \
+            INSERT INTO procedure_wait_log VALUES (''after''); \
+          END'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let mut blocker = TxnState::new(&mut budget, 256).unwrap();
+    assert!(run_txn(&mut engine, &mut budget, &mut blocker, "BEGIN").contains("BEGIN"));
+    assert!(
+        run_txn(
+            &mut engine,
+            &mut budget,
+            &mut blocker,
+            "UPDATE procedure_wait_target SET value = 20 WHERE id = 1",
+        )
+        .contains("UPDATE 1")
+    );
+
+    let mut caller = TxnState::new(&mut budget, 256).unwrap();
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "procedure wait send", 1 << 18).unwrap();
+    let arena = Arena::new(&mut budget, "procedure wait SQL", 1 << 18).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut guc = GucState::new();
+    let mut cursors = test_cursors(&mut budget);
+    let call = "CALL procedure_wait()";
+    let rejected = engine
+        .execute_simple(
+            call,
+            &arena,
+            &mut caller,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut Responder::new(&mut send),
+            2,
+        )
+        .unwrap();
+    assert_eq!(rejected, ExecutionStatus::Complete);
+    let error = String::from_utf8_lossy(send.readable());
+    assert!(error.contains("0A000"), "{error}");
+    assert!(
+        error.contains("cannot suspend after transaction control"),
+        "{error}"
+    );
+
+    assert!(run_txn(&mut engine, &mut budget, &mut blocker, "COMMIT").contains("COMMIT"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT phase, count(*) FROM procedure_wait_log GROUP BY phase ORDER BY phase; \
+             SELECT value FROM procedure_wait_target",
+        )),
+        ["before|1", "20"]
+    );
+}
+
+#[test]
 fn sql_standard_routine_bodies_keep_creation_time_catalog_identity() {
     let mut config = test_config("routine_creation_dependencies");
     config.max_tables = 16;

@@ -1853,7 +1853,14 @@ def test_plpgsql_transaction_boundaries_over_raw_wire():
         "'BEGIN INSERT INTO wire_plpgsql_transaction_log VALUES (3); COMMIT; "
         "INSERT INTO wire_plpgsql_transaction_log VALUES (4); END'; "
         "CREATE PROCEDURE wire_plpgsql_forbidden_transaction() LANGUAGE plpgsql AS "
-        "'BEGIN INSERT INTO wire_plpgsql_transaction_log VALUES (5); COMMIT; END'",
+        "'BEGIN INSERT INTO wire_plpgsql_transaction_log VALUES (5); COMMIT; END'; "
+        "CREATE TABLE wire_plpgsql_wait_target(id integer PRIMARY KEY, value integer); "
+        "CREATE TABLE wire_plpgsql_wait_log(phase text); "
+        "INSERT INTO wire_plpgsql_wait_target VALUES (1, 10); "
+        "CREATE PROCEDURE wire_plpgsql_wait_transaction() LANGUAGE plpgsql AS "
+        "'BEGIN INSERT INTO wire_plpgsql_wait_log VALUES (''before''); COMMIT; "
+        "UPDATE wire_plpgsql_wait_target SET value = value + 1 WHERE id = 1; "
+        "INSERT INTO wire_plpgsql_wait_log VALUES (''after''); END'",
     )
     check(
         "raw wire: transaction procedure setup succeeds",
@@ -1901,6 +1908,85 @@ def test_plpgsql_transaction_boundaries_over_raw_wire():
             )
         )
         == "1,2,3,4",
+    )
+
+    blocker = connect()
+    blocker.sendall(startup_payload(0))
+    drain_startup(blocker)
+    locked = simple_query(
+        blocker,
+        "BEGIN; UPDATE wire_plpgsql_wait_target SET value = 20 WHERE id = 1",
+    )
+    check(
+        "raw wire: concurrent transaction owns the procedure target row",
+        not any(kind == b"E" for kind, _ in locked),
+        locked,
+    )
+    waited = simple_query(s, "CALL wire_plpgsql_wait_transaction()")
+    check(
+        "raw wire: a post-boundary wait is rejected instead of replayed",
+        has_sqlstate(waited, "0A000") and waited[-1][0] == b"Z",
+        waited,
+    )
+    simple_query(blocker, "COMMIT")
+    blocker.close()
+    check(
+        "raw wire: the committed procedure prefix executes exactly once",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT count(*) FILTER (WHERE phase = 'before') || ':' || "
+                "count(*) FILTER (WHERE phase = 'after') FROM wire_plpgsql_wait_log",
+            )
+        )
+        == "1:0",
+    )
+
+    reset = simple_query(
+        s,
+        "TRUNCATE wire_plpgsql_wait_log; "
+        "UPDATE wire_plpgsql_wait_target SET value = 10 WHERE id = 1",
+    )
+    check(
+        "raw wire: extended wait replay setup succeeds",
+        not any(kind == b"E" for kind, _ in reset),
+        reset,
+    )
+    blocker = connect()
+    blocker.sendall(startup_payload(0))
+    drain_startup(blocker)
+    simple_query(
+        blocker,
+        "BEGIN; UPDATE wire_plpgsql_wait_target SET value = 30 WHERE id = 1",
+    )
+    query = "CALL wire_plpgsql_wait_transaction()"
+    parse = frontend_message(b"P", b"\x00" + query.encode() + b"\x00\x00\x00")
+    bind = frontend_message(b"B", b"\x00\x00\x00\x00\x00\x00\x00\x00")
+    execute = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + execute + frontend_message(b"S"))
+    waited = []
+    while True:
+        item = read_message(s)
+        waited.append(item)
+        if item[0] == b"Z":
+            break
+    check(
+        "raw wire: extended CALL never replays a committed prefix",
+        has_sqlstate(waited, "0A000") and waited[-1][0] == b"Z",
+        waited,
+    )
+    simple_query(blocker, "COMMIT")
+    blocker.close()
+    check(
+        "raw wire: extended CALL committed its prefix once",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT count(*) FILTER (WHERE phase = 'before') || ':' || "
+                "count(*) FILTER (WHERE phase = 'after') FROM wire_plpgsql_wait_log",
+            )
+        )
+        == "1:0",
     )
     s.close()
 

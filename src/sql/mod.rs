@@ -4189,6 +4189,10 @@ impl Engine {
     /// before discovering a lock wait. Transaction-level locks remain held
     /// while the protocol message is parked.
     fn rollback_waiting_statement(&mut self, txn: &mut TxnState, mark: txn::StatementMark) {
+        assert!(
+            txn.owns_statement_mark(mark),
+            "a statement rewind cannot cross a transaction boundary"
+        );
         for index in (mark.touched..txn.touched().len()).rev() {
             let (table, rowid, prior) = txn.touched()[index];
             self.storage
@@ -5046,20 +5050,27 @@ impl Engine {
                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
-                    self.rollback_waiting_statement(txn, statement_mark);
-                    if !lock_timeout_expired {
-                        return Ok(ExecutionStatus::Blocked {
-                            completed_statements: statement_index,
-                            output_mark,
-                            io_wait: e.sqlstate == sqlstate::INTERNAL_IO_WAIT,
-                        });
+                    if txn.owns_statement_mark(statement_mark) {
+                        self.rollback_waiting_statement(txn, statement_mark);
+                        if !lock_timeout_expired {
+                            return Ok(ExecutionStatus::Blocked {
+                                completed_statements: statement_index,
+                                output_mark,
+                                io_wait: e.sqlstate == sqlstate::INTERNAL_IO_WAIT,
+                            });
+                        }
+                        self.storage
+                            .rollback_locks_to(txn.txid, statement_mark.lock);
+                        e = sql_err!(
+                            sqlstate::LOCK_NOT_AVAILABLE,
+                            "canceling statement due to lock timeout"
+                        );
+                    } else {
+                        e = sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "a non-atomic routine cannot suspend after transaction control"
+                        );
                     }
-                    self.storage
-                        .rollback_locks_to(txn.txid, statement_mark.lock);
-                    e = sql_err!(
-                        sqlstate::LOCK_NOT_AVAILABLE,
-                        "canceling statement due to lock timeout"
-                    );
                 }
                 if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
                     self.abort_explicit_txn(txn, guc);
@@ -5199,18 +5210,25 @@ impl Engine {
                 if e.sqlstate == sqlstate::INTERNAL_LOCK_WAIT
                     || e.sqlstate == sqlstate::INTERNAL_IO_WAIT
                 {
-                    self.rollback_waiting_statement(txn, statement_mark);
-                    if !lock_timeout_expired {
-                        return Ok(ExtendedExecutionStatus::Blocked {
-                            io_wait: e.sqlstate == sqlstate::INTERNAL_IO_WAIT,
-                        });
+                    if txn.owns_statement_mark(statement_mark) {
+                        self.rollback_waiting_statement(txn, statement_mark);
+                        if !lock_timeout_expired {
+                            return Ok(ExtendedExecutionStatus::Blocked {
+                                io_wait: e.sqlstate == sqlstate::INTERNAL_IO_WAIT,
+                            });
+                        }
+                        self.storage
+                            .rollback_locks_to(txn.txid, statement_mark.lock);
+                        e = sql_err!(
+                            sqlstate::LOCK_NOT_AVAILABLE,
+                            "canceling statement due to lock timeout"
+                        );
+                    } else {
+                        e = sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "a non-atomic routine cannot suspend after transaction control"
+                        );
                     }
-                    self.storage
-                        .rollback_locks_to(txn.txid, statement_mark.lock);
-                    e = sql_err!(
-                        sqlstate::LOCK_NOT_AVAILABLE,
-                        "canceling statement due to lock timeout"
-                    );
                 }
                 if txn.is_explicit() && e.sqlstate == sqlstate::DEADLOCK_DETECTED {
                     self.abort_explicit_txn(txn, guc);

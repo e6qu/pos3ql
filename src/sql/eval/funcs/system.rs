@@ -1053,6 +1053,7 @@ pub(crate) fn dispatch<'a>(
                 if let crate::sql::ast::Expr::Call {
                     name,
                     args,
+                    argument_names,
                     star: false,
                     ..
                 } = args[0]
@@ -1074,9 +1075,12 @@ pub(crate) fn dispatch<'a>(
                             .unwrap_or(crate::sql::types::oid::UNKNOWN),
                         };
                     }
-                    if let Some(referenced_oid) =
-                        cat.routine_result_oid(name, &argument_oids[..args.len()])
-                        && let Some(type_name) = cat.type_name(referenced_oid, arena)?
+                    if let Some(referenced_oid) = cat.routine_result_oid(
+                        name,
+                        argument_names,
+                        false,
+                        &argument_oids[..args.len()],
+                    ) && let Some(type_name) = cat.type_name(referenced_oid, arena)?
                     {
                         return Ok(regtype(referenced_oid, type_name));
                     }

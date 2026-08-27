@@ -263,10 +263,20 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
             .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
     }
 
-    fn routine_result(&self, name: &str, arguments: &[i32]) -> Option<StaticTypeMeta> {
-        let routine = self
-            .storage
-            .function_for_call_oids(name, arguments, self.txid)?;
+    fn routine_result(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
+        arguments: &[i32],
+    ) -> Option<StaticTypeMeta> {
+        let routine = if argument_names.is_empty() {
+            self.storage
+                .function_for_call_syntax_oids(name, arguments, variadic, self.txid)?
+        } else {
+            self.storage
+                .function_for_named_call_oids(name, argument_names, arguments, self.txid)?
+        };
         let ctype = routine.kind.function_result()?;
         Some(StaticTypeMeta {
             type_oid: self
@@ -285,12 +295,27 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     fn routine_record_field(
         &self,
         name: &str,
+        argument_names: &[Option<&str>],
+        variadic: bool,
         arguments: &[i32],
         index: usize,
     ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
-        let slot = self
-            .storage
-            .routine_slot_for_table_call_oids(name, arguments, self.txid)?;
+        let slot = if argument_names.is_empty() {
+            if variadic {
+                self.storage
+                    .routine_slot_for_function_call_syntax_oids(name, arguments, true, self.txid)?
+            } else {
+                self.storage
+                    .routine_slot_for_table_call_oids(name, arguments, self.txid)?
+            }
+        } else {
+            self.storage.routine_slot_for_named_function_call_oids(
+                name,
+                argument_names,
+                arguments,
+                self.txid,
+            )?
+        };
         let routine = self.storage.routine_for(slot, self.txid);
         let column = routine.record_result_columns()?.get(index)?;
         Some((

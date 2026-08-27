@@ -296,6 +296,8 @@ pub enum Stmt<'a> {
     Call {
         name: QualName<'a>,
         arguments: &'a [&'a Expr<'a>],
+        argument_names: &'a [Option<&'a str>],
+        variadic: bool,
     },
     DropFunction {
         functions: &'a [RoutineIdentity<'a>],
@@ -1813,6 +1815,11 @@ pub struct TableRef<'a> {
     /// Table function: `FROM func(args) alias`. When set, `table` is the
     /// function name and these are its argument expressions.
     pub func_args: Option<&'a [&'a Expr<'a>]>,
+    /// Empty for positional function sources; otherwise parallel to
+    /// `func_args`. The parser constructs both together.
+    pub func_argument_names: &'a [Option<&'a str>],
+    /// The last function-source argument is an already-packed array.
+    pub func_variadic: bool,
     /// `ROWS FROM (f(...), g(...))`: each entry is a function-only table
     /// reference. The outer source owns the shared alias and ordinality, so a
     /// parsed table source is either one function or one non-empty function
@@ -2204,8 +2211,47 @@ pub struct CreateDomain<'a> {
     pub checks: &'a [DomainCheck<'a>],
 }
 
+/// An input-capable routine parameter either requires a call argument or owns
+/// a parsed default. Keeping `VARIADIC` separate prevents an INOUT/OUT
+/// parameter from accidentally acquiring variadic call semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineArgumentMode<'a> {
+    In { default_text: Option<&'a str> },
+    Out,
+    InOut { default_text: Option<&'a str> },
+    Variadic { default_text: Option<&'a str> },
+}
+
+impl<'a> RoutineArgumentMode<'a> {
+    pub const fn is_input(self) -> bool {
+        !matches!(self, Self::Out)
+    }
+
+    pub const fn is_output(self) -> bool {
+        matches!(self, Self::Out | Self::InOut { .. })
+    }
+
+    pub const fn default_text(self) -> Option<&'a str> {
+        match self {
+            Self::In { default_text }
+            | Self::InOut { default_text }
+            | Self::Variadic { default_text } => default_text,
+            Self::Out => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutineArgument<'a> {
+    pub mode: RoutineArgumentMode<'a>,
+    /// PostgreSQL permits unnamed input and output parameters. Absence is a
+    /// distinct state rather than an empty identifier accepted by accident.
+    pub name: Option<&'a str>,
+    pub type_name: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutineResultColumn<'a> {
     pub name: &'a str,
     pub type_name: &'a str,
 }
@@ -2348,8 +2394,15 @@ pub enum RoutineCreateKind<'a> {
         result_type: &'a str,
         set_returning: bool,
     },
+    /// OUT/INOUT parameters define the result contract. An optional RETURNS
+    /// clause is retained only so execution can resolve and prove that it
+    /// agrees with the implied scalar/record type.
+    OutputFunction {
+        declared_result_type: Option<&'a str>,
+        set_returning: bool,
+    },
     TableFunction {
-        columns: &'a [RoutineArgument<'a>],
+        columns: &'a [RoutineResultColumn<'a>],
     },
     Trigger,
     Procedure,
@@ -3169,6 +3222,12 @@ pub enum Expr<'a> {
     Call {
         name: &'a str,
         args: &'a [&'a Expr<'a>],
+        /// Empty for positional calls; otherwise parallel to `args` and
+        /// populated only for named notation parsed after positional inputs.
+        argument_names: &'a [Option<&'a str>],
+        /// The final argument was introduced by the `VARIADIC` keyword and is
+        /// already the declared array, rather than an element to pack.
+        variadic: bool,
         star: bool,
         distinct: bool,
         order_by: &'a [OrderBy<'a>],

@@ -562,6 +562,7 @@ fn extension_config_dump_arguments<'a>(statement: &'a Stmt<'a>) -> Option<[&'a E
         order_by,
         over: None,
         filter: None,
+        ..
     } = expression
     else {
         return None;
@@ -5866,6 +5867,68 @@ impl Engine {
                     }
                 }
             }
+            Stmt::Call {
+                name,
+                arguments,
+                argument_names,
+                variadic: _,
+            } => {
+                let qualified = match name.schema {
+                    Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
+                    None => stack_format!(260, "{}", name.name),
+                };
+                let Some(slot) = self.storage.procedure_slot_for_call_shape(
+                    qualified.as_str(),
+                    argument_names,
+                    arguments.len(),
+                    txn.txid,
+                ) else {
+                    responder.error(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        stack_format!(192, "procedure \"{}\" does not exist", qualified.as_str())
+                            .as_str(),
+                    )?;
+                    return Ok(false);
+                };
+                let routine = self.storage.routine_for(slot, txn.txid);
+                let mut columns =
+                    [ColDesc::new("", types::oid::TEXT, -1); crate::storage::MAX_ROUTINE_ARGUMENTS];
+                let mut count = 0usize;
+                for parameter in routine.parameters() {
+                    if !parameter.mode.is_output() {
+                        continue;
+                    }
+                    let Some(type_oid) = self.storage.routine_type_oid(
+                        parameter.ctype,
+                        parameter.user_type,
+                        txn.txid,
+                    ) else {
+                        responder.error(
+                            sqlstate::INTERNAL_ERROR,
+                            "procedure output type identity is unavailable",
+                        )?;
+                        return Ok(false);
+                    };
+                    let name = match arena.alloc_str(parameter.name.as_str()) {
+                        Ok(name) => name,
+                        Err(_) => {
+                            responder.error(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "procedure description exceeds the statement arena",
+                            )?;
+                            return Ok(false);
+                        }
+                    };
+                    columns[count] = ColDesc::new(name, type_oid, parameter.ctype.typlen());
+                    count += 1;
+                }
+                if count == 0 {
+                    responder.no_data()?;
+                } else {
+                    responder.row_description(&columns[..count])?;
+                }
+                Ok(true)
+            }
             Stmt::Show(name) => {
                 responder.row_description(&[ColDesc::new(name, types::oid::TEXT, -1)])?;
                 Ok(true)
@@ -7389,6 +7452,8 @@ impl Engine {
         &mut self,
         name: ast::QualName<'_>,
         arguments: &[&Expr<'_>],
+        argument_names: &[Option<&str>],
+        variadic: bool,
         arena: &Arena,
         params: &[Datum],
         txn: &mut TxnState,
@@ -7404,12 +7469,34 @@ impl Engine {
                 "too many procedure arguments"
             )));
         }
+        let qualified = match name.schema {
+            Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
+            None => stack_format!(260, "{}", name.name),
+        };
+        let shape_slot = self.storage.procedure_slot_for_call_shape(
+            qualified.as_str(),
+            argument_names,
+            arguments.len(),
+            txn.txid,
+        );
+        let shape_mapping = shape_slot.and_then(|slot| {
+            let routine = self.storage.routine_for(slot, txn.txid);
+            routine
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.mode.is_output())
+                .then(|| routine.procedure_call_mapping(argument_names, arguments.len()))
+                .flatten()
+        });
         let catalog = query::storage_catalog(&self.storage, &self.work, txn.txid);
         let hooks = EvalHooks {
             catalog: Some(&catalog),
             ..NO_HOOKS
         };
         for (slot, argument) in arguments.iter().enumerate() {
+            if shape_mapping.is_some_and(|mapping| mapping[slot] == u8::MAX) {
+                continue;
+            }
             values[slot] = match eval::eval_full(argument, arena, params, &NoColumns, &hooks) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
@@ -7417,6 +7504,9 @@ impl Engine {
         }
         let mut type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (slot, argument) in arguments.iter().enumerate() {
+            if shape_mapping.is_some_and(|mapping| mapping[slot] == u8::MAX) {
+                continue;
+            }
             type_oids[slot] = match argument {
                 ast::Expr::Cast { type_name, .. } => {
                     crate::sql::catalog::user_type_oid(&self.storage, txn.txid, type_name)
@@ -7425,15 +7515,24 @@ impl Engine {
                 _ => values[slot].type_oid(),
             };
         }
-        let qualified = match name.schema {
-            Some(schema) => stack_format!(260, "{}.{}", schema, name.name),
-            None => stack_format!(260, "{}", name.name),
+        let slot = if shape_mapping.is_some() {
+            shape_slot
+        } else if argument_names.is_empty() {
+            self.storage.procedure_slot_for_call_syntax_oids(
+                qualified.as_str(),
+                &type_oids[..arguments.len()],
+                variadic,
+                txn.txid,
+            )
+        } else {
+            self.storage.procedure_slot_for_named_call_oids(
+                qualified.as_str(),
+                argument_names,
+                &type_oids[..arguments.len()],
+                txn.txid,
+            )
         };
-        let Some(slot) = self.storage.procedure_slot_for_call_oids(
-            qualified.as_str(),
-            &type_oids[..arguments.len()],
-            txn.txid,
-        ) else {
+        let Some(slot) = slot else {
             return Ok(Err(sql_err!(
                 sqlstate::UNDEFINED_FUNCTION,
                 "procedure \"{}\" does not exist",
@@ -7443,15 +7542,134 @@ impl Engine {
         if let Err(error) = self.storage.require_routine_execute(slot, txn.txid) {
             return Ok(Err(error));
         }
-        let routine = self.storage.routine_for(slot, txn.txid);
+        let declared = self.storage.routine_for(slot, txn.txid);
+        let mapping = shape_mapping.unwrap_or_else(|| {
+            declared
+                .call_input_mapping(argument_names, arguments.len(), variadic)
+                .expect("resolved procedure call has a valid argument mapping")
+        });
+        let mut completed = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut completed_type_oids = [types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut provided = [false; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut variadic_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut variadic_count = 0usize;
+        for call_index in 0..arguments.len() {
+            if mapping[call_index] == u8::MAX {
+                continue;
+            }
+            let input_index = usize::from(mapping[call_index]);
+            if !variadic
+                && matches!(
+                    declared
+                        .parameter_for_input(input_index)
+                        .expect("mapped procedure input has a declared parameter")
+                        .mode,
+                    crate::storage::RoutineParameterMode::Variadic { .. }
+                )
+            {
+                variadic_values[variadic_count] = values[call_index];
+                variadic_count += 1;
+                provided[input_index] = true;
+                continue;
+            }
+            completed[input_index] = values[call_index];
+            completed_type_oids[input_index] = type_oids[call_index];
+            provided[input_index] = true;
+        }
+        if variadic_count != 0 {
+            let input_index = declared.argument_count - 1;
+            let parameter = declared
+                .parameter_for_input(input_index)
+                .expect("variadic procedure input has a declared parameter");
+            let types::ColType::Array(element) = parameter.ctype else {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "variadic procedure parameter is not an array"
+                )));
+            };
+            completed[input_index] = Datum::Array {
+                element,
+                raw: match array::build(&variadic_values[..variadic_count], arena) {
+                    Ok(raw) => raw,
+                    Err(error) => return Ok(Err(error)),
+                },
+            };
+            completed_type_oids[input_index] =
+                match self
+                    .storage
+                    .routine_type_oid(parameter.ctype, parameter.user_type, txn.txid)
+                {
+                    Some(oid) => oid,
+                    None => {
+                        return Ok(Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "variadic procedure parameter type identity is unavailable"
+                        )));
+                    }
+                };
+        }
+        for input_index in 0..declared.argument_count {
+            if provided[input_index] {
+                continue;
+            }
+            let parameter = declared
+                .parameter_for_input(input_index)
+                .expect("procedure input signature has a declared parameter");
+            completed[input_index] = if let Some(default) = parameter.mode.default() {
+                let source = match arena.alloc_str(default.as_str()) {
+                    Ok(source) => source,
+                    Err(_) => return Ok(Err(eval::arena_full())),
+                };
+                let expression = match parser::parse_expression(source, arena) {
+                    Ok(expression) => expression,
+                    Err(error) => return Ok(Err(error)),
+                };
+                match eval::eval_full(expression, arena, params, &NoColumns, &hooks) {
+                    Ok(value) => match eval::cast_to(value, parameter.ctype, arena) {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    },
+                    Err(error) => return Ok(Err(error)),
+                }
+            } else {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "resolved procedure is missing a required argument"
+                )));
+            };
+            completed_type_oids[input_index] =
+                match self
+                    .storage
+                    .routine_type_oid(parameter.ctype, parameter.user_type, txn.txid)
+                {
+                    Some(oid) => oid,
+                    None => {
+                        return Ok(Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "procedure parameter type identity is unavailable"
+                        )));
+                    }
+                };
+        }
+        let routine = self
+            .storage
+            .routine_for_bound_call(
+                slot,
+                &completed_type_oids[..declared.argument_count],
+                txn.txid,
+            )
+            .expect("resolved procedure call has a valid polymorphic binding");
         let body = routine.body;
         let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
-        let mut parser = match Parser::new(body.as_str(), arena) {
+        let mut parser = match Parser::new(body.as_str(), arena).and_then(|parser| {
+            parser.with_routine_parameters(routine.name.as_str(), routine.arguments())
+        }) {
             Ok(parser) => parser,
             Err(error) => return Ok(Err(parse_error_to_sql(&error))),
         };
         let output_mark = responder.buffer.mark();
-        let mut statements = 0usize;
+        let mut statements = [None; parser::MAX_LIST];
+        let mut statement_count = 0usize;
         loop {
             let statement = match parser.next_stmt() {
                 Ok(Some(statement)) => statement,
@@ -7461,15 +7679,97 @@ impl Engine {
                     return Ok(Err(parse_error_to_sql(&error)));
                 }
             };
-            statements += 1;
+            if statement_count == statements.len() {
+                return Ok(Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "procedure body has too many statements"
+                )));
+            }
+            statements[statement_count] = Some(statement);
+            statement_count += 1;
+        }
+        if statement_count == 0 {
+            return Ok(Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "procedure body is empty"
+            )));
+        }
+        let mut output_parameters =
+            [crate::storage::RoutineParameterDef::EMPTY; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut output_count = 0usize;
+        for parameter in routine.parameters() {
+            if parameter.mode.is_output() {
+                output_parameters[output_count] = *parameter;
+                output_count += 1;
+            }
+        }
+        let mut output_values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut output_rows = 0usize;
+        for (index, statement) in statements[..statement_count]
+            .iter()
+            .map(|statement| statement.as_ref().expect("parsed procedure statement"))
+            .enumerate()
+        {
             // A top-level CALL has no enclosing query workspace; reclaim each
             // suppressed internal result exactly as the ordinary dispatcher
             // did before routine dispatch gained a non-resetting mode.
             self.work.reset();
+            if output_count != 0 && index + 1 == statement_count {
+                let output_query = match statement {
+                    Stmt::Select(select) => Some(query::RoutineQuery::Select(select)),
+                    Stmt::SetQuery(set) => Some(query::RoutineQuery::Set(set)),
+                    _ => None,
+                };
+                let Some(output_query) = output_query else {
+                    responder.buffer.truncate_to(output_mark);
+                    return Ok(Err(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "SQL procedure with output parameters must end with a query"
+                    )));
+                };
+                if let Err(error) = query::execute_routine_query(
+                    &output_query,
+                    &self.storage,
+                    txn.txid,
+                    arena,
+                    &completed[..declared.argument_count],
+                    false,
+                    &mut |values| {
+                        if values.len() != output_count {
+                            return Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "SQL procedure query returns {} columns but {} output parameters were declared",
+                                values.len(),
+                                output_count
+                            ));
+                        }
+                        if output_rows != 0 {
+                            return Err(sql_err!(
+                                sqlstate::CARDINALITY_VIOLATION,
+                                "SQL procedure output query returned more than one row"
+                            ));
+                        }
+                        let encoded = exec::encode_projected_pub(values, arena)?;
+                        for (column, output) in output_values[..output_count].iter_mut().enumerate()
+                        {
+                            *output = exec::decode_projected_col_record(encoded, column, arena)?;
+                        }
+                        output_rows = 1;
+                        Ok(())
+                    },
+                ) {
+                    responder.buffer.truncate_to(output_mark);
+                    return Ok(Err(error));
+                }
+                if output_rows == 0 {
+                    output_values[..output_count].fill(Datum::Null);
+                }
+                continue;
+            }
             match self.execute_routine_stmt(
-                &statement,
+                statement,
                 arena,
-                &values[..arguments.len()],
+                &completed[..declared.argument_count],
                 txn,
                 sqlprep,
                 cursors,
@@ -7489,11 +7789,40 @@ impl Engine {
             }
         }
         responder.buffer.truncate_to(output_mark);
-        if statements == 0 {
-            return Ok(Err(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "procedure body is empty"
-            )));
+        if output_count != 0 {
+            let mut description =
+                [ColDesc::new("", types::oid::TEXT, -1); crate::storage::MAX_ROUTINE_ARGUMENTS];
+            for index in 0..output_count {
+                let parameter = output_parameters[index];
+                let type_oid = match self.storage.routine_type_oid(
+                    parameter.ctype,
+                    parameter.user_type,
+                    txn.txid,
+                ) {
+                    Some(oid) => oid,
+                    None => {
+                        return Ok(Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "procedure output type identity is unavailable"
+                        )));
+                    }
+                };
+                description[index] = ColDesc::new(
+                    match arena.alloc_str(parameter.name.as_str()) {
+                        Ok(name) => name,
+                        Err(_) => return Ok(Err(eval::arena_full())),
+                    },
+                    type_oid,
+                    parameter.ctype.typlen(),
+                );
+                output_values[index] =
+                    match eval::cast_to(output_values[index], parameter.ctype, arena) {
+                        Ok(value) => value,
+                        Err(error) => return Ok(Err(error)),
+                    };
+            }
+            responder.row_description(&description[..output_count])?;
+            responder.data_row(&output_values[..output_count])?;
         }
         responder.command_complete("CALL").map(|_| Ok(()))
     }
@@ -8000,8 +8329,23 @@ impl Engine {
                 *enabled,
                 responder,
             ),
-            Stmt::Call { name, arguments } => self.execute_call(
-                *name, arguments, arena, params, txn, sqlprep, cursors, guc, responder,
+            Stmt::Call {
+                name,
+                arguments,
+                argument_names,
+                variadic,
+            } => self.execute_call(
+                *name,
+                arguments,
+                argument_names,
+                *variadic,
+                arena,
+                params,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
             ),
             Stmt::AlterRoutine {
                 kind,

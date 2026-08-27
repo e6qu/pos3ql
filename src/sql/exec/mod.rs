@@ -20,8 +20,8 @@ use crate::storage::{
     CHECK_SQL_MAX, ColumnMeta, MAX_COLUMNS, MAX_ROUTINE_ARGUMENTS,
     PartitionBound as StoredPartitionBound, PartitionBoundValue, PartitionDef,
     PartitionStrategy as StoredPartitionStrategy, PolicyCommandKind, ROUTINE_SQL_MAX,
-    RoutineArgumentDef, RoutineIdentity, RoutineSpec, RowHome, SeqSpec, SeqType, SqlName, Storage,
-    TableDef,
+    RoutineArgumentDef, RoutineIdentity, RoutineParameterDef, RoutineParameterMode, RoutineSpec,
+    RowHome, SeqSpec, SeqType, SqlName, Storage, TableDef,
 };
 use crate::util::StackStr;
 use crate::wal::{Wal, WalOp};
@@ -15664,6 +15664,67 @@ pub fn create_routine(
                 crate::storage::RoutineKind::Function { result }
             }
         }
+        super::ast::RoutineCreateKind::OutputFunction {
+            declared_result_type,
+            set_returning,
+        } => {
+            for parameter in routine
+                .arguments
+                .iter()
+                .filter(|parameter| parameter.mode.is_output())
+            {
+                let name = match SqlName::parse(parameter.name.unwrap_or("")) {
+                    Ok(name) => name,
+                    Err(error) => return sql_fail(error),
+                };
+                let resolved = match resolve_routine_type(storage, txn.txid, parameter.type_name) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return sql_fail(error),
+                };
+                if resolved.ctype.is_pseudo() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "OUT parameter has pseudo-type {}",
+                        parameter.type_name
+                    ));
+                }
+                result_columns[result_column_count] = RoutineArgumentDef {
+                    name,
+                    ctype: resolved.ctype,
+                    user_type: resolved.user_type,
+                };
+                result_column_count += 1;
+            }
+            let implied = if result_column_count == 1 {
+                crate::storage::RoutineResult {
+                    ctype: result_columns[0].ctype,
+                    user_type: result_columns[0].user_type,
+                }
+            } else {
+                crate::storage::RoutineResult::builtin(ColType::Record)
+            };
+            if let Some(declared) = declared_result_type {
+                let declared = match resolve_routine_type(storage, txn.txid, declared) {
+                    Ok(result) => result,
+                    Err(error) => return sql_fail(error),
+                };
+                if declared != implied {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "function result type must agree with OUT parameters"
+                    ));
+                }
+            }
+            if result_column_count == 1 {
+                if set_returning {
+                    crate::storage::RoutineKind::SetFunction { result: implied }
+                } else {
+                    crate::storage::RoutineKind::Function { result: implied }
+                }
+            } else {
+                crate::storage::RoutineKind::RecordFunction { set_returning }
+            }
+        }
         super::ast::RoutineCreateKind::TableFunction { columns } => {
             let mut output = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
             for (slot, column) in columns.iter().enumerate() {
@@ -15706,8 +15767,10 @@ pub fn create_routine(
         super::ast::RoutineCreateKind::Procedure => crate::storage::RoutineKind::Procedure,
     };
     let mut arguments = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
-    for (slot, argument) in routine.arguments.iter().enumerate() {
-        let argument_name = match SqlName::parse(argument.name) {
+    let mut parameters = [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
+    let mut argument_count = 0usize;
+    for (parameter_count, argument) in routine.arguments.iter().enumerate() {
+        let argument_name = match SqlName::parse(argument.name.unwrap_or("")) {
             Ok(name) => name,
             Err(error) => return sql_fail(error),
         };
@@ -15720,18 +15783,51 @@ pub fn create_routine(
             return sql_fail(sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
                 "function argument \"{}\" has pseudo-type {}",
-                argument.name,
+                argument.name.unwrap_or(""),
                 argument.type_name
             ));
         }
-        arguments[slot] = RoutineArgumentDef {
+        let default = match argument.mode.default_text() {
+            Some(text) => {
+                let stored = StackStr::from_str(text);
+                if stored.is_truncated() {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "routine parameter default exceeds {} bytes",
+                        crate::storage::ROUTINE_DEFAULT_MAX
+                    ));
+                }
+                Some(stored)
+            }
+            None => None,
+        };
+        let mode = match argument.mode {
+            super::ast::RoutineArgumentMode::In { .. } => RoutineParameterMode::In { default },
+            super::ast::RoutineArgumentMode::Out => RoutineParameterMode::Out,
+            super::ast::RoutineArgumentMode::InOut { .. } => {
+                RoutineParameterMode::InOut { default }
+            }
+            super::ast::RoutineArgumentMode::Variadic { .. } => {
+                RoutineParameterMode::Variadic { default }
+            }
+        };
+        parameters[parameter_count] = RoutineParameterDef {
             name: argument_name,
             ctype,
             user_type: resolved.user_type,
+            mode,
         };
+        if argument.mode.is_input() {
+            arguments[argument_count] = RoutineArgumentDef {
+                name: argument_name,
+                ctype,
+                user_type: resolved.user_type,
+            };
+            argument_count += 1;
+        }
     }
     let has_polymorphic_input = |output: crate::storage::PolymorphicType| {
-        arguments[..routine.arguments.len()].iter().any(|argument| {
+        arguments[..argument_count].iter().any(|argument| {
             argument
                 .polymorphic_type()
                 .is_some_and(|input| input.compatible_family() == output.compatible_family())
@@ -15742,7 +15838,8 @@ pub fn create_routine(
         | crate::storage::RoutineKind::SetFunction { result } => result
             .polymorphic_type()
             .filter(|output| !has_polymorphic_input(*output)),
-        crate::storage::RoutineKind::TableFunction => result_columns[..result_column_count]
+        crate::storage::RoutineKind::RecordFunction { .. }
+        | crate::storage::RoutineKind::TableFunction => result_columns[..result_column_count]
             .iter()
             .find_map(|column| column.polymorphic_type())
             .filter(|output| !has_polymorphic_input(*output)),
@@ -15758,7 +15855,7 @@ pub fn create_routine(
     let replaced = storage.routine_slot_by_declared_signature(
         schema.as_str(),
         name.as_str(),
-        &arguments[..routine.arguments.len()],
+        &arguments[..argument_count],
         txn.txid,
     );
     if let Some(replaced_slot) = replaced {
@@ -15775,10 +15872,13 @@ pub fn create_routine(
         let prior = storage.routine(replaced_slot);
         let prior_kind = prior.kind;
         let same_result_contract = prior_kind == kind
-            && (!matches!(kind, crate::storage::RoutineKind::TableFunction)
-                || (prior.result_column_count == result_column_count
-                    && prior.result_columns[..result_column_count]
-                        == result_columns[..result_column_count]));
+            && (!matches!(
+                kind,
+                crate::storage::RoutineKind::RecordFunction { .. }
+                    | crate::storage::RoutineKind::TableFunction
+            ) || (prior.result_column_count == result_column_count
+                && prior.result_columns[..result_column_count]
+                    == result_columns[..result_column_count]));
         if !same_result_contract {
             let message =
                 if prior_kind.function_result().is_some() && kind.function_result().is_some() {
@@ -15805,12 +15905,13 @@ pub fn create_routine(
                 arena,
                 returns_void,
                 routine.name.name,
-                &arguments[..routine.arguments.len()],
+                &arguments[..argument_count],
             ) {
                 return sql_fail(error);
             }
         }
         crate::storage::RoutineKind::SetFunction { .. }
+        | crate::storage::RoutineKind::RecordFunction { .. }
         | crate::storage::RoutineKind::TableFunction => {
             let returns_void = matches!(
                 kind,
@@ -15822,7 +15923,7 @@ pub fn create_routine(
                 arena,
                 returns_void,
                 routine.name.name,
-                &arguments[..routine.arguments.len()],
+                &arguments[..argument_count],
             ) {
                 return sql_fail(error);
             }
@@ -15833,10 +15934,13 @@ pub fn create_routine(
             }
         }
         crate::storage::RoutineKind::Procedure => {
-            let mut parser = match super::parser::Parser::new(routine.body, arena) {
-                Ok(parser) => parser,
-                Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
-            };
+            let mut parser =
+                match super::parser::Parser::new(routine.body, arena).and_then(|parser| {
+                    parser.with_routine_parameters(routine.name.name, &arguments[..argument_count])
+                }) {
+                    Ok(parser) => parser,
+                    Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+                };
             let mut statements = 0usize;
             loop {
                 match parser.next_stmt() {
@@ -15881,7 +15985,9 @@ pub fn create_routine(
             let pending = crate::storage::PendingRoutineDefinition {
                 txid: txn.txid,
                 arguments,
-                argument_count: routine.arguments.len(),
+                argument_count,
+                parameters,
+                parameter_count: routine.arguments.len(),
                 kind,
                 result_columns,
                 result_column_count,
@@ -15913,7 +16019,9 @@ pub fn create_routine(
                 schema,
                 name,
                 arguments,
-                argument_count: routine.arguments.len(),
+                argument_count,
+                parameters,
+                parameter_count: routine.arguments.len(),
                 kind,
                 result_columns,
                 result_column_count,
@@ -15947,6 +16055,7 @@ pub fn create_routine(
     responder.command_complete(match kind {
         crate::storage::RoutineKind::Function { .. }
         | crate::storage::RoutineKind::SetFunction { .. }
+        | crate::storage::RoutineKind::RecordFunction { .. }
         | crate::storage::RoutineKind::TableFunction => "CREATE FUNCTION",
         crate::storage::RoutineKind::Trigger => "CREATE FUNCTION",
         crate::storage::RoutineKind::Procedure => "CREATE PROCEDURE",
@@ -16165,6 +16274,7 @@ pub fn create_aggregate(
         ));
     }
     let mut arguments = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
+    let mut parameters = [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
     let mut argument_types = [crate::storage::RoutineResult::TEXT; MAX_ROUTINE_ARGUMENTS];
     let mut variadic_argument = None;
     for (index, argument) in direct_ast.iter().chain(aggregated_ast).enumerate() {
@@ -16196,6 +16306,16 @@ pub fn create_aggregate(
             name: argument_name,
             ctype: resolved.ctype,
             user_type: resolved.user_type,
+        };
+        parameters[index] = RoutineParameterDef {
+            name: argument_name,
+            ctype: resolved.ctype,
+            user_type: resolved.user_type,
+            mode: if argument.variadic {
+                RoutineParameterMode::Variadic { default: None }
+            } else {
+                RoutineParameterMode::In { default: None }
+            },
         };
         argument_types[index] = resolved;
     }
@@ -16621,6 +16741,8 @@ pub fn create_aggregate(
                 txid: txn.txid,
                 arguments,
                 argument_count: total_arguments,
+                parameters,
+                parameter_count: total_arguments,
                 kind,
                 result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
                 result_column_count: 0,
@@ -16653,6 +16775,8 @@ pub fn create_aggregate(
                 name,
                 arguments,
                 argument_count: total_arguments,
+                parameters,
+                parameter_count: total_arguments,
                 kind,
                 result_columns: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
                 result_column_count: 0,
@@ -20205,6 +20329,7 @@ fn routine_uses_selected_type(
                 })
         }
         crate::storage::RoutineKind::TableFunction
+        | crate::storage::RoutineKind::RecordFunction { .. }
         | crate::storage::RoutineKind::Trigger
         | crate::storage::RoutineKind::Procedure => false,
     }

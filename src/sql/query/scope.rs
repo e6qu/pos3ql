@@ -1175,6 +1175,8 @@ impl<'d> QueryScope<'d> {
                     .alloc(Expr::Call {
                         name: "coalesce",
                         args,
+                        argument_names: &[],
+                        variadic: false,
                         star: false,
                         distinct: false,
                         order_by: &[],

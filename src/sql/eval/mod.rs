@@ -493,7 +493,13 @@ pub(crate) fn expression_type_identity<'a>(
             return catalog_user_type_oid(identity, true, hooks).map(ExpressionTypeIdentity::Known);
         }
     }
-    if let Expr::Call { name, args, .. } = expression
+    if let Expr::Call {
+        name,
+        args,
+        argument_names,
+        variadic,
+        ..
+    } = expression
         && args.len() <= crate::storage::MAX_ROUTINE_ARGUMENTS
         && let Some(catalog) = hooks.catalog
     {
@@ -506,7 +512,12 @@ pub(crate) fn expression_type_identity<'a>(
             }
         }
         if resolved
-            && let Some(result_oid) = catalog.routine_result_oid(name, &argument_oids[..args.len()])
+            && let Some(result_oid) = catalog.routine_result_oid(
+                name,
+                argument_names,
+                *variadic,
+                &argument_oids[..args.len()],
+            )
         {
             return Ok(ExpressionTypeIdentity::Known(result_oid));
         }
@@ -757,6 +768,8 @@ pub trait CatalogAccess {
         &self,
         _name: &str,
         _arguments: &[Datum<'a>],
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
         _argument_type_oids: &[i32],
         _arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
@@ -776,7 +789,13 @@ pub trait CatalogAccess {
     }
     /// The declared result identity of a catalog routine. This is separate
     /// from execution because a domain result shares its base datum layout.
-    fn routine_result_oid(&self, _name: &str, _argument_type_oids: &[i32]) -> Option<i32> {
+    fn routine_result_oid(
+        &self,
+        _name: &str,
+        _argument_names: &[Option<&str>],
+        _variadic: bool,
+        _argument_type_oids: &[i32],
+    ) -> Option<i32> {
         None
     }
     fn sequence_state_by_oid(&self, _oid: i32) -> Option<(i64, bool)> {
@@ -1515,7 +1534,15 @@ pub fn eval_full<'a>(
             // The prefix arithmetic operators compute exactly what their
             // functions do, so they run the same code rather than a second copy.
             if let Some(function) = operator.arithmetic_function() {
-                return call(function, &[operand], false, arena, params, row, hooks);
+                return call(
+                    function,
+                    &[operand],
+                    CallSyntax::ordinary(),
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                );
             }
             let v = eval_full(operand, arena, params, row, hooks)?;
             unary(operator, v, arena)
@@ -1736,6 +1763,8 @@ pub fn eval_full<'a>(
         Expr::Call {
             name,
             args,
+            argument_names,
+            variadic,
             star,
             distinct,
             over,
@@ -1764,7 +1793,19 @@ pub fn eval_full<'a>(
                     "DISTINCT is only supported inside aggregate functions"
                 ));
             }
-            call(name, args, star, arena, params, row, hooks)
+            call(
+                name,
+                args,
+                CallSyntax {
+                    argument_names,
+                    variadic,
+                    star,
+                },
+                arena,
+                params,
+                row,
+                hooks,
+            )
         }
         Expr::InList {
             operand,
@@ -2457,7 +2498,12 @@ pub fn eval_full<'a>(
                 _ => false,
             };
             match b {
-                Datum::Record(_) if anonymous_source => {
+                Datum::Record(fields)
+                    if anonymous_source
+                        && !fields
+                            .iter()
+                            .any(|value| value.name.eq_ignore_ascii_case(field)) =>
+                {
                     Err(crate::sql::exec::could_not_identify(field))
                 }
                 Datum::Null => Ok(Datum::Null),
@@ -3075,15 +3121,37 @@ fn undefined_function<'a>(name: &str, args: &[&Expr<'a>], row: &impl ColumnLooku
     )
 }
 
+#[derive(Clone, Copy)]
+struct CallSyntax<'slice, 'text> {
+    argument_names: &'slice [Option<&'text str>],
+    variadic: bool,
+    star: bool,
+}
+
+impl CallSyntax<'static, 'static> {
+    const fn ordinary() -> Self {
+        Self {
+            argument_names: &[],
+            variadic: false,
+            star: false,
+        }
+    }
+}
+
 fn call<'a>(
     name: &str,
     args: &[&Expr<'a>],
-    star: bool,
+    syntax: CallSyntax<'_, '_>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     row: &impl ColumnLookup<'a>,
     hooks: &EvalHooks<'_, 'a>,
 ) -> Result<Datum<'a>, SqlError> {
+    let CallSyntax {
+        argument_names,
+        variadic,
+        star,
+    } = syntax;
     let arity = |n: usize| -> Result<(), SqlError> {
         if args.len() != n || star {
             Err(sql_err!(
@@ -3096,41 +3164,65 @@ fn call<'a>(
             Ok(())
         }
     };
-    if let Some(result) = funcs::bytea::dispatch(name, args, star, arena, params, row, hooks) {
-        return result;
-    }
-    if let Some(result) = funcs::math::dispatch(name, args, star, arena, params, row, hooks) {
-        return result;
-    }
-    if let Some(result) = funcs::string::dispatch(name, args, star, arena, params, row, hooks) {
-        return result;
-    }
-    if let Some(result) = funcs::datetime::dispatch(name, args, star, arena, params, row, hooks) {
-        return result;
-    }
-    if let Some(result) = funcs::json::dispatch(name, args, star, arena, params, row, hooks) {
-        return result;
-    }
-    if let Some(result) = funcs::array::dispatch(name, args, star, arena, params, row, hooks) {
-        return result;
-    }
-    if let Some(result) = funcs::net::dispatch(name, args, star, arena, params, row, hooks) {
-        return result;
-    }
-    if let Some(result) = funcs::range::dispatch(name, args, star, arena, params, row, hooks) {
-        return result;
-    }
-    if let Some(result) = funcs::regex::dispatch(name, args, star, arena, params, row, hooks) {
-        return result;
-    }
-    if let Some(result) = funcs::system::dispatch(name, args, star, arena, params, row, hooks) {
-        return result;
-    }
-    if let Some(result) = funcs::conditional::dispatch(name, args, star, arena, params, row, hooks)
+    if argument_names.is_empty()
+        && let Some(result) = funcs::bytea::dispatch(name, args, star, arena, params, row, hooks)
     {
         return result;
     }
-    if let Some(result) = funcs::misc::dispatch(name, args, star, arena, params, row, hooks) {
+    if argument_names.is_empty()
+        && let Some(result) = funcs::math::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::string::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::datetime::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::json::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::array::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::net::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::range::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::regex::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::system::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) =
+            funcs::conditional::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
+        && let Some(result) = funcs::misc::dispatch(name, args, star, arena, params, row, hooks)
+    {
         return result;
     }
     if !star && let Some(catalog) = hooks.catalog {
@@ -3146,6 +3238,8 @@ fn call<'a>(
             if let Some(result) = catalog.call_routine(
                 name,
                 &arguments[..args.len()],
+                argument_names,
+                variadic,
                 &argument_type_oids[..args.len()],
                 arena,
             )? {

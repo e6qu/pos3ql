@@ -3036,15 +3036,36 @@ pub fn function_def_text<'a>(
         routine.name_for(txid).as_str()
     )
     .map_err(|_| super::eval::arena_full())?;
-    for (index, argument) in routine.arguments().iter().enumerate() {
+    for (index, parameter) in routine.parameters().iter().enumerate() {
         if index != 0 {
             write!(definition, ", ").map_err(|_| super::eval::arena_full())?;
         }
-        if !argument.name.as_str().is_empty() {
-            write!(definition, "{} ", argument.name.as_str())
+        match parameter.mode {
+            crate::storage::RoutineParameterMode::In { .. }
+                if !matches!(routine.kind, crate::storage::RoutineKind::Procedure) => {}
+            crate::storage::RoutineParameterMode::In { .. } => {
+                write!(definition, "IN ").map_err(|_| super::eval::arena_full())?;
+            }
+            crate::storage::RoutineParameterMode::Out => {
+                write!(definition, "OUT ").map_err(|_| super::eval::arena_full())?;
+            }
+            crate::storage::RoutineParameterMode::InOut { .. } => {
+                write!(definition, "INOUT ").map_err(|_| super::eval::arena_full())?;
+            }
+            crate::storage::RoutineParameterMode::Variadic { .. } => {
+                write!(definition, "VARIADIC ").map_err(|_| super::eval::arena_full())?;
+            }
+        }
+        if !parameter.name.as_str().is_empty() {
+            write!(definition, "{} ", parameter.name.as_str())
                 .map_err(|_| super::eval::arena_full())?;
         }
-        write_routine_type(&mut definition, argument).map_err(|_| super::eval::arena_full())?;
+        write_routine_type_name(&mut definition, parameter.ctype, parameter.user_type, true)
+            .map_err(|_| super::eval::arena_full())?;
+        if let Some(default) = parameter.mode.default() {
+            write!(definition, " DEFAULT {}", default.as_str())
+                .map_err(|_| super::eval::arena_full())?;
+        }
     }
     match routine.kind {
         crate::storage::RoutineKind::Function { result } => {
@@ -3074,6 +3095,13 @@ pub fn function_def_text<'a>(
                     .map_err(|_| super::eval::arena_full())?;
             }
             write!(definition, ") LANGUAGE sql")
+        }
+        crate::storage::RoutineKind::RecordFunction { set_returning } => {
+            write!(
+                definition,
+                ") RETURNS {}record LANGUAGE sql",
+                if set_returning { "SETOF " } else { "" }
+            )
         }
         crate::storage::RoutineKind::Trigger => {
             write!(definition, ") RETURNS trigger LANGUAGE plpgsql")
@@ -3363,22 +3391,41 @@ pub fn function_arguments_text<'a>(
     let routine = storage.routine_for(slot, txid);
     let mut output = StackStr::<256>::new();
     use core::fmt::Write;
-    for (index, argument) in routine.arguments().iter().enumerate() {
+    for (index, parameter) in routine.parameters().iter().enumerate() {
         if index != 0 {
             write!(output, ", ").map_err(|_| super::eval::arena_full())?;
         }
-        if !identity && !argument.name.as_str().is_empty() {
-            write!(output, "{} ", argument.name.as_str()).map_err(|_| super::eval::arena_full())?;
+        let mode = match parameter.mode {
+            crate::storage::RoutineParameterMode::In { .. }
+                if !matches!(routine.kind, crate::storage::RoutineKind::Procedure) =>
+            {
+                None
+            }
+            crate::storage::RoutineParameterMode::In { .. } => Some("IN"),
+            crate::storage::RoutineParameterMode::Out => Some("OUT"),
+            crate::storage::RoutineParameterMode::InOut { .. } => Some("INOUT"),
+            crate::storage::RoutineParameterMode::Variadic { .. } => Some("VARIADIC"),
+        };
+        if let Some(mode) = mode {
+            write!(output, "{} ", mode).map_err(|_| super::eval::arena_full())?;
+        }
+        if !parameter.name.as_str().is_empty() {
+            write!(output, "{} ", parameter.name.as_str())
+                .map_err(|_| super::eval::arena_full())?;
         }
         write_routine_type_name(
             &mut output,
-            argument.ctype,
-            argument.user_type,
-            argument
+            parameter.ctype,
+            parameter.user_type,
+            parameter
                 .user_type
-                .is_some_and(|identity| !storage.schema_is_on_path(identity.schema)),
+                .is_some_and(|type_identity| !storage.schema_is_on_path(type_identity.schema)),
         )
         .map_err(|_| super::eval::arena_full())?;
+        if !identity && let Some(default) = parameter.mode.default() {
+            write!(output, " DEFAULT {}", default.as_str())
+                .map_err(|_| super::eval::arena_full())?;
+        }
     }
     if output.is_truncated() {
         return Err(super::eval::arena_full());
@@ -3449,6 +3496,12 @@ pub fn function_result_text<'a>(
                 .map_err(|_| super::eval::arena_full())?;
             }
             write!(output, ")").map_err(|_| super::eval::arena_full())?;
+        }
+        crate::storage::RoutineKind::RecordFunction { set_returning } => {
+            if *set_returning {
+                write!(output, "SETOF ").map_err(|_| super::eval::arena_full())?;
+            }
+            write!(output, "record").map_err(|_| super::eval::arena_full())?;
         }
         crate::storage::RoutineKind::Trigger => {
             write!(output, "trigger").map_err(|_| super::eval::arena_full())?;
@@ -8605,9 +8658,9 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             text("sql", arena)?,
             Datum::Int4(10),
             Datum::Bool(true),
-            Datum::Bool(true),
+            Datum::Bool(false),
             Datum::Int4(0),
-            Datum::Int4(0),
+            Datum::Int4(2248),
             Datum::Int4(0),
             Datum::Null,
         ],
@@ -8621,9 +8674,9 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Int4(10),
             Datum::Bool(true),
             Datum::Bool(true),
-            Datum::Int4(0),
-            Datum::Int4(0),
-            Datum::Int4(0),
+            Datum::Int4(13644),
+            Datum::Int4(13646),
+            Datum::Int4(13645),
             Datum::Null,
         ],
         arena,
@@ -8659,6 +8712,13 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             ("prorows", ColType::Float8),
             ("protrftypes", ColType::Array(super::types::ArrElem::Int4)),
             ("prosupport", ColType::Text),
+            ("pronargdefaults", ColType::Int4),
+            ("provariadic", ColType::Oid),
+            ("proallargtypes", ColType::Array(super::types::ArrElem::Oid)),
+            ("proargmodes", ColType::Array(super::types::ArrElem::Char)),
+            ("proargnames", ColType::Array(super::types::ArrElem::Text)),
+            ("proargdefaults", ColType::PgNodeTree),
+            ("prosqlbody", ColType::PgNodeTree),
         ],
     );
     const MAX_ROWS: usize = 512;
@@ -8697,6 +8757,13 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Float8(0.0),
                 Datum::Null,
                 text("-", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
+                Datum::Null,
             ],
             arena,
         )?;
@@ -8726,6 +8793,59 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             let _ =
                 core::fmt::Write::write_fmt(&mut argument_types, format_args!("{argument_oid}"));
         }
+        let mut all_argument_types = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_modes = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut argument_names = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        let mut has_modes = false;
+        let mut has_names = false;
+        let mut default_count = 0i32;
+        let mut default_expressions = crate::util::StackStr::<256>::new();
+        let mut variadic_oid = 0;
+        for (index, parameter) in routine.parameters().iter().enumerate() {
+            let parameter_oid = storage
+                .routine_type_oid(parameter.ctype, parameter.user_type, txid)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "routine {} has an unresolved declared parameter type",
+                        routine.name.as_str()
+                    )
+                });
+            all_argument_types[index] = Datum::Oid(parameter_oid as u32);
+            let mode = match parameter.mode {
+                crate::storage::RoutineParameterMode::In { .. } => "i",
+                crate::storage::RoutineParameterMode::Out => {
+                    has_modes = true;
+                    "o"
+                }
+                crate::storage::RoutineParameterMode::InOut { .. } => {
+                    has_modes = true;
+                    "b"
+                }
+                crate::storage::RoutineParameterMode::Variadic { .. } => {
+                    has_modes = true;
+                    variadic_oid = match parameter.ctype {
+                        ColType::Array(element) => element.element_oid(),
+                        _ => 0,
+                    };
+                    "v"
+                }
+            };
+            argument_modes[index] = Datum::Bpchar(mode);
+            if !parameter.name.as_str().is_empty() {
+                has_names = true;
+            }
+            argument_names[index] = text(parameter.name.as_str(), arena)?;
+            if let Some(default) = parameter.mode.default() {
+                if default_count != 0 {
+                    let _ = core::fmt::Write::write_str(&mut default_expressions, ", ");
+                }
+                let _ = core::fmt::Write::write_str(&mut default_expressions, default.as_str());
+                default_count += 1;
+            }
+        }
+        if default_expressions.is_truncated() {
+            return Err(catalog_capacity_exceeded("pg_proc.proargdefaults"));
+        }
         rows[count] = row(
             &[
                 Datum::Int4(1255),
@@ -8735,7 +8855,8 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(routine.argument_count as i32),
                 Datum::Int4(match routine.kind {
                     crate::storage::RoutineKind::Function { .. }
-                    | crate::storage::RoutineKind::SetFunction { .. } => storage
+                    | crate::storage::RoutineKind::SetFunction { .. }
+                    | crate::storage::RoutineKind::RecordFunction { .. } => storage
                         .routine_function_result_oid(&routine, txid)
                         .unwrap_or_else(|| {
                             panic!(
@@ -8798,6 +8919,47 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Float8(0.0),
                 Datum::Null,
                 text("-", arena)?,
+                Datum::Int4(default_count),
+                Datum::Oid(variadic_oid as u32),
+                if has_modes {
+                    Datum::Array {
+                        element: super::types::ArrElem::Oid,
+                        raw: super::array::build(
+                            &all_argument_types[..routine.parameter_count],
+                            arena,
+                        )?,
+                    }
+                } else {
+                    Datum::Null
+                },
+                if has_modes {
+                    Datum::Array {
+                        element: super::types::ArrElem::Char,
+                        raw: super::array::build(
+                            &argument_modes[..routine.parameter_count],
+                            arena,
+                        )?,
+                    }
+                } else {
+                    Datum::Null
+                },
+                if has_names {
+                    Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(
+                            &argument_names[..routine.parameter_count],
+                            arena,
+                        )?,
+                    }
+                } else {
+                    Datum::Null
+                },
+                if default_count == 0 {
+                    Datum::Null
+                } else {
+                    text(default_expressions.as_str(), arena)?
+                },
+                Datum::Null,
             ],
             arena,
         )?;
@@ -10788,7 +10950,7 @@ fn info_parameters<'a>(
     );
     let count = (0..storage.routine_count())
         .filter(|slot| storage.routine(*slot).visible_to(txid))
-        .map(|slot| storage.routine(slot).argument_count)
+        .map(|slot| storage.routine_for(slot, txid).parameter_count)
         .sum();
     let output = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
@@ -10800,14 +10962,20 @@ fn info_parameters<'a>(
             continue;
         }
         let specific_name = routine_specific_name(&routine, txid);
-        for (argument_index, argument) in routine.arguments().iter().enumerate() {
+        for (argument_index, argument) in routine.parameters().iter().enumerate() {
+            let mode = match argument.mode {
+                crate::storage::RoutineParameterMode::In { .. }
+                | crate::storage::RoutineParameterMode::Variadic { .. } => "IN",
+                crate::storage::RoutineParameterMode::Out => "OUT",
+                crate::storage::RoutineParameterMode::InOut { .. } => "INOUT",
+            };
             output[row_index] = row(
                 &[
                     text("postgres", arena)?,
                     text(routine.schema_for(txid).as_str(), arena)?,
                     text(specific_name.as_str(), arena)?,
                     Datum::Int4((argument_index + 1) as i32),
-                    text("IN", arena)?,
+                    text(mode, arena)?,
                     if argument.name.as_str().is_empty() {
                         Datum::Null
                     } else {

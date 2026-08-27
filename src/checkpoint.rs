@@ -2134,6 +2134,56 @@ impl Checkpointer {
                             })
                         };
                     }
+                    let parameter_count: usize =
+                        parse_field(words.next(), "routine parameter count")?;
+                    if parameter_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
+                        return Err(CheckpointSetupError::Corrupt("too many routine parameters"));
+                    }
+                    let mut parameters = [crate::storage::RoutineParameterDef::EMPTY;
+                        crate::storage::MAX_ROUTINE_ARGUMENTS];
+                    for parameter in &mut parameters[..parameter_count] {
+                        parameter.name = sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("routine parameter name missing"),
+                        )?)?)?;
+                        let type_code: u8 = parse_field(words.next(), "routine parameter type")?;
+                        parameter.ctype = ColType::from_code(type_code).ok_or(
+                            CheckpointSetupError::Corrupt("invalid routine parameter type"),
+                        )?;
+                        let schema = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "routine parameter type schema missing",
+                        ))?;
+                        let name = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "routine parameter type name missing",
+                        ))?;
+                        parameter.user_type = if schema == "-" && name == "-" {
+                            None
+                        } else {
+                            Some(crate::storage::UserTypeName {
+                                schema: sql_name(&decode_hex_name(schema)?)?,
+                                name: sql_name(&decode_hex_name(name)?)?,
+                            })
+                        };
+                        let mode: u8 = parse_field(words.next(), "routine parameter mode")?;
+                        let default_word = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "routine parameter default missing",
+                        ))?;
+                        let default = if default_word == "-" {
+                            None
+                        } else {
+                            let decoded = decode_hex_name(default_word)?;
+                            let stored = StackStr::from_str(&decoded);
+                            if stored.is_truncated() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "routine parameter default too long",
+                                ));
+                            }
+                            Some(stored)
+                        };
+                        parameter.mode =
+                            crate::storage::RoutineParameterMode::from_code(mode, default).ok_or(
+                                CheckpointSetupError::Corrupt("invalid routine parameter mode"),
+                            )?;
+                    }
                     let attributes = crate::storage::RoutineAttributes {
                         strict: match parse_field::<u8>(words.next(), "routine strictness")? {
                             0 => false,
@@ -2184,7 +2234,7 @@ impl Checkpointer {
                     };
                     let code: u8 = parse_field(Some(kind_code), "routine kind")?;
                     let kind = {
-                        if code == 3 {
+                        if matches!(code, 3 | 6 | 7) {
                             result_column_count =
                                 parse_field(words.next(), "routine result column count")?;
                             if result_column_count > crate::storage::MAX_ROUTINE_ARGUMENTS {
@@ -2225,7 +2275,8 @@ impl Checkpointer {
                                     "malformed routine record",
                                 ));
                             }
-                            crate::storage::RoutineKind::TableFunction
+                            crate::storage::RoutineKind::from_wire_code(code, result)
+                                .ok_or(CheckpointSetupError::Corrupt("invalid routine kind"))?
                         } else if code == 5 {
                             let aggregate =
                                 crate::storage::AggregateRoutine::decode_wire(body.as_str())
@@ -2268,6 +2319,8 @@ impl Checkpointer {
                                 name,
                                 arguments,
                                 argument_count,
+                                parameters,
+                                parameter_count,
                                 kind,
                                 result_columns,
                                 result_column_count,
@@ -4783,6 +4836,9 @@ impl Checkpointer {
                 for byte in argument.name.as_str().as_bytes() {
                     let _ = write!(argument_name, "{byte:02x}");
                 }
+                if argument.name.as_str().is_empty() {
+                    let _ = write!(argument_name, "-");
+                }
                 let _ = write!(
                     arguments,
                     " {} {}",
@@ -4803,14 +4859,59 @@ impl Checkpointer {
                     let _ = write!(arguments, " - -");
                 }
             }
+            let mut parameters = StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 660 }>::new();
+            let _ = write!(parameters, " {}", routine.parameter_count);
+            for parameter in routine.parameters() {
+                let mut parameter_name = StackStr::<130>::new();
+                for byte in parameter.name.as_str().as_bytes() {
+                    let _ = write!(parameter_name, "{byte:02x}");
+                }
+                if parameter.name.as_str().is_empty() {
+                    let _ = write!(parameter_name, "-");
+                }
+                let _ = write!(
+                    parameters,
+                    " {} {}",
+                    parameter_name.as_str(),
+                    parameter.ctype.code()
+                );
+                if let Some(identity) = parameter.user_type {
+                    let mut schema = StackStr::<130>::new();
+                    let mut name = StackStr::<130>::new();
+                    for byte in identity.schema.as_str().as_bytes() {
+                        let _ = write!(schema, "{byte:02x}");
+                    }
+                    for byte in identity.name.as_str().as_bytes() {
+                        let _ = write!(name, "{byte:02x}");
+                    }
+                    let _ = write!(parameters, " {} {}", schema.as_str(), name.as_str());
+                } else {
+                    let _ = write!(parameters, " - -");
+                }
+                let _ = write!(parameters, " {} ", parameter.mode.code());
+                if let Some(default) = parameter.mode.default() {
+                    for byte in default.as_str().as_bytes() {
+                        let _ = write!(parameters, "{byte:02x}");
+                    }
+                } else {
+                    let _ = write!(parameters, "-");
+                }
+            }
             let mut result_columns =
                 StackStr::<{ crate::storage::MAX_ROUTINE_ARGUMENTS * 396 }>::new();
-            if matches!(routine.kind, crate::storage::RoutineKind::TableFunction) {
+            if matches!(
+                routine.kind,
+                crate::storage::RoutineKind::TableFunction
+                    | crate::storage::RoutineKind::RecordFunction { .. }
+            ) {
                 let _ = write!(result_columns, " {}", routine.result_column_count);
                 for column in &routine.result_columns[..routine.result_column_count] {
                     let mut column_name = StackStr::<130>::new();
                     for byte in column.name.as_str().as_bytes() {
                         let _ = write!(column_name, "{byte:02x}");
+                    }
+                    if column.name.as_str().is_empty() {
+                        let _ = write!(column_name, "-");
                     }
                     let _ = write!(
                         result_columns,
@@ -4857,7 +4958,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rtn {} {} {} {} {} {} {}{} {} {} {} {} {} {}{}",
+                    "rtn {} {} {} {} {} {} {}{}{} {} {} {} {} {} {}{}",
                     routine.created_at,
                     owner.as_str(),
                     match routine.kind {
@@ -4867,6 +4968,7 @@ impl Checkpointer {
                             aggregate.result_type.ctype
                         }
                         crate::storage::RoutineKind::TableFunction
+                        | crate::storage::RoutineKind::RecordFunction { .. }
                         | crate::storage::RoutineKind::Trigger
                         | crate::storage::RoutineKind::Procedure => ColType::Text,
                     }
@@ -4876,6 +4978,7 @@ impl Checkpointer {
                     name.as_str(),
                     body.as_str(),
                     arguments.as_str(),
+                    parameters.as_str(),
                     u8::from(routine.attributes.strict),
                     routine.attributes.volatility.code(),
                     routine.attributes.parallel.code(),

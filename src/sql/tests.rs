@@ -13927,6 +13927,156 @@ fn sql_routine_lifecycle_is_transactional_and_durable() {
 }
 
 #[test]
+fn routine_parameter_contracts_drive_defaults_outputs_and_catalog_text() {
+    let mut config = test_config("routine_parameter_contracts");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("routine-parameter-contracts-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION f_defaults(a integer, b integer DEFAULT 2, c integer = 3) \
+             RETURNS integer LANGUAGE SQL AS 'SELECT a + b + c';
+         CREATE FUNCTION f_out(a integer, OUT doubled integer, OUT tripled integer) \
+             LANGUAGE SQL AS 'SELECT a * 2, a * 3';
+         CREATE FUNCTION f_variadic(prefix integer, VARIADIC vals integer[]) \
+             RETURNS integer LANGUAGE SQL AS 'SELECT prefix + cardinality(vals)';
+         CREATE FUNCTION f_named_rows(a integer, b integer DEFAULT 2) \
+             RETURNS TABLE(total integer) LANGUAGE SQL AS 'SELECT a + b';
+         CREATE FUNCTION f_variadic_rows(VARIADIC vals integer[]) \
+             RETURNS TABLE(total integer) LANGUAGE SQL AS 'SELECT cardinality(vals)';
+         CREATE TABLE procedure_log (a integer, b integer);
+         CREATE PROCEDURE p_defaults(a integer, b integer DEFAULT 2) \
+             LANGUAGE SQL AS 'INSERT INTO procedure_log VALUES (a, b)';
+         CREATE PROCEDURE p_out(IN a integer, OUT doubled integer, INOUT total integer, \
+                                IN b integer DEFAULT 2) \
+             LANGUAGE SQL AS 'SELECT a * 2, total + b';
+         CREATE PROCEDURE p_variadic(prefix integer, VARIADIC vals integer[]) \
+             LANGUAGE SQL AS 'INSERT INTO procedure_log VALUES (prefix, cardinality(vals))';
+         CALL p_defaults(3);
+         CALL p_defaults(b => 5, a => 4);
+         CALL p_variadic(7, 1, 2, 3);
+         CALL p_variadic(8, VARIADIC ARRAY[4, 5]);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT f_defaults(1), f_defaults(1, 10), f_defaults(1, 10, 20), \
+                f_defaults(c => 30, a => 1, b => 10); \
+         SELECT f_variadic(10, 1), f_variadic(10, 1, 2), \
+                f_variadic(10, VARIADIC ARRAY[1, 2, 3]); \
+         SELECT total FROM f_named_rows(b => 5, a => 3); \
+         SELECT total FROM f_variadic_rows(1, 2, 3); \
+         SELECT total FROM f_variadic_rows(VARIADIC ARRAY[1, 2]); \
+         SELECT (f_out(4)).doubled, (f_out(4)).tripled; \
+         SELECT pg_get_function_arguments('f_defaults(integer,integer,integer)'::regprocedure), \
+                pg_get_function_identity_arguments('f_out(integer)'::regprocedure), \
+                pg_get_function_result('f_out(integer)'::regprocedure); \
+         SELECT pronargdefaults, provariadic, proallargtypes::text, proargmodes::text, \
+                proargnames::text, proargdefaults::text, prosqlbody IS NULL \
+           FROM pg_proc WHERE proname = 'f_defaults'; \
+         SELECT pronargdefaults, provariadic, proallargtypes::text, proargmodes::text, \
+                proargnames::text, proargdefaults IS NULL, prosqlbody IS NULL \
+           FROM pg_proc WHERE proname = 'f_out'; \
+         SELECT pronargdefaults, provariadic, proallargtypes::text, proargmodes::text, \
+                proargnames::text \
+           FROM pg_proc WHERE proname = 'f_variadic'; \
+         CALL p_out(3, NULL, 10); \
+         SELECT a, b FROM procedure_log ORDER BY a;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "6|14|31|41",
+            "11|12|13",
+            "8",
+            "3",
+            "2",
+            "8|12",
+            "a integer, b integer DEFAULT 2, c integer DEFAULT 3|a integer, OUT doubled integer, OUT tripled integer|record",
+            "2|0|NULL|NULL|{a,b,c}|2, 3|t",
+            "0|0|{23,23,23}|{i,o,o}|{a,doubled,tripled}|t|t",
+            "0|23|{23,1007}|{i,v}|{prefix,vals}",
+            "6|12",
+            "3|2",
+            "4|5",
+            "7|3",
+            "8|2",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT f_defaults(c => 30, a => 1, b => 10)",
+        )),
+        [23]
+    );
+    assert_eq!(
+        row_description_type_oids(&describe_with(
+            &mut engine,
+            &mut budget,
+            "CALL p_out(3, NULL, 10)",
+        )),
+        [23, 23]
+    );
+    let omitted_variadic = run_with(&mut engine, &mut budget, "SELECT f_variadic(10)");
+    assert!(
+        String::from_utf8_lossy(&omitted_variadic).contains("42883"),
+        "{}",
+        String::from_utf8_lossy(&omitted_variadic)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    let recovered_output = run_with(
+        &mut recovered,
+        &mut budget,
+        "SELECT f_defaults(10), (f_out(5)).doubled, (f_out(5)).tripled; \
+         SELECT f_variadic(20, 1, 2), f_variadic(20, VARIADIC ARRAY[1, 2, 3]); \
+         SELECT total FROM f_named_rows(b => 7, a => 3); \
+         SELECT total FROM f_variadic_rows(1, 2, 3, 4); \
+         CALL p_out(4, 1 / 0, 20); \
+         CALL p_variadic(9, 1, 2, 3, 4); \
+         CALL p_defaults(6); \
+         SELECT a, b FROM procedure_log ORDER BY a; \
+         SELECT pg_get_function_arguments('f_defaults(integer,integer,integer)'::regprocedure);",
+    );
+    assert_eq!(
+        data_rows(&recovered_output),
+        [
+            "15|10|15",
+            "22|23",
+            "10",
+            "4",
+            "8|22",
+            "3|2",
+            "4|5",
+            "6|2",
+            "7|3",
+            "8|2",
+            "9|4",
+            "a integer, b integer DEFAULT 2, c integer DEFAULT 3",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered_output)
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn user_defined_aggregate_executes_typed_transition_final_and_ordering() {
     let mut config = test_config("user-defined-aggregate-execution");
     config.max_tables = 32;
@@ -18668,7 +18818,7 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
          CREATE TYPE routine_pair AS (value integer, label text); \
          CREATE FUNCTION echo_state(value routine_state) RETURNS routine_state LANGUAGE SQL AS 'SELECT $1'; \
          CREATE FUNCTION echo_count(value routine_count) RETURNS routine_count LANGUAGE SQL AS 'SELECT $1'; \
-         CREATE FUNCTION echo_counts(values routine_count[]) RETURNS routine_count[] LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE FUNCTION echo_counts(vals routine_count[]) RETURNS routine_count[] LANGUAGE SQL AS 'SELECT $1'; \
          CREATE FUNCTION echo_counts_unnamed(routine_count[]) RETURNS routine_count[] LANGUAGE SQL AS 'SELECT $1'; \
          CREATE FUNCTION echo_pair(value routine_pair) RETURNS routine_pair LANGUAGE SQL AS 'SELECT $1'; \
          CREATE FUNCTION routine_overload(value integer) RETURNS text LANGUAGE SQL AS 'SELECT ''integer'''; \
@@ -18811,7 +18961,7 @@ fn routines_retain_catalog_defined_signature_and_result_types() {
         data_rows(&moved_catalog),
         [
             "value routine_type_target.routine_count_moved|routine_type_target.routine_count_moved",
-            "values routine_type_target.routine_count_moved[]|routine_type_target.routine_count_moved[]",
+            "vals routine_type_target.routine_count_moved[]|routine_type_target.routine_count_moved[]",
         ],
         "{}",
         String::from_utf8_lossy(&moved_catalog)
@@ -18968,7 +19118,7 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
              CREATE DOMAIN recovered_count AS integer CHECK (VALUE > 0); \
              CREATE TYPE recovered_pair AS (value integer, label text); \
              CREATE FUNCTION recovered_state_echo(value recovered_state) RETURNS recovered_state LANGUAGE SQL AS 'SELECT $1'; \
-             CREATE FUNCTION recovered_counts_echo(values recovered_count[]) RETURNS recovered_count[] LANGUAGE SQL AS 'SELECT $1'; \
+             CREATE FUNCTION recovered_counts_echo(vals recovered_count[]) RETURNS recovered_count[] LANGUAGE SQL AS 'SELECT $1'; \
              CREATE FUNCTION recovered_pair_echo(value recovered_pair) RETURNS recovered_pair LANGUAGE SQL AS 'SELECT $1'; \
              CREATE FUNCTION recovered_overload(value integer) RETURNS text LANGUAGE SQL AS 'SELECT ''integer'''; \
              CREATE FUNCTION recovered_overload(value recovered_count) RETURNS text LANGUAGE SQL AS 'SELECT ''domain'''; \

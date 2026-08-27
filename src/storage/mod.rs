@@ -3506,6 +3506,7 @@ pub(crate) const MAX_DOMAINS: usize = 32;
 /// identity and body.
 pub(crate) const MAX_ROUTINE_ARGUMENTS: usize = 16;
 pub(crate) const ROUTINE_SQL_MAX: usize = VIEW_SQL_MAX;
+pub(crate) const ROUTINE_DEFAULT_MAX: usize = DEFAULT_EXPR_MAX;
 pub(crate) const AGGREGATE_INIT_MAX: usize = 256;
 /// User-defined routine OIDs occupy a stable, disjoint catalog range.
 pub(crate) const ROUTINE_OID_BASE: i32 = 100_000;
@@ -3543,6 +3544,76 @@ pub(crate) struct RoutineArgumentDef {
     /// The declared catalog type identity when this is not a built-in type.
     /// Slots are executor-local; this name is the durable routine contract.
     pub user_type: Option<UserTypeName>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutineParameterMode {
+    In {
+        default: Option<StackStr<ROUTINE_DEFAULT_MAX>>,
+    },
+    Out,
+    InOut {
+        default: Option<StackStr<ROUTINE_DEFAULT_MAX>>,
+    },
+    Variadic {
+        default: Option<StackStr<ROUTINE_DEFAULT_MAX>>,
+    },
+}
+
+impl RoutineParameterMode {
+    pub(crate) const fn is_input(self) -> bool {
+        !matches!(self, Self::Out)
+    }
+
+    pub(crate) const fn is_output(self) -> bool {
+        matches!(self, Self::Out | Self::InOut { .. })
+    }
+
+    pub(crate) const fn default(self) -> Option<StackStr<ROUTINE_DEFAULT_MAX>> {
+        match self {
+            Self::In { default } | Self::InOut { default } | Self::Variadic { default } => default,
+            Self::Out => None,
+        }
+    }
+
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::In { .. } => 0,
+            Self::Out => 1,
+            Self::InOut { .. } => 2,
+            Self::Variadic { .. } => 3,
+        }
+    }
+
+    pub(crate) const fn from_code(
+        code: u8,
+        default: Option<StackStr<ROUTINE_DEFAULT_MAX>>,
+    ) -> Option<Self> {
+        match code {
+            0 => Some(Self::In { default }),
+            1 if default.is_none() => Some(Self::Out),
+            2 => Some(Self::InOut { default }),
+            3 => Some(Self::Variadic { default }),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoutineParameterDef {
+    pub name: SqlName,
+    pub ctype: ColType,
+    pub user_type: Option<UserTypeName>,
+    pub mode: RoutineParameterMode,
+}
+
+impl RoutineParameterDef {
+    pub(crate) const EMPTY: Self = Self {
+        name: SqlName::EMPTY,
+        ctype: ColType::Text,
+        user_type: None,
+        mode: RoutineParameterMode::In { default: None },
+    };
 }
 
 /// PostgreSQL polymorphic pseudo-types are durable routine contracts, not
@@ -3835,6 +3906,8 @@ pub(crate) struct RoutineSpec {
     pub name: SqlName,
     pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub argument_count: usize,
+    pub parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
+    pub parameter_count: usize,
     pub kind: RoutineKind,
     pub result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub result_column_count: usize,
@@ -3851,8 +3924,17 @@ pub(crate) struct RoutineSpec {
     reason = "aggregate contracts stay inline and Copy; catalog heap indirection is forbidden"
 )]
 pub(crate) enum RoutineKind {
-    Function { result: RoutineResult },
-    SetFunction { result: RoutineResult },
+    Function {
+        result: RoutineResult,
+    },
+    SetFunction {
+        result: RoutineResult,
+    },
+    /// OUT/INOUT parameters form a named record. The set bit is part of the
+    /// kind, so a scalar record cannot enter a table-function execution path.
+    RecordFunction {
+        set_returning: bool,
+    },
     TableFunction,
     Trigger,
     Procedure,
@@ -4330,19 +4412,27 @@ impl RoutineKind {
     pub(crate) const fn function_result(self) -> Option<ColType> {
         match self {
             Self::Function { result } | Self::SetFunction { result } => Some(result.ctype),
-            Self::TableFunction => Some(ColType::Record),
+            Self::RecordFunction { .. } | Self::TableFunction => Some(ColType::Record),
             Self::Trigger | Self::Procedure | Self::Aggregate(_) => None,
         }
     }
 
     pub(crate) const fn is_set_returning(self) -> bool {
-        matches!(self, Self::SetFunction { .. } | Self::TableFunction)
+        matches!(
+            self,
+            Self::SetFunction { .. }
+                | Self::RecordFunction {
+                    set_returning: true
+                }
+                | Self::TableFunction
+        )
     }
 
     pub(crate) const fn catalog_kind(self) -> &'static str {
         match self {
             Self::Function { .. }
             | Self::SetFunction { .. }
+            | Self::RecordFunction { .. }
             | Self::TableFunction
             | Self::Trigger => "f",
             Self::Procedure => "p",
@@ -4358,6 +4448,12 @@ impl RoutineKind {
             Self::Procedure => 1,
             Self::Trigger => 4,
             Self::Aggregate(_) => 5,
+            Self::RecordFunction {
+                set_returning: false,
+            } => 6,
+            Self::RecordFunction {
+                set_returning: true,
+            } => 7,
         }
     }
 
@@ -4366,7 +4462,14 @@ impl RoutineKind {
             0 => Some(Self::Function { result }),
             1 => Some(Self::Procedure),
             2 => Some(Self::SetFunction { result }),
+            3 => Some(Self::TableFunction),
             4 => Some(Self::Trigger),
+            6 => Some(Self::RecordFunction {
+                set_returning: false,
+            }),
+            7 => Some(Self::RecordFunction {
+                set_returning: true,
+            }),
             _ => None,
         }
     }
@@ -4423,6 +4526,8 @@ pub(crate) struct RoutineDef {
     pub(crate) pending_definition: Option<PendingRoutineDefinition>,
     pub arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub argument_count: usize,
+    pub parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
+    pub parameter_count: usize,
     pub kind: RoutineKind,
     pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) result_column_count: usize,
@@ -4440,6 +4545,8 @@ pub(crate) struct PendingRoutineDefinition {
     pub(crate) txid: u32,
     pub(crate) arguments: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) argument_count: usize,
+    pub(crate) parameters: [RoutineParameterDef; MAX_ROUTINE_ARGUMENTS],
+    pub(crate) parameter_count: usize,
     pub(crate) kind: RoutineKind,
     pub(crate) result_columns: [RoutineArgumentDef; MAX_ROUTINE_ARGUMENTS],
     pub(crate) result_column_count: usize,
@@ -4456,6 +4563,8 @@ impl RoutineDef {
         pending_definition: None,
         arguments: [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
         argument_count: 0,
+        parameters: [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS],
+        parameter_count: 0,
         kind: RoutineKind::Function {
             result: RoutineResult::TEXT,
         },
@@ -4475,12 +4584,146 @@ impl RoutineDef {
         &self.arguments[..self.argument_count]
     }
 
+    pub(crate) fn parameters(&self) -> &[RoutineParameterDef] {
+        &self.parameters[..self.parameter_count]
+    }
+
+    pub(crate) fn required_argument_count(&self) -> usize {
+        self.parameters()
+            .iter()
+            .filter(|parameter| parameter.mode.is_input())
+            .take_while(|parameter| parameter.mode.default().is_none())
+            .count()
+    }
+
+    pub(crate) fn accepts_input_arity(&self, arity: usize) -> bool {
+        self.required_argument_count() <= arity && arity <= self.argument_count
+    }
+
+    pub(crate) fn parameter_for_input(&self, input_index: usize) -> Option<RoutineParameterDef> {
+        self.parameters()
+            .iter()
+            .copied()
+            .filter(|parameter| parameter.mode.is_input())
+            .nth(input_index)
+    }
+
+    /// Maps call-site argument positions to the declared input signature.
+    /// Missing slots are accepted only when the typed parameter owns a
+    /// default.
+    pub(crate) fn call_input_mapping(
+        &self,
+        argument_names: &[Option<&str>],
+        argument_count: usize,
+        explicit_variadic: bool,
+    ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
+        let variadic_index = self
+            .arguments()
+            .iter()
+            .enumerate()
+            .find_map(|(input_index, _)| {
+                matches!(
+                    self.parameter_for_input(input_index)?.mode,
+                    RoutineParameterMode::Variadic { .. }
+                )
+                .then_some(input_index)
+            });
+        if argument_count > MAX_ROUTINE_ARGUMENTS
+            || (argument_count > self.argument_count && variadic_index.is_none())
+            || (!argument_names.is_empty() && argument_names.len() != argument_count)
+            || explicit_variadic && !argument_names.is_empty()
+        {
+            return None;
+        }
+        let mut mapping = [u8::MAX; MAX_ROUTINE_ARGUMENTS];
+        let mut occupied = [false; MAX_ROUTINE_ARGUMENTS];
+        for (call_index, mapped_input) in mapping.iter_mut().enumerate().take(argument_count) {
+            let input_index = match argument_names.get(call_index).copied().flatten() {
+                None if !explicit_variadic
+                    && variadic_index.is_some_and(|variadic| call_index >= variadic) =>
+                {
+                    variadic_index?
+                }
+                None => call_index,
+                Some(name) => (0..self.argument_count).find(|&input_index| {
+                    self.parameter_for_input(input_index)
+                        .is_some_and(|parameter| parameter.name.as_str().eq_ignore_ascii_case(name))
+                })?,
+            };
+            let expanded_variadic =
+                !explicit_variadic && variadic_index == Some(input_index) && occupied[input_index];
+            if input_index >= self.argument_count || occupied[input_index] && !expanded_variadic {
+                return None;
+            }
+            occupied[input_index] = true;
+            *mapped_input = u8::try_from(input_index).ok()?;
+        }
+        for (input_index, occupied) in occupied.iter().enumerate().take(self.argument_count) {
+            if !occupied {
+                let mode = self.parameter_for_input(input_index)?.mode;
+                let _ = mode.default()?;
+            }
+        }
+        Some(mapping)
+    }
+
+    /// CALL syntax includes OUT placeholders even though overload identity and
+    /// execution inputs do not. This mapping marks those positions with
+    /// `u8::MAX` and maps IN/INOUT positions to the callable signature.
+    pub(crate) fn procedure_call_mapping(
+        &self,
+        argument_names: &[Option<&str>],
+        argument_count: usize,
+    ) -> Option<[u8; MAX_ROUTINE_ARGUMENTS]> {
+        if !matches!(self.kind, RoutineKind::Procedure)
+            || argument_count > self.parameter_count
+            || (!argument_names.is_empty() && argument_names.len() != argument_count)
+        {
+            return None;
+        }
+        let mut mapping = [u8::MAX; MAX_ROUTINE_ARGUMENTS];
+        let mut occupied = [false; MAX_ROUTINE_ARGUMENTS];
+        let mut input_of_parameter = [u8::MAX; MAX_ROUTINE_ARGUMENTS];
+        let mut input_index = 0usize;
+        for (parameter_index, parameter) in self.parameters().iter().enumerate() {
+            if parameter.mode.is_input() {
+                input_of_parameter[parameter_index] = u8::try_from(input_index).ok()?;
+                input_index += 1;
+            }
+        }
+        for (call_index, mapped_input) in mapping.iter_mut().enumerate().take(argument_count) {
+            let parameter_index = match argument_names.get(call_index).copied().flatten() {
+                None => call_index,
+                Some(name) => self
+                    .parameters()
+                    .iter()
+                    .position(|parameter| parameter.name.as_str().eq_ignore_ascii_case(name))?,
+            };
+            if occupied[parameter_index] {
+                return None;
+            }
+            occupied[parameter_index] = true;
+            *mapped_input = input_of_parameter[parameter_index];
+        }
+        for (parameter_index, occupied) in occupied.iter().enumerate().take(self.parameter_count) {
+            if !occupied {
+                let parameter = self.parameters[parameter_index];
+                if !parameter.mode.is_input() || parameter.mode.default().is_none() {
+                    return None;
+                }
+            }
+        }
+        Some(mapping)
+    }
+
     pub(crate) fn definition_for(&self, txid: u32) -> Self {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(*self, |pending| Self {
                 arguments: pending.arguments,
                 argument_count: pending.argument_count,
+                parameters: pending.parameters,
+                parameter_count: pending.parameter_count,
                 kind: pending.kind,
                 result_columns: pending.result_columns,
                 result_column_count: pending.result_column_count,
@@ -4492,14 +4735,24 @@ impl RoutineDef {
     }
 
     pub(crate) fn table_columns(&self) -> Option<&[RoutineArgumentDef]> {
-        matches!(self.kind, RoutineKind::TableFunction)
-            .then_some(&self.result_columns[..self.result_column_count])
+        matches!(
+            self.kind,
+            RoutineKind::TableFunction
+                | RoutineKind::RecordFunction {
+                    set_returning: true
+                }
+        )
+        .then_some(&self.result_columns[..self.result_column_count])
     }
 
     /// PostgreSQL exposes a single OUT column as the set element itself, not
     /// as a record that can be expanded with field selection or `.*`.
     pub(crate) fn record_result_columns(&self) -> Option<&[RoutineArgumentDef]> {
-        let columns = self.table_columns()?;
+        let columns = matches!(
+            self.kind,
+            RoutineKind::TableFunction | RoutineKind::RecordFunction { .. }
+        )
+        .then_some(&self.result_columns[..self.result_column_count])?;
         (columns.len() > 1).then_some(columns)
     }
 
@@ -18194,6 +18447,11 @@ impl Storage {
                     argument.ctype = rebind(self, argument.ctype, identity)?;
                 }
             }
+            for parameter in &mut routine.parameters[..routine.parameter_count] {
+                if let Some(identity) = parameter.user_type {
+                    parameter.ctype = rebind(self, parameter.ctype, identity)?;
+                }
+            }
             for column in &mut routine.result_columns[..routine.result_column_count] {
                 if let Some(identity) = column.user_type {
                     column.ctype = rebind(self, column.ctype, identity)?;
@@ -18217,7 +18475,10 @@ impl Storage {
                         moving.state_type.ctype = rebind(self, moving.state_type.ctype, identity)?;
                     }
                 }
-                RoutineKind::TableFunction | RoutineKind::Trigger | RoutineKind::Procedure => {}
+                RoutineKind::RecordFunction { .. }
+                | RoutineKind::TableFunction
+                | RoutineKind::Trigger
+                | RoutineKind::Procedure => {}
             }
             self.routines[slot] = routine;
         }
@@ -19249,6 +19510,15 @@ impl Storage {
             {
                 move_argument(column);
             }
+            for parameter in routine.parameters.iter_mut().take(routine.parameter_count) {
+                let mut argument = RoutineArgumentDef {
+                    name: parameter.name,
+                    ctype: parameter.ctype,
+                    user_type: parameter.user_type,
+                };
+                move_argument(&mut argument);
+                parameter.user_type = argument.user_type;
+            }
             match &mut routine.kind {
                 RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
                     move_result(result)
@@ -19272,6 +19542,15 @@ impl Storage {
                     .take(pending.result_column_count)
                 {
                     move_argument(column);
+                }
+                for parameter in pending.parameters.iter_mut().take(pending.parameter_count) {
+                    let mut argument = RoutineArgumentDef {
+                        name: parameter.name,
+                        ctype: parameter.ctype,
+                        user_type: parameter.user_type,
+                    };
+                    move_argument(&mut argument);
+                    parameter.user_type = argument.user_type;
                 }
                 match &mut pending.kind {
                     RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
@@ -19777,10 +20056,194 @@ impl Storage {
         argument_type_oids: &[i32],
         txid: u32,
     ) -> Option<usize> {
+        self.routine_slot_for_call_syntax_oids(name, argument_type_oids, false, txid)
+    }
+
+    pub(crate) fn routine_slot_for_call_syntax_oids(
+        &self,
+        name: &str,
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<usize> {
         if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS {
             return None;
         }
-        self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Scalar)
+        if !explicit_variadic
+            && let Some(slot) = self.routine_slot_on_path_oids(
+                name,
+                argument_type_oids,
+                txid,
+                RoutineCallKind::Scalar,
+            )
+        {
+            return Some(slot);
+        }
+        self.variadic_routine_slot_on_path_oids(
+            name,
+            argument_type_oids,
+            explicit_variadic,
+            txid,
+            RoutineCallKind::Scalar,
+        )
+    }
+
+    pub(crate) fn routine_slot_for_function_call_syntax_oids(
+        &self,
+        name: &str,
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<usize> {
+        if !explicit_variadic
+            && let Some(slot) =
+                self.routine_slot_for_function_call_oids(name, argument_type_oids, txid)
+        {
+            return Some(slot);
+        }
+        self.routine_slot_for_call_syntax_oids(name, argument_type_oids, explicit_variadic, txid)
+            .or_else(|| {
+                self.variadic_routine_slot_on_path_oids(
+                    name,
+                    argument_type_oids,
+                    explicit_variadic,
+                    txid,
+                    RoutineCallKind::Set,
+                )
+            })
+    }
+
+    fn variadic_routine_slot_on_path_oids(
+        &self,
+        name: &str,
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+        kind: RoutineCallKind,
+    ) -> Option<usize> {
+        let resolve = |schema: &str, routine_name: &str| {
+            let mut candidates = self
+                .routines
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, routine)| {
+                    let definition = routine.definition_for(txid);
+                    if !routine.visible_to(txid)
+                        || !kind.accepts(definition.kind)
+                        || definition.schema_for(txid).as_str() != schema
+                        || definition.name_for(txid).as_str() != routine_name
+                    {
+                        return None;
+                    }
+                    let variadic_index = definition.arguments().len().checked_sub(1)?;
+                    let variadic_parameter = definition.parameter_for_input(variadic_index)?;
+                    let RoutineParameterMode::Variadic { .. } = variadic_parameter.mode else {
+                        return None;
+                    };
+                    let ColType::Array(element) = variadic_parameter.ctype else {
+                        return None;
+                    };
+                    let fixed = &definition.arguments()[..variadic_index];
+                    if argument_type_oids.len() < fixed.len() + usize::from(!explicit_variadic)
+                        || explicit_variadic && argument_type_oids.len() != fixed.len() + 1
+                        || !fixed.iter().zip(argument_type_oids).all(|(argument, oid)| {
+                            self.routine_argument_oid(argument, txid) == Some(*oid)
+                        })
+                    {
+                        return None;
+                    }
+                    let expected = if explicit_variadic {
+                        self.routine_argument_oid(&definition.arguments()[variadic_index], txid)?
+                    } else {
+                        element.element_oid()
+                    };
+                    argument_type_oids[variadic_index..]
+                        .iter()
+                        .all(|oid| *oid == expected)
+                        .then_some(slot)
+                });
+            let first = candidates.next();
+            if first.is_some() && candidates.next().is_none() {
+                first
+            } else {
+                None
+            }
+        };
+        if let Some((schema, routine_name)) = name.split_once('.') {
+            return resolve(schema, routine_name);
+        }
+        self.path.entries().iter().find_map(|entry| {
+            let PathEntry::Schema(slot) = entry else {
+                return None;
+            };
+            resolve(self.schemas[*slot as usize].name.as_str(), name)
+        })
+    }
+
+    pub(crate) fn routine_slot_for_named_call_oids(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) -> Option<usize> {
+        if argument_type_oids.len() > MAX_ROUTINE_ARGUMENTS
+            || argument_names.len() != argument_type_oids.len()
+        {
+            return None;
+        }
+        let resolve = |schema: &str, routine_name: &str| {
+            self.routine_slot_in_named_oids(
+                schema,
+                routine_name,
+                argument_names,
+                argument_type_oids,
+                txid,
+                RoutineCallKind::Scalar,
+            )
+        };
+        if let Some((schema, routine_name)) = name.split_once('.') {
+            return resolve(schema, routine_name);
+        }
+        self.path.entries().iter().find_map(|entry| {
+            let PathEntry::Schema(slot) = entry else {
+                return None;
+            };
+            resolve(self.schemas[*slot as usize].name.as_str(), name)
+        })
+    }
+
+    pub(crate) fn routine_slot_for_named_function_call_oids(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) -> Option<usize> {
+        if let Some(slot) =
+            self.routine_slot_for_named_call_oids(name, argument_names, argument_type_oids, txid)
+        {
+            return Some(slot);
+        }
+        let resolve = |schema: &str, routine_name: &str| {
+            self.routine_slot_in_named_oids(
+                schema,
+                routine_name,
+                argument_names,
+                argument_type_oids,
+                txid,
+                RoutineCallKind::Set,
+            )
+        };
+        if let Some((schema, routine_name)) = name.split_once('.') {
+            return resolve(schema, routine_name);
+        }
+        self.path.entries().iter().find_map(|entry| {
+            let PathEntry::Schema(slot) = entry else {
+                return None;
+            };
+            resolve(self.schemas[*slot as usize].name.as_str(), name)
+        })
     }
 
     pub(crate) fn routine_for_call_oids(
@@ -19831,6 +20294,69 @@ impl Storage {
             .and_then(|slot| self.routine_for_bound_call(slot, argument_type_oids, txid))
     }
 
+    pub(crate) fn function_for_call_syntax_oids(
+        &self,
+        name: &str,
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<RoutineDef> {
+        if !explicit_variadic
+            && let Some(routine) = self.function_for_call_oids(name, argument_type_oids, txid)
+        {
+            return Some(routine);
+        }
+        let slot = self
+            .variadic_routine_slot_on_path_oids(
+                name,
+                argument_type_oids,
+                explicit_variadic,
+                txid,
+                RoutineCallKind::Scalar,
+            )
+            .or_else(|| {
+                self.variadic_routine_slot_on_path_oids(
+                    name,
+                    argument_type_oids,
+                    explicit_variadic,
+                    txid,
+                    RoutineCallKind::Set,
+                )
+            })?;
+        let routine = self.routine_for(slot, txid);
+        let mut declared_oids = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+        for (index, argument) in routine.arguments().iter().enumerate() {
+            declared_oids[index] = self.routine_argument_oid(argument, txid)?;
+        }
+        self.routine_for_bound_call(slot, &declared_oids[..routine.argument_count], txid)
+    }
+
+    pub(crate) fn function_for_named_call_oids(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) -> Option<RoutineDef> {
+        let slot = self.routine_slot_for_named_function_call_oids(
+            name,
+            argument_names,
+            argument_type_oids,
+            txid,
+        )?;
+        let routine = self.routine_for(slot, txid);
+        let mapping =
+            routine.call_input_mapping(argument_names, argument_type_oids.len(), false)?;
+        let mut completed = [crate::sql::types::oid::UNKNOWN; MAX_ROUTINE_ARGUMENTS];
+        for (input_index, argument) in routine.arguments().iter().enumerate() {
+            completed[input_index] = self.routine_argument_oid(argument, txid)?;
+        }
+        for (call_index, oid) in argument_type_oids.iter().enumerate() {
+            completed[usize::from(mapping[call_index])] = *oid;
+        }
+        self.routine_for_bound_call(slot, &completed[..routine.argument_count], txid)
+    }
+
     pub(crate) fn routine_for_bound_call(
         &self,
         slot: usize,
@@ -19838,17 +20364,19 @@ impl Storage {
         txid: u32,
     ) -> Option<RoutineDef> {
         let mut routine = self.routine_for(slot, txid);
-        if routine.argument_count == argument_type_oids.len()
-            && routine
-                .arguments()
+        if routine.accepts_input_arity(argument_type_oids.len())
+            && routine.arguments()[..argument_type_oids.len()]
                 .iter()
                 .zip(argument_type_oids)
                 .all(|(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid))
         {
             return Some(routine);
         }
-        let binding =
-            self.polymorphic_call_binding(routine.arguments(), argument_type_oids, txid)?;
+        let binding = self.polymorphic_call_binding(
+            &routine.arguments()[..argument_type_oids.len()],
+            argument_type_oids,
+            txid,
+        )?;
         for argument in routine.arguments.iter_mut().take(routine.argument_count) {
             let Some(kind) = argument.polymorphic_type() else {
                 continue;
@@ -19856,6 +20384,14 @@ impl Storage {
             let concrete = self.routine_result_for_oid(binding.concrete_oid(kind)?, txid)?;
             argument.ctype = concrete.ctype;
             argument.user_type = concrete.user_type;
+        }
+        for parameter in routine.parameters.iter_mut().take(routine.parameter_count) {
+            let Some(kind) = polymorphic_type(parameter.ctype, parameter.user_type) else {
+                continue;
+            };
+            let concrete = self.routine_result_for_oid(binding.concrete_oid(kind)?, txid)?;
+            parameter.ctype = concrete.ctype;
+            parameter.user_type = concrete.user_type;
         }
         for column in routine
             .result_columns
@@ -19887,7 +20423,10 @@ impl Storage {
                     resolve(&mut moving.state_type)?;
                 }
             }
-            RoutineKind::TableFunction | RoutineKind::Trigger | RoutineKind::Procedure => {}
+            RoutineKind::RecordFunction { .. }
+            | RoutineKind::TableFunction
+            | RoutineKind::Trigger
+            | RoutineKind::Procedure => {}
         }
         Some(routine)
     }
@@ -19919,6 +20458,7 @@ impl Storage {
                 routine.kind,
                 RoutineKind::Function { .. }
                     | RoutineKind::SetFunction { .. }
+                    | RoutineKind::RecordFunction { .. }
                     | RoutineKind::TableFunction
             )
         })
@@ -19935,6 +20475,7 @@ impl Storage {
                 routine.kind,
                 RoutineKind::Function { .. }
                     | RoutineKind::SetFunction { .. }
+                    | RoutineKind::RecordFunction { .. }
                     | RoutineKind::TableFunction
             ) && routine.attributes.volatility == RoutineVolatility::Volatile
         })
@@ -19952,7 +20493,7 @@ impl Storage {
                 let definition = routine.definition_for(txid);
                 routine.visible_to(txid)
                     && accepts(definition)
-                    && definition.argument_count == arity
+                    && definition.accepts_input_arity(arity)
                     && definition.schema_for(txid).as_str() == schema
                     && definition.name_for(txid).as_str() == routine_name
             })
@@ -19990,10 +20531,10 @@ impl Storage {
     ) -> Option<i32> {
         let result = match routine.kind {
             RoutineKind::Function { result } | RoutineKind::SetFunction { result } => result,
-            RoutineKind::TableFunction
-            | RoutineKind::Trigger
-            | RoutineKind::Procedure
-            | RoutineKind::Aggregate(_) => {
+            RoutineKind::RecordFunction { .. } | RoutineKind::TableFunction => {
+                return Some(crate::sql::types::oid::RECORD);
+            }
+            RoutineKind::Trigger | RoutineKind::Procedure | RoutineKind::Aggregate(_) => {
                 return None;
             }
         };
@@ -20007,6 +20548,95 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         self.routine_slot_on_path_oids(name, argument_type_oids, txid, RoutineCallKind::Procedure)
+    }
+
+    pub(crate) fn procedure_slot_for_call_syntax_oids(
+        &self,
+        name: &str,
+        argument_type_oids: &[i32],
+        explicit_variadic: bool,
+        txid: u32,
+    ) -> Option<usize> {
+        if !explicit_variadic
+            && let Some(slot) = self.procedure_slot_for_call_oids(name, argument_type_oids, txid)
+        {
+            return Some(slot);
+        }
+        self.variadic_routine_slot_on_path_oids(
+            name,
+            argument_type_oids,
+            explicit_variadic,
+            txid,
+            RoutineCallKind::Procedure,
+        )
+    }
+
+    pub(crate) fn procedure_slot_for_named_call_oids(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        txid: u32,
+    ) -> Option<usize> {
+        let resolve = |schema: &str, routine_name: &str| {
+            self.routine_slot_in_named_oids(
+                schema,
+                routine_name,
+                argument_names,
+                argument_type_oids,
+                txid,
+                RoutineCallKind::Procedure,
+            )
+        };
+        if let Some((schema, routine_name)) = name.split_once('.') {
+            return resolve(schema, routine_name);
+        }
+        self.path.entries().iter().find_map(|entry| {
+            let PathEntry::Schema(slot) = entry else {
+                return None;
+            };
+            resolve(self.schemas[*slot as usize].name.as_str(), name)
+        })
+    }
+
+    pub(crate) fn procedure_slot_for_call_shape(
+        &self,
+        name: &str,
+        argument_names: &[Option<&str>],
+        argument_count: usize,
+        txid: u32,
+    ) -> Option<usize> {
+        let resolve = |schema: &str, routine_name: &str| {
+            let mut candidates = self
+                .routines
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, routine)| {
+                    let definition = routine.definition_for(txid);
+                    (routine.visible_to(txid)
+                        && definition.schema_for(txid).as_str() == schema
+                        && definition.name_for(txid).as_str() == routine_name
+                        && definition
+                            .procedure_call_mapping(argument_names, argument_count)
+                            .is_some())
+                    .then_some(slot)
+                });
+            let first = candidates.next();
+            if first.is_some() && candidates.next().is_none() {
+                first
+            } else {
+                None
+            }
+        };
+        if let Some((schema, routine_name)) = name.split_once('.') {
+            return resolve(schema, routine_name);
+        }
+        self.path.entries().iter().find_map(|entry| {
+            let PathEntry::Schema(slot) = entry else {
+                return None;
+            };
+            resolve(self.schemas[*slot as usize].name.as_str(), name)
+        })
     }
 
     pub(crate) fn trigger_slot_for_call(&self, name: &str, txid: u32) -> Option<usize> {
@@ -20075,9 +20705,8 @@ impl Storage {
                 && kind.accepts(definition.kind)
                 && definition.schema_for(txid).as_str() == schema
                 && definition.name_for(txid).as_str() == name
-                && definition.argument_count == argument_types.len()
-                && definition
-                    .arguments()
+                && definition.accepts_input_arity(argument_types.len())
+                && definition.arguments()[..argument_types.len()]
                     .iter()
                     .zip(argument_types)
                     .all(|(parameter, value)| parameter.ctype == *value)
@@ -20104,19 +20733,112 @@ impl Storage {
                         |(argument, oid)| self.routine_argument_oid(argument, txid) == Some(*oid),
                     )
             });
-        exact.or_else(|| {
-            self.routines.iter().position(|routine| {
+        if exact.is_some() {
+            return exact;
+        }
+        let concrete = self
+            .routines
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, routine)| {
                 let definition = routine.definition_for(txid);
-                routine.visible_to(txid)
+                (routine.visible_to(txid)
                     && kind.accepts(definition.kind)
                     && definition.schema_for(txid).as_str() == schema
                     && definition.name_for(txid).as_str() == name
-                    && definition.argument_count == argument_type_oids.len()
+                    && definition.accepts_input_arity(argument_type_oids.len())
+                    && definition.arguments()[..argument_type_oids.len()]
+                        .iter()
+                        .zip(argument_type_oids)
+                        .all(|(argument, oid)| {
+                            self.routine_argument_oid(argument, txid) == Some(*oid)
+                        }))
+                .then_some(slot)
+            });
+        let mut concrete = concrete;
+        let first = concrete.next();
+        if first.is_some() && concrete.next().is_none() {
+            return first;
+        }
+        let polymorphic = self
+            .routines
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, routine)| {
+                let definition = routine.definition_for(txid);
+                (routine.visible_to(txid)
+                    && kind.accepts(definition.kind)
+                    && definition.schema_for(txid).as_str() == schema
+                    && definition.name_for(txid).as_str() == name
+                    && definition.accepts_input_arity(argument_type_oids.len())
                     && self
-                        .polymorphic_call_binding(definition.arguments(), argument_type_oids, txid)
-                        .is_some()
-            })
-        })
+                        .polymorphic_call_binding(
+                            &definition.arguments()[..argument_type_oids.len()],
+                            argument_type_oids,
+                            txid,
+                        )
+                        .is_some())
+                .then_some(slot)
+            });
+        let mut polymorphic = polymorphic;
+        let first = polymorphic.next();
+        if first.is_some() && polymorphic.next().is_none() {
+            first
+        } else {
+            None
+        }
+    }
+
+    fn routine_slot_in_named_oids(
+        &self,
+        schema: &str,
+        name: &str,
+        argument_names: &[Option<&str>],
+        argument_type_oids: &[i32],
+        txid: u32,
+        call_kind: RoutineCallKind,
+    ) -> Option<usize> {
+        let matches = |routine: &RoutineDef, polymorphic: bool| {
+            let definition = routine.definition_for(txid);
+            if !routine.visible_to(txid)
+                || !call_kind.accepts(definition.kind)
+                || definition.schema_for(txid).as_str() != schema
+                || definition.name_for(txid).as_str() != name
+            {
+                return false;
+            }
+            let Some(mapping) =
+                definition.call_input_mapping(argument_names, argument_type_oids.len(), false)
+            else {
+                return false;
+            };
+            let mut binding = PolymorphicBinding::EMPTY;
+            let mut saw_polymorphic = false;
+            for (call_index, actual_oid) in argument_type_oids.iter().enumerate() {
+                let argument = definition.arguments[usize::from(mapping[call_index])];
+                if let Some(kind) = argument.polymorphic_type() {
+                    if !polymorphic || binding.bind(kind, *actual_oid).is_none() {
+                        return false;
+                    }
+                    saw_polymorphic = true;
+                } else if self.routine_argument_oid(&argument, txid) != Some(*actual_oid) {
+                    return false;
+                }
+            }
+            polymorphic == saw_polymorphic
+        };
+        for polymorphic in [false, true] {
+            let mut candidates = self
+                .routines
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, routine)| matches(routine, polymorphic).then_some(slot));
+            let first = candidates.next();
+            if first.is_some() && candidates.next().is_none() {
+                return first;
+            }
+        }
+        None
     }
 
     fn polymorphic_call_binding(
@@ -20445,18 +21167,57 @@ impl Storage {
             name,
             arguments,
             argument_count,
+            parameters,
+            parameter_count,
             kind,
             result_columns,
             result_column_count,
             attributes,
             body,
         } = spec;
+        if parameter_count > parameters.len()
+            || parameters[..parameter_count]
+                .iter()
+                .filter(|parameter| parameter.mode.is_input())
+                .count()
+                != argument_count
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "routine parameter contract does not match its input signature"
+            ));
+        }
+        let output_parameter_count = parameters[..parameter_count]
+            .iter()
+            .filter(|parameter| parameter.mode.is_output())
+            .count();
+        let mut saw_default = false;
+        let mut saw_variadic = false;
+        for parameter in &parameters[..parameter_count] {
+            if saw_variadic && !matches!(parameter.mode, RoutineParameterMode::Out) {
+                return Err(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "VARIADIC parameter must be the last input parameter"
+                ));
+            }
+            if parameter.mode.is_input() {
+                if parameter.mode.default().is_some() {
+                    saw_default = true;
+                } else if saw_default {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "input parameters after one with a default value must also have defaults"
+                    ));
+                }
+            }
+            saw_variadic |= matches!(parameter.mode, RoutineParameterMode::Variadic { .. });
+        }
         match kind {
             RoutineKind::TableFunction => {
                 if result_column_count == 0 || result_column_count > result_columns.len() {
                     return Err(sql_err!(
                         sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "table function must have between one and {} result columns",
+                        "record-returning function must have between one and {} result columns",
                         result_columns.len()
                     ));
                 }
@@ -20471,27 +21232,40 @@ impl Storage {
                 {
                     return Err(sql_err!(
                         sqlstate::INVALID_FUNCTION_DEFINITION,
-                        "table function result column names must be distinct"
+                        "routine result column names must be distinct"
                     ));
                 }
             }
-            RoutineKind::Function { .. }
-            | RoutineKind::SetFunction { .. }
-            | RoutineKind::Trigger
-            | RoutineKind::Procedure
-            | RoutineKind::Aggregate(_)
+            RoutineKind::RecordFunction { .. }
+                if result_column_count < 2
+                    || result_column_count != output_parameter_count
+                    || result_column_count > result_columns.len() =>
+            {
+                return Err(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "record function result contract does not match its output parameters"
+                ));
+            }
+            RoutineKind::RecordFunction { .. } => {}
+            RoutineKind::Function { .. } | RoutineKind::SetFunction { .. }
+                if result_column_count != 0
+                    && (result_column_count != 1 || output_parameter_count != 1) =>
+            {
+                return Err(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "scalar function result contract does not match its output parameter"
+                ));
+            }
+            RoutineKind::Function { .. } | RoutineKind::SetFunction { .. } => {}
+            RoutineKind::Trigger | RoutineKind::Procedure | RoutineKind::Aggregate(_)
                 if result_column_count != 0 =>
             {
                 return Err(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "only table functions may define result columns"
+                    "routine kind cannot define result columns"
                 ));
             }
-            RoutineKind::Function { .. }
-            | RoutineKind::SetFunction { .. }
-            | RoutineKind::Trigger
-            | RoutineKind::Procedure
-            | RoutineKind::Aggregate(_) => {}
+            RoutineKind::Trigger | RoutineKind::Procedure | RoutineKind::Aggregate(_) => {}
         }
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.routines.iter().find_map(|routine| {
@@ -20560,6 +21334,8 @@ impl Storage {
             pending_definition: None,
             arguments,
             argument_count,
+            parameters,
+            parameter_count,
             kind,
             result_columns,
             result_column_count,
@@ -20610,6 +21386,8 @@ impl Storage {
         {
             routine.arguments = pending.arguments;
             routine.argument_count = pending.argument_count;
+            routine.parameters = pending.parameters;
+            routine.parameter_count = pending.parameter_count;
             routine.kind = pending.kind;
             routine.result_columns = pending.result_columns;
             routine.result_column_count = pending.result_column_count;
@@ -21429,6 +22207,8 @@ impl Storage {
             if self.routines[slot].created_at == definition.created_at {
                 self.routines[slot].arguments = definition.arguments;
                 self.routines[slot].argument_count = definition.argument_count;
+                self.routines[slot].parameters = definition.parameters;
+                self.routines[slot].parameter_count = definition.parameter_count;
                 self.routines[slot].kind = definition.kind;
                 self.routines[slot].result_columns = definition.result_columns;
                 self.routines[slot].result_column_count = definition.result_column_count;
@@ -21451,6 +22231,8 @@ impl Storage {
                 name: definition.name,
                 arguments: definition.arguments,
                 argument_count: definition.argument_count,
+                parameters: definition.parameters,
+                parameter_count: definition.parameter_count,
                 kind: definition.kind,
                 result_columns: definition.result_columns,
                 result_column_count: definition.result_column_count,

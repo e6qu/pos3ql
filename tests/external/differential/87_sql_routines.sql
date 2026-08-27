@@ -54,6 +54,32 @@ CREATE FUNCTION routine_answer() RETURNS integer LANGUAGE SQL AS 'SELECT 42';
 CREATE FUNCTION routine_increment(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1 + 1';
 
 SELECT routine_answer(), routine_increment(41);
+CREATE FUNCTION routine_defaults(a integer, b integer DEFAULT 2, c integer = 3)
+  RETURNS integer LANGUAGE SQL AS 'SELECT a + b + c';
+CREATE FUNCTION routine_output(a integer, OUT doubled integer, OUT tripled integer)
+  LANGUAGE SQL AS 'SELECT a * 2, a * 3';
+CREATE FUNCTION routine_variadic(prefix integer, VARIADIC vals integer[])
+  RETURNS integer LANGUAGE SQL AS 'SELECT prefix + cardinality(vals)';
+CREATE FUNCTION routine_named_rows(a integer, b integer DEFAULT 2)
+  RETURNS TABLE(total integer) LANGUAGE SQL AS 'SELECT a + b';
+CREATE FUNCTION routine_variadic_rows(VARIADIC vals integer[])
+  RETURNS TABLE(total integer) LANGUAGE SQL AS 'SELECT cardinality(vals)';
+SELECT routine_defaults(1), routine_defaults(1, 10),
+       routine_defaults(c => 30, a => 1, b => 10);
+SELECT (routine_output(4)).doubled, (routine_output(4)).tripled;
+SELECT routine_variadic(10, 1), routine_variadic(10, 1, 2),
+       routine_variadic(10, VARIADIC ARRAY[1, 2, 3]);
+SELECT total FROM routine_named_rows(b => 5, a => 3);
+SELECT total FROM routine_variadic_rows(1, 2, 3);
+SELECT total FROM routine_variadic_rows(VARIADIC ARRAY[1, 2]);
+SELECT pg_get_function_arguments('routine_defaults(integer,integer,integer)'::regprocedure),
+       pg_get_function_identity_arguments('routine_output(integer)'::regprocedure),
+       pg_get_function_result('routine_output(integer)'::regprocedure);
+SELECT pronargdefaults, provariadic, proallargtypes::text, proargmodes::text,
+       proargnames::text, proargdefaults IS NULL, prosqlbody IS NULL
+  FROM pg_proc
+ WHERE proname IN ('routine_defaults', 'routine_output', 'routine_variadic')
+ ORDER BY proname;
 CREATE FUNCTION routine_multi_query_value(integer) RETURNS integer LANGUAGE SQL
   AS 'SELECT 1 / $1 UNION ALL SELECT 2 / $1; WITH routine_input AS (SELECT $1 AS value), derived_input AS (SELECT value + 1 AS value FROM routine_input) SELECT value + 1 FROM derived_input';
 CREATE FUNCTION routine_multi_query_pairs(integer) RETURNS TABLE (routine_id integer, routine_value integer) LANGUAGE SQL
@@ -166,6 +192,11 @@ SELECT routine_answer();
 
 DROP FUNCTION routine_increment(integer);
 DROP FUNCTION routine_answer();
+DROP FUNCTION routine_defaults(integer, integer, integer);
+DROP FUNCTION routine_output(integer);
+DROP FUNCTION routine_variadic(integer, integer[]);
+DROP FUNCTION routine_named_rows(integer, integer);
+DROP FUNCTION routine_variadic_rows(integer[]);
 DROP FUNCTION routine_lookup_value(integer);
 DROP FUNCTION routine_nested_value(integer);
 DROP FUNCTION routine_values_from(integer);

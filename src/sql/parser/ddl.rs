@@ -19,13 +19,13 @@ use crate::sql::ast::{
     ExtensionMemberIdentity, ExtensionRelationKind, IndexBuildMode, IndexStorageOptionNames,
     IndexStorageOptions, IndexTargetScope, PartitionBound, PartitionClause, PartitionStrategy,
     PolicyCommand, PolicyExpression, PolicyIdentity, PolicyPermissiveness, PolicyRole,
-    PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineCreateKind,
-    RoutineIdentity, RoutineParallel, RoutineTargetKind, StatisticsExpression, StatisticsKey,
-    StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget, SubscriptionBehavior,
-    SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName,
-    SubscriptionSlotPlan, SubscriptionStreaming, SubscriptionSynchronousCommit,
-    TablespaceOptionNames, TablespaceOptions, TriggerEvent, TriggerIdentity, TriggerKind,
-    TriggerTiming, TriggerTransitionTables, ViewSecurity,
+    PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineArgumentMode,
+    RoutineCreateKind, RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind,
+    StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName,
+    StatisticsTarget, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
+    SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions, TriggerEvent,
+    TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables, ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -847,13 +847,17 @@ impl<'a> Parser<'a> {
             }
             _ => true,
         };
-        let first = self.type_name()?;
-        let argument_type = if !matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
-            // The first identifier was the optional argument name. It cannot
-            // be retained in a routine identity, so parse and return the type.
-            self.type_name()?
+        let mark = self.lexer.mark();
+        let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+        let candidate_type = self.type_name()?;
+        let argument_type = if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
+            candidate_type
         } else {
-            first
+            self.lexer.reset(mark);
+            self.peeked = saved_peeked;
+            self.peek_at = saved_peek_at;
+            let _ = self.type_function_ident("routine argument name")?;
+            self.type_name()?
         };
         Ok((argument_type, input))
     }
@@ -1636,8 +1640,77 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// SQL-language routine definition. Its parsed kind makes omitting a
-    /// function return type or assigning one to a procedure impossible.
+    fn routine_argument(&mut self) -> Result<RoutineArgument<'a>, ParseError> {
+        #[derive(Clone, Copy)]
+        enum WrittenMode {
+            In,
+            Out,
+            InOut,
+            Variadic,
+        }
+
+        let written_mode = if self.eat_ident("in")? {
+            WrittenMode::In
+        } else if self.eat_ident("out")? {
+            WrittenMode::Out
+        } else if self.eat_ident("inout")? {
+            WrittenMode::InOut
+        } else if self.eat_ident("variadic")? {
+            WrittenMode::Variadic
+        } else {
+            WrittenMode::In
+        };
+
+        // A parameter name and a user type name occupy the same lexical
+        // category. Parse a type first and keep it only when the next token is
+        // a parameter boundary; otherwise restore and parse `name type`.
+        let mark = self.lexer.mark();
+        let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
+        let candidate_type = self.type_name()?;
+        let candidate_is_complete = matches!(
+            self.peeked,
+            Tok::Op("," | ")" | "=") | Tok::Ident("default")
+        );
+        let (name, type_name) = if candidate_is_complete {
+            (None, candidate_type)
+        } else {
+            self.lexer.reset(mark);
+            self.peeked = saved_peeked;
+            self.peek_at = saved_peek_at;
+            let name = self.type_function_ident("routine argument name")?;
+            (Some(name), self.type_name()?)
+        };
+
+        let has_default = self.eat_ident("default")? || self.eat_op("=")?;
+        let default_text = if has_default {
+            let start = self.peek_at;
+            let _ = self.expression(0)?;
+            Some(self.arena_str(self.text[start..self.peek_at].trim_end())?)
+        } else {
+            None
+        };
+        let mode = match written_mode {
+            WrittenMode::In => RoutineArgumentMode::In { default_text },
+            WrittenMode::Out if default_text.is_none() => RoutineArgumentMode::Out,
+            WrittenMode::Out => {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "only input parameters can have default values"),
+                    sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                });
+            }
+            WrittenMode::InOut => RoutineArgumentMode::InOut { default_text },
+            WrittenMode::Variadic => RoutineArgumentMode::Variadic { default_text },
+        };
+        Ok(RoutineArgument {
+            mode,
+            name,
+            type_name,
+        })
+    }
+
+    /// SQL-language routine definition. The parsed parameter modes separate
+    /// call identity from output shape before catalog resolution.
     fn create_routine(&mut self, or_replace: bool, function: bool) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name(if function {
             "function name"
@@ -1646,32 +1719,47 @@ impl<'a> Parser<'a> {
         })?;
         self.expect_op("(")?;
         let mut arguments = [RoutineArgument {
-            name: "",
+            mode: RoutineArgumentMode::In { default_text: None },
+            name: None,
             type_name: "",
         }; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut count = 0;
+        let mut saw_default = false;
+        let mut saw_variadic = false;
+        let mut output_count = 0usize;
         if !self.eat_op(")")? {
             loop {
                 if count == arguments.len() {
                     return Err(self.limit("function arguments", arguments.len()));
                 }
-                let first = self.any_ident("function argument")?;
-                let type_name = if self.peeked == Tok::Op("[") {
-                    self.advance()?;
-                    self.expect_op("]")?;
-                    while self.peeked == Tok::Op("[") {
-                        self.advance()?;
-                        self.expect_op("]")?;
+                let argument = self.routine_argument()?;
+                if saw_variadic && !matches!(argument.mode, RoutineArgumentMode::Out) {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "VARIADIC parameter must be the last input parameter"
+                        ),
+                        sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                    });
+                }
+                if argument.mode.is_input() {
+                    if argument.mode.default_text().is_some() {
+                        saw_default = true;
+                    } else if saw_default {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                96,
+                                "input parameters after one with a default value must also have defaults"
+                            ),
+                            sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                        });
                     }
-                    self.arena_str(stack_format!(132, "{}[]", first).as_str())?
-                } else if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
-                    first
-                } else {
-                    let type_name = self.type_name()?;
-                    arguments[count].name = first;
-                    type_name
-                };
-                arguments[count].type_name = type_name;
+                }
+                saw_variadic |= matches!(argument.mode, RoutineArgumentMode::Variadic { .. });
+                output_count += usize::from(argument.mode.is_output());
+                arguments[count] = argument;
                 count += 1;
                 if self.eat_op(")")? {
                     break;
@@ -1680,12 +1768,25 @@ impl<'a> Parser<'a> {
             }
         }
         let kind = if function {
-            self.expect_ident("returns")?;
-            if self.eat_ident("trigger")? {
+            let has_returns = self.eat_ident("returns")?;
+            if has_returns && self.eat_ident("trigger")? {
+                if output_count != 0 {
+                    return Err(self.err_here("trigger functions cannot have OUT parameters"));
+                }
                 RoutineCreateKind::Trigger
-            } else if self.eat_ident("table")? {
+            } else if has_returns && self.eat_ident("table")? {
+                if output_count != 0 {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "OUT and INOUT arguments cannot be used with RETURNS TABLE"
+                        ),
+                        sqlstate: sqlstate::INVALID_FUNCTION_DEFINITION,
+                    });
+                }
                 self.expect_op("(")?;
-                let mut columns = [RoutineArgument {
+                let mut columns = [RoutineResultColumn {
                     name: "",
                     type_name: "",
                 }; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -1694,7 +1795,7 @@ impl<'a> Parser<'a> {
                     if column_count == columns.len() {
                         return Err(self.limit("function result columns", columns.len()));
                     }
-                    columns[column_count] = RoutineArgument {
+                    columns[column_count] = RoutineResultColumn {
                         name: self.any_ident("function result column")?,
                         type_name: self.type_name()?,
                     };
@@ -1707,7 +1808,21 @@ impl<'a> Parser<'a> {
                 RoutineCreateKind::TableFunction {
                     columns: self.arena_slice(&columns[..column_count])?,
                 }
+            } else if output_count != 0 {
+                let set_returning = has_returns && self.eat_ident("setof")?;
+                let declared_result_type = if has_returns {
+                    Some(self.type_name()?)
+                } else {
+                    None
+                };
+                RoutineCreateKind::OutputFunction {
+                    declared_result_type,
+                    set_returning,
+                }
             } else {
+                if !has_returns {
+                    return Err(self.unexpected("RETURNS clause or OUT parameters"));
+                }
                 RoutineCreateKind::Function {
                     set_returning: self.eat_ident("setof")?,
                     result_type: self.type_name()?,

@@ -23246,6 +23246,74 @@ fn altered_table_survives_restart() {
 }
 
 #[test]
+fn drop_column_removes_dependent_indexes_and_rebinds_survivors_transactionally() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE index_column_drop (a int, b int, c int);
+         CREATE INDEX index_column_drop_key ON index_column_drop (b);
+         CREATE INDEX index_column_drop_expression ON index_column_drop ((b + 1));
+         CREATE INDEX index_column_drop_predicate ON index_column_drop (a) WHERE b > 0;
+         CREATE INDEX index_column_drop_include ON index_column_drop (a) INCLUDE (b);
+         CREATE INDEX index_column_drop_survivor ON index_column_drop (c) INCLUDE (a);
+         INSERT INTO index_column_drop VALUES (1, 2, 3);",
+    );
+
+    let altered = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER TABLE index_column_drop DROP COLUMN b;
+         INSERT INTO index_column_drop VALUES (4, 5);
+         SELECT indexname FROM pg_indexes
+         WHERE tablename = 'index_column_drop' ORDER BY indexname;
+         ROLLBACK;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&altered).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&altered)
+    );
+    assert_eq!(data_rows(&altered), ["index_column_drop_survivor"]);
+
+    let restored = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT indexname FROM pg_indexes
+         WHERE tablename = 'index_column_drop' ORDER BY indexname;",
+    );
+    assert_eq!(
+        data_rows(&restored),
+        [
+            "index_column_drop_expression",
+            "index_column_drop_include",
+            "index_column_drop_key",
+            "index_column_drop_predicate",
+            "index_column_drop_survivor",
+        ]
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE index_column_drop DROP COLUMN b;
+         INSERT INTO index_column_drop VALUES (6, 7);",
+    );
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT a, c FROM index_column_drop ORDER BY a;
+         SELECT indexname FROM pg_indexes
+         WHERE tablename = 'index_column_drop' ORDER BY indexname;",
+    );
+    assert_eq!(
+        data_rows(&rows),
+        ["1|3", "6|7", "index_column_drop_survivor"]
+    );
+}
+
+#[test]
 fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
     let mut config = test_config("typed-complex-defaults");
     config.object_store_on = true;

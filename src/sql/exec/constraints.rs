@@ -863,9 +863,24 @@ pub fn check_all_unique(
 /// the immutable object generation cannot represent the key. Checkpoint is
 /// never the first observer of this physical limit.
 pub(crate) fn check_index_tuple_size(columns: &[u16], values: &[Datum]) -> Result<(), SqlError> {
+    if columns.len() > crate::storage::MAX_INDEX_COLS {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "index has {} columns, exceeding the internal limit {}",
+            columns.len(),
+            crate::storage::MAX_INDEX_COLS
+        ));
+    }
     let mut key = [Datum::Null; crate::storage::MAX_INDEX_COLS];
     for (at, column) in columns.iter().enumerate() {
-        key[at] = values[*column as usize];
+        key[at] = *values.get(*column as usize).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "index column position {} is outside row width {}",
+                column,
+                values.len()
+            )
+        })?;
     }
     let encoded = rowenc::encoded_len(&key[..columns.len()]);
     if encoded > crate::store::VALUE_INDEX_KEY_MAX {
@@ -895,6 +910,17 @@ fn check_index_tuple_sizes(
     for unique in def.uniques() {
         check_index_tuple_size(unique.columns(), values)?;
     }
+    let table_slot = storage
+        .find_visible(def.schema.as_str(), def.name.as_str(), txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "index tuple validation cannot resolve table {}.{}",
+                def.schema.as_str(),
+                def.name.as_str()
+            )
+        })?;
+    let index_source = storage.table_def(table_slot, txid);
     for index in storage.indexes_for(def.schema.as_str(), def.name.as_str(), txid) {
         if index.predicate.is_some()
             || index.expressions[..index.n_cols]
@@ -903,7 +929,29 @@ fn check_index_tuple_sizes(
         {
             continue;
         }
-        check_index_tuple_size(&index.columns[..index.n_cols], values)?;
+        let mut columns = [0u16; crate::storage::MAX_INDEX_COLS];
+        for (target, source) in columns.iter_mut().zip(&index.columns[..index.n_cols]) {
+            let name = index_source
+                .columns()
+                .get(usize::from(*source))
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "index column position {} is outside table width {}",
+                        source,
+                        index_source.n_columns
+                    )
+                })?
+                .name;
+            *target = def.column_index(name.as_str()).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "visible index references removed column {}",
+                    name.as_str()
+                )
+            })? as u16;
+        }
+        check_index_tuple_size(&columns[..index.n_cols], values)?;
     }
     Ok(())
 }
@@ -939,7 +987,7 @@ pub fn check_unique_indexes(
                 expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
             }
         }
-        let resolved = resolve_index_operator_classes(index)?;
+        let resolved = resolve_index_operator_classes(&index)?;
         let custom = resolved[..index.n_cols]
             .iter()
             .any(|class| matches!(class, Some(crate::storage::IndexOperatorClass::Catalog(_))));
@@ -2441,5 +2489,12 @@ mod tests {
         let error = check_index_tuple_size(&[0], &[Datum::Text(&text)]).unwrap_err();
         assert_eq!(error.sqlstate, sqlstate::PROGRAM_LIMIT_EXCEEDED);
         assert!(error.message.as_str().contains("index row size"));
+    }
+
+    #[test]
+    fn malformed_index_column_is_an_error_instead_of_a_panic() {
+        let error = check_index_tuple_size(&[1], &[Datum::Int4(7)]).unwrap_err();
+        assert_eq!(error.sqlstate, sqlstate::INTERNAL_ERROR);
+        assert!(error.message.as_str().contains("outside row width 1"));
     }
 }

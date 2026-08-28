@@ -28924,6 +28924,45 @@ fn apply_column_drop_dependencies(
         &dependent_routines,
     );
     let table_definition = *storage.table_def(table, txn.txid);
+
+    // An index's physical column numbers belong to the table definition that
+    // existed when it was created. PostgreSQL treats indexes that mention a
+    // dropped column as automatic dependencies of that column, including
+    // expression, predicate, and INCLUDE references.
+    loop {
+        let mut dependent_index = None;
+        for slot in 0..storage.index_count() {
+            let Some(index) = storage.index_visible_to(slot, txn.txid) else {
+                continue;
+            };
+            if index.schema != table_definition.schema || index.table != table_definition.name {
+                continue;
+            }
+            let direct_key = (0..index.n_cols).any(|key| {
+                index.expressions[key].is_none() && usize::from(index.columns[key]) == column
+            });
+            let included = index.include_columns[..index.n_include_cols].contains(&(column as u16));
+            let mut expression = false;
+            for source in index.expressions[..index.n_cols].iter().flatten() {
+                let parsed = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+                expression |=
+                    check_referenced_columns(parsed, &table_definition)? & (1u64 << column) != 0;
+            }
+            let predicate = if let Some(source) = index.predicate {
+                let parsed = crate::sql::parser::parse_expr(source.as_str(), arena)?;
+                check_referenced_columns(parsed, &table_definition)? & (1u64 << column) != 0
+            } else {
+                false
+            };
+            if direct_key || included || expression || predicate {
+                dependent_index = Some(slot);
+                break;
+            }
+        }
+        let Some(slot) = dependent_index else { break };
+        stage_index_drop(storage, wal, txn, slot)?;
+    }
+
     let mut selected_statistics = [usize::MAX; crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
     let mut selected_statistics_count = 0usize;
     for (slot, statistics) in storage.extended_statistics_for_table(table, txn.txid) {

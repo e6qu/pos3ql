@@ -2105,7 +2105,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 crate::storage::ConstraintTiming::NotDeferrable,
                 stack_str_64(index.name_for(txid).as_str()),
             );
-            info.oid = explicit_index_oid(index);
+            info.oid = explicit_index_oid(&index);
             info.collations = index.collations;
             info.explicit_collations = index.explicit_collations;
             info.operator_classes = index.operator_classes;

@@ -28005,18 +28005,22 @@ impl Storage {
         schema: &'a str,
         table: &'a str,
         txid: u32,
-    ) -> impl Iterator<Item = &'a IndexDef> {
+    ) -> impl Iterator<Item = IndexDef> + 'a {
         let committed_binding = self
             .find_visible(schema, table, txid)
             .map(|slot| (self.tables[slot].def.schema, self.tables[slot].def.name));
-        self.indexes.iter().filter(move |x| {
-            x.database == self.current_database
-                && x.visible_to(txid)
-                && ((x.schema.as_str() == schema && x.table.as_str() == table)
-                    || committed_binding.is_some_and(|(old_schema, old_table)| {
-                        x.schema == old_schema && x.table == old_table
-                    }))
-        })
+        self.indexes
+            .iter()
+            .copied()
+            .filter(move |x| {
+                x.database == self.current_database
+                    && x.visible_to(txid)
+                    && ((x.schema.as_str() == schema && x.table.as_str() == table)
+                        || committed_binding.is_some_and(|(old_schema, old_table)| {
+                            x.schema == old_schema && x.table == old_table
+                        }))
+            })
+            .map(move |index| self.project_index_binding(index, txid))
     }
 
     pub fn unique_indexes_for<'a>(
@@ -28024,7 +28028,7 @@ impl Storage {
         schema: &'a str,
         table: &'a str,
         txid: u32,
-    ) -> impl Iterator<Item = &'a IndexDef> {
+    ) -> impl Iterator<Item = IndexDef> + 'a {
         self.indexes_for(schema, table, txid).filter(|x| x.unique)
     }
 
@@ -28044,6 +28048,58 @@ impl Storage {
             .get(slot)
             .copied()
             .filter(|index| index.database == self.current_database && index.visible_to(txid))
+            .map(|index| self.project_index_binding(index, txid))
+    }
+
+    /// Projects committed index column ordinals through this transaction's
+    /// pending table shape. A visible index that names a removed column is an
+    /// executor invariant violation: DROP COLUMN must mark it pending-drop
+    /// before publishing the pending table definition.
+    fn project_index_binding(&self, mut index: IndexDef, txid: u32) -> IndexDef {
+        // A transaction-private CREATE INDEX is already expressed against the
+        // table shape visible at its creation point. Committed indexes alone
+        // need projection from their committed table binding.
+        if index.ddl_state != CatalogDdlState::Present {
+            return index;
+        }
+        let Some(table_slot) = self.tables.iter().position(|table| {
+            table.database == index.database
+                && table.def.schema == index.schema
+                && table.def.name == index.table
+        }) else {
+            return index;
+        };
+        let Some(pending) = self
+            .pending_table_def(table_slot)
+            .filter(|pending| pending.txid == txid)
+        else {
+            return index;
+        };
+        for key in 0..index.n_cols {
+            if index.expressions[key].is_some() {
+                continue;
+            }
+            let committed = usize::from(index.columns[key]);
+            let target_name = pending.column_mapping[committed]
+                .expect("visible index key cannot reference a dropped column");
+            index.columns[key] = pending
+                .def
+                .column_index(target_name.as_str())
+                .expect("pending index key name must exist in pending table definition")
+                as u16;
+        }
+        for column in &mut index.include_columns[..index.n_include_cols] {
+            let target_name = pending.column_mapping[usize::from(*column)]
+                .expect("visible included index column cannot reference a dropped column");
+            *column = pending
+                .def
+                .column_index(target_name.as_str())
+                .expect("pending included column name must exist in pending table definition")
+                as u16;
+        }
+        index.schema = pending.def.schema;
+        index.table = pending.def.name;
+        index
     }
 
     pub(crate) fn tablespace_slot(&self, name: &str, txid: u32) -> Option<usize> {
@@ -28540,6 +28596,17 @@ impl Storage {
                 continue;
             }
             for column in &mut index_def.columns[..index_def.n_cols] {
+                let Some(target_name) = column_mapping
+                    .get(*column as usize)
+                    .and_then(|target| *target)
+                else {
+                    continue;
+                };
+                if let Some(target_column) = def.column_index(target_name.as_str()) {
+                    *column = target_column as u16;
+                }
+            }
+            for column in &mut index_def.include_columns[..index_def.n_include_cols] {
                 let Some(target_name) = column_mapping
                     .get(*column as usize)
                     .and_then(|target| *target)

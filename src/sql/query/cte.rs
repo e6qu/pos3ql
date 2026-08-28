@@ -3953,6 +3953,47 @@ fn rewrite_stored_type_name<'a>(
     arena.alloc_str(rendered.as_str()).map_err(|_| arena_full())
 }
 
+fn rewrite_stored_collation<'a>(
+    collation: crate::sql::ast::ParsedCollation<'a>,
+    context: Subst<'_, 'a, '_, '_>,
+) -> Result<crate::sql::ast::ParsedCollation<'a>, SqlError> {
+    let crate::sql::ast::ParsedCollation::Named(name) = collation else {
+        return Ok(collation);
+    };
+    let Some(dependencies) = context.dependencies else {
+        return Ok(collation);
+    };
+    let dependency = dependencies
+        .entries()
+        .iter()
+        .find(|dependency| {
+            dependency.class == crate::storage::DependencyClass::Collation
+                && dependency.referenced_schema.as_str() == name.schema.unwrap_or("")
+                && dependency.referenced_name.as_str() == name.name
+        })
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "stored collation dependency \"{}\" does not exist",
+                name.name
+            )
+        })?;
+    if !context
+        .storage
+        .collations_visible_to(context.txid)
+        .any(|(slot, _)| slot == dependency.slot as usize)
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "stored collation dependency \"{}\" does not exist",
+            name.name
+        ));
+    }
+    Ok(crate::sql::ast::ParsedCollation::Builtin(
+        crate::sql::ast::Collation::Catalog(dependency.slot as u8),
+    ))
+}
+
 fn rewrite_stored_routine_name<'a>(
     name: &'a str,
     args: &[&Expr<'a>],
@@ -4047,6 +4088,10 @@ fn subst_expr<'a>(
             operand: subst_expr(operand, context, arena)?,
             type_name: rewrite_stored_type_name(type_name, context, arena)?,
             type_mod: *type_mod,
+        },
+        Expr::Collate { operand, collation } => Expr::Collate {
+            operand: subst_expr(operand, context, arena)?,
+            collation: rewrite_stored_collation(*collation, context)?,
         },
         Expr::IsNull { operand, negated } => Expr::IsNull {
             operand: subst_expr(operand, context, arena)?,

@@ -128,6 +128,9 @@ pub enum ResolvedColumn {
 /// The resolved FROM clause: per table, its exposed name (alias or table
 /// name), definition, and storage slot.
 pub struct QueryScope<'d> {
+    storage: &'d Storage,
+    txid: u32,
+    arena: &'d Arena,
     pub names: &'d mut [&'d str],
     pub defs: &'d mut [Option<&'d TableDef>],
     pub slots: &'d mut [usize],
@@ -218,7 +221,12 @@ impl<'a> ColumnLookup<'a> for ScopeTypes<'_, '_> {
 }
 
 impl<'d> QueryScope<'d> {
-    fn empty(arena: &'d Arena, from: &FromClause<'d>) -> Result<Self, SqlError> {
+    fn empty(
+        storage: &'d Storage,
+        txid: u32,
+        arena: &'d Arena,
+        from: &FromClause<'d>,
+    ) -> Result<Self, SqlError> {
         let table_count = from.joins.len() + 1;
         let merged_capacity = from
             .joins
@@ -282,6 +290,9 @@ impl<'d> QueryScope<'d> {
             .alloc_slice_with(from.joins.len().max(1), |_| None)
             .map_err(|_| arena_full())?;
         Ok(QueryScope {
+            storage,
+            txid,
+            arena,
             names,
             defs,
             slots,
@@ -324,7 +335,7 @@ impl<'d> QueryScope<'d> {
         params: &[Datum<'a>],
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<QueryScope<'a>, SqlError> {
-        let mut scope = QueryScope::empty(arena, from)?;
+        let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.add_exec(storage, &from.base, txid, arena, params, outer)?;
         for j in from.joins {
             scope.add_exec(storage, &j.table, txid, arena, params, outer)?;
@@ -579,7 +590,7 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'a Arena,
     ) -> Result<QueryScope<'a>, SqlError> {
-        let mut scope = QueryScope::empty(arena, from)?;
+        let mut scope = QueryScope::empty(storage, txid, arena, from)?;
         scope.add_schema(storage, &from.base, txid, arena)?;
         for j in from.joins {
             scope.add_schema(storage, &j.table, txid, arena)?;
@@ -1119,7 +1130,12 @@ impl<'d> QueryScope<'d> {
         &self,
         expression: &Expr<'d>,
     ) -> Result<crate::sql::ast::Collation, SqlError> {
-        crate::sql::eval::resolved_expression_collation(expression, &ScopeTypes(self))
+        let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+        crate::sql::eval::resolved_expression_collation(
+            expression,
+            &ScopeTypes(self),
+            Some(&catalog),
+        )
     }
 
     pub(crate) fn described_expression_collation(
@@ -1132,7 +1148,12 @@ impl<'d> QueryScope<'d> {
         ),
         SqlError,
     > {
-        crate::sql::eval::described_expression_collation(expression, &ScopeTypes(self))
+        let catalog = super::storage_catalog(self.storage, self.arena, self.txid);
+        crate::sql::eval::described_expression_collation(
+            expression,
+            &ScopeTypes(self),
+            Some(&catalog),
+        )
     }
 
     /// An expression reading a join-tree output column: a qualified column

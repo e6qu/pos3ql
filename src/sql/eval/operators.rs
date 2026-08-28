@@ -48,7 +48,7 @@ pub(crate) fn compare_text_collated<'a>(
     };
     let ordering = match collation {
         Collation::None | Collation::C | Collation::Posix | Collation::UcsBasic => left.cmp(right),
-        Collation::Default => catalog
+        Collation::Default | Collation::Catalog(_) => catalog
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -516,7 +516,7 @@ pub fn compare_datums_with_catalog(
         Collation::None | Collation::C | Collation::Posix | Collation::UcsBasic => {
             Ok(left.cmp(right))
         }
-        Collation::Default => catalog
+        Collation::Default | Collation::Catalog(_) => catalog
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -533,8 +533,8 @@ pub fn compare_datums_with_catalog(
 /// values that happen to share a hash are only false positives, re-verified by
 /// the caller against the actual row. Types whose canonical form is subtle
 /// (numeric, interval, timetz, ranges, arrays, non-jsonb json) hash to a
-/// per-type constant: correct, but every value collides, so a column of that
-/// type falls back to a full verify scan; the common key types (integers, text,
+/// per-type constant: correct, but every value collides and is verified by the
+/// caller; the common key types (integers, text,
 /// char, uuid, dates/times, bytea, bit, jsonb, float) hash precisely. Writes are
 /// little-endian so the hash is identical across platforms (the simulator
 /// replays bit-for-bit).
@@ -548,15 +548,17 @@ pub fn hash_key(values: &[Datum], columns: &[u16]) -> u64 {
 }
 
 /// Hashes a tuple without ever excluding values equal under its SQL collation.
-/// Locale equality has no portable fixed-width transform, so default-collated
-/// text deliberately shares one hash bucket and is rechecked by the caller.
+/// Locale equality has no portable fixed-width transform, so locale-capable
+/// collation identities deliberately share one hash bucket and are rechecked.
 pub fn hash_key_collated(values: &[Datum], columns: &[u16], collations: &[Collation]) -> u64 {
     use core::hash::Hasher as _;
     let mut hasher = crate::mem::fixed_map::Fnv1aHasher::default();
     for (index, &column) in columns.iter().enumerate() {
         let datum = &values[column as usize];
-        if collations[index] == Collation::Default
-            && matches!(datum, Datum::Text(_) | Datum::Bpchar(_))
+        if matches!(
+            collations[index],
+            Collation::Default | Collation::Catalog(_)
+        ) && matches!(datum, Datum::Text(_) | Datum::Bpchar(_))
         {
             hasher.write(&[0x54]);
         } else {
@@ -2069,12 +2071,14 @@ mod hash_tests {
     }
 
     #[test]
-    fn default_collation_hash_never_excludes_a_locale_equal_text_pair() {
+    fn locale_capable_collation_hash_never_excludes_an_equal_text_pair() {
         let left = [Datum::Text("a")];
         let right = [Datum::Text("A")];
-        assert_eq!(
-            hash_key_collated(&left, &[0], &[Collation::Default]),
-            hash_key_collated(&right, &[0], &[Collation::Default]),
-        );
+        for collation in [Collation::Default, Collation::Catalog(0)] {
+            assert_eq!(
+                hash_key_collated(&left, &[0], &[collation]),
+                hash_key_collated(&right, &[0], &[collation]),
+            );
+        }
     }
 }

@@ -288,7 +288,8 @@ pub(super) fn build_column(
     };
     let auto_increment = serial || is_identity;
     let collatable = ctype.is_collatable();
-    if !collatable && c.collation != crate::sql::ast::Collation::Default {
+    let collation = resolve_parsed_collation(storage, txid, c.collation)?;
+    if !collatable && collation != crate::sql::ast::Collation::Default {
         return Err(sql_err!(
             sqlstate::DATATYPE_MISMATCH,
             "collations are not supported by type {}",
@@ -300,7 +301,7 @@ pub(super) fn build_column(
         ctype,
         type_mod,
         collation: if collatable {
-            c.collation
+            collation
         } else {
             crate::sql::ast::Collation::None
         },
@@ -314,6 +315,25 @@ pub(super) fn build_column(
         auto_increment_step,
         user_type,
     })
+}
+
+pub(super) fn resolve_parsed_collation(
+    storage: &Storage,
+    txid: u32,
+    parsed: crate::sql::ast::ParsedCollation<'_>,
+) -> Result<crate::sql::ast::Collation, SqlError> {
+    match parsed {
+        crate::sql::ast::ParsedCollation::Builtin(collation) => Ok(collation),
+        crate::sql::ast::ParsedCollation::Named(name) => storage
+            .resolve_collation(name.schema, name.name, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "collation \"{}\" does not exist",
+                    name.name
+                )
+            }),
+    }
 }
 
 /// Validates a `GENERATED ALWAYS AS (expr) STORED` expression and returns its

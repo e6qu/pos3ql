@@ -39,6 +39,7 @@ pub(crate) fn dispatch<'a>(
             | "decode"
             | "convert_to"
             | "convert_from"
+            | "convert"
             | "get_byte"
             | "set_byte"
             | "get_bit"
@@ -157,38 +158,74 @@ pub(crate) fn dispatch<'a>(
                     Ok(Datum::Bytea(bytes))
                 }
             }
-            // `convert_to(text, enc)` → bytea; `convert_from(bytea, enc)` → text.
-            // Only UTF8/UTF-8 (an identity mapping over our text storage) is
-            // supported; other encodings error loudly.
-            "convert_to" | "convert_from" => {
-                arity(2)?;
-                let Some(encoding) = text_arg(name, args, 1, arena, params, row, hooks)? else {
+            "convert_to" | "convert_from" | "convert" => {
+                arity(if name == "convert" { 3 } else { 2 })?;
+                let destination_index = if name == "convert" { 2 } else { 1 };
+                let Some(destination_name) =
+                    text_arg(name, args, destination_index, arena, params, row, hooks)?
+                else {
                     return Ok(Datum::Null);
                 };
-                if !encoding.eq_ignore_ascii_case("UTF8") && !encoding.eq_ignore_ascii_case("UTF-8")
-                {
-                    return Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "encoding \"{}\" is not supported (only UTF8)",
-                        encoding
-                    ));
-                }
-                if name == "convert_to" {
-                    let Some(s) = text_arg(name, args, 0, arena, params, row, hooks)? else {
-                        return Ok(Datum::Null);
-                    };
-                    Ok(Datum::Bytea(s.as_bytes()))
-                } else {
-                    let Some(bytes) = bytea_arg(name, args, 0, arena, params, row, hooks)? else {
-                        return Ok(Datum::Null);
-                    };
-                    let s = core::str::from_utf8(bytes).map_err(|_| {
+                let destination =
+                    crate::storage::PgEncoding::parse(destination_name).ok_or_else(|| {
                         sql_err!(
-                            sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
-                            "invalid byte sequence for encoding UTF8"
+                            sqlstate::UNDEFINED_OBJECT,
+                            "encoding \"{}\" does not exist",
+                            destination_name
                         )
                     })?;
-                    Ok(Datum::Text(s))
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "encoding conversion catalog is unavailable"
+                    )
+                })?;
+                if name == "convert_to" {
+                    let Some(text) = text_arg(name, args, 0, arena, params, row, hooks)? else {
+                        return Ok(Datum::Null);
+                    };
+                    return Ok(Datum::Bytea(catalog.convert_encoding(
+                        crate::storage::PgEncoding::UTF8,
+                        destination,
+                        text.as_bytes(),
+                        arena,
+                    )?));
+                }
+                let Some(bytes) = bytea_arg(name, args, 0, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                let source = if name == "convert" {
+                    let Some(source_name) = text_arg(name, args, 1, arena, params, row, hooks)?
+                    else {
+                        return Ok(Datum::Null);
+                    };
+                    crate::storage::PgEncoding::parse(source_name).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "encoding \"{}\" does not exist",
+                            source_name
+                        )
+                    })?
+                } else {
+                    destination
+                };
+                let target = if name == "convert" {
+                    destination
+                } else {
+                    crate::storage::PgEncoding::UTF8
+                };
+                let converted = catalog.convert_encoding(source, target, bytes, arena)?;
+                if name == "convert" {
+                    Ok(Datum::Bytea(converted))
+                } else {
+                    Ok(Datum::Text(core::str::from_utf8(converted).map_err(
+                        |_| {
+                            sql_err!(
+                                sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+                                "invalid byte sequence for encoding UTF8"
+                            )
+                        },
+                    )?))
                 }
             }
             // `get_byte(bytea, n)` / `set_byte(bytea, n, v)`: 0-based byte access.
@@ -269,4 +306,78 @@ pub(crate) fn dispatch<'a>(
             _ => unreachable!("dispatch guard admitted an unhandled name"),
         }
     })())
+}
+
+pub(crate) fn convert_encoding<'a>(
+    source: crate::storage::PgEncoding,
+    destination: crate::storage::PgEncoding,
+    procedure: Option<i32>,
+    input: &[u8],
+    arena: &'a crate::mem::arena::Arena,
+) -> Result<&'a [u8], SqlError> {
+    if source == destination {
+        if source == crate::storage::PgEncoding::UTF8 {
+            core::str::from_utf8(input).map_err(|_| {
+                sql_err!(
+                    sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+                    "invalid byte sequence for encoding UTF8"
+                )
+            })?;
+        }
+        return arena
+            .alloc_slice_copy(input)
+            .map(|output| &*output)
+            .map_err(|_| arena_full());
+    }
+    match procedure {
+        Some(4374)
+            if source == crate::storage::PgEncoding::LATIN1
+                && destination == crate::storage::PgEncoding::UTF8 =>
+        {
+            let output = arena
+                .alloc_slice_with(input.len().saturating_mul(2), |_| 0u8)
+                .map_err(|_| arena_full())?;
+            let mut written = 0;
+            for &byte in input {
+                if byte < 0x80 {
+                    output[written] = byte;
+                    written += 1;
+                } else {
+                    output[written] = 0xc0 | (byte >> 6);
+                    output[written + 1] = 0x80 | (byte & 0x3f);
+                    written += 2;
+                }
+            }
+            Ok(&output[..written])
+        }
+        Some(4375)
+            if source == crate::storage::PgEncoding::UTF8
+                && destination == crate::storage::PgEncoding::LATIN1 =>
+        {
+            let text = core::str::from_utf8(input).map_err(|_| {
+                sql_err!(
+                    sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+                    "invalid byte sequence for encoding UTF8"
+                )
+            })?;
+            let output = arena
+                .alloc_slice_with(text.chars().count(), |_| 0u8)
+                .map_err(|_| arena_full())?;
+            for (index, character) in text.chars().enumerate() {
+                output[index] = u8::try_from(character as u32).map_err(|_| {
+                    sql_err!(
+                        sqlstate::UNTRANSLATABLE_CHARACTER,
+                        "character cannot be converted from encoding UTF8 to LATIN1"
+                    )
+                })?;
+            }
+            Ok(output)
+        }
+        _ => Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "default conversion from {} to {} does not exist",
+            source.name(),
+            destination.name()
+        )),
+    }
 }

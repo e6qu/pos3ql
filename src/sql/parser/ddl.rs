@@ -639,6 +639,122 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn create_collation(&mut self) -> Result<Stmt<'a>, ParseError> {
+        use crate::sql::ast::{CreateCollation, CreateCollationDefinition};
+        let if_not_exists = if self.eat_ident("if")? {
+            self.expect_ident("not")?;
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.qual_name("collation name")?;
+        let definition = if self.eat_ident("from")? {
+            CreateCollationDefinition::From(self.qual_name("source collation")?)
+        } else {
+            self.expect_op("(")?;
+            let mut locale = None;
+            let mut lc_collate = None;
+            let mut lc_ctype = None;
+            let mut provider = None;
+            let mut deterministic = None;
+            let mut rules = None;
+            let mut version = None;
+            if !self.eat_op(")")? {
+                loop {
+                    let option = self.any_ident("collation option")?;
+                    self.expect_op("=")?;
+                    let value = match self.peeked {
+                        Tok::Ident(value) | Tok::Str(value) => value,
+                        _ => return Err(self.err_here("collation option value is required")),
+                    };
+                    self.advance()?;
+                    let duplicate = if option.eq_ignore_ascii_case("locale") {
+                        locale.replace(value).is_some()
+                    } else if option.eq_ignore_ascii_case("lc_collate") {
+                        lc_collate.replace(value).is_some()
+                    } else if option.eq_ignore_ascii_case("lc_ctype") {
+                        lc_ctype.replace(value).is_some()
+                    } else if option.eq_ignore_ascii_case("provider") {
+                        let value = if value.eq_ignore_ascii_case("builtin") {
+                            crate::sql::ast::ParsedCollationProvider::Builtin
+                        } else if value.eq_ignore_ascii_case("libc") {
+                            crate::sql::ast::ParsedCollationProvider::Libc
+                        } else if value.eq_ignore_ascii_case("icu") {
+                            crate::sql::ast::ParsedCollationProvider::Icu
+                        } else {
+                            return Err(self.err_here("unrecognized collation provider"));
+                        };
+                        provider.replace(value).is_some()
+                    } else if option.eq_ignore_ascii_case("deterministic") {
+                        let parsed = if value == "1"
+                            || value.eq_ignore_ascii_case("true")
+                            || value.eq_ignore_ascii_case("on")
+                        {
+                            true
+                        } else if value == "0"
+                            || value.eq_ignore_ascii_case("false")
+                            || value.eq_ignore_ascii_case("off")
+                        {
+                            false
+                        } else {
+                            return Err(self.err_here("DETERMINISTIC requires a boolean value"));
+                        };
+                        deterministic.replace(parsed).is_some()
+                    } else if option.eq_ignore_ascii_case("rules") {
+                        rules.replace(value).is_some()
+                    } else if option.eq_ignore_ascii_case("version") {
+                        version.replace(value).is_some()
+                    } else {
+                        return Err(self.err_here("unrecognized collation option"));
+                    };
+                    if duplicate {
+                        return Err(self.err_here("conflicting or redundant collation options"));
+                    }
+                    if self.eat_op(")")? {
+                        break;
+                    }
+                    self.expect_op(",")?;
+                }
+            }
+            CreateCollationDefinition::Options {
+                locale,
+                lc_collate,
+                lc_ctype,
+                provider,
+                deterministic,
+                rules,
+                version,
+            }
+        };
+        Ok(Stmt::CreateCollation(CreateCollation {
+            name,
+            if_not_exists,
+            definition,
+        }))
+    }
+
+    fn create_conversion(&mut self, default: bool) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("conversion name")?;
+        self.expect_ident("for")?;
+        let source_encoding = self.str_literal("source encoding")?;
+        let source_encoding = crate::storage::PgEncoding::parse(source_encoding)
+            .ok_or_else(|| self.err_here("invalid source encoding"))?;
+        self.expect_ident("to")?;
+        let destination_encoding = self.str_literal("destination encoding")?;
+        let destination_encoding = crate::storage::PgEncoding::parse(destination_encoding)
+            .ok_or_else(|| self.err_here("invalid destination encoding"))?;
+        self.expect_ident("from")?;
+        let function = self.qual_name("conversion function")?;
+        Ok(Stmt::CreateConversion(crate::sql::ast::CreateConversion {
+            default,
+            name,
+            source_encoding,
+            destination_encoding,
+            function,
+        }))
+    }
+
     /// Dispatches CREATE: `[OR REPLACE] VIEW`, `TABLE`, `INDEX` or `SCHEMA`
     /// ("create" consumed here).
     pub(super) fn create(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -681,6 +797,10 @@ impl<'a> Parser<'a> {
             self.expect_ident("index")?;
             return self.create_index(true);
         }
+        if self.eat_ident("default")? {
+            self.expect_ident("conversion")?;
+            return self.create_conversion(true);
+        }
         let trusted = self.eat_ident("trusted")?;
         let procedural = self.eat_ident("procedural")?;
         if trusted || procedural || self.eat_ident("language")? {
@@ -691,6 +811,12 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("view")? {
             return self.create_view(false);
+        }
+        if self.eat_ident("collation")? {
+            return self.create_collation();
+        }
+        if self.eat_ident("conversion")? {
+            return self.create_conversion(false);
         }
         if self.eat_ident("function")? {
             return self.create_routine(false, true);
@@ -3463,7 +3589,7 @@ impl<'a> Parser<'a> {
             name: "",
             type_name: "",
             type_mod: -1,
-            collation: crate::sql::ast::Collation::Default,
+            collation: crate::sql::ast::ParsedCollation::DEFAULT,
         }; MAX_LIST];
         let mut n = 0;
         if self.peeked != Tok::Op(")") {
@@ -3476,7 +3602,7 @@ impl<'a> Parser<'a> {
                 let collation = if self.eat_ident("collate")? {
                     self.collation_name()?
                 } else {
-                    crate::sql::ast::Collation::Default
+                    crate::sql::ast::ParsedCollation::DEFAULT
                 };
                 fields[n] = crate::sql::ast::CompositeField {
                     name: field_name,
@@ -3510,7 +3636,7 @@ impl<'a> Parser<'a> {
                 let collation = if self.eat_ident("collate")? {
                     self.collation_name()?
                 } else {
-                    crate::sql::ast::Collation::Default
+                    crate::sql::ast::ParsedCollation::DEFAULT
                 };
                 AlterTypeAction::AddAttribute(crate::sql::ast::CompositeField {
                     name: field_name,
@@ -3584,7 +3710,7 @@ impl<'a> Parser<'a> {
                     let collation = if self.eat_ident("collate")? {
                         self.collation_name()?
                     } else {
-                        crate::sql::ast::Collation::Default
+                        crate::sql::ast::ParsedCollation::DEFAULT
                     };
                     AlterTypeAction::AlterAttributeType {
                         name: field,
@@ -3602,7 +3728,7 @@ impl<'a> Parser<'a> {
                 let collation = if self.eat_ident("collate")? {
                     self.collation_name()?
                 } else {
-                    crate::sql::ast::Collation::Default
+                    crate::sql::ast::ParsedCollation::DEFAULT
                 };
                 AlterTypeAction::AlterAttributeType {
                     name: field,
@@ -4856,6 +4982,46 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::DropOwned { roles, cascade });
         }
+        if self.eat_ident("collation")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.qual_name("collation name")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropCollation {
+                name,
+                if_exists,
+                cascade,
+            });
+        }
+        if self.eat_ident("conversion")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.qual_name("conversion name")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropConversion {
+                name,
+                if_exists,
+                cascade,
+            });
+        }
         if self.eat_ident("cast")? {
             let if_exists = if self.eat_ident("if")? {
                 self.expect_ident("exists")?;
@@ -5786,7 +5952,7 @@ impl<'a> Parser<'a> {
             name: "",
             type_name: "",
             type_mod: -1,
-            collation: crate::sql::ast::Collation::Default,
+            collation: crate::sql::ast::ParsedCollation::DEFAULT,
             not_null: false,
             unique: false,
             primary: false,
@@ -5872,7 +6038,7 @@ impl<'a> Parser<'a> {
             let collation = if self.eat_ident("collate")? {
                 self.collation_name()?
             } else {
-                crate::sql::ast::Collation::Default
+                crate::sql::ast::ParsedCollation::DEFAULT
             };
             // PostgreSQL resolves a column definition's type twice, so a
             // precision-clamp warning is reported twice per column here where

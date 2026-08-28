@@ -360,9 +360,12 @@ fn resolve_index_operator_classes(
 }
 
 pub(crate) fn index_key_collations(
+    storage: &Storage,
+    txid: u32,
     def: &TableDef,
     columns: &[u16],
     expressions: &[Option<&Expr<'_>>],
+    arena: &Arena,
 ) -> Result<[crate::sql::ast::Collation; crate::storage::MAX_INDEX_COLS], SqlError> {
     let mut collations = [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS];
     let row = RowCtx {
@@ -372,7 +375,10 @@ pub(crate) fn index_key_collations(
     };
     for (index, expression) in expressions.iter().enumerate() {
         collations[index] = match expression {
-            Some(expression) => resolved_expression_collation(expression, &row)?,
+            Some(expression) => {
+                let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+                resolved_expression_collation(expression, &row, Some(&catalog))?
+            }
             None => def.columns()[columns[index] as usize].collation,
         };
     }
@@ -431,7 +437,7 @@ fn enforce_expression_index_uniqueness<'a>(
         return Ok(());
     }
     let keys = index_key_values(def, values, columns, expressions, arena)?;
-    let collations = index_key_collations(def, columns, expressions)?;
+    let collations = index_key_collations(storage, txid, def, columns, expressions, arena)?;
     if !nulls_not_distinct && keys[..columns.len()].iter().any(Datum::is_null) {
         return Ok(());
     }

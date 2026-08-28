@@ -16,7 +16,9 @@ use crate::sql::types::{ArrElem, ColType, Datum, TypeMod};
 use crate::sql_err;
 use crate::stack_format;
 
-use super::super::{ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, sqlstate};
+use super::super::{
+    ColumnLookup, EvalHooks, SqlError, arena_full, eval_full, sqlstate, type_mismatch,
+};
 
 /// A catalog OID accepted by identity predicates.  Keeping conversion at the
 /// boundary prevents a wide integer from wrapping into an unrelated object.
@@ -1246,13 +1248,28 @@ pub(crate) fn dispatch<'a>(
             }
             "pg_encoding_to_char" => {
                 arity(1)?;
-                Ok(Datum::Text("UTF8"))
+                match eval_full(args[0], arena, params, row, hooks)? {
+                    Datum::Int2(code) => Ok(Datum::Text(
+                        crate::storage::PgEncoding::from_code(code as u8)
+                            .filter(|_| code >= 0)
+                            .map_or("", crate::storage::PgEncoding::name),
+                    )),
+                    Datum::Int4(code) => Ok(Datum::Text(
+                        u8::try_from(code)
+                            .ok()
+                            .and_then(crate::storage::PgEncoding::from_code)
+                            .map_or("", crate::storage::PgEncoding::name),
+                    )),
+                    Datum::Null => Ok(Datum::Null),
+                    other => Err(type_mismatch("pg_encoding_to_char", &other)),
+                }
             }
             "pg_char_to_encoding" => {
                 arity(1)?;
                 match eval_full(args[0], arena, params, row, hooks)? {
-                    Datum::Text(name) if name.eq_ignore_ascii_case("UTF8") => Ok(Datum::Int4(6)),
-                    Datum::Text(_) => Ok(Datum::Int4(-1)),
+                    Datum::Text(name) => Ok(Datum::Int4(
+                        crate::storage::PgEncoding::parse(name).map_or(-1, |value| value.code()),
+                    )),
                     Datum::Null => Ok(Datum::Null),
                     _ => Err(sql_err!(
                         sqlstate::DATATYPE_MISMATCH,

@@ -1284,7 +1284,13 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
                 user_type,
                 type_mod,
                 if ctype.is_collatable() {
-                    crate::sql::eval::described_expression_collation(argument, columns)?.0
+                    let catalog = super::storage_catalog(storage, arena, txid);
+                    crate::sql::eval::described_expression_collation(
+                        argument,
+                        columns,
+                        Some(&catalog),
+                    )?
+                    .0
                 } else {
                     crate::sql::ast::Collation::None
                 },

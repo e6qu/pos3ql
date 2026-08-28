@@ -1811,9 +1811,12 @@ fn find_conflict<'a>(
                             arena,
                         )?;
                         let collations = crate::sql::exec::constraints::index_key_collations(
+                            storage,
+                            txid,
                             def,
                             &columns[..*n_columns],
                             &expressions[..*n_columns],
+                            arena,
                         )?;
                         crate::sql::exec::constraints::key_values_equal(
                             storage,
@@ -1876,9 +1879,12 @@ fn find_conflict<'a>(
                             arena,
                         )?;
                         let collations = crate::sql::exec::constraints::index_key_collations(
+                            storage,
+                            txid,
                             def,
                             &partial_index.columns[..partial_index.n_columns],
                             &partial_index.expressions[..partial_index.n_columns],
+                            arena,
                         )?;
                         if candidate_member
                             && other_member
@@ -5308,6 +5314,14 @@ pub fn reassign_owned(
         .operator_classes_visible_to(txn.txid)
         .filter(|(_, definition)| source_owns_catalog(definition.owner))
         .count();
+    changes += storage
+        .collations_visible_to(txn.txid)
+        .filter(|(_, definition)| source_owns_catalog(definition.owner))
+        .count();
+    changes += storage
+        .conversions_visible_to(txn.txid)
+        .filter(|(_, definition)| source_owns_catalog(definition.owner))
+        .count();
     if changes > super::txn::MAX_TXN_DDL.saturating_sub(txn.ddl().len()) {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5372,6 +5386,70 @@ pub fn reassign_owned(
         let mut definition = storage.operator_class_for(slot, txn.txid);
         definition.owner = target_oid;
         if let Err(error) = stage_operator_class(storage, wal, txn, slot, definition) {
+            return sql_fail(error);
+        }
+    }
+    loop {
+        let found = storage
+            .collations_visible_to(txn.txid)
+            .find_map(|(slot, definition)| source_owns_catalog(definition.owner).then_some(slot));
+        let Some(slot) = found else { break };
+        let mut definition = storage.collation(slot).definition_for(txn.txid);
+        definition.owner = target_oid;
+        let prior = match storage.alter_collation(slot, definition, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::SetCollation {
+                slot: slot as u8,
+                created_at: storage.collation(slot).created_at,
+                definition,
+            },
+        ) {
+            storage.rollback_collation_alter(slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationAltered {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_collation_alter(slot, prior);
+            return sql_fail(error);
+        }
+    }
+    loop {
+        let found = storage
+            .conversions_visible_to(txn.txid)
+            .find_map(|(slot, definition)| source_owns_catalog(definition.owner).then_some(slot));
+        let Some(slot) = found else { break };
+        let mut definition = storage.conversion(slot).definition_for(txn.txid);
+        definition.owner = target_oid;
+        let prior = match storage.alter_conversion(slot, definition, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::SetConversion {
+                slot: slot as u8,
+                created_at: storage.conversion(slot).created_at,
+                definition,
+            },
+        ) {
+            storage.rollback_conversion_alter(slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionAltered {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_conversion_alter(slot, prior);
             return sql_fail(error);
         }
     }
@@ -5607,6 +5685,8 @@ pub fn drop_owned(
     let mut composites = [false; crate::storage::MAX_COMPOSITES];
     let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut operators = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let mut collations = [false; crate::storage::MAX_COLLATIONS];
+    let mut conversions = [false; crate::storage::MAX_CONVERSIONS];
     let mut statistics =
         [false; MAX_DEPENDENT_STORED_QUERIES * crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
     let mut schemas = [false; MAX_SCHEMAS];
@@ -5642,6 +5722,16 @@ pub fn drop_owned(
                 .any(|role| Storage::role_oid(usize::from(*role)) == definition.owner);
         }
     }
+    for (slot, definition) in storage.collations_visible_to(txn.txid) {
+        collations[slot] = owned_roles
+            .iter()
+            .any(|role| Storage::role_oid(usize::from(*role)) == definition.owner);
+    }
+    for (slot, definition) in storage.conversions_visible_to(txn.txid) {
+        conversions[slot] = owned_roles
+            .iter()
+            .any(|role| Storage::role_oid(usize::from(*role)) == definition.owner);
+    }
 
     let root = |dependency: &crate::storage::StoredQueryDependency| match dependency.class {
         DependencyClass::Table => tables
@@ -5673,6 +5763,10 @@ pub fn drop_owned(
             .copied()
             .unwrap_or(false),
         DependencyClass::Operator => operators
+            .get(dependency.slot as usize)
+            .copied()
+            .unwrap_or(false),
+        DependencyClass::Collation => collations
             .get(dependency.slot as usize)
             .copied()
             .unwrap_or(false),
@@ -6122,6 +6216,78 @@ pub fn drop_owned(
         if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RoutineDropped(slot as u32)) {
             storage.rollback_routine_drop(slot, txn.txid);
             return sql_fail(error);
+        }
+    }
+
+    for (slot, selected) in collations.iter().copied().enumerate().rev() {
+        if !selected || !storage.collation(slot).visible_to(txn.txid) {
+            continue;
+        }
+        let definition = storage.collation(slot).definition_for(txn.txid);
+        let owner = match storage.role_slot_by_oid(definition.owner, txn.txid) {
+            Some(owner) => storage.role_name(owner, txn.txid),
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "collation owner does not exist"
+                ));
+            }
+        };
+        let qualified = QualName {
+            schema: Some(definition.schema.as_str()),
+            name: definition.name.as_str(),
+        };
+        let outcome = run_as_role(owner, || {
+            responder.without_command_complete(|responder| {
+                drop_collation(
+                    storage,
+                    &mut *wal,
+                    txn,
+                    scratch,
+                    &qualified,
+                    false,
+                    cascade,
+                    arena,
+                    seq_session,
+                    responder,
+                )
+            })
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return sql_fail(error),
+            Err(error) => return Err(error),
+        }
+    }
+    for (slot, selected) in conversions.iter().copied().enumerate().rev() {
+        if !selected || !storage.conversion(slot).visible_to(txn.txid) {
+            continue;
+        }
+        let definition = storage.conversion(slot).definition_for(txn.txid);
+        let owner = match storage.role_slot_by_oid(definition.owner, txn.txid) {
+            Some(owner) => storage.role_name(owner, txn.txid),
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "conversion owner does not exist"
+                ));
+            }
+        };
+        let qualified = QualName {
+            schema: Some(definition.schema.as_str()),
+            name: definition.name.as_str(),
+        };
+        let outcome = run_as_role(owner, || {
+            responder.without_command_complete(|responder| {
+                drop_conversion(
+                    storage, &mut *wal, txn, &qualified, false, cascade, responder,
+                )
+            })
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return sql_fail(error),
+            Err(error) => return Err(error),
         }
     }
 
@@ -7107,6 +7273,8 @@ enum SchemaObject {
     Table(usize),
     View(usize),
     Routine(usize),
+    Collation(usize),
+    Conversion(usize),
     Matview {
         table: usize,
         catalog: usize,
@@ -7256,6 +7424,20 @@ pub fn drop_schema(
         if definition.visible_to(txn.txid)
             && in_listed(storage, definition.schema_for(txn.txid).as_str())
             && let Err(error) = push(SchemaObject::Routine(routine), &mut n_objects)
+        {
+            return sql_fail(error);
+        }
+    }
+    for (slot, definition) in storage.collations_visible_to(txn.txid) {
+        if in_listed(storage, definition.schema.as_str())
+            && let Err(error) = push(SchemaObject::Collation(slot), &mut n_objects)
+        {
+            return sql_fail(error);
+        }
+    }
+    for (slot, definition) in storage.conversions_visible_to(txn.txid) {
+        if in_listed(storage, definition.schema.as_str())
+            && let Err(error) = push(SchemaObject::Conversion(slot), &mut n_objects)
         {
             return sql_fail(error);
         }
@@ -7695,6 +7877,24 @@ pub fn drop_schema(
                     0,
                 )
             }
+            SchemaObject::Collation(slot) => {
+                let state = storage.collation(*slot);
+                let definition = state.definition_for(txn.txid);
+                (
+                    schema_rank(storage, definition.schema.as_str()),
+                    state.created_at,
+                    0,
+                )
+            }
+            SchemaObject::Conversion(slot) => {
+                let state = storage.conversion(*slot);
+                let definition = state.definition_for(txn.txid);
+                (
+                    schema_rank(storage, definition.schema.as_str()),
+                    state.created_at,
+                    0,
+                )
+            }
             SchemaObject::Matview { table, .. } => {
                 let table_state = storage.table(*table);
                 let def = storage.table_def(*table, txn.txid);
@@ -7847,6 +8047,16 @@ pub fn drop_schema(
                 }
                 let _ = write!(out, ")");
             }
+            SchemaObject::Collation(slot) => {
+                let definition = storage.collation(*slot).definition_for(txn.txid);
+                let _ = write!(out, "collation ");
+                write_rel(out, &definition.schema, &definition.name);
+            }
+            SchemaObject::Conversion(slot) => {
+                let definition = storage.conversion(*slot).definition_for(txn.txid);
+                let _ = write!(out, "conversion ");
+                write_rel(out, &definition.schema, &definition.name);
+            }
             SchemaObject::Matview { table, .. } => {
                 let def = storage.table_def(*table, txn.txid);
                 let _ = write!(out, "materialized view ");
@@ -7922,6 +8132,12 @@ pub fn drop_schema(
                 SchemaObject::View(v) => storage.view(*v).schema,
                 SchemaObject::Routine(routine) => {
                     storage.routine_for(*routine, txn.txid).schema_for(txn.txid)
+                }
+                SchemaObject::Collation(slot) => {
+                    storage.collation(*slot).definition_for(txn.txid).schema
+                }
+                SchemaObject::Conversion(slot) => {
+                    storage.conversion(*slot).definition_for(txn.txid).schema
                 }
                 SchemaObject::Matview { table, .. } => storage.table_def(*table, txn.txid).schema,
                 SchemaObject::Sequence(sequence) => {
@@ -8015,6 +8231,11 @@ pub fn drop_schema(
                         let operator = storage.operator_for(*root_slot, txn.txid);
                         let _ = write!(dependency, "operator ");
                         write_rel(&mut dependency, &operator.schema, &operator.name);
+                    }
+                    crate::storage::DependencyClass::Collation => {
+                        let collation = storage.collation(*root_slot).definition_for(txn.txid);
+                        let _ = write!(dependency, "collation ");
+                        write_rel(&mut dependency, &collation.schema, &collation.name);
                     }
                 }
                 let _ = write!(
@@ -8226,6 +8447,71 @@ pub fn drop_schema(
                     &routines,
                 ) {
                     return sql_fail(error);
+                }
+            }
+            SchemaObject::Collation(slot) => {
+                if !storage.collation(*slot).visible_to(txn.txid) {
+                    continue;
+                }
+                let definition = storage.collation(*slot).definition_for(txn.txid);
+                let Some(owner) = storage.role_slot_by_oid(definition.owner, txn.txid) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "collation owner does not exist"
+                    ));
+                };
+                let owner = storage.role_name(owner, txn.txid);
+                let qualified = QualName {
+                    schema: Some(definition.schema.as_str()),
+                    name: definition.name.as_str(),
+                };
+                let outcome = run_as_role(owner, || {
+                    responder.without_command_complete(|responder| {
+                        drop_collation(
+                            storage,
+                            &mut *wal,
+                            txn,
+                            scratch,
+                            &qualified,
+                            false,
+                            true,
+                            arena,
+                            seq_session,
+                            responder,
+                        )
+                    })
+                });
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return sql_fail(error),
+                    Err(error) => return Err(error),
+                }
+            }
+            SchemaObject::Conversion(slot) => {
+                if !storage.conversion(*slot).visible_to(txn.txid) {
+                    continue;
+                }
+                let definition = storage.conversion(*slot).definition_for(txn.txid);
+                let Some(owner) = storage.role_slot_by_oid(definition.owner, txn.txid) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "conversion owner does not exist"
+                    ));
+                };
+                let owner = storage.role_name(owner, txn.txid);
+                let qualified = QualName {
+                    schema: Some(definition.schema.as_str()),
+                    name: definition.name.as_str(),
+                };
+                let outcome = run_as_role(owner, || {
+                    responder.without_command_complete(|responder| {
+                        drop_conversion(storage, &mut *wal, txn, &qualified, false, true, responder)
+                    })
+                });
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return sql_fail(error),
+                    Err(error) => return Err(error),
                 }
             }
             SchemaObject::Matview { table, catalog } => {
@@ -15598,10 +15884,16 @@ fn execute_trigger_block<'a>(
                     let value = eval_trigger_expression(context, branch.when, &scope)?;
                     let matches = match operand {
                         Some(operand) => {
+                            let catalog = crate::sql::query::storage_catalog(
+                                context.storage(),
+                                context.arena,
+                                context.txn.txid,
+                            );
                             let collation = crate::sql::eval::resolve_comparison_collation(
                                 program.operand.expect("simple CASE operand"),
                                 branch.when,
                                 &scope,
+                                Some(&catalog),
                             )?;
                             !operand.is_null()
                                 && !value.is_null()
@@ -18489,6 +18781,827 @@ fn catalog_owner_slot(storage: &Storage, txid: u32, written: &str) -> Result<i32
         ));
     }
     Ok(Storage::role_oid(slot))
+}
+
+fn fixed_catalog_text<const N: usize>(
+    value: Option<&str>,
+    what: &str,
+) -> Result<StackStr<N>, SqlError> {
+    let value = StackStr::from_str(value.unwrap_or(""));
+    if value.is_truncated() {
+        Err(sql_err!(
+            sqlstate::NAME_TOO_LONG,
+            "{} exceeds the supported catalog length",
+            what
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn current_catalog_owner(storage: &Storage, txid: u32) -> Result<i32, SqlError> {
+    storage
+        .current_role_slot(txid)
+        .map(Storage::role_oid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))
+}
+
+fn require_definition_owner(
+    storage: &Storage,
+    txid: u32,
+    owner: i32,
+    kind: &str,
+) -> Result<(), SqlError> {
+    let current = storage
+        .current_role_slot(txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))?;
+    if storage.role(current).attributes_to(txid).superuser
+        || Storage::role_oid(current) == owner
+        || storage
+            .role_slot_by_oid(owner, txid)
+            .is_some_and(|owner| storage.role_can_set(current, owner, txid))
+    {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be owner of {}",
+            kind
+        ))
+    }
+}
+
+pub fn create_collation(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &crate::sql::ast::CreateCollation<'_>,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    use crate::sql::ast::CreateCollationDefinition;
+    use crate::storage::{CollationBehavior, CollationDefinition, CollationProvider};
+    let schema = match storage.creation_schema(command.name.schema, command.name.name, txn.txid) {
+        Ok(schema) => schema,
+        Err(error) => return sql_fail(error),
+    };
+    if storage
+        .collation_slot(schema.as_str(), command.name.name, txn.txid)
+        .is_some()
+    {
+        if command.if_not_exists {
+            responder.notice(
+                sqlstate::DUPLICATE_OBJECT,
+                stack_format!(
+                    128,
+                    "collation \"{}\" already exists, skipping",
+                    command.name.name
+                )
+                .as_str(),
+            )?;
+            responder.command_complete("CREATE COLLATION")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "collation \"{}\" already exists",
+            command.name.name
+        ));
+    }
+    let owner = match current_catalog_owner(storage, txn.txid) {
+        Ok(owner) => owner,
+        Err(error) => return sql_fail(error),
+    };
+    let definition = match command.definition {
+        CreateCollationDefinition::From(source) => {
+            let Some(source) = storage.resolve_collation(source.schema, source.name, txn.txid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "collation \"{}\" does not exist",
+                    source.name
+                ));
+            };
+            let mut definition = match source {
+                crate::sql::ast::Collation::Catalog(slot) => storage
+                    .collation(usize::from(slot))
+                    .definition_for(txn.txid),
+                crate::sql::ast::Collation::C => CollationDefinition {
+                    provider: CollationProvider::Libc,
+                    collate: StackStr::from_str("C"),
+                    ctype: StackStr::from_str("C"),
+                    behavior: CollationBehavior::Bytewise,
+                    ..CollationDefinition::EMPTY
+                },
+                crate::sql::ast::Collation::Posix => CollationDefinition {
+                    provider: CollationProvider::Libc,
+                    collate: StackStr::from_str("POSIX"),
+                    ctype: StackStr::from_str("POSIX"),
+                    behavior: CollationBehavior::Bytewise,
+                    ..CollationDefinition::EMPTY
+                },
+                crate::sql::ast::Collation::UcsBasic => CollationDefinition {
+                    provider: CollationProvider::Builtin,
+                    encoding: Some(crate::storage::PgEncoding::UTF8),
+                    locale: StackStr::from_str("C"),
+                    version: StackStr::from_str("1"),
+                    behavior: CollationBehavior::Bytewise,
+                    ..CollationDefinition::EMPTY
+                },
+                crate::sql::ast::Collation::Default => CollationDefinition {
+                    provider: CollationProvider::Default,
+                    behavior: CollationBehavior::Database,
+                    ..CollationDefinition::EMPTY
+                },
+                crate::sql::ast::Collation::None => unreachable!("None is not a catalog collation"),
+            };
+            definition.schema = schema;
+            definition.name = match SqlName::parse(command.name.name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            definition.owner = owner;
+            definition
+        }
+        CreateCollationDefinition::Options {
+            locale,
+            lc_collate,
+            lc_ctype,
+            provider,
+            deterministic,
+            rules,
+            version,
+        } => {
+            let provider = match provider.unwrap_or(crate::sql::ast::ParsedCollationProvider::Libc)
+            {
+                crate::sql::ast::ParsedCollationProvider::Builtin => CollationProvider::Builtin,
+                crate::sql::ast::ParsedCollationProvider::Libc => CollationProvider::Libc,
+                crate::sql::ast::ParsedCollationProvider::Icu => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "ICU collations are not supported"
+                    ));
+                }
+            };
+            if locale.is_some() && (lc_collate.is_some() || lc_ctype.is_some()) {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "conflicting or redundant options"
+                ));
+            }
+            if rules.is_some() && provider != CollationProvider::Icu {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "RULES is only supported with ICU collations"
+                ));
+            }
+            let collate = locale.or(lc_collate);
+            let ctype = locale.or(lc_ctype);
+            if collate.is_none() || ctype.is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "parameter LC_COLLATE and LC_CTYPE must be specified"
+                ));
+            }
+            let behavior = match storage.executable_collation_behavior(
+                provider,
+                collate.unwrap_or(""),
+                ctype.unwrap_or(""),
+                locale.unwrap_or(collate.unwrap_or("")),
+            ) {
+                Ok(behavior) => behavior,
+                Err(error) => return sql_fail(error),
+            };
+            let definition = (|| {
+                let stored_collate =
+                    (provider == CollationProvider::Libc).then_some(collate.unwrap_or(""));
+                let stored_ctype =
+                    (provider == CollationProvider::Libc).then_some(ctype.unwrap_or(""));
+                let stored_locale = (provider != CollationProvider::Libc)
+                    .then_some(locale.unwrap_or(collate.unwrap_or("")));
+                let stored_version =
+                    version.or_else(|| (provider == CollationProvider::Builtin).then_some("1"));
+                Ok(CollationDefinition {
+                    schema,
+                    name: SqlName::parse(command.name.name)?,
+                    owner,
+                    provider,
+                    deterministic: deterministic.unwrap_or(true),
+                    encoding: (provider == CollationProvider::Builtin)
+                        .then_some(crate::storage::PgEncoding::UTF8),
+                    collate: fixed_catalog_text(stored_collate, "LC_COLLATE")?,
+                    ctype: fixed_catalog_text(stored_ctype, "LC_CTYPE")?,
+                    locale: fixed_catalog_text(stored_locale, "LOCALE")?,
+                    rules: fixed_catalog_text(rules, "RULES")?,
+                    version: fixed_catalog_text(stored_version, "VERSION")?,
+                    behavior,
+                })
+            })();
+            match definition {
+                Ok(definition) => definition,
+                Err(error) => return sql_fail(error),
+            }
+        }
+    };
+    let slot = match storage.create_collation(definition, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetCollation {
+            slot: slot as u8,
+            created_at: storage.collation(slot).created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_collation_create(slot);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationCreated(slot as u32)) {
+        storage.rollback_collation_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE COLLATION")?;
+    sql_ok()
+}
+
+pub fn create_conversion(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &crate::sql::ast::CreateConversion<'_>,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let source = command.source_encoding;
+    let destination = command.destination_encoding;
+    let catalog_schema = command
+        .function
+        .schema
+        .is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"));
+    let procedure = match (
+        catalog_schema,
+        command.function.name,
+        source.code(),
+        destination.code(),
+    ) {
+        (true, "utf8_to_iso8859_1", 6, 8) => 4375,
+        (true, "iso8859_1_to_utf8", 8, 6) => 4374,
+        _ => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {}(integer, integer, cstring, internal, integer, boolean) does not exist",
+                command.function.name
+            ));
+        }
+    };
+    let schema = match storage.creation_schema(command.name.schema, command.name.name, txn.txid) {
+        Ok(schema) => schema,
+        Err(error) => return sql_fail(error),
+    };
+    let definition = match (|| {
+        Ok(crate::storage::ConversionDefinition {
+            schema,
+            name: SqlName::parse(command.name.name)?,
+            owner: current_catalog_owner(storage, txn.txid)?,
+            source,
+            destination,
+            procedure,
+            default: command.default,
+        })
+    })() {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
+    let slot = match storage.create_conversion(definition, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetConversion {
+            slot: slot as u8,
+            created_at: storage.conversion(slot).created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_conversion_create(slot);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionCreated(slot as u32)) {
+        storage.rollback_conversion_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE CONVERSION")?;
+    sql_ok()
+}
+
+pub fn alter_collation(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &QualName<'_>,
+    action: crate::sql::ast::AlterCollationAction<'_>,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let Some(slot) = storage.collation_slot_on_path(name.schema, name.name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "collation \"{}\" does not exist",
+            name.name
+        ));
+    };
+    let mut definition = storage.collation(slot).definition_for(txn.txid);
+    if let Err(error) = require_definition_owner(storage, txn.txid, definition.owner, "collation") {
+        return sql_fail(error);
+    }
+    match action {
+        crate::sql::ast::AlterCollationAction::RefreshVersion => {
+            definition.version = match (definition.provider, definition.behavior) {
+                (crate::storage::CollationProvider::Builtin, _) => StackStr::from_str("1"),
+                (_, crate::storage::CollationBehavior::Bytewise) => StackStr::new(),
+                _ => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "collation provider version is unavailable"
+                    ));
+                }
+            };
+        }
+        crate::sql::ast::AlterCollationAction::Rename(new_name) => {
+            definition.name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        crate::sql::ast::AlterCollationAction::Owner(owner) => {
+            definition.owner = match catalog_owner_slot(storage, txn.txid, owner) {
+                Ok(owner) => owner,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        crate::sql::ast::AlterCollationAction::SetSchema(schema) => {
+            if let Err(error) = storage.require_schema_create(schema, txn.txid) {
+                return sql_fail(error);
+            }
+            definition.schema = match SqlName::parse(schema) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+        }
+    }
+    let prior = match storage.alter_collation(slot, definition, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetCollation {
+            slot: slot as u8,
+            created_at: storage.collation(slot).created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_collation_alter(slot, prior);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_collation_alter(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER COLLATION")?;
+    sql_ok()
+}
+
+pub fn alter_conversion(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &QualName<'_>,
+    action: crate::sql::ast::AlterConversionAction<'_>,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let Some(slot) = storage.conversion_slot_on_path(name.schema, name.name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "conversion \"{}\" does not exist",
+            name.name
+        ));
+    };
+    let mut definition = storage.conversion(slot).definition_for(txn.txid);
+    if let Err(error) = require_definition_owner(storage, txn.txid, definition.owner, "conversion")
+    {
+        return sql_fail(error);
+    }
+    match action {
+        crate::sql::ast::AlterConversionAction::Rename(new_name) => {
+            definition.name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        crate::sql::ast::AlterConversionAction::Owner(owner) => {
+            definition.owner = match catalog_owner_slot(storage, txn.txid, owner) {
+                Ok(owner) => owner,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        crate::sql::ast::AlterConversionAction::SetSchema(schema) => {
+            if let Err(error) = storage.require_schema_create(schema, txn.txid) {
+                return sql_fail(error);
+            }
+            definition.schema = match SqlName::parse(schema) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+        }
+    }
+    let prior = match storage.alter_conversion(slot, definition, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetConversion {
+            slot: slot as u8,
+            created_at: storage.conversion(slot).created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_conversion_alter(slot, prior);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_conversion_alter(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER CONVERSION")?;
+    sql_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn drop_collation(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    name: &QualName<'_>,
+    if_exists: bool,
+    cascade: bool,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let Some(slot) = storage.collation_slot_on_path(name.schema, name.name, txn.txid) else {
+        if if_exists {
+            responder.notice(
+                sqlstate::UNDEFINED_OBJECT,
+                stack_format!(128, "collation \"{}\" does not exist, skipping", name.name).as_str(),
+            )?;
+            responder.command_complete("DROP COLLATION")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "collation \"{}\" does not exist",
+            name.name
+        ));
+    };
+    let definition = storage.collation(slot).definition_for(txn.txid);
+    if let Err(error) = require_definition_owner(storage, txn.txid, definition.owner, "collation") {
+        return sql_fail(error);
+    }
+    let identity = crate::sql::ast::Collation::Catalog(slot as u8);
+    let StoredDependencyClosure {
+        views: dependent_views,
+        matviews: dependent_matviews,
+        routines: dependent_routines,
+    } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        dependency.class == crate::storage::DependencyClass::Collation
+            && dependency.slot as usize == slot
+    }) {
+        Ok(dependents) => dependents,
+        Err(error) => return sql_fail(error),
+    };
+    let policy_root = PolicyDependencySelection::Catalog {
+        class: crate::storage::DependencyClass::Collation,
+        slot,
+    };
+    let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
+        || dependent_matviews.iter().any(|selected| *selected)
+        || dependent_routines.iter().any(|selected| *selected)
+        || policy_dependents_exist(
+            storage,
+            txn.txid,
+            policy_root,
+            &dependent_views,
+            &dependent_matviews,
+            &dependent_routines,
+        );
+    if has_stored_dependents && !cascade {
+        if let Err(error) = report_stored_query_dependents(
+            storage,
+            txn.txid,
+            StoredQueryRoot {
+                class: crate::storage::DependencyClass::Collation,
+                slot,
+                kind: "collation",
+                schema: definition.schema,
+                name: definition.name,
+                suffix: crate::util::StackStr::new(),
+            },
+            StoredQuerySelection {
+                views: &dependent_views,
+                matviews: &dependent_matviews,
+                routines: &dependent_routines,
+                policy_root: Some(policy_root),
+            },
+            false,
+            responder,
+        ) {
+            return sql_fail(error);
+        }
+        return sql_fail(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop collation {}.{} because other objects depend on it",
+            definition.schema.as_str(),
+            definition.name.as_str()
+        ));
+    }
+    if !cascade {
+        for table_slot in 0..storage.table_count() {
+            if !storage.table_slot_visible_to(table_slot, txn.txid) {
+                continue;
+            }
+            let table = storage.table_def(table_slot, txn.txid);
+            if let Some(column) = table
+                .columns()
+                .iter()
+                .find(|column| column.collation == identity)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop collation {}.{} because column {}.{} depends on it",
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
+                    table.name.as_str(),
+                    column.name.as_str()
+                ));
+            }
+        }
+        for index_slot in 0..storage.index_count() {
+            if let Some(index) = storage.index_visible_to(index_slot, txn.txid)
+                && index.collations[..index.n_cols].contains(&identity)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop collation {}.{} because index {} depends on it",
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
+                    index.name.as_str()
+                ));
+            }
+        }
+        for (_, composite) in storage.composites_with_slots_visible_to(txn.txid) {
+            if let Some(field) = composite
+                .active_fields()
+                .find(|field| field.collation == identity)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop collation {}.{} because attribute {} of type {} depends on it",
+                    definition.schema.as_str(),
+                    definition.name.as_str(),
+                    field.name.as_str(),
+                    composite.name.as_str()
+                ));
+            }
+        }
+    } else {
+        for table_slot in 0..storage.table_count() {
+            if !storage.table_slot_visible_to(table_slot, txn.txid) {
+                continue;
+            }
+            let table = storage.table_def(table_slot, txn.txid);
+            let table_schema = table.schema;
+            let table_name = table.name;
+            let mut columns = [SqlName::EMPTY; MAX_COLUMNS];
+            let mut count = 0;
+            for column in table.columns() {
+                if column.collation == identity {
+                    columns[count] = column.name;
+                    count += 1;
+                }
+            }
+            if count != 0
+                && let Err(error) = cascade_drop_type_column(
+                    storage,
+                    wal,
+                    txn,
+                    scratch,
+                    table_schema,
+                    table_name,
+                    &columns[..count],
+                    arena,
+                    seq_session,
+                    responder,
+                )
+            {
+                return sql_fail(error);
+            }
+        }
+        for index_slot in 0..storage.index_count() {
+            if storage
+                .index_visible_to(index_slot, txn.txid)
+                .is_some_and(|index| index.collations[..index.n_cols].contains(&identity))
+                && let Err(error) = stage_index_drop(storage, wal, txn, index_slot)
+            {
+                return sql_fail(error);
+            }
+        }
+        for composite_slot in 0..crate::storage::MAX_COMPOSITES {
+            if !storage.composite_slot_visible_to(composite_slot, txn.txid) {
+                continue;
+            }
+            let mut composite = storage.composite_for(composite_slot, txn.txid);
+            let mut changed = false;
+            for field in composite.fields.iter_mut().take(composite.n_fields) {
+                if !field.dropped && field.collation == identity {
+                    field.dropped = true;
+                    field.not_null = false;
+                    field.user_type = None;
+                    field.name = match SqlName::parse(
+                        stack_format!(64, "........pg.dropped.{}........", field.attribute_number)
+                            .as_str(),
+                    ) {
+                        Ok(name) => name,
+                        Err(error) => return sql_fail(error),
+                    };
+                    changed = true;
+                }
+            }
+            if !changed {
+                continue;
+            }
+            let prior = match storage.stage_composite_alter(composite_slot, composite, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateComposite {
+                    slot: composite_slot as u16,
+                    definition: composite,
+                },
+            ) {
+                storage.rollback_composite_alter(composite_slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CompositeAltered {
+                slot: composite_slot as u32,
+                prior,
+            }) {
+                storage.rollback_composite_alter(composite_slot, prior);
+                return sql_fail(error);
+            }
+        }
+        if has_stored_dependents {
+            if let Err(error) = report_stored_query_dependents(
+                storage,
+                txn.txid,
+                StoredQueryRoot {
+                    class: crate::storage::DependencyClass::Collation,
+                    slot,
+                    kind: "collation",
+                    schema: definition.schema,
+                    name: definition.name,
+                    suffix: crate::util::StackStr::new(),
+                },
+                StoredQuerySelection {
+                    views: &dependent_views,
+                    matviews: &dependent_matviews,
+                    routines: &dependent_routines,
+                    policy_root: Some(policy_root),
+                },
+                true,
+                responder,
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = drop_policy_dependents(
+                storage,
+                wal,
+                txn,
+                policy_root,
+                &dependent_views,
+                &dependent_matviews,
+                &dependent_routines,
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = drop_selected_stored_queries(
+                storage,
+                wal,
+                txn,
+                &dependent_views,
+                &dependent_matviews,
+                &dependent_routines,
+            ) {
+                return sql_fail(error);
+            }
+        }
+    }
+    storage.drop_collation(slot, txn.txid);
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::DropCollation {
+            schema: definition.schema.as_str(),
+            name: definition.name.as_str(),
+        },
+    ) {
+        storage.rollback_collation_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CollationDropped(slot as u32)) {
+        storage.rollback_collation_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    responder.command_complete("DROP COLLATION")?;
+    sql_ok()
+}
+
+pub fn drop_conversion(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &QualName<'_>,
+    if_exists: bool,
+    _cascade: bool,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let Some(slot) = storage.conversion_slot_on_path(name.schema, name.name, txn.txid) else {
+        if if_exists {
+            responder.notice(
+                sqlstate::UNDEFINED_OBJECT,
+                stack_format!(128, "conversion \"{}\" does not exist, skipping", name.name)
+                    .as_str(),
+            )?;
+            responder.command_complete("DROP CONVERSION")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "conversion \"{}\" does not exist",
+            name.name
+        ));
+    };
+    let definition = storage.conversion(slot).definition_for(txn.txid);
+    if let Err(error) = require_definition_owner(storage, txn.txid, definition.owner, "conversion")
+    {
+        return sql_fail(error);
+    }
+    storage.drop_conversion(slot, txn.txid);
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::DropConversion {
+            schema: definition.schema.as_str(),
+            name: definition.name.as_str(),
+        },
+    ) {
+        storage.rollback_conversion_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConversionDropped(slot as u32)) {
+        storage.rollback_conversion_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    responder.command_complete("DROP CONVERSION")?;
+    sql_ok()
 }
 
 fn require_catalog_superuser(storage: &Storage, txid: u32) -> Result<(), SqlError> {
@@ -23472,6 +24585,52 @@ pub fn comment(
             };
             (CommentClass::Database, SqlName::EMPTY, stored, 0u32)
         }
+        CommentTarget::Collation(collation_name) => {
+            let Some(slot) =
+                storage.collation_slot_on_path(collation_name.schema, collation_name.name, txid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "collation \"{}\" does not exist",
+                    collation_name.name
+                ));
+            };
+            let definition = storage.collation(slot).definition_for(txid);
+            if let Err(error) =
+                require_definition_owner(storage, txid, definition.owner, "collation")
+            {
+                return sql_fail(error);
+            }
+            (
+                CommentClass::Collation,
+                definition.schema,
+                definition.name,
+                0u32,
+            )
+        }
+        CommentTarget::Conversion(conversion_name) => {
+            let Some(slot) =
+                storage.conversion_slot_on_path(conversion_name.schema, conversion_name.name, txid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "conversion \"{}\" does not exist",
+                    conversion_name.name
+                ));
+            };
+            let definition = storage.conversion(slot).definition_for(txid);
+            if let Err(error) =
+                require_definition_owner(storage, txid, definition.owner, "conversion")
+            {
+                return sql_fail(error);
+            }
+            (
+                CommentClass::Conversion,
+                definition.schema,
+                definition.name,
+                0u32,
+            )
+        }
         CommentTarget::Extension(extension_name) => {
             let Some(slot) = storage.extension_slot(extension_name, txid) else {
                 return sql_fail(sql_err!(
@@ -26512,7 +27671,8 @@ fn build_composite_spec(
             ));
         }
         let collatable = ctype.is_collatable();
-        if !collatable && field.collation != crate::sql::ast::Collation::Default {
+        let collation = ddl::resolve_parsed_collation(storage, txid, field.collation)?;
+        if !collatable && collation != crate::sql::ast::Collation::Default {
             return Err(sql_err!(
                 sqlstate::DATATYPE_MISMATCH,
                 "collations are not supported by type {}",
@@ -26525,7 +27685,7 @@ fn build_composite_spec(
             ctype,
             type_mod: field.type_mod,
             collation: if collatable {
-                field.collation
+                collation
             } else {
                 crate::sql::ast::Collation::None
             },
@@ -27640,6 +28800,7 @@ fn policy_depends_on_owned_selection(
                 crate::storage::DependencyClass::Composite => composites.get(slot),
                 crate::storage::DependencyClass::Routine => routines.get(slot),
                 crate::storage::DependencyClass::Operator => operators.get(slot),
+                crate::storage::DependencyClass::Collation => None,
             }
             .copied()
             .unwrap_or(false)
@@ -31869,9 +33030,12 @@ pub fn create_index(
         }
     }
     let mut collations = match constraints::index_key_collations(
+        storage,
+        txn.txid,
         &tdef,
         &columns[..command.columns.len()],
         &expression_refs[..command.columns.len()],
+        arena,
     ) {
         Ok(collations) => collations,
         Err(error) => return sql_fail(error),
@@ -31879,7 +33043,10 @@ pub fn create_index(
     let mut explicit_collations = [false; MAX_INDEX_COLS];
     for (index, column) in command.columns.iter().enumerate() {
         if let Some(collation) = column.collation {
-            collations[index] = collation;
+            collations[index] = match ddl::resolve_parsed_collation(storage, txn.txid, collation) {
+                Ok(collation) => collation,
+                Err(error) => return sql_fail(error),
+            };
             explicit_collations[index] = true;
         }
     }
@@ -44592,7 +45759,12 @@ fn alter_table_inner(
                 let source_type = new_def.columns[i].ctype;
                 let source_collation = new_def.columns[i].collation;
                 let target_collation = match (*collation, target.is_collatable()) {
-                    (Some(collation), true) => collation,
+                    (Some(collation), true) => {
+                        match ddl::resolve_parsed_collation(storage, txn.txid, collation) {
+                            Ok(collation) => collation,
+                            Err(error) => return sql_fail(error),
+                        }
+                    }
                     (Some(_), false) => {
                         return sql_fail(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,

@@ -7,6 +7,214 @@
 use super::*;
 
 #[test]
+fn collation_and_conversion_lifecycle_is_typed_transactional_and_executable() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE COLLATION public.byte_order (PROVIDER = libc, LOCALE = 'C', DETERMINISTIC = TRUE, VERSION = '1'); \
+         CREATE DEFAULT CONVERSION public.latin1_to_utf8 FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8; \
+         COMMENT ON COLLATION public.byte_order IS 'byte ordering'; \
+         COMMENT ON CONVERSION public.latin1_to_utf8 IS 'latin1 conversion'; \
+         CREATE TABLE public.collated_values(value text COLLATE public.byte_order); \
+         INSERT INTO public.collated_values VALUES ('z'), ('a'); \
+         CREATE VIEW public.collated_view AS SELECT value COLLATE public.byte_order AS value FROM public.collated_values; \
+         SELECT value FROM public.collated_view ORDER BY value; \
+         SELECT collprovider, collisdeterministic, collcollate, collctype, collversion FROM pg_collation WHERE collname = 'byte_order'; \
+         SELECT conforencoding, contoencoding, conproc::regproc, condefault FROM pg_conversion WHERE conname = 'latin1_to_utf8'; \
+         SELECT encode(convert_to('é', 'LATIN1'), 'hex'), convert_from(decode('e9', 'hex'), 'LATIN1'), encode(convert(decode('e9', 'hex'), 'LATIN1', 'UTF8'), 'hex')",
+    );
+    let text = String::from_utf8_lossy(&setup);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&setup),
+        [
+            "a",
+            "z",
+            "c|t|C|C|1",
+            "8|6|iso8859_1_to_utf8|t",
+            "e9|é|c3a9",
+        ]
+    );
+
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER COLLATION public.byte_order RENAME TO byte_order_renamed; \
+         ALTER CONVERSION public.latin1_to_utf8 RENAME TO latin1_to_utf8_renamed; \
+         SELECT collname FROM pg_collation WHERE oid = (SELECT attcollation FROM pg_attribute WHERE attrelid = 'collated_values'::regclass AND attname = 'value'); \
+         SELECT conname FROM pg_conversion WHERE conname = 'latin1_to_utf8_renamed'; \
+         SELECT obj_description(oid, 'pg_collation') FROM pg_collation WHERE collname = 'byte_order_renamed'; \
+         SELECT obj_description(oid, 'pg_conversion') FROM pg_conversion WHERE conname = 'latin1_to_utf8_renamed'; \
+         SELECT value FROM public.collated_view ORDER BY value",
+    );
+    let text = String::from_utf8_lossy(&renamed);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&renamed),
+        [
+            "byte_order_renamed",
+            "latin1_to_utf8_renamed",
+            "byte ordering",
+            "latin1 conversion",
+            "a",
+            "z"
+        ]
+    );
+
+    let rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP CONVERSION public.latin1_to_utf8_renamed; DROP COLLATION public.byte_order_renamed CASCADE; ROLLBACK; \
+         SELECT count(*) FROM pg_collation WHERE collname = 'byte_order_renamed'; \
+         SELECT count(*) FROM pg_conversion WHERE conname = 'latin1_to_utf8_renamed'; \
+         SELECT value FROM public.collated_view ORDER BY value",
+    );
+    let text = String::from_utf8_lossy(&rollback);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&rollback), ["1", "1", "a", "z"]);
+}
+
+#[test]
+fn locale_catalog_ownership_schema_and_dependency_lifecycle_is_complete() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE locale_owner; \
+         CREATE SCHEMA locale_lifecycle; \
+         CREATE COLLATION locale_lifecycle.byte_order (PROVIDER = libc, LOCALE = 'C'); \
+         CREATE CONVERSION locale_lifecycle.latin1_to_utf8 \
+           FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8; \
+         ALTER COLLATION locale_lifecycle.byte_order OWNER TO locale_owner; \
+         ALTER CONVERSION locale_lifecycle.latin1_to_utf8 OWNER TO locale_owner; \
+         SELECT count(*) FROM pg_depend \
+          WHERE classid = 'pg_collation'::regclass \
+            AND objid = (SELECT oid FROM pg_collation WHERE collname = 'byte_order'); \
+         SELECT count(*) FROM pg_depend \
+          WHERE classid = 'pg_conversion'::regclass \
+            AND objid = (SELECT oid FROM pg_conversion WHERE conname = 'latin1_to_utf8')",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1", "2"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let drop_role = run_with(&mut engine, &mut budget, "DROP ROLE locale_owner");
+    assert!(
+        String::from_utf8_lossy(&drop_role).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&drop_role)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "REASSIGN OWNED BY locale_owner TO postgres; DROP ROLE locale_owner",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA locale_lifecycle RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA locale_lifecycle CASCADE; \
+         SELECT count(*) FROM pg_collation WHERE collname = 'byte_order'; \
+         SELECT count(*) FROM pg_conversion WHERE conname = 'latin1_to_utf8'; \
+         CREATE ROLE locale_owner; \
+         CREATE COLLATION public.owned_byte_order (PROVIDER = libc, LOCALE = 'C'); \
+         CREATE CONVERSION public.owned_latin1_to_utf8 \
+           FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8; \
+         ALTER COLLATION public.owned_byte_order OWNER TO locale_owner; \
+         ALTER CONVERSION public.owned_latin1_to_utf8 OWNER TO locale_owner; \
+         DROP OWNED BY locale_owner; \
+         DROP ROLE locale_owner; \
+         SELECT count(*) FROM pg_collation WHERE collname = 'owned_byte_order'; \
+         SELECT count(*) FROM pg_conversion WHERE conname = 'owned_latin1_to_utf8'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0", "0", "0", "0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn collation_and_conversion_survive_wal_checkpoint_and_cold_object_recovery() {
+    let mut config = test_config("collation-conversion-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("collation-conversion-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE COLLATION public.durable_c (PROVIDER = libc, LOCALE = 'C'); \
+             CREATE DEFAULT CONVERSION public.durable_latin1 FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8; \
+             COMMENT ON COLLATION public.durable_c IS 'durable collation'; \
+             COMMENT ON CONVERSION public.durable_latin1 IS 'durable conversion'; \
+             CREATE TABLE public.durable_text(value text COLLATE public.durable_c); \
+             INSERT INTO public.durable_text VALUES ('b'), ('a')",
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+        assert!(
+            !String::from_utf8_lossy(&checkpoint).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&checkpoint)
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value FROM public.durable_text ORDER BY value; \
+         SELECT collprovider, collcollate FROM pg_collation WHERE collname = 'durable_c'; \
+         SELECT conproc::regproc, condefault FROM pg_conversion WHERE conname = 'durable_latin1'; \
+         SELECT obj_description(oid, 'pg_collation') FROM pg_collation WHERE collname = 'durable_c'; \
+         SELECT obj_description(oid, 'pg_conversion') FROM pg_conversion WHERE conname = 'durable_latin1'; \
+         SELECT convert_from(decode('e9', 'hex'), 'LATIN1')",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "a",
+            "b",
+            "c|C",
+            "iso8859_1_to_utf8|t",
+            "durable collation",
+            "durable conversion",
+            "é"
+        ]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
     let config = test_config("cast-operator-ddl");
     let mut budget = Budget::new(1 << 29);
@@ -12402,7 +12610,7 @@ fn collate_is_retained_in_the_expression_tree() {
         expression,
         crate::sql::ast::Expr::Collate {
             operand: crate::sql::ast::Expr::Column { name: "value", .. },
-            collation: crate::sql::ast::Collation::C,
+            collation: crate::sql::ast::ParsedCollation::Builtin(crate::sql::ast::Collation::C,),
         }
     ));
 }
@@ -23590,9 +23798,7 @@ fn named_single_column_key_retains_name() {
 
 #[test]
 fn alter_table_multi_action() {
-    let config = test_config("alter-multi");
-    let mut b = Budget::new(1 << 26);
-    let mut e = Engine::new(&config, &mut b).unwrap();
+    let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE m (a int)");
     run_with(&mut e, &mut b, "INSERT INTO m VALUES (1), (2), (3)");
     // Several ADD COLUMNs with defaults applied in one statement.
@@ -32081,13 +32287,20 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          CREATE SCHEMA template_app;
          CREATE TYPE template_app.state AS ENUM ('ready', 'done');
          CREATE DOMAIN template_app.positive AS integer CHECK (VALUE > 0);
+         CREATE COLLATION template_app.byte_order
+           (PROVIDER = libc, LOCALE = 'C', VERSION = '1');
+         CREATE DEFAULT CONVERSION template_app.latin1_to_utf8
+           FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8;
          CREATE TABLE template_app.items (
              id template_app.positive PRIMARY KEY,
-             state template_app.state NOT NULL
+             state template_app.state NOT NULL,
+             label text COLLATE template_app.byte_order
          );
-         INSERT INTO template_app.items VALUES (1, 'ready');
+         CREATE INDEX items_label_idx ON template_app.items(label);
+         INSERT INTO template_app.items VALUES (1, 'ready', 'z');
          CREATE VIEW template_app.ready_items AS
-           SELECT id FROM template_app.items WHERE state = 'ready';
+           SELECT id, label COLLATE template_app.byte_order AS label
+             FROM template_app.items WHERE state = 'ready';
          CREATE SEQUENCE template_app.item_sequence;
          SELECT setval('template_app.item_sequence', 7, true);
          CREATE PUBLICATION template_changes FOR TABLE template_app.items;
@@ -32150,7 +32363,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes';
          SELECT obj_description('template_app.items'::regclass, 'pg_class');
          SELECT has_table_privilege('template_reader', 'template_app.items', 'SELECT');
-         INSERT INTO template_app.items VALUES (2, 'done');",
+         SELECT collname FROM pg_collation WHERE collname = 'byte_order';
+         SELECT conname FROM pg_conversion WHERE conname = 'latin1_to_utf8';
+         SELECT label FROM template_app.items ORDER BY label;
+         SELECT convert_from(decode('e9', 'hex'), 'LATIN1');
+         INSERT INTO template_app.items VALUES (2, 'done', 'a');",
     );
     assert_eq!(
         data_rows(&output),
@@ -32162,6 +32379,10 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "1",
             "copied template table",
             "t",
+            "byte_order",
+            "latin1_to_utf8",
+            "z",
+            "é",
         ],
         "{}",
         String::from_utf8_lossy(&output)
@@ -32178,6 +32399,10 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         })
         .map(|(slot, _)| slot)
         .unwrap();
+    let cloned_collation = engine
+        .storage
+        .collation_slot("template_app", "byte_order", 0)
+        .unwrap();
     assert!(
         engine
             .storage
@@ -32189,6 +32414,18 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
                     && usize::from(dependency.slot) == cloned_table
             }),
         "template clone must rebind stored-query dependencies to cloned slots"
+    );
+    assert!(
+        engine
+            .storage
+            .view_dependencies(cloned_view)
+            .entries()
+            .iter()
+            .any(|dependency| {
+                dependency.class == crate::storage::DependencyClass::Collation
+                    && usize::from(dependency.slot) == cloned_collation
+            }),
+        "template clone must rebind collation dependencies to cloned slots"
     );
     let output = run_with(
         &mut engine,
@@ -32296,7 +32533,12 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             AND indexname = 'items_pkey';
          SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes';
          SELECT has_table_privilege('template_reader', 'template_app.cloned_items', 'SELECT');
-         SELECT obj_description('template_app.cloned_items'::regclass, 'pg_class');",
+         SELECT obj_description('template_app.cloned_items'::regclass, 'pg_class');
+         SELECT collname FROM pg_collation WHERE oid = (
+           SELECT attcollation FROM pg_attribute
+            WHERE attrelid = 'template_app.cloned_items'::regclass AND attname = 'label');
+         SELECT conname FROM pg_conversion WHERE conname = 'latin1_to_utf8';
+         SELECT label FROM template_app.cloned_items ORDER BY label;",
     );
     assert_eq!(
         data_rows(&output),
@@ -32307,7 +32549,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "1",
             "1",
             "t",
-            "copied template table"
+            "copied template table",
+            "byte_order",
+            "latin1_to_utf8",
+            "a",
+            "z"
         ],
         "{}",
         String::from_utf8_lossy(&output)
@@ -35809,7 +36055,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
 fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
     std::thread::Builder::new()
         .name("cold-pax-regression".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack)
         .expect("cold PAX test thread starts")
         .join()

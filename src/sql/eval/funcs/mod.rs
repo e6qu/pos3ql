@@ -9,7 +9,7 @@
 //! relocated here without depending on where they sat in the original `match`.
 
 pub(super) mod array;
-pub(super) mod bytea;
+pub(crate) mod bytea;
 pub(super) mod conditional;
 pub(super) mod datetime;
 pub(super) mod json;

@@ -362,6 +362,12 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterMaterializedViewExtensionDependency { .. }
         | Stmt::DropExtension { .. }
         | Stmt::DropView { .. }
+        | Stmt::CreateCollation(_)
+        | Stmt::AlterCollation { .. }
+        | Stmt::DropCollation { .. }
+        | Stmt::CreateConversion(_)
+        | Stmt::AlterConversion { .. }
+        | Stmt::DropConversion { .. }
         | Stmt::CreatePublication { .. }
         | Stmt::AlterPublication { .. }
         | Stmt::DropPublication { .. }
@@ -3851,6 +3857,24 @@ impl Engine {
                 DdlUndo::OperatorCreated(slot) => {
                     self.storage.commit_operator_create(*slot as usize)
                 }
+                DdlUndo::CollationCreated(slot) => {
+                    self.storage.commit_collation_create(*slot as usize)
+                }
+                DdlUndo::CollationAltered { slot, .. } => self
+                    .storage
+                    .commit_collation_alter(*slot as usize, txn.txid),
+                DdlUndo::CollationDropped(slot) => {
+                    self.storage.commit_collation_drop(*slot as usize)
+                }
+                DdlUndo::ConversionCreated(slot) => {
+                    self.storage.commit_conversion_create(*slot as usize)
+                }
+                DdlUndo::ConversionAltered { slot, .. } => self
+                    .storage
+                    .commit_conversion_alter(*slot as usize, txn.txid),
+                DdlUndo::ConversionDropped(slot) => {
+                    self.storage.commit_conversion_drop(*slot as usize)
+                }
                 DdlUndo::OperatorAltered { slot, .. } => {
                     self.storage.commit_operator_alter(*slot as usize, txn.txid)
                 }
@@ -4239,6 +4263,24 @@ impl Engine {
             DdlUndo::CastCreated(slot) => self.storage.rollback_cast_create(slot as usize),
             DdlUndo::CastDropped(slot) => self.storage.rollback_cast_drop(slot as usize, txid),
             DdlUndo::OperatorCreated(slot) => self.storage.rollback_operator_create(slot as usize),
+            DdlUndo::CollationCreated(slot) => {
+                self.storage.rollback_collation_create(slot as usize)
+            }
+            DdlUndo::CollationAltered { slot, prior } => {
+                self.storage.rollback_collation_alter(slot as usize, prior)
+            }
+            DdlUndo::CollationDropped(slot) => {
+                self.storage.rollback_collation_drop(slot as usize, txid)
+            }
+            DdlUndo::ConversionCreated(slot) => {
+                self.storage.rollback_conversion_create(slot as usize)
+            }
+            DdlUndo::ConversionAltered { slot, prior } => {
+                self.storage.rollback_conversion_alter(slot as usize, prior)
+            }
+            DdlUndo::ConversionDropped(slot) => {
+                self.storage.rollback_conversion_drop(slot as usize, txid)
+            }
             DdlUndo::OperatorAltered { slot, prior } => {
                 self.storage.rollback_operator_alter(slot as usize, prior)
             }
@@ -9355,6 +9397,57 @@ impl Engine {
                 *cascade,
                 responder,
             ),
+            Stmt::CreateCollation(command) => {
+                exec::create_collation(&mut self.storage, &mut self.wal, txn, command, responder)
+            }
+            Stmt::AlterCollation { name, action } => exec::alter_collation(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *action,
+                responder,
+            ),
+            Stmt::DropCollation {
+                name,
+                if_exists,
+                cascade,
+            } => exec::drop_collation(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                &mut self.dml_scratch,
+                name,
+                *if_exists,
+                *cascade,
+                arena,
+                guc.seq_session(),
+                responder,
+            ),
+            Stmt::CreateConversion(command) => {
+                exec::create_conversion(&mut self.storage, &mut self.wal, txn, command, responder)
+            }
+            Stmt::AlterConversion { name, action } => exec::alter_conversion(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *action,
+                responder,
+            ),
+            Stmt::DropConversion {
+                name,
+                if_exists,
+                cascade,
+            } => exec::drop_conversion(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
             Stmt::CreatePublication {
                 name,
                 all_tables,
@@ -12802,6 +12895,22 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 })?;
             storage.drop_operator(slot, 0);
             storage.commit_operator_drop(slot);
+        }
+        WalOp::SetCollation {
+            slot,
+            created_at,
+            definition,
+        } => storage.replay_collation(usize::from(slot), created_at, definition)?,
+        WalOp::DropCollation { schema, name } => {
+            storage.replay_drop_collation(schema, name);
+        }
+        WalOp::SetConversion {
+            slot,
+            created_at,
+            definition,
+        } => storage.replay_conversion(usize::from(slot), created_at, definition)?,
+        WalOp::DropConversion { schema, name } => {
+            storage.replay_drop_conversion(schema, name);
         }
         WalOp::SetOperatorFamily {
             created_at,

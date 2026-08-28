@@ -1477,6 +1477,10 @@ impl StorageCatalog<'_, '_, '_, '_> {
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn resolve_collation(&self, schema: Option<&str>, name: &str) -> Option<super::ast::Collation> {
+        self.storage.resolve_collation(schema, name, self.txid)
+    }
+
     fn has_operator_candidate(&self, name: &str) -> bool {
         self.storage
             .operators_visible_to(self.txid)
@@ -1585,6 +1589,31 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         right: &str,
     ) -> Result<core::cmp::Ordering, SqlError> {
         self.storage.compare_text(collation, left, right)
+    }
+
+    fn convert_encoding<'a>(
+        &self,
+        source: crate::storage::PgEncoding,
+        destination: crate::storage::PgEncoding,
+        input: &[u8],
+        arena: &'a Arena,
+    ) -> Result<&'a [u8], SqlError> {
+        let procedure = if source == destination {
+            None
+        } else if source == crate::storage::PgEncoding::UTF8
+            && destination == crate::storage::PgEncoding::LATIN1
+        {
+            Some(4375)
+        } else if source == crate::storage::PgEncoding::LATIN1
+            && destination == crate::storage::PgEncoding::UTF8
+        {
+            Some(4374)
+        } else {
+            self.storage
+                .default_conversion(source, destination, self.txid)
+                .map(|definition| definition.procedure)
+        };
+        super::eval::funcs::bytea::convert_encoding(source, destination, procedure, input, arena)
     }
 
     fn call_routine<'a>(
@@ -1934,7 +1963,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     }
 
     fn collation_is_visible(&self, oid: i32) -> Option<bool> {
-        super::catalog::collation_oid_is_visible(oid).then_some(true)
+        super::catalog::collation_oid_is_visible(self.storage, self.txid, oid).then_some(true)
     }
 
     fn relation_is_publishable(&self, oid: i32) -> Option<bool> {
@@ -5283,11 +5312,15 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
                 _ => None,
             })
             .unwrap_or(order.expression);
-        order_collations[index] =
-            match resolved_expression_collation(expression, &super::eval::NoColumns) {
-                Ok(collation) => collation,
-                Err(error) => return sql_fail(error),
-            };
+        let catalog = storage_catalog(storage, arena, txid);
+        order_collations[index] = match resolved_expression_collation(
+            expression,
+            &super::eval::NoColumns,
+            Some(&catalog),
+        ) {
+            Ok(collation) => collation,
+            Err(error) => return sql_fail(error),
+        };
     }
     if n_order > 0 {
         for row in out_rows.iter() {

@@ -4037,6 +4037,43 @@ impl<'a> Parser<'a> {
         if self.eat_ident("role")? || self.eat_ident("user")? || self.eat_ident("group")? {
             return self.alter_role();
         }
+        if self.eat_ident("collation")? {
+            let name = self.qual_name("collation name")?;
+            let action = if self.eat_ident("refresh")? {
+                self.expect_ident("version")?;
+                crate::sql::ast::AlterCollationAction::RefreshVersion
+            } else if self.eat_ident("rename")? {
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterCollationAction::Rename(self.any_ident("new collation name")?)
+            } else if self.eat_ident("owner")? {
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterCollationAction::Owner(self.any_ident("role name")?)
+            } else if self.eat_ident("set")? {
+                self.expect_ident("schema")?;
+                crate::sql::ast::AlterCollationAction::SetSchema(self.any_ident("schema name")?)
+            } else {
+                return Err(self.err_here("expected a collation alteration"));
+            };
+            return Ok(Stmt::AlterCollation { name, action });
+        }
+        if self.eat_ident("conversion")? {
+            let name = self.qual_name("conversion name")?;
+            let action = if self.eat_ident("rename")? {
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterConversionAction::Rename(
+                    self.any_ident("new conversion name")?,
+                )
+            } else if self.eat_ident("owner")? {
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterConversionAction::Owner(self.any_ident("role name")?)
+            } else if self.eat_ident("set")? {
+                self.expect_ident("schema")?;
+                crate::sql::ast::AlterConversionAction::SetSchema(self.any_ident("schema name")?)
+            } else {
+                return Err(self.err_here("expected a conversion alteration"));
+            };
+            return Ok(Stmt::AlterConversion { name, action });
+        }
         if self.eat_ident("publication")? {
             return self.alter_publication();
         }
@@ -4551,7 +4588,7 @@ impl<'a> Parser<'a> {
             let collation = if self.eat_ident("collate")? {
                 self.collation_name()?
             } else {
-                crate::sql::ast::Collation::Default
+                crate::sql::ast::ParsedCollation::DEFAULT
             };
             let mut not_null = false;
             let mut unique = false;
@@ -5226,6 +5263,10 @@ impl<'a> Parser<'a> {
             CommentTarget::Tablespace(self.col_ident("tablespace name")?)
         } else if self.eat_ident("database")? {
             CommentTarget::Database(self.col_ident("database name")?)
+        } else if self.eat_ident("collation")? {
+            CommentTarget::Collation(self.qual_name("collation name")?)
+        } else if self.eat_ident("conversion")? {
+            CommentTarget::Conversion(self.qual_name("conversion name")?)
         } else if self.eat_ident("extension")? {
             CommentTarget::Extension(self.col_ident("extension name")?)
         } else if self.eat_ident("trigger")? {
@@ -7423,6 +7464,46 @@ mod tests {
             with_parser(sql, |parser| {
                 let error = parser.next_stmt().unwrap_err();
                 assert_eq!(error.sqlstate, state, "{sql}");
+            });
+        }
+    }
+
+    #[test]
+    fn locale_ddl_parses_encoding_and_provider_into_closed_types() {
+        with_parser(
+            "CREATE DEFAULT CONVERSION app.c FOR 'latin-1' TO 'utf_8' FROM pg_catalog.iso8859_1_to_utf8; \
+             CREATE COLLATION app.c_locale (provider = LIBC, locale = 'C')",
+            |parser| {
+                let Stmt::CreateConversion(conversion) = parser.next_stmt().unwrap().unwrap()
+                else {
+                    panic!("expected CREATE CONVERSION")
+                };
+                assert_eq!(
+                    conversion.source_encoding,
+                    crate::storage::PgEncoding::LATIN1
+                );
+                assert_eq!(
+                    conversion.destination_encoding,
+                    crate::storage::PgEncoding::UTF8
+                );
+                let Stmt::CreateCollation(collation) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected CREATE COLLATION")
+                };
+                assert!(matches!(
+                    collation.definition,
+                    crate::sql::ast::CreateCollationDefinition::Options {
+                        provider: Some(crate::sql::ast::ParsedCollationProvider::Libc),
+                        ..
+                    }
+                ));
+            },
+        );
+        for sql in [
+            "CREATE CONVERSION c FOR 'not-an-encoding' TO 'UTF8' FROM f",
+            "CREATE COLLATION c (provider = pretend, locale = 'C')",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().is_err(), "accepted {sql}");
             });
         }
     }

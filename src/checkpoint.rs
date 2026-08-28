@@ -1193,16 +1193,11 @@ impl Checkpointer {
                     let auto_increment_step: i64 = parse_field(words.next(), "col step")?;
                     let ctype = ColType::from_code(type_code)
                         .ok_or(CheckpointSetupError::Corrupt("unknown column type code"))?;
-                    let collation = match parse_field::<u8>(words.next(), "col collation")? {
-                        0 => crate::sql::ast::Collation::Default,
-                        1 => crate::sql::ast::Collation::C,
-                        2 => crate::sql::ast::Collation::Posix,
-                        3 => crate::sql::ast::Collation::UcsBasic,
-                        4 => crate::sql::ast::Collation::None,
-                        _ => {
-                            return Err(CheckpointSetupError::Corrupt("unknown column collation"));
-                        }
-                    };
+                    let collation = crate::sql::ast::Collation::from_code(parse_field::<u8>(
+                        words.next(),
+                        "col collation",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("unknown column collation"))?;
                     let schema_hex = words.next().ok_or(CheckpointSetupError::Corrupt(
                         "col user type schema missing",
                     ))?;
@@ -2777,6 +2772,187 @@ impl Checkpointer {
                             ))
                         })?;
                 }
+                Some("coll") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let slot = parse_field(words.next(), "collation slot")?;
+                    let created_at = parse_field(words.next(), "collation created_at")?;
+                    let schema =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("collation schema missing"),
+                        )?)?)?;
+                    let name =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("collation name missing"),
+                        )?)?)?;
+                    let owner: i32 = parse_field(words.next(), "collation owner")?;
+                    if storage.role_slot_by_oid(owner, 0).is_none() {
+                        return Err(CheckpointSetupError::Corrupt("collation owner missing"));
+                    }
+                    let provider = match parse_field::<u8>(words.next(), "collation provider")? {
+                        b'd' => crate::storage::CollationProvider::Default,
+                        b'b' => crate::storage::CollationProvider::Builtin,
+                        b'c' => crate::storage::CollationProvider::Libc,
+                        b'i' => crate::storage::CollationProvider::Icu,
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid collation provider",
+                            ));
+                        }
+                    };
+                    let deterministic =
+                        match parse_field::<u8>(words.next(), "collation deterministic")? {
+                            0 => false,
+                            1 => true,
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "invalid collation determinism",
+                                ));
+                            }
+                        };
+                    let encoding =
+                        match parse_field::<u8>(words.next(), "collation encoding")? {
+                            255 => None,
+                            code => Some(crate::storage::PgEncoding::from_code(code).ok_or(
+                                CheckpointSetupError::Corrupt("invalid collation encoding"),
+                            )?),
+                        };
+                    let fixed = |value: Option<&str>, missing, too_long| {
+                        let decoded =
+                            decode_hex_name(value.ok_or(CheckpointSetupError::Corrupt(missing))?)?;
+                        let fixed = StackStr::from_str(&decoded);
+                        (!fixed.is_truncated())
+                            .then_some(fixed)
+                            .ok_or(CheckpointSetupError::Corrupt(too_long))
+                    };
+                    let collate = fixed(
+                        words.next(),
+                        "collation collate missing",
+                        "collation collate too long",
+                    )?;
+                    let ctype = fixed(
+                        words.next(),
+                        "collation ctype missing",
+                        "collation ctype too long",
+                    )?;
+                    let locale = fixed(
+                        words.next(),
+                        "collation locale missing",
+                        "collation locale too long",
+                    )?;
+                    let rules = fixed(
+                        words.next(),
+                        "collation rules missing",
+                        "collation rules too long",
+                    )?;
+                    let decoded_version = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("collation version missing"))?,
+                    )?;
+                    let version = StackStr::<64>::from_str(&decoded_version);
+                    if version.is_truncated() {
+                        return Err(CheckpointSetupError::Corrupt("collation version too long"));
+                    }
+                    let behavior = match parse_field::<u8>(words.next(), "collation behavior")? {
+                        0 => crate::storage::CollationBehavior::Bytewise,
+                        1 => crate::storage::CollationBehavior::Database,
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid collation behavior",
+                            ));
+                        }
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing collation fields"));
+                    }
+                    storage
+                        .replay_collation(
+                            slot,
+                            created_at,
+                            crate::storage::CollationDefinition {
+                                schema,
+                                name,
+                                owner,
+                                provider,
+                                deterministic,
+                                encoding,
+                                collate,
+                                ctype,
+                                locale,
+                                rules,
+                                version,
+                                behavior,
+                            },
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest collation rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("conv") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let slot = parse_field(words.next(), "conversion slot")?;
+                    let created_at = parse_field(words.next(), "conversion created_at")?;
+                    let schema =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("conversion schema missing"),
+                        )?)?)?;
+                    let name =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("conversion name missing"),
+                        )?)?)?;
+                    let owner: i32 = parse_field(words.next(), "conversion owner")?;
+                    if storage.role_slot_by_oid(owner, 0).is_none() {
+                        return Err(CheckpointSetupError::Corrupt("conversion owner missing"));
+                    }
+                    let source = crate::storage::PgEncoding::from_code(parse_field(
+                        words.next(),
+                        "conversion source",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid conversion source"))?;
+                    let destination = crate::storage::PgEncoding::from_code(parse_field(
+                        words.next(),
+                        "conversion destination",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt(
+                        "invalid conversion destination",
+                    ))?;
+                    let procedure = parse_field(words.next(), "conversion procedure")?;
+                    let default = match parse_field::<u8>(words.next(), "conversion default")? {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid conversion default",
+                            ));
+                        }
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing conversion fields"));
+                    }
+                    storage
+                        .replay_conversion(
+                            slot,
+                            created_at,
+                            crate::storage::ConversionDefinition {
+                                schema,
+                                name,
+                                owner,
+                                source,
+                                destination,
+                                procedure,
+                                default,
+                            },
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest conversion rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
                 Some("opr") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let created_at = parse_field(words.next(), "operator created_at")?;
@@ -3978,10 +4154,18 @@ impl Checkpointer {
                     let mut explicit_collations = [false; crate::storage::MAX_INDEX_COLS];
                     for position in 0..n_cols {
                         let code: u8 = parse_field(words.next(), "idx collation")?;
-                        explicit_collations[position] = code & 0x80 != 0;
-                        collations[position] =
-                            crate::sql::ast::Collation::from_code(code & 0x7f)
-                                .ok_or(CheckpointSetupError::Corrupt("bad index collation"))?;
+                        explicit_collations[position] =
+                            match parse_field::<u8>(words.next(), "idx explicit collation")? {
+                                0 => false,
+                                1 => true,
+                                _ => {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "bad index explicit collation",
+                                    ));
+                                }
+                            };
+                        collations[position] = crate::sql::ast::Collation::from_code(code)
+                            .ok_or(CheckpointSetupError::Corrupt("bad index collation"))?;
                     }
                     let mut operator_classes = [None; crate::storage::MAX_INDEX_COLS];
                     for operator_class in operator_classes.iter_mut().take(n_cols) {
@@ -5056,13 +5240,7 @@ impl Checkpointer {
                         default_hex.as_str(),
                         dexpr_hex.as_str(),
                         c.auto_increment_step,
-                        match c.collation {
-                            crate::sql::ast::Collation::None => 4,
-                            crate::sql::ast::Collation::Default => 0,
-                            crate::sql::ast::Collation::C => 1,
-                            crate::sql::ast::Collation::Posix => 2,
-                            crate::sql::ast::Collation::UcsBasic => 3,
-                        },
+                        c.collation.code(),
                         domain_schema_hex.as_str(),
                         domain_hex.as_str(),
                         c.name.as_str()
@@ -6070,6 +6248,60 @@ impl Checkpointer {
                 ),
             )?;
         }
+        for (slot, collation) in storage.checkpoint_collations() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                collation.database,
+            )?;
+            let definition = collation.definition;
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "coll {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    slot,
+                    collation.created_at,
+                    ManifestName(definition.schema.as_str()),
+                    ManifestName(definition.name.as_str()),
+                    definition.owner,
+                    definition.provider as u8,
+                    u8::from(definition.deterministic),
+                    definition.encoding.map_or(255, |encoding| encoding.code()),
+                    ManifestName(definition.collate.as_str()),
+                    ManifestName(definition.ctype.as_str()),
+                    ManifestName(definition.locale.as_str()),
+                    ManifestName(definition.rules.as_str()),
+                    ManifestName(definition.version.as_str()),
+                    match definition.behavior {
+                        crate::storage::CollationBehavior::Bytewise => 0,
+                        crate::storage::CollationBehavior::Database => 1,
+                    },
+                ),
+            )?;
+        }
+        for (slot, conversion) in storage.checkpoint_conversions() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                conversion.database,
+            )?;
+            let definition = conversion.definition;
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "conv {} {} {} {} {} {} {} {} {}",
+                    slot,
+                    conversion.created_at,
+                    ManifestName(definition.schema.as_str()),
+                    ManifestName(definition.name.as_str()),
+                    definition.owner,
+                    definition.source.code(),
+                    definition.destination.code(),
+                    definition.procedure,
+                    u8::from(definition.default),
+                ),
+            )?;
+        }
         for (_, operator) in storage.checkpoint_operators() {
             write_database_context(
                 &mut self.manifest_buf,
@@ -6676,14 +6908,17 @@ impl Checkpointer {
                     let _ = write!(encoded_expressions, "{byte:02x}");
                 }
             }
-            let mut collations = StackStr::<64>::new();
+            let mut collations = StackStr::<128>::new();
             let mut operator_classes = StackStr::<128>::new();
             let mut resolved_operator_classes = StackStr::<128>::new();
             let mut statistics = StackStr::<128>::new();
             for position in 0..index.n_cols {
-                let code = index.collations[position].code()
-                    | (u8::from(index.explicit_collations[position]) << 7);
-                let _ = write!(collations, " {code}");
+                let _ = write!(
+                    collations,
+                    " {} {}",
+                    index.collations[position].code(),
+                    u8::from(index.explicit_collations[position])
+                );
                 match index.operator_classes[position] {
                     None => {
                         let _ = operator_classes.write_str(" 0");

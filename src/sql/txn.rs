@@ -239,6 +239,18 @@ pub(crate) enum DdlUndo {
         prior: Option<crate::storage::PendingOperatorClassDefinition>,
     },
     OperatorClassDropped(u32),
+    CollationCreated(u32),
+    CollationAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingCollationDefinition>,
+    },
+    CollationDropped(u32),
+    ConversionCreated(u32),
+    ConversionAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingConversionDefinition>,
+    },
+    ConversionDropped(u32),
     TriggerCreated(u32),
     TriggerDropped(u32),
     TriggerAltered {

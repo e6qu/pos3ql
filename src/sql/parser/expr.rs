@@ -435,7 +435,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub(super) fn collation_name(&mut self) -> Result<crate::sql::ast::Collation, ParseError> {
+    pub(super) fn collation_name(
+        &mut self,
+    ) -> Result<crate::sql::ast::ParsedCollation<'a>, ParseError> {
+        use crate::sql::ast::{Collation, ParsedCollation, QualName};
         let first = self.any_ident("collation name")?;
         let mut schema = None;
         let mut name = first;
@@ -443,27 +446,22 @@ impl<'a> Parser<'a> {
             schema = Some(first);
             name = self.any_ident("collation name")?;
         }
-        if !schema.is_none_or(|value| value.eq_ignore_ascii_case("pg_catalog")) {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: crate::stack_format!(96, "schema \"{}\" does not exist", schema.unwrap()),
-                sqlstate: sqlstate::INVALID_SCHEMA_NAME,
-            });
-        }
-        if name.eq_ignore_ascii_case("c") {
-            Ok(crate::sql::ast::Collation::C)
-        } else if name.eq_ignore_ascii_case("posix") {
-            Ok(crate::sql::ast::Collation::Posix)
-        } else if name.eq_ignore_ascii_case("default") {
-            Ok(crate::sql::ast::Collation::Default)
-        } else if name.eq_ignore_ascii_case("ucs_basic") {
-            Ok(crate::sql::ast::Collation::UcsBasic)
+        let catalog = schema.is_none_or(|value| value.eq_ignore_ascii_case("pg_catalog"));
+        if catalog && name.eq_ignore_ascii_case("c") {
+            Ok(ParsedCollation::Builtin(Collation::C))
+        } else if catalog && name.eq_ignore_ascii_case("posix") {
+            Ok(ParsedCollation::Builtin(Collation::Posix))
+        } else if catalog && name.eq_ignore_ascii_case("default") {
+            Ok(ParsedCollation::Builtin(Collation::Default))
+        } else if catalog && name.eq_ignore_ascii_case("ucs_basic") {
+            Ok(ParsedCollation::Builtin(Collation::UcsBasic))
         } else {
-            Err(ParseError {
-                at: self.peek_at,
-                message: crate::stack_format!(96, "collation \"{}\" does not exist", name),
-                sqlstate: sqlstate::UNDEFINED_OBJECT,
-            })
+            let name = self
+                .arena
+                .alloc(QualName { schema, name })
+                .map(|name| &*name)
+                .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+            Ok(ParsedCollation::Named(name))
         }
     }
 

@@ -132,6 +132,14 @@ const KIND_SET_VIEW_SCHEMA: u8 = 82;
 const KIND_SET_EXTENSION_CONFIG: u8 = 83;
 const KIND_SET_ROLE_SETTING: u8 = 84;
 const KIND_SET_COLUMN_ACL: u8 = 85;
+const KIND_SET_CAST: u8 = 86;
+const KIND_DROP_CAST: u8 = 87;
+const KIND_SET_OPERATOR: u8 = 88;
+const KIND_DROP_OPERATOR: u8 = 89;
+const KIND_SET_OPERATOR_FAMILY: u8 = 90;
+const KIND_DROP_OPERATOR_FAMILY: u8 = 91;
+const KIND_SET_OPERATOR_CLASS: u8 = 92;
+const KIND_DROP_OPERATOR_CLASS: u8 = 93;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -139,7 +147,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_SET_COLUMN_ACL;
+const LAST_KIND: u8 = KIND_DROP_OPERATOR_CLASS;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -869,6 +877,36 @@ pub(crate) enum WalOp<'a> {
     CreateRoutine {
         definition: crate::storage::RoutineDef,
         dependencies: WalStoredQueryDependencies<'a>,
+    },
+    SetCast(crate::storage::CastDef),
+    DropCast {
+        source: crate::storage::RoutineResult,
+        target: crate::storage::RoutineResult,
+    },
+    SetOperator {
+        created_at: u64,
+        definition: crate::storage::OperatorDefinition,
+    },
+    DropOperator {
+        schema: &'a str,
+        name: &'a str,
+        signature: crate::storage::OperatorSignature,
+    },
+    SetOperatorFamily {
+        created_at: u64,
+        definition: crate::storage::OperatorFamilyDefinition,
+    },
+    DropOperatorFamily {
+        schema: &'a str,
+        name: &'a str,
+    },
+    SetOperatorClass {
+        created_at: u64,
+        definition: crate::storage::OperatorClassDefinition,
+    },
+    DropOperatorClass {
+        schema: &'a str,
+        name: &'a str,
     },
     DropRoutine {
         schema: &'a str,
@@ -1697,6 +1735,14 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateComposite { .. } => KIND_CREATE_COMPOSITE,
         WalOp::DropComposite { .. } => KIND_DROP_COMPOSITE,
         WalOp::CreateRoutine { .. } => KIND_CREATE_ROUTINE,
+        WalOp::SetCast(_) => KIND_SET_CAST,
+        WalOp::DropCast { .. } => KIND_DROP_CAST,
+        WalOp::SetOperator { .. } => KIND_SET_OPERATOR,
+        WalOp::DropOperator { .. } => KIND_DROP_OPERATOR,
+        WalOp::SetOperatorFamily { .. } => KIND_SET_OPERATOR_FAMILY,
+        WalOp::DropOperatorFamily { .. } => KIND_DROP_OPERATOR_FAMILY,
+        WalOp::SetOperatorClass { .. } => KIND_SET_OPERATOR_CLASS,
+        WalOp::DropOperatorClass { .. } => KIND_DROP_OPERATOR_CLASS,
         WalOp::DropRoutine { .. } => KIND_DROP_ROUTINE,
         WalOp::AlterRoutineIdentity { .. } => KIND_ALTER_ROUTINE_IDENTITY,
         WalOp::AlterDomainIdentity { .. } => KIND_ALTER_DOMAIN_IDENTITY,
@@ -1718,6 +1764,15 @@ fn op_kind(operation: &WalOp) -> u8 {
 }
 
 fn encoded_payload_len(operation: &WalOp) -> usize {
+    fn routine_result_len(result: crate::storage::RoutineResult) -> usize {
+        2 + result.user_type.map_or(0, |identity| {
+            1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len()
+        })
+    }
+    fn operator_signature_len(signature: crate::storage::OperatorSignature) -> usize {
+        1 + signature.left.map_or(0, routine_result_len)
+            + signature.right.map_or(0, routine_result_len)
+    }
     match operation {
         WalOp::CreateTable(def) => {
             let mut n = 1 + def.name.as_str().len() + 2;
@@ -2387,6 +2442,82 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + def.creation_path.as_str().len()
                 + dependencies.encoded_len()
         }
+        WalOp::SetCast(definition) => {
+            8 + routine_result_len(definition.source)
+                + routine_result_len(definition.target)
+                + 1
+                + usize::from(matches!(
+                    definition.method,
+                    crate::storage::CastMethod::Function(_)
+                )) * 4
+                + 1
+        }
+        WalOp::DropCast { source, target } => {
+            routine_result_len(*source) + routine_result_len(*target)
+        }
+        WalOp::SetOperator { definition, .. } => {
+            let result = definition
+                .implementation
+                .result()
+                .unwrap_or(crate::storage::RoutineResult::TEXT);
+            8 + 1
+                + definition.schema.as_str().len()
+                + 1
+                + definition.name.as_str().len()
+                + operator_signature_len(definition.signature)
+                + routine_result_len(result)
+                + 4
+                + 4
+                + 4
+                + 1
+                + 4
+        }
+        WalOp::DropOperator {
+            schema,
+            name,
+            signature,
+        } => 1 + schema.len() + 1 + name.len() + operator_signature_len(*signature),
+        WalOp::SetOperatorFamily { definition, .. } => {
+            8 + 1
+                + definition.schema.as_str().len()
+                + 1
+                + definition.name.as_str().len()
+                + 4
+                + 1
+                + definition
+                    .operators
+                    .iter()
+                    .filter(|member| member.used)
+                    .map(|member| {
+                        1 + routine_result_len(member.left) + routine_result_len(member.right) + 4
+                    })
+                    .sum::<usize>()
+                + 1
+                + definition
+                    .functions
+                    .iter()
+                    .filter(|member| member.used)
+                    .map(|member| {
+                        routine_result_len(member.left) + routine_result_len(member.right) + 4
+                    })
+                    .sum::<usize>()
+        }
+        WalOp::DropOperatorFamily { schema, name } | WalOp::DropOperatorClass { schema, name } => {
+            1 + schema.len() + 1 + name.len()
+        }
+        WalOp::SetOperatorClass { definition, .. } => {
+            8 + 1
+                + definition.schema.as_str().len()
+                + 1
+                + definition.name.as_str().len()
+                + 4
+                + 4
+                + routine_result_len(definition.input)
+                + routine_result_len(definition.storage)
+                + 1
+                + 5 * 4
+                + 4
+        }
         WalOp::DropRoutine {
             schema,
             name,
@@ -2711,6 +2842,33 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
     let name_bytes = |buffer: &mut FixedBuf, s: &str| -> bool {
         buffer.append(&[s.len() as u8]) && buffer.append(s.as_bytes())
     };
+    fn append_routine_result(buffer: &mut FixedBuf, result: crate::storage::RoutineResult) -> bool {
+        let mut ok = buffer.append(&[result.ctype.code()]);
+        match result.user_type {
+            Some(identity) => {
+                ok &= buffer.append(&[1]);
+                for name in [identity.schema.as_str(), identity.name.as_str()] {
+                    ok &= buffer.append(&[name.len() as u8]) && buffer.append(name.as_bytes());
+                }
+            }
+            None => ok &= buffer.append(&[0]),
+        }
+        ok
+    }
+    fn append_operator_signature(
+        buffer: &mut FixedBuf,
+        signature: crate::storage::OperatorSignature,
+    ) -> bool {
+        let flags = u8::from(signature.left.is_some()) | (u8::from(signature.right.is_some()) << 1);
+        let mut ok = buffer.append(&[flags]);
+        if let Some(left) = signature.left {
+            ok &= append_routine_result(buffer, left);
+        }
+        if let Some(right) = signature.right {
+            ok &= append_routine_result(buffer, right);
+        }
+        ok
+    }
     match operation {
         WalOp::CreateTable(def) => {
             let mut ok = name_bytes(buffer, def.name.as_str());
@@ -3627,6 +3785,105 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= name_bytes(buffer, def.creation_path.as_str()) && dependencies.append(buffer);
             ok
         }
+        WalOp::SetCast(definition) => {
+            let mut ok = buffer.append(&definition.created_at.to_le_bytes())
+                && append_routine_result(buffer, definition.source)
+                && append_routine_result(buffer, definition.target);
+            ok &= match definition.method {
+                crate::storage::CastMethod::Function(slot) => {
+                    buffer.append(b"f") && buffer.append(&slot.to_le_bytes())
+                }
+                crate::storage::CastMethod::Binary => buffer.append(b"b"),
+                crate::storage::CastMethod::InOut => buffer.append(b"i"),
+            };
+            ok && buffer.append(&[definition.context.code()])
+        }
+        WalOp::DropCast { source, target } => {
+            append_routine_result(buffer, *source) && append_routine_result(buffer, *target)
+        }
+        WalOp::SetOperator {
+            created_at,
+            definition,
+        } => {
+            let result = definition
+                .implementation
+                .result()
+                .unwrap_or(crate::storage::RoutineResult::TEXT);
+            let function = definition.implementation.routine().unwrap_or(0);
+            buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, definition.schema.as_str())
+                && name_bytes(buffer, definition.name.as_str())
+                && append_operator_signature(buffer, definition.signature)
+                && append_routine_result(buffer, result)
+                && buffer.append(&function.to_le_bytes())
+                && buffer.append(&definition.commutator.unwrap_or(0).to_le_bytes())
+                && buffer.append(&definition.negator.unwrap_or(0).to_le_bytes())
+                && buffer
+                    .append(&[u8::from(definition.hashes) | (u8::from(definition.merges) << 1)])
+                && buffer.append(&definition.owner.to_le_bytes())
+        }
+        WalOp::DropOperator {
+            schema,
+            name,
+            signature,
+        } => {
+            name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
+                && append_operator_signature(buffer, *signature)
+        }
+        WalOp::SetOperatorFamily {
+            created_at,
+            definition,
+        } => {
+            let operator_count = definition
+                .operators
+                .iter()
+                .filter(|member| member.used)
+                .count();
+            let function_count = definition
+                .functions
+                .iter()
+                .filter(|member| member.used)
+                .count();
+            let mut ok = buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, definition.schema.as_str())
+                && name_bytes(buffer, definition.name.as_str())
+                && buffer.append(&definition.owner.to_le_bytes())
+                && buffer.append(&[operator_count as u8]);
+            for member in definition.operators.iter().filter(|member| member.used) {
+                ok &= buffer.append(&[member.strategy.number()])
+                    && append_routine_result(buffer, member.left)
+                    && append_routine_result(buffer, member.right)
+                    && buffer.append(&member.operator.to_le_bytes());
+            }
+            ok &= buffer.append(&[function_count as u8]);
+            for member in definition.functions.iter().filter(|member| member.used) {
+                ok &= append_routine_result(buffer, member.left)
+                    && append_routine_result(buffer, member.right)
+                    && buffer.append(&member.function.to_le_bytes());
+            }
+            ok
+        }
+        WalOp::DropOperatorFamily { schema, name } | WalOp::DropOperatorClass { schema, name } => {
+            name_bytes(buffer, schema) && name_bytes(buffer, name)
+        }
+        WalOp::SetOperatorClass {
+            created_at,
+            definition,
+        } => {
+            let mut ok = buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, definition.schema.as_str())
+                && name_bytes(buffer, definition.name.as_str())
+                && buffer.append(&definition.owner.to_le_bytes())
+                && buffer.append(&definition.family.to_le_bytes())
+                && append_routine_result(buffer, definition.input)
+                && append_routine_result(buffer, definition.storage)
+                && buffer.append(&[u8::from(definition.default)]);
+            for operator in definition.operators {
+                ok &= buffer.append(&operator.to_le_bytes());
+            }
+            ok && buffer.append(&definition.compare_function.to_le_bytes())
+        }
         WalOp::DropRoutine {
             schema,
             name,
@@ -4359,6 +4616,56 @@ fn decode_tablespace_options(
         effective_io_concurrency: concurrency(effective_io_concurrency),
         maintenance_io_concurrency: concurrency(maintenance_io_concurrency),
     })
+}
+
+fn decode_catalog_name<'a>(payload: &'a [u8], at: &mut usize) -> Option<&'a str> {
+    let length = usize::from(*payload.get(*at)?);
+    *at += 1;
+    let value = core::str::from_utf8(payload.get(*at..*at + length)?).ok()?;
+    *at += length;
+    Some(value)
+}
+
+fn decode_routine_result(payload: &[u8], at: &mut usize) -> Option<crate::storage::RoutineResult> {
+    let ctype = ColType::from_code(*payload.get(*at)?)?;
+    *at += 1;
+    let user_type = match *payload.get(*at)? {
+        0 => {
+            *at += 1;
+            None
+        }
+        1 => {
+            *at += 1;
+            Some(crate::storage::UserTypeName {
+                schema: SqlName::parse(decode_catalog_name(payload, at)?).ok()?,
+                name: SqlName::parse(decode_catalog_name(payload, at)?).ok()?,
+            })
+        }
+        _ => return None,
+    };
+    Some(crate::storage::RoutineResult { ctype, user_type })
+}
+
+fn decode_operator_signature(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::OperatorSignature> {
+    let flags = *payload.get(*at)?;
+    *at += 1;
+    if flags & !3 != 0 || flags == 0 {
+        return None;
+    }
+    let left = if flags & 1 != 0 {
+        Some(decode_routine_result(payload, at)?)
+    } else {
+        None
+    };
+    let right = if flags & 2 != 0 {
+        Some(decode_routine_result(payload, at)?)
+    } else {
+        None
+    };
+    Some(crate::storage::OperatorSignature { left, right })
 }
 
 fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
@@ -6207,6 +6514,237 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 dependencies: WalStoredQueryDependencies::Encoded(encoded_dependencies),
             })
         }
+        KIND_SET_CAST => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let source = decode_routine_result(payload, &mut at)?;
+            let target = decode_routine_result(payload, &mut at)?;
+            let method = match *payload.get(at)? {
+                b'f' => {
+                    at += 1;
+                    let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                    at += 4;
+                    if oid <= 0 {
+                        return None;
+                    }
+                    crate::storage::CastMethod::Function(oid)
+                }
+                b'b' => {
+                    at += 1;
+                    crate::storage::CastMethod::Binary
+                }
+                b'i' => {
+                    at += 1;
+                    crate::storage::CastMethod::InOut
+                }
+                _ => return None,
+            };
+            let context = crate::storage::CastContext::from_code(*payload.get(at)?)?;
+            at += 1;
+            (at == payload.len()).then_some(WalOp::SetCast(crate::storage::CastDef {
+                created_at,
+                source,
+                target,
+                method,
+                context,
+                ddl_state: crate::storage::CatalogDdlState::Absent,
+            }))
+        }
+        KIND_DROP_CAST => {
+            let source = decode_routine_result(payload, &mut at)?;
+            let target = decode_routine_result(payload, &mut at)?;
+            (at == payload.len()).then_some(WalOp::DropCast { source, target })
+        }
+        KIND_SET_OPERATOR => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let schema = SqlName::parse(take_name(&mut at)?).ok()?;
+            let name = SqlName::parse(take_name(&mut at)?).ok()?;
+            let signature = decode_operator_signature(payload, &mut at)?;
+            let result = decode_routine_result(payload, &mut at)?;
+            let function = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let commutator = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let negator = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            if function < 0 || commutator < 0 || negator < 0 {
+                return None;
+            }
+            let flags = *payload.get(at)?;
+            at += 1;
+            if flags & !3 != 0 {
+                return None;
+            }
+            let owner = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            if owner <= 0 {
+                return None;
+            }
+            (at == payload.len()).then_some(WalOp::SetOperator {
+                created_at,
+                definition: crate::storage::OperatorDefinition {
+                    schema,
+                    name,
+                    signature,
+                    implementation: if function == 0 {
+                        crate::storage::OperatorImplementation::Shell
+                    } else {
+                        crate::storage::OperatorImplementation::Function {
+                            routine: function,
+                            result,
+                        }
+                    },
+                    commutator: (commutator != 0).then_some(commutator),
+                    negator: (negator != 0).then_some(negator),
+                    hashes: flags & 1 != 0,
+                    merges: flags & 2 != 0,
+                    owner,
+                },
+            })
+        }
+        KIND_DROP_OPERATOR => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let signature = decode_operator_signature(payload, &mut at)?;
+            (at == payload.len()).then_some(WalOp::DropOperator {
+                schema,
+                name,
+                signature,
+            })
+        }
+        KIND_SET_OPERATOR_FAMILY => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let schema = SqlName::parse(take_name(&mut at)?).ok()?;
+            let name = SqlName::parse(take_name(&mut at)?).ok()?;
+            let owner = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            if owner <= 0 {
+                return None;
+            }
+            let operator_count = usize::from(*payload.get(at)?);
+            at += 1;
+            if operator_count > crate::storage::MAX_OPERATOR_FAMILY_MEMBERS {
+                return None;
+            }
+            let mut operators = [crate::storage::OperatorFamilyOperator::EMPTY;
+                crate::storage::MAX_OPERATOR_FAMILY_MEMBERS];
+            for member in &mut operators[..operator_count] {
+                let strategy =
+                    crate::sql::ast::BtreeStrategy::from_number(u32::from(*payload.get(at)?))?;
+                at += 1;
+                let left = decode_routine_result(payload, &mut at)?;
+                let right = decode_routine_result(payload, &mut at)?;
+                let operator = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                if operator <= 0 {
+                    return None;
+                }
+                *member = crate::storage::OperatorFamilyOperator {
+                    used: true,
+                    strategy,
+                    left,
+                    right,
+                    operator,
+                };
+            }
+            let function_count = usize::from(*payload.get(at)?);
+            at += 1;
+            if function_count > crate::storage::MAX_OPERATOR_FAMILY_MEMBERS {
+                return None;
+            }
+            let mut functions = [crate::storage::OperatorFamilyFunction::EMPTY;
+                crate::storage::MAX_OPERATOR_FAMILY_MEMBERS];
+            for member in &mut functions[..function_count] {
+                let left = decode_routine_result(payload, &mut at)?;
+                let right = decode_routine_result(payload, &mut at)?;
+                let function = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                if function <= 0 {
+                    return None;
+                }
+                *member = crate::storage::OperatorFamilyFunction {
+                    used: true,
+                    left,
+                    right,
+                    function,
+                };
+            }
+            (at == payload.len()).then_some(WalOp::SetOperatorFamily {
+                created_at,
+                definition: crate::storage::OperatorFamilyDefinition {
+                    schema,
+                    name,
+                    owner,
+                    operators,
+                    functions,
+                },
+            })
+        }
+        KIND_DROP_OPERATOR_FAMILY | KIND_DROP_OPERATOR_CLASS => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            if at != payload.len() {
+                return None;
+            }
+            Some(if kind == KIND_DROP_OPERATOR_FAMILY {
+                WalOp::DropOperatorFamily { schema, name }
+            } else {
+                WalOp::DropOperatorClass { schema, name }
+            })
+        }
+        KIND_SET_OPERATOR_CLASS => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let schema = SqlName::parse(take_name(&mut at)?).ok()?;
+            let name = SqlName::parse(take_name(&mut at)?).ok()?;
+            let owner = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            if owner <= 0 {
+                return None;
+            }
+            let family = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            if family <= 0 {
+                return None;
+            }
+            let input = decode_routine_result(payload, &mut at)?;
+            let storage = decode_routine_result(payload, &mut at)?;
+            let default = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            let mut operators = [0; 5];
+            for operator in &mut operators {
+                *operator = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                if *operator < 0 {
+                    return None;
+                }
+            }
+            let compare_function = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            if compare_function < 0 {
+                return None;
+            }
+            (at == payload.len()).then_some(WalOp::SetOperatorClass {
+                created_at,
+                definition: crate::storage::OperatorClassDefinition {
+                    schema,
+                    name,
+                    owner,
+                    family,
+                    input,
+                    storage,
+                    default,
+                    operators,
+                    compare_function,
+                },
+            })
+        }
         KIND_DROP_ROUTINE => {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
@@ -7365,6 +7903,133 @@ fn decode_bounded_default_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_catalog_operation<'a>(operation: &WalOp<'_>, bytes: &'a mut [u8; 4096]) -> &'a [u8] {
+        let mut budget = Budget::new(bytes.len());
+        let mut payload = FixedBuf::new(
+            &mut budget,
+            "catalog operation payload",
+            encoded_payload_len(operation),
+        )
+        .unwrap();
+        assert!(append_payload(&mut payload, operation));
+        assert_eq!(payload.len(), encoded_payload_len(operation));
+        let len = payload.len();
+        bytes[..len].copy_from_slice(payload.readable());
+        &bytes[..len]
+    }
+
+    #[test]
+    fn cast_and_operator_catalog_payloads_round_trip_strictly() {
+        let public = SqlName::parse("public").unwrap();
+        let custom = crate::storage::RoutineResult {
+            ctype: ColType::Enum(7),
+            user_type: Some(crate::storage::UserTypeName {
+                schema: public,
+                name: SqlName::parse("mood").unwrap(),
+            }),
+        };
+        let binary_signature = crate::storage::OperatorSignature {
+            left: Some(custom),
+            right: Some(custom),
+        };
+        let operator = crate::storage::OperatorDefinition {
+            schema: public,
+            name: SqlName::parse("===").unwrap(),
+            signature: binary_signature,
+            implementation: crate::storage::OperatorImplementation::Function {
+                routine: 701_003,
+                result: crate::storage::RoutineResult::builtin(ColType::Bool),
+            },
+            commutator: Some(620_011),
+            negator: None,
+            hashes: true,
+            merges: true,
+            owner: 10,
+        };
+        let mut family = crate::storage::OperatorFamilyDefinition {
+            schema: public,
+            name: SqlName::parse("mood_ops").unwrap(),
+            owner: 10,
+            operators: [crate::storage::OperatorFamilyOperator::EMPTY;
+                crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
+            functions: [crate::storage::OperatorFamilyFunction::EMPTY;
+                crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
+        };
+        family.operators[0] = crate::storage::OperatorFamilyOperator {
+            used: true,
+            strategy: crate::sql::ast::BtreeStrategy::Equal,
+            left: custom,
+            right: custom,
+            operator: 620_011,
+        };
+        family.functions[0] = crate::storage::OperatorFamilyFunction {
+            used: true,
+            left: custom,
+            right: custom,
+            function: 701_004,
+        };
+        let class = crate::storage::OperatorClassDefinition {
+            schema: public,
+            name: SqlName::parse("mood_ops").unwrap(),
+            owner: 10,
+            family: 640_012,
+            input: custom,
+            storage: custom,
+            default: true,
+            operators: [620_007, 620_008, 620_011, 620_009, 620_010],
+            compare_function: 701_004,
+        };
+        let operations = [
+            WalOp::SetCast(crate::storage::CastDef {
+                created_at: 9,
+                source: custom,
+                target: crate::storage::RoutineResult::TEXT,
+                method: crate::storage::CastMethod::Function(701_002),
+                context: crate::storage::CastContext::Assignment,
+                ddl_state: crate::storage::CatalogDdlState::Present,
+            }),
+            WalOp::DropCast {
+                source: custom,
+                target: crate::storage::RoutineResult::TEXT,
+            },
+            WalOp::SetOperator {
+                created_at: 11,
+                definition: operator,
+            },
+            WalOp::DropOperator {
+                schema: "public",
+                name: "===",
+                signature: binary_signature,
+            },
+            WalOp::SetOperatorFamily {
+                created_at: 12,
+                definition: family,
+            },
+            WalOp::DropOperatorFamily {
+                schema: "public",
+                name: "mood_ops",
+            },
+            WalOp::SetOperatorClass {
+                created_at: 13,
+                definition: class,
+            },
+            WalOp::DropOperatorClass {
+                schema: "public",
+                name: "mood_ops",
+            },
+        ];
+        for operation in operations {
+            let mut bytes = [0; 4096];
+            let payload = encode_catalog_operation(&operation, &mut bytes);
+            let kind = op_kind(&operation);
+            assert!(decode_op(kind, payload).is_some());
+            assert!(decode_op(kind, &payload[..payload.len() - 1]).is_none());
+            let mut trailing = [0; 4097];
+            trailing[..payload.len()].copy_from_slice(payload);
+            assert!(decode_op(kind, &trailing[..payload.len() + 1]).is_none());
+        }
+    }
 
     #[test]
     fn typed_default_codec_size_and_round_trip_agree() {

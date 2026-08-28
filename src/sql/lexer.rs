@@ -89,32 +89,13 @@ impl<'a> Lexer<'a> {
             return Ok(Tok::Eof);
         };
         match c {
-            '(' | ')' | ',' | ';' | '+' | '*' | '%' | '^' | '.' | '[' | ']' => {
+            '(' | ')' | ',' | ';' | '.' | '[' | ']' => {
                 let operator = &self.text[self.at..self.at + 1];
                 self.at += 1;
                 Ok(Tok::Op(operator))
             }
-            '-' => {
-                // JSON accessors `->`/`->>`, range adjacency `-|-`, else minus.
-                let rest = self.rest();
-                let operator = if rest.starts_with("->>") {
-                    "->>"
-                } else if rest.starts_with("->") {
-                    "->"
-                } else if rest.starts_with("-|-") {
-                    "-|-"
-                } else {
-                    "-"
-                };
-                self.at += operator.len();
-                Ok(Tok::Op(&self.text[self.at - operator.len()..self.at]))
-            }
-            '/' => {
-                // Comment starters were consumed above, so this is an operator.
-                let operator = &self.text[self.at..self.at + 1];
-                self.at += 1;
-                Ok(Tok::Op(operator))
-            }
+            '+' | '-' | '*' | '/' | '%' | '^' | '<' | '>' | '=' | '!' | '|' | '~' | '&' | '#'
+            | '@' | '?' => self.operator(),
             ':' => {
                 if rest.starts_with("::") {
                     self.at += 2;
@@ -126,7 +107,6 @@ impl<'a> Lexer<'a> {
                     Ok(Tok::Op(":"))
                 }
             }
-            '<' | '>' | '=' | '!' | '|' | '~' | '&' | '#' | '@' | '?' => self.operator(),
             '\'' => self.plain_string(),
             '"' => self.quoted_ident(),
             '$' => self.dollar(),
@@ -137,19 +117,44 @@ impl<'a> Lexer<'a> {
     }
 
     fn operator(&mut self) -> Result<Tok<'a>, LexError> {
-        let rest = self.rest();
-        // Longer operators first: the POSIX regex match family before `~`.
-        for operator in [
-            "!~*", "!~", "~*", "<=", ">=", "<>", "!=", "=>", "||/", "||", "|/", "<<=", ">>=", "<<",
-            ">>", "@>", "<@", "&<", "&>", "&&", "#>>", "#>", "#-", "?|", "?&", "<", ">", "=", "~",
-            "|", "&", "#", "^", "?", "@",
-        ] {
-            if rest.starts_with(operator) {
-                self.at += operator.len();
-                return Ok(Tok::Op(&self.text[self.at - operator.len()..self.at]));
+        let start = self.at;
+        let bytes = self.text.as_bytes();
+        while self.at < bytes.len()
+            && matches!(
+                bytes[self.at],
+                b'+' | b'-'
+                    | b'*'
+                    | b'/'
+                    | b'<'
+                    | b'>'
+                    | b'='
+                    | b'~'
+                    | b'!'
+                    | b'@'
+                    | b'#'
+                    | b'%'
+                    | b'^'
+                    | b'&'
+                    | b'|'
+                    | b'`'
+                    | b'?'
+            )
+        {
+            self.at += 1;
+        }
+        let contains_pg_extension_character =
+            self.text.as_bytes()[start..self.at].iter().any(|byte| {
+                matches!(
+                    byte,
+                    b'~' | b'!' | b'@' | b'#' | b'%' | b'^' | b'&' | b'|' | b'`' | b'?'
+                )
+            });
+        if !contains_pg_extension_character {
+            while self.at > start + 1 && matches!(bytes[self.at - 1], b'+' | b'-') {
+                self.at -= 1;
             }
         }
-        Err(self.error("unknown operator"))
+        Ok(Tok::Op(&self.text[start..self.at]))
     }
 
     fn ident(&mut self) -> Result<Tok<'a>, LexError> {

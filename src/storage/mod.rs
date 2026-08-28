@@ -2414,6 +2414,7 @@ pub enum DependencyClass {
     Sequence = 5,
     Composite = 6,
     Routine = 7,
+    Operator = 8,
 }
 
 impl DependencyClass {
@@ -2426,6 +2427,7 @@ impl DependencyClass {
             5 => Some(Self::Sequence),
             6 => Some(Self::Composite),
             7 => Some(Self::Routine),
+            8 => Some(Self::Operator),
             _ => None,
         }
     }
@@ -2435,6 +2437,7 @@ impl DependencyClass {
 pub enum StoredDependencyIdentity {
     Name,
     RoutineOid(i32),
+    OperatorOid(i32),
 }
 
 impl StoredDependencyIdentity {
@@ -2442,6 +2445,7 @@ impl StoredDependencyIdentity {
         match self {
             Self::Name => 0,
             Self::RoutineOid(oid) => oid,
+            Self::OperatorOid(oid) => oid,
         }
     }
 
@@ -2453,6 +2457,12 @@ impl StoredDependencyIdentity {
                 Some(Self::RoutineOid(oid))
             }
             (DependencyClass::Routine, _) => None,
+            (DependencyClass::Operator, oid)
+                if (OPERATOR_OID_BASE..OPERATOR_FAMILY_OID_BASE).contains(&oid) =>
+            {
+                Some(Self::OperatorOid(oid))
+            }
+            (DependencyClass::Operator, _) => None,
             (_, 0) => Some(Self::Name),
             _ => None,
         }
@@ -3913,6 +3923,356 @@ impl RoutineResult {
 
     pub(crate) fn polymorphic_type(self) -> Option<PolymorphicType> {
         polymorphic_type(self.ctype, self.user_type)
+    }
+}
+
+pub(crate) const CAST_OID_BASE: i32 = 600_000;
+pub(crate) const OPERATOR_OID_BASE: i32 = 620_000;
+pub(crate) const OPERATOR_FAMILY_OID_BASE: i32 = 640_000;
+pub(crate) const OPERATOR_CLASS_OID_BASE: i32 = 660_000;
+pub(crate) const MAX_OPERATOR_FAMILY_MEMBERS: usize = 16;
+
+fn catalog_object_oid(base: i32, created_at: u64) -> i32 {
+    base.checked_add(i32::try_from(created_at).expect("catalog OID range exhausted"))
+        .expect("catalog OID range exhausted")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CastContext {
+    Explicit,
+    Assignment,
+    Implicit,
+}
+
+impl CastContext {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Explicit => b'e',
+            Self::Assignment => b'a',
+            Self::Implicit => b'i',
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b'e' => Some(Self::Explicit),
+            b'a' => Some(Self::Assignment),
+            b'i' => Some(Self::Implicit),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn permits_assignment(self) -> bool {
+        matches!(self, Self::Assignment | Self::Implicit)
+    }
+
+    pub(crate) const fn permits_implicit(self) -> bool {
+        matches!(self, Self::Implicit)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CastMethod {
+    Function(i32),
+    Binary,
+    InOut,
+}
+
+impl CastMethod {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Function(_) => b'f',
+            Self::Binary => b'b',
+            Self::InOut => b'i',
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CastDef {
+    pub created_at: u64,
+    pub source: RoutineResult,
+    pub target: RoutineResult,
+    pub method: CastMethod,
+    pub context: CastContext,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl CastDef {
+    pub(crate) const EMPTY: Self = Self {
+        created_at: 0,
+        source: RoutineResult::TEXT,
+        target: RoutineResult::TEXT,
+        method: CastMethod::Binary,
+        context: CastContext::Explicit,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn oid(&self) -> i32 {
+        catalog_object_oid(CAST_OID_BASE, self.created_at)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OperatorSignature {
+    pub left: Option<RoutineResult>,
+    pub right: Option<RoutineResult>,
+}
+
+impl OperatorSignature {
+    pub(crate) const EMPTY: Self = Self {
+        left: None,
+        right: None,
+    };
+
+    pub(crate) const fn arity(self) -> usize {
+        self.left.is_some() as usize + self.right.is_some() as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OperatorImplementation {
+    Shell,
+    Function { routine: i32, result: RoutineResult },
+}
+
+impl OperatorImplementation {
+    pub(crate) const fn routine(self) -> Option<i32> {
+        match self {
+            Self::Shell => None,
+            Self::Function { routine, .. } => Some(routine),
+        }
+    }
+
+    pub(crate) const fn result(self) -> Option<RoutineResult> {
+        match self {
+            Self::Shell => None,
+            Self::Function { result, .. } => Some(result),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OperatorDefinition {
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub signature: OperatorSignature,
+    pub implementation: OperatorImplementation,
+    pub commutator: Option<i32>,
+    pub negator: Option<i32>,
+    pub hashes: bool,
+    pub merges: bool,
+    pub owner: i32,
+}
+
+impl OperatorDefinition {
+    pub(crate) const EMPTY: Self = Self {
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        signature: OperatorSignature::EMPTY,
+        implementation: OperatorImplementation::Shell,
+        commutator: None,
+        negator: None,
+        hashes: false,
+        merges: false,
+        owner: 0,
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingOperatorDefinition {
+    pub txid: u32,
+    pub definition: OperatorDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OperatorDef {
+    pub created_at: u64,
+    pub definition: OperatorDefinition,
+    pub pending: Option<PendingOperatorDefinition>,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl OperatorDef {
+    pub(crate) const EMPTY: Self = Self {
+        created_at: 0,
+        definition: OperatorDefinition::EMPTY,
+        pending: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> OperatorDefinition {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.definition, |pending| pending.definition)
+    }
+
+    pub(crate) fn oid(&self) -> i32 {
+        catalog_object_oid(OPERATOR_OID_BASE, self.created_at)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OperatorFamilyOperator {
+    pub used: bool,
+    pub strategy: crate::sql::ast::BtreeStrategy,
+    pub left: RoutineResult,
+    pub right: RoutineResult,
+    pub operator: i32,
+}
+
+impl OperatorFamilyOperator {
+    pub(crate) const EMPTY: Self = Self {
+        used: false,
+        strategy: crate::sql::ast::BtreeStrategy::Equal,
+        left: RoutineResult::TEXT,
+        right: RoutineResult::TEXT,
+        operator: 0,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OperatorFamilyFunction {
+    pub used: bool,
+    pub left: RoutineResult,
+    pub right: RoutineResult,
+    pub function: i32,
+}
+
+impl OperatorFamilyFunction {
+    pub(crate) const EMPTY: Self = Self {
+        used: false,
+        left: RoutineResult::TEXT,
+        right: RoutineResult::TEXT,
+        function: 0,
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OperatorFamilyDefinition {
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub owner: i32,
+    pub operators: [OperatorFamilyOperator; MAX_OPERATOR_FAMILY_MEMBERS],
+    pub functions: [OperatorFamilyFunction; MAX_OPERATOR_FAMILY_MEMBERS],
+}
+
+impl OperatorFamilyDefinition {
+    pub(crate) const EMPTY: Self = Self {
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        owner: 0,
+        operators: [OperatorFamilyOperator::EMPTY; MAX_OPERATOR_FAMILY_MEMBERS],
+        functions: [OperatorFamilyFunction::EMPTY; MAX_OPERATOR_FAMILY_MEMBERS],
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingOperatorFamilyDefinition {
+    pub txid: u32,
+    pub definition: OperatorFamilyDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OperatorFamilyDef {
+    pub created_at: u64,
+    pub definition: OperatorFamilyDefinition,
+    pub pending: Option<PendingOperatorFamilyDefinition>,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl OperatorFamilyDef {
+    pub(crate) const EMPTY: Self = Self {
+        created_at: 0,
+        definition: OperatorFamilyDefinition::EMPTY,
+        pending: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> OperatorFamilyDefinition {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.definition, |pending| pending.definition)
+    }
+
+    pub(crate) fn oid(&self) -> i32 {
+        catalog_object_oid(OPERATOR_FAMILY_OID_BASE, self.created_at)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OperatorClassDefinition {
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub owner: i32,
+    pub family: i32,
+    pub input: RoutineResult,
+    pub storage: RoutineResult,
+    pub default: bool,
+    pub operators: [i32; 5],
+    pub compare_function: i32,
+}
+
+impl OperatorClassDefinition {
+    pub(crate) const EMPTY: Self = Self {
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        owner: 0,
+        family: 0,
+        input: RoutineResult::TEXT,
+        storage: RoutineResult::TEXT,
+        default: false,
+        operators: [0; 5],
+        compare_function: 0,
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingOperatorClassDefinition {
+    pub txid: u32,
+    pub definition: OperatorClassDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OperatorClassDef {
+    pub created_at: u64,
+    pub definition: OperatorClassDefinition,
+    pub pending: Option<PendingOperatorClassDefinition>,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl OperatorClassDef {
+    pub(crate) const EMPTY: Self = Self {
+        created_at: 0,
+        definition: OperatorClassDefinition::EMPTY,
+        pending: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> OperatorClassDefinition {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.definition, |pending| pending.definition)
+    }
+
+    pub(crate) fn oid(&self) -> i32 {
+        catalog_object_oid(OPERATOR_CLASS_OID_BASE, self.created_at)
     }
 }
 
@@ -7730,6 +8090,10 @@ pub struct Storage {
     pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
     views: FixedVec<ViewDef>,
     routines: FixedVec<RoutineDef>,
+    casts: FixedVec<CastDef>,
+    operators: FixedVec<OperatorDef>,
+    operator_families: FixedVec<OperatorFamilyDef>,
+    operator_classes: FixedVec<OperatorClassDef>,
     routine_dependencies: FixedVec<StoredQueryDependencies>,
     pending_routine_dependencies: FixedVec<PendingRoutineDependencies>,
     triggers: FixedVec<TriggerDef>,
@@ -8249,6 +8613,15 @@ impl Storage {
                         self.routine_slot_by_oid(oid, txid)
                     }
                     StoredDependencyIdentity::Name => None,
+                    StoredDependencyIdentity::OperatorOid(_) => None,
+                },
+                DependencyClass::Operator => match dependency.identity {
+                    StoredDependencyIdentity::OperatorOid(oid) => {
+                        self.operator_slot_by_oid(oid, txid)
+                    }
+                    StoredDependencyIdentity::Name | StoredDependencyIdentity::RoutineOid(_) => {
+                        None
+                    }
                 },
             }
             .ok_or_else(|| {
@@ -8405,6 +8778,10 @@ impl Storage {
                     + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
                     + size_of::<ViewDef>()
                     + size_of::<RoutineDef>()
+                    + size_of::<CastDef>()
+                    + size_of::<OperatorDef>()
+                    + size_of::<OperatorFamilyDef>()
+                    + size_of::<OperatorClassDef>()
                     + size_of::<StoredQueryDependencies>()
                     + MAX_PENDING_TABLE_DEFS * size_of::<PendingRoutineDependencies>()
                     + size_of::<TriggerDef>()
@@ -8540,6 +8917,22 @@ impl Storage {
         for _ in 0..config.max_tables {
             routines
                 .push(RoutineDef::EMPTY)
+                .expect("sized to max_tables");
+        }
+        let mut casts = FixedVec::new(budget, "casts", config.max_tables)?;
+        let mut operators = FixedVec::new(budget, "operators", config.max_tables)?;
+        let mut operator_families = FixedVec::new(budget, "operator_families", config.max_tables)?;
+        let mut operator_classes = FixedVec::new(budget, "operator_classes", config.max_tables)?;
+        for _ in 0..config.max_tables {
+            casts.push(CastDef::EMPTY).expect("sized to max_tables");
+            operators
+                .push(OperatorDef::EMPTY)
+                .expect("sized to max_tables");
+            operator_families
+                .push(OperatorFamilyDef::EMPTY)
+                .expect("sized to max_tables");
+            operator_classes
+                .push(OperatorClassDef::EMPTY)
                 .expect("sized to max_tables");
         }
         let routine_dependencies =
@@ -8918,6 +9311,10 @@ impl Storage {
             pending_table_statistics,
             views,
             routines,
+            casts,
+            operators,
+            operator_families,
+            operator_classes,
             routine_dependencies,
             pending_routine_dependencies,
             triggers,
@@ -9448,6 +9845,10 @@ impl Storage {
         &self.schemas[slot]
     }
 
+    pub(crate) fn schema_count(&self) -> usize {
+        self.schemas.len()
+    }
+
     pub fn role_count(&self) -> usize {
         self.roles.len()
     }
@@ -9840,7 +10241,17 @@ impl Storage {
                     && self.object_owner(object, txid) == role
             })
         });
+        let owned_catalog = self
+            .operators_visible_to(txid)
+            .any(|(_, definition)| definition.owner == Self::role_oid(role))
+            || self
+                .operator_families_visible_to(txid)
+                .any(|(_, definition)| definition.owner == Self::role_oid(role))
+            || self
+                .operator_classes_visible_to(txid)
+                .any(|(_, definition)| definition.owner == Self::role_oid(role));
         owned
+            || owned_catalog
             || self.acl_entries.iter().any(|entry| {
                 let (visible, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
                 visible
@@ -10972,6 +11383,47 @@ impl Storage {
             "must be owner of function {}",
             routine.name_for(txid).as_str()
         ))
+    }
+
+    pub(crate) fn require_catalog_owner(
+        &self,
+        owner: i32,
+        txid: u32,
+        object_type: &str,
+        name: &str,
+    ) -> Result<(), SqlError> {
+        if txid == 0 {
+            return Ok(());
+        }
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let owner = self.role_slot_by_oid(owner, txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "catalog owner role does not exist"
+            )
+        })?;
+        if self.role(role).attributes_to(txid).superuser
+            || owner == role
+            || self.role_can_set(role, owner, txid)
+        {
+            Ok(())
+        } else {
+            Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "must be owner of {} {}",
+                object_type,
+                name
+            ))
+        }
+    }
+
+    pub(crate) fn initial_catalog_owner(&self, txid: u32) -> i32 {
+        Self::role_oid(usize::from(self.initial_ownership(txid).owner_to(txid)))
     }
 
     pub(crate) fn require_routine_execute(&self, slot: usize, txid: u32) -> Result<(), SqlError> {
@@ -21990,6 +22442,87 @@ impl Storage {
         self.user_type_identity_oid(identity, array, txid)
     }
 
+    /// Binds the transient representation slot in a persisted routine type to
+    /// its durable schema/name identity. WAL and manifests intentionally write
+    /// unresolved slots because catalog allocation order is process-local.
+    pub(crate) fn bind_routine_result(
+        &self,
+        mut result: RoutineResult,
+        txid: u32,
+    ) -> Result<RoutineResult, SqlError> {
+        use crate::sql::types::ArrElem;
+
+        let Some(identity) = result.user_type else {
+            return Ok(result);
+        };
+        result.ctype = match result.ctype {
+            ColType::Enum(_) => ColType::Enum(
+                self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "persisted type \"{}.{}\" does not exist",
+                            identity.schema.as_str(),
+                            identity.name.as_str()
+                        )
+                    })? as u16,
+            ),
+            ColType::Composite(_) => ColType::Composite(
+                self.composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "persisted type \"{}.{}\" does not exist",
+                            identity.schema.as_str(),
+                            identity.name.as_str()
+                        )
+                    })? as u16,
+            ),
+            ColType::Array(ArrElem::Enum(_)) => ColType::Array(ArrElem::Enum(
+                self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "persisted type \"{}.{}\" does not exist",
+                            identity.schema.as_str(),
+                            identity.name.as_str()
+                        )
+                    })? as u16,
+            )),
+            ColType::Array(ArrElem::Composite(_)) => ColType::Array(ArrElem::Composite(
+                self.composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "persisted type \"{}.{}\" does not exist",
+                            identity.schema.as_str(),
+                            identity.name.as_str()
+                        )
+                    })? as u16,
+            )),
+            ColType::Array(ArrElem::Domain {
+                base_code,
+                base_user_slot,
+                ..
+            }) => ColType::Array(ArrElem::Domain {
+                slot: self
+                    .domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "persisted type \"{}.{}\" does not exist",
+                            identity.schema.as_str(),
+                            identity.name.as_str()
+                        )
+                    })? as u16,
+                base_code,
+                base_user_slot,
+            }),
+            ctype => ctype,
+        };
+        Ok(result)
+    }
+
     pub(crate) fn routine_result_for_oid(&self, type_oid: i32, txid: u32) -> Option<RoutineResult> {
         use crate::sql::types::{ArrElem, ColType, oid};
 
@@ -22088,6 +22621,12 @@ impl Storage {
         if let (ColType::Array(actual), ColType::Array(expected)) = (actual.ctype, expected.ctype) {
             return self.routine_implicit_cast(actual.element_oid(), expected.element_oid(), txid);
         }
+        if self
+            .cast_for_oids(actual_oid, expected_oid, txid)
+            .is_some_and(|(_, cast)| cast.context.permits_implicit())
+        {
+            return true;
+        }
 
         matches!(
             (actual_oid, expected_oid),
@@ -22139,7 +22678,8 @@ impl Storage {
     ) -> Option<i32> {
         use crate::sql::types::oid;
 
-        if let Some(slot) = self.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        if let Some(slot) =
+            self.domain_identity_slot(identity.schema.as_str(), identity.name.as_str(), txid)
         {
             return Some(if array {
                 oid::domain_array_oid(slot as u16)
@@ -25184,6 +25724,1403 @@ impl Storage {
                 name
             ),
         }
+    }
+
+    pub(crate) fn live_casts(&self) -> impl Iterator<Item = (usize, &CastDef)> {
+        self.casts
+            .iter()
+            .enumerate()
+            .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn cast(&self, slot: usize) -> &CastDef {
+        &self.casts[slot]
+    }
+
+    pub(crate) fn casts_visible_to(&self, txid: u32) -> impl Iterator<Item = (usize, &CastDef)> {
+        self.casts
+            .iter()
+            .enumerate()
+            .filter(move |(_, definition)| definition.visible_to(txid))
+    }
+
+    pub(crate) fn cast_slot(
+        &self,
+        source: RoutineResult,
+        target: RoutineResult,
+        txid: u32,
+    ) -> Option<usize> {
+        self.casts.iter().position(|definition| {
+            definition.visible_to(txid)
+                && definition.source == source
+                && definition.target == target
+        })
+    }
+
+    pub(crate) fn cast_for_oids(
+        &self,
+        source_oid: i32,
+        target_oid: i32,
+        txid: u32,
+    ) -> Option<(usize, CastDef)> {
+        self.casts_visible_to(txid).find_map(|(slot, definition)| {
+            let source =
+                self.routine_type_oid(definition.source.ctype, definition.source.user_type, txid)?;
+            let target =
+                self.routine_type_oid(definition.target.ctype, definition.target.user_type, txid)?;
+            (source == source_oid && target == target_oid).then_some((slot, *definition))
+        })
+    }
+
+    fn validate_cast_definition(&self, definition: CastDef, txid: u32) -> Result<(), SqlError> {
+        if self
+            .routine_type_oid(definition.source.ctype, definition.source.user_type, txid)
+            .is_none()
+            || self
+                .routine_type_oid(definition.target.ctype, definition.target.user_type, txid)
+                .is_none()
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "cast source or target type does not exist"
+            ));
+        }
+        match definition.method {
+            CastMethod::Binary if definition.source.ctype != definition.target.ctype => {
+                Err(sql_err!(
+                    sqlstate::CANNOT_COERCE,
+                    "cast types are not binary compatible"
+                ))
+            }
+            CastMethod::Function(oid) => {
+                let slot = self.routine_slot_by_oid(oid, txid).ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_FUNCTION, "cast function does not exist")
+                })?;
+                let routine = self.routine_for(slot, txid);
+                let RoutineKind::Function { result } = routine.kind else {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "cast support object is not a scalar function"
+                    ));
+                };
+                let result = self.bind_routine_result(result, txid)?;
+                let argument = routine.arguments().first().copied().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "cast function has no source argument"
+                    )
+                })?;
+                let argument = self.bind_routine_result(
+                    RoutineResult {
+                        ctype: argument.ctype,
+                        user_type: argument.user_type,
+                    },
+                    txid,
+                )?;
+                if result != definition.target || argument != definition.source {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "cast function contract does not match the cast"
+                    ));
+                }
+                Ok(())
+            }
+            CastMethod::Binary | CastMethod::InOut => Ok(()),
+        }
+    }
+
+    fn builtin_cast_exists(source: i32, target: i32) -> bool {
+        use crate::sql::types::oid;
+
+        let numeric = |oid| {
+            matches!(
+                oid,
+                oid::INT2 | oid::INT4 | oid::INT8 | oid::FLOAT4 | oid::FLOAT8 | oid::NUMERIC
+            )
+        };
+        let oid_alias = |oid| {
+            matches!(
+                oid,
+                oid::OID
+                    | oid::REGPROC
+                    | oid::REGPROCEDURE
+                    | oid::REGOPER
+                    | oid::REGOPERATOR
+                    | oid::REGCLASS
+                    | oid::REGTYPE
+                    | oid::REGNAMESPACE
+                    | oid::REGROLE
+            )
+        };
+        (numeric(source) && numeric(target))
+            || (matches!(source, oid::INT2 | oid::INT4 | oid::INT8) && oid_alias(target))
+            || (oid_alias(source) && matches!(target, oid::INT4 | oid::INT8 | oid::OID))
+            || (source == oid::OID && oid_alias(target))
+            || matches!(
+                (source, target),
+                (oid::REGPROC, oid::REGPROCEDURE)
+                    | (oid::REGPROCEDURE, oid::REGPROC)
+                    | (oid::REGOPER, oid::REGOPERATOR)
+                    | (oid::REGOPERATOR, oid::REGOPER)
+                    | (
+                        oid::BOOL,
+                        oid::INT4 | oid::TEXT | oid::VARCHAR | oid::BPCHAR
+                    )
+                    | (oid::INT4, oid::BOOL | oid::CHAR | oid::BIT)
+                    | (
+                        oid::CHAR,
+                        oid::INT4 | oid::TEXT | oid::VARCHAR | oid::BPCHAR
+                    )
+                    | (oid::BYTEA, oid::INT2 | oid::INT4 | oid::INT8)
+                    | (oid::INT2 | oid::INT4 | oid::INT8, oid::BYTEA)
+                    | (
+                        oid::TEXT,
+                        oid::CHAR | oid::NAME | oid::VARCHAR | oid::BPCHAR | oid::REGCLASS
+                    )
+                    | (
+                        oid::VARCHAR,
+                        oid::CHAR | oid::NAME | oid::TEXT | oid::BPCHAR | oid::REGCLASS
+                    )
+                    | (
+                        oid::BPCHAR,
+                        oid::CHAR | oid::NAME | oid::TEXT | oid::VARCHAR
+                    )
+                    | (oid::NAME, oid::TEXT | oid::VARCHAR | oid::BPCHAR)
+                    | (oid::DATE, oid::TIMESTAMP | oid::TIMESTAMPTZ)
+                    | (oid::TIMESTAMP, oid::DATE | oid::TIME | oid::TIMESTAMPTZ)
+                    | (
+                        oid::TIMESTAMPTZ,
+                        oid::DATE | oid::TIME | oid::TIMESTAMP | oid::TIMETZ
+                    )
+                    | (oid::TIME, oid::INTERVAL | oid::TIMETZ)
+                    | (oid::TIMETZ, oid::TIME)
+                    | (oid::INTERVAL, oid::TIME)
+                    | (oid::BIT, oid::INT4 | oid::INT8 | oid::VARBIT)
+                    | (oid::INT8, oid::BIT)
+                    | (oid::VARBIT, oid::BIT)
+                    | (
+                        oid::CIDR,
+                        oid::INET | oid::TEXT | oid::VARCHAR | oid::BPCHAR
+                    )
+                    | (
+                        oid::INET,
+                        oid::CIDR | oid::TEXT | oid::VARCHAR | oid::BPCHAR
+                    )
+                    | (oid::MACADDR, oid::MACADDR8)
+                    | (oid::MACADDR8, oid::MACADDR)
+                    | (oid::JSON, oid::JSONB)
+                    | (
+                        oid::JSONB,
+                        oid::JSON
+                            | oid::BOOL
+                            | oid::INT2
+                            | oid::INT4
+                            | oid::INT8
+                            | oid::FLOAT4
+                            | oid::FLOAT8
+                            | oid::NUMERIC
+                    )
+            )
+    }
+
+    pub(crate) fn create_cast(
+        &mut self,
+        source: RoutineResult,
+        target: RoutineResult,
+        method: CastMethod,
+        context: CastContext,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if source == target {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "source data type and target data type are the same"
+            ));
+        }
+        self.validate_cast_definition(
+            CastDef {
+                created_at: 0,
+                source,
+                target,
+                method,
+                context,
+                ddl_state: CatalogDdlState::Absent,
+            },
+            txid,
+        )?;
+        if self.cast_slot(source, target, txid).is_some() {
+            return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
+        }
+        let source_oid = self
+            .routine_type_oid(source.ctype, source.user_type, txid)
+            .expect("validated cast source type");
+        let target_oid = self
+            .routine_type_oid(target.ctype, target.user_type, txid)
+            .expect("validated cast target type");
+        if Self::builtin_cast_exists(source_oid, target_oid) {
+            return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
+        }
+        let Some(slot) = self
+            .casts
+            .iter()
+            .position(|definition| definition.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many casts (limit {})",
+                self.casts.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        self.casts[slot] = CastDef {
+            created_at: self.catalog_seq,
+            source,
+            target,
+            method,
+            context,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn create_cast_from_image(
+        &mut self,
+        mut definition: CastDef,
+    ) -> Result<usize, SqlError> {
+        definition.source = self.bind_routine_result(definition.source, 0)?;
+        definition.target = self.bind_routine_result(definition.target, 0)?;
+        self.validate_cast_definition(definition, 0)?;
+        if self
+            .cast_slot(definition.source, definition.target, 0)
+            .is_some()
+        {
+            return Err(sql_err!(sqlstate::DUPLICATE_OBJECT, "cast already exists"));
+        }
+        let Some(slot) = self
+            .casts
+            .iter()
+            .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many casts (limit {})",
+                self.casts.len()
+            ));
+        };
+        self.catalog_seq = self.catalog_seq.max(definition.created_at);
+        definition.ddl_state = CatalogDdlState::Present;
+        self.casts[slot] = definition;
+        Ok(slot)
+    }
+
+    pub(crate) fn drop_cast(
+        &mut self,
+        source: RoutineResult,
+        target: RoutineResult,
+        txid: u32,
+    ) -> Option<usize> {
+        let slot = self.cast_slot(source, target, txid)?;
+        self.casts[slot].ddl_state = self.casts[slot].ddl_state.drop_by(txid);
+        Some(slot)
+    }
+
+    pub(crate) fn commit_cast_create(&mut self, slot: usize) {
+        self.casts[slot].ddl_state = self.casts[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_cast_create(&mut self, slot: usize) {
+        self.casts[slot].ddl_state = self.casts[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_cast_drop(&mut self, slot: usize) {
+        self.casts[slot].ddl_state = self.casts[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_cast_drop(&mut self, slot: usize, txid: u32) {
+        self.casts[slot].ddl_state = self.casts[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn operators_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, OperatorDefinition)> + '_ {
+        self.operators
+            .iter()
+            .enumerate()
+            .filter(move |(_, operator)| operator.visible_to(txid))
+            .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
+    }
+
+    pub(crate) fn live_operators(&self) -> impl Iterator<Item = (usize, &OperatorDef)> {
+        self.operators
+            .iter()
+            .enumerate()
+            .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn operator(&self, slot: usize) -> &OperatorDef {
+        &self.operators[slot]
+    }
+
+    pub(crate) fn operator_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
+        self.operators
+            .iter()
+            .position(|operator| operator.visible_to(txid) && operator.oid() == oid)
+    }
+
+    pub(crate) fn operator_for(&self, slot: usize, txid: u32) -> OperatorDefinition {
+        self.operators[slot].definition_for(txid)
+    }
+
+    pub(crate) fn operator_slot_exact(
+        &self,
+        schema: &str,
+        name: &str,
+        signature: OperatorSignature,
+        txid: u32,
+    ) -> Option<usize> {
+        self.operators_visible_to(txid)
+            .find_map(|(slot, definition)| {
+                (definition.schema.as_str() == schema
+                    && definition.name.as_str() == name
+                    && definition.signature == signature)
+                    .then_some(slot)
+            })
+    }
+
+    fn operator_schema_matches_path(&self, schema: SqlName) -> bool {
+        self.path.entries().iter().any(|entry| match entry {
+            PathEntry::Schema(slot) => self.schemas[*slot as usize].name == schema,
+            PathEntry::Catalog => false,
+        })
+    }
+
+    pub(crate) fn operator_slot_for_oids(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        left_oid: Option<i32>,
+        right_oid: Option<i32>,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
+        let mut exact = None;
+        let mut coercible = None;
+        for (slot, definition) in self.operators_visible_to(txid) {
+            if definition.name.as_str() != name
+                || schema.is_some_and(|schema| definition.schema.as_str() != schema)
+                || (schema.is_none() && !self.operator_schema_matches_path(definition.schema))
+                || definition.signature.arity()
+                    != left_oid.is_some() as usize + right_oid.is_some() as usize
+            {
+                continue;
+            }
+            let left_expected = definition.signature.left.and_then(|argument| {
+                self.routine_type_oid(argument.ctype, argument.user_type, txid)
+            });
+            let right_expected = definition.signature.right.and_then(|argument| {
+                self.routine_type_oid(argument.ctype, argument.user_type, txid)
+            });
+            let is_exact = left_expected == left_oid && right_expected == right_oid;
+            let accepts = [(left_oid, left_expected), (right_oid, right_expected)]
+                .into_iter()
+                .all(|(actual, expected)| match (actual, expected) {
+                    (None, None) => true,
+                    (Some(actual), Some(expected)) => {
+                        actual == expected || self.routine_implicit_cast(actual, expected, txid)
+                    }
+                    _ => false,
+                });
+            if is_exact {
+                if exact.replace(slot).is_some() {
+                    return Err(sql_err!(
+                        sqlstate::AMBIGUOUS_FUNCTION,
+                        "operator is not unique: {}",
+                        name
+                    ));
+                }
+            } else if accepts && coercible.replace(slot).is_some() {
+                return Err(sql_err!(
+                    sqlstate::AMBIGUOUS_FUNCTION,
+                    "operator is not unique: {}",
+                    name
+                ));
+            }
+        }
+        Ok(exact.or(coercible))
+    }
+
+    /// Resolves the binary input contract for Parse parameters before their
+    /// values exist. Unknown parameters may use only one matching overload in
+    /// the selected schema; ambiguity remains unresolved for PostgreSQL to
+    /// report at the Parse boundary.
+    pub(crate) fn operator_call_parameter_oids(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        actual: [i32; 2],
+        txid: u32,
+    ) -> Option<[i32; 2]> {
+        let resolve = |candidate_schema: &str| {
+            let mut found = None;
+            for (_, definition) in self.operators_visible_to(txid) {
+                if definition.schema.as_str() != candidate_schema
+                    || definition.name.as_str() != name
+                    || definition.signature.arity() != 2
+                {
+                    continue;
+                }
+                let expected = [
+                    definition.signature.left.and_then(|argument| {
+                        self.routine_type_oid(argument.ctype, argument.user_type, txid)
+                    })?,
+                    definition.signature.right.and_then(|argument| {
+                        self.routine_type_oid(argument.ctype, argument.user_type, txid)
+                    })?,
+                ];
+                if actual.into_iter().zip(expected).all(|(actual, expected)| {
+                    actual == crate::sql::types::oid::UNKNOWN
+                        || self.routine_implicit_cast(actual, expected, txid)
+                }) && found.replace(expected).is_some()
+                {
+                    return None;
+                }
+            }
+            found
+        };
+        if let Some(schema) = schema {
+            return resolve(schema);
+        }
+        for entry in self.path.entries() {
+            let PathEntry::Schema(schema_slot) = entry else {
+                continue;
+            };
+            if let Some(expected) = resolve(self.schemas[*schema_slot as usize].name.as_str()) {
+                return Some(expected);
+            }
+        }
+        None
+    }
+
+    fn validate_operator_definition(
+        &self,
+        definition: OperatorDefinition,
+        txid: u32,
+        self_oid: Option<i32>,
+    ) -> Result<(), SqlError> {
+        if definition.signature.arity() == 0
+            || self.role_slot_by_oid(definition.owner, txid).is_none()
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "operator has an invalid owner, signature, or result type"
+            ));
+        }
+        if self
+            .find_schema_visible(definition.schema.as_str(), txid)
+            .is_none()
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "operator schema does not exist"
+            ));
+        }
+        let mut expected = [RoutineResult::TEXT; 2];
+        let mut count = 0usize;
+        for argument in [definition.signature.left, definition.signature.right]
+            .into_iter()
+            .flatten()
+        {
+            if self
+                .routine_type_oid(argument.ctype, argument.user_type, txid)
+                .is_none()
+            {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "operator argument type does not exist"
+                ));
+            }
+            expected[count] = argument;
+            count += 1;
+        }
+        for linked in [definition.commutator, definition.negator]
+            .into_iter()
+            .flatten()
+        {
+            if Some(linked) != self_oid && self.operator_slot_by_oid(linked, txid).is_none() {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "linked operator does not exist"
+                ));
+            }
+        }
+        let OperatorImplementation::Function {
+            routine: routine_oid,
+            result: declared_result,
+        } = definition.implementation
+        else {
+            if definition.hashes || definition.merges {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "operator shells cannot be marked HASHES or MERGES"
+                ));
+            }
+            return Ok(());
+        };
+        if self
+            .routine_type_oid(declared_result.ctype, declared_result.user_type, txid)
+            .is_none()
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator result type does not exist"
+            ));
+        }
+        let function_slot = self.routine_slot_by_oid(routine_oid, txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator function does not exist"
+            )
+        })?;
+        let function = self.routine_for(function_slot, txid);
+        let RoutineKind::Function { result } = function.kind else {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "operator support object is not a scalar function"
+            ));
+        };
+        let mut contract_matches = function.arguments().len() == count;
+        for (actual, expected) in function.arguments().iter().zip(&expected[..count]) {
+            let actual = self.bind_routine_result(
+                RoutineResult {
+                    ctype: actual.ctype,
+                    user_type: actual.user_type,
+                },
+                txid,
+            )?;
+            contract_matches &= actual == *expected;
+        }
+        if !contract_matches || self.bind_routine_result(result, txid)? != declared_result {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "operator function contract does not match the operator"
+            ));
+        }
+        if (definition.hashes || definition.merges)
+            && (count != 2 || declared_result.ctype != ColType::Bool)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "HASHES and MERGES require a binary boolean operator"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_operator(
+        &mut self,
+        definition: OperatorDefinition,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        self.require_schema_create(definition.schema.as_str(), txid)?;
+        self.validate_operator_definition(definition, txid, None)?;
+        if self
+            .operator_slot_exact(
+                definition.schema.as_str(),
+                definition.name.as_str(),
+                definition.signature,
+                txid,
+            )
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_FUNCTION,
+                "operator already exists with the same argument types"
+            ));
+        }
+        let Some(slot) = self
+            .operators
+            .iter()
+            .position(|operator| operator.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many operators (limit {})",
+                self.operators.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        self.operators[slot] = OperatorDef {
+            created_at: self.catalog_seq,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn replay_set_operator(
+        &mut self,
+        created_at: u64,
+        mut definition: OperatorDefinition,
+    ) -> Result<usize, SqlError> {
+        if let Some(left) = definition.signature.left {
+            definition.signature.left = Some(self.bind_routine_result(left, 0)?);
+        }
+        if let Some(right) = definition.signature.right {
+            definition.signature.right = Some(self.bind_routine_result(right, 0)?);
+        }
+        if let OperatorImplementation::Function { routine, result } = definition.implementation {
+            definition.implementation = OperatorImplementation::Function {
+                routine,
+                result: self.bind_routine_result(result, 0)?,
+            };
+        }
+        self.validate_operator_definition(
+            definition,
+            0,
+            Some(catalog_object_oid(OPERATOR_OID_BASE, created_at)),
+        )?;
+        let existing = self.operators.iter().position(|candidate| {
+            candidate.ddl_state == CatalogDdlState::Present && candidate.created_at == created_at
+        });
+        if self
+            .operator_slot_exact(
+                definition.schema.as_str(),
+                definition.name.as_str(),
+                definition.signature,
+                0,
+            )
+            .is_some_and(|slot| Some(slot) != existing)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_FUNCTION,
+                "operator already exists with the same argument types"
+            ));
+        }
+        let slot = match existing {
+            Some(slot) => slot,
+            None => self
+                .operators
+                .iter()
+                .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many operators (limit {})",
+                        self.operators.len()
+                    )
+                })?,
+        };
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.operators[slot] = OperatorDef {
+            created_at,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn stage_operator_definition(
+        &mut self,
+        slot: usize,
+        definition: OperatorDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingOperatorDefinition>, SqlError> {
+        self.validate_operator_definition(definition, txid, Some(self.operators[slot].oid()))?;
+        let prior = self.operators[slot].pending;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                prior.expect("checked Some").txid,
+                definition.name.as_str(),
+            ));
+        }
+        self.operators[slot].pending = Some(PendingOperatorDefinition { txid, definition });
+        Ok(prior)
+    }
+
+    pub(crate) fn drop_operator(&mut self, slot: usize, txid: u32) {
+        self.operators[slot].ddl_state = self.operators[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_operator_create(&mut self, slot: usize) {
+        self.operators[slot].ddl_state = self.operators[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_operator_create(&mut self, slot: usize) {
+        self.operators[slot].ddl_state = self.operators[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_operator_alter(&mut self, slot: usize, txid: u32) {
+        let changed = self.operators[slot]
+            .pending
+            .filter(|pending| pending.txid == txid)
+            .map(|pending| (pending.definition.schema, pending.definition.name));
+        if let Some(pending) = self.operators[slot]
+            .pending
+            .filter(|pending| pending.txid == txid)
+        {
+            self.operators[slot].definition = pending.definition;
+            self.operators[slot].pending = None;
+        }
+        if let Some((schema, name)) = changed {
+            self.rename_stored_query_dependency(DependencyClass::Operator, slot, schema, name);
+        }
+    }
+
+    pub(crate) fn rollback_operator_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingOperatorDefinition>,
+    ) {
+        self.operators[slot].pending = prior;
+    }
+
+    pub(crate) fn commit_operator_drop(&mut self, slot: usize) {
+        self.operators[slot].ddl_state = self.operators[slot].ddl_state.commit_drop();
+        self.operators[slot].pending = None;
+    }
+
+    pub(crate) fn rollback_operator_drop(&mut self, slot: usize, txid: u32) {
+        self.operators[slot].ddl_state = self.operators[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn operator_families_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, OperatorFamilyDefinition)> + '_ {
+        self.operator_families
+            .iter()
+            .enumerate()
+            .filter(move |(_, family)| family.visible_to(txid))
+            .map(move |(slot, family)| (slot, family.definition_for(txid)))
+    }
+
+    pub(crate) fn live_operator_families(
+        &self,
+    ) -> impl Iterator<Item = (usize, &OperatorFamilyDef)> {
+        self.operator_families
+            .iter()
+            .enumerate()
+            .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn operator_family(&self, slot: usize) -> &OperatorFamilyDef {
+        &self.operator_families[slot]
+    }
+
+    pub(crate) fn operator_family_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
+        self.operator_families
+            .iter()
+            .position(|family| family.visible_to(txid) && family.oid() == oid)
+    }
+
+    pub(crate) fn operator_family_for(&self, slot: usize, txid: u32) -> OperatorFamilyDefinition {
+        self.operator_families[slot].definition_for(txid)
+    }
+
+    pub(crate) fn operator_family_slot_exact(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        self.operator_families_visible_to(txid)
+            .find_map(|(slot, definition)| {
+                (definition.schema.as_str() == schema && definition.name.as_str() == name)
+                    .then_some(slot)
+            })
+    }
+
+    pub(crate) fn operator_family_slot_on_path(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        if let Some(schema) = schema {
+            return self.operator_family_slot_exact(schema, name, txid);
+        }
+        for entry in self.path.entries() {
+            if let PathEntry::Schema(schema_slot) = entry {
+                let schema = self.schemas[*schema_slot as usize].name;
+                if let Some(slot) = self.operator_family_slot_exact(schema.as_str(), name, txid) {
+                    return Some(slot);
+                }
+            }
+        }
+        None
+    }
+
+    fn validate_operator_family_definition(
+        &self,
+        definition: OperatorFamilyDefinition,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if self.role_slot_by_oid(definition.owner, txid).is_none() {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator-family owner does not exist"
+            ));
+        }
+        if self
+            .find_schema_visible(definition.schema.as_str(), txid)
+            .is_none()
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "operator-family schema does not exist"
+            ));
+        }
+        for (index, member) in definition.operators.iter().enumerate() {
+            if !member.used {
+                if *member != OperatorFamilyOperator::EMPTY {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "unused operator-family member is not empty"
+                    ));
+                }
+                continue;
+            }
+            let operator_slot = self
+                .operator_slot_by_oid(member.operator, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "operator-family operator does not exist"
+                    )
+                })?;
+            let operator = self.operator_for(operator_slot, txid);
+            if operator.signature.left != Some(member.left)
+                || operator.signature.right != Some(member.right)
+                || operator
+                    .implementation
+                    .result()
+                    .is_none_or(|result| result.ctype != ColType::Bool)
+                || definition.operators[..index].iter().any(|prior| {
+                    prior.used
+                        && prior.strategy == member.strategy
+                        && prior.left == member.left
+                        && prior.right == member.right
+                })
+            {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "operator-family operator contract is invalid or duplicated"
+                ));
+            }
+        }
+        for (index, member) in definition.functions.iter().enumerate() {
+            if !member.used {
+                if *member != OperatorFamilyFunction::EMPTY {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "unused operator-family function is not empty"
+                    ));
+                }
+                continue;
+            }
+            let function_slot =
+                self.routine_slot_by_oid(member.function, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "operator-family support function does not exist"
+                        )
+                    })?;
+            let function = self.routine_for(function_slot, txid);
+            let valid_result = match function.kind {
+                RoutineKind::Function { result } => {
+                    self.bind_routine_result(result, txid)? == RoutineResult::builtin(ColType::Int4)
+                }
+                _ => false,
+            };
+            let expected = [member.left, member.right];
+            let mut arguments_match = function.arguments().len() == 2;
+            for (actual, expected) in function.arguments().iter().zip(expected) {
+                let actual = self.bind_routine_result(
+                    RoutineResult {
+                        ctype: actual.ctype,
+                        user_type: actual.user_type,
+                    },
+                    txid,
+                )?;
+                arguments_match &= actual == expected;
+            }
+            if !valid_result
+                || !arguments_match
+                || definition.functions[..index].iter().any(|prior| {
+                    prior.used && prior.left == member.left && prior.right == member.right
+                })
+            {
+                return Err(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "operator-family support function contract is invalid or duplicated"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_operator_family(
+        &mut self,
+        definition: OperatorFamilyDefinition,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        self.require_schema_create(definition.schema.as_str(), txid)?;
+        self.validate_operator_family_definition(definition, txid)?;
+        if self
+            .operator_family_slot_exact(definition.schema.as_str(), definition.name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "operator family \"{}\" already exists for access method \"btree\"",
+                definition.name.as_str()
+            ));
+        }
+        let Some(slot) = self
+            .operator_families
+            .iter()
+            .position(|family| family.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many operator families (limit {})",
+                self.operator_families.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        self.operator_families[slot] = OperatorFamilyDef {
+            created_at: self.catalog_seq,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn replay_set_operator_family(
+        &mut self,
+        created_at: u64,
+        mut definition: OperatorFamilyDefinition,
+    ) -> Result<usize, SqlError> {
+        for member in definition.operators.iter_mut().filter(|member| member.used) {
+            member.left = self.bind_routine_result(member.left, 0)?;
+            member.right = self.bind_routine_result(member.right, 0)?;
+        }
+        for member in definition.functions.iter_mut().filter(|member| member.used) {
+            member.left = self.bind_routine_result(member.left, 0)?;
+            member.right = self.bind_routine_result(member.right, 0)?;
+        }
+        self.validate_operator_family_definition(definition, 0)?;
+        let existing = self.operator_families.iter().position(|candidate| {
+            candidate.ddl_state == CatalogDdlState::Present && candidate.created_at == created_at
+        });
+        if self
+            .operator_family_slot_exact(definition.schema.as_str(), definition.name.as_str(), 0)
+            .is_some_and(|slot| Some(slot) != existing)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "operator family already exists for access method \"btree\""
+            ));
+        }
+        let slot = match existing {
+            Some(slot) => slot,
+            None => self
+                .operator_families
+                .iter()
+                .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many operator families (limit {})",
+                        self.operator_families.len()
+                    )
+                })?,
+        };
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.operator_families[slot] = OperatorFamilyDef {
+            created_at,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn stage_operator_family_definition(
+        &mut self,
+        slot: usize,
+        definition: OperatorFamilyDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingOperatorFamilyDefinition>, SqlError> {
+        self.validate_operator_family_definition(definition, txid)?;
+        let prior = self.operator_families[slot].pending;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                prior.expect("checked Some").txid,
+                definition.name.as_str(),
+            ));
+        }
+        self.operator_families[slot].pending =
+            Some(PendingOperatorFamilyDefinition { txid, definition });
+        Ok(prior)
+    }
+
+    pub(crate) fn drop_operator_family(&mut self, slot: usize, txid: u32) {
+        self.operator_families[slot].ddl_state =
+            self.operator_families[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_operator_family_create(&mut self, slot: usize) {
+        self.operator_families[slot].ddl_state =
+            self.operator_families[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_operator_family_create(&mut self, slot: usize) {
+        self.operator_families[slot].ddl_state =
+            self.operator_families[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_operator_family_alter(&mut self, slot: usize, txid: u32) {
+        if let Some(pending) = self.operator_families[slot]
+            .pending
+            .filter(|pending| pending.txid == txid)
+        {
+            self.operator_families[slot].definition = pending.definition;
+            self.operator_families[slot].pending = None;
+        }
+    }
+
+    pub(crate) fn rollback_operator_family_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingOperatorFamilyDefinition>,
+    ) {
+        self.operator_families[slot].pending = prior;
+    }
+
+    pub(crate) fn commit_operator_family_drop(&mut self, slot: usize) {
+        self.operator_families[slot].ddl_state =
+            self.operator_families[slot].ddl_state.commit_drop();
+        self.operator_families[slot].pending = None;
+    }
+
+    pub(crate) fn rollback_operator_family_drop(&mut self, slot: usize, txid: u32) {
+        self.operator_families[slot].ddl_state =
+            self.operator_families[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn operator_classes_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, OperatorClassDefinition)> + '_ {
+        self.operator_classes
+            .iter()
+            .enumerate()
+            .filter(move |(_, class)| class.visible_to(txid))
+            .map(move |(slot, class)| (slot, class.definition_for(txid)))
+    }
+
+    pub(crate) fn live_operator_classes(&self) -> impl Iterator<Item = (usize, &OperatorClassDef)> {
+        self.operator_classes
+            .iter()
+            .enumerate()
+            .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn operator_class(&self, slot: usize) -> &OperatorClassDef {
+        &self.operator_classes[slot]
+    }
+
+    pub(crate) fn operator_class_for(&self, slot: usize, txid: u32) -> OperatorClassDefinition {
+        self.operator_classes[slot].definition_for(txid)
+    }
+
+    pub(crate) fn operator_class_slot_exact(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        self.operator_classes_visible_to(txid)
+            .find_map(|(slot, definition)| {
+                (definition.schema.as_str() == schema && definition.name.as_str() == name)
+                    .then_some(slot)
+            })
+    }
+
+    pub(crate) fn operator_class_slot_on_path(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        if let Some(schema) = schema {
+            return self.operator_class_slot_exact(schema, name, txid);
+        }
+        for entry in self.path.entries() {
+            if let PathEntry::Schema(schema_slot) = entry {
+                let schema = self.schemas[*schema_slot as usize].name;
+                if let Some(slot) = self.operator_class_slot_exact(schema.as_str(), name, txid) {
+                    return Some(slot);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn default_operator_class_for_type(
+        &self,
+        input: RoutineResult,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
+        let mut found = None;
+        for (slot, definition) in self.operator_classes_visible_to(txid) {
+            if definition.default && definition.input == input && found.replace(slot).is_some() {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "multiple default operator classes exist for the data type"
+                ));
+            }
+        }
+        Ok(found)
+    }
+
+    fn validate_operator_class_definition(
+        &self,
+        definition: OperatorClassDefinition,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        if self.role_slot_by_oid(definition.owner, txid).is_none()
+            || self
+                .operator_family_slot_by_oid(definition.family, txid)
+                .is_none()
+            || self
+                .routine_type_oid(definition.input.ctype, definition.input.user_type, txid)
+                .is_none()
+            || self
+                .routine_type_oid(definition.storage.ctype, definition.storage.user_type, txid)
+                .is_none()
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator class has a missing owner, family, or data type"
+            ));
+        }
+        if self
+            .find_schema_visible(definition.schema.as_str(), txid)
+            .is_none()
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "operator-class schema does not exist"
+            ));
+        }
+        for operator_oid in definition.operators.into_iter().filter(|oid| *oid != 0) {
+            let slot = self
+                .operator_slot_by_oid(operator_oid, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "operator-class operator does not exist"
+                    )
+                })?;
+            let operator = self.operator_for(slot, txid);
+            if operator.signature.left.is_none()
+                || operator.signature.right.is_none()
+                || operator.implementation.result().is_none()
+            {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "btree operator-class members must be binary operators"
+                ));
+            }
+        }
+        if definition.compare_function != 0 {
+            let slot = self
+                .routine_slot_by_oid(definition.compare_function, txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "operator-class support function does not exist"
+                    )
+                })?;
+            let function = self.routine_for(slot, txid);
+            let valid_result = match function.kind {
+                RoutineKind::Function { result } => {
+                    self.bind_routine_result(result, txid)? == RoutineResult::builtin(ColType::Int4)
+                }
+                _ => false,
+            };
+            if !valid_result || function.arguments().len() != 2 {
+                return Err(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "btree support function 1 must accept two arguments and return integer"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_operator_class(
+        &mut self,
+        definition: OperatorClassDefinition,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        self.require_schema_create(definition.schema.as_str(), txid)?;
+        self.validate_operator_class_definition(definition, txid)?;
+        if self
+            .operator_class_slot_exact(definition.schema.as_str(), definition.name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "operator class \"{}\" already exists for access method \"btree\"",
+                definition.name.as_str()
+            ));
+        }
+        if definition.default
+            && (crate::sql::types::BtreeOperatorClass::for_type(definition.input.ctype).is_some()
+                || self
+                    .default_operator_class_for_type(definition.input, txid)?
+                    .is_some())
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "could not make operator class \"{}\" be default for type because another default operator class already exists",
+                definition.name.as_str()
+            ));
+        }
+        let Some(slot) = self
+            .operator_classes
+            .iter()
+            .position(|class| class.ddl_state == CatalogDdlState::Absent)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many operator classes (limit {})",
+                self.operator_classes.len()
+            ));
+        };
+        self.catalog_seq += 1;
+        self.operator_classes[slot] = OperatorClassDef {
+            created_at: self.catalog_seq,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn replay_set_operator_class(
+        &mut self,
+        created_at: u64,
+        mut definition: OperatorClassDefinition,
+    ) -> Result<usize, SqlError> {
+        definition.input = self.bind_routine_result(definition.input, 0)?;
+        definition.storage = self.bind_routine_result(definition.storage, 0)?;
+        self.validate_operator_class_definition(definition, 0)?;
+        let existing = self.operator_classes.iter().position(|candidate| {
+            candidate.ddl_state == CatalogDdlState::Present && candidate.created_at == created_at
+        });
+        if self
+            .operator_class_slot_exact(definition.schema.as_str(), definition.name.as_str(), 0)
+            .is_some_and(|slot| Some(slot) != existing)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "operator class already exists for access method \"btree\""
+            ));
+        }
+        let slot = match existing {
+            Some(slot) => slot,
+            None => self
+                .operator_classes
+                .iter()
+                .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many operator classes (limit {})",
+                        self.operator_classes.len()
+                    )
+                })?,
+        };
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.operator_classes[slot] = OperatorClassDef {
+            created_at,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn stage_operator_class_definition(
+        &mut self,
+        slot: usize,
+        definition: OperatorClassDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingOperatorClassDefinition>, SqlError> {
+        self.validate_operator_class_definition(definition, txid)?;
+        let prior = self.operator_classes[slot].pending;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                prior.expect("checked Some").txid,
+                definition.name.as_str(),
+            ));
+        }
+        self.operator_classes[slot].pending =
+            Some(PendingOperatorClassDefinition { txid, definition });
+        Ok(prior)
+    }
+
+    pub(crate) fn drop_operator_class(&mut self, slot: usize, txid: u32) {
+        self.operator_classes[slot].ddl_state = self.operator_classes[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_operator_class_create(&mut self, slot: usize) {
+        self.operator_classes[slot].ddl_state =
+            self.operator_classes[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_operator_class_create(&mut self, slot: usize) {
+        self.operator_classes[slot].ddl_state =
+            self.operator_classes[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_operator_class_alter(&mut self, slot: usize, txid: u32) {
+        if let Some(pending) = self.operator_classes[slot]
+            .pending
+            .filter(|pending| pending.txid == txid)
+        {
+            self.operator_classes[slot].definition = pending.definition;
+            self.operator_classes[slot].pending = None;
+        }
+    }
+
+    pub(crate) fn rollback_operator_class_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingOperatorClassDefinition>,
+    ) {
+        self.operator_classes[slot].pending = prior;
+    }
+
+    pub(crate) fn commit_operator_class_drop(&mut self, slot: usize) {
+        self.operator_classes[slot].ddl_state = self.operator_classes[slot].ddl_state.commit_drop();
+        self.operator_classes[slot].pending = None;
+    }
+
+    pub(crate) fn rollback_operator_class_drop(&mut self, slot: usize, txid: u32) {
+        self.operator_classes[slot].ddl_state =
+            self.operator_classes[slot].ddl_state.rollback_drop(txid);
     }
 
     /// Lowers reads to a command snapshot (a data-modifying `WITH` statement) or

@@ -5111,6 +5111,7 @@ fn resolve_owned_roles(
 
 pub fn reassign_owned(
     storage: &mut Storage,
+    wal: &mut Wal,
     txn: &mut TxnState,
     roles: &[&str],
     new_owner: &str,
@@ -5173,6 +5174,23 @@ pub fn reassign_owned(
             }
         }
     }
+    let source_owns_catalog = |owner: i32| {
+        source_roles[..source_count]
+            .iter()
+            .any(|role| Storage::role_oid(usize::from(*role)) == owner)
+    };
+    changes += storage
+        .operators_visible_to(txn.txid)
+        .filter(|(_, definition)| source_owns_catalog(definition.owner))
+        .count();
+    changes += storage
+        .operator_families_visible_to(txn.txid)
+        .filter(|(_, definition)| source_owns_catalog(definition.owner))
+        .count();
+    changes += storage
+        .operator_classes_visible_to(txn.txid)
+        .filter(|(_, definition)| source_owns_catalog(definition.owner))
+        .count();
     if changes > super::txn::MAX_TXN_DDL.saturating_sub(txn.ddl().len()) {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5204,6 +5222,40 @@ pub fn reassign_owned(
             {
                 return sql_fail(error);
             }
+        }
+    }
+    let target_oid = Storage::role_oid(target);
+    loop {
+        let found = storage
+            .operators_visible_to(txn.txid)
+            .find_map(|(slot, definition)| source_owns_catalog(definition.owner).then_some(slot));
+        let Some(slot) = found else { break };
+        let mut definition = storage.operator_for(slot, txn.txid);
+        definition.owner = target_oid;
+        if let Err(error) = stage_operator(storage, wal, txn, slot, definition) {
+            return sql_fail(error);
+        }
+    }
+    loop {
+        let found = storage
+            .operator_families_visible_to(txn.txid)
+            .find_map(|(slot, definition)| source_owns_catalog(definition.owner).then_some(slot));
+        let Some(slot) = found else { break };
+        let mut definition = storage.operator_family_for(slot, txn.txid);
+        definition.owner = target_oid;
+        if let Err(error) = stage_operator_family(storage, wal, txn, slot, definition) {
+            return sql_fail(error);
+        }
+    }
+    loop {
+        let found = storage
+            .operator_classes_visible_to(txn.txid)
+            .find_map(|(slot, definition)| source_owns_catalog(definition.owner).then_some(slot));
+        let Some(slot) = found else { break };
+        let mut definition = storage.operator_class_for(slot, txn.txid);
+        definition.owner = target_oid;
+        if let Err(error) = stage_operator_class(storage, wal, txn, slot, definition) {
+            return sql_fail(error);
         }
     }
     responder.command_complete("REASSIGN OWNED")?;
@@ -5434,6 +5486,7 @@ pub fn drop_owned(
     let mut enums = [false; MAX_ENUMS];
     let mut composites = [false; crate::storage::MAX_COMPOSITES];
     let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let mut operators = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut statistics =
         [false; MAX_DEPENDENT_STORED_QUERIES * crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
     let mut schemas = [false; MAX_SCHEMAS];
@@ -5460,6 +5513,13 @@ pub fn drop_owned(
             };
             *selected = storage.access_object_visible_to(object, txn.txid)
                 && owned_roles.contains(&(storage.object_owner(object, txn.txid) as u16));
+        }
+    }
+    for (slot, definition) in storage.operators_visible_to(txn.txid) {
+        if let Some(selected) = operators.get_mut(slot) {
+            *selected = owned_roles
+                .iter()
+                .any(|role| Storage::role_oid(usize::from(*role)) == definition.owner);
         }
     }
 
@@ -5492,6 +5552,10 @@ pub fn drop_owned(
             .get(dependency.slot as usize)
             .copied()
             .unwrap_or(false),
+        DependencyClass::Operator => operators
+            .get(dependency.slot as usize)
+            .copied()
+            .unwrap_or(false),
     };
     let StoredDependencyClosure {
         views: dependent_views,
@@ -5516,6 +5580,7 @@ pub fn drop_owned(
                     &enums,
                     &composites,
                     &routines,
+                    &operators,
                     &dependent_views,
                     &dependent_matviews,
                     &dependent_routines,
@@ -5557,6 +5622,7 @@ pub fn drop_owned(
                         &enums,
                         &composites,
                         &routines,
+                        &operators,
                         &dependent_views,
                         &dependent_matviews,
                         &dependent_routines,
@@ -5578,6 +5644,68 @@ pub fn drop_owned(
         drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines)
     {
         return sql_fail(error);
+    }
+
+    let owned_catalog = |owner: i32| {
+        owned_roles
+            .iter()
+            .any(|role| Storage::role_oid(usize::from(*role)) == owner)
+    };
+    loop {
+        let owned = storage
+            .operator_classes_visible_to(txn.txid)
+            .find_map(|(slot, definition)| owned_catalog(definition.owner).then_some(slot));
+        let Some(slot) = owned else { break };
+        if let Err(error) = stage_operator_class_drop(storage, wal, txn, slot) {
+            return sql_fail(error);
+        }
+    }
+    loop {
+        let owned = storage
+            .operator_families_visible_to(txn.txid)
+            .find_map(|(slot, definition)| owned_catalog(definition.owner).then_some(slot));
+        let Some(slot) = owned else { break };
+        let family_oid = storage.operator_family(slot).oid();
+        let has_dependents = storage
+            .operator_classes_visible_to(txn.txid)
+            .any(|(_, class)| class.family == family_oid);
+        if has_dependents && !cascade {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop owned operator family because operator classes depend on it"
+            ));
+        }
+        loop {
+            let dependent = storage
+                .operator_classes_visible_to(txn.txid)
+                .find_map(|(slot, class)| (class.family == family_oid).then_some(slot));
+            let Some(class) = dependent else { break };
+            if let Err(error) = stage_operator_class_drop(storage, wal, txn, class) {
+                return sql_fail(error);
+            }
+        }
+        if let Err(error) = stage_operator_family_drop(storage, wal, txn, slot) {
+            return sql_fail(error);
+        }
+    }
+    loop {
+        let owned = storage
+            .operators_visible_to(txn.txid)
+            .find_map(|(slot, definition)| owned_catalog(definition.owner).then_some(slot));
+        let Some(slot) = owned else { break };
+        let operator_oid = storage.operator(slot).oid();
+        if operator_has_dependents(storage, txn.txid, operator_oid) && !cascade {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop owned operator because other objects depend on it"
+            ));
+        }
+        if let Err(error) = cascade_operator_dependencies(storage, wal, txn, operator_oid) {
+            return sql_fail(error);
+        }
+        if let Err(error) = stage_operator_drop(storage, wal, txn, slot) {
+            return sql_fail(error);
+        }
     }
 
     for (slot, selected) in statistics
@@ -6866,6 +6994,10 @@ enum SchemaObject {
     Sequence(usize),
     Domain(usize),
     Enum(usize),
+    Composite(usize),
+    Operator(usize),
+    OperatorFamily(usize),
+    OperatorClass(usize),
     Statistics(usize),
     Policy {
         slot: usize,
@@ -7042,6 +7174,36 @@ pub fn drop_schema(
             && let Err(e) = push(SchemaObject::Enum(enumeration), &mut n_objects)
         {
             return sql_fail(e);
+        }
+    }
+    for composite in 0..crate::storage::MAX_COMPOSITES {
+        let definition = storage.composite_for(composite, txn.txid);
+        if definition.visible_to(txn.txid)
+            && in_listed(storage, definition.schema.as_str())
+            && let Err(error) = push(SchemaObject::Composite(composite), &mut n_objects)
+        {
+            return sql_fail(error);
+        }
+    }
+    for (operator, definition) in storage.operators_visible_to(txn.txid) {
+        if in_listed(storage, definition.schema.as_str())
+            && let Err(error) = push(SchemaObject::Operator(operator), &mut n_objects)
+        {
+            return sql_fail(error);
+        }
+    }
+    for (family, definition) in storage.operator_families_visible_to(txn.txid) {
+        if in_listed(storage, definition.schema.as_str())
+            && let Err(error) = push(SchemaObject::OperatorFamily(family), &mut n_objects)
+        {
+            return sql_fail(error);
+        }
+    }
+    for (class, definition) in storage.operator_classes_visible_to(txn.txid) {
+        if in_listed(storage, definition.schema.as_str())
+            && let Err(error) = push(SchemaObject::OperatorClass(class), &mut n_objects)
+        {
+            return sql_fail(error);
         }
     }
     for (statistics, definition) in storage.extended_statistics_visible(txn.txid) {
@@ -7446,6 +7608,38 @@ pub fn drop_schema(
                     0,
                 )
             }
+            SchemaObject::Composite(composite) => {
+                let definition = storage.composite_for(*composite, txn.txid);
+                (
+                    schema_rank(storage, definition.schema.as_str()),
+                    definition.created_at,
+                    0,
+                )
+            }
+            SchemaObject::Operator(operator) => {
+                let definition = storage.operator_for(*operator, txn.txid);
+                (
+                    schema_rank(storage, definition.schema.as_str()),
+                    storage.operator(*operator).created_at,
+                    0,
+                )
+            }
+            SchemaObject::OperatorFamily(family) => {
+                let definition = storage.operator_family_for(*family, txn.txid);
+                (
+                    schema_rank(storage, definition.schema.as_str()),
+                    storage.operator_family(*family).created_at,
+                    0,
+                )
+            }
+            SchemaObject::OperatorClass(class) => {
+                let definition = storage.operator_class_for(*class, txn.txid);
+                (
+                    schema_rank(storage, definition.schema.as_str()),
+                    storage.operator_class(*class).created_at,
+                    0,
+                )
+            }
             SchemaObject::Statistics(statistics) => {
                 let definition = storage.extended_statistics(*statistics);
                 let mutable = definition.definition_for(txn.txid);
@@ -7553,6 +7747,26 @@ pub fn drop_schema(
                 let _ = write!(out, "type ");
                 write_rel(out, &enumeration.schema, &enumeration.name);
             }
+            SchemaObject::Composite(composite) => {
+                let definition = storage.composite_for(*composite, txn.txid);
+                let _ = write!(out, "type ");
+                write_rel(out, &definition.schema, &definition.name);
+            }
+            SchemaObject::Operator(operator) => {
+                let definition = storage.operator_for(*operator, txn.txid);
+                let _ = write!(out, "operator ");
+                write_rel(out, &definition.schema, &definition.name);
+            }
+            SchemaObject::OperatorFamily(family) => {
+                let definition = storage.operator_family_for(*family, txn.txid);
+                let _ = write!(out, "operator family ");
+                write_rel(out, &definition.schema, &definition.name);
+            }
+            SchemaObject::OperatorClass(class) => {
+                let definition = storage.operator_class_for(*class, txn.txid);
+                let _ = write!(out, "operator class ");
+                write_rel(out, &definition.schema, &definition.name);
+            }
             SchemaObject::Statistics(statistics) => {
                 let definition = storage
                     .extended_statistics(*statistics)
@@ -7595,6 +7809,18 @@ pub fn drop_schema(
                 }
                 SchemaObject::Domain(domain) => storage.domain(*domain).schema,
                 SchemaObject::Enum(enumeration) => storage.enum_for(*enumeration, txn.txid).schema,
+                SchemaObject::Composite(composite) => {
+                    storage.composite_for(*composite, txn.txid).schema
+                }
+                SchemaObject::Operator(operator) => {
+                    storage.operator_for(*operator, txn.txid).schema
+                }
+                SchemaObject::OperatorFamily(family) => {
+                    storage.operator_family_for(*family, txn.txid).schema
+                }
+                SchemaObject::OperatorClass(class) => {
+                    storage.operator_class_for(*class, txn.txid).schema
+                }
                 SchemaObject::Statistics(statistics) => {
                     storage
                         .extended_statistics(*statistics)
@@ -7664,6 +7890,11 @@ pub fn drop_schema(
                             &routine.schema_for(txn.txid),
                             &routine.name_for(txn.txid),
                         );
+                    }
+                    crate::storage::DependencyClass::Operator => {
+                        let operator = storage.operator_for(*root_slot, txn.txid);
+                        let _ = write!(dependency, "operator ");
+                        write_rel(&mut dependency, &operator.schema, &operator.name);
                     }
                 }
                 let _ = write!(
@@ -7772,8 +8003,17 @@ pub fn drop_schema(
             super::txn::MAX_TXN_DDL - txn.ddl().len()
         ));
     }
-    // Apply the preflighted catalog plan in its deterministic creation order;
-    // every mutation is journaled before the containing schemas are removed.
+    // Persist drops while every referenced type and routine can still be
+    // resolved. The notice above retains PostgreSQL's creation order.
+    let drop_rank = |object: &SchemaObject| match object {
+        SchemaObject::OperatorClass(_) => 0,
+        SchemaObject::OperatorFamily(_) => 1,
+        SchemaObject::Operator(_) => 2,
+        SchemaObject::Domain(_) | SchemaObject::Composite(_) => 4,
+        SchemaObject::Enum(_) => 5,
+        _ => 3,
+    };
+    objects[..n_objects].sort_unstable_by_key(|object| drop_rank(object.as_ref().expect("filled")));
     for o in objects[..n_objects].iter().flatten() {
         match o {
             SchemaObject::InboundFk { table, fk_index } => {
@@ -7839,6 +8079,15 @@ pub fn drop_schema(
                 }
             }
             SchemaObject::Routine(routine) => {
+                if storage.routine(*routine).visible_to(txn.txid) {
+                    let routine_oid =
+                        crate::storage::routine_oid(&storage.routine_for(*routine, txn.txid));
+                    if let Err(error) =
+                        cascade_routine_cast_operator_dependents(storage, wal, txn, routine_oid)
+                    {
+                        return sql_fail(error);
+                    }
+                }
                 let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
                 let Some(selected) = routines.get_mut(*routine) else {
                     return sql_fail(sql_err!(
@@ -7977,6 +8226,60 @@ pub fn drop_schema(
                     }
                     Ok(None) => {}
                     Err(error) => return sql_fail(error),
+                }
+            }
+            SchemaObject::Composite(composite) => {
+                if storage.composite(*composite).visible_to(txn.txid)
+                    && let Err(error) = drop_composite_type(
+                        storage,
+                        wal,
+                        txn,
+                        scratch,
+                        *composite,
+                        true,
+                        arena,
+                        seq_session,
+                        responder,
+                    )
+                {
+                    return sql_fail(error);
+                }
+            }
+            SchemaObject::Operator(operator) => {
+                if storage.operator(*operator).visible_to(txn.txid) {
+                    let operator_oid = storage.operator(*operator).oid();
+                    if let Err(error) =
+                        cascade_operator_dependencies(storage, wal, txn, operator_oid)
+                    {
+                        return sql_fail(error);
+                    }
+                    if let Err(error) = stage_operator_drop(storage, wal, txn, *operator) {
+                        return sql_fail(error);
+                    }
+                }
+            }
+            SchemaObject::OperatorFamily(family) => {
+                if storage.operator_family(*family).visible_to(txn.txid) {
+                    let family_oid = storage.operator_family(*family).oid();
+                    loop {
+                        let dependent = storage
+                            .operator_classes_visible_to(txn.txid)
+                            .find_map(|(slot, class)| (class.family == family_oid).then_some(slot));
+                        let Some(class) = dependent else { break };
+                        if let Err(error) = stage_operator_class_drop(storage, wal, txn, class) {
+                            return sql_fail(error);
+                        }
+                    }
+                    if let Err(error) = stage_operator_family_drop(storage, wal, txn, *family) {
+                        return sql_fail(error);
+                    }
+                }
+            }
+            SchemaObject::OperatorClass(class) => {
+                if storage.operator_class(*class).visible_to(txn.txid)
+                    && let Err(error) = stage_operator_class_drop(storage, wal, txn, *class)
+                {
+                    return sql_fail(error);
                 }
             }
             SchemaObject::Statistics(statistics) => {
@@ -17323,6 +17626,2032 @@ pub(crate) fn resolve_routine_signature(
     Ok(arguments)
 }
 
+fn qualified_catalog_name(name: crate::sql::ast::QualName<'_>) -> crate::util::StackStr<130> {
+    match name.schema {
+        Some(schema) => stack_format!(130, "{}.{}", schema, name.name),
+        None => crate::util::StackStr::from_str(name.name),
+    }
+}
+
+fn routine_result_contract(
+    storage: &Storage,
+    slot: usize,
+    txid: u32,
+) -> Result<crate::storage::RoutineResult, SqlError> {
+    match storage.routine_for(slot, txid).kind {
+        crate::storage::RoutineKind::Function { result } => Ok(result),
+        _ => Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "cast and operator implementation must be a scalar function"
+        )),
+    }
+}
+
+fn resolve_function_slot_exact(
+    storage: &Storage,
+    txid: u32,
+    name: crate::sql::ast::QualName<'_>,
+    argument_types: &[crate::storage::RoutineResult],
+) -> Result<usize, SqlError> {
+    let mut oids = [crate::sql::types::oid::UNKNOWN; crate::storage::MAX_ROUTINE_ARGUMENTS];
+    if argument_types.len() > oids.len() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many function arguments"
+        ));
+    }
+    for (index, argument) in argument_types.iter().enumerate() {
+        oids[index] = storage
+            .routine_type_oid(argument.ctype, argument.user_type, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "function argument type identity is unavailable"
+                )
+            })?;
+    }
+    let qualified = qualified_catalog_name(name);
+    storage
+        .routine_slot_for_function_call_syntax_oids(
+            qualified.as_str(),
+            &oids[..argument_types.len()],
+            false,
+            txid,
+        )
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {} does not exist for the required argument types",
+                qualified.as_str()
+            )
+        })
+}
+
+fn resolve_operator_identity(
+    storage: &Storage,
+    txid: u32,
+    identity: crate::sql::ast::OperatorIdentity<'_>,
+) -> Result<(usize, crate::storage::OperatorSignature), SqlError> {
+    let left = identity
+        .left_type
+        .map(|name| resolve_routine_type(storage, txid, name))
+        .transpose()?;
+    let right = identity
+        .right_type
+        .map(|name| resolve_routine_type(storage, txid, name))
+        .transpose()?;
+    let signature = crate::storage::OperatorSignature { left, right };
+    let left_oid = left
+        .and_then(|argument| storage.routine_type_oid(argument.ctype, argument.user_type, txid));
+    let right_oid = right
+        .and_then(|argument| storage.routine_type_oid(argument.ctype, argument.user_type, txid));
+    let slot = storage
+        .operator_slot_for_oids(
+            identity.name.schema,
+            identity.name.name,
+            left_oid,
+            right_oid,
+            txid,
+        )?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator {} does not exist",
+                identity.name.name
+            )
+        })?;
+    Ok((slot, signature))
+}
+
+fn user_type_access_object(
+    storage: &Storage,
+    txid: u32,
+    result: crate::storage::RoutineResult,
+) -> Option<crate::storage::AccessObject> {
+    let identity = result.user_type?;
+    [
+        crate::storage::AccessClass::Domain,
+        crate::storage::AccessClass::Enum,
+        crate::storage::AccessClass::Composite,
+    ]
+    .into_iter()
+    .find_map(|class| {
+        storage.resolve_access_object(
+            class,
+            identity.schema.as_str(),
+            identity.name.as_str(),
+            txid,
+        )
+    })
+}
+
+fn current_role_owns_type(
+    storage: &Storage,
+    txid: u32,
+    result: crate::storage::RoutineResult,
+) -> bool {
+    let Some(current) = storage.current_role_slot(txid) else {
+        return false;
+    };
+    if storage.role(current).attributes_to(txid).superuser {
+        return true;
+    }
+    let Some(object) = user_type_access_object(storage, txid, result) else {
+        return false;
+    };
+    let owner = storage.object_owner(object, txid);
+    current == owner || storage.role_can_set(current, owner, txid)
+}
+
+pub(crate) fn create_cast(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    cast: &crate::sql::ast::CreateCast<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let source = match resolve_routine_type(storage, txn.txid, cast.source_type) {
+        Ok(source) => source,
+        Err(error) => return sql_fail(error),
+    };
+    let target = match resolve_routine_type(storage, txn.txid, cast.target_type) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
+    if !current_role_owns_type(storage, txn.txid, source)
+        && !current_role_owns_type(storage, txn.txid, target)
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be owner of source or target data type"
+        ));
+    }
+    let method = match cast.method {
+        crate::sql::ast::CastMethod::Binary => {
+            let current = match storage.current_role_slot(txn.txid) {
+                Some(current) => current,
+                None => {
+                    return sql_fail(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "current role is not present in the role catalog"
+                    ));
+                }
+            };
+            if !storage.role(current).attributes_to(txn.txid).superuser {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "must be superuser to create a cast WITHOUT FUNCTION"
+                ));
+            }
+            if source.ctype != target.ctype {
+                return sql_fail(sql_err!(
+                    sqlstate::CANNOT_COERCE,
+                    "source and target data types are not physically compatible"
+                ));
+            }
+            crate::storage::CastMethod::Binary
+        }
+        crate::sql::ast::CastMethod::InOut => crate::storage::CastMethod::InOut,
+        crate::sql::ast::CastMethod::Function {
+            name,
+            argument_types,
+        } => {
+            let mut arguments =
+                [crate::storage::RoutineResult::TEXT; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            let count = if argument_types.is_empty() {
+                arguments[0] = source;
+                1
+            } else {
+                if argument_types.len() > arguments.len() {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many cast function arguments"
+                    ));
+                }
+                for (index, written) in argument_types.iter().enumerate() {
+                    arguments[index] = match resolve_routine_type(storage, txn.txid, written) {
+                        Ok(argument) => argument,
+                        Err(error) => return sql_fail(error),
+                    };
+                }
+                argument_types.len()
+            };
+            if arguments[0] != source
+                || count > 3
+                || (count >= 2 && arguments[1].ctype != ColType::Int4)
+                || (count == 3 && arguments[2].ctype != ColType::Bool)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "cast function must accept the source type, optionally followed by integer and boolean"
+                ));
+            }
+            let slot =
+                match resolve_function_slot_exact(storage, txn.txid, name, &arguments[..count]) {
+                    Ok(slot) => slot,
+                    Err(error) => return sql_fail(error),
+                };
+            let result = match routine_result_contract(storage, slot, txn.txid) {
+                Ok(result) => result,
+                Err(error) => return sql_fail(error),
+            };
+            if result != target {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "cast function must return the target data type"
+                ));
+            }
+            crate::storage::CastMethod::Function(crate::storage::routine_oid(
+                &storage.routine_for(slot, txn.txid),
+            ))
+        }
+    };
+    let context = match cast.context {
+        crate::sql::ast::CastContext::Explicit => crate::storage::CastContext::Explicit,
+        crate::sql::ast::CastContext::Assignment => crate::storage::CastContext::Assignment,
+        crate::sql::ast::CastContext::Implicit => crate::storage::CastContext::Implicit,
+    };
+    let slot = match storage.create_cast(source, target, method, context, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let definition = *storage.cast(slot);
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::SetCast(definition)) {
+        storage.rollback_cast_create(slot);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CastCreated(slot as u32)) {
+        storage.rollback_cast_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE CAST")?;
+    sql_ok()
+}
+
+fn stage_cast_drop(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+) -> Result<(), SqlError> {
+    let definition = *storage.cast(slot);
+    storage.drop_cast(definition.source, definition.target, txn.txid);
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::DropCast {
+            source: definition.source,
+            target: definition.target,
+        },
+    ) {
+        storage.rollback_cast_drop(slot, txn.txid);
+        return Err(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CastDropped(slot as u32)) {
+        storage.rollback_cast_drop(slot, txn.txid);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn drop_cast(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    cast: crate::sql::ast::DropCast<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let source = match resolve_routine_type(storage, txn.txid, cast.source_type) {
+        Ok(source) => source,
+        Err(error) => return sql_fail(error),
+    };
+    let target = match resolve_routine_type(storage, txn.txid, cast.target_type) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
+    let Some(slot) = storage.cast_slot(source, target, txn.txid) else {
+        if cast.if_exists {
+            responder.command_complete("DROP CAST")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(sqlstate::UNDEFINED_OBJECT, "cast does not exist"));
+    };
+    if let Err(error) = stage_cast_drop(storage, wal, txn, slot) {
+        return sql_fail(error);
+    }
+    responder.command_complete("DROP CAST")?;
+    sql_ok()
+}
+
+fn operator_link_slot(
+    storage: &Storage,
+    txid: u32,
+    name: crate::sql::ast::QualName<'_>,
+    signature: crate::storage::OperatorSignature,
+) -> Result<usize, SqlError> {
+    let left_oid = signature
+        .left
+        .and_then(|argument| storage.routine_type_oid(argument.ctype, argument.user_type, txid));
+    let right_oid = signature
+        .right
+        .and_then(|argument| storage.routine_type_oid(argument.ctype, argument.user_type, txid));
+    storage
+        .operator_slot_for_oids(name.schema, name.name, left_oid, right_oid, txid)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator {} does not exist",
+                name.name
+            )
+        })
+}
+
+#[derive(Clone, Copy)]
+struct OperatorLinkRequest<'a> {
+    name: crate::sql::ast::QualName<'a>,
+    default_schema: SqlName,
+    signature: crate::storage::OperatorSignature,
+    source_oid: i32,
+    kind: OperatorLinkKind,
+}
+
+#[derive(Clone, Copy)]
+enum OperatorLinkKind {
+    Commutator,
+    Negator,
+}
+
+fn operator_link_or_shell(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    request: OperatorLinkRequest<'_>,
+) -> Result<usize, SqlError> {
+    match operator_link_slot(storage, txn.txid, request.name, request.signature) {
+        Ok(slot) => {
+            let mut linked = storage.operator_for(slot, txn.txid);
+            storage.require_catalog_owner(
+                linked.owner,
+                txn.txid,
+                "operator",
+                linked.name.as_str(),
+            )?;
+            let reverse = if matches!(request.kind, OperatorLinkKind::Commutator) {
+                &mut linked.commutator
+            } else {
+                &mut linked.negator
+            };
+            if reverse.is_none() {
+                *reverse = Some(request.source_oid);
+                stage_operator(storage, wal, txn, slot, linked)?;
+            } else if *reverse != Some(request.source_oid) {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "linked operator already has a different reciprocal link"
+                ));
+            }
+            return Ok(slot);
+        }
+        Err(error) if error.sqlstate == sqlstate::UNDEFINED_FUNCTION => {}
+        Err(error) => return Err(error),
+    }
+    let schema = match request.name.schema {
+        Some(schema) => storage
+            .find_schema_visible(schema, txn.txid)
+            .map(|slot| storage.schema_def(slot).name)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
+                )
+            })?,
+        None => request.default_schema,
+    };
+    storage.require_schema_create(schema.as_str(), txn.txid)?;
+    let mut definition = crate::storage::OperatorDefinition {
+        schema,
+        name: SqlName::parse(request.name.name)?,
+        signature: request.signature,
+        implementation: crate::storage::OperatorImplementation::Shell,
+        commutator: None,
+        negator: None,
+        hashes: false,
+        merges: false,
+        owner: storage.initial_catalog_owner(txn.txid),
+    };
+    if matches!(request.kind, OperatorLinkKind::Commutator) {
+        definition.commutator = Some(request.source_oid);
+    } else {
+        definition.negator = Some(request.source_oid);
+    }
+    let slot = storage.create_operator(definition, txn.txid)?;
+    let created_at = storage.operator(slot).created_at;
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetOperator {
+            created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_operator_create(slot);
+        return Err(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorCreated(slot as u32)) {
+        storage.rollback_operator_create(slot);
+        return Err(error);
+    }
+    Ok(slot)
+}
+
+pub(crate) fn create_operator(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    operator: &crate::sql::ast::CreateOperator<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let schema = match storage.creation_schema(operator.name.schema, operator.name.name, txn.txid) {
+        Ok(schema) => schema,
+        Err(error) => return sql_fail(error),
+    };
+    let left = match operator
+        .left_type
+        .map(|written| resolve_routine_type(storage, txn.txid, written))
+        .transpose()
+    {
+        Ok(left) => left,
+        Err(error) => return sql_fail(error),
+    };
+    let right = match operator
+        .right_type
+        .map(|written| resolve_routine_type(storage, txn.txid, written))
+        .transpose()
+    {
+        Ok(right) => right,
+        Err(error) => return sql_fail(error),
+    };
+    let signature = crate::storage::OperatorSignature { left, right };
+    let mut arguments = [crate::storage::RoutineResult::TEXT; 2];
+    let mut count = 0usize;
+    if let Some(left) = left {
+        arguments[count] = left;
+        count += 1;
+    }
+    if let Some(right) = right {
+        arguments[count] = right;
+        count += 1;
+    }
+    let function = match resolve_function_slot_exact(
+        storage,
+        txn.txid,
+        operator.function,
+        &arguments[..count],
+    ) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let result = match routine_result_contract(storage, function, txn.txid) {
+        Ok(result) => result,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_routine_execute(function, txn.txid) {
+        return sql_fail(error);
+    }
+    if let Some(identity) = result.user_type
+        && let Err(error) =
+            storage.require_type_usage(identity.schema.as_str(), identity.name.as_str(), txn.txid)
+    {
+        return sql_fail(error);
+    }
+    if (operator.hashes || operator.merges) && (count != 2 || result.ctype != ColType::Bool) {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "HASHES and MERGES require a binary boolean operator"
+        ));
+    }
+    let name = match SqlName::parse(operator.name.name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let mut definition = crate::storage::OperatorDefinition {
+        schema,
+        name,
+        signature,
+        implementation: crate::storage::OperatorImplementation::Function {
+            routine: crate::storage::routine_oid(&storage.routine_for(function, txn.txid)),
+            result,
+        },
+        commutator: None,
+        negator: None,
+        hashes: operator.hashes,
+        merges: operator.merges,
+        owner: storage.initial_catalog_owner(txn.txid),
+    };
+    let (slot, created) =
+        match storage.operator_slot_exact(schema.as_str(), name.as_str(), signature, txn.txid) {
+            Some(slot)
+                if matches!(
+                    storage.operator_for(slot, txn.txid).implementation,
+                    crate::storage::OperatorImplementation::Shell
+                ) =>
+            {
+                let shell = storage.operator_for(slot, txn.txid);
+                if let Err(error) =
+                    storage.require_catalog_owner(shell.owner, txn.txid, "operator", name.as_str())
+                {
+                    return sql_fail(error);
+                }
+                definition.owner = shell.owner;
+                if let Err(error) = stage_operator(storage, wal, txn, slot, definition) {
+                    return sql_fail(error);
+                }
+                (slot, false)
+            }
+            Some(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_FUNCTION,
+                    "operator already exists with the same argument types"
+                ));
+            }
+            None => match storage.create_operator(definition, txn.txid) {
+                Ok(slot) => (slot, true),
+                Err(error) => return sql_fail(error),
+            },
+        };
+    if created {
+        let created_at = storage.operator(slot).created_at;
+        let lsn = storage.lsn() + 1;
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::SetOperator {
+                created_at,
+                definition,
+            },
+        ) {
+            storage.rollback_operator_create(slot);
+            return sql_fail(error);
+        }
+        storage.set_lsn(lsn);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorCreated(slot as u32)) {
+            storage.rollback_operator_create(slot);
+            return sql_fail(error);
+        }
+    }
+    let mut linked = definition;
+    if let Some(commutator) = operator.commutator {
+        let swapped = crate::storage::OperatorSignature {
+            left: signature.right,
+            right: signature.left,
+        };
+        linked.commutator = Some(
+            match operator_link_or_shell(
+                storage,
+                wal,
+                txn,
+                OperatorLinkRequest {
+                    name: commutator,
+                    default_schema: schema,
+                    signature: swapped,
+                    source_oid: storage.operator(slot).oid(),
+                    kind: OperatorLinkKind::Commutator,
+                },
+            ) {
+                Ok(link) => storage.operator(link).oid(),
+                Err(error) => return sql_fail(error),
+            },
+        );
+    }
+    if let Some(negator) = operator.negator {
+        linked.negator = Some(
+            match operator_link_or_shell(
+                storage,
+                wal,
+                txn,
+                OperatorLinkRequest {
+                    name: negator,
+                    default_schema: schema,
+                    signature,
+                    source_oid: storage.operator(slot).oid(),
+                    kind: OperatorLinkKind::Negator,
+                },
+            ) {
+                Ok(link) => storage.operator(link).oid(),
+                Err(error) => return sql_fail(error),
+            },
+        );
+    }
+    if (linked.commutator.is_some() || linked.negator.is_some())
+        && let Err(error) = stage_operator(storage, wal, txn, slot, linked)
+    {
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE OPERATOR")?;
+    sql_ok()
+}
+
+fn catalog_owner_slot(storage: &Storage, txid: u32, written: &str) -> Result<i32, SqlError> {
+    let role = resolve_role_name(written);
+    let slot = storage
+        .find_role_visible(role.as_str(), txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                role.as_str()
+            )
+        })?;
+    let current = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    if !storage.role(current).attributes_to(txid).superuser
+        && current != slot
+        && !storage.role_can_set(current, slot, txid)
+    {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be able to SET ROLE \"{}\"",
+            role.as_str()
+        ));
+    }
+    Ok(Storage::role_oid(slot))
+}
+
+fn require_catalog_superuser(storage: &Storage, txid: u32) -> Result<(), SqlError> {
+    let current = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    if storage.role(current).attributes_to(txid).superuser {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to manage operator families and operator classes"
+        ))
+    }
+}
+
+fn stage_operator(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    definition: crate::storage::OperatorDefinition,
+) -> Result<(), SqlError> {
+    let prior = storage.stage_operator_definition(slot, definition, txn.txid)?;
+    let created_at = storage.operator(slot).created_at;
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetOperator {
+            created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_operator_alter(slot, prior);
+        return Err(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_operator_alter(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn stage_operator_drop(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+) -> Result<(), SqlError> {
+    let definition = storage.operator_for(slot, txn.txid);
+    storage.drop_operator(slot, txn.txid);
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::DropOperator {
+            schema: definition.schema.as_str(),
+            name: definition.name.as_str(),
+            signature: definition.signature,
+        },
+    ) {
+        storage.rollback_operator_drop(slot, txn.txid);
+        return Err(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorDropped(slot as u32)) {
+        storage.rollback_operator_drop(slot, txn.txid);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn operator_has_dependents(storage: &Storage, txid: u32, operator_oid: i32) -> bool {
+    storage
+        .operator_classes_visible_to(txid)
+        .any(|(_, class)| class.operators.contains(&operator_oid))
+        || storage
+            .operator_families_visible_to(txid)
+            .any(|(_, family)| {
+                family
+                    .operators
+                    .iter()
+                    .any(|member| member.used && member.operator == operator_oid)
+            })
+}
+
+fn cascade_operator_dependencies(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    operator_oid: i32,
+) -> Result<(), SqlError> {
+    let StoredDependencyClosure {
+        views,
+        matviews,
+        routines,
+    } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+        dependency.class == crate::storage::DependencyClass::Operator
+            && matches!(
+                dependency.identity,
+                crate::storage::StoredDependencyIdentity::OperatorOid(oid) if oid == operator_oid
+            )
+    })?;
+    let operator_slot = storage.operator_slot_by_oid(operator_oid, txn.txid);
+    if let Some(operator_slot) = operator_slot {
+        let root = PolicyDependencySelection::Catalog {
+            class: crate::storage::DependencyClass::Operator,
+            slot: operator_slot,
+        };
+        drop_policy_dependents(storage, wal, txn, root, &views, &matviews, &routines)?;
+    }
+    drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines)?;
+    loop {
+        let dependent = storage
+            .operator_classes_visible_to(txn.txid)
+            .find_map(|(slot, class)| class.operators.contains(&operator_oid).then_some(slot));
+        let Some(slot) = dependent else { break };
+        stage_operator_class_drop(storage, wal, txn, slot)?;
+    }
+    loop {
+        let dependent =
+            storage
+                .operator_families_visible_to(txn.txid)
+                .find_map(|(slot, family)| {
+                    family
+                        .operators
+                        .iter()
+                        .any(|member| member.used && member.operator == operator_oid)
+                        .then_some(slot)
+                });
+        let Some(slot) = dependent else { break };
+        let mut family = storage.operator_family_for(slot, txn.txid);
+        for member in &mut family.operators {
+            if member.used && member.operator == operator_oid {
+                *member = crate::storage::OperatorFamilyOperator::EMPTY;
+            }
+        }
+        stage_operator_family(storage, wal, txn, slot, family)?;
+    }
+    loop {
+        let dependent = storage
+            .operators_visible_to(txn.txid)
+            .find_map(|(slot, operator)| {
+                (operator.commutator == Some(operator_oid)
+                    || operator.negator == Some(operator_oid))
+                .then_some(slot)
+            });
+        let Some(slot) = dependent else { break };
+        let mut operator = storage.operator_for(slot, txn.txid);
+        if operator.commutator == Some(operator_oid) {
+            operator.commutator = None;
+        }
+        if operator.negator == Some(operator_oid) {
+            operator.negator = None;
+        }
+        stage_operator(storage, wal, txn, slot, operator)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn alter_operator(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    identity: crate::sql::ast::OperatorIdentity<'_>,
+    action: crate::sql::ast::AlterOperatorAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let (slot, signature) = match resolve_operator_identity(storage, txn.txid, identity) {
+        Ok(found) => found,
+        Err(error) => return sql_fail(error),
+    };
+    let mut definition = storage.operator_for(slot, txn.txid);
+    if let Err(error) = storage.require_catalog_owner(
+        definition.owner,
+        txn.txid,
+        "operator",
+        definition.name.as_str(),
+    ) {
+        return sql_fail(error);
+    }
+    match action {
+        crate::sql::ast::AlterOperatorAction::Owner(role) => {
+            let owner = match catalog_owner_slot(storage, txn.txid, role) {
+                Ok(owner) => owner,
+                Err(error) => return sql_fail(error),
+            };
+            let owner_slot = storage
+                .role_slot_by_oid(owner, txn.txid)
+                .expect("resolved catalog owner");
+            if let Err(error) =
+                storage.require_schema_create_as(definition.schema.as_str(), owner_slot, txn.txid)
+            {
+                return sql_fail(error);
+            }
+            definition.owner = owner;
+        }
+        crate::sql::ast::AlterOperatorAction::SetSchema(schema) => {
+            if storage.find_schema_visible(schema, txn.txid).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
+                ));
+            }
+            if let Err(error) = storage.require_schema_create(schema, txn.txid) {
+                return sql_fail(error);
+            }
+            definition.schema = match SqlName::parse(schema) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        crate::sql::ast::AlterOperatorAction::Set {
+            commutator,
+            negator,
+            hashes,
+            merges,
+        } => {
+            if (hashes || merges)
+                && (signature.arity() != 2
+                    || definition
+                        .implementation
+                        .result()
+                        .is_none_or(|result| result.ctype != ColType::Bool))
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "HASHES and MERGES require a binary boolean operator"
+                ));
+            }
+            if let Some(name) = commutator {
+                if definition.commutator.is_some() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "operator already has a commutator"
+                    ));
+                }
+                let swapped = crate::storage::OperatorSignature {
+                    left: signature.right,
+                    right: signature.left,
+                };
+                let link = match operator_link_slot(storage, txn.txid, name, swapped) {
+                    Ok(link) => link,
+                    Err(error) => return sql_fail(error),
+                };
+                let mut linked = storage.operator_for(link, txn.txid);
+                if let Err(error) = storage.require_catalog_owner(
+                    linked.owner,
+                    txn.txid,
+                    "operator",
+                    linked.name.as_str(),
+                ) {
+                    return sql_fail(error);
+                }
+                let source_oid = storage.operator(slot).oid();
+                if linked.commutator.is_some() && linked.commutator != Some(source_oid) {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "commutator operator already has a different commutator"
+                    ));
+                }
+                linked.commutator = Some(source_oid);
+                if let Err(error) = stage_operator(storage, wal, txn, link, linked) {
+                    return sql_fail(error);
+                }
+                definition.commutator = Some(storage.operator(link).oid());
+            }
+            if let Some(name) = negator {
+                if definition.negator.is_some() {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "operator already has a negator"
+                    ));
+                }
+                let link = match operator_link_slot(storage, txn.txid, name, signature) {
+                    Ok(link) => link,
+                    Err(error) => return sql_fail(error),
+                };
+                let mut linked = storage.operator_for(link, txn.txid);
+                if let Err(error) = storage.require_catalog_owner(
+                    linked.owner,
+                    txn.txid,
+                    "operator",
+                    linked.name.as_str(),
+                ) {
+                    return sql_fail(error);
+                }
+                let source_oid = storage.operator(slot).oid();
+                if linked.negator.is_some() && linked.negator != Some(source_oid) {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "negator operator already has a different negator"
+                    ));
+                }
+                linked.negator = Some(source_oid);
+                if let Err(error) = stage_operator(storage, wal, txn, link, linked) {
+                    return sql_fail(error);
+                }
+                definition.negator = Some(storage.operator(link).oid());
+            }
+            definition.hashes |= hashes;
+            definition.merges |= merges;
+        }
+    }
+    if storage
+        .operator_slot_exact(
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            definition.signature,
+            txn.txid,
+        )
+        .is_some_and(|found| found != slot)
+    {
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_FUNCTION,
+            "operator already exists with the same argument types"
+        ));
+    }
+    if let Err(error) = stage_operator(storage, wal, txn, slot, definition) {
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER OPERATOR")?;
+    sql_ok()
+}
+
+pub(crate) fn drop_operators(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    identities: &[crate::sql::ast::OperatorIdentity<'_>],
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for identity in identities {
+        let (slot, _) = match resolve_operator_identity(storage, txn.txid, *identity) {
+            Ok(found) => found,
+            Err(error) if if_exists && error.sqlstate == sqlstate::UNDEFINED_FUNCTION => {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        160,
+                        "operator {} does not exist, skipping",
+                        identity.name.name
+                    )
+                    .as_str(),
+                )?;
+                continue;
+            }
+            Err(error) => return sql_fail(error),
+        };
+        let definition = storage.operator_for(slot, txn.txid);
+        if let Err(error) = storage.require_catalog_owner(
+            definition.owner,
+            txn.txid,
+            "operator",
+            definition.name.as_str(),
+        ) {
+            return sql_fail(error);
+        }
+        let operator_oid = storage.operator(slot).oid();
+        let StoredDependencyClosure {
+            views: dependent_views,
+            matviews: dependent_matviews,
+            routines: dependent_routines,
+        } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
+            dependency.class == crate::storage::DependencyClass::Operator
+                && matches!(
+                    dependency.identity,
+                    crate::storage::StoredDependencyIdentity::OperatorOid(oid)
+                        if oid == operator_oid
+                )
+        }) {
+            Ok(dependents) => dependents,
+            Err(error) => return sql_fail(error),
+        };
+        let policy_root = PolicyDependencySelection::Catalog {
+            class: crate::storage::DependencyClass::Operator,
+            slot,
+        };
+        let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
+            || dependent_matviews.iter().any(|selected| *selected)
+            || dependent_routines.iter().any(|selected| *selected)
+            || policy_dependents_exist(
+                storage,
+                txn.txid,
+                policy_root,
+                &dependent_views,
+                &dependent_matviews,
+                &dependent_routines,
+            );
+        if (operator_has_dependents(storage, txn.txid, operator_oid) || has_stored_dependents)
+            && !cascade
+        {
+            if has_stored_dependents
+                && let Err(error) = report_stored_query_dependents(
+                    storage,
+                    txn.txid,
+                    StoredQueryRoot {
+                        class: crate::storage::DependencyClass::Operator,
+                        slot,
+                        kind: "operator",
+                        schema: definition.schema,
+                        name: definition.name,
+                        suffix: crate::util::StackStr::new(),
+                    },
+                    StoredQuerySelection {
+                        views: &dependent_views,
+                        matviews: &dependent_matviews,
+                        routines: &dependent_routines,
+                        policy_root: Some(policy_root),
+                    },
+                    false,
+                    responder,
+                )
+            {
+                return sql_fail(error);
+            }
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop operator {} because other objects depend on it",
+                definition.name.as_str()
+            ));
+        }
+        if has_stored_dependents
+            && let Err(error) = report_stored_query_dependents(
+                storage,
+                txn.txid,
+                StoredQueryRoot {
+                    class: crate::storage::DependencyClass::Operator,
+                    slot,
+                    kind: "operator",
+                    schema: definition.schema,
+                    name: definition.name,
+                    suffix: crate::util::StackStr::new(),
+                },
+                StoredQuerySelection {
+                    views: &dependent_views,
+                    matviews: &dependent_matviews,
+                    routines: &dependent_routines,
+                    policy_root: Some(policy_root),
+                },
+                true,
+                responder,
+            )
+        {
+            return sql_fail(error);
+        }
+        if let Err(error) = cascade_operator_dependencies(storage, wal, txn, operator_oid) {
+            return sql_fail(error);
+        }
+        if let Err(error) = stage_operator_drop(storage, wal, txn, slot) {
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("DROP OPERATOR")?;
+    sql_ok()
+}
+
+fn empty_operator_family(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    name: crate::sql::ast::QualName<'_>,
+) -> Result<usize, SqlError> {
+    let schema = storage.creation_schema(name.schema, name.name, txn.txid)?;
+    let definition = crate::storage::OperatorFamilyDefinition {
+        schema,
+        name: SqlName::parse(name.name)?,
+        owner: storage.initial_catalog_owner(txn.txid),
+        operators: [crate::storage::OperatorFamilyOperator::EMPTY;
+            crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
+        functions: [crate::storage::OperatorFamilyFunction::EMPTY;
+            crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
+    };
+    storage.create_operator_family(definition, txn.txid)
+}
+
+pub(crate) fn create_operator_family(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: crate::sql::ast::QualName<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    if let Err(error) = require_catalog_superuser(storage, txn.txid) {
+        return sql_fail(error);
+    }
+    let slot = match empty_operator_family(storage, txn, name) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let created_at = storage.operator_family(slot).created_at;
+    let definition = storage.operator_family_for(slot, txn.txid);
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetOperatorFamily {
+            created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_operator_family_create(slot);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyCreated(slot as u32)) {
+        storage.rollback_operator_family_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE OPERATOR FAMILY")?;
+    sql_ok()
+}
+
+fn stage_operator_family_drop(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+) -> Result<(), SqlError> {
+    let definition = storage.operator_family_for(slot, txn.txid);
+    storage.drop_operator_family(slot, txn.txid);
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::DropOperatorFamily {
+            schema: definition.schema.as_str(),
+            name: definition.name.as_str(),
+        },
+    ) {
+        storage.rollback_operator_family_drop(slot, txn.txid);
+        return Err(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyDropped(slot as u32)) {
+        storage.rollback_operator_family_drop(slot, txn.txid);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn resolve_compare_function(
+    storage: &Storage,
+    txid: u32,
+    left: crate::storage::RoutineResult,
+    right: crate::storage::RoutineResult,
+    function: crate::sql::ast::QualName<'_>,
+    argument_types: &[&str],
+) -> Result<usize, SqlError> {
+    let arguments = if argument_types.is_empty() {
+        [left, right]
+    } else {
+        if argument_types.len() != 2 {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "btree support function 1 must accept two arguments"
+            ));
+        }
+        let declared_left = resolve_routine_type(storage, txid, argument_types[0])?;
+        let declared_right = resolve_routine_type(storage, txid, argument_types[1])?;
+        if declared_left != left || declared_right != right {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "support function argument types must match the operator family types"
+            ));
+        }
+        [declared_left, declared_right]
+    };
+    let slot = resolve_function_slot_exact(storage, txid, function, &arguments)?;
+    let result = routine_result_contract(storage, slot, txid)?;
+    if result.ctype != ColType::Int4 || result.user_type.is_some() {
+        return Err(sql_err!(
+            sqlstate::INVALID_FUNCTION_DEFINITION,
+            "btree support function 1 must return integer"
+        ));
+    }
+    Ok(slot)
+}
+
+fn add_operator_family_members(
+    storage: &Storage,
+    txid: u32,
+    definition: &mut crate::storage::OperatorFamilyDefinition,
+    members: &[crate::sql::ast::OperatorFamilyMember<'_>],
+) -> Result<(), SqlError> {
+    for member in members {
+        match *member {
+            crate::sql::ast::OperatorFamilyMember::Operator { strategy, operator } => {
+                let (slot, signature) = resolve_operator_identity(storage, txid, operator)?;
+                let Some(left) = signature.left else {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "btree strategy operators must be binary"
+                    ));
+                };
+                let Some(right) = signature.right else {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "btree strategy operators must be binary"
+                    ));
+                };
+                let existing = definition.operators.iter().position(|entry| {
+                    entry.used
+                        && entry.strategy == strategy
+                        && entry.left == left
+                        && entry.right == right
+                });
+                if existing.is_some() {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "operator family already has an operator for strategy {} and these types",
+                        strategy.number()
+                    ));
+                }
+                let target = definition
+                    .operators
+                    .iter_mut()
+                    .find(|entry| !entry.used)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "too many operator-family operators (limit {})",
+                            crate::storage::MAX_OPERATOR_FAMILY_MEMBERS
+                        )
+                    })?;
+                *target = crate::storage::OperatorFamilyOperator {
+                    used: true,
+                    strategy,
+                    left,
+                    right,
+                    operator: storage.operator(slot).oid(),
+                };
+            }
+            crate::sql::ast::OperatorFamilyMember::CompareFunction {
+                left_type,
+                right_type,
+                function,
+                argument_types,
+            } => {
+                let left = resolve_routine_type(storage, txid, left_type)?;
+                let right = resolve_routine_type(storage, txid, right_type)?;
+                if definition
+                    .functions
+                    .iter()
+                    .any(|entry| entry.used && entry.left == left && entry.right == right)
+                {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "operator family already has support function 1 for these types"
+                    ));
+                }
+                let function =
+                    resolve_compare_function(storage, txid, left, right, function, argument_types)?;
+                let target = definition
+                    .functions
+                    .iter_mut()
+                    .find(|entry| !entry.used)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "too many operator-family support functions (limit {})",
+                            crate::storage::MAX_OPERATOR_FAMILY_MEMBERS
+                        )
+                    })?;
+                *target = crate::storage::OperatorFamilyFunction {
+                    used: true,
+                    left,
+                    right,
+                    function: crate::storage::routine_oid(&storage.routine_for(function, txid)),
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
+fn drop_operator_family_members(
+    storage: &Storage,
+    txid: u32,
+    definition: &mut crate::storage::OperatorFamilyDefinition,
+    members: &[crate::sql::ast::OperatorFamilyMemberIdentity<'_>],
+) -> Result<(), SqlError> {
+    for member in members {
+        let (left, right, operator) = match *member {
+            crate::sql::ast::OperatorFamilyMemberIdentity::Operator {
+                strategy,
+                left_type,
+                right_type,
+            } => (
+                resolve_routine_type(storage, txid, left_type)?,
+                resolve_routine_type(storage, txid, right_type)?,
+                Some(strategy),
+            ),
+            crate::sql::ast::OperatorFamilyMemberIdentity::CompareFunction {
+                left_type,
+                right_type,
+            } => (
+                resolve_routine_type(storage, txid, left_type)?,
+                resolve_routine_type(storage, txid, right_type)?,
+                None,
+            ),
+        };
+        let removed = if let Some(strategy) = operator {
+            definition
+                .operators
+                .iter_mut()
+                .find(|entry| {
+                    entry.used
+                        && entry.strategy == strategy
+                        && entry.left == left
+                        && entry.right == right
+                })
+                .map(|entry| *entry = crate::storage::OperatorFamilyOperator::EMPTY)
+                .is_some()
+        } else {
+            definition
+                .functions
+                .iter_mut()
+                .find(|entry| entry.used && entry.left == left && entry.right == right)
+                .map(|entry| *entry = crate::storage::OperatorFamilyFunction::EMPTY)
+                .is_some()
+        };
+        if !removed {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator-family member does not exist"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn stage_operator_family(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    definition: crate::storage::OperatorFamilyDefinition,
+) -> Result<(), SqlError> {
+    let prior = storage.stage_operator_family_definition(slot, definition, txn.txid)?;
+    let created_at = storage.operator_family(slot).created_at;
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetOperatorFamily {
+            created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_operator_family_alter(slot, prior);
+        return Err(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_operator_family_alter(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn alter_operator_family(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: crate::sql::ast::QualName<'_>,
+    action: crate::sql::ast::AlterOperatorFamilyAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    if let Err(error) = require_catalog_superuser(storage, txn.txid) {
+        return sql_fail(error);
+    }
+    let Some(slot) = storage.operator_family_slot_on_path(name.schema, name.name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "operator family \"{}\" does not exist for access method \"btree\"",
+            name.name
+        ));
+    };
+    let mut definition = storage.operator_family_for(slot, txn.txid);
+    if let Err(error) = storage.require_catalog_owner(
+        definition.owner,
+        txn.txid,
+        "operator family",
+        definition.name.as_str(),
+    ) {
+        return sql_fail(error);
+    }
+    let result = match action {
+        crate::sql::ast::AlterOperatorFamilyAction::Add(members) => {
+            add_operator_family_members(storage, txn.txid, &mut definition, members)
+        }
+        crate::sql::ast::AlterOperatorFamilyAction::Drop(members) => {
+            drop_operator_family_members(storage, txn.txid, &mut definition, members)
+        }
+        crate::sql::ast::AlterOperatorFamilyAction::Rename(name) => {
+            definition.name = match SqlName::parse(name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            Ok(())
+        }
+        crate::sql::ast::AlterOperatorFamilyAction::Owner(role) => {
+            let owner = match catalog_owner_slot(storage, txn.txid, role) {
+                Ok(owner) => owner,
+                Err(error) => return sql_fail(error),
+            };
+            let owner_slot = storage
+                .role_slot_by_oid(owner, txn.txid)
+                .expect("resolved catalog owner");
+            if let Err(error) =
+                storage.require_schema_create_as(definition.schema.as_str(), owner_slot, txn.txid)
+            {
+                return sql_fail(error);
+            }
+            definition.owner = owner;
+            Ok(())
+        }
+        crate::sql::ast::AlterOperatorFamilyAction::SetSchema(schema) => {
+            if storage.find_schema_visible(schema, txn.txid).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
+                ));
+            }
+            if let Err(error) = storage.require_schema_create(schema, txn.txid) {
+                return sql_fail(error);
+            }
+            definition.schema = match SqlName::parse(schema) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+            Ok(())
+        }
+    };
+    if let Err(error) = result {
+        return sql_fail(error);
+    }
+    if storage
+        .operator_family_slot_exact(
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            txn.txid,
+        )
+        .is_some_and(|found| found != slot)
+    {
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "operator family already exists for access method \"btree\""
+        ));
+    }
+    if let Err(error) = stage_operator_family(storage, wal, txn, slot, definition) {
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER OPERATOR FAMILY")?;
+    sql_ok()
+}
+
+pub(crate) fn drop_operator_families(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[crate::sql::ast::QualName<'_>],
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        let Some(slot) = storage.operator_family_slot_on_path(name.schema, name.name, txn.txid)
+        else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        180,
+                        "operator family \"{}\" does not exist for access method \"btree\", skipping",
+                        name.name
+                    )
+                    .as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator family \"{}\" does not exist for access method \"btree\"",
+                name.name
+            ));
+        };
+        let definition = storage.operator_family_for(slot, txn.txid);
+        if let Err(error) = storage.require_catalog_owner(
+            definition.owner,
+            txn.txid,
+            "operator family",
+            definition.name.as_str(),
+        ) {
+            return sql_fail(error);
+        }
+        let family_oid = storage.operator_family(slot).oid();
+        let has_dependents = storage
+            .operator_classes_visible_to(txn.txid)
+            .any(|(_, class)| class.family == family_oid);
+        if has_dependents && !cascade {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop operator family {} because operator classes depend on it",
+                definition.name.as_str()
+            ));
+        }
+        if cascade {
+            loop {
+                let dependent = storage
+                    .operator_classes_visible_to(txn.txid)
+                    .find_map(|(slot, class)| (class.family == family_oid).then_some(slot));
+                let Some(class_slot) = dependent else { break };
+                if let Err(error) = stage_operator_class_drop(storage, wal, txn, class_slot) {
+                    return sql_fail(error);
+                }
+            }
+        }
+        if let Err(error) = stage_operator_family_drop(storage, wal, txn, slot) {
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("DROP OPERATOR FAMILY")?;
+    sql_ok()
+}
+
+fn stage_operator_class(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    definition: crate::storage::OperatorClassDefinition,
+) -> Result<(), SqlError> {
+    let prior = storage.stage_operator_class_definition(slot, definition, txn.txid)?;
+    let created_at = storage.operator_class(slot).created_at;
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetOperatorClass {
+            created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_operator_class_alter(slot, prior);
+        return Err(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorClassAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_operator_class_alter(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn stage_operator_class_drop(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+) -> Result<(), SqlError> {
+    let definition = storage.operator_class_for(slot, txn.txid);
+    storage.drop_operator_class(slot, txn.txid);
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::DropOperatorClass {
+            schema: definition.schema.as_str(),
+            name: definition.name.as_str(),
+        },
+    ) {
+        storage.rollback_operator_class_drop(slot, txn.txid);
+        return Err(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorClassDropped(slot as u32)) {
+        storage.rollback_operator_class_drop(slot, txn.txid);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub(crate) fn create_operator_class(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    class: &crate::sql::ast::CreateOperatorClass<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    if let Err(error) = require_catalog_superuser(storage, txn.txid) {
+        return sql_fail(error);
+    }
+    let schema = match storage.creation_schema(class.name.schema, class.name.name, txn.txid) {
+        Ok(schema) => schema,
+        Err(error) => return sql_fail(error),
+    };
+    let input = match resolve_routine_type(storage, txn.txid, class.input_type) {
+        Ok(input) => input,
+        Err(error) => return sql_fail(error),
+    };
+    let mut storage_type = input;
+    let family = if let Some(family) = class.family {
+        match storage.operator_family_slot_on_path(family.schema, family.name, txn.txid) {
+            Some(slot) => slot,
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "operator family \"{}\" does not exist for access method \"btree\"",
+                    family.name
+                ));
+            }
+        }
+    } else if let Some(slot) =
+        storage.operator_family_slot_exact(schema.as_str(), class.name.name, txn.txid)
+    {
+        slot
+    } else {
+        let slot = match empty_operator_family(storage, txn, class.name) {
+            Ok(slot) => slot,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorFamilyCreated(slot as u32))
+        {
+            storage.rollback_operator_family_create(slot);
+            return sql_fail(error);
+        }
+        let created_at = storage.operator_family(slot).created_at;
+        let definition = storage.operator_family_for(slot, txn.txid);
+        let lsn = storage.lsn() + 1;
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::SetOperatorFamily {
+                created_at,
+                definition,
+            },
+        ) {
+            storage.rollback_operator_family_create(slot);
+            return sql_fail(error);
+        }
+        storage.set_lsn(lsn);
+        slot
+    };
+    let mut operators = [0; 5];
+    let mut compare_function = 0;
+    for member in class.members {
+        match *member {
+            crate::sql::ast::OperatorClassMember::Operator {
+                strategy,
+                operator,
+                operand_types,
+            } => {
+                let signature = match operand_types {
+                    Some((left, right)) => crate::storage::OperatorSignature {
+                        left: Some(match resolve_routine_type(storage, txn.txid, left) {
+                            Ok(value) => value,
+                            Err(error) => return sql_fail(error),
+                        }),
+                        right: Some(match resolve_routine_type(storage, txn.txid, right) {
+                            Ok(value) => value,
+                            Err(error) => return sql_fail(error),
+                        }),
+                    },
+                    None => crate::storage::OperatorSignature {
+                        left: Some(input),
+                        right: Some(input),
+                    },
+                };
+                let slot = match operator_link_slot(storage, txn.txid, operator, signature) {
+                    Ok(slot) => slot,
+                    Err(error) => return sql_fail(error),
+                };
+                let index = usize::from(strategy.number() - 1);
+                if operators[index] != 0 {
+                    return sql_fail(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "operator class has more than one operator for strategy {}",
+                        strategy.number()
+                    ));
+                }
+                operators[index] = storage.operator(slot).oid();
+            }
+            crate::sql::ast::OperatorClassMember::CompareFunction {
+                operand_types,
+                function,
+                argument_types,
+            } => {
+                if compare_function != 0 {
+                    return sql_fail(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "operator class has more than one support function 1"
+                    ));
+                }
+                let (left, right) = operand_types.unwrap_or((class.input_type, class.input_type));
+                let left = match resolve_routine_type(storage, txn.txid, left) {
+                    Ok(value) => value,
+                    Err(error) => return sql_fail(error),
+                };
+                let right = match resolve_routine_type(storage, txn.txid, right) {
+                    Ok(value) => value,
+                    Err(error) => return sql_fail(error),
+                };
+                compare_function = match resolve_compare_function(
+                    storage,
+                    txn.txid,
+                    left,
+                    right,
+                    function,
+                    argument_types,
+                ) {
+                    Ok(slot) => crate::storage::routine_oid(&storage.routine_for(slot, txn.txid)),
+                    Err(error) => return sql_fail(error),
+                };
+            }
+            crate::sql::ast::OperatorClassMember::Storage(written) => {
+                storage_type = match resolve_routine_type(storage, txn.txid, written) {
+                    Ok(value) => value,
+                    Err(error) => return sql_fail(error),
+                };
+            }
+        }
+    }
+    let definition = crate::storage::OperatorClassDefinition {
+        schema,
+        name: match SqlName::parse(class.name.name) {
+            Ok(name) => name,
+            Err(error) => return sql_fail(error),
+        },
+        owner: storage.initial_catalog_owner(txn.txid),
+        family: storage.operator_family(family).oid(),
+        input,
+        storage: storage_type,
+        default: class.default,
+        operators,
+        compare_function,
+    };
+    let slot = match storage.create_operator_class(definition, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let created_at = storage.operator_class(slot).created_at;
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetOperatorClass {
+            created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_operator_class_create(slot);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::OperatorClassCreated(slot as u32)) {
+        storage.rollback_operator_class_create(slot);
+        return sql_fail(error);
+    }
+    let mut family_definition = storage.operator_family_for(family, txn.txid);
+    for (index, operator) in operators.into_iter().enumerate() {
+        if operator == 0 {
+            continue;
+        }
+        let operator_slot = storage
+            .operator_slot_by_oid(operator, txn.txid)
+            .expect("operator-class member OID is live");
+        let signature = storage.operator_for(operator_slot, txn.txid).signature;
+        let member = crate::storage::OperatorFamilyOperator {
+            used: true,
+            strategy: crate::sql::ast::BtreeStrategy::from_number((index + 1) as u32)
+                .expect("operator-class strategy index"),
+            left: signature.left.expect("btree class operator is binary"),
+            right: signature.right.expect("btree class operator is binary"),
+            operator,
+        };
+        if !family_definition.operators.contains(&member) {
+            let Some(target) = family_definition
+                .operators
+                .iter_mut()
+                .find(|entry| !entry.used)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many operator-family operators"
+                ));
+            };
+            *target = member;
+        }
+    }
+    if compare_function != 0 {
+        let member = crate::storage::OperatorFamilyFunction {
+            used: true,
+            left: input,
+            right: input,
+            function: compare_function,
+        };
+        if !family_definition.functions.contains(&member) {
+            let Some(target) = family_definition
+                .functions
+                .iter_mut()
+                .find(|entry| !entry.used)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many operator-family support functions"
+                ));
+            };
+            *target = member;
+        }
+    }
+    if let Err(error) = stage_operator_family(storage, wal, txn, family, family_definition) {
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE OPERATOR CLASS")?;
+    sql_ok()
+}
+
+pub(crate) fn alter_operator_class(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: crate::sql::ast::QualName<'_>,
+    action: crate::sql::ast::AlterOperatorClassAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some(slot) = storage.operator_class_slot_on_path(name.schema, name.name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "operator class \"{}\" does not exist for access method \"btree\"",
+            name.name
+        ));
+    };
+    let mut definition = storage.operator_class_for(slot, txn.txid);
+    if let Err(error) = storage.require_catalog_owner(
+        definition.owner,
+        txn.txid,
+        "operator class",
+        definition.name.as_str(),
+    ) {
+        return sql_fail(error);
+    }
+    match action {
+        crate::sql::ast::AlterOperatorClassAction::Rename(name) => {
+            definition.name = match SqlName::parse(name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        crate::sql::ast::AlterOperatorClassAction::Owner(role) => {
+            let owner = match catalog_owner_slot(storage, txn.txid, role) {
+                Ok(owner) => owner,
+                Err(error) => return sql_fail(error),
+            };
+            let owner_slot = storage
+                .role_slot_by_oid(owner, txn.txid)
+                .expect("resolved catalog owner");
+            if let Err(error) =
+                storage.require_schema_create_as(definition.schema.as_str(), owner_slot, txn.txid)
+            {
+                return sql_fail(error);
+            }
+            definition.owner = owner;
+        }
+        crate::sql::ast::AlterOperatorClassAction::SetSchema(schema) => {
+            if storage.find_schema_visible(schema, txn.txid).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    schema
+                ));
+            }
+            if let Err(error) = storage.require_schema_create(schema, txn.txid) {
+                return sql_fail(error);
+            }
+            definition.schema = match SqlName::parse(schema) {
+                Ok(schema) => schema,
+                Err(error) => return sql_fail(error),
+            };
+        }
+    }
+    if storage
+        .operator_class_slot_exact(
+            definition.schema.as_str(),
+            definition.name.as_str(),
+            txn.txid,
+        )
+        .is_some_and(|found| found != slot)
+    {
+        return sql_fail(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "operator class already exists for access method \"btree\""
+        ));
+    }
+    if let Err(error) = stage_operator_class(storage, wal, txn, slot, definition) {
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER OPERATOR CLASS")?;
+    sql_ok()
+}
+
+pub(crate) fn drop_operator_classes(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[crate::sql::ast::QualName<'_>],
+    if_exists: bool,
+    _cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        let Some(slot) = storage.operator_class_slot_on_path(name.schema, name.name, txn.txid)
+        else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        180,
+                        "operator class \"{}\" does not exist for access method \"btree\", skipping",
+                        name.name
+                    )
+                    .as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "operator class \"{}\" does not exist for access method \"btree\"",
+                name.name
+            ));
+        };
+        let definition = storage.operator_class_for(slot, txn.txid);
+        if let Err(error) = storage.require_catalog_owner(
+            definition.owner,
+            txn.txid,
+            "operator class",
+            definition.name.as_str(),
+        ) {
+            return sql_fail(error);
+        }
+        if let Err(error) = stage_operator_class_drop(storage, wal, txn, slot) {
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("DROP OPERATOR CLASS")?;
+    sql_ok()
+}
+
 const ROUTINE_SIGNATURE_WAL_BYTES: usize = 1 + MAX_ROUTINE_ARGUMENTS * (2 + 2 * (1 + 63));
 
 fn encode_routine_signature<'a>(
@@ -20001,6 +22330,80 @@ pub fn alter_routine(
     sql_ok()
 }
 
+fn routine_has_cast_operator_dependents(storage: &Storage, txid: u32, routine_oid: i32) -> bool {
+    storage.casts_visible_to(txid).any(|(_, cast)| {
+        matches!(cast.method, crate::storage::CastMethod::Function(oid) if oid == routine_oid)
+    }) || storage
+        .operators_visible_to(txid)
+        .any(|(_, operator)| operator.implementation.routine() == Some(routine_oid))
+        || storage
+            .operator_families_visible_to(txid)
+            .any(|(_, family)| {
+                family
+                    .functions
+                    .iter()
+                    .any(|member| member.used && member.function == routine_oid)
+            })
+        || storage
+            .operator_classes_visible_to(txid)
+            .any(|(_, class)| class.compare_function == routine_oid)
+}
+
+fn cascade_routine_cast_operator_dependents(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    routine_oid: i32,
+) -> Result<(), SqlError> {
+    loop {
+        let dependent = storage
+            .operator_classes_visible_to(txn.txid)
+            .find_map(|(slot, class)| (class.compare_function == routine_oid).then_some(slot));
+        let Some(slot) = dependent else { break };
+        stage_operator_class_drop(storage, wal, txn, slot)?;
+    }
+    loop {
+        let dependent =
+            storage
+                .operator_families_visible_to(txn.txid)
+                .find_map(|(slot, family)| {
+                    family
+                        .functions
+                        .iter()
+                        .any(|member| member.used && member.function == routine_oid)
+                        .then_some(slot)
+                });
+        let Some(slot) = dependent else { break };
+        let mut family = storage.operator_family_for(slot, txn.txid);
+        for member in &mut family.functions {
+            if member.used && member.function == routine_oid {
+                *member = crate::storage::OperatorFamilyFunction::EMPTY;
+            }
+        }
+        stage_operator_family(storage, wal, txn, slot, family)?;
+    }
+    loop {
+        let dependent = storage
+            .operators_visible_to(txn.txid)
+            .find_map(|(slot, operator)| {
+                (operator.implementation.routine() == Some(routine_oid)).then_some(slot)
+            });
+        let Some(slot) = dependent else { break };
+        let operator_oid = storage.operator(slot).oid();
+        cascade_operator_dependencies(storage, wal, txn, operator_oid)?;
+        stage_operator_drop(storage, wal, txn, slot)?;
+    }
+    loop {
+        let dependent = storage.casts_visible_to(txn.txid).find_map(|(slot, cast)| {
+            matches!(cast.method, crate::storage::CastMethod::Function(oid) if oid == routine_oid)
+                .then_some(slot)
+        });
+        let Some(slot) = dependent else { break };
+        stage_cast_drop(storage, wal, txn, slot)?;
+    }
+    Ok(())
+}
+
 pub fn drop_routine(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -20246,6 +22649,19 @@ pub fn drop_routine(
             return sql_fail(error);
         }
         let support_oid = crate::storage::routine_oid(&routine);
+        if routine_has_cast_operator_dependents(storage, txn.txid, support_oid) && !cascade {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop function {} because cast or operator objects depend on it",
+                routine.name_for(txn.txid).as_str()
+            ));
+        }
+        if cascade
+            && let Err(error) =
+                cascade_routine_cast_operator_dependents(storage, wal, txn, support_oid)
+        {
+            return sql_fail(error);
+        }
         let dependent_aggregate = (0..storage.routine_count()).find(|candidate| {
             *candidate != slot
                 && storage.routine(*candidate).visible_to(txn.txid)
@@ -22574,6 +24990,112 @@ fn drop_type_dependent_routines(
     selected_composite: Option<usize>,
     cascade: bool,
 ) -> Result<(), SqlError> {
+    macro_rules! uses {
+        ($result:expr) => {
+            routine_result_uses_selected_type(
+                storage,
+                txn.txid,
+                $result,
+                selected_domains,
+                selected_enum,
+                selected_composite,
+            )
+        };
+    }
+    let catalog_dependents = storage
+        .casts_visible_to(txn.txid)
+        .any(|(_, cast)| uses!(cast.source) || uses!(cast.target))
+        || storage.operators_visible_to(txn.txid).any(|(_, operator)| {
+            operator.signature.left.is_some_and(|result| uses!(result))
+                || operator.signature.right.is_some_and(|result| uses!(result))
+                || operator
+                    .implementation
+                    .result()
+                    .is_some_and(|result| uses!(result))
+        })
+        || storage
+            .operator_families_visible_to(txn.txid)
+            .any(|(_, family)| {
+                family
+                    .operators
+                    .iter()
+                    .any(|member| member.used && (uses!(member.left) || uses!(member.right)))
+                    || family
+                        .functions
+                        .iter()
+                        .any(|member| member.used && (uses!(member.left) || uses!(member.right)))
+            })
+        || storage
+            .operator_classes_visible_to(txn.txid)
+            .any(|(_, class)| uses!(class.input) || uses!(class.storage));
+    if catalog_dependents && !cascade {
+        return Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop type because cast or operator objects depend on it"
+        ));
+    }
+    if cascade {
+        loop {
+            let dependent =
+                storage
+                    .operator_classes_visible_to(txn.txid)
+                    .find_map(|(slot, class)| {
+                        (uses!(class.input) || uses!(class.storage)).then_some(slot)
+                    });
+            let Some(slot) = dependent else { break };
+            stage_operator_class_drop(storage, wal, txn, slot)?;
+        }
+        loop {
+            let dependent = storage
+                .operators_visible_to(txn.txid)
+                .find_map(|(slot, operator)| {
+                    (operator.signature.left.is_some_and(|result| uses!(result))
+                        || operator.signature.right.is_some_and(|result| uses!(result))
+                        || operator
+                            .implementation
+                            .result()
+                            .is_some_and(|result| uses!(result)))
+                    .then_some(slot)
+                });
+            let Some(slot) = dependent else { break };
+            let operator_oid = storage.operator(slot).oid();
+            cascade_operator_dependencies(storage, wal, txn, operator_oid)?;
+            stage_operator_drop(storage, wal, txn, slot)?;
+        }
+        loop {
+            let dependent = storage.casts_visible_to(txn.txid).find_map(|(slot, cast)| {
+                (uses!(cast.source) || uses!(cast.target)).then_some(slot)
+            });
+            let Some(slot) = dependent else { break };
+            stage_cast_drop(storage, wal, txn, slot)?;
+        }
+        loop {
+            let dependent =
+                storage
+                    .operator_families_visible_to(txn.txid)
+                    .find_map(|(slot, family)| {
+                        (family.operators.iter().any(|member| {
+                            member.used && (uses!(member.left) || uses!(member.right))
+                        }) || family.functions.iter().any(|member| {
+                            member.used && (uses!(member.left) || uses!(member.right))
+                        }))
+                        .then_some(slot)
+                    });
+            let Some(slot) = dependent else { break };
+            let mut family = storage.operator_family_for(slot, txn.txid);
+            for member in &mut family.operators {
+                if member.used && (uses!(member.left) || uses!(member.right)) {
+                    *member = crate::storage::OperatorFamilyOperator::EMPTY;
+                }
+            }
+            for member in &mut family.functions {
+                if member.used && (uses!(member.left) || uses!(member.right)) {
+                    *member = crate::storage::OperatorFamilyFunction::EMPTY;
+                }
+            }
+            stage_operator_family(storage, wal, txn, slot, family)?;
+        }
+    }
     if storage.routine_count() > MAX_DEPENDENT_STORED_QUERIES {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -22710,6 +25232,12 @@ fn drop_type_dependent_routines(
             continue;
         }
         let routine = storage.routine_for(slot, txn.txid);
+        cascade_routine_cast_operator_dependents(
+            storage,
+            wal,
+            txn,
+            crate::storage::routine_oid(&routine),
+        )?;
         let mut signature = [0_u8; ROUTINE_SIGNATURE_WAL_BYTES];
         let signature = encode_routine_signature(routine.arguments(), &mut signature)?;
         let lsn = storage.bump_lsn();
@@ -24728,6 +27256,7 @@ fn policy_depends_on_owned_selection(
     enums: &[bool; crate::storage::MAX_ENUMS],
     composites: &[bool; crate::storage::MAX_COMPOSITES],
     routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    operators: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     dependent_views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     dependent_matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     dependent_routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
@@ -24754,6 +27283,7 @@ fn policy_depends_on_owned_selection(
                 crate::storage::DependencyClass::Enum => enums.get(slot),
                 crate::storage::DependencyClass::Composite => composites.get(slot),
                 crate::storage::DependencyClass::Routine => routines.get(slot),
+                crate::storage::DependencyClass::Operator => operators.get(slot),
             }
             .copied()
             .unwrap_or(false)
@@ -27952,7 +30482,10 @@ fn generated_index_name(
 ) -> Result<SqlName, SqlError> {
     use core::fmt::Write as _;
     let key = match columns.first().map(|column| column.expression) {
-        Some(Expr::Column { name, .. }) | Some(Expr::Call { name, .. }) => *name,
+        Some(Expr::Column { name, .. }) => *name,
+        Some(Expr::Call { name, .. }) if crate::sql::ast::catalog_operator_call(name).is_none() => {
+            *name
+        }
         _ => "expr",
     };
     for ordinal in 0..=storage.index_count() {
@@ -28824,7 +31357,7 @@ pub fn create_index(
     let mut expression_refs = [None; MAX_INDEX_COLS];
     let mut operator_classes = [None; MAX_INDEX_COLS];
     for (i, index_column) in command.columns.iter().enumerate() {
-        let ctype = if let Some(column_name) = index_column.column {
+        let (ctype, type_oid) = if let Some(column_name) = index_column.column {
             let Some(column_index) = tdef.column_index(column_name) else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_COLUMN,
@@ -28833,7 +31366,15 @@ pub fn create_index(
                 ));
             };
             columns[i] = column_index as u16;
-            tdef.columns()[column_index].ctype
+            let column = tdef.columns()[column_index];
+            let Some(type_oid) = storage.routine_type_oid(column.ctype, column.user_type, txn.txid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "index column data type does not exist"
+                ));
+            };
+            (column.ctype, type_oid)
         } else {
             let (type_oid, _) =
                 match infer_type_catalog(index_column.expression, Some(&tdef), storage, txn.txid) {
@@ -28847,7 +31388,7 @@ pub fn create_index(
                 };
             expression_refs[i] = Some(index_column.expression);
             match catalog_column_type(storage, txn.txid, type_oid) {
-                Some((ctype, _)) => ctype,
+                Some((ctype, _)) => (ctype, type_oid),
                 None => {
                     return sql_fail(sql_err!(
                         sqlstate::UNDEFINED_OBJECT,
@@ -28865,6 +31406,28 @@ pub fn create_index(
             ));
         };
         if let Some(operator_class) = index_column.operator_class {
+            if let Some(slot) = storage.operator_class_slot_on_path(
+                operator_class.schema,
+                operator_class.name,
+                txn.txid,
+            ) {
+                let definition = storage.operator_class_for(slot, txn.txid);
+                let input_oid = storage
+                    .routine_type_oid(definition.input.ctype, definition.input.user_type, txn.txid)
+                    .expect("validated operator-class input type");
+                if input_oid != type_oid {
+                    return sql_fail(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "operator class \"{}\" does not accept data type {}",
+                        operator_class.name,
+                        ctype.name()
+                    ));
+                }
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "user-defined btree operator classes are not executable"
+                ));
+            }
             if operator_class
                 .schema
                 .is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"))
@@ -42637,6 +45200,31 @@ pub(crate) fn coerce<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<Datum<'a>, SqlError> {
+    let mut v = v;
+    if !v.is_null() {
+        let source_oid = v.type_oid();
+        let target_oid = storage
+            .routine_type_oid(col.ctype, col.user_type, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "column type identity is unavailable"
+                )
+            })?;
+        if source_oid != target_oid {
+            let catalog = crate::sql::query::storage_catalog(storage, arena, txid);
+            if let Some(cast) = crate::sql::eval::CatalogAccess::cast_defined(
+                &catalog,
+                source_oid,
+                target_oid,
+                v,
+                crate::sql::eval::DefinedCastContext::Assignment,
+                arena,
+            )? {
+                v = cast;
+            }
+        }
+    }
     if let ColType::Composite(slot) = col.ctype {
         let typed = match v {
             value @ Datum::Composite { slot: actual, .. } if actual == slot => value,

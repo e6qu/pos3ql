@@ -30,6 +30,34 @@ names = [d.name for d in cur.description]
 assert names == ["id", "name"], names
 print("describe ok:", names)
 
+# User-defined cast/operator resolution crosses Parse, binary Bind, Describe,
+# and Result as one typed contract.
+cur.execute("CREATE TYPE drv_mood AS ENUM ('low', 'high')")
+cur.execute(
+    "CREATE FUNCTION drv_mood_text(drv_mood) RETURNS text LANGUAGE SQL "
+    "RETURN CASE WHEN $1 = 'low' THEN 'low-driver' ELSE 'high-driver' END"
+)
+cur.execute(
+    "CREATE CAST (drv_mood AS text) WITH FUNCTION drv_mood_text(drv_mood)"
+)
+cur.execute(
+    "CREATE FUNCTION drv_catalog_operator(integer, integer) RETURNS text "
+    "LANGUAGE SQL RETURN 'driver'"
+)
+cur.execute(
+    "CREATE OPERATOR public.@+ (FUNCTION = drv_catalog_operator, "
+    "LEFTARG = integer, RIGHTARG = integer)"
+)
+cur.execute("SELECT %s::drv_mood::text, %s OPERATOR(public.@+) %s", ("low", 7, 9))
+assert [column.type_code for column in cur.description] == [25, 25], cur.description
+assert cur.fetchone() == ("low-driver", "driver")
+bcur = conn.cursor(binary=True)
+bcur.execute("SELECT %s OPERATOR(public.@+) %s", (11, 13))
+assert bcur.description[0].type_code == 25
+assert bcur.fetchone() == ("driver",)
+bcur.close()
+print("cast/operator extended protocol ok")
+
 # Aggregates.
 cur.execute("SELECT count(*), sum(score) FROM drv")
 count, total = cur.fetchone()

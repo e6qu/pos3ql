@@ -674,6 +674,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             name: crate::sql::parser::OVERLAPS_PERIODS,
             ..
         } => Some("overlaps"),
+        Expr::Call { name, .. } if crate::sql::ast::catalog_operator_call(name).is_some() => None,
         Expr::Call { name, .. } => Some(name),
         // A cast keeps its operand's name when the operand is a column or
         // function call (`count(*)::int` → `count`); otherwise it takes the
@@ -816,6 +817,17 @@ pub trait ColTypeResolver {
         _argument_names: &[Option<&str>],
         _variadic: bool,
         _arguments: &[i32],
+    ) -> Option<StaticTypeMeta> {
+        None
+    }
+
+    /// Result type of a visible user-defined binary operator. Returning none
+    /// leaves resolution to the built-in PostgreSQL operator table.
+    fn operator_result(
+        &self,
+        _name: &str,
+        _left_oid: i32,
+        _right_oid: i32,
     ) -> Option<StaticTypeMeta> {
         None
     }
@@ -2171,7 +2183,7 @@ fn comparable(a: ColType, b: ColType) -> bool {
     let timeofday = |t: ColType| matches!(t, Time | Timetz);
     let bit = |t: ColType| matches!(t, Bit { .. });
     let stringy = |t: ColType| matches!(t, Text | Varchar | Bpchar | Name);
-    let catalog_object = |t: ColType| t.is_reg_object();
+    let catalog_object = |t: ColType| t == ColType::Regtype || t.is_reg_object();
     let oid_integer = |t: ColType| matches!(t, Int2 | Int4 | Oid | Int8);
     (numeric(a) && numeric(b))
         || (catalog_object(a) && oid_integer(b))
@@ -2402,6 +2414,12 @@ pub fn infer_type_res(
             use crate::sql::ast::BinaryOp::*;
             let lo = infer_type_res(left, columns)?.0;
             let ro = infer_type_res(right, columns)?.0;
+            if let Some(result) = operator
+                .operator_name()
+                .and_then(|name| columns.operator_result(name, lo, ro))
+            {
+                return Ok((result.type_oid, result.ctype.typlen()));
+            }
             let is_bit = |o: i32| matches!(o, oid::BIT | oid::VARBIT);
             match operator {
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {

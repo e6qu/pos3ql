@@ -451,6 +451,23 @@ RETURNS anyelement LANGUAGE sql IMMUTABLE AS 'SELECT coalesce(state, value)';
 CREATE AGGREGATE outbound_dump.dump_first(anyelement) (
   SFUNC = outbound_dump.dump_first_state, STYPE = anyelement
 );
+CREATE FUNCTION outbound_dump.mood_text(value outbound_type_target.mood)
+RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT CASE WHEN $1 = ''ok'' THEN ''ok'' ELSE ''great'' END';
+CREATE CAST (outbound_type_target.mood AS text)
+  WITH FUNCTION outbound_dump.mood_text(outbound_type_target.mood) AS ASSIGNMENT;
+CREATE FUNCTION outbound_dump.int_same(integer, integer)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 = $2';
+CREATE FUNCTION outbound_dump.int_compare(integer, integer)
+RETURNS integer LANGUAGE sql IMMUTABLE
+AS 'SELECT CASE WHEN $1 < $2 THEN -1 WHEN $1 > $2 THEN 1 ELSE 0 END';
+CREATE OPERATOR outbound_dump.=== (
+  FUNCTION = outbound_dump.int_same, LEFTARG = integer, RIGHTARG = integer
+);
+CREATE OPERATOR FAMILY outbound_dump.outbound_int_family USING btree;
+CREATE OPERATOR CLASS outbound_dump.outbound_int_class FOR TYPE integer USING btree
+  FAMILY outbound_dump.outbound_int_family AS
+  OPERATOR 3 outbound_dump.===,
+  FUNCTION 1 outbound_dump.int_compare(integer, integer);
 CREATE FUNCTION outbound_dump.echo_mood(value outbound_type_target.mood) RETURNS outbound_type_target.mood LANGUAGE sql AS 'SELECT $1';
 CREATE FUNCTION outbound_dump.echo_location(value outbound_type_target.location) RETURNS outbound_type_target.location LANGUAGE sql AS 'SELECT $1';
 CREATE FUNCTION outbound_dump.echo_marked_location(value outbound_dump.location_domain) RETURNS outbound_dump.location_domain LANGUAGE sql AS 'SELECT $1';
@@ -515,7 +532,7 @@ GRANT EXECUTE ON FUNCTION outbound_dump.dump_answer() TO outbound_reader;
 SQL
 outbound_setup_status=$?
 pg_dump -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
-  --schema=outbound_dump --schema=outbound_type_target --no-owner \
+  --no-owner \
   -f "$WORK/outbound.sql" > "$WORK/outbound_dump.out" 2>&1
 outbound_dump_status=$?
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
@@ -624,8 +641,28 @@ else
       SELECT outbound_dump.dump_total(value) FROM (VALUES (2), (3), (5)) input(value);
       SELECT outbound_dump.dump_first(value), outbound_dump.dump_first(label)
         FROM (VALUES (2, 'x'::text), (3, 'y'::text)) input(value,label);
+      SELECT 'ok'::outbound_type_target.mood::text,
+             1 OPERATOR(outbound_dump.===) 1;
+      SELECT castmethod,castcontext
+        FROM pg_cast
+       WHERE castsource='outbound_type_target.mood'::regtype
+         AND casttarget='text'::regtype;
+      SELECT operator_class.opcname,operator_family.opfname
+        FROM pg_opclass AS operator_class
+        JOIN pg_opfamily AS operator_family
+          ON operator_family.oid=operator_class.opcfamily
+       WHERE operator_class.opcname='outbound_int_class';
+      SELECT
+        (SELECT string_agg(amopstrategy::text, ',' ORDER BY amopstrategy)
+           FROM pg_amop
+          WHERE amopfamily=(SELECT oid FROM pg_opfamily
+                             WHERE opfname='outbound_int_family')),
+        (SELECT string_agg(amprocnum::text, ',' ORDER BY amprocnum)
+           FROM pg_amproc
+          WHERE amprocfamily=(SELECT oid FROM pg_opfamily
+                               WHERE opfname='outbound_int_family'));
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

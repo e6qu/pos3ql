@@ -495,6 +495,14 @@ pub(crate) fn expression_type_identity<'a>(
             return catalog_user_type_oid(identity, true, hooks).map(ExpressionTypeIdentity::Known);
         }
     }
+    // ROW() determines the anonymous record identity from its constructor,
+    // including `record.*` arguments whose individual expressions are not
+    // scalar values. Do not recursively type those expansion sentinels.
+    if let Expr::Call { name, .. } = expression
+        && name.eq_ignore_ascii_case("row")
+    {
+        return Ok(ExpressionTypeIdentity::Known(super::types::oid::RECORD));
+    }
     if let Expr::Call {
         name,
         args,
@@ -524,15 +532,24 @@ pub(crate) fn expression_type_identity<'a>(
             return Ok(ExpressionTypeIdentity::Known(result_oid));
         }
     }
-    match crate::sql::exec::infer_type_res(
+    let inferred = crate::sql::exec::infer_type_res(
         expression,
         &RuntimeColumnTypes {
             row,
             catalog: hooks.catalog,
         },
-    )?
-    .0
-    {
+    );
+    let oid = match inferred {
+        Ok((oid, _)) => oid,
+        // Evaluation has already resolved the value. Whole-row references and
+        // some set-returning aliases intentionally have no scalar column
+        // metadata, so overload resolution must use the datum identity.
+        Err(error) if error.sqlstate == sqlstate::UNDEFINED_COLUMN => {
+            return Ok(ExpressionTypeIdentity::Unresolved);
+        }
+        Err(error) => return Err(error),
+    };
+    match oid {
         super::types::oid::UNKNOWN => Ok(ExpressionTypeIdentity::Unresolved),
         oid => Ok(ExpressionTypeIdentity::Known(oid)),
     }
@@ -785,6 +802,37 @@ pub trait CatalogAccess {
         _oid: i32,
         _arguments: &[Datum<'a>],
         _argument_type_oids: &[i32],
+        _arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        Ok(None)
+    }
+    /// Applies a catalog-defined cast in the context that selected it.
+    /// `None` means no visible cast has this exact source/target identity.
+    fn cast_defined<'a>(
+        &self,
+        _source_oid: i32,
+        _target_oid: i32,
+        _value: Datum<'a>,
+        _context: DefinedCastContext,
+        _arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        Ok(None)
+    }
+    /// Whether resolving this unqualified symbol can select a user-defined
+    /// operator. Callers use this before asking for static operand identities.
+    fn has_operator_candidate(&self, _name: &str) -> bool {
+        false
+    }
+    /// Executes a search-path-resolved user-defined binary operator. `None`
+    /// means the catalog has no matching definition and builtin resolution
+    /// continues.
+    fn call_operator<'a>(
+        &self,
+        _name: &str,
+        _left: Datum<'a>,
+        _right: Datum<'a>,
+        _left_oid: i32,
+        _right_oid: i32,
         _arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
         Ok(None)
@@ -1111,6 +1159,13 @@ pub trait CatalogAccess {
     ) -> Option<i32> {
         None
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefinedCastContext {
+    Explicit,
+    Assignment,
+    Implicit,
 }
 
 #[derive(Clone, Copy)]
@@ -1440,6 +1495,83 @@ pub(crate) fn escape_char(d: Datum<'_>) -> Result<Option<char>, SqlError> {
     }
 }
 
+struct BinaryExpression<'expression, 'a> {
+    operator: BinaryOp,
+    left: &'expression Expr<'a>,
+    right: &'expression Expr<'a>,
+    search_catalog: bool,
+}
+
+fn eval_binary_expression<'a>(
+    expression: BinaryExpression<'_, 'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    row: &impl ColumnLookup<'a>,
+    hooks: &EvalHooks<'_, 'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let BinaryExpression {
+        operator,
+        left,
+        right,
+        search_catalog,
+    } = expression;
+    let comparison_collation = if matches!(
+        operator,
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+    ) {
+        Some(resolve_comparison_collation(left, right, row)?)
+    } else {
+        None
+    };
+    let l = materialize_named_composite(eval_full(left, arena, params, row, hooks)?, hooks, arena)?;
+    let r =
+        materialize_named_composite(eval_full(right, arena, params, row, hooks)?, hooks, arena)?;
+    if search_catalog
+        && let Some(catalog) = hooks.catalog
+        && let Some(name) = operator.operator_name()
+        && catalog.has_operator_candidate(name)
+    {
+        let left_oid = expression_type_identity(left, row, hooks)?.routine_argument_oid(&l);
+        let right_oid = expression_type_identity(right, row, hooks)?.routine_argument_oid(&r);
+        if let Some(value) = catalog.call_operator(name, l, r, left_oid, right_oid, arena)? {
+            return Ok(value);
+        }
+    }
+    if operator == BinaryOp::Concat
+        && let Some(value) = array_null_concat(l, r, left, right, row, arena)?
+    {
+        return Ok(value);
+    }
+    let left_unknown = is_unknown_literal(left);
+    let right_unknown = is_unknown_literal(right);
+    let (l, r) = coerce_enum_literal(l, r, left_unknown, right_unknown, hooks, arena)?;
+    if let Some(collation) = comparison_collation
+        && matches!(
+            (&l, &r),
+            (
+                Datum::Text(_) | Datum::Bpchar(_),
+                Datum::Text(_) | Datum::Bpchar(_)
+            )
+        )
+    {
+        return compare_text_collated(
+            operator,
+            l,
+            r,
+            left_unknown,
+            right_unknown,
+            collation,
+            hooks.catalog,
+        );
+    }
+    binary(operator, l, r, left_unknown, right_unknown, arena)
+}
+
 pub fn eval_full<'a>(
     expression: &Expr<'a>,
     arena: &'a Arena,
@@ -1618,79 +1750,48 @@ pub fn eval_full<'a>(
             operator,
             left,
             right,
-        } => {
-            let comparison_collation = if matches!(
+        } => eval_binary_expression(
+            BinaryExpression {
                 operator,
-                BinaryOp::Eq
-                    | BinaryOp::NotEq
-                    | BinaryOp::Lt
-                    | BinaryOp::LtEq
-                    | BinaryOp::Gt
-                    | BinaryOp::GtEq
-            ) {
-                Some(resolve_comparison_collation(left, right, row)?)
-            } else {
-                None
-            };
-            // A column reference materializes its stored composite layout, but
-            // a cast or binary Bind parameter can still carry the same value
-            // as `CompositeText`. Normalize both operands at this comparison
-            // choke point so historical physical layouts never acquire a
-            // second equality or index-key semantics.
-            let l = materialize_named_composite(
-                eval_full(left, arena, params, row, hooks)?,
-                hooks,
-                arena,
-            )?;
-            let r = materialize_named_composite(
-                eval_full(right, arena, params, row, hooks)?,
-                hooks,
-                arena,
-            )?;
-            // `array || NULL` resolution depends on the NULL operand's static
-            // type, which the datum has lost — resolve it here where the
-            // expression is still available.
-            if operator == BinaryOp::Concat
-                && let Some(d) = array_null_concat(l, r, left, right, row, arena)?
-            {
-                return Ok(d);
-            }
-            // Track which side is an "unknown" literal (a string literal or a
-            // parameter): only those coerce to the other operand's type, as
-            // PostgreSQL does. A real text value never coerces to a number.
-            let l_unknown = is_unknown_literal(left);
-            let r_unknown = is_unknown_literal(right);
-            // An enum operand meeting an unknown text literal resolves the
-            // literal to a member of the enum's type (the generic coercion has
-            // no catalog to look up labels). A non-member is 22P02.
-            let (l, r) = coerce_enum_literal(l, r, l_unknown, r_unknown, hooks, arena)?;
-            if let Some(collation) = comparison_collation
-                && matches!(
-                    (&l, &r),
-                    (
-                        Datum::Text(_) | Datum::Bpchar(_),
-                        Datum::Text(_) | Datum::Bpchar(_)
-                    )
-                )
-            {
-                return compare_text_collated(
-                    operator,
-                    l,
-                    r,
-                    l_unknown,
-                    r_unknown,
-                    collation,
-                    hooks.catalog,
-                );
-            }
-            binary(operator, l, r, l_unknown, r_unknown, arena)
-        }
+                left,
+                right,
+                search_catalog: true,
+            },
+            arena,
+            params,
+            row,
+            hooks,
+        ),
         Expr::Cast {
             operand,
             type_name,
             type_mod,
         } => {
             let mut v = eval_full(operand, arena, params, row, hooks)?;
+            if let Some(catalog) = hooks.catalog {
+                let source_oid =
+                    expression_type_identity(operand, row, hooks)?.routine_argument_oid(&v);
+                let target_oid = ColType::from_sql_name(type_name)
+                    .map(ColType::oid)
+                    .or_else(|| catalog.user_type_oid(type_name));
+                if let Some(target_oid) = target_oid
+                    && source_oid != target_oid
+                    && let Some(value) = catalog.cast_defined(
+                        source_oid,
+                        target_oid,
+                        v,
+                        DefinedCastContext::Explicit,
+                        arena,
+                    )?
+                {
+                    if type_mod != -1
+                        && let Some(target) = ColType::from_sql_name(type_name)
+                    {
+                        return super::exec::apply_cast_typmod(value, target, type_mod, arena);
+                    }
+                    return Ok(value);
+                }
+            }
             let catalog_text = matches!(v, Datum::CompositeText { .. })
                 || matches!(
                     v,
@@ -1727,14 +1828,14 @@ pub fn eval_full<'a>(
             if type_name.eq_ignore_ascii_case("regtype") {
                 match text_view(v) {
                     Datum::Text(name) => {
-                        // A known enum type name renders as itself (like a base
-                        // type's regtype), rather than erroring as "unknown".
-                        if let Some(cat) = hooks.catalog
-                            && cat.enum_slot_of_name(name.trim()).is_some()
+                        if let Some(referenced_oid) = hooks
+                            .catalog
+                            .and_then(|catalog| catalog.user_type_oid(name.trim()))
                         {
-                            return Ok(Datum::Text(
-                                arena.alloc_str(name.trim()).map_err(|_| arena_full())?,
-                            ));
+                            return Ok(Datum::Regtype {
+                                referenced_oid,
+                                name: arena.alloc_str(name.trim()).map_err(|_| arena_full())?,
+                            });
                         }
                         return regtype_of_name(name);
                     }
@@ -1814,6 +1915,35 @@ pub fn eval_full<'a>(
             over,
             ..
         } => {
+            if let Some((Some(schema), symbol)) = crate::sql::ast::catalog_operator_call(name)
+                && schema.eq_ignore_ascii_case("pg_catalog")
+            {
+                if args.len() != 2 || star || !argument_names.is_empty() || variadic {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "builtin operator expression has an invalid argument contract"
+                    ));
+                }
+                let operator = BinaryOp::from_operator_name(symbol).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "operator does not exist: {}",
+                        symbol
+                    )
+                })?;
+                return eval_binary_expression(
+                    BinaryExpression {
+                        operator,
+                        left: args[0],
+                        right: args[1],
+                        search_catalog: false,
+                    },
+                    arena,
+                    params,
+                    row,
+                    hooks,
+                );
+            }
             // A window-function call resolves to this row's precomputed value.
             if over.is_some()
                 && let Some((nodes, values)) = hooks.windows
@@ -5371,7 +5501,17 @@ pub(crate) fn regobject_cast<'a>(
             type_oid,
             referenced_oid,
             ..
-        } if type_oid == target.oid() => referenced_oid,
+        } if type_oid == target.oid()
+            || matches!(
+                (type_oid, target),
+                (super::types::oid::REGPROC, ColType::Regprocedure)
+                    | (super::types::oid::REGPROCEDURE, ColType::Regproc)
+                    | (super::types::oid::REGOPER, ColType::Regoperator)
+                    | (super::types::oid::REGOPERATOR, ColType::Regoper)
+            ) =>
+        {
+            referenced_oid
+        }
         Datum::RegObject { .. } => return Err(cast_unsupported(&value, target.name())),
         Datum::Int2(value) => i32::from(value),
         Datum::Int4(value) => value,
@@ -5466,6 +5606,7 @@ pub(crate) fn regobject_cast<'a>(
     };
     let name = match name {
         Some(name) => name,
+        None if object_oid == 0 => arena.alloc_str("-").map_err(|_| arena_full())?,
         None => arena
             .alloc_str_display(object_oid)
             .map_err(|_| arena_full())?,

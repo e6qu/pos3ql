@@ -361,6 +361,17 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateView { .. }
         | Stmt::CreateRoutine(_)
         | Stmt::CreateAggregate(_)
+        | Stmt::CreateCast(_)
+        | Stmt::DropCast { .. }
+        | Stmt::CreateOperator(_)
+        | Stmt::AlterOperator { .. }
+        | Stmt::DropOperator { .. }
+        | Stmt::CreateOperatorFamily { .. }
+        | Stmt::AlterOperatorFamily { .. }
+        | Stmt::DropOperatorFamily { .. }
+        | Stmt::CreateOperatorClass(_)
+        | Stmt::AlterOperatorClass { .. }
+        | Stmt::DropOperatorClass { .. }
         | Stmt::CreateLanguage(_)
         | Stmt::AlterLanguage { .. }
         | Stmt::DropLanguage { .. }
@@ -3669,6 +3680,33 @@ impl Engine {
                 DdlUndo::RoutineReplaced { slot, .. } => self
                     .storage
                     .commit_routine_replace(*slot as usize, txn.txid),
+                DdlUndo::CastCreated(slot) => self.storage.commit_cast_create(*slot as usize),
+                DdlUndo::CastDropped(slot) => self.storage.commit_cast_drop(*slot as usize),
+                DdlUndo::OperatorCreated(slot) => {
+                    self.storage.commit_operator_create(*slot as usize)
+                }
+                DdlUndo::OperatorAltered { slot, .. } => {
+                    self.storage.commit_operator_alter(*slot as usize, txn.txid)
+                }
+                DdlUndo::OperatorDropped(slot) => self.storage.commit_operator_drop(*slot as usize),
+                DdlUndo::OperatorFamilyCreated(slot) => {
+                    self.storage.commit_operator_family_create(*slot as usize)
+                }
+                DdlUndo::OperatorFamilyAltered { slot, .. } => self
+                    .storage
+                    .commit_operator_family_alter(*slot as usize, txn.txid),
+                DdlUndo::OperatorFamilyDropped(slot) => {
+                    self.storage.commit_operator_family_drop(*slot as usize)
+                }
+                DdlUndo::OperatorClassCreated(slot) => {
+                    self.storage.commit_operator_class_create(*slot as usize)
+                }
+                DdlUndo::OperatorClassAltered { slot, .. } => self
+                    .storage
+                    .commit_operator_class_alter(*slot as usize, txn.txid),
+                DdlUndo::OperatorClassDropped(slot) => {
+                    self.storage.commit_operator_class_drop(*slot as usize)
+                }
                 DdlUndo::TriggerCreated(slot) => self.storage.commit_trigger_create(*slot as usize),
                 DdlUndo::TriggerDropped(slot) => self.storage.commit_trigger_drop(*slot as usize),
                 DdlUndo::TriggerAltered { slot, .. } => {
@@ -4022,6 +4060,33 @@ impl Engine {
             DdlUndo::RoutineReplaced { slot, prior } => {
                 self.storage.rollback_routine_replace(slot as usize, prior)
             }
+            DdlUndo::CastCreated(slot) => self.storage.rollback_cast_create(slot as usize),
+            DdlUndo::CastDropped(slot) => self.storage.rollback_cast_drop(slot as usize, txid),
+            DdlUndo::OperatorCreated(slot) => self.storage.rollback_operator_create(slot as usize),
+            DdlUndo::OperatorAltered { slot, prior } => {
+                self.storage.rollback_operator_alter(slot as usize, prior)
+            }
+            DdlUndo::OperatorDropped(slot) => {
+                self.storage.rollback_operator_drop(slot as usize, txid)
+            }
+            DdlUndo::OperatorFamilyCreated(slot) => {
+                self.storage.rollback_operator_family_create(slot as usize)
+            }
+            DdlUndo::OperatorFamilyAltered { slot, prior } => self
+                .storage
+                .rollback_operator_family_alter(slot as usize, prior),
+            DdlUndo::OperatorFamilyDropped(slot) => self
+                .storage
+                .rollback_operator_family_drop(slot as usize, txid),
+            DdlUndo::OperatorClassCreated(slot) => {
+                self.storage.rollback_operator_class_create(slot as usize)
+            }
+            DdlUndo::OperatorClassAltered { slot, prior } => self
+                .storage
+                .rollback_operator_class_alter(slot as usize, prior),
+            DdlUndo::OperatorClassDropped(slot) => self
+                .storage
+                .rollback_operator_class_drop(slot as usize, txid),
             DdlUndo::TriggerCreated(slot) => self.storage.rollback_trigger_create(slot as usize),
             DdlUndo::TriggerDropped(slot) => {
                 self.storage.rollback_trigger_drop(slot as usize, txid)
@@ -5561,7 +5626,22 @@ impl Engine {
                     for (index, argument) in args.iter().copied().enumerate() {
                         actual[index] = infer(argument).unwrap_or(types::oid::UNKNOWN);
                     }
-                    if let Some(expected) = self.storage.function_call_parameter_oids(
+                    if let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name) {
+                        if args.len() == 2
+                            && let Some(expected) = self.storage.operator_call_parameter_oids(
+                                schema,
+                                operator,
+                                [actual[0], actual[1]],
+                                txid,
+                            )
+                        {
+                            for (argument, expected_oid) in args.iter().copied().zip(expected) {
+                                if expected_oid != types::oid::UNKNOWN {
+                                    assign(argument, expected_oid, oids);
+                                }
+                            }
+                        }
+                    } else if let Some(expected) = self.storage.function_call_parameter_oids(
                         name,
                         argument_names,
                         *variadic,
@@ -8732,6 +8812,90 @@ impl Engine {
                 arena,
                 responder,
             ),
+            Stmt::CreateCast(cast) => {
+                exec::create_cast(&mut self.storage, &mut self.wal, txn, cast, responder)
+            }
+            Stmt::DropCast(cast) => {
+                exec::drop_cast(&mut self.storage, &mut self.wal, txn, *cast, responder)
+            }
+            Stmt::CreateOperator(operator) => {
+                exec::create_operator(&mut self.storage, &mut self.wal, txn, operator, responder)
+            }
+            Stmt::AlterOperator { identity, action } => exec::alter_operator(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *identity,
+                *action,
+                responder,
+            ),
+            Stmt::DropOperator {
+                identities,
+                if_exists,
+                cascade,
+            } => exec::drop_operators(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                identities,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
+            Stmt::CreateOperatorFamily { name, .. } => exec::create_operator_family(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *name,
+                responder,
+            ),
+            Stmt::AlterOperatorFamily { name, action, .. } => exec::alter_operator_family(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *name,
+                *action,
+                responder,
+            ),
+            Stmt::DropOperatorFamily {
+                names,
+                if_exists,
+                cascade,
+                ..
+            } => exec::drop_operator_families(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
+            Stmt::CreateOperatorClass(class) => {
+                exec::create_operator_class(&mut self.storage, &mut self.wal, txn, class, responder)
+            }
+            Stmt::AlterOperatorClass { name, action, .. } => exec::alter_operator_class(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *name,
+                *action,
+                responder,
+            ),
+            Stmt::DropOperatorClass {
+                names,
+                if_exists,
+                cascade,
+                ..
+            } => exec::drop_operator_classes(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
             Stmt::CreateExtension {
                 name,
                 if_not_exists,
@@ -9727,9 +9891,14 @@ impl Engine {
                 *action,
                 responder,
             ),
-            Stmt::ReassignOwned { roles, new_owner } => {
-                exec::reassign_owned(&mut self.storage, txn, roles, new_owner, responder)
-            }
+            Stmt::ReassignOwned { roles, new_owner } => exec::reassign_owned(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                roles,
+                new_owner,
+                responder,
+            ),
             Stmt::DropOwned { roles, cascade } => exec::drop_owned(
                 &mut self.storage,
                 &mut self.wal,
@@ -12185,6 +12354,82 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
     match operator {
         WalOp::Commit { .. } => {}
         WalOp::Truncate { .. } => {}
+        WalOp::SetCast(definition) => {
+            storage.create_cast_from_image(definition)?;
+        }
+        WalOp::DropCast { source, target } => {
+            let source = storage.bind_routine_result(source, 0)?;
+            let target = storage.bind_routine_result(target, 0)?;
+            let slot = storage.cast_slot(source, target, 0).ok_or_else(|| {
+                sql_err!(sqlstate::UNDEFINED_OBJECT, "journal cast does not exist")
+            })?;
+            storage.drop_cast(source, target, 0);
+            storage.commit_cast_drop(slot);
+        }
+        WalOp::SetOperator {
+            created_at,
+            definition,
+        } => {
+            storage.replay_set_operator(created_at, definition)?;
+        }
+        WalOp::DropOperator {
+            schema,
+            name,
+            mut signature,
+        } => {
+            if let Some(left) = signature.left {
+                signature.left = Some(storage.bind_routine_result(left, 0)?);
+            }
+            if let Some(right) = signature.right {
+                signature.right = Some(storage.bind_routine_result(right, 0)?);
+            }
+            let slot = storage
+                .operator_slot_exact(schema, name, signature, 0)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "journal operator does not exist"
+                    )
+                })?;
+            storage.drop_operator(slot, 0);
+            storage.commit_operator_drop(slot);
+        }
+        WalOp::SetOperatorFamily {
+            created_at,
+            definition,
+        } => {
+            storage.replay_set_operator_family(created_at, definition)?;
+        }
+        WalOp::DropOperatorFamily { schema, name } => {
+            let slot = storage
+                .operator_family_slot_exact(schema, name, 0)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "journal operator family does not exist"
+                    )
+                })?;
+            storage.drop_operator_family(slot, 0);
+            storage.commit_operator_family_drop(slot);
+        }
+        WalOp::SetOperatorClass {
+            created_at,
+            definition,
+        } => {
+            storage.replay_set_operator_class(created_at, definition)?;
+        }
+        WalOp::DropOperatorClass { schema, name } => {
+            let slot = storage
+                .operator_class_slot_exact(schema, name, 0)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "journal operator class does not exist"
+                    )
+                })?;
+            storage.drop_operator_class(slot, 0);
+            storage.commit_operator_class_drop(slot);
+        }
         WalOp::CreateReplicationSlot {
             name,
             restart_lsn,

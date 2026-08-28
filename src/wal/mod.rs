@@ -686,7 +686,8 @@ pub(crate) enum WalOp<'a> {
         include_columns: [u16; MAX_INDEX_COLS],
         collations: [crate::sql::ast::Collation; MAX_INDEX_COLS],
         explicit_collations: [bool; MAX_INDEX_COLS],
-        operator_classes: [Option<BtreeOperatorClass>; MAX_INDEX_COLS],
+        operator_classes: [Option<crate::storage::IndexOperatorClass>; MAX_INDEX_COLS],
+        resolved_operator_classes: [Option<crate::storage::IndexOperatorClass>; MAX_INDEX_COLS],
         descending: [bool; MAX_INDEX_COLS],
         nulls_first: [bool; MAX_INDEX_COLS],
         n_cols: usize,
@@ -2121,7 +2122,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .map(|(_, value)| 2 + value.unwrap().len())
                     .sum::<usize>()
                 + n_cols
-                + n_cols
+                + n_cols * 5
+                + 1
+                + n_cols * 5
                 + 3
                 + 2
                 + 1
@@ -2515,8 +2518,24 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + routine_result_len(definition.input)
                 + routine_result_len(definition.storage)
                 + 1
-                + 5 * 4
-                + 4
+                + 1
+                + definition
+                    .operators
+                    .iter()
+                    .filter(|member| member.used)
+                    .map(|member| {
+                        1 + routine_result_len(member.left) + routine_result_len(member.right) + 4
+                    })
+                    .sum::<usize>()
+                + 1
+                + definition
+                    .functions
+                    .iter()
+                    .filter(|member| member.used)
+                    .map(|member| {
+                        routine_result_len(member.left) + routine_result_len(member.right) + 4
+                    })
+                    .sum::<usize>()
         }
         WalOp::DropRoutine {
             schema,
@@ -3307,6 +3326,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             collations,
             explicit_collations,
             operator_classes,
+            resolved_operator_classes,
             descending,
             nulls_first,
             n_cols,
@@ -3363,7 +3383,27 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok &= buffer.append(&[0xa7]);
             for operator_class in &operator_classes[..*n_cols] {
-                ok &= buffer.append(&[operator_class.map_or(0, BtreeOperatorClass::code)]);
+                ok &= match operator_class {
+                    None => buffer.append(&[0, 0, 0, 0, 0]),
+                    Some(crate::storage::IndexOperatorClass::Builtin(class)) => {
+                        buffer.append(&[1, class.code(), 0, 0, 0])
+                    }
+                    Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
+                        buffer.append(&[2]) && buffer.append(&oid.get().to_le_bytes())
+                    }
+                };
+            }
+            ok &= buffer.append(&[0xa9]);
+            for operator_class in &resolved_operator_classes[..*n_cols] {
+                ok &= match operator_class {
+                    Some(crate::storage::IndexOperatorClass::Builtin(class)) => {
+                        buffer.append(&[1, class.code(), 0, 0, 0])
+                    }
+                    Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
+                        buffer.append(&[2]) && buffer.append(&oid.get().to_le_bytes())
+                    }
+                    None => false,
+                };
             }
             ok &= buffer.append(&[0xa8]);
             ok && append_index_definition(buffer, *definition)
@@ -3871,6 +3911,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             created_at,
             definition,
         } => {
+            let operator_count = definition
+                .operators
+                .iter()
+                .filter(|member| member.used)
+                .count();
+            let function_count = definition
+                .functions
+                .iter()
+                .filter(|member| member.used)
+                .count();
             let mut ok = buffer.append(&created_at.to_le_bytes())
                 && name_bytes(buffer, definition.schema.as_str())
                 && name_bytes(buffer, definition.name.as_str())
@@ -3878,11 +3928,21 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&definition.family.to_le_bytes())
                 && append_routine_result(buffer, definition.input)
                 && append_routine_result(buffer, definition.storage)
-                && buffer.append(&[u8::from(definition.default)]);
-            for operator in definition.operators {
-                ok &= buffer.append(&operator.to_le_bytes());
+                && buffer.append(&[u8::from(definition.default)])
+                && buffer.append(&[operator_count as u8]);
+            for member in definition.operators.iter().filter(|member| member.used) {
+                ok &= buffer.append(&[member.strategy.number()])
+                    && append_routine_result(buffer, member.left)
+                    && append_routine_result(buffer, member.right)
+                    && buffer.append(&member.operator.to_le_bytes());
             }
-            ok && buffer.append(&definition.compare_function.to_le_bytes())
+            ok &= buffer.append(&[function_count as u8]);
+            for member in definition.functions.iter().filter(|member| member.used) {
+                ok &= append_routine_result(buffer, member.left)
+                    && append_routine_result(buffer, member.right)
+                    && buffer.append(&member.function.to_le_bytes());
+            }
+            ok
         }
         WalOp::DropRoutine {
             schema,
@@ -5809,12 +5869,45 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 1;
             let mut operator_classes = [None; MAX_INDEX_COLS];
             for operator_class in operator_classes.iter_mut().take(n_cols) {
-                let code = *payload.get(at)?;
-                at += 1;
-                *operator_class = if code == 0 {
-                    None
-                } else {
-                    Some(BtreeOperatorClass::from_code(code)?)
+                let tag = *payload.get(at)?;
+                let value = payload.get(at + 1..at + 5)?;
+                at += 5;
+                *operator_class = match tag {
+                    0 if value == [0, 0, 0, 0] => None,
+                    1 if value[1..] == [0, 0, 0] => {
+                        Some(crate::storage::IndexOperatorClass::Builtin(
+                            BtreeOperatorClass::from_code(value[0])?,
+                        ))
+                    }
+                    2 => Some(crate::storage::IndexOperatorClass::Catalog(
+                        crate::storage::OperatorClassOid::parse(i32::from_le_bytes(
+                            value.try_into().ok()?,
+                        ))?,
+                    )),
+                    _ => return None,
+                };
+            }
+            if *payload.get(at)? != 0xa9 {
+                return None;
+            }
+            at += 1;
+            let mut resolved_operator_classes = [None; MAX_INDEX_COLS];
+            for operator_class in resolved_operator_classes.iter_mut().take(n_cols) {
+                let tag = *payload.get(at)?;
+                let value = payload.get(at + 1..at + 5)?;
+                at += 5;
+                *operator_class = match tag {
+                    1 if value[1..] == [0, 0, 0] => {
+                        Some(crate::storage::IndexOperatorClass::Builtin(
+                            BtreeOperatorClass::from_code(value[0])?,
+                        ))
+                    }
+                    2 => Some(crate::storage::IndexOperatorClass::Catalog(
+                        crate::storage::OperatorClassOid::parse(i32::from_le_bytes(
+                            value.try_into().ok()?,
+                        ))?,
+                    )),
+                    _ => return None,
                 };
             }
             if *payload.get(at)? != 0xa8 {
@@ -5833,6 +5926,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 collations,
                 explicit_collations,
                 operator_classes,
+                resolved_operator_classes,
                 descending,
                 nulls_first,
                 n_cols,
@@ -6717,18 +6811,53 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 _ => return None,
             };
             at += 1;
-            let mut operators = [0; 5];
-            for operator in &mut operators {
-                *operator = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            let operator_count = usize::from(*payload.get(at)?);
+            at += 1;
+            if operator_count > crate::storage::MAX_OPERATOR_FAMILY_MEMBERS {
+                return None;
+            }
+            let mut operators = [crate::storage::OperatorFamilyOperator::EMPTY;
+                crate::storage::MAX_OPERATOR_FAMILY_MEMBERS];
+            for member in &mut operators[..operator_count] {
+                let strategy =
+                    crate::sql::ast::BtreeStrategy::from_number(u32::from(*payload.get(at)?))?;
+                at += 1;
+                let left = decode_routine_result(payload, &mut at)?;
+                let right = decode_routine_result(payload, &mut at)?;
+                let operator = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
                 at += 4;
-                if *operator < 0 {
+                if operator <= 0 {
                     return None;
                 }
+                *member = crate::storage::OperatorFamilyOperator {
+                    used: true,
+                    strategy,
+                    left,
+                    right,
+                    operator,
+                };
             }
-            let compare_function = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-            at += 4;
-            if compare_function < 0 {
+            let function_count = usize::from(*payload.get(at)?);
+            at += 1;
+            if function_count > crate::storage::MAX_OPERATOR_FAMILY_MEMBERS {
                 return None;
+            }
+            let mut functions = [crate::storage::OperatorFamilyFunction::EMPTY;
+                crate::storage::MAX_OPERATOR_FAMILY_MEMBERS];
+            for member in &mut functions[..function_count] {
+                let left = decode_routine_result(payload, &mut at)?;
+                let right = decode_routine_result(payload, &mut at)?;
+                let function = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                if function <= 0 {
+                    return None;
+                }
+                *member = crate::storage::OperatorFamilyFunction {
+                    used: true,
+                    left,
+                    right,
+                    function,
+                };
             }
             (at == payload.len()).then_some(WalOp::SetOperatorClass {
                 created_at,
@@ -6741,7 +6870,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     storage,
                     default,
                     operators,
-                    compare_function,
+                    functions,
                 },
             })
         }
@@ -7977,8 +8106,8 @@ mod tests {
             input: custom,
             storage: custom,
             default: true,
-            operators: [620_007, 620_008, 620_011, 620_009, 620_010],
-            compare_function: 701_004,
+            operators: family.operators,
+            functions: family.functions,
         };
         let operations = [
             WalOp::SetCast(crate::storage::CastDef {
@@ -9374,6 +9503,9 @@ mod tests {
             collations: [crate::sql::ast::Collation::Default; MAX_INDEX_COLS],
             explicit_collations: [false; MAX_INDEX_COLS],
             operator_classes: [None; MAX_INDEX_COLS],
+            resolved_operator_classes: [Some(crate::storage::IndexOperatorClass::Builtin(
+                BtreeOperatorClass::Text,
+            )); MAX_INDEX_COLS],
             descending: [false; MAX_INDEX_COLS],
             nulls_first: [false; MAX_INDEX_COLS],
             n_cols: 1,

@@ -622,6 +622,20 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 self.expression(8)
             }
+            Tok::Ident("operator") => {
+                self.advance()?;
+                self.expect_op("(")?;
+                let first = self.any_op_token()?;
+                let mut schema = None;
+                let mut operator = first;
+                if self.eat_op(".")? {
+                    schema = Some(first);
+                    operator = self.any_op_token()?;
+                }
+                self.expect_op(")")?;
+                let operand = self.expression(6)?;
+                self.catalog_prefix_operator_expr(schema, operator, operand)
+            }
             Tok::Ident("not") => {
                 self.advance()?;
                 let operand = self.expression(3)?;
@@ -996,6 +1010,11 @@ impl<'a> Parser<'a> {
                     qualifier: None,
                     name,
                 })
+            }
+            Tok::Op(operator) if !matches!(operator, ")" | "]" | "," | ";" | "." | "::" | "=") => {
+                self.advance()?;
+                let operand = self.expression(6)?;
+                self.catalog_prefix_operator_expr(None, operator, operand)
             }
             _ => Err(self.unexpected("expected an expression")),
         }
@@ -1394,6 +1413,39 @@ impl<'a> Parser<'a> {
         self.arena_expr(Expr::Call {
             name,
             args,
+            argument_names: &[],
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over: None,
+            filter: None,
+        })
+    }
+
+    fn catalog_prefix_operator_expr(
+        &self,
+        schema: Option<&'a str>,
+        operator: &'a str,
+        operand: &'a Expr<'a>,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let encoded = crate::stack_format!(
+            260,
+            "{}{}\u{1f}{}",
+            crate::sql::ast::CATALOG_OPERATOR_CALL_PREFIX,
+            schema.unwrap_or(""),
+            operator
+        );
+        if encoded.is_truncated() {
+            return Err(self.err_here("operator identity is too long"));
+        }
+        let name = self
+            .arena
+            .alloc_str(encoded.as_str())
+            .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+        self.arena_expr(Expr::Call {
+            name,
+            args: self.arena_slice(&[operand])?,
             argument_names: &[],
             variadic: false,
             star: false,

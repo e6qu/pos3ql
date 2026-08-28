@@ -224,6 +224,53 @@ impl ColTypeResolver for CatalogCols<'_> {
         variadic: bool,
         arguments: &[i32],
     ) -> Option<StaticTypeMeta> {
+        if let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name) {
+            if !(1..=2).contains(&arguments.len()) {
+                return None;
+            }
+            if arguments.len() == 2
+                && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+            {
+                let ctype = crate::sql::query::builtin_operator_result(operator, arguments)?;
+                return Some(StaticTypeMeta {
+                    type_oid: ctype.oid(),
+                    ctype,
+                    type_mod: -1,
+                    collation: if ctype.is_collatable() {
+                        crate::sql::ast::Collation::Default
+                    } else {
+                        crate::sql::ast::Collation::None
+                    },
+                });
+            }
+            let (left, right) = if arguments.len() == 1 {
+                (None, Some(arguments[0]))
+            } else {
+                (Some(arguments[0]), Some(arguments[1]))
+            };
+            let slot = self
+                .storage
+                .operator_slot_for_oids(schema, operator, left, right, self.txid)
+                .ok()??;
+            let result = self
+                .storage
+                .operator_for(slot, self.txid)
+                .implementation
+                .result()?;
+            let ctype = result.ctype;
+            return Some(StaticTypeMeta {
+                type_oid: self
+                    .storage
+                    .routine_type_oid(ctype, result.user_type, self.txid)?,
+                ctype,
+                type_mod: -1,
+                collation: if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            });
+        }
         let routine = if argument_names.is_empty() {
             self.storage
                 .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
@@ -250,6 +297,31 @@ impl ColTypeResolver for CatalogCols<'_> {
             type_oid: self
                 .storage
                 .routine_type_oid(result.ctype, result.user_type, self.txid)?,
+            ctype,
+            type_mod: -1,
+            collation: if ctype.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
+        })
+    }
+
+    fn operator_result(&self, name: &str, left_oid: i32, right_oid: i32) -> Option<StaticTypeMeta> {
+        let slot = self
+            .storage
+            .operator_slot_for_oids(None, name, Some(left_oid), Some(right_oid), self.txid)
+            .ok()??;
+        let result = self
+            .storage
+            .operator_for(slot, self.txid)
+            .implementation
+            .result()?;
+        let ctype = result.ctype;
+        Some(StaticTypeMeta {
+            type_oid: self
+                .storage
+                .routine_type_oid(ctype, result.user_type, self.txid)?,
             ctype,
             type_mod: -1,
             collation: if ctype.is_collatable() {

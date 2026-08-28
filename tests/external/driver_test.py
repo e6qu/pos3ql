@@ -48,13 +48,23 @@ cur.execute(
     "CREATE OPERATOR public.@+ (FUNCTION = drv_catalog_operator, "
     "LEFTARG = integer, RIGHTARG = integer)"
 )
-cur.execute("SELECT %s::drv_mood::text, %s OPERATOR(public.@+) %s", ("low", 7, 9))
-assert [column.type_code for column in cur.description] == [25, 25], cur.description
-assert cur.fetchone() == ("low-driver", "driver")
+cur.execute(
+    "CREATE FUNCTION drv_prefix_operator(integer) RETURNS integer "
+    "LANGUAGE SQL RETURN -$1"
+)
+cur.execute(
+    "CREATE OPERATOR public.!! (FUNCTION = drv_prefix_operator, RIGHTARG = integer)"
+)
+cur.execute(
+    "SELECT %s::drv_mood::text, %s OPERATOR(public.@+) %s, OPERATOR(public.!!) %s",
+    ("low", 7, 9, 11),
+)
+assert [column.type_code for column in cur.description] == [25, 25, 23], cur.description
+assert cur.fetchone() == ("low-driver", "driver", -11)
 bcur = conn.cursor(binary=True)
-bcur.execute("SELECT %s OPERATOR(public.@+) %s", (11, 13))
-assert bcur.description[0].type_code == 25
-assert bcur.fetchone() == ("driver",)
+bcur.execute("SELECT %s OPERATOR(public.@+) %s, !! %s", (11, 13, 17))
+assert [column.type_code for column in bcur.description] == [25, 23]
+assert bcur.fetchone() == ("driver", -17)
 bcur.close()
 print("cast/operator extended protocol ok")
 

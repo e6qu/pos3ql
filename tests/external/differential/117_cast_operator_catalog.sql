@@ -4,16 +4,20 @@ DROP OPERATOR FAMILY IF EXISTS differential_int_family USING btree CASCADE;
 DROP OPERATOR IF EXISTS === (integer, integer) CASCADE;
 DROP OPERATOR IF EXISTS ## (integer, integer) CASCADE;
 DROP OPERATOR IF EXISTS @@ (integer, integer) CASCADE;
+DROP OPERATOR IF EXISTS !! (NONE, integer) CASCADE;
+DROP FUNCTION IF EXISTS differential_int_prefix(integer) CASCADE;
 DROP FUNCTION IF EXISTS differential_int_same(integer, integer) CASCADE;
 DROP FUNCTION IF EXISTS differential_int_compare(integer, integer) CASCADE;
 DROP TYPE IF EXISTS differential_mood CASCADE;
 
 CREATE TYPE differential_mood AS ENUM ('low', 'high');
-CREATE FUNCTION differential_mood_text(differential_mood)
-RETURNS text LANGUAGE SQL IMMUTABLE
-RETURN CASE WHEN $1 = 'low' THEN 'low-cast' ELSE 'high-cast' END;
+CREATE FUNCTION differential_mood_text(differential_mood, integer)
+RETURNS varchar LANGUAGE SQL IMMUTABLE
+RETURN CASE WHEN $2 = -1 THEN
+  CASE WHEN $1 = 'low' THEN 'low-cast' ELSE 'high-cast' END
+ELSE 'bad-typmod' END;
 CREATE CAST (differential_mood AS text)
-WITH FUNCTION differential_mood_text(differential_mood) AS ASSIGNMENT;
+WITH FUNCTION differential_mood_text AS ASSIGNMENT;
 
 SELECT 'low'::differential_mood::text;
 SELECT castmethod, castcontext, castfunc <> 0
@@ -22,10 +26,13 @@ WHERE castsource = 'differential_mood'::regtype
   AND casttarget = 'text'::regtype;
 
 CREATE FUNCTION differential_int_same(integer, integer)
-RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN $1 = $2;
+RETURNS boolean LANGUAGE SQL IMMUTABLE RETURN $1 % 10 = $2 % 10;
 CREATE FUNCTION differential_int_compare(integer, integer)
 RETURNS integer LANGUAGE SQL IMMUTABLE
-RETURN CASE WHEN $1 < $2 THEN -1 WHEN $1 > $2 THEN 1 ELSE 0 END;
+RETURN CASE WHEN $1 % 10 < $2 % 10 THEN -1
+            WHEN $1 % 10 > $2 % 10 THEN 1 ELSE 0 END;
+CREATE FUNCTION differential_int_prefix(integer)
+RETURNS integer LANGUAGE SQL IMMUTABLE RETURN -$1;
 CREATE OPERATOR === (
   FUNCTION = differential_int_same,
   LEFTARG = integer,
@@ -39,8 +46,13 @@ CREATE OPERATOR ## (
   RIGHTARG = integer,
   COMMUTATOR = OPERATOR(public.@@)
 );
+CREATE OPERATOR !! (
+  FUNCTION = differential_int_prefix,
+  RIGHTARG = integer
+);
 
 SELECT 1 === 1, 1 OPERATOR(public.===) 2;
+SELECT !! 4, OPERATOR(public.!!) 5;
 SELECT oprkind, oprcanmerge, oprcanhash, oprresult::regtype::text,
        pg_typeof(oprcode)::text, oprcode::text,
        oprrest::regprocedure::text, oprjoin::regprocedure::text
@@ -96,16 +108,50 @@ FROM pg_opclass AS operator_class
 JOIN pg_opfamily AS operator_family
   ON operator_family.oid = operator_class.opcfamily
 WHERE operator_class.opcname = 'differential_int_class';
+SELECT
+  (SELECT count(*) FROM pg_depend AS dependency
+   JOIN pg_amop AS member ON member.oid = dependency.objid
+   WHERE dependency.classid = 'pg_amop'::regclass
+     AND dependency.refclassid = 'pg_opclass'::regclass
+     AND dependency.refobjid = (
+       SELECT oid FROM pg_opclass WHERE opcname = 'differential_int_class'
+     ) AND dependency.deptype = 'i') AS operator_dependencies,
+  (SELECT count(*) FROM pg_depend AS dependency
+   JOIN pg_amproc AS member ON member.oid = dependency.objid
+   WHERE dependency.classid = 'pg_amproc'::regclass
+     AND dependency.refclassid = 'pg_opclass'::regclass
+     AND dependency.refobjid = (
+       SELECT oid FROM pg_opclass WHERE opcname = 'differential_int_class'
+     ) AND dependency.deptype = 'i') AS function_dependencies;
+
+CREATE TABLE differential_operator_class_values(value integer);
+CREATE UNIQUE INDEX differential_operator_class_values_idx
+  ON differential_operator_class_values (value differential_int_class);
+SELECT count(*) FROM pg_depend
+WHERE classid = 'pg_class'::regclass
+  AND objid = 'differential_operator_class_values_idx'::regclass
+  AND refclassid = 'pg_opclass'::regclass
+  AND refobjid = (
+    SELECT oid FROM pg_opclass WHERE opcname = 'differential_int_class'
+  ) AND deptype = 'n';
+INSERT INTO differential_operator_class_values VALUES (1);
+INSERT INTO differential_operator_class_values VALUES (11);
+SELECT pg_get_indexdef('differential_operator_class_values_idx'::regclass);
 
 ALTER OPERATOR CLASS differential_int_class USING btree
   RENAME TO differential_int_class_moved;
 ALTER OPERATOR CLASS differential_int_class_moved USING btree
   RENAME TO differential_int_class;
+SELECT count(*) FROM pg_indexes
+WHERE indexname = 'differential_operator_class_values_idx';
 ALTER OPERATOR FAMILY differential_int_family USING btree
   RENAME TO differential_int_family_moved;
 ALTER OPERATOR FAMILY differential_int_family_moved USING btree
   RENAME TO differential_int_family;
 DROP OPERATOR CLASS differential_int_class USING btree;
+DROP OPERATOR CLASS differential_int_class USING btree CASCADE;
+SELECT count(*) FROM pg_indexes
+WHERE indexname = 'differential_operator_class_values_idx';
 DROP OPERATOR FAMILY differential_int_family USING btree;
 
 CREATE VIEW differential_operator_view AS
@@ -117,8 +163,10 @@ SELECT count(*) FROM pg_views WHERE viewname = 'differential_operator_view';
 
 DROP OPERATOR ## (integer, integer);
 DROP OPERATOR @@ (integer, integer);
+DROP OPERATOR !! (NONE, integer);
 DROP CAST (differential_mood AS text);
-DROP FUNCTION differential_mood_text(differential_mood);
+DROP FUNCTION differential_mood_text(differential_mood, integer);
+DROP FUNCTION differential_int_prefix(integer);
 DROP FUNCTION differential_int_same(integer, integer);
 DROP FUNCTION differential_int_compare(integer, integer);
 DROP TYPE differential_mood;

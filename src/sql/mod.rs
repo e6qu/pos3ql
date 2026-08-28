@@ -5627,7 +5627,14 @@ impl Engine {
                         actual[index] = infer(argument).unwrap_or(types::oid::UNKNOWN);
                     }
                     if let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name) {
-                        if args.len() == 2
+                        if args.len() == 1 {
+                            if let Some(expected) = self
+                                .storage
+                                .operator_prefix_parameter_oid(schema, operator, actual[0], txid)
+                            {
+                                assign(args[0], expected, oids);
+                            }
+                        } else if args.len() == 2
                             && let Some(expected) = self.storage.operator_call_parameter_oids(
                                 schema,
                                 operator,
@@ -13657,6 +13664,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             collations,
             explicit_collations,
             operator_classes,
+            resolved_operator_classes,
             descending,
             nulls_first,
             n_cols,
@@ -13687,6 +13695,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     collations,
                     explicit_collations,
                     operator_classes,
+                    resolved_operator_classes,
                     descending,
                     nulls_first,
                     n_cols,

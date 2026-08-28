@@ -375,8 +375,22 @@ ALTER TYPE outbound_dump.mood SET SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.location SET SCHEMA outbound_type_target;
 CREATE INDEX outbound_items_note_idx ON outbound_dump.items (note DESC)
   INCLUDE (mood) WHERE note IS NOT NULL;
+CREATE FUNCTION outbound_dump.int_same(integer, integer)
+RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 = $2';
+CREATE FUNCTION outbound_dump.int_compare(integer, integer)
+RETURNS integer LANGUAGE sql IMMUTABLE
+AS 'SELECT CASE WHEN $1 < $2 THEN -1 WHEN $1 > $2 THEN 1 ELSE 0 END';
+CREATE OPERATOR outbound_dump.=== (
+  FUNCTION = outbound_dump.int_same, LEFTARG = integer, RIGHTARG = integer
+);
+CREATE OPERATOR FAMILY outbound_dump.outbound_int_family USING btree;
+CREATE OPERATOR CLASS outbound_dump.outbound_int_class FOR TYPE integer USING btree
+  FAMILY outbound_dump.outbound_int_family AS
+  OPERATOR 3 outbound_dump.===,
+  FUNCTION 1 outbound_dump.int_compare(integer, integer);
 CREATE TABLE outbound_dump."Odd Table" ("Key Value" integer PRIMARY KEY, "select" text);
-CREATE INDEX "Odd Index" ON outbound_dump."Odd Table" ("select" DESC);
+CREATE INDEX "Odd Index" ON outbound_dump."Odd Table"
+  ("Key Value" outbound_dump.outbound_int_class);
 COMMENT ON TABLE outbound_dump.items IS 'dumped table comment';
 COMMENT ON COLUMN outbound_dump.items.note IS 'dumped column comment';
 CREATE VIEW outbound_dump.item_view AS
@@ -455,19 +469,6 @@ CREATE FUNCTION outbound_dump.mood_text(value outbound_type_target.mood)
 RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT CASE WHEN $1 = ''ok'' THEN ''ok'' ELSE ''great'' END';
 CREATE CAST (outbound_type_target.mood AS text)
   WITH FUNCTION outbound_dump.mood_text(outbound_type_target.mood) AS ASSIGNMENT;
-CREATE FUNCTION outbound_dump.int_same(integer, integer)
-RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 = $2';
-CREATE FUNCTION outbound_dump.int_compare(integer, integer)
-RETURNS integer LANGUAGE sql IMMUTABLE
-AS 'SELECT CASE WHEN $1 < $2 THEN -1 WHEN $1 > $2 THEN 1 ELSE 0 END';
-CREATE OPERATOR outbound_dump.=== (
-  FUNCTION = outbound_dump.int_same, LEFTARG = integer, RIGHTARG = integer
-);
-CREATE OPERATOR FAMILY outbound_dump.outbound_int_family USING btree;
-CREATE OPERATOR CLASS outbound_dump.outbound_int_class FOR TYPE integer USING btree
-  FAMILY outbound_dump.outbound_int_family AS
-  OPERATOR 3 outbound_dump.===,
-  FUNCTION 1 outbound_dump.int_compare(integer, integer);
 CREATE FUNCTION outbound_dump.echo_mood(value outbound_type_target.mood) RETURNS outbound_type_target.mood LANGUAGE sql AS 'SELECT $1';
 CREATE FUNCTION outbound_dump.echo_location(value outbound_type_target.location) RETURNS outbound_type_target.location LANGUAGE sql AS 'SELECT $1';
 CREATE FUNCTION outbound_dump.echo_marked_location(value outbound_dump.location_domain) RETURNS outbound_dump.location_domain LANGUAGE sql AS 'SELECT $1';
@@ -581,7 +582,7 @@ else
        WHERE conrelid = 'outbound_dump.items'::regclass AND contype = 'c';
       SELECT indexdef LIKE '%INCLUDE (mood)%' AND indexdef LIKE '%WHERE (note IS NOT NULL)%'
         FROM pg_indexes WHERE schemaname='outbound_dump' AND indexname='outbound_items_note_idx';
-      SELECT indexdef = 'CREATE INDEX \"Odd Index\" ON outbound_dump.\"Odd Table\" USING btree (\"select\" DESC)'
+      SELECT indexdef = 'CREATE INDEX \"Odd Index\" ON outbound_dump.\"Odd Table\" USING btree (\"Key Value\" outbound_dump.outbound_int_class)'
         FROM pg_indexes WHERE schemaname='outbound_dump' AND indexname='Odd Index';
       SELECT obj_description('outbound_dump.items'::regclass),
              col_description('outbound_dump.items'::regclass, 8);

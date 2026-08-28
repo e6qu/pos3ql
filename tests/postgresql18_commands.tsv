@@ -32,8 +32,8 @@ ALTER LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; cu
 ALTER LARGE OBJECT	missing	-
 ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql and typed extension dependencies in 111_extension_lifecycle.sql
 ALTER OPERATOR	partial	117_cast_operator_catalog.sql (typed owner/schema and optimization links; selectivity estimators rejected)
-ALTER OPERATOR CLASS	partial	117_cast_operator_catalog.sql (modeled btree metadata)
-ALTER OPERATOR FAMILY	partial	117_cast_operator_catalog.sql (modeled btree members and lifecycle)
+ALTER OPERATOR CLASS	complete	117_cast_operator_catalog.sql
+ALTER OPERATOR FAMILY	complete	117_cast_operator_catalog.sql
 ALTER POLICY	complete	106_row_level_security.sql
 ALTER PROCEDURE	partial	90_routine_lifecycle.sql
 ALTER PUBLICATION	partial	84_publication.sql
@@ -69,7 +69,7 @@ COMMIT PREPARED	missing	-
 COPY	complete	40_copy.sql
 CREATE ACCESS METHOD	missing	-
 CREATE AGGREGATE	complete	110_user_defined_aggregates.sql
-CREATE CAST	partial	117_cast_operator_catalog.sql (function, binary, and INOUT methods for modeled types)
+CREATE CAST	complete	117_cast_operator_catalog.sql
 CREATE COLLATION	missing	-
 CREATE CONVERSION	missing	-
 CREATE DATABASE	missing	-
@@ -84,8 +84,8 @@ CREATE INDEX	partial	43_indexes.sql, 107_index_lifecycle.sql, and 108_index_oper
 CREATE LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; native handlers are outside the architecture)
 CREATE MATERIALIZED VIEW	complete	53_materialized_view.sql
 CREATE OPERATOR	partial	117_cast_operator_catalog.sql (typed binary operators and durable forward shells)
-CREATE OPERATOR CLASS	partial	117_cast_operator_catalog.sql (modeled btree catalog definitions; execution rejected)
-CREATE OPERATOR FAMILY	partial	117_cast_operator_catalog.sql (modeled btree catalog definitions)
+CREATE OPERATOR CLASS	complete	117_cast_operator_catalog.sql (btree; unsupported access methods are rejected)
+CREATE OPERATOR FAMILY	complete	117_cast_operator_catalog.sql (btree; unsupported access methods are rejected)
 CREATE POLICY	complete	106_row_level_security.sql
 CREATE PROCEDURE	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql
 CREATE PUBLICATION	partial	84_publication.sql

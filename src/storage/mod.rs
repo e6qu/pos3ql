@@ -3937,6 +3937,27 @@ fn catalog_object_oid(base: i32, created_at: u64) -> i32 {
         .expect("catalog OID range exhausted")
 }
 
+/// Durable identity of a user-defined operator class selected by an index.
+///
+/// Catalog slots are rebuilt during recovery, so an index must retain the
+/// stable catalog OID rather than a transient slot or a mutable name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OperatorClassOid(i32);
+
+impl OperatorClassOid {
+    pub(crate) const fn parse(oid: i32) -> Option<Self> {
+        if oid > OPERATOR_CLASS_OID_BASE {
+            Some(Self(oid))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn get(self) -> i32 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CastContext {
     Explicit,
@@ -4221,8 +4242,8 @@ pub(crate) struct OperatorClassDefinition {
     pub input: RoutineResult,
     pub storage: RoutineResult,
     pub default: bool,
-    pub operators: [i32; 5],
-    pub compare_function: i32,
+    pub operators: [OperatorFamilyOperator; MAX_OPERATOR_FAMILY_MEMBERS],
+    pub functions: [OperatorFamilyFunction; MAX_OPERATOR_FAMILY_MEMBERS],
 }
 
 impl OperatorClassDefinition {
@@ -4234,9 +4255,27 @@ impl OperatorClassDefinition {
         input: RoutineResult::TEXT,
         storage: RoutineResult::TEXT,
         default: false,
-        operators: [0; 5],
-        compare_function: 0,
+        operators: [OperatorFamilyOperator::EMPTY; MAX_OPERATOR_FAMILY_MEMBERS],
+        functions: [OperatorFamilyFunction::EMPTY; MAX_OPERATOR_FAMILY_MEMBERS],
     };
+
+    pub(crate) fn comparison_function(self) -> Option<OperatorFamilyFunction> {
+        self.functions
+            .into_iter()
+            .find(|member| member.used && member.left == self.input && member.right == self.input)
+    }
+
+    pub(crate) fn owns_operator(self, oid: i32) -> bool {
+        self.operators
+            .iter()
+            .any(|member| member.used && member.operator == oid)
+    }
+
+    pub(crate) fn owns_function(self, oid: i32) -> bool {
+        self.functions
+            .iter()
+            .any(|member| member.used && member.function == oid)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6473,6 +6512,28 @@ impl SequenceDef {
 /// Maximum columns in an index key.
 pub(crate) const MAX_INDEX_COLS: usize = 8;
 
+/// Comparison contract selected for one explicit btree index key.
+///
+/// An omitted class remains `None` in [`IndexDef`] so `pg_get_indexdef` can
+/// distinguish implicit defaults from explicitly written classes. Once
+/// resolved, a class is either one of the closed built-ins or one durable
+/// user-catalog identity; a catalog name or slot can never masquerade as an
+/// executable class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexOperatorClass {
+    Builtin(crate::sql::types::BtreeOperatorClass),
+    Catalog(OperatorClassOid),
+}
+
+impl IndexOperatorClass {
+    pub(crate) const fn oid(self) -> i32 {
+        match self {
+            Self::Builtin(class) => class.oid(),
+            Self::Catalog(oid) => oid.get(),
+        }
+    }
+}
+
 fn hash_table_key(definition: &TableDef, values: &[Datum], columns: &[u16]) -> u64 {
     let mut collations = [Collation::None; MAX_INDEX_COLS];
     for (index, column) in columns.iter().enumerate() {
@@ -6660,7 +6721,8 @@ pub struct IndexDef {
     pub include_columns: [u16; MAX_INDEX_COLS],
     pub collations: [Collation; MAX_INDEX_COLS],
     pub explicit_collations: [bool; MAX_INDEX_COLS],
-    pub operator_classes: [Option<crate::sql::types::BtreeOperatorClass>; MAX_INDEX_COLS],
+    pub(crate) operator_classes: [Option<IndexOperatorClass>; MAX_INDEX_COLS],
+    pub(crate) resolved_operator_classes: [Option<IndexOperatorClass>; MAX_INDEX_COLS],
     pub descending: [bool; MAX_INDEX_COLS],
     pub nulls_first: [bool; MAX_INDEX_COLS],
     pub n_cols: usize,
@@ -9258,6 +9320,7 @@ impl Storage {
                     collations: [Collation::Default; MAX_INDEX_COLS],
                     explicit_collations: [false; MAX_INDEX_COLS],
                     operator_classes: [None; MAX_INDEX_COLS],
+                    resolved_operator_classes: [None; MAX_INDEX_COLS],
                     descending: [false; MAX_INDEX_COLS],
                     nulls_first: [false; MAX_INDEX_COLS],
                     n_cols: 0,
@@ -16243,6 +16306,12 @@ impl Storage {
                 // cache without changing their SQL semantics.
                 && index.expressions[..index.n_cols].iter().all(Option::is_none)
         }) {
+            let uses_catalog_comparison = index.resolved_operator_classes[..index.n_cols]
+                .iter()
+                .any(|class| matches!(class, Some(IndexOperatorClass::Catalog(_))));
+            if uses_catalog_comparison {
+                continue;
+            }
             let columns = &index.columns[..index.n_cols];
             if want[..n_want]
                 .iter()
@@ -25786,7 +25855,13 @@ impl Storage {
             ));
         }
         match definition.method {
-            CastMethod::Binary if definition.source.ctype != definition.target.ctype => {
+            CastMethod::Binary
+                if !self.routine_results_binary_coercible(
+                    definition.source,
+                    definition.target,
+                    txid,
+                ) =>
+            {
                 Err(sql_err!(
                     sqlstate::CANNOT_COERCE,
                     "cast types are not binary compatible"
@@ -25817,7 +25892,9 @@ impl Storage {
                     },
                     txid,
                 )?;
-                if result != definition.target || argument != definition.source {
+                if !self.routine_results_binary_coercible(result, definition.target, txid)
+                    || !self.routine_results_binary_coercible(definition.source, argument, txid)
+                {
                     return Err(sql_err!(
                         sqlstate::INVALID_FUNCTION_DEFINITION,
                         "cast function contract does not match the cast"
@@ -25827,6 +25904,59 @@ impl Storage {
             }
             CastMethod::Binary | CastMethod::InOut => Ok(()),
         }
+    }
+
+    pub(crate) fn routine_results_binary_coercible(
+        &self,
+        source: RoutineResult,
+        target: RoutineResult,
+        txid: u32,
+    ) -> bool {
+        use ColType::*;
+        if source == target {
+            return true;
+        }
+        if source.user_type.is_some() || target.user_type.is_some() {
+            let is_domain = |result: RoutineResult| {
+                result.user_type.is_some_and(|identity| {
+                    self.domain_identity_slot(
+                        identity.schema.as_str(),
+                        identity.name.as_str(),
+                        txid,
+                    )
+                    .is_some()
+                })
+            };
+            return source.ctype == target.ctype && (is_domain(source) || is_domain(target));
+        }
+        let oid_reference = |ctype| {
+            matches!(
+                ctype,
+                Oid | Regtype
+                    | Regproc
+                    | Regprocedure
+                    | Regoper
+                    | Regoperator
+                    | Regclass
+                    | Regnamespace
+                    | Regrole
+            )
+        };
+        matches!(
+            (source.ctype, target.ctype),
+            (Text, Bpchar | Varchar)
+                | (Varchar, Text | Bpchar)
+                | (Bit { varying: false }, Bit { varying: true })
+                | (Bit { varying: true }, Bit { varying: false })
+                | (Cidr, Inet)
+                | (Regproc, Regprocedure)
+                | (Regprocedure, Regproc)
+                | (Regoper, Regoperator)
+                | (Regoperator, Regoper)
+        ) || (source.ctype == Int4 && oid_reference(target.ctype))
+            || (target.ctype == Int4 && oid_reference(source.ctype))
+            || (source.ctype == Oid && oid_reference(target.ctype))
+            || (target.ctype == Oid && oid_reference(source.ctype))
     }
 
     fn builtin_cast_exists(source: i32, target: i32) -> bool {
@@ -26201,6 +26331,48 @@ impl Storage {
         None
     }
 
+    pub(crate) fn operator_prefix_parameter_oid(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        actual: i32,
+        txid: u32,
+    ) -> Option<i32> {
+        let resolve = |candidate_schema: &str| {
+            let mut found = None;
+            for (_, definition) in self.operators_visible_to(txid) {
+                if definition.schema.as_str() != candidate_schema
+                    || definition.name.as_str() != name
+                    || definition.signature.left.is_some()
+                {
+                    continue;
+                }
+                let expected = definition.signature.right.and_then(|argument| {
+                    self.routine_type_oid(argument.ctype, argument.user_type, txid)
+                })?;
+                if (actual == crate::sql::types::oid::UNKNOWN
+                    || self.routine_implicit_cast(actual, expected, txid))
+                    && found.replace(expected).is_some()
+                {
+                    return None;
+                }
+            }
+            found
+        };
+        if let Some(schema) = schema {
+            return resolve(schema);
+        }
+        for entry in self.path.entries() {
+            let PathEntry::Schema(schema_slot) = entry else {
+                continue;
+            };
+            if let Some(expected) = resolve(self.schemas[*schema_slot as usize].name.as_str()) {
+                return Some(expected);
+            }
+        }
+        None
+    }
+
     fn validate_operator_definition(
         &self,
         definition: OperatorDefinition,
@@ -26208,6 +26380,7 @@ impl Storage {
         self_oid: Option<i32>,
     ) -> Result<(), SqlError> {
         if definition.signature.arity() == 0
+            || (definition.signature.left.is_some() && definition.signature.right.is_none())
             || self.role_slot_by_oid(definition.owner, txid).is_none()
         {
             return Err(sql_err!(
@@ -26837,6 +27010,16 @@ impl Storage {
         &self.operator_classes[slot]
     }
 
+    pub(crate) fn operator_class_slot_by_oid(
+        &self,
+        oid: OperatorClassOid,
+        txid: u32,
+    ) -> Option<usize> {
+        self.operator_classes
+            .iter()
+            .position(|class| class.visible_to(txid) && class.oid() == oid.get())
+    }
+
     pub(crate) fn operator_class_for(&self, slot: usize, txid: u32) -> OperatorClassDefinition {
         self.operator_classes[slot].definition_for(txid)
     }
@@ -26891,6 +27074,45 @@ impl Storage {
         Ok(found)
     }
 
+    /// Resolves the comparison contract an index key will execute. Explicit
+    /// classes arrive already typed; an omitted class is selected once from
+    /// the transaction-visible catalog and the closed builtin inventory.
+    pub(crate) fn resolve_index_operator_class(
+        &self,
+        explicit: Option<IndexOperatorClass>,
+        input: RoutineResult,
+        txid: u32,
+    ) -> Result<IndexOperatorClass, SqlError> {
+        if let Some(class) = explicit {
+            if let IndexOperatorClass::Catalog(oid) = class {
+                let slot = self.operator_class_slot_by_oid(oid, txid).ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "operator class does not exist")
+                })?;
+                if self.operator_class_for(slot, txid).input != input {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "operator class does not accept the index key data type"
+                    ));
+                }
+            }
+            return Ok(class);
+        }
+        if let Some(slot) = self.default_operator_class_for_type(input, txid)? {
+            let oid = OperatorClassOid::parse(self.operator_class(slot).oid())
+                .expect("user operator-class OID is typed");
+            return Ok(IndexOperatorClass::Catalog(oid));
+        }
+        crate::sql::types::BtreeOperatorClass::for_type(input.ctype)
+            .map(IndexOperatorClass::Builtin)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "data type {} has no default operator class for access method \"btree\"",
+                    input.ctype.name()
+                )
+            })
+    }
+
     fn validate_operator_class_definition(
         &self,
         definition: OperatorClassDefinition,
@@ -26921,9 +27143,24 @@ impl Storage {
                 "operator-class schema does not exist"
             ));
         }
-        for operator_oid in definition.operators.into_iter().filter(|oid| *oid != 0) {
+        if definition.storage != definition.input {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "storage type cannot be different from data type for access method \"btree\""
+            ));
+        }
+        for (index, member) in definition.operators.iter().enumerate() {
+            if !member.used {
+                if *member != OperatorFamilyOperator::EMPTY {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "unused operator-class member is not empty"
+                    ));
+                }
+                continue;
+            }
             let slot = self
-                .operator_slot_by_oid(operator_oid, txid)
+                .operator_slot_by_oid(member.operator, txid)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,
@@ -26931,19 +27168,37 @@ impl Storage {
                     )
                 })?;
             let operator = self.operator_for(slot, txid);
-            if operator.signature.left.is_none()
-                || operator.signature.right.is_none()
-                || operator.implementation.result().is_none()
+            if operator.signature.left != Some(member.left)
+                || operator.signature.right != Some(member.right)
+                || operator
+                    .implementation
+                    .result()
+                    .is_none_or(|result| result.ctype != ColType::Bool)
+                || definition.operators[..index].iter().any(|prior| {
+                    prior.used
+                        && prior.strategy == member.strategy
+                        && prior.left == member.left
+                        && prior.right == member.right
+                })
             {
                 return Err(sql_err!(
                     sqlstate::INVALID_OBJECT_DEFINITION,
-                    "btree operator-class members must be binary operators"
+                    "btree operator-class member contract is invalid or duplicated"
                 ));
             }
         }
-        if definition.compare_function != 0 {
+        for (index, member) in definition.functions.iter().enumerate() {
+            if !member.used {
+                if *member != OperatorFamilyFunction::EMPTY {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "unused operator-class support member is not empty"
+                    ));
+                }
+                continue;
+            }
             let slot = self
-                .routine_slot_by_oid(definition.compare_function, txid)
+                .routine_slot_by_oid(member.function, txid)
                 .ok_or_else(|| {
                     sql_err!(
                         sqlstate::UNDEFINED_FUNCTION,
@@ -26957,10 +27212,27 @@ impl Storage {
                 }
                 _ => false,
             };
-            if !valid_result || function.arguments().len() != 2 {
+            let expected = [member.left, member.right];
+            let mut arguments_match = function.arguments().len() == 2;
+            for (actual, expected) in function.arguments().iter().zip(expected) {
+                let actual = self.bind_routine_result(
+                    RoutineResult {
+                        ctype: actual.ctype,
+                        user_type: actual.user_type,
+                    },
+                    txid,
+                )?;
+                arguments_match &= actual == expected;
+            }
+            if !valid_result
+                || !arguments_match
+                || definition.functions[..index].iter().any(|prior| {
+                    prior.used && prior.left == member.left && prior.right == member.right
+                })
+            {
                 return Err(sql_err!(
                     sqlstate::INVALID_FUNCTION_DEFINITION,
-                    "btree support function 1 must accept two arguments and return integer"
+                    "btree operator-class support function contract is invalid or duplicated"
                 ));
             }
         }
@@ -27024,6 +27296,14 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         definition.input = self.bind_routine_result(definition.input, 0)?;
         definition.storage = self.bind_routine_result(definition.storage, 0)?;
+        for member in definition.operators.iter_mut().filter(|member| member.used) {
+            member.left = self.bind_routine_result(member.left, 0)?;
+            member.right = self.bind_routine_result(member.right, 0)?;
+        }
+        for member in definition.functions.iter_mut().filter(|member| member.used) {
+            member.left = self.bind_routine_result(member.left, 0)?;
+            member.right = self.bind_routine_result(member.right, 0)?;
+        }
         self.validate_operator_class_definition(definition, 0)?;
         let existing = self.operator_classes.iter().position(|candidate| {
             candidate.ddl_state == CatalogDdlState::Present && candidate.created_at == created_at

@@ -276,6 +276,89 @@ pub(crate) fn key_values_equal(
     Ok(true)
 }
 
+struct IndexKeyEquality<'a> {
+    storage: &'a Storage,
+    txid: u32,
+    collations: &'a [crate::sql::ast::Collation],
+    operator_classes: &'a [crate::storage::IndexOperatorClass],
+    nulls_not_distinct: bool,
+    arena: &'a Arena,
+}
+
+fn index_key_values_equal(
+    equality: &IndexKeyEquality<'_>,
+    values: &[Datum],
+    other: &[Datum],
+) -> Result<bool, SqlError> {
+    for (index, (value, other_value)) in values.iter().zip(other).enumerate() {
+        if value.is_null() || other_value.is_null() {
+            if equality.nulls_not_distinct && value.is_null() && other_value.is_null() {
+                continue;
+            }
+            return Ok(false);
+        }
+        let equal = match equality.operator_classes[index] {
+            crate::storage::IndexOperatorClass::Builtin(_) => compare_datums_collated(
+                equality.storage,
+                equality.collations[index],
+                value,
+                other_value,
+            )?
+            .is_eq(),
+            crate::storage::IndexOperatorClass::Catalog(oid) => {
+                let slot = equality
+                    .storage
+                    .operator_class_slot_by_oid(oid, equality.txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "index operator class does not exist"
+                        )
+                    })?;
+                let function = equality
+                    .storage
+                    .operator_class_for(slot, equality.txid)
+                    .comparison_function()
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "missing support function 1 for index operator class"
+                        )
+                    })?;
+                crate::sql::query::execute_index_comparison(
+                    equality.storage,
+                    equality.txid,
+                    function.function,
+                    *value,
+                    *other_value,
+                    equality.arena,
+                )?
+                .is_eq()
+            }
+        };
+        if !equal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn resolve_index_operator_classes(
+    index: &crate::storage::IndexDef,
+) -> Result<[Option<crate::storage::IndexOperatorClass>; crate::storage::MAX_INDEX_COLS], SqlError>
+{
+    let mut resolved = [None; crate::storage::MAX_INDEX_COLS];
+    for (position, value) in resolved.iter_mut().enumerate().take(index.n_cols) {
+        *value = Some(index.resolved_operator_classes[position].ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "index key has no resolved operator class"
+            )
+        })?);
+    }
+    Ok(resolved)
+}
+
 pub(crate) fn index_key_collations(
     def: &TableDef,
     columns: &[u16],
@@ -336,6 +419,7 @@ fn enforce_expression_index_uniqueness<'a>(
     txid: u32,
     columns: &[u16],
     expressions: &[Option<&'a Expr<'a>>],
+    operator_classes: &[crate::storage::IndexOperatorClass],
     nulls_not_distinct: bool,
     name: &ConstraintName,
     predicate: Option<&'a Expr<'a>>,
@@ -358,12 +442,17 @@ fn enforce_expression_index_uniqueness<'a>(
             return Ok(false);
         }
         let other_keys = index_key_values(def, other, columns, expressions, arena)?;
-        key_values_equal(
-            storage,
-            &collations[..columns.len()],
+        index_key_values_equal(
+            &IndexKeyEquality {
+                storage,
+                txid,
+                collations: &collations[..columns.len()],
+                operator_classes,
+                nulls_not_distinct,
+                arena,
+            },
             &keys[..columns.len()],
             &other_keys[..columns.len()],
-            nulls_not_distinct,
         )
     };
     storage.for_each_row_state(table_index, &mut |rowid, state| {
@@ -419,8 +508,8 @@ fn enforce_expression_index_uniqueness<'a>(
 /// table-level key, or a unique index). Committed collisions raise 23505; a
 /// collision against another transaction's pending image waits for it. The
 /// committed side is served by the value index when the table carries an
-/// enforcer for these columns (an O(1) probe), falling back to a full scan
-/// otherwise; the pending side is always a bounded scan of the resident overlay
+/// enforcer for these columns (an O(1) probe); keys without that accelerator
+/// use the authoritative row scan. The pending side is always a bounded scan of the resident overlay
 /// (pending rows are never evicted). The index definition controls whether a
 /// NULL key is distinct.
 #[allow(clippy::too_many_arguments)]
@@ -835,28 +924,39 @@ pub fn check_unique_indexes(
         let icols = &index.columns[..index.n_cols];
         let index_name = index.name_for(txid);
         let name = ConstraintName::Named(index_name.as_str());
-        if index.expressions[..index.n_cols]
-            .iter()
-            .any(Option::is_some)
-        {
-            let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
-            for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
-                if let Some(source) = source {
-                    let source = arena
-                        .alloc_str(source.as_str())
-                        .map_err(|_| crate::sql::eval::arena_full())?;
-                    expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
-                }
+        let mut expressions = [None; crate::storage::MAX_INDEX_COLS];
+        for (position, source) in index.expressions.iter().enumerate().take(index.n_cols) {
+            if let Some(source) = source {
+                let source = arena
+                    .alloc_str(source.as_str())
+                    .map_err(|_| crate::sql::eval::arena_full())?;
+                expressions[position] = Some(crate::sql::parser::parse_expr(source, arena)?);
             }
-            let predicate = match index.predicate {
-                Some(source) => {
+        }
+        let resolved = resolve_index_operator_classes(index)?;
+        let custom = resolved[..index.n_cols]
+            .iter()
+            .any(|class| matches!(class, Some(crate::storage::IndexOperatorClass::Catalog(_))));
+        if custom
+            || index.expressions[..index.n_cols]
+                .iter()
+                .any(Option::is_some)
+        {
+            let predicate = index
+                .predicate
+                .map(|source| {
                     let source = arena
                         .alloc_str(source.as_str())
                         .map_err(|_| crate::sql::eval::arena_full())?;
-                    Some(crate::sql::parser::parse_expr(source, arena)?)
-                }
-                None => None,
-            };
+                    crate::sql::parser::parse_expr(source, arena)
+                })
+                .transpose()?;
+            let mut classes = [crate::storage::IndexOperatorClass::Builtin(
+                crate::sql::types::BtreeOperatorClass::Int4,
+            ); crate::storage::MAX_INDEX_COLS];
+            for position in 0..index.n_cols {
+                classes[position] = resolved[position].expect("index operator class resolved");
+            }
             enforce_expression_index_uniqueness(
                 storage,
                 table_index,
@@ -867,6 +967,7 @@ pub fn check_unique_indexes(
                 txid,
                 icols,
                 &expressions[..index.n_cols],
+                &classes[..index.n_cols],
                 index.nulls_not_distinct,
                 &name,
                 predicate,

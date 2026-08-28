@@ -20,12 +20,12 @@ use crate::sql::ast::{
     CreateTrigger, DomainCheck, ExclusionOperator, Expr, ExtensionMemberIdentity,
     ExtensionRelationKind, IndexAccessMethod, IndexBuildMode, IndexStorageOptionNames,
     IndexStorageOptions, IndexTargetScope, OperatorClassMember, OperatorFamilyMember,
-    OperatorFamilyMemberIdentity, OperatorIdentity, PartitionBound, PartitionClause,
-    PartitionStrategy, PolicyCommand, PolicyExpression, PolicyIdentity, PolicyPermissiveness,
-    PolicyRole, PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument,
-    RoutineArgumentMode, RoutineCreateKind, RoutineIdentity, RoutineParallel, RoutineResultColumn,
-    RoutineTargetKind, StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds,
-    StatisticsName, StatisticsTarget, SubscriptionBehavior, SubscriptionConnect,
+    OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands, PartitionBound,
+    PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression, PolicyIdentity,
+    PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget, RoleOptions,
+    RoutineArgument, RoutineArgumentMode, RoutineCreateKind, RoutineIdentity, RoutineParallel,
+    RoutineResultColumn, RoutineTargetKind, StatisticsExpression, StatisticsKey, StatisticsKeys,
+    StatisticsKinds, StatisticsName, StatisticsTarget, SubscriptionBehavior, SubscriptionConnect,
     SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
     SubscriptionStreaming, SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions,
     TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables,
@@ -858,14 +858,13 @@ impl<'a> Parser<'a> {
         self.expect_op(",")?;
         let right_type = self.operator_operand_type()?;
         self.expect_op(")")?;
-        if left_type.is_none() && right_type.is_none() {
-            return Err(self.err_here("operator must have at least one argument"));
-        }
-        Ok(OperatorIdentity {
-            name,
-            left_type,
-            right_type,
-        })
+        let operands = match (left_type, right_type) {
+            (None, Some(right)) => OperatorOperands::Prefix(right),
+            (Some(left), Some(right)) => OperatorOperands::Binary { left, right },
+            (Some(_), None) => return Err(self.err_here("postfix operators are not supported")),
+            (None, None) => return Err(self.err_here("operator must have at least one argument")),
+        };
+        Ok(OperatorIdentity { name, operands })
     }
 
     fn btree_strategy(&mut self) -> Result<BtreeStrategy, ParseError> {
@@ -995,14 +994,16 @@ impl<'a> Parser<'a> {
             self.expect_op(",")?;
         }
         let function = function.ok_or_else(|| self.err_here("operator FUNCTION is required"))?;
-        if left_type.is_none() && right_type.is_none() {
-            return Err(self.err_here("operator must have at least one argument"));
-        }
+        let operands = match (left_type, right_type) {
+            (None, Some(right)) => OperatorOperands::Prefix(right),
+            (Some(left), Some(right)) => OperatorOperands::Binary { left, right },
+            (Some(_), None) => return Err(self.err_here("postfix operators are not supported")),
+            (None, None) => return Err(self.err_here("operator must have at least one argument")),
+        };
         Ok(Stmt::CreateOperator(CreateOperator {
             name,
             function,
-            left_type,
-            right_type,
+            operands,
             commutator,
             negator,
             hashes,
@@ -4707,8 +4708,7 @@ impl<'a> Parser<'a> {
             };
             let mut identities = [OperatorIdentity {
                 name: QualName::bare("="),
-                left_type: None,
-                right_type: Some("bool"),
+                operands: OperatorOperands::Prefix("bool"),
             }; MAX_LIST];
             let mut count = 0usize;
             loop {

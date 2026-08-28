@@ -1939,8 +1939,9 @@ struct IdxInfo {
     include_columns: [u16; crate::storage::MAX_INDEX_COLS],
     collations: [crate::sql::ast::Collation; crate::storage::MAX_INDEX_COLS],
     explicit_collations: [bool; crate::storage::MAX_INDEX_COLS],
-    operator_classes:
-        [Option<crate::sql::types::BtreeOperatorClass>; crate::storage::MAX_INDEX_COLS],
+    operator_classes: [Option<crate::storage::IndexOperatorClass>; crate::storage::MAX_INDEX_COLS],
+    resolved_operator_classes:
+        [Option<crate::storage::IndexOperatorClass>; crate::storage::MAX_INDEX_COLS],
     descending: [bool; crate::storage::MAX_INDEX_COLS],
     nulls_first: [bool; crate::storage::MAX_INDEX_COLS],
     n_cols: usize,
@@ -2053,6 +2054,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
                 explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
                 operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+                resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
                 descending,
                 nulls_first,
                 n_cols: columns.len(),
@@ -2172,6 +2174,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
             info.collations = index.collations;
             info.explicit_collations = index.explicit_collations;
             info.operator_classes = index.operator_classes;
+            info.resolved_operator_classes = index.resolved_operator_classes;
             info.explicit_definition = Some(index.mutable_for(txid));
             visit(info);
         }
@@ -2190,6 +2193,7 @@ fn empty_index() -> IdxInfo {
         collations: [crate::sql::ast::Collation::None; crate::storage::MAX_INDEX_COLS],
         explicit_collations: [false; crate::storage::MAX_INDEX_COLS],
         operator_classes: [None; crate::storage::MAX_INDEX_COLS],
+        resolved_operator_classes: [None; crate::storage::MAX_INDEX_COLS],
         descending: [false; crate::storage::MAX_INDEX_COLS],
         nulls_first: [false; crate::storage::MAX_INDEX_COLS],
         n_cols: 0,
@@ -4683,10 +4687,29 @@ fn fk_action_suffix(a: crate::storage::FkAction, event: &str) -> &'static str {
 }
 
 /// The complete `CREATE INDEX` statement returned by `pg_get_indexdef`.
-fn write_index_key_metadata(out: &mut impl core::fmt::Write, info: &IdxInfo, position: usize) {
+fn write_index_key_metadata(
+    out: &mut impl core::fmt::Write,
+    storage: &Storage,
+    txid: u32,
+    info: &IdxInfo,
+    position: usize,
+) {
     if info.explicit_collations[position] {
         let _ = out.write_str(" COLLATE ");
         write_identifier(out, info.collations[position].name());
+    }
+    if let Some(crate::storage::IndexOperatorClass::Catalog(oid)) = info.operator_classes[position]
+    {
+        let _ = out.write_char(' ');
+        let slot = storage
+            .operator_class_slot_by_oid(oid, txid)
+            .expect("index operator class dependency is visible");
+        let definition = storage.operator_class_for(slot, txid);
+        if !storage.schema_is_on_path(definition.schema) {
+            write_identifier(out, definition.schema.as_str());
+            let _ = out.write_char('.');
+        }
+        write_identifier(out, definition.name.as_str());
     }
 }
 
@@ -4778,7 +4801,7 @@ pub fn index_def_text<'a>(
             } else {
                 write_identifier(&mut s, col_name(k));
             }
-            write_index_key_metadata(&mut s, info, k);
+            write_index_key_metadata(&mut s, storage, txid, info, k);
             if info.descending[k] {
                 let _ = s.write_str(" DESC");
             }
@@ -7787,66 +7810,48 @@ fn pg_depend<'a>(
                 )
             })?;
         let family = storage.operator_family_for(family_slot, txid);
-        for (strategy_index, operator_oid) in class.operators.into_iter().enumerate() {
-            if operator_oid == 0 {
-                continue;
-            }
-            let strategy = crate::sql::ast::BtreeStrategy::from_number(
-                u32::try_from(strategy_index + 1).expect("btree strategy index"),
-            )
-            .expect("operator class strategy is bounded");
+        for member in class.operators.into_iter().filter(|member| member.used) {
             let Some((member_index, _)) = family
                 .operators
                 .iter()
-                .filter(|member| member.used)
                 .enumerate()
-                .find(|(_, member)| {
-                    member.strategy == strategy
-                        && member.operator == operator_oid
-                        && member.left == class.input
-                        && member.right == class.input
-                })
+                .find(|(_, candidate)| **candidate == member)
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "operator class member identity is unavailable"
                 ));
             };
-            let member_oid = class.family * 16 + member_index as i32;
+            let member_oid = operator_family_member_oid(class.family, member_index);
             push(PG_AMOP_OID, member_oid, PG_OPCLASS_OID, class_oid, 0, "i")?;
             push(
                 PG_AMOP_OID,
                 member_oid,
                 PG_OPERATOR_OID,
-                operator_oid,
+                member.operator,
                 0,
                 "n",
             )?;
         }
-        if class.compare_function != 0 {
+        for member in class.functions.into_iter().filter(|member| member.used) {
             let Some((member_index, _)) = family
                 .functions
                 .iter()
-                .filter(|member| member.used)
                 .enumerate()
-                .find(|(_, member)| {
-                    member.function == class.compare_function
-                        && member.left == class.input
-                        && member.right == class.input
-                })
+                .find(|(_, candidate)| **candidate == member)
             else {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
                     "operator class support-function identity is unavailable"
                 ));
             };
-            let member_oid = class.family * 16 + member_index as i32 + 8;
+            let member_oid = operator_family_member_oid(class.family, member_index);
             push(PG_AMPROC_OID, member_oid, PG_OPCLASS_OID, class_oid, 0, "i")?;
             push(
                 PG_AMPROC_OID,
                 member_oid,
                 PG_PROC_OID,
-                class.compare_function,
+                member.function,
                 0,
                 "n",
             )?;
@@ -7857,19 +7862,16 @@ fn pg_depend<'a>(
         for (member_index, member) in family
             .operators
             .iter()
-            .filter(|member| member.used)
             .enumerate()
+            .filter(|(_, member)| member.used)
         {
-            let class_owned = storage.operator_classes_visible_to(txid).any(|(_, class)| {
-                class.family == family_oid
-                    && member.left == class.input
-                    && member.right == class.input
-                    && class.operators[usize::from(member.strategy.number() - 1)] == member.operator
-            });
+            let class_owned = storage
+                .operator_classes_visible_to(txid)
+                .any(|(_, class)| class.family == family_oid && class.operators.contains(member));
             if class_owned {
                 continue;
             }
-            let member_oid = family_oid * 16 + member_index as i32;
+            let member_oid = operator_family_member_oid(family_oid, member_index);
             push(PG_AMOP_OID, member_oid, PG_OPFAMILY_OID, family_oid, 0, "a")?;
             push(
                 PG_AMOP_OID,
@@ -7883,19 +7885,16 @@ fn pg_depend<'a>(
         for (member_index, member) in family
             .functions
             .iter()
-            .filter(|member| member.used)
             .enumerate()
+            .filter(|(_, member)| member.used)
         {
-            let class_owned = storage.operator_classes_visible_to(txid).any(|(_, class)| {
-                class.family == family_oid
-                    && member.left == class.input
-                    && member.right == class.input
-                    && class.compare_function == member.function
-            });
+            let class_owned = storage
+                .operator_classes_visible_to(txid)
+                .any(|(_, class)| class.family == family_oid && class.functions.contains(member));
             if class_owned {
                 continue;
             }
-            let member_oid = family_oid * 16 + member_index as i32 + 8;
+            let member_oid = operator_family_member_oid(family_oid, member_index);
             push(
                 PG_AMPROC_OID,
                 member_oid,
@@ -7911,6 +7910,32 @@ fn pg_depend<'a>(
                 member.function,
                 0,
                 "a",
+            )?;
+        }
+    }
+
+    for index_slot in 0..storage.index_count() {
+        let Some(index) = storage.index_visible_to(index_slot, txid) else {
+            continue;
+        };
+        for position in 0..index.n_cols {
+            let Some(crate::storage::IndexOperatorClass::Catalog(class_oid)) =
+                index.resolved_operator_classes[position]
+            else {
+                continue;
+            };
+            if index.resolved_operator_classes[..position].contains(&Some(
+                crate::storage::IndexOperatorClass::Catalog(class_oid),
+            )) {
+                continue;
+            }
+            push(
+                PG_CLASS_OID,
+                explicit_index_oid(&index),
+                PG_OPCLASS_OID,
+                class_oid.get(),
+                0,
+                "n",
             )?;
         }
     }
@@ -8341,7 +8366,7 @@ fn index_operator_classes<'a>(
     let table = storage.table_def(info.table_slot, txid);
     let mut values = [0i32; crate::storage::MAX_INDEX_COLS];
     for (position, value) in values.iter_mut().enumerate().take(info.n_cols) {
-        *value = if let Some(operator_class) = info.operator_classes[position] {
+        *value = if let Some(operator_class) = info.resolved_operator_classes[position] {
             operator_class.oid()
         } else if info.expression_keys[position] {
             let source = index_expression_source(storage, info, position, txid)
@@ -9092,6 +9117,16 @@ fn pg_opclass<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+fn operator_family_member_oid(family_oid: i32, position: usize) -> i32 {
+    const MEMBER_OID_BASE: i64 = 680_000;
+    let family = i64::from(family_oid - crate::storage::OPERATOR_FAMILY_OID_BASE);
+    let position = i64::try_from(position).expect("operator-family position is bounded");
+    i32::try_from(
+        MEMBER_OID_BASE + family * crate::storage::MAX_OPERATOR_FAMILY_MEMBERS as i64 + position,
+    )
+    .expect("operator-family member OID range exhausted")
+}
+
 fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_amop",
@@ -9114,8 +9149,8 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         for (member_index, member) in family
             .operators
             .iter()
-            .filter(|member| member.used)
             .enumerate()
+            .filter(|(_, member)| member.used)
         {
             if count == rows.len() {
                 return Err(catalog_capacity_exceeded("pg_amop"));
@@ -9123,9 +9158,10 @@ fn pg_amop<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             rows[count] = row(
                 &[
                     Datum::Int4(2602),
-                    Datum::Int4(
-                        storage.operator_family(family_slot).oid() * 16 + member_index as i32,
-                    ),
+                    Datum::Int4(operator_family_member_oid(
+                        storage.operator_family(family_slot).oid(),
+                        member_index,
+                    )),
                     Datum::Int4(storage.operator_family(family_slot).oid()),
                     Datum::Int4(catalog_routine_result_oid(storage, txid, member.left)?),
                     Datum::Int4(catalog_routine_result_oid(storage, txid, member.right)?),
@@ -9166,8 +9202,8 @@ fn pg_amproc<'a>(
         for (member_index, member) in family
             .functions
             .iter()
-            .filter(|member| member.used)
             .enumerate()
+            .filter(|(_, member)| member.used)
         {
             if count == rows.len() {
                 return Err(catalog_capacity_exceeded("pg_amproc"));
@@ -9175,9 +9211,10 @@ fn pg_amproc<'a>(
             rows[count] = row(
                 &[
                     Datum::Int4(2603),
-                    Datum::Int4(
-                        storage.operator_family(family_slot).oid() * 16 + member_index as i32 + 8,
-                    ),
+                    Datum::Int4(operator_family_member_oid(
+                        storage.operator_family(family_slot).oid(),
+                        member_index,
+                    )),
                     Datum::Int4(storage.operator_family(family_slot).oid()),
                     Datum::Int4(catalog_routine_result_oid(storage, txid, member.left)?),
                     Datum::Int4(catalog_routine_result_oid(storage, txid, member.right)?),
@@ -10936,7 +10973,7 @@ fn pg_indexes<'a>(
                         table_def.columns()[info.columns[k] as usize].name.as_str(),
                     );
                 }
-                write_index_key_metadata(&mut indexdef, info, k);
+                write_index_key_metadata(&mut indexdef, storage, txid, info, k);
                 if info.descending[k] {
                     let _ = indexdef.write_str(" DESC");
                 }

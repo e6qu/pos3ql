@@ -2855,24 +2855,6 @@ impl Checkpointer {
                             ));
                         }
                     };
-                    let mut operators = [0; 5];
-                    for operator in &mut operators {
-                        let oid: i32 = parse_field(words.next(), "operator class operator")?;
-                        if oid != 0 {
-                            if storage.operator_slot_by_oid(oid, 0).is_none() {
-                                return Err(CheckpointSetupError::Corrupt(
-                                    "operator class operator missing",
-                                ));
-                            }
-                            *operator = oid;
-                        }
-                    }
-                    let compare_oid: i32 = parse_field(words.next(), "operator class function")?;
-                    if compare_oid != 0 && storage.routine_slot_by_oid(compare_oid, 0).is_none() {
-                        return Err(CheckpointSetupError::Corrupt(
-                            "operator class function missing",
-                        ));
-                    }
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt(
                             "trailing operator class fields",
@@ -2889,13 +2871,92 @@ impl Checkpointer {
                                 input,
                                 storage: key_storage,
                                 default,
-                                operators,
-                                compare_function: compare_oid,
+                                operators: [crate::storage::OperatorFamilyOperator::EMPTY;
+                                    crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
+                                functions: [crate::storage::OperatorFamilyFunction::EMPTY;
+                                    crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
                             },
                         )
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest operator class rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                tag @ (Some("opco") | Some("opcf")) => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let class_oid: i32 = parse_field(words.next(), "operator class member class")?;
+                    let class_oid = crate::storage::OperatorClassOid::parse(class_oid).ok_or(
+                        CheckpointSetupError::Corrupt("invalid operator class identity"),
+                    )?;
+                    let class_slot = storage.operator_class_slot_by_oid(class_oid, 0).ok_or(
+                        CheckpointSetupError::Corrupt("operator class member class missing"),
+                    )?;
+                    let mut definition = storage.operator_class_for(class_slot, 0);
+                    if tag == Some("opco") {
+                        let strategy = parse_field::<u32>(words.next(), "operator class strategy")
+                            .ok()
+                            .and_then(crate::sql::ast::BtreeStrategy::from_number)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "invalid operator class strategy",
+                            ))?;
+                        let left = manifest_routine_result(&mut words)?;
+                        let right = manifest_routine_result(&mut words)?;
+                        let operator = parse_field(words.next(), "operator class operator")?;
+                        if storage.operator_slot_by_oid(operator, 0).is_none() {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "operator class operator missing",
+                            ));
+                        }
+                        let target = definition
+                            .operators
+                            .iter_mut()
+                            .find(|member| !member.used)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "too many operator class operators",
+                            ))?;
+                        *target = crate::storage::OperatorFamilyOperator {
+                            used: true,
+                            strategy,
+                            left,
+                            right,
+                            operator,
+                        };
+                    } else {
+                        let left = manifest_routine_result(&mut words)?;
+                        let right = manifest_routine_result(&mut words)?;
+                        let function = parse_field(words.next(), "operator class function")?;
+                        if storage.routine_slot_by_oid(function, 0).is_none() {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "operator class function missing",
+                            ));
+                        }
+                        let target = definition
+                            .functions
+                            .iter_mut()
+                            .find(|member| !member.used)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "too many operator class functions",
+                            ))?;
+                        *target = crate::storage::OperatorFamilyFunction {
+                            used: true,
+                            left,
+                            right,
+                            function,
+                        };
+                    }
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing operator class member fields",
+                        ));
+                    }
+                    let created_at = storage.operator_class(class_slot).created_at;
+                    storage
+                        .replay_set_operator_class(created_at, definition)
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest operator class member rejected: {}",
                                 error.message.as_str()
                             ))
                         })?;
@@ -3737,15 +3798,74 @@ impl Checkpointer {
                     }
                     let mut operator_classes = [None; crate::storage::MAX_INDEX_COLS];
                     for operator_class in operator_classes.iter_mut().take(n_cols) {
-                        let code: u8 = parse_field(words.next(), "idx operator class")?;
-                        *operator_class = if code == 0 {
+                        let encoded = words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("idx operator class missing"))?;
+                        *operator_class = if encoded == "0" {
                             None
-                        } else {
-                            Some(
+                        } else if let Some(code) = encoded.strip_prefix('b') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt("bad builtin index operator class")
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Builtin(
                                 crate::sql::types::BtreeOperatorClass::from_code(code).ok_or(
-                                    CheckpointSetupError::Corrupt("bad index operator class"),
+                                    CheckpointSetupError::Corrupt(
+                                        "bad builtin index operator class",
+                                    ),
                                 )?,
-                            )
+                            ))
+                        } else if let Some(oid) = encoded.strip_prefix('c') {
+                            let oid = oid.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt("bad catalog index operator class")
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Catalog(
+                                crate::storage::OperatorClassOid::parse(oid).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad catalog index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "bad index operator class encoding",
+                            ));
+                        };
+                    }
+                    let mut resolved_operator_classes = [None; crate::storage::MAX_INDEX_COLS];
+                    for operator_class in resolved_operator_classes.iter_mut().take(n_cols) {
+                        let encoded = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "idx resolved operator class missing",
+                        ))?;
+                        *operator_class = if let Some(code) = encoded.strip_prefix('b') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt(
+                                    "bad builtin resolved index operator class",
+                                )
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Builtin(
+                                crate::sql::types::BtreeOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad builtin resolved index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else if let Some(oid) = encoded.strip_prefix('c') {
+                            let oid = oid.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt(
+                                    "bad catalog resolved index operator class",
+                                )
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Catalog(
+                                crate::storage::OperatorClassOid::parse(oid).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad catalog resolved index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "bad resolved index operator class encoding",
+                            ));
                         };
                     }
                     let tablespace: u16 = parse_field(words.next(), "idx tablespace")?;
@@ -3806,6 +3926,7 @@ impl Checkpointer {
                                 collations,
                                 explicit_collations,
                                 operator_classes,
+                                resolved_operator_classes,
                                 descending,
                                 nulls_first,
                                 n_cols,
@@ -5741,7 +5862,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "opc {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "opc {} {} {} {} {} {} {} {}",
                     class.created_at,
                     ManifestName(definition.schema.as_str()),
                     ManifestName(definition.name.as_str()),
@@ -5750,14 +5871,33 @@ impl Checkpointer {
                     ManifestRoutineResult(definition.input),
                     ManifestRoutineResult(definition.storage),
                     u8::from(definition.default),
-                    definition.operators[0],
-                    definition.operators[1],
-                    definition.operators[2],
-                    definition.operators[3],
-                    definition.operators[4],
-                    definition.compare_function,
                 ),
             )?;
+            for member in definition.operators.iter().filter(|member| member.used) {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "opco {} {} {} {} {}",
+                        class.oid(),
+                        member.strategy.number(),
+                        ManifestRoutineResult(member.left),
+                        ManifestRoutineResult(member.right),
+                        member.operator,
+                    ),
+                )?;
+            }
+            for member in definition.functions.iter().filter(|member| member.used) {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "opcf {} {} {} {}",
+                        class.oid(),
+                        ManifestRoutineResult(member.left),
+                        ManifestRoutineResult(member.right),
+                        member.function,
+                    ),
+                )?;
+            }
         }
         for (_, trigger) in storage.triggers_with_slots_visible_to(0) {
             use core::fmt::Write;
@@ -6184,18 +6324,33 @@ impl Checkpointer {
             }
             let mut collations = StackStr::<64>::new();
             let mut operator_classes = StackStr::<128>::new();
+            let mut resolved_operator_classes = StackStr::<128>::new();
             let mut statistics = StackStr::<128>::new();
             for position in 0..index.n_cols {
                 let code = index.collations[position].code()
                     | (u8::from(index.explicit_collations[position]) << 7);
                 let _ = write!(collations, " {code}");
-                let _ = operator_classes.write_str(" ");
-                let _ = write!(
-                    operator_classes,
-                    "{}",
-                    index.operator_classes[position]
-                        .map_or(0, crate::sql::types::BtreeOperatorClass::code)
-                );
+                match index.operator_classes[position] {
+                    None => {
+                        let _ = operator_classes.write_str(" 0");
+                    }
+                    Some(crate::storage::IndexOperatorClass::Builtin(class)) => {
+                        let _ = write!(operator_classes, " b{}", class.code());
+                    }
+                    Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
+                        let _ = write!(operator_classes, " c{}", oid.get());
+                    }
+                }
+                match index.resolved_operator_classes[position]
+                    .expect("live index key has a resolved operator class")
+                {
+                    crate::storage::IndexOperatorClass::Builtin(class) => {
+                        let _ = write!(resolved_operator_classes, " b{}", class.code());
+                    }
+                    crate::storage::IndexOperatorClass::Catalog(oid) => {
+                        let _ = write!(resolved_operator_classes, " c{}", oid.get());
+                    }
+                }
                 let _ = write!(statistics, " {}", index.mutable.statistics[position]);
             }
             let mutable = index.mutable;
@@ -6213,7 +6368,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{} {} {} {} {}{} {} {}",
+                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {}",
                     index.created_at,
                     u8::from(index.unique),
                     index.n_cols,
@@ -6232,6 +6387,7 @@ impl Checkpointer {
                     index.n_cols,
                     collations.as_str(),
                     operator_classes.as_str(),
+                    resolved_operator_classes.as_str(),
                     mutable.tablespace,
                     fillfactor,
                     deduplicate,

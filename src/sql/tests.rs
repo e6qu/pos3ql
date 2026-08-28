@@ -41,6 +41,7 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
         "SET search_path = custom_ops, pg_catalog; SELECT '+(integer,integer)'::regoperator::oid = (SELECT oid FROM pg_operator WHERE oprnamespace='custom_ops'::regnamespace AND oprname='+'); RESET search_path",
         "CREATE OPERATOR FAMILY public.int_family USING btree",
         "ALTER OPERATOR FAMILY public.int_family USING btree ADD OPERATOR 3 public.===(integer, integer), FUNCTION 1 (integer, integer) public.int_compare(integer, integer)",
+        "ALTER OPERATOR FAMILY public.int_family USING btree DROP OPERATOR 3 (integer, integer), FUNCTION 1 (integer, integer)",
         "CREATE OPERATOR CLASS public.int_class FOR TYPE integer USING btree FAMILY public.int_family AS OPERATOR 3 public.===, FUNCTION 1 public.int_compare(integer, integer)",
         "CREATE TABLE operator_class_index(value integer)",
         "CREATE INDEX operator_class_index_idx ON operator_class_index (value public.int_class)",
@@ -50,7 +51,9 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
         "BEGIN; ALTER OPERATOR CLASS public.int_class USING btree RENAME TO abandoned; ROLLBACK",
         "ALTER OPERATOR CLASS public.int_class USING btree RENAME TO int_class_renamed",
         "DROP OPERATOR CLASS public.int_class_renamed USING btree",
-        "ALTER OPERATOR FAMILY public.int_family USING btree DROP OPERATOR 3 (integer, integer), FUNCTION 1 (integer, integer)",
+        "SELECT count(*) FROM pg_indexes WHERE indexname = 'operator_class_index_idx'",
+        "DROP OPERATOR CLASS public.int_class_renamed USING btree CASCADE",
+        "SELECT count(*) FROM pg_opclass WHERE opcname='int_class_renamed'; SELECT count(*) FROM pg_indexes WHERE indexname='operator_class_index_idx'; SELECT count(*) FROM pg_amop WHERE amopfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family'); SELECT count(*) FROM pg_amproc WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family')",
         "DROP OPERATOR FAMILY public.int_family USING btree",
         "DROP OPERATOR public.===(integer, integer)",
         "DROP CAST (public.mood AS text)",
@@ -61,8 +64,8 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
             assert!(text.contains("ERROR"), "{sql}: {text}");
             continue;
         }
-        if sql.starts_with("CREATE INDEX operator_class_index_idx") {
-            assert!(text.contains("0A000"), "{sql}: {text}");
+        if sql == "DROP OPERATOR CLASS public.int_class_renamed USING btree" {
+            assert!(text.contains("2BP01"), "{sql}: {text}");
             continue;
         }
         assert!(!text.contains("ERROR"), "{sql}: {text}");
@@ -76,6 +79,14 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
             assert_eq!(rows, ["1"], "{sql}: {text}");
         } else if sql.starts_with("SELECT count(*) FROM pg_cast") {
             assert_eq!(rows, ["1", "1", "1", "1", "1", "1"], "{sql}: {text}");
+        } else if sql
+            .starts_with("SELECT count(*) FROM pg_opclass WHERE opcname='int_class_renamed'")
+        {
+            assert_eq!(rows, ["0", "0", "0", "0"], "{sql}: {text}");
+        } else if sql
+            == "SELECT count(*) FROM pg_indexes WHERE indexname = 'operator_class_index_idx'"
+        {
+            assert_eq!(rows, ["1"], "{sql}: {text}");
         } else if sql.starts_with("SELECT 1 ===") {
             assert_eq!(rows, ["t|f"], "{sql}: {text}");
         } else if sql.starts_with("SELECT pg_typeof(oprcode)") {
@@ -123,6 +134,52 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
 }
 
 #[test]
+fn cast_function_resolution_matches_postgresql_contracts() {
+    let config = test_config("cast-function-contracts");
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE public.cast_mood AS ENUM ('low', 'high'); \
+         CREATE FUNCTION public.cast_mood_text(public.cast_mood, integer) \
+           RETURNS varchar LANGUAGE SQL RETURN CASE WHEN $2 = -1 THEN \
+             CASE WHEN $1 = 'low' THEN 'low' ELSE 'high' END ELSE 'bad' END; \
+         CREATE CAST (public.cast_mood AS text) WITH FUNCTION public.cast_mood_text; \
+         SELECT 'low'::public.cast_mood::text",
+    );
+    let text = String::from_utf8_lossy(&setup);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&setup), ["low"]);
+
+    let ambiguous = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE public.cast_tone AS ENUM ('quiet', 'loud'); \
+         CREATE FUNCTION public.cast_tone_text(public.cast_tone) RETURNS text \
+           LANGUAGE SQL RETURN $1::text; \
+         CREATE FUNCTION public.cast_tone_text(public.cast_tone, integer) RETURNS text \
+           LANGUAGE SQL RETURN $1::text; \
+         CREATE CAST (public.cast_tone AS text) WITH FUNCTION public.cast_tone_text",
+    );
+    assert!(String::from_utf8_lossy(&ambiguous).contains("42725"));
+
+    let domain = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN public.cast_domain AS integer; \
+         CREATE FUNCTION public.cast_domain_text(public.cast_domain) RETURNS text \
+           LANGUAGE SQL RETURN 'defined'; \
+         CREATE CAST (public.cast_domain AS text) \
+           WITH FUNCTION public.cast_domain_text(public.cast_domain); \
+         SELECT 7::public.cast_domain::text",
+    );
+    let text = String::from_utf8_lossy(&domain);
+    assert!(text.contains("cast will be ignored"), "{text}");
+    assert_eq!(data_rows(&domain), ["7"]);
+}
+
+#[test]
 fn cast_operator_dependencies_enforce_restrict_and_transactional_cascade() {
     let config = test_config("cast-operator-dependencies");
     let mut budget = Budget::new(1 << 28);
@@ -135,9 +192,6 @@ fn cast_operator_dependencies_enforce_restrict_and_transactional_cascade() {
         CREATE CAST (public.mood AS text) WITH FUNCTION public.mood_text(public.mood); \
         CREATE OPERATOR public.=== (FUNCTION = public.mood_same, LEFTARG = public.mood, RIGHTARG = public.mood); \
         CREATE OPERATOR FAMILY public.mood_family USING btree; \
-        ALTER OPERATOR FAMILY public.mood_family USING btree ADD \
-          OPERATOR 3 public.===(public.mood, public.mood), \
-          FUNCTION 1 (public.mood, public.mood) public.mood_compare(public.mood, public.mood); \
         CREATE OPERATOR CLASS public.mood_class FOR TYPE public.mood USING btree \
           FAMILY public.mood_family AS OPERATOR 3 public.===, \
           FUNCTION 1 public.mood_compare(public.mood, public.mood)";
@@ -372,32 +426,45 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
           RETURN CASE WHEN $1 = 'sad' THEN 'sad-cast' ELSE 'ok-cast' END; \
         CREATE FUNCTION public.int_same(integer, integer) RETURNS boolean LANGUAGE SQL RETURN $1 = $2; \
         CREATE FUNCTION public.int_compare(integer, integer) RETURNS integer LANGUAGE SQL \
-          RETURN CASE WHEN $1 < $2 THEN -1 WHEN $1 > $2 THEN 1 ELSE 0 END; \
+          RETURN CASE WHEN $1 % 10 < $2 % 10 THEN -1 WHEN $1 % 10 > $2 % 10 THEN 1 ELSE 0 END; \
+        CREATE FUNCTION public.int_prefix(integer) RETURNS integer LANGUAGE SQL RETURN -$1; \
         CREATE CAST (public.mood AS text) WITH FUNCTION public.mood_text(public.mood) AS IMPLICIT; \
         CREATE OPERATOR public.=== (FUNCTION = public.int_same, LEFTARG = integer, RIGHTARG = integer, HASHES, MERGES); \
+        CREATE OPERATOR public.!! (FUNCTION = public.int_prefix, RIGHTARG = integer); \
         CREATE OPERATOR FAMILY public.int_family USING btree; \
-        ALTER OPERATOR FAMILY public.int_family USING btree ADD \
-          OPERATOR 3 public.===(integer, integer), \
-          FUNCTION 1 (integer, integer) public.int_compare(integer, integer); \
         CREATE OPERATOR CLASS public.int_class FOR TYPE integer USING btree \
           FAMILY public.int_family AS OPERATOR 3 public.===, \
           FUNCTION 1 public.int_compare(integer, integer); \
+        CREATE TABLE public.catalog_index_values(value integer); \
+        CREATE UNIQUE INDEX catalog_index_values_mod10 ON public.catalog_index_values \
+          (value public.int_class); \
+        INSERT INTO public.catalog_index_values VALUES (1); \
         CREATE VIEW public.catalog_operator_view AS SELECT 1 === 1 AS same; \
+        CREATE VIEW public.catalog_prefix_view AS SELECT !! 4 AS value; \
         DROP FUNCTION public.catalog_gap(integer)";
-    let verify = "SELECT 'sad'::public.mood::text, public.mood_text('sad'::public.mood), 1 === 1; \
+    let verify = "SELECT 'sad'::public.mood::text, public.mood_text('sad'::public.mood), 1 === 1, !! 4, OPERATOR(public.!!) 5; \
         SELECT same FROM public.catalog_operator_view; \
+        SELECT value FROM public.catalog_prefix_view; \
+        SELECT value FROM public.catalog_index_values; \
         SELECT count(*) FROM pg_cast; \
         SELECT count(*) FROM pg_operator WHERE oprname='==='; \
         SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; \
         SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; \
         SELECT count(*) FROM pg_amop WHERE amopstrategy=3; \
         SELECT count(*) FROM pg_amproc WHERE amprocnum=1; \
+        SELECT count(*) FROM pg_depend WHERE classid='pg_class'::regclass AND objid='catalog_index_values_mod10'::regclass AND refclassid='pg_opclass'::regclass; \
         SELECT castmethod, castcontext, castfunc <> 0 FROM pg_cast";
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(&mut engine, &mut budget, ddl);
     assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO public.catalog_index_values VALUES (11)",
+    );
+    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
     drop(engine);
 
     let mut wal_budget = Budget::new(1 << 29);
@@ -405,8 +472,11 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
     assert_eq!(
         data_rows(&run_with(&mut wal_recovered, &mut wal_budget, verify)),
         [
-            "sad-cast|sad-cast|t",
+            "sad-cast|sad-cast|t|-4|-5",
             "t",
+            "-4",
+            "1",
+            "1",
             "1",
             "1",
             "1",
@@ -425,8 +495,11 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
     assert_eq!(
         data_rows(&run_with(&mut cold, &mut cold_budget, verify)),
         [
-            "sad-cast|sad-cast|t",
+            "sad-cast|sad-cast|t|-4|-5",
             "t",
+            "-4",
+            "1",
+            "1",
             "1",
             "1",
             "1",

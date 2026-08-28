@@ -1532,10 +1532,15 @@ pub enum IndexAccessMethod {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorOperands<'a> {
+    Prefix(&'a str),
+    Binary { left: &'a str, right: &'a str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperatorIdentity<'a> {
     pub name: QualName<'a>,
-    pub left_type: Option<&'a str>,
-    pub right_type: Option<&'a str>,
+    pub operands: OperatorOperands<'a>,
 }
 
 pub(crate) const CATALOG_OPERATOR_CALL_PREFIX: &str = "\u{1}operator\u{1f}";
@@ -1550,8 +1555,7 @@ pub(crate) fn catalog_operator_call(name: &str) -> Option<(Option<&str>, &str)> 
 pub struct CreateOperator<'a> {
     pub name: QualName<'a>,
     pub function: QualName<'a>,
-    pub left_type: Option<&'a str>,
-    pub right_type: Option<&'a str>,
+    pub operands: OperatorOperands<'a>,
     pub commutator: Option<QualName<'a>>,
     pub negator: Option<QualName<'a>>,
     pub hashes: bool,

@@ -1167,7 +1167,7 @@ fn record_routine_call(
 
 fn record_operator_call(
     identity: crate::sql::ast::QualName<'_>,
-    operands: (&Expr<'_>, &Expr<'_>),
+    operands: &[&Expr<'_>],
     storage: &Storage,
     txid: u32,
     resolver: &DependencyTypes<'_, '_, '_>,
@@ -1175,7 +1175,6 @@ fn record_operator_call(
     needs_scope: &mut bool,
 ) -> Result<(), SqlError> {
     let crate::sql::ast::QualName { schema, name } = identity;
-    let (left, right) = operands;
     let has_catalog_candidate = storage.operators_visible_to(txid).any(|(_, operator)| {
         operator.name.as_str() == name
             && schema.map_or_else(
@@ -1195,15 +1194,23 @@ fn record_operator_call(
             }
         })
     };
-    let (left_oid, right_oid) = match (infer(left), infer(right)) {
-        (Ok(left), Ok(right)) => (left, right),
-        _ => {
+    if !(1..=2).contains(&operands.len()) {
+        return Err(sql_err!(sqlstate::INTERNAL_ERROR, "invalid operator arity"));
+    }
+    let mut inferred = [0; 2];
+    for (slot, operand) in inferred.iter_mut().zip(operands.iter().copied()) {
+        let Ok(oid) = infer(operand) else {
             *needs_scope = true;
             return Ok(());
-        }
+        };
+        *slot = oid;
+    }
+    let (left_oid, right_oid) = if operands.len() == 1 {
+        (None, Some(inferred[0]))
+    } else {
+        (Some(inferred[0]), Some(inferred[1]))
     };
-    let Some(slot) =
-        storage.operator_slot_for_oids(schema, name, Some(left_oid), Some(right_oid), txid)?
+    let Some(slot) = storage.operator_slot_for_oids(schema, name, left_oid, right_oid, txid)?
     else {
         return Ok(());
     };
@@ -1246,7 +1253,7 @@ fn collect_routine_dependencies_with_resolver(
         } = expression
         {
             if let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name) {
-                if args.len() == 2
+                if (1..=2).contains(&args.len())
                     && !schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
                 {
                     record_operator_call(
@@ -1254,7 +1261,7 @@ fn collect_routine_dependencies_with_resolver(
                             schema,
                             name: operator,
                         },
-                        (args[0], args[1]),
+                        args,
                         storage,
                         txid,
                         resolver,
@@ -1285,7 +1292,7 @@ fn collect_routine_dependencies_with_resolver(
         {
             record_operator_call(
                 crate::sql::ast::QualName { schema: None, name },
-                (left, right),
+                &[left, right],
                 storage,
                 txid,
                 resolver,

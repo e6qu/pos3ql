@@ -941,7 +941,7 @@ pub(super) fn add_unique_key(
     if def.n_uniques == crate::storage::MAX_UNIQUES {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "a table can have at most {} multi-column key constraints",
+            "a table can have at most {} key constraints",
             crate::storage::MAX_UNIQUES
         ));
     }

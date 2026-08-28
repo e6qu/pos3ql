@@ -1850,6 +1850,70 @@ def has_sqlstate(messages, state):
     return any(kind == b"E" and b"C" + state.encode() + b"\x00" in payload for kind, payload in messages)
 
 
+def test_database_force_terminates_live_backends_with_fatal():
+    admin = connect()
+    admin.sendall(startup_payload(0))
+    drain_startup(admin)
+    setup = simple_query(admin, "CREATE DATABASE wire_force_database")
+    check(
+        "raw wire: FORCE database setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+
+    victim = connect()
+    victim.sendall(startup_payload(0, parameters=(("database", "wire_force_database"),)))
+    drain_startup(victim)
+    blocked = simple_query(admin, "DROP DATABASE wire_force_database")
+    check("raw wire: ordinary DROP sees the live backend", has_sqlstate(blocked, "55006"), blocked)
+    dropped = simple_query(admin, "DROP DATABASE wire_force_database WITH (FORCE)")
+    check(
+        "raw wire: DROP DATABASE FORCE completes",
+        not any(kind == b"E" for kind, _ in dropped),
+        dropped,
+    )
+    kind, payload = read_message(victim)
+    check(
+        "raw wire: FORCE terminates the backend with PostgreSQL FATAL 57P01",
+        kind == b"E" and b"SFATAL\x00" in payload and b"C57P01\x00" in payload,
+        (kind, payload),
+    )
+    victim.close()
+    admin.close()
+
+
+def test_configuration_reload_updates_existing_unoverridden_sessions():
+    admin = connect()
+    observer = connect()
+    for connection in (admin, observer):
+        connection.sendall(startup_payload(0))
+        drain_startup(connection)
+
+    changed = simple_query(admin, "ALTER SYSTEM SET application_name = 'wire-cluster-one'")
+    reloaded = simple_query(admin, "SELECT pg_reload_conf()")
+    observed = simple_query(observer, "SHOW application_name")
+    check(
+        "raw wire: reload reaches an existing session after the command boundary",
+        not any(kind == b"E" for kind, _ in changed + reloaded + observed)
+        and any(kind == b"D" and b"wire-cluster-one" in payload for kind, payload in observed),
+        observed,
+    )
+
+    simple_query(observer, "SET application_name = 'wire-session'")
+    simple_query(admin, "ALTER SYSTEM SET application_name = 'wire-cluster-two'")
+    simple_query(admin, "SELECT pg_reload_conf()")
+    observed = simple_query(observer, "SHOW application_name")
+    check(
+        "raw wire: reload preserves an explicit session SET",
+        any(kind == b"D" and b"wire-session" in payload for kind, payload in observed),
+        observed,
+    )
+    simple_query(admin, "ALTER SYSTEM RESET application_name")
+    simple_query(admin, "SELECT pg_reload_conf()")
+    observer.close()
+    admin.close()
+
+
 def test_catalog_definition_oid_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

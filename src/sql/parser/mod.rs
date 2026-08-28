@@ -869,6 +869,21 @@ impl<'a> Parser<'a> {
                 }
                 Ok(Stmt::CloseCursor(Some(self.col_ident("cursor name")?)))
             }
+            Tok::Ident("discard") => {
+                self.advance()?;
+                let target = if self.eat_ident("all")? {
+                    crate::sql::ast::DiscardTarget::All
+                } else if self.eat_ident("plans")? {
+                    crate::sql::ast::DiscardTarget::Plans
+                } else if self.eat_ident("sequences")? {
+                    crate::sql::ast::DiscardTarget::Sequences
+                } else if self.eat_ident("temporary")? || self.eat_ident("temp")? {
+                    crate::sql::ast::DiscardTarget::Temporary
+                } else {
+                    return Err(self.err_here("expected ALL, PLANS, SEQUENCES, or TEMPORARY"));
+                };
+                Ok(Stmt::Discard(target))
+            }
             Tok::Ident("begin") => {
                 self.advance()?;
                 let characteristics = self.transaction_modifiers(true)?;
@@ -3892,6 +3907,31 @@ impl<'a> Parser<'a> {
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
         use crate::sql::ast::AlterOwnerKind;
+        if self.eat_ident("system")? {
+            if self.eat_ident("set")? {
+                let name = self.any_ident("configuration parameter")?;
+                let _ = self.eat_op("=")?;
+                let start = self.peek_at;
+                while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+                    self.advance()?;
+                }
+                let value = self.text[start..self.peek_at].trim();
+                if value.is_empty() {
+                    return Err(self.err_here("configuration value is required"));
+                }
+                return Ok(Stmt::AlterSystem {
+                    name: Some(name),
+                    value: Some(value),
+                });
+            }
+            self.expect_ident("reset")?;
+            let name = if self.eat_ident("all")? {
+                None
+            } else {
+                Some(self.any_ident("configuration parameter")?)
+            };
+            return Ok(Stmt::AlterSystem { name, value: None });
+        }
         if self.eat_ident("default")? {
             self.expect_ident("privileges")?;
             return self.alter_default_privileges();
@@ -3994,6 +4034,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("tablespace")? {
             return self.alter_tablespace();
+        }
+        if self.eat_ident("database")? {
+            return self.alter_database();
         }
         if self.eat_ident("extension")? {
             return self.alter_extension();
@@ -5083,6 +5126,8 @@ impl<'a> Parser<'a> {
             CommentTarget::Schema(self.col_ident("schema name")?)
         } else if self.eat_ident("tablespace")? {
             CommentTarget::Tablespace(self.col_ident("tablespace name")?)
+        } else if self.eat_ident("database")? {
+            CommentTarget::Database(self.col_ident("database name")?)
         } else if self.eat_ident("extension")? {
             CommentTarget::Extension(self.col_ident("extension name")?)
         } else if self.eat_ident("trigger")? {

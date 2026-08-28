@@ -1584,13 +1584,25 @@ impl<'b> Responder<'b> {
     /// ErrorResponse with the fields every client expects: severity (twice,
     /// localized and not), SQLSTATE, and message.
     pub fn error<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
-        let sqlstate = sqlstate.as_ref();
+        self.error_severity("ERROR", sqlstate.as_ref(), message)
+    }
+
+    pub fn fatal<S: AsRef<str>>(&mut self, sqlstate: S, message: &str) -> Result<(), WireFull> {
+        self.error_severity("FATAL", sqlstate.as_ref(), message)
+    }
+
+    fn error_severity(
+        &mut self,
+        severity: &str,
+        sqlstate: &str,
+        message: &str,
+    ) -> Result<(), WireFull> {
         let diagnostic = crate::sql::eval::take_diagnostic();
         let mut m = MsgOut::begin(self.buffer, wire::MSG_ERROR_RESPONSE);
         m.u8(b'S');
-        m.cstr("ERROR");
+        m.cstr(severity);
         m.u8(b'V');
-        m.cstr("ERROR");
+        m.cstr(severity);
         m.u8(b'C');
         m.cstr(sqlstate);
         m.u8(b'M');

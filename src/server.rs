@@ -922,10 +922,47 @@ impl Server {
                 }
             }
         }
+        self.terminate_dropped_database_connections();
+        if self.engine.take_system_settings_reload() {
+            for slot in self.slots.iter() {
+                if slot.conn.is_open() {
+                    self.engine
+                        .apply_system_settings(&slot.conn.guc)
+                        .expect("stored system settings were validated before publication");
+                }
+            }
+        }
         // A NOTIFY committed by the message just processed leaves notifications
         // in the engine outbox; fan them out to every listening connection.
         if self.engine.has_notifications() {
             self.deliver_notifications();
+        }
+    }
+
+    fn terminate_dropped_database_connections(&mut self) {
+        let dropped = self.engine.dropped_database_connections();
+        for (database, &must_terminate) in dropped.iter().enumerate() {
+            if !must_terminate {
+                continue;
+            }
+            for index in 0..self.slots.len() {
+                if !self.slots[index].conn.is_open()
+                    || self.slots[index].conn.is_terminating()
+                    || self.slots[index].conn.authenticated_database()
+                        != u16::try_from(database).ok()
+                {
+                    continue;
+                }
+                {
+                    let slot = &mut self.slots[index];
+                    self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
+                }
+                if self.slots[index].conn.terminate_by_administrator() {
+                    self.sync_write_interest(index);
+                } else {
+                    self.release(index);
+                }
+            }
         }
     }
 
@@ -1909,6 +1946,9 @@ impl Server {
         self.engine.drop_connection(self.slots[index].conn.id());
         if let Some(role) = self.slots[index].conn.authenticated_role() {
             self.engine.release_role_connection(role);
+        }
+        if let Some(database) = self.slots[index].conn.authenticated_database() {
+            self.engine.release_database_connection(database);
         }
         let slot = &mut self.slots[index];
         if let Some(stream) = slot.conn.close() {

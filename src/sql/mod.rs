@@ -207,6 +207,44 @@ pub struct Engine {
     /// Authenticated sessions per fixed role slot, used to enforce
     /// `CONNECTION LIMIT` without allocating in the server loop.
     role_connections: [u16; crate::storage::MAX_ROLES],
+    database_connections: [u16; crate::storage::MAX_DATABASES],
+    active_system_settings: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS],
+    system_settings_reloaded: bool,
+    discard_protocol_state: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveSystemSetting {
+    name: crate::storage::SqlName,
+    value: crate::util::StackStr<{ crate::storage::ROLE_SETTING_VALUE_MAX }>,
+}
+
+struct ConfigurationReloadScope {
+    engine: *mut Engine,
+    guc: *const GucState,
+}
+
+impl ConfigurationReloadScope {
+    fn new(engine: &mut Engine, guc: &GucState) -> Self {
+        eval::funcs::system::clear_configuration_reload_request();
+        Self { engine, guc }
+    }
+}
+
+impl Drop for ConfigurationReloadScope {
+    fn drop(&mut self) {
+        if !eval::funcs::system::take_configuration_reload_request() {
+            return;
+        }
+        // The scope drops after statement evaluation has released every
+        // Engine and GUC borrow; the pointers refer to its enclosing call.
+        let engine = unsafe { &mut *self.engine };
+        let guc = unsafe { &*self.guc };
+        engine.reload_system_settings();
+        engine
+            .apply_system_settings(guc)
+            .expect("stored system settings were validated before publication");
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -218,6 +256,14 @@ pub(crate) struct RoleLogin {
     pub replication: bool,
     pub connection_limit: i32,
     pub password: Option<crate::storage::RolePassword>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DatabaseLogin {
+    pub slot: u16,
+    pub oid: crate::storage::DatabaseOid,
+    pub allow_connections: bool,
+    pub connection_limit: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -420,6 +466,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DropIndex { .. }
         | Stmt::Reindex { .. }
         | Stmt::Checkpoint
+        | Stmt::AlterSystem { .. }
         | Stmt::AlterTable(_)
         | Stmt::CreateSchema { .. }
         | Stmt::DropSchema { .. }
@@ -432,6 +479,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterRoleRename { .. }
         | Stmt::AlterRoleSetting { .. }
         | Stmt::DropRole { .. } => true,
+        Stmt::Discard(_) => true,
         Stmt::GrantRole { .. }
         | Stmt::RevokeRole { .. }
         | Stmt::GrantPrivileges { .. }
@@ -441,7 +489,10 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DropOwned { .. } => true,
         Stmt::CreateTablespace { .. }
         | Stmt::AlterTablespace { .. }
-        | Stmt::DropTablespace { .. } => true,
+        | Stmt::DropTablespace { .. }
+        | Stmt::CreateDatabase { .. }
+        | Stmt::AlterDatabase { .. }
+        | Stmt::DropDatabase { .. } => true,
     }
 }
 
@@ -657,6 +708,46 @@ fn statement_tag(statement: &Stmt<'_>) -> &'static str {
         Stmt::Reindex { .. } => "REINDEX",
         Stmt::Notify { .. } => "NOTIFY",
         _ => "DDL",
+    }
+}
+
+fn top_level_only_command(statement: &Stmt<'_>) -> Option<&'static str> {
+    match statement {
+        Stmt::Checkpoint => Some("CHECKPOINT"),
+        Stmt::Vacuum { .. } => Some("VACUUM"),
+        Stmt::AlterSystem { .. } => Some("ALTER SYSTEM"),
+        Stmt::Discard(ast::DiscardTarget::All) => Some("DISCARD ALL"),
+        Stmt::CreateDatabase { .. } => Some("CREATE DATABASE"),
+        Stmt::DropDatabase { .. } => Some("DROP DATABASE"),
+        Stmt::CreateTablespace { .. } => Some("CREATE TABLESPACE"),
+        Stmt::DropTablespace { .. } => Some("DROP TABLESPACE"),
+        Stmt::AlterDatabase {
+            action: ast::AlterDatabaseAction::SetTablespace(_),
+            ..
+        } => Some("ALTER DATABASE SET TABLESPACE"),
+        Stmt::CreateIndex {
+            build: ast::IndexBuildMode::Concurrent,
+            ..
+        } => Some("CREATE INDEX CONCURRENTLY"),
+        Stmt::DropIndex {
+            build: ast::IndexBuildMode::Concurrent,
+            ..
+        } => Some("DROP INDEX CONCURRENTLY"),
+        Stmt::Reindex {
+            options:
+                ast::ReindexOptions {
+                    build: ast::IndexBuildMode::Concurrent,
+                    ..
+                },
+            ..
+        } => Some("REINDEX CONCURRENTLY"),
+        Stmt::AlterSubscription {
+            action: ast::AlterSubscriptionAction::SetOptions(patch),
+            ..
+        } if patch.failover.is_some() || patch.two_phase.is_some() => {
+            Some("ALTER SUBSCRIPTION SET")
+        }
+        _ => None,
     }
 }
 
@@ -1692,20 +1783,80 @@ impl Engine {
         })
     }
 
+    pub(crate) fn database_login(&self, name: &str) -> Option<DatabaseLogin> {
+        let slot = self.storage.database_slot(name, 0)?;
+        let database = self.storage.database(slot);
+        let definition = database.definition_for(0);
+        Some(DatabaseLogin {
+            slot: slot as u16,
+            oid: database.oid,
+            allow_connections: definition.allow_connections,
+            connection_limit: definition.connection_limit,
+        })
+    }
+
+    pub(crate) fn select_database(
+        &mut self,
+        database: crate::storage::DatabaseOid,
+    ) -> Result<(), SqlError> {
+        self.storage.select_database(database)?;
+        self.wal.select_database(database);
+        Ok(())
+    }
+
     pub(crate) fn apply_role_settings(&self, role: u16, guc: &GucState) -> Result<(), SqlError> {
         use crate::storage::RoleSettingScope;
+        let database = self.storage.current_database_oid();
         for scope in [
-            RoleSettingScope::AllRolesInDatabase,
+            RoleSettingScope::AllRolesInDatabase(database),
             RoleSettingScope::RoleAllDatabases(role),
-            RoleSettingScope::RoleInDatabase(role),
+            RoleSettingScope::RoleInDatabase { role, database },
         ] {
+            let source = match scope {
+                RoleSettingScope::AllRolesInDatabase(_) => guc::ConnectionDefaultSource::Database,
+                RoleSettingScope::RoleAllDatabases(_) => guc::ConnectionDefaultSource::Role,
+                RoleSettingScope::RoleInDatabase { .. } => {
+                    guc::ConnectionDefaultSource::DatabaseRole
+                }
+            };
             for (_, setting) in self.storage.role_settings() {
                 if setting.live && setting.scope == scope {
-                    guc.set(setting.name.as_str(), setting.value.as_str(), false)?;
+                    guc.set_connection_default(
+                        setting.name.as_str(),
+                        setting.value.as_str(),
+                        source,
+                    )?;
                 }
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn apply_system_settings(&self, guc: &GucState) -> Result<(), SqlError> {
+        guc.reset_cluster_defaults();
+        for setting in self.active_system_settings.iter().flatten() {
+            guc.set_cluster_default(setting.name.as_str(), setting.value.as_str())?;
+        }
+        Ok(())
+    }
+
+    fn reload_system_settings(&mut self) {
+        self.active_system_settings = [None; crate::storage::MAX_SYSTEM_SETTINGS];
+        let mut count = 0usize;
+        for (_, setting) in self.storage.system_settings() {
+            if setting.live {
+                self.active_system_settings[count] = Some(ActiveSystemSetting {
+                    name: setting.name,
+                    value: setting.value,
+                });
+                count += 1;
+            }
+        }
+        self.system_settings_reloaded = true;
+    }
+
+    pub(crate) fn take_system_settings_reload(&mut self) -> bool {
+        core::mem::take(&mut self.system_settings_reloaded)
     }
 
     pub(crate) fn role_can_connect(&self, role: u16) -> bool {
@@ -1728,11 +1879,57 @@ impl Engine {
         true
     }
 
+    pub(crate) fn reserve_database_connection(
+        &mut self,
+        database: DatabaseLogin,
+        superuser: bool,
+    ) -> bool {
+        if !database.allow_connections && !superuser {
+            return false;
+        }
+        let count = &mut self.database_connections[database.slot as usize];
+        if !superuser
+            && database.connection_limit >= 0
+            && usize::from(*count) >= database.connection_limit as usize
+        {
+            return false;
+        }
+        let Some(next) = count.checked_add(1) else {
+            return false;
+        };
+        *count = next;
+        true
+    }
+
     pub(crate) fn release_role_connection(&mut self, slot: u16) {
         let count = &mut self.role_connections[slot as usize];
         *count = count
             .checked_sub(1)
             .expect("an authenticated role connection is released once");
+    }
+
+    pub(crate) fn release_database_connection(&mut self, slot: u16) {
+        let count = &mut self.database_connections[slot as usize];
+        *count = count
+            .checked_sub(1)
+            .expect("an authenticated database connection is released once");
+    }
+
+    pub(crate) fn take_discard_protocol_state(&mut self) -> bool {
+        core::mem::take(&mut self.discard_protocol_state)
+    }
+
+    pub(crate) fn dropped_database_connections(&self) -> [bool; crate::storage::MAX_DATABASES] {
+        core::array::from_fn(|slot| {
+            self.database_connections[slot] != 0
+                && self.storage.database(slot).ddl_state == crate::storage::CatalogDdlState::Absent
+        })
+    }
+
+    fn database_connection_count(&self, name: &str, txid: u32) -> u16 {
+        self.storage
+            .database_slot(name, txid)
+            .map_or(0, |slot| self.database_connections[slot])
     }
 
     /// Whether one extended-protocol statement is COPY. Execute's `max_rows`
@@ -1834,10 +2031,25 @@ impl Engine {
             apply_wal_op(&mut storage, *lsn, operator)?;
         }
         // WAL carries catalog identities as names where runtime slots are not
-        // durable. Rebind only after every replayed catalog definition exists.
-        storage.rebind_domain_base_types()?;
-        storage.rebind_user_type_declarations()?;
-        storage.rebind_routine_types()?;
+        // durable. Rebind each recovered database only after every replayed
+        // definition exists.
+        let mut recovered_databases =
+            [crate::storage::DatabaseOid::POSTGRES; crate::storage::MAX_DATABASES];
+        let mut recovered_database_count = 0usize;
+        for (_, database) in storage.databases_visible_to(0) {
+            recovered_databases[recovered_database_count] = database.oid;
+            recovered_database_count += 1;
+        }
+        for database in &recovered_databases[..recovered_database_count] {
+            storage.select_database(*database)?;
+            wal.select_database(*database);
+            storage.rebind_domain_base_types()?;
+            storage.rebind_user_type_declarations()?;
+            storage.rebind_routine_types()?;
+            storage.rebind_all_stored_query_dependencies()?;
+        }
+        storage.select_database(crate::storage::DatabaseOid::POSTGRES)?;
+        wal.select_database(crate::storage::DatabaseOid::POSTGRES);
         // Startup reconciliation makes every recovered commit durable in the
         // configured object store before the server admits any connection.
         if config.wal_upload
@@ -1868,6 +2080,17 @@ impl Engine {
         // rebuild every table's uniqueness indexes from the recovered committed
         // rows before serving queries.
         storage.rebuild_all_enforcers()?;
+        let mut active_system_settings = [None; crate::storage::MAX_SYSTEM_SETTINGS];
+        let mut active_system_setting_count = 0usize;
+        for (_, setting) in storage.system_settings() {
+            if setting.live {
+                active_system_settings[active_system_setting_count] = Some(ActiveSystemSetting {
+                    name: setting.name,
+                    value: setting.value,
+                });
+                active_system_setting_count += 1;
+            }
+        }
         // The upload buffer must hold at least one full WAL batch.
         let upload_buf = config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes);
         Ok(Self {
@@ -1908,6 +2131,10 @@ impl Engine {
             )?,
             replication_system_id: crate::object_store::writer_id(config),
             role_connections: [0; crate::storage::MAX_ROLES],
+            database_connections: [0; crate::storage::MAX_DATABASES],
+            active_system_settings,
+            system_settings_reloaded: false,
+            discard_protocol_state: false,
         })
     }
 
@@ -3887,6 +4114,13 @@ impl Engine {
                 DdlUndo::TablespaceDropped(slot) => {
                     self.storage.commit_tablespace_drop(*slot as usize)
                 }
+                DdlUndo::DatabaseCreated(slot) => {
+                    self.storage.commit_database_create(*slot as usize)
+                }
+                DdlUndo::DatabaseAltered { slot, .. } => {
+                    self.storage.commit_database_alter(*slot as usize, txn.txid)
+                }
+                DdlUndo::DatabaseDropped(slot) => self.storage.commit_database_drop(*slot as usize),
                 // The reset already happened in place; committing keeps it.
                 DdlUndo::SequenceReset { .. } | DdlUndo::OwnedSequenceReset { .. } => {}
                 DdlUndo::SchemaCreated(slot) => {
@@ -3923,6 +4157,9 @@ impl Engine {
                 }
                 DdlUndo::RoleSettingChanged { slot, .. } => {
                     self.storage.commit_role_setting(*slot as usize);
+                }
+                DdlUndo::SystemSettingChanged { slot, .. } => {
+                    self.storage.commit_system_setting(*slot as usize);
                 }
                 DdlUndo::ObjectOwnerChanged { object, .. } => {
                     self.storage.commit_object_owner(*object, txn.txid);
@@ -4236,6 +4473,23 @@ impl Engine {
             DdlUndo::TablespaceDropped(slot) => {
                 self.storage.rollback_tablespace_drop(slot as usize, txid)
             }
+            DdlUndo::DatabaseCreated(slot) => self.storage.rollback_database_create(slot as usize),
+            DdlUndo::DatabaseAltered {
+                slot,
+                prior_definition,
+                prior_owner,
+            } => {
+                let object = crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Database,
+                    slot: slot as u16,
+                };
+                self.storage
+                    .rollback_database_alter(slot as usize, prior_definition);
+                self.storage.restore_object_owner(object, prior_owner);
+            }
+            DdlUndo::DatabaseDropped(slot) => {
+                self.storage.rollback_database_drop(slot as usize, txid)
+            }
             DdlUndo::SequenceReset {
                 table,
                 column,
@@ -4275,6 +4529,9 @@ impl Engine {
             }
             DdlUndo::RoleSettingChanged { slot, prior } => {
                 self.storage.rollback_role_setting(slot as usize, prior);
+            }
+            DdlUndo::SystemSettingChanged { slot, prior } => {
+                self.storage.rollback_system_setting(slot as usize, prior);
             }
             DdlUndo::ObjectOwnerChanged { object, prior } => {
                 self.storage.restore_object_owner(object, prior);
@@ -8476,6 +8733,7 @@ impl Engine {
         if statement_writes(statement) {
             self.disable_async_block_reads();
         }
+        let _configuration_reload_scope = ConfigurationReloadScope::new(self, guc);
         let _guc_eval_scope = guc::enter_eval_scope(guc);
         // Reclaim the shared execution arena from the previous top-level
         // statement. A routine entered from an active query keeps that query's
@@ -8499,6 +8757,12 @@ impl Engine {
                 return Ok(Err(error));
             }
         }
+        let database = self
+            .storage
+            .database_slot_by_oid(self.storage.current_database_oid(), txn.txid)
+            .expect("selected database remains visible");
+        let database_name = self.storage.database_definition(database, txn.txid).name;
+        eval::funcs::system::set_current_database(database_name.as_str());
         let current_role = if reset_workspace {
             let session_user = guc.session_user();
             eval::funcs::system::set_session_user(session_user.as_str());
@@ -8551,20 +8815,28 @@ impl Engine {
         {
             let mut names = [""; SETTING_NAMES.len()];
             let mut values = [crate::util::StackStr::<256>::new(); SETTING_NAMES.len()];
+            let mut reset_values = [crate::util::StackStr::<256>::new(); SETTING_NAMES.len()];
+            let mut sources = ["default"; SETTING_NAMES.len()];
             let mut setting_count = 0;
             for &name in SETTING_NAMES {
-                if let Some(value) = fixed_setting(name)
-                    .map(crate::util::StackStr::from_str)
-                    .or_else(|| guc.get_owned(name))
-                {
+                if let Some(value) = self.fixed_setting_for(name, txn.txid) {
                     names[setting_count] = name;
                     values[setting_count] = value;
+                    reset_values[setting_count] = value;
+                    setting_count += 1;
+                } else if let Some(value) = guc.get_owned(name) {
+                    names[setting_count] = name;
+                    values[setting_count] = value;
+                    reset_values[setting_count] = guc.reset_owned(name).unwrap_or(value);
+                    sources[setting_count] = guc.source(name);
                     setting_count += 1;
                 }
             }
             if let Err(e) = eval::funcs::system::set_session_settings(
                 &names[..setting_count],
                 &values[..setting_count],
+                &reset_values[..setting_count],
+                &sources[..setting_count],
             ) {
                 return Ok(Err(e));
             }
@@ -8594,24 +8866,14 @@ impl Engine {
                 ),
             }));
         }
-        // CHECKPOINT cannot run inside a transaction block (as in
-        // PostgreSQL, where it is a utility command). DDL is transactional:
-        // CREATE/DROP TABLE roll back with their transaction — with the
-        // divergence that uncommitted DDL is visible to other sessions
-        // (PostgreSQL would block them on a lock instead).
-        if txn.is_explicit() && matches!(statement, Stmt::Checkpoint) {
-            return Ok(Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::FEATURE_NOT_SUPPORTED),
-                message: stack_format!(192, "CHECKPOINT cannot run inside a transaction block"),
-            }));
-        }
-        // VACUUM is non-transactional (25001); ANALYZE, by contrast, is allowed
-        // inside a transaction block.
-        if txn.is_explicit() && matches!(statement, Stmt::Vacuum { .. }) {
-            return Ok(Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::ACTIVE_SQL_TRANSACTION),
-                message: stack_format!(192, "VACUUM cannot run inside a transaction block"),
-            }));
+        if routine_transaction_context == exec::PlpgsqlTransactionContext::Atomic
+            && let Some(command) = top_level_only_command(statement)
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "{} cannot run inside a transaction block",
+                command
+            )));
         }
         if txn.read_only && statement_writes(statement) {
             return Ok(Err(sql_err!(
@@ -9595,6 +9857,62 @@ impl Engine {
                 *if_exists,
                 responder,
             ),
+            Stmt::CreateDatabase { name, options } => {
+                let template = options.template.unwrap_or("template1");
+                let mut connections = self.database_connection_count(template, txn.txid);
+                if self
+                    .storage
+                    .database_slot(template, txn.txid)
+                    .is_some_and(|slot| {
+                        self.storage.database(slot).oid == self.storage.current_database_oid()
+                    })
+                {
+                    connections = connections.saturating_sub(1);
+                }
+                exec::create_database(
+                    &mut self.storage,
+                    &mut self.wal,
+                    txn,
+                    name,
+                    *options,
+                    connections,
+                    responder,
+                )
+            }
+            Stmt::AlterDatabase { name, action } => {
+                let connections = self.database_connection_count(name, txn.txid);
+                exec::alter_database(
+                    &mut self.storage,
+                    &mut self.wal,
+                    txn,
+                    exec::AlterDatabaseCommand {
+                        name,
+                        action: *action,
+                        active_connections: connections,
+                        guc,
+                    },
+                    responder,
+                )
+            }
+            Stmt::DropDatabase {
+                name,
+                if_exists,
+                force,
+            } => {
+                let connections = self.database_connection_count(name, txn.txid);
+                exec::drop_database(
+                    &mut self.storage,
+                    &mut self.wal,
+                    txn,
+                    exec::DropDatabaseCommand {
+                        name,
+                        if_exists: *if_exists,
+                        force: *force,
+                        active_connections: connections,
+                    },
+                    responder,
+                )
+            }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
                 &mut self.dml_scratch,
@@ -10408,6 +10726,15 @@ impl Engine {
                     Err(e) => Ok(Err(e)),
                 }
             }
+            Stmt::AlterSystem { name, value } => exec::alter_system(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *name,
+                *value,
+                guc,
+                responder,
+            ),
             Stmt::Reset(name) => {
                 let result = match name {
                     Some(name) => guc.reset(name),
@@ -10466,6 +10793,31 @@ impl Engine {
             }
             Stmt::Show(name) => self.show(name, guc, responder),
             Stmt::ShowAll => self.show_all(guc, responder),
+            Stmt::Discard(target) => {
+                match target {
+                    ast::DiscardTarget::All => {
+                        sqlprep.clear();
+                        cursors.close_all();
+                        guc.discard_all();
+                        if let Err(error) = self.apply_system_settings(guc) {
+                            return Ok(Err(error));
+                        }
+                        let role = self
+                            .storage
+                            .find_role(guc.authenticated_user())
+                            .expect("authenticated role remains present");
+                        if let Err(error) = self.apply_role_settings(role as u16, guc) {
+                            return Ok(Err(error));
+                        }
+                        self.notify.drop_conn(self.current_conn_id);
+                        self.discard_protocol_state = true;
+                    }
+                    ast::DiscardTarget::Sequences => guc.seq_session().discard(),
+                    ast::DiscardTarget::Plans | ast::DiscardTarget::Temporary => {}
+                }
+                responder.command_complete("DISCARD")?;
+                Ok(Ok(()))
+            }
             Stmt::Copy(c) => {
                 // COPY (query) TO STDOUT streams a query's rows, not a table's.
                 if let Some(sql) = c.query {
@@ -12046,11 +12398,11 @@ impl Engine {
     ) -> Result<Result<(), SqlError>, WireFull> {
         // Session GUCs come from the per-session store; the rest are fixed
         // server parameters.
-        let owned = guc.get_owned(name);
-        let value = if let Some(value) = fixed_setting(name) {
+        let value = if let Some(value) = self
+            .fixed_setting_for(name, 0)
+            .or_else(|| guc.get_owned(name))
+        {
             value
-        } else if let Some(value) = owned.as_ref() {
-            value.as_str()
         } else {
             return Ok(Err(SqlError {
                 sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
@@ -12069,7 +12421,7 @@ impl Engine {
             name
         };
         responder.row_description(&[ColDesc::new(title, types::oid::TEXT, -1)])?;
-        responder.data_row(&[Datum::Text(value)])?;
+        responder.data_row(&[Datum::Text(value.as_str())])?;
         responder.command_complete("SHOW")?;
         Ok(Ok(()))
     }
@@ -12087,15 +12439,35 @@ impl Engine {
             ColDesc::new("description", types::oid::TEXT, -1),
         ])?;
         for &name in SETTING_NAMES {
-            let owned = guc.get_owned(name);
-            if let Some(value) =
-                fixed_setting(name).or_else(|| owned.as_ref().map(|value| value.as_str()))
+            if let Some(value) = self
+                .fixed_setting_for(name, 0)
+                .or_else(|| guc.get_owned(name))
             {
-                responder.data_row(&[Datum::Text(name), Datum::Text(value), Datum::Text("")])?;
+                responder.data_row(&[
+                    Datum::Text(name),
+                    Datum::Text(value.as_str()),
+                    Datum::Text(""),
+                ])?;
             }
         }
         responder.command_complete("SHOW")?;
         Ok(Ok(()))
+    }
+
+    fn fixed_setting_for(&self, name: &str, txid: u32) -> Option<crate::util::StackStr<256>> {
+        if name.eq_ignore_ascii_case("is_superuser") {
+            let role = crate::sql::eval::funcs::system::current_user_owned();
+            let superuser = self
+                .storage
+                .find_role_visible(role.as_str(), txid)
+                .is_some_and(|slot| self.storage.role(slot).attributes_to(txid).superuser);
+            return Some(crate::util::StackStr::from_str(if superuser {
+                "on"
+            } else {
+                "off"
+            }));
+        }
+        fixed_setting(name).map(crate::util::StackStr::from_str)
     }
 }
 
@@ -12108,7 +12480,6 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
         "standard_conforming_strings" => Some("on"),
         "integer_datetimes" => Some("on"),
         "transaction_isolation" => Some("read committed"),
-        "is_superuser" => Some("on"),
         _ => None,
     }
 }
@@ -12359,6 +12730,11 @@ fn decode_wal_routine_signature(
 
 fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
     match operator {
+        WalOp::DatabaseScope { oid } => {
+            let database = crate::storage::DatabaseOid::parse(oid)
+                .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL database scope"))?;
+            storage.select_database(database)?;
+        }
         WalOp::Commit { .. } => {}
         WalOp::Truncate { .. } => {}
         WalOp::SetCast(definition) => {
@@ -13683,6 +14059,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             }
             let slot = storage.create_index(
                 crate::storage::IndexDef {
+                    database: storage.current_database_oid(),
                     created_at,
                     schema: crate::storage::SqlName::parse(schema)?,
                     name: crate::storage::SqlName::parse(name)?,
@@ -13791,6 +14168,60 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             })?;
             storage.drop_tablespace(slot, 0)?;
             storage.commit_tablespace_drop(slot);
+        }
+        WalOp::CreateDatabase {
+            oid,
+            template_oid,
+            definition,
+            owner,
+        } => {
+            let oid = crate::storage::DatabaseOid::parse(oid)
+                .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL database OID"))?;
+            let template_oid =
+                crate::storage::DatabaseOid::parse(template_oid).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "corrupt WAL template database OID"
+                    )
+                })?;
+            if storage.database_slot_by_oid(template_oid, 0).is_none() {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "journal template database does not exist"
+                ));
+            }
+            let slot = storage.create_database(Some(oid), template_oid, definition, owner, 0)?;
+            storage.commit_database_create(slot);
+        }
+        WalOp::AlterDatabase {
+            oid,
+            definition,
+            owner,
+        } => {
+            let oid = crate::storage::DatabaseOid::parse(oid)
+                .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL database OID"))?;
+            let slot = storage.database_slot_by_oid(oid, 0).ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "journal database does not exist")
+            })?;
+            storage.alter_database_definition(slot, definition, 0)?;
+            storage.set_object_owner(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Database,
+                    slot: slot as u16,
+                },
+                owner as usize,
+                0,
+            );
+            storage.commit_database_alter(slot, 0);
+        }
+        WalOp::DropDatabase { oid } => {
+            let oid = crate::storage::DatabaseOid::parse(oid)
+                .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL database OID"))?;
+            let slot = storage.database_slot_by_oid(oid, 0).ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "journal database does not exist")
+            })?;
+            storage.drop_database(slot, 0);
+            storage.commit_database_drop(slot);
         }
         WalOp::DropIndex { schema, name } => {
             if let Some(slot) = storage.drop_index(schema, name, 0)? {
@@ -14019,8 +14450,25 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             name,
             value,
         } => {
+            let database = database
+                .map(|oid| {
+                    let oid = crate::storage::DatabaseOid::parse(oid).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "corrupt WAL role setting database"
+                        )
+                    })?;
+                    storage.database_slot_by_oid(oid, 0).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "journal configures unknown database"
+                        )
+                    })?;
+                    Ok(oid)
+                })
+                .transpose()?;
             let scope = match (role, database) {
-                (Some(role), false) => crate::storage::RoleSettingScope::RoleAllDatabases(
+                (Some(role), None) => crate::storage::RoleSettingScope::RoleAllDatabases(
                     storage.find_role(role).ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_OBJECT,
@@ -14029,17 +14477,20 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                         )
                     })? as u16,
                 ),
-                (Some(role), true) => crate::storage::RoleSettingScope::RoleInDatabase(
-                    storage.find_role(role).ok_or_else(|| {
+                (Some(role), Some(database)) => crate::storage::RoleSettingScope::RoleInDatabase {
+                    role: storage.find_role(role).ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_OBJECT,
                             "journal configures unknown role \"{}\"",
                             role
                         )
                     })? as u16,
-                ),
-                (None, true) => crate::storage::RoleSettingScope::AllRolesInDatabase,
-                (None, false) => {
+                    database,
+                },
+                (None, Some(database)) => {
+                    crate::storage::RoleSettingScope::AllRolesInDatabase(database)
+                }
+                (None, None) => {
                     return Err(sql_err!(
                         sqlstate::INTERNAL_ERROR,
                         "corrupt WAL role setting scope"
@@ -14060,6 +14511,22 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 })
                 .transpose()?;
             storage.install_role_setting(scope, crate::storage::SqlName::parse(name)?, value)?;
+        }
+        WalOp::SetSystemSetting { name, value } => {
+            let value = value
+                .map(|value| {
+                    let stored = crate::util::StackStr::from_str(value);
+                    if stored.is_truncated() {
+                        Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "corrupt WAL system setting value"
+                        ))
+                    } else {
+                        Ok(stored)
+                    }
+                })
+                .transpose()?;
+            storage.install_system_setting(crate::storage::SqlName::parse(name)?, value)?;
         }
         WalOp::SetObjectOwner {
             class,
@@ -14097,7 +14564,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 )
             })?;
             let old_owner = storage.object_owner(object, 0) as u16;
-            let acl_count = storage.acl_entries().count();
+            let acl_count = storage.acl_entry_count();
             for slot in 0..acl_count {
                 let entry = *storage.acl_entry(slot);
                 if entry.object != object || entry.object.slot == u16::MAX {
@@ -14121,7 +14588,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     );
                 }
             }
-            let column_acl_count = storage.column_acl_entries().count();
+            let column_acl_count = storage.column_acl_entry_count();
             for slot in 0..column_acl_count {
                 let entry = *storage.column_acl_entry(slot);
                 if entry.target.relation() != object {

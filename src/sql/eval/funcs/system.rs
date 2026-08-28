@@ -179,6 +179,34 @@ std::thread_local! {
             let _ = core::fmt::Write::write_str(&mut s, "postgres");
             s
         });
+    static CURRENT_DATABASE: core::cell::RefCell<crate::util::StackStr<64>> =
+        core::cell::RefCell::new({
+            let mut s = crate::util::StackStr::new();
+            let _ = core::fmt::Write::write_str(&mut s, "postgres");
+            s
+        });
+    static CONFIGURATION_RELOAD_REQUESTED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+pub(crate) fn clear_configuration_reload_request() {
+    CONFIGURATION_RELOAD_REQUESTED.with(|requested| requested.set(false));
+}
+
+pub(crate) fn take_configuration_reload_request() -> bool {
+    CONFIGURATION_RELOAD_REQUESTED.with(core::cell::Cell::take)
+}
+
+pub fn set_current_database(database: &str) {
+    CURRENT_DATABASE.with(|current| {
+        *current.borrow_mut() = crate::util::StackStr::from_str(database);
+    });
+}
+
+fn current_database_str(arena: &crate::mem::arena::Arena) -> Result<&str, SqlError> {
+    CURRENT_DATABASE.with(|current| {
+        let current = *current.borrow();
+        arena.alloc_str(current.as_str()).map_err(|_| arena_full())
+    })
 }
 
 /// The effective search path's schema names, published per statement for
@@ -221,6 +249,8 @@ pub const MAX_SESSION_SETTINGS: usize = 32;
 pub struct SessionSettings {
     pub names: [&'static str; MAX_SESSION_SETTINGS],
     pub values: [crate::util::StackStr<256>; MAX_SESSION_SETTINGS],
+    pub reset_values: [crate::util::StackStr<256>; MAX_SESSION_SETTINGS],
+    pub sources: [&'static str; MAX_SESSION_SETTINGS],
     pub n: usize,
 }
 
@@ -229,6 +259,8 @@ std::thread_local! {
         core::cell::RefCell::new(SessionSettings {
             names: [""; MAX_SESSION_SETTINGS],
             values: [crate::util::StackStr::new(); MAX_SESSION_SETTINGS],
+            reset_values: [crate::util::StackStr::new(); MAX_SESSION_SETTINGS],
+            sources: ["default"; MAX_SESSION_SETTINGS],
             n: 0,
         })
     };
@@ -240,8 +272,13 @@ std::thread_local! {
 pub fn set_session_settings(
     names: &[&'static str],
     values: &[crate::util::StackStr<256>],
+    reset_values: &[crate::util::StackStr<256>],
+    sources: &[&'static str],
 ) -> Result<(), SqlError> {
-    if names.len() != values.len() {
+    if names.len() != values.len()
+        || names.len() != reset_values.len()
+        || names.len() != sources.len()
+    {
         return Err(sql_err!(
             sqlstate::INTERNAL_ERROR,
             "session setting snapshot is misaligned"
@@ -259,13 +296,26 @@ pub fn set_session_settings(
         let mut s = s.borrow_mut();
         s.names[..names.len()].copy_from_slice(names);
         s.values[..values.len()].copy_from_slice(values);
+        s.reset_values[..reset_values.len()].copy_from_slice(reset_values);
+        s.sources[..sources.len()].copy_from_slice(sources);
         s.n = names.len();
     });
     Ok(())
 }
 
+pub(crate) fn session_setting_metadata(
+    name: &str,
+) -> Option<(crate::util::StackStr<256>, &'static str)> {
+    SESSION_SETTINGS.with(|settings| {
+        let settings = settings.borrow();
+        (0..settings.n)
+            .find(|&index| settings.names[index].eq_ignore_ascii_case(name))
+            .map(|index| (settings.reset_values[index], settings.sources[index]))
+    })
+}
+
 /// The published value of setting `name` (case-insensitive), if any.
-fn session_setting(name: &str) -> Option<crate::util::StackStr<256>> {
+pub(crate) fn session_setting(name: &str) -> Option<crate::util::StackStr<256>> {
     SESSION_SETTINGS.with(|s| {
         let s = s.borrow();
         (0..s.n)
@@ -274,13 +324,20 @@ fn session_setting(name: &str) -> Option<crate::util::StackStr<256>> {
     })
 }
 
-pub(crate) fn update_session_setting(name: &str, value: crate::util::StackStr<256>) {
+pub(crate) fn update_session_setting(
+    name: &str,
+    value: crate::util::StackStr<256>,
+    reset_value: crate::util::StackStr<256>,
+    source: &'static str,
+) {
     SESSION_SETTINGS.with(|settings| {
         let mut settings = settings.borrow_mut();
         if let Some(index) =
             (0..settings.n).find(|&index| settings.names[index].eq_ignore_ascii_case(name))
         {
             settings.values[index] = value;
+            settings.reset_values[index] = reset_value;
+            settings.sources[index] = source;
         }
     });
 }
@@ -353,6 +410,7 @@ pub(crate) fn dispatch<'a>(
         name,
         "version"
             | "pg_is_in_recovery"
+            | "pg_reload_conf"
             | "pg_extension_config_dump"
             | "current_database"
             | "current_catalog"
@@ -439,6 +497,11 @@ pub(crate) fn dispatch<'a>(
                 arity(0)?;
                 Ok(Datum::Bool(false))
             }
+            "pg_reload_conf" => {
+                arity(0)?;
+                CONFIGURATION_RELOAD_REQUESTED.with(|requested| requested.set(true));
+                Ok(Datum::Bool(true))
+            }
             "pg_extension_config_dump" => {
                 arity(2)?;
                 Err(sql_err!(
@@ -511,7 +574,7 @@ pub(crate) fn dispatch<'a>(
             }
             "current_database" | "current_catalog" => {
                 arity(0)?;
-                Ok(Datum::Text("postgres"))
+                Ok(Datum::Text(current_database_str(arena)?))
             }
             // `current_setting(name [, missing_ok])` returns the setting's value
             // as text — the same value `SHOW name` reports. An unknown setting
@@ -595,7 +658,6 @@ pub(crate) fn dispatch<'a>(
                     }
                 };
                 let configured = crate::sql::guc::set_active_config(name, value, local)?;
-                update_session_setting(name, configured);
                 Ok(Datum::Text(
                     arena
                         .alloc_str(configured.as_str())
@@ -940,6 +1002,9 @@ pub(crate) fn dispatch<'a>(
                 } else {
                     "pg_class"
                 };
+                if matches!(catalog_name, "pg_database" | "pg_tablespace" | "pg_authid") {
+                    return Ok(Datum::Null);
+                }
                 Ok(cat
                     .comment(catalog_name, oid, 0, arena)?
                     .map(Datum::Text)

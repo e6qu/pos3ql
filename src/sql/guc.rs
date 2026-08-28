@@ -88,7 +88,13 @@ pub fn set_active_config(
 
 pub(crate) fn publish_active_setting(guc: &GucState, name: &str) {
     if let Some(value) = guc.get_owned(name) {
-        crate::sql::eval::funcs::system::update_session_setting(name, value);
+        let reset = guc.reset_owned(name).unwrap_or(value);
+        crate::sql::eval::funcs::system::update_session_setting(
+            name,
+            value,
+            reset,
+            guc.source(name),
+        );
     }
     ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(guc.render()));
     if name.eq_ignore_ascii_case("timezone") {
@@ -230,6 +236,13 @@ impl SeqSession {
         let (defined, value) = self.lastval.get();
         defined.then_some(value)
     }
+
+    pub fn discard(&self) {
+        for value in &self.currvals {
+            value.set((0, 0));
+        }
+        self.lastval.set((false, 0));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -298,16 +311,97 @@ impl GucValues {
     }
 }
 
+const GUC_DATESTYLE: u32 = 1 << 0;
+const GUC_INTERVALSTYLE: u32 = 1 << 1;
+const GUC_TIMEZONE: u32 = 1 << 2;
+const GUC_CLIENT_ENCODING: u32 = 1 << 3;
+const GUC_APPLICATION_NAME: u32 = 1 << 4;
+const GUC_SEARCH_PATH: u32 = 1 << 5;
+const GUC_DEFAULT_TABLESPACE: u32 = 1 << 6;
+const GUC_CLIENT_MIN_MESSAGES: u32 = 1 << 7;
+const GUC_EXTRA_FLOAT_DIGITS: u32 = 1 << 8;
+const GUC_LOCK_TIMEOUT: u32 = 1 << 9;
+const GUC_STATEMENT_TIMEOUT: u32 = 1 << 10;
+const GUC_ROW_SECURITY: u32 = 1 << 11;
+const GUC_BYTEA_OUTPUT: u32 = 1 << 12;
+const GUC_CHECK_FUNCTION_BODIES: u32 = 1 << 13;
+const GUC_ALL: u32 = (1 << 14) - 1;
+
+fn guc_bit(name: &str) -> u32 {
+    if name.eq_ignore_ascii_case("datestyle") {
+        GUC_DATESTYLE
+    } else if name.eq_ignore_ascii_case("intervalstyle") {
+        GUC_INTERVALSTYLE
+    } else if name.eq_ignore_ascii_case("timezone") {
+        GUC_TIMEZONE
+    } else if name.eq_ignore_ascii_case("client_encoding") {
+        GUC_CLIENT_ENCODING
+    } else if name.eq_ignore_ascii_case("application_name") {
+        GUC_APPLICATION_NAME
+    } else if name.eq_ignore_ascii_case("search_path") {
+        GUC_SEARCH_PATH
+    } else if name.eq_ignore_ascii_case("default_tablespace") {
+        GUC_DEFAULT_TABLESPACE
+    } else if name.eq_ignore_ascii_case("client_min_messages") {
+        GUC_CLIENT_MIN_MESSAGES
+    } else if name.eq_ignore_ascii_case("extra_float_digits") {
+        GUC_EXTRA_FLOAT_DIGITS
+    } else if name.eq_ignore_ascii_case("lock_timeout") {
+        GUC_LOCK_TIMEOUT
+    } else if name.eq_ignore_ascii_case("statement_timeout") {
+        GUC_STATEMENT_TIMEOUT
+    } else if name.eq_ignore_ascii_case("row_security") {
+        GUC_ROW_SECURITY
+    } else if name.eq_ignore_ascii_case("bytea_output") {
+        GUC_BYTEA_OUTPUT
+    } else if name.eq_ignore_ascii_case("check_function_bodies") {
+        GUC_CHECK_FUNCTION_BODIES
+    } else {
+        0
+    }
+}
+
+fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
+    macro_rules! copy {
+        ($bit:ident, $field:ident) => {
+            if mask & $bit != 0 {
+                target.$field = source.$field;
+            }
+        };
+    }
+    copy!(GUC_DATESTYLE, datestyle);
+    copy!(GUC_INTERVALSTYLE, intervalstyle);
+    if mask & GUC_TIMEZONE != 0 {
+        target.timezone = source.timezone;
+        target.parsed_timezone = source.parsed_timezone;
+    }
+    copy!(GUC_CLIENT_ENCODING, client_encoding);
+    copy!(GUC_APPLICATION_NAME, application_name);
+    copy!(GUC_SEARCH_PATH, search_path);
+    copy!(GUC_DEFAULT_TABLESPACE, default_tablespace);
+    copy!(GUC_CLIENT_MIN_MESSAGES, client_min_messages);
+    copy!(GUC_EXTRA_FLOAT_DIGITS, extra_float_digits);
+    copy!(GUC_LOCK_TIMEOUT, lock_timeout);
+    copy!(GUC_STATEMENT_TIMEOUT, statement_timeout);
+    copy!(GUC_ROW_SECURITY, row_security);
+    copy!(GUC_BYTEA_OUTPUT, bytea_escape);
+    copy!(GUC_CHECK_FUNCTION_BODIES, check_function_bodies);
+}
+
 #[derive(Clone, Copy)]
 struct GucSavepoint {
     current: GucValues,
     session: GucValues,
+    current_overrides: u32,
+    session_overrides: u32,
 }
 
 struct GucTransaction {
     active: bool,
     start: GucValues,
     session: GucValues,
+    start_overrides: u32,
+    session_overrides: u32,
     savepoints: [Option<GucSavepoint>; super::txn::MAX_SAVEPOINTS],
     savepoint_count: usize,
 }
@@ -315,7 +409,22 @@ struct GucTransaction {
 struct GucStore {
     current: GucValues,
     defaults: GucValues,
+    cluster_defaults: GucValues,
+    cluster_overrides: u32,
+    connection_overrides: u32,
+    database_overrides: u32,
+    role_overrides: u32,
+    database_role_overrides: u32,
+    client_overrides: u32,
+    session_overrides: u32,
     transaction: GucTransaction,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ConnectionDefaultSource {
+    Database,
+    Role,
+    DatabaseRole,
 }
 
 pub struct GucState {
@@ -349,7 +458,13 @@ impl Drop for RoutineConfigScope {
         drop(state);
         for name in &self.names[..self.count] {
             if let Some(value) = guc.get_owned(name.as_str()) {
-                crate::sql::eval::funcs::system::update_session_setting(name.as_str(), value);
+                let reset = guc.reset_owned(name.as_str()).unwrap_or(value);
+                crate::sql::eval::funcs::system::update_session_setting(
+                    name.as_str(),
+                    value,
+                    reset,
+                    guc.source(name.as_str()),
+                );
             }
         }
         ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(guc.render()));
@@ -393,16 +508,90 @@ impl Default for GucState {
 }
 
 impl GucState {
+    pub(crate) fn source(&self, name: &str) -> &'static str {
+        let state = self.store.borrow();
+        let bit = guc_bit(name);
+        if state.session_overrides & bit != 0 {
+            "session"
+        } else if state.client_overrides & bit != 0 {
+            "client"
+        } else if state.database_role_overrides & bit != 0 {
+            "database user"
+        } else if state.role_overrides & bit != 0 {
+            "user"
+        } else if state.database_overrides & bit != 0 {
+            "database"
+        } else if state.cluster_overrides & bit != 0 {
+            "configuration file"
+        } else {
+            "default"
+        }
+    }
+
+    pub(crate) fn reset_owned(&self, name: &str) -> Option<StackStr<256>> {
+        let state = self.store.borrow();
+        let values = &state.defaults;
+        if name.eq_ignore_ascii_case("datestyle") {
+            Some(StackStr::from_str(values.datestyle.as_str()))
+        } else if name.eq_ignore_ascii_case("intervalstyle") {
+            Some(StackStr::from_str(values.intervalstyle.as_str()))
+        } else if name.eq_ignore_ascii_case("timezone") {
+            Some(StackStr::from_str(values.timezone.as_str()))
+        } else if name.eq_ignore_ascii_case("client_encoding") {
+            Some(StackStr::from_str(values.client_encoding.as_str()))
+        } else if name.eq_ignore_ascii_case("application_name") {
+            Some(StackStr::from_str(values.application_name.as_str()))
+        } else if name.eq_ignore_ascii_case("search_path") {
+            Some(StackStr::from_str(values.search_path.as_str()))
+        } else if name.eq_ignore_ascii_case("default_tablespace") {
+            Some(StackStr::from_str(values.default_tablespace.as_str()))
+        } else if name.eq_ignore_ascii_case("client_min_messages") {
+            Some(StackStr::from_str(values.client_min_messages.as_str()))
+        } else if name.eq_ignore_ascii_case("extra_float_digits") {
+            Some(StackStr::from_str(values.extra_float_digits.as_str()))
+        } else if name.eq_ignore_ascii_case("lock_timeout") {
+            Some(StackStr::from_str(values.lock_timeout.as_str()))
+        } else if name.eq_ignore_ascii_case("statement_timeout") {
+            Some(StackStr::from_str(values.statement_timeout.as_str()))
+        } else if name.eq_ignore_ascii_case("row_security") {
+            Some(StackStr::from_str(values.row_security.as_str()))
+        } else if name.eq_ignore_ascii_case("bytea_output") {
+            Some(StackStr::from_str(if values.bytea_escape {
+                "escape"
+            } else {
+                "hex"
+            }))
+        } else if name.eq_ignore_ascii_case("check_function_bodies") {
+            Some(StackStr::from_str(if values.check_function_bodies {
+                "on"
+            } else {
+                "off"
+            }))
+        } else {
+            None
+        }
+    }
+
     pub fn new() -> Self {
         let values = GucValues::new();
         let mut g = Self {
             store: RefCell::new(GucStore {
                 current: values,
                 defaults: values,
+                cluster_defaults: values,
+                cluster_overrides: 0,
+                connection_overrides: 0,
+                database_overrides: 0,
+                role_overrides: 0,
+                database_role_overrides: 0,
+                client_overrides: 0,
+                session_overrides: 0,
                 transaction: GucTransaction {
                     active: false,
                     start: values,
                     session: values,
+                    start_overrides: 0,
+                    session_overrides: 0,
                     savepoints: [None; super::txn::MAX_SAVEPOINTS],
                     savepoint_count: 0,
                 },
@@ -500,16 +689,134 @@ impl GucState {
         let mut values = state.current;
         change_setting(&mut values, &state.defaults, name, raw)?;
         state.current = values;
+        let bit = guc_bit(name);
+        let resetting = unquote(raw).eq_ignore_ascii_case("default");
         if !state.transaction.active {
-            // Before the first transaction this is a startup-packet setting;
-            // PostgreSQL makes it the value RESET returns to.
             state.defaults = values;
+            state.connection_overrides |= bit;
+            state.database_overrides &= !bit;
+            state.role_overrides &= !bit;
+            state.database_role_overrides &= !bit;
+            state.client_overrides |= bit;
         } else if !local {
             let mut session = state.transaction.session;
             change_setting(&mut session, &state.defaults, name, raw)?;
             state.transaction.session = session;
+            if resetting {
+                state.session_overrides &= !bit;
+                state.transaction.session_overrides &= !bit;
+            } else {
+                state.session_overrides |= bit;
+                state.transaction.session_overrides |= bit;
+            }
         }
         Ok(())
+    }
+
+    pub(crate) fn set_cluster_default(&self, name: &str, raw: &str) -> Result<(), SqlError> {
+        let mut state = self.store.borrow_mut();
+        let mut cluster = state.cluster_defaults;
+        change_setting(&mut cluster, &GucValues::new(), name, raw)?;
+        state.cluster_defaults = cluster;
+        state.cluster_overrides |= guc_bit(name);
+        Self::recompute_cluster_defaults(&mut state);
+        Ok(())
+    }
+
+    pub(crate) fn reset_cluster_defaults(&self) {
+        let mut state = self.store.borrow_mut();
+        state.cluster_defaults = GucValues::new();
+        state.cluster_overrides = 0;
+        Self::recompute_cluster_defaults(&mut state);
+    }
+
+    pub(crate) fn set_connection_default(
+        &self,
+        name: &str,
+        raw: &str,
+        source: ConnectionDefaultSource,
+    ) -> Result<(), SqlError> {
+        let mut state = self.store.borrow_mut();
+        let mut values = state.defaults;
+        change_setting(&mut values, &state.defaults, name, raw)?;
+        let bit = guc_bit(name);
+        state.connection_overrides |= bit;
+        state.database_overrides &= !bit;
+        state.role_overrides &= !bit;
+        state.database_role_overrides &= !bit;
+        state.client_overrides &= !bit;
+        match source {
+            ConnectionDefaultSource::Database => state.database_overrides |= bit,
+            ConnectionDefaultSource::Role => state.role_overrides |= bit,
+            ConnectionDefaultSource::DatabaseRole => state.database_role_overrides |= bit,
+        }
+        state.defaults = values;
+        if state.session_overrides & bit == 0 {
+            copy_guc_values(&mut state.current, &values, bit);
+            if state.transaction.active {
+                copy_guc_values(&mut state.transaction.start, &values, bit);
+                copy_guc_values(&mut state.transaction.session, &values, bit);
+            }
+        }
+        Ok(())
+    }
+
+    fn recompute_cluster_defaults(state: &mut GucStore) {
+        let old_defaults = state.defaults;
+        let old_current = state.current;
+        let old_start = state.transaction.start;
+        let old_session = state.transaction.session;
+        let mut defaults = state.cluster_defaults;
+        defaults.current_role = old_defaults.current_role;
+        defaults.session_authorization = old_defaults.session_authorization;
+        copy_guc_values(
+            &mut defaults,
+            &old_defaults,
+            state.connection_overrides & GUC_ALL,
+        );
+        state.defaults = defaults;
+
+        let mut current = defaults;
+        current.current_role = old_current.current_role;
+        current.session_authorization = old_current.session_authorization;
+        copy_guc_values(&mut current, &old_current, state.session_overrides);
+        state.current = current;
+        if state.transaction.active {
+            let mut start = defaults;
+            start.current_role = old_start.current_role;
+            start.session_authorization = old_start.session_authorization;
+            copy_guc_values(&mut start, &old_start, state.transaction.start_overrides);
+            state.transaction.start = start;
+            let mut session = defaults;
+            session.current_role = old_session.current_role;
+            session.session_authorization = old_session.session_authorization;
+            copy_guc_values(
+                &mut session,
+                &old_session,
+                state.transaction.session_overrides,
+            );
+            state.transaction.session = session;
+            for savepoint in state.transaction.savepoints.iter_mut().flatten() {
+                let old_current = savepoint.current;
+                let old_session = savepoint.session;
+                savepoint.current = defaults;
+                savepoint.current.current_role = old_current.current_role;
+                savepoint.current.session_authorization = old_current.session_authorization;
+                copy_guc_values(
+                    &mut savepoint.current,
+                    &old_current,
+                    savepoint.current_overrides,
+                );
+                savepoint.session = defaults;
+                savepoint.session.current_role = old_session.current_role;
+                savepoint.session.session_authorization = old_session.session_authorization;
+                copy_guc_values(
+                    &mut savepoint.session,
+                    &old_session,
+                    savepoint.session_overrides,
+                );
+            }
+        }
     }
 
     pub fn reset(&self, name: &str) -> Result<(), SqlError> {
@@ -520,9 +827,24 @@ impl GucState {
         let mut state = self.store.borrow_mut();
         let values = state.defaults;
         state.current = values;
+        state.session_overrides = 0;
         if state.transaction.active {
             state.transaction.session = values;
+            state.transaction.session_overrides = 0;
         }
+    }
+
+    pub fn discard_all(&self) {
+        let mut state = self.store.borrow_mut();
+        let values = state.defaults;
+        state.current = values;
+        state.session_overrides = 0;
+        state.transaction.start = values;
+        state.transaction.session = values;
+        state.transaction.start_overrides = 0;
+        state.transaction.session_overrides = 0;
+        state.transaction.savepoint_count = 0;
+        self.seq_session.discard();
     }
 
     pub fn begin_transaction(&self) {
@@ -534,6 +856,8 @@ impl GucState {
         state.transaction.active = true;
         state.transaction.start = current;
         state.transaction.session = current;
+        state.transaction.start_overrides = state.session_overrides;
+        state.transaction.session_overrides = state.session_overrides;
         state.transaction.savepoint_count = 0;
     }
 
@@ -543,6 +867,7 @@ impl GucState {
             return;
         }
         state.current = state.transaction.session;
+        state.session_overrides = state.transaction.session_overrides;
         state.transaction.active = false;
         state.transaction.savepoint_count = 0;
     }
@@ -553,6 +878,7 @@ impl GucState {
             return;
         }
         state.current = state.transaction.start;
+        state.session_overrides = state.transaction.start_overrides;
         state.transaction.active = false;
         state.transaction.savepoint_count = 0;
     }
@@ -567,6 +893,8 @@ impl GucState {
         state.transaction.savepoints[index] = Some(GucSavepoint {
             current: state.current,
             session: state.transaction.session,
+            current_overrides: state.session_overrides,
+            session_overrides: state.transaction.session_overrides,
         });
         state.transaction.savepoint_count += 1;
     }
@@ -587,6 +915,8 @@ impl GucState {
             state.transaction.savepoints[index].expect("GUC savepoint mirrors transaction");
         state.current = savepoint.current;
         state.transaction.session = savepoint.session;
+        state.session_overrides = savepoint.current_overrides;
+        state.transaction.session_overrides = savepoint.session_overrides;
         state.transaction.savepoint_count = index + 1;
     }
 
@@ -650,9 +980,12 @@ impl GucState {
         drop(state);
         for config in configs {
             if let Some(value) = self.get_owned(config.name.as_str()) {
+                let reset = self.reset_owned(config.name.as_str()).unwrap_or(value);
                 crate::sql::eval::funcs::system::update_session_setting(
                     config.name.as_str(),
                     value,
+                    reset,
+                    self.source(config.name.as_str()),
                 );
             }
         }

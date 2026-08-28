@@ -355,6 +355,13 @@ pub(crate) enum DdlUndo {
         prior_owner: Option<crate::storage::PendingOwnership>,
     },
     TablespaceDropped(u32),
+    DatabaseCreated(u32),
+    DatabaseAltered {
+        slot: u32,
+        prior_definition: Option<crate::storage::PendingDatabaseDefinition>,
+        prior_owner: Option<crate::storage::PendingOwnership>,
+    },
+    DatabaseDropped(u32),
     /// TRUNCATE ... RESTART IDENTITY reset one column's sequence — undo by
     /// restoring the prior counter. (A plain advance is *not* undone: a
     /// rolled-back insert still consumes its number, as PostgreSQL has it.)
@@ -399,6 +406,10 @@ pub(crate) enum DdlUndo {
         prior: Option<crate::storage::PendingRoleMembership>,
     },
     RoleSettingChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingRoleSetting>,
+    },
+    SystemSettingChanged {
         slot: u32,
         prior: Option<crate::storage::PendingRoleSetting>,
     },

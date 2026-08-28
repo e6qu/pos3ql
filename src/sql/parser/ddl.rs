@@ -745,6 +745,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("tablespace")? {
             return self.create_tablespace();
         }
+        if self.eat_ident("database")? {
+            return self.create_database();
+        }
         if self.eat_ident("schema")? {
             return self.create_schema();
         }
@@ -1860,6 +1863,231 @@ impl<'a> Parser<'a> {
             location,
             options,
         })
+    }
+
+    fn database_option_value(&mut self, what: &'static str) -> Result<&'a str, ParseError> {
+        match self.peeked {
+            Tok::Ident(value) | Tok::QuotedIdent(value) | Tok::Str(value) | Tok::Num(value) => {
+                self.advance()?;
+                Ok(value)
+            }
+            _ => Err(self.err_here(what)),
+        }
+    }
+
+    fn create_database(&mut self) -> Result<Stmt<'a>, ParseError> {
+        use crate::sql::ast::{CreateDatabaseOptions, DatabaseLocaleProvider, DatabaseStrategy};
+        let name = self.any_ident("database name")?;
+        let _ = self.eat_ident("with")?;
+        let mut options = CreateDatabaseOptions::EMPTY;
+        while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+            let option = self.any_ident("database option")?;
+            let _ = self.eat_op("=")?;
+            if option.eq_ignore_ascii_case("owner") {
+                if options.owner.is_some() {
+                    return Err(self.err_here("OWNER specified more than once"));
+                }
+                options.owner = Some(self.any_ident("database owner")?);
+            } else if option.eq_ignore_ascii_case("template") {
+                if options.template.is_some() {
+                    return Err(self.err_here("TEMPLATE specified more than once"));
+                }
+                options.template = Some(self.any_ident("template database")?);
+            } else if option.eq_ignore_ascii_case("encoding") {
+                if options.encoding.is_some() {
+                    return Err(self.err_here("ENCODING specified more than once"));
+                }
+                options.encoding = Some(self.database_option_value("invalid database encoding")?);
+            } else if option.eq_ignore_ascii_case("strategy") {
+                if options.strategy.is_some() {
+                    return Err(self.err_here("STRATEGY specified more than once"));
+                }
+                let value = self.database_option_value("invalid database strategy")?;
+                options.strategy = Some(if value.eq_ignore_ascii_case("wal_log") {
+                    DatabaseStrategy::WalLog
+                } else if value.eq_ignore_ascii_case("file_copy") {
+                    DatabaseStrategy::FileCopy
+                } else {
+                    return Err(self.err_here("invalid database creation strategy"));
+                });
+            } else if option.eq_ignore_ascii_case("locale_provider") {
+                if options.locale_provider.is_some() {
+                    return Err(self.err_here("LOCALE_PROVIDER specified more than once"));
+                }
+                let value = self.database_option_value("invalid locale provider")?;
+                options.locale_provider = Some(if value.eq_ignore_ascii_case("builtin") {
+                    DatabaseLocaleProvider::Builtin
+                } else if value.eq_ignore_ascii_case("libc") {
+                    DatabaseLocaleProvider::Libc
+                } else if value.eq_ignore_ascii_case("icu") {
+                    DatabaseLocaleProvider::Icu
+                } else {
+                    return Err(self.err_here("invalid locale provider"));
+                });
+            } else if option.eq_ignore_ascii_case("locale") {
+                if options
+                    .locale
+                    .replace(self.database_option_value("invalid locale")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("LOCALE specified more than once"));
+                }
+            } else if option.eq_ignore_ascii_case("lc_collate") {
+                if options
+                    .collate
+                    .replace(self.database_option_value("invalid LC_COLLATE")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("LC_COLLATE specified more than once"));
+                }
+            } else if option.eq_ignore_ascii_case("lc_ctype") {
+                if options
+                    .ctype
+                    .replace(self.database_option_value("invalid LC_CTYPE")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("LC_CTYPE specified more than once"));
+                }
+            } else if option.eq_ignore_ascii_case("builtin_locale")
+                || option.eq_ignore_ascii_case("icu_locale")
+                || option.eq_ignore_ascii_case("icu_rules")
+            {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "database option {} is not supported", option),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            } else if option.eq_ignore_ascii_case("collation_version") {
+                if options
+                    .collation_version
+                    .replace(self.database_option_value("invalid collation version")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("COLLATION_VERSION specified more than once"));
+                }
+            } else if option.eq_ignore_ascii_case("tablespace") {
+                if options.tablespace.is_some() {
+                    return Err(self.err_here("TABLESPACE specified more than once"));
+                }
+                options.tablespace = Some(self.any_ident("tablespace name")?);
+            } else if option.eq_ignore_ascii_case("allow_connections") {
+                if options
+                    .allow_connections
+                    .replace(self.role_option_boolean()?)
+                    .is_some()
+                {
+                    return Err(self.err_here("ALLOW_CONNECTIONS specified more than once"));
+                }
+            } else if option.eq_ignore_ascii_case("connection_limit") {
+                let value = i32::try_from(self.seq_int()?)
+                    .ok()
+                    .filter(|value| *value >= -1)
+                    .ok_or_else(|| self.err_here("connection limit is out of range"))?;
+                if options.connection_limit.replace(value).is_some() {
+                    return Err(self.err_here("CONNECTION LIMIT specified more than once"));
+                }
+            } else if option.eq_ignore_ascii_case("is_template") {
+                if options
+                    .is_template
+                    .replace(self.role_option_boolean()?)
+                    .is_some()
+                {
+                    return Err(self.err_here("IS_TEMPLATE specified more than once"));
+                }
+            } else if option.eq_ignore_ascii_case("oid") {
+                let value = i32::try_from(self.seq_int()?)
+                    .map_err(|_| self.err_here("database OID is out of range"))?;
+                if options.oid.replace(value).is_some() {
+                    return Err(self.err_here("OID specified more than once"));
+                }
+            } else {
+                return Err(self.err_here("unrecognized CREATE DATABASE option"));
+            }
+        }
+        Ok(Stmt::CreateDatabase { name, options })
+    }
+
+    pub(super) fn alter_database(&mut self) -> Result<Stmt<'a>, ParseError> {
+        use crate::sql::ast::{AlterDatabaseAction, RoutineConfigValue};
+        let name = self.any_ident("database name")?;
+        let action = if self.eat_ident("with")? {
+            let mut allow_connections = None;
+            let mut connection_limit = None;
+            let mut is_template = None;
+            loop {
+                let option = self.any_ident("database option")?;
+                let _ = self.eat_op("=")?;
+                if option.eq_ignore_ascii_case("allow_connections") {
+                    if allow_connections
+                        .replace(self.role_option_boolean()?)
+                        .is_some()
+                    {
+                        return Err(self.err_here("ALLOW_CONNECTIONS specified more than once"));
+                    }
+                } else if option.eq_ignore_ascii_case("connection_limit") {
+                    let value = i32::try_from(self.seq_int()?)
+                        .ok()
+                        .filter(|value| *value >= -1)
+                        .ok_or_else(|| self.err_here("connection limit is out of range"))?;
+                    if connection_limit.replace(value).is_some() {
+                        return Err(self.err_here("CONNECTION LIMIT specified more than once"));
+                    }
+                } else if option.eq_ignore_ascii_case("is_template") {
+                    if is_template.replace(self.role_option_boolean()?).is_some() {
+                        return Err(self.err_here("IS_TEMPLATE specified more than once"));
+                    }
+                } else {
+                    return Err(self.err_here("unrecognized ALTER DATABASE option"));
+                }
+                if matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+                    break;
+                }
+            }
+            AlterDatabaseAction::Options {
+                allow_connections,
+                connection_limit,
+                is_template,
+            }
+        } else if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterDatabaseAction::Rename(self.any_ident("new database name")?)
+        } else if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterDatabaseAction::SetOwner(self.any_ident("database owner")?)
+        } else if self.eat_ident("set")? {
+            if self.eat_ident("tablespace")? {
+                AlterDatabaseAction::SetTablespace(self.any_ident("tablespace name")?)
+            } else {
+                let name = self.any_ident("configuration parameter")?;
+                let value = if self.eat_ident("from")? {
+                    self.expect_ident("current")?;
+                    RoutineConfigValue::Current
+                } else {
+                    if !self.eat_op("=")? {
+                        self.expect_ident("to")?;
+                    }
+                    let start = self.peek_at;
+                    while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+                        self.advance()?;
+                    }
+                    RoutineConfigValue::Value(self.text[start..self.peek_at].trim())
+                };
+                AlterDatabaseAction::Set { name, value }
+            }
+        } else if self.eat_ident("reset")? {
+            AlterDatabaseAction::Reset(if self.eat_ident("all")? {
+                None
+            } else {
+                Some(self.any_ident("configuration parameter")?)
+            })
+        } else if self.eat_ident("refresh")? {
+            self.expect_ident("collation")?;
+            self.expect_ident("version")?;
+            AlterDatabaseAction::RefreshCollationVersion
+        } else {
+            return Err(self.err_here("expected an ALTER DATABASE action"));
+        };
+        Ok(Stmt::AlterDatabase { name, action })
     }
 
     pub(super) fn alter_tablespace(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -4773,6 +5001,28 @@ impl<'a> Parser<'a> {
             };
             let name = self.any_ident("tablespace name")?;
             return Ok(Stmt::DropTablespace { name, if_exists });
+        }
+        if self.eat_ident("database")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.any_ident("database name")?;
+            let force = if self.eat_ident("with")? {
+                self.expect_op("(")?;
+                self.expect_ident("force")?;
+                self.expect_op(")")?;
+                true
+            } else {
+                false
+            };
+            return Ok(Stmt::DropDatabase {
+                name,
+                if_exists,
+                force,
+            });
         }
         if self.eat_ident("extension")? {
             let if_exists = if self.eat_ident("if")? {

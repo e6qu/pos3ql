@@ -280,6 +280,8 @@ pub struct Conn {
     login_verifier: LoginVerifier,
     auth_login: Option<crate::sql::RoleLogin>,
     authenticated_role: Option<u16>,
+    auth_database: Option<crate::sql::DatabaseLogin>,
+    authenticated_database: Option<u16>,
     database: StackStr<64>,
     auth_password: StackStr<256>,
     auth_reject: bool,
@@ -318,9 +320,21 @@ pub struct Conn {
     /// the plaintext `S` acknowledgement has left the socket.
     pending_tls: Option<crate::pg::tls::ServerSession>,
     cancel_request: Option<CancelRequest>,
+    terminate_after_flush: bool,
 }
 
 impl Conn {
+    fn clear_protocol_state(&mut self) {
+        for prepared in &mut self.prepared {
+            prepared.active = false;
+        }
+        for portal in &mut self.portals {
+            portal.active = false;
+            portal.result.clear();
+            portal.execution = PortalExecution::Fresh;
+        }
+    }
+
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         let empty = SqlName::parse("").expect("empty name fits");
         let mut prepared = Vec::with_capacity(config.max_prepared);
@@ -364,6 +378,8 @@ impl Conn {
             login_verifier: LoginVerifier::Rejected,
             auth_login: None,
             authenticated_role: None,
+            auth_database: None,
+            authenticated_database: None,
             database: StackStr::new(),
             auth_password: StackStr::new(),
             auth_reject: false,
@@ -389,6 +405,7 @@ impl Conn {
             tls: None,
             pending_tls: None,
             cancel_request: None,
+            terminate_after_flush: false,
         })
     }
 
@@ -417,6 +434,8 @@ impl Conn {
         self.login_verifier = LoginVerifier::Rejected;
         self.auth_login = None;
         self.authenticated_role = None;
+        self.auth_database = None;
+        self.authenticated_database = None;
         self.database = StackStr::new();
         self.auth_password = StackStr::new();
         self.auth_reject = false;
@@ -436,6 +455,7 @@ impl Conn {
         self.tls = None;
         self.pending_tls = None;
         self.cancel_request = None;
+        self.terminate_after_flush = false;
     }
 
     pub fn close(&mut self) -> Option<TcpStream> {
@@ -459,7 +479,7 @@ impl Conn {
     }
 
     pub(crate) fn wants_read(&self) -> bool {
-        !self.parked
+        !self.parked && !self.terminate_after_flush
     }
 
     /// The connection's id (the backend PID reported in BackendKeyData and in
@@ -470,6 +490,27 @@ impl Conn {
 
     pub(crate) fn authenticated_role(&self) -> Option<u16> {
         self.authenticated_role
+    }
+
+    pub(crate) fn authenticated_database(&self) -> Option<u16> {
+        self.authenticated_database
+    }
+
+    pub(crate) fn is_terminating(&self) -> bool {
+        self.terminate_after_flush
+    }
+
+    pub(crate) fn terminate_by_administrator(&mut self) -> bool {
+        self.recv.clear();
+        self.send.clear();
+        self.finish_lock_wait();
+        self.terminate_after_flush = true;
+        Responder::new(&mut self.send)
+            .fatal(
+                sqlstate::ADMIN_SHUTDOWN,
+                "terminating connection due to administrator command",
+            )
+            .is_ok()
     }
 
     pub(crate) fn take_cancel_request(&mut self) -> Option<CancelRequest> {
@@ -526,6 +567,13 @@ impl Conn {
     ) -> After {
         if self.stream.is_none() {
             return After::Close;
+        }
+        if self.terminate_after_flush {
+            return match self.flush() {
+                Ok(()) if self.send.is_empty() => After::Close,
+                Ok(()) => After::Continue,
+                Err(()) => After::Close,
+            };
         }
         if self.parked {
             return match self.flush() {
@@ -604,6 +652,7 @@ impl Conn {
         // A TLS session mid-handshake may still owe the peer bytes after the
         // socket accepted what it could; keep the connection alive.
         match flushed {
+            Ok(()) if self.terminate_after_flush && self.send.is_empty() => After::Close,
             Ok(()) => After::Continue,
             Err(()) => After::Close,
         }
@@ -626,6 +675,13 @@ impl Conn {
         tls_config: Option<&std::sync::Arc<rustls::ServerConfig>>,
     ) -> After {
         loop {
+            if matches!(self.phase, Phase::Ready | Phase::SkipToSync)
+                && self
+                    .auth_database
+                    .is_none_or(|database| engine.select_database(database.oid).is_err())
+            {
+                return After::Close;
+            }
             let after = match self.phase {
                 Phase::Startup => self.process_startup(engine, cancel_key, auth, tls_config),
                 Phase::AwaitPassword | Phase::AwaitSaslInit | Phase::AwaitSaslFinal => {
@@ -854,18 +910,29 @@ impl Conn {
                 "no PostgreSQL user name specified in startup packet",
             );
             return Step::Close;
-        }
+        };
         if self.database.as_str().is_empty() {
             self.database = self.guc.session_user();
         }
 
         let session_user = self.guc.session_user();
-        if let Some(role) = engine.role_login(session_user.as_str())
-            && let Err(error) = engine.apply_role_settings(role.slot, &self.guc)
-        {
-            let mut responder = Responder::new(&mut self.send);
-            let _ = responder.error(error.sqlstate, error.message.as_str());
-            return Step::Close;
+        self.auth_database = engine.database_login(self.database.as_str());
+        if let Some(database) = self.auth_database {
+            if engine.select_database(database.oid).is_err() {
+                return Step::Close;
+            }
+            if let Err(error) = engine.apply_system_settings(&self.guc) {
+                let mut responder = Responder::new(&mut self.send);
+                let _ = responder.error(error.sqlstate, error.message.as_str());
+                return Step::Close;
+            }
+            if let Some(role) = engine.role_login(session_user.as_str())
+                && let Err(error) = engine.apply_role_settings(role.slot, &self.guc)
+            {
+                let mut responder = Responder::new(&mut self.send);
+                let _ = responder.error(error.sqlstate, error.message.as_str());
+                return Step::Close;
+            }
         }
         let mut msg = MsgIn::new(payload);
         loop {
@@ -964,7 +1031,7 @@ impl Conn {
 
     /// AuthenticationOk, parameter statuses, key data, ReadyForQuery.
     fn finish_startup(&mut self, engine: &mut Engine, cancel_key: &[u8]) -> Step {
-        if !self.database.as_str().eq_ignore_ascii_case("postgres") {
+        let Some(database) = self.auth_database else {
             let mut responder = Responder::new(&mut self.send);
             let _ = responder.error(
                 sqlstate::INVALID_CATALOG_NAME,
@@ -976,7 +1043,7 @@ impl Conn {
                 .as_str(),
             );
             return Step::Close;
-        }
+        };
         if self.authenticated_role.is_none() {
             let Some(login) = self.auth_login else {
                 return Step::Close;
@@ -985,7 +1052,12 @@ impl Conn {
                 let mut responder = Responder::new(&mut self.send);
                 let _ = responder.error(
                     sqlstate::INSUFFICIENT_PRIVILEGE,
-                    "permission denied for database postgres",
+                    stack_format!(
+                        128,
+                        "permission denied for database {}",
+                        self.database.as_str()
+                    )
+                    .as_str(),
                 );
                 return Step::Close;
             }
@@ -997,7 +1069,19 @@ impl Conn {
                 );
                 return Step::Close;
             }
+            if !engine.reserve_database_connection(database, login.superuser) {
+                engine.release_role_connection(login.slot);
+                let mut responder = Responder::new(&mut self.send);
+                let message = if !database.allow_connections {
+                    "database is not currently accepting connections"
+                } else {
+                    "too many connections for database"
+                };
+                let _ = responder.error(sqlstate::TOO_MANY_CONNECTIONS, message);
+                return Step::Close;
+            }
             self.authenticated_role = Some(login.slot);
+            self.authenticated_database = Some(database.slot);
         }
         let minor = self.minor;
         let id = self.id;
@@ -2529,6 +2613,9 @@ impl Conn {
                 let portal = &mut self.portals[portal_slot];
                 portal.completion = completion;
                 portal.execution = PortalExecution::Complete;
+                if engine.take_discard_protocol_state() {
+                    self.clear_protocol_state();
+                }
                 return Step::Continue;
             }
         }
@@ -2567,6 +2654,9 @@ impl Conn {
                     responder.raw(&data[..total_msg])
                 };
                 portal.execution = PortalExecution::Complete;
+                if engine.take_discard_protocol_state() {
+                    self.clear_protocol_state();
+                }
                 return match result {
                     Ok(()) => Step::Continue,
                     Err(WireFull) => Step::Close,
@@ -2739,6 +2829,9 @@ impl Conn {
                 }
             }
         };
+        if engine.take_discard_protocol_state() {
+            self.clear_protocol_state();
+        }
         self.arena.reset();
         self.recv.consume(total);
         step
@@ -2765,7 +2858,7 @@ impl Conn {
                 Datum::Int8(1),
                 Datum::Text(lsn.as_str()),
                 if self.replication == ReplicationMode::Logical {
-                    Datum::Text("postgres")
+                    Datum::Text(self.database.as_str())
                 } else {
                     Datum::Null
                 },
@@ -4328,6 +4421,22 @@ mod tests {
                 .any(|bytes| bytes == b"57014"),
             "cancellation must be reported as SQLSTATE 57014"
         );
+    }
+
+    #[test]
+    fn administrative_termination_is_a_fatal_non_reading_wire_state() {
+        let config = Config::default_dev();
+        let mut budget = Budget::new(64 << 20);
+        let mut connection = Conn::new(&config, &mut budget).expect("connection budget");
+        connection.recv.append(b"Q\0\0\0\x05");
+        connection.park(false, 0);
+        assert!(connection.terminate_by_administrator());
+        assert!(connection.is_terminating());
+        assert!(!connection.wants_read());
+        assert!(connection.recv.is_empty());
+        let response = connection.send.readable();
+        assert!(response.windows(6).any(|bytes| bytes == b"FATAL\0"));
+        assert!(response.windows(5).any(|bytes| bytes == b"57P01"));
     }
 
     fn num_str(bytes: &[u8]) -> String {

@@ -626,6 +626,10 @@ pub enum Stmt<'a> {
     },
     /// RESET name / RESET ALL restores one or every settable GUC to default.
     Reset(Option<&'a str>),
+    AlterSystem {
+        name: Option<&'a str>,
+        value: Option<&'a str>,
+    },
     /// SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS TRANSACTION ....
     SetTransaction(&'a str),
     /// SET TRANSACTION SNAPSHOT 'snapshot_id'.
@@ -648,6 +652,7 @@ pub enum Stmt<'a> {
     Show(&'a str),
     /// SHOW ALL: every readable setting as (name, setting, description).
     ShowAll,
+    Discard(DiscardTarget),
     /// Snapshot to object storage now.
     Checkpoint,
     AlterTable(AlterTable<'a>),
@@ -686,6 +691,19 @@ pub enum Stmt<'a> {
         names: &'a [&'a str],
         if_exists: bool,
         cascade: bool,
+    },
+    CreateDatabase {
+        name: &'a str,
+        options: CreateDatabaseOptions<'a>,
+    },
+    AlterDatabase {
+        name: &'a str,
+        action: AlterDatabaseAction<'a>,
+    },
+    DropDatabase {
+        name: &'a str,
+        if_exists: bool,
+        force: bool,
     },
     CreateTablespace {
         name: &'a str,
@@ -904,6 +922,82 @@ pub enum AlterTablespaceAction<'a> {
     SetOwner(&'a str),
     SetOptions(TablespaceOptions),
     ResetOptions(TablespaceOptionNames),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseStrategy {
+    WalLog,
+    FileCopy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseLocaleProvider {
+    Builtin,
+    Libc,
+    Icu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateDatabaseOptions<'a> {
+    pub owner: Option<&'a str>,
+    pub template: Option<&'a str>,
+    pub encoding: Option<&'a str>,
+    pub strategy: Option<DatabaseStrategy>,
+    pub locale_provider: Option<DatabaseLocaleProvider>,
+    pub collate: Option<&'a str>,
+    pub ctype: Option<&'a str>,
+    pub locale: Option<&'a str>,
+    pub collation_version: Option<&'a str>,
+    pub tablespace: Option<&'a str>,
+    pub allow_connections: Option<bool>,
+    pub connection_limit: Option<i32>,
+    pub is_template: Option<bool>,
+    pub oid: Option<i32>,
+}
+
+impl CreateDatabaseOptions<'_> {
+    pub const EMPTY: Self = Self {
+        owner: None,
+        template: None,
+        encoding: None,
+        strategy: None,
+        locale_provider: None,
+        collate: None,
+        ctype: None,
+        locale: None,
+        collation_version: None,
+        tablespace: None,
+        allow_connections: None,
+        connection_limit: None,
+        is_template: None,
+        oid: None,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterDatabaseAction<'a> {
+    Options {
+        allow_connections: Option<bool>,
+        connection_limit: Option<i32>,
+        is_template: Option<bool>,
+    },
+    Rename(&'a str),
+    SetOwner(&'a str),
+    SetTablespace(&'a str),
+    RefreshCollationVersion,
+    Set {
+        name: &'a str,
+        value: RoutineConfigValue<'a>,
+    },
+    Reset(Option<&'a str>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscardTarget {
+    All,
+    Plans,
+    Sequences,
+    Temporary,
 }
 
 /// PostgreSQL's blocking and concurrent index lifecycle paths have different
@@ -1755,12 +1849,16 @@ pub enum CommentTarget<'a> {
     Schema(&'a str),
     /// TABLESPACE name.
     Tablespace(&'a str),
+    Database(&'a str),
     /// EXTENSION name.
     Extension(&'a str),
     /// TRIGGER name ON relation; trigger names are relation-local.
     Trigger(TriggerIdentity<'a>),
     /// TYPE name, or DOMAIN name when `domain_only` requires that kind.
-    Type { name: &'a str, domain_only: bool },
+    Type {
+        name: &'a str,
+        domain_only: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4004,6 +4102,7 @@ impl Expr<'_> {
                 "txid_current",
                 "pg_current_xact_id",
                 "pg_is_in_recovery",
+                "pg_reload_conf",
                 "current_setting",
                 "set_config",
             ];
@@ -4030,6 +4129,7 @@ impl Expr<'_> {
                 "txid_current",
                 "pg_current_xact_id",
                 "pg_is_in_recovery",
+                "pg_reload_conf",
                 "set_config",
             ];
             NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))

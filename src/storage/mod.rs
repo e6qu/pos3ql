@@ -987,7 +987,9 @@ impl ColumnMeta {
     };
 }
 
-/// Maximum number of multi-column UNIQUE/PRIMARY KEY constraints per table.
+/// Maximum number of named or multi-column UNIQUE/PRIMARY KEY constraints per
+/// table. Inline single-column keys use column flags until they need an
+/// independent catalog name.
 pub(crate) const MAX_UNIQUES: usize = 8;
 /// Maximum number of CHECK constraints per table.
 pub(crate) const MAX_CHECKS: usize = 8;
@@ -1908,6 +1910,10 @@ impl RowHeap {
 }
 
 pub struct Table {
+    /// Database catalog owning this relation. Slots are process-global while
+    /// relation names are database-local, so the database identity is part of
+    /// the stored relation identity rather than an execution-time filter.
+    pub(crate) database: DatabaseOid,
     pub def: TableDef,
     pub ownership: Ownership,
     /// Transaction-owned table-definition versions. Other transactions keep
@@ -2160,6 +2166,7 @@ pub(crate) struct PendingExtendedStatisticsDataSlot {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExtendedStatisticsDef {
+    pub(crate) database: DatabaseOid,
     pub(crate) created_at: u64,
     pub(crate) table: u16,
     pub(crate) mutable: ExtendedStatisticsMutableDefinition,
@@ -2192,6 +2199,7 @@ pub(crate) struct ExtendedStatisticsSpec {
 
 impl ExtendedStatisticsDef {
     const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         table: u16::MAX,
         mutable: ExtendedStatisticsMutableDefinition {
@@ -2684,6 +2692,7 @@ pub enum ViewSecurity {
 
 #[derive(Clone)]
 pub struct ViewDef {
+    pub(crate) database: DatabaseOid,
     /// Monotonic creation stamp, shared with tables (see `Table::created_at`).
     pub created_at: u64,
     pub schema: SqlName,
@@ -2722,6 +2731,7 @@ pub(crate) struct PendingObjectSchema {
 /// when the replication stream is opened.
 #[derive(Clone, Copy)]
 pub struct PublicationDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub name: SqlName,
     pending_name: Option<PendingPublicationName>,
@@ -2833,6 +2843,7 @@ impl From<crate::sql::ast::PublishGeneratedColumns> for PublishGeneratedColumns 
 /// fields; physical XLOG slots are outside pos3ql's object-native design.
 #[derive(Clone, Copy)]
 pub(crate) struct ReplicationSlotDef {
+    pub(crate) database: DatabaseOid,
     pub name: SqlName,
     pub restart_lsn: u64,
     pub confirmed_flush_lsn: u64,
@@ -2875,6 +2886,7 @@ impl ReplicationSlotBehavior {
 /// has to reparse SQL source or infer an omitted publication list.
 #[derive(Clone, Copy)]
 pub(crate) struct SubscriptionDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     /// Increments only when a committed publisher stream definition changes.
     /// An acknowledgement is valid for exactly one such definition.
@@ -2963,6 +2975,7 @@ impl SubscriptionRelation {
 /// from a committed catalog entry and is required to advance its frontier.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SubscriptionStream {
+    database: DatabaseOid,
     slot: usize,
     created_at: u64,
     definition_generation: u64,
@@ -2971,6 +2984,7 @@ pub(crate) struct SubscriptionStream {
 
 impl SubscriptionStream {
     pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         slot: usize::MAX,
         created_at: 0,
         definition_generation: 0,
@@ -2996,6 +3010,7 @@ impl SubscriptionStream {
     #[cfg(test)]
     pub(crate) fn for_test(name: SqlName, definition_generation: u64) -> Self {
         Self {
+            database: DatabaseOid::POSTGRES,
             slot: 0,
             created_at: 1,
             definition_generation,
@@ -3500,6 +3515,7 @@ impl PublicationDef {
 /// the defining query (re-run by REFRESH) and whether it has been populated.
 #[derive(Clone)]
 pub struct MatviewDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
@@ -4011,6 +4027,7 @@ impl CastMethod {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CastDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub source: RoutineResult,
     pub target: RoutineResult,
@@ -4021,6 +4038,7 @@ pub(crate) struct CastDef {
 
 impl CastDef {
     pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         source: RoutineResult::TEXT,
         target: RoutineResult::TEXT,
@@ -4112,6 +4130,7 @@ pub(crate) struct PendingOperatorDefinition {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OperatorDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub definition: OperatorDefinition,
     pub pending: Option<PendingOperatorDefinition>,
@@ -4120,6 +4139,7 @@ pub(crate) struct OperatorDef {
 
 impl OperatorDef {
     pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         definition: OperatorDefinition::EMPTY,
         pending: None,
@@ -4204,6 +4224,7 @@ pub(crate) struct PendingOperatorFamilyDefinition {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OperatorFamilyDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub definition: OperatorFamilyDefinition,
     pub pending: Option<PendingOperatorFamilyDefinition>,
@@ -4212,6 +4233,7 @@ pub(crate) struct OperatorFamilyDef {
 
 impl OperatorFamilyDef {
     pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         definition: OperatorFamilyDefinition::EMPTY,
         pending: None,
@@ -4286,6 +4308,7 @@ pub(crate) struct PendingOperatorClassDefinition {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OperatorClassDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub definition: OperatorClassDefinition,
     pub pending: Option<PendingOperatorClassDefinition>,
@@ -4294,6 +4317,7 @@ pub(crate) struct OperatorClassDef {
 
 impl OperatorClassDef {
     pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         definition: OperatorClassDefinition::EMPTY,
         pending: None,
@@ -5019,6 +5043,7 @@ impl RoutineArgumentDef {
 /// as parsed types, so catalog rendering and execution cannot disagree.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RoutineDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
@@ -5067,6 +5092,7 @@ pub(crate) struct PendingRoutineDefinition {
 
 impl RoutineDef {
     pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
@@ -5418,6 +5444,7 @@ impl TriggerTarget {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TriggerDef {
+    pub(crate) database: DatabaseOid,
     pub(crate) created_at: u64,
     pub(crate) name: SqlName,
     pub(crate) target: TriggerTarget,
@@ -5740,6 +5767,7 @@ pub(crate) struct PendingPolicyDefinition {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PolicyDef {
+    pub(crate) database: DatabaseOid,
     pub(crate) created_at: u64,
     pub(crate) name: SqlName,
     pub(crate) table: u16,
@@ -5752,6 +5780,7 @@ pub(crate) struct PolicyDef {
 
 impl PolicyDef {
     pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         name: SqlName::EMPTY,
         table: u16::MAX,
@@ -5789,6 +5818,7 @@ pub(crate) struct PolicySpec {
 
 impl TriggerDef {
     pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         name: SqlName::EMPTY,
         target: TriggerTarget::Table(u16::MAX),
@@ -5877,6 +5907,7 @@ pub(crate) const MAX_DOMAIN_CHECKS: usize = 4;
 /// a domain carries no per-value state.
 #[derive(Debug, Clone, Copy)]
 pub struct DomainDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
@@ -5916,6 +5947,7 @@ pub(crate) struct PendingDomainIdentity {
 
 impl DomainDef {
     pub(crate) const EMPTY: Self = DomainDef {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
@@ -6009,6 +6041,7 @@ impl EnumMember {
 /// sort key inline, so decoding a row needs no catalog lookup.
 #[derive(Debug, Clone, Copy)]
 pub struct EnumDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
@@ -6030,6 +6063,7 @@ pub(crate) struct PendingEnumDefinition {
 
 impl EnumDef {
     pub(crate) const EMPTY: Self = EnumDef {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
@@ -6111,6 +6145,7 @@ impl CompositeFieldDef {
 /// object, so field access never needs to reparse a declaration string.
 #[derive(Debug, Clone, Copy)]
 pub struct CompositeDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
@@ -6134,6 +6169,7 @@ pub(crate) struct PendingCompositeDefinition {
 
 impl CompositeDef {
     pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         schema: SqlName::EMPTY,
         name: SqlName::EMPTY,
@@ -6268,6 +6304,7 @@ impl SeqType {
 /// either image through a shared `&Storage` borrow.
 #[derive(Clone)]
 pub struct SequenceDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub schema: SqlName,
     pub name: SqlName,
@@ -6581,7 +6618,163 @@ pub(crate) fn index_expression_stackstr(
 }
 
 pub(crate) const MAX_TABLESPACES: usize = 64;
+pub(crate) const MAX_DATABASES: usize = 32;
+pub(crate) const USER_DATABASE_OID_BASE: i32 = 16_383;
 pub(crate) const TABLESPACE_LOCATION_MAX: usize = 256;
+
+/// Stable database identity. Catalog slots are reusable, so session, ACL,
+/// setting, WAL, and object identities carry this OID instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DatabaseOid(i32);
+
+impl DatabaseOid {
+    pub(crate) const TEMPLATE1: Self = Self(1);
+    pub(crate) const TEMPLATE0: Self = Self(4);
+    pub(crate) const POSTGRES: Self = Self(5);
+
+    pub(crate) const fn parse(oid: i32) -> Option<Self> {
+        if oid == Self::TEMPLATE1.0
+            || oid == Self::TEMPLATE0.0
+            || oid == Self::POSTGRES.0
+            || oid > USER_DATABASE_OID_BASE
+        {
+            Some(Self(oid))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn get(self) -> i32 {
+        self.0
+    }
+
+    fn next_after(self) -> Option<Self> {
+        self.0.checked_add(1).and_then(Self::parse)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatabaseEncoding {
+    Utf8,
+    SqlAscii,
+}
+
+impl DatabaseEncoding {
+    pub(crate) const fn code(self) -> i32 {
+        match self {
+            Self::SqlAscii => 0,
+            Self::Utf8 => 6,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::SqlAscii),
+            6 => Some(Self::Utf8),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatabaseLocaleProvider {
+    Builtin,
+    Libc,
+}
+
+impl DatabaseLocaleProvider {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Builtin => b'b',
+            Self::Libc => b'c',
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b'b' => Some(Self::Builtin),
+            b'c' => Some(Self::Libc),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DatabaseDefinition {
+    pub name: SqlName,
+    pub encoding: DatabaseEncoding,
+    pub locale_provider: DatabaseLocaleProvider,
+    pub collate: StackStr<128>,
+    pub ctype: StackStr<128>,
+    pub locale: StackStr<128>,
+    pub collation_version: StackStr<64>,
+    pub allow_connections: bool,
+    pub connection_limit: i32,
+    pub is_template: bool,
+    /// Stable internal tablespace identifier; zero and one name the built-ins.
+    pub tablespace: u16,
+}
+
+impl DatabaseDefinition {
+    fn builtin(name: &str, template: bool, allow_connections: bool, locale: &str) -> Self {
+        Self {
+            name: SqlName::parse(name).expect("built-in database name fits"),
+            encoding: DatabaseEncoding::Utf8,
+            locale_provider: DatabaseLocaleProvider::Libc,
+            collate: StackStr::from_str(locale),
+            ctype: StackStr::from_str(locale),
+            locale: StackStr::new(),
+            collation_version: StackStr::new(),
+            allow_connections,
+            connection_limit: -1,
+            is_template: template,
+            tablespace: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingDatabaseDefinition {
+    pub txid: u32,
+    pub definition: DatabaseDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DatabaseDef {
+    pub oid: DatabaseOid,
+    pub definition: DatabaseDefinition,
+    pub pending: Option<PendingDatabaseDefinition>,
+    pub ownership: Ownership,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl DatabaseDef {
+    fn builtin(
+        oid: DatabaseOid,
+        name: &str,
+        template: bool,
+        allow_connections: bool,
+        locale: &str,
+    ) -> Self {
+        Self {
+            oid,
+            definition: DatabaseDefinition::builtin(name, template, allow_connections, locale),
+            pending: None,
+            ownership: Ownership::BOOTSTRAP,
+            ddl_state: CatalogDdlState::Present,
+        }
+    }
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(&self, txid: u32) -> DatabaseDefinition {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.definition, |pending| pending.definition)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TablespaceOptions {
@@ -6704,6 +6897,7 @@ pub(crate) struct PendingIndexDefinition {
 /// A named btree index over a table's columns.
 #[derive(Clone, Copy)]
 pub struct IndexDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     /// The schema of both the index and its table (an index always lives in
     /// its table's schema).
@@ -6810,6 +7004,7 @@ pub(crate) struct PendingExtensionDefinition {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExtensionDef {
+    pub(crate) database: DatabaseOid,
     pub created_at: u64,
     pub name: SqlName,
     pub namespace: u16,
@@ -6822,6 +7017,7 @@ pub(crate) struct ExtensionDef {
 
 impl ExtensionDef {
     const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
         created_at: 0,
         name: SqlName::EMPTY,
         namespace: 0,
@@ -7362,6 +7558,7 @@ fn merge_extension_control(
 /// A named schema (namespace for tables, views and indexes).
 #[derive(Clone, Copy)]
 pub struct SchemaDef {
+    pub(crate) database: DatabaseOid,
     pub name: SqlName,
     pub ownership: Ownership,
     ddl_state: CatalogDdlState,
@@ -7613,6 +7810,16 @@ pub(crate) struct AclEntry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoleObjectDependency {
+    OwnedObject,
+    OwnedCatalogObject,
+    ObjectPrivilege,
+    DefaultPrivilege,
+    ColumnPrivilege,
+    Policy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ColumnPrivilegeTarget {
     relation: AccessObject,
     column: u16,
@@ -7672,6 +7879,7 @@ pub(crate) struct DefaultAclKey {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DefaultAclEntry {
+    pub database: DatabaseOid,
     pub owner: u16,
     /// DEFAULT_ACL_ALL_SCHEMAS denotes the global default; otherwise this is a
     /// stable schema slot.
@@ -7690,6 +7898,7 @@ pub(crate) struct DefaultAclEntry {
 pub(crate) const MAX_ROLES: usize = 64;
 pub(crate) const MAX_ROLE_MEMBERSHIPS: usize = 256;
 pub(crate) const MAX_ROLE_SETTINGS: usize = 128;
+pub(crate) const MAX_SYSTEM_SETTINGS: usize = 32;
 pub(crate) const ROLE_SETTING_VALUE_MAX: usize = 256;
 pub(crate) const ROLE_PASSWORD_MAX: usize = 128;
 pub(crate) const ROLE_VALID_UNTIL_MAX: usize = 64;
@@ -7849,8 +8058,26 @@ impl RoleMembership {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RoleSettingScope {
     RoleAllDatabases(u16),
-    RoleInDatabase(u16),
-    AllRolesInDatabase,
+    RoleInDatabase { role: u16, database: DatabaseOid },
+    AllRolesInDatabase(DatabaseOid),
+}
+
+impl RoleSettingScope {
+    pub(crate) const fn role(self) -> Option<u16> {
+        match self {
+            Self::RoleAllDatabases(role) | Self::RoleInDatabase { role, .. } => Some(role),
+            Self::AllRolesInDatabase(_) => None,
+        }
+    }
+
+    pub(crate) const fn database(self) -> Option<DatabaseOid> {
+        match self {
+            Self::RoleAllDatabases(_) => None,
+            Self::RoleInDatabase { database, .. } | Self::AllRolesInDatabase(database) => {
+                Some(database)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7871,7 +8098,7 @@ pub(crate) struct RoleSetting {
 
 impl RoleSetting {
     pub(crate) const EMPTY: Self = Self {
-        scope: RoleSettingScope::AllRolesInDatabase,
+        scope: RoleSettingScope::AllRolesInDatabase(DatabaseOid::POSTGRES),
         name: SqlName::EMPTY,
         value: StackStr::new(),
         live: false,
@@ -7889,6 +8116,30 @@ impl RoleSetting {
         match self.pending {
             Some(pending) if pending.txid == txid && pending.exists => pending.value,
             _ => self.value,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SystemSetting {
+    pub name: SqlName,
+    pub value: StackStr<ROLE_SETTING_VALUE_MAX>,
+    pub live: bool,
+    pub pending: Option<PendingRoleSetting>,
+}
+
+impl SystemSetting {
+    const EMPTY: Self = Self {
+        name: SqlName::EMPTY,
+        value: StackStr::new(),
+        live: false,
+        pending: None,
+    };
+
+    pub(crate) fn visible_to(&self, txid: u32) -> bool {
+        match self.pending {
+            Some(pending) if pending.txid == txid => pending.exists,
+            _ => self.live,
         }
     }
 }
@@ -7931,6 +8182,7 @@ pub enum CommentClass {
     Tablespace,
     Extension,
     Trigger,
+    Database,
 }
 
 impl CommentClass {
@@ -7942,6 +8194,7 @@ impl CommentClass {
             CommentClass::Tablespace => 3,
             CommentClass::Extension => 4,
             CommentClass::Trigger => 5,
+            CommentClass::Database => 6,
         }
     }
 
@@ -7953,6 +8206,7 @@ impl CommentClass {
             3 => CommentClass::Tablespace,
             4 => CommentClass::Extension,
             5 => CommentClass::Trigger,
+            6 => CommentClass::Database,
             _ => return None,
         })
     }
@@ -7980,6 +8234,7 @@ pub struct PendingComment {
 #[derive(Clone, Copy, Debug)]
 struct PendingCommentIdentity {
     txid: u32,
+    schema: SqlName,
     name: SqlName,
 }
 
@@ -7991,6 +8246,7 @@ struct PendingCommentIdentity {
 #[derive(Clone, Copy, Debug)]
 pub struct CommentEntry {
     pub used: bool,
+    pub(crate) database: Option<DatabaseOid>,
     pub class: CommentClass,
     pub schema: SqlName,
     pub name: SqlName,
@@ -8004,6 +8260,7 @@ impl CommentEntry {
     fn empty() -> Self {
         Self {
             used: false,
+            database: None,
             class: CommentClass::Relation,
             schema: SqlName::EMPTY,
             name: SqlName::EMPTY,
@@ -8014,8 +8271,16 @@ impl CommentEntry {
         }
     }
 
-    fn matches(&self, class: CommentClass, schema: &str, name: &str, subid: u32) -> bool {
+    fn matches(
+        &self,
+        database: Option<DatabaseOid>,
+        class: CommentClass,
+        schema: &str,
+        name: &str,
+        subid: u32,
+    ) -> bool {
         self.used
+            && self.database == database
             && self.class == class
             && self.subid == subid
             && self.name.as_str() == name
@@ -8024,6 +8289,7 @@ impl CommentEntry {
 
     fn matches_to(
         &self,
+        database: Option<DatabaseOid>,
         class: CommentClass,
         schema: &str,
         name: &str,
@@ -8031,9 +8297,15 @@ impl CommentEntry {
         txid: u32,
     ) -> bool {
         self.used
+            && self.database == database
             && self.class == class
             && self.subid == subid
-            && self.schema.as_str() == schema
+            && self
+                .pending_identity
+                .filter(|identity| identity.txid == txid)
+                .map_or(self.schema, |identity| identity.schema)
+                .as_str()
+                == schema
             && self
                 .pending_identity
                 .filter(|identity| identity.txid == txid)
@@ -8086,6 +8358,16 @@ impl PathContext {
         entries[0] = PathEntry::Catalog;
         entries[1] = PathEntry::Schema(0);
         PathContext {
+            entries,
+            n: 2,
+            explicit_catalog: false,
+        }
+    }
+
+    const fn public_schema(slot: u16) -> Self {
+        let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
+        entries[1] = PathEntry::Schema(slot);
+        Self {
             entries,
             n: 2,
             explicit_catalog: false,
@@ -8175,6 +8457,8 @@ pub struct Storage {
     enums: FixedVec<EnumDef>,
     composites: FixedVec<CompositeDef>,
     indexes: FixedVec<IndexDef>,
+    databases: FixedVec<DatabaseDef>,
+    current_database: DatabaseOid,
     tablespaces: FixedVec<TablespaceDef>,
     schemas: FixedVec<SchemaDef>,
     extensions: FixedVec<ExtensionDef>,
@@ -8185,9 +8469,9 @@ pub struct Storage {
     extension_script_source: FixedBuf,
     extension_package_source: ExtensionPackageSource,
     roles: FixedVec<RoleDef>,
-    database_ownership: Ownership,
     role_memberships: FixedVec<RoleMembership>,
     role_settings: FixedVec<RoleSetting>,
+    system_settings: FixedVec<SystemSetting>,
     acl_entries: FixedVec<AclEntry>,
     column_acl_entries: FixedVec<ColumnAclEntry>,
     default_acl_entries: FixedVec<DefaultAclEntry>,
@@ -8662,7 +8946,8 @@ impl Storage {
             let slot = match dependency.class {
                 DependencyClass::Table => self.find_visible(schema, name, txid),
                 DependencyClass::View => self.views.iter().position(|view| {
-                    view.visible_to(txid)
+                    view.database == self.current_database
+                        && view.visible_to(txid)
                         && view.schema.as_str() == schema
                         && view.name.as_str() == name
                 }),
@@ -8709,32 +8994,44 @@ impl Storage {
     }
 
     pub fn rebind_all_stored_query_dependencies(&mut self) -> Result<(), SqlError> {
+        self.rebind_all_stored_query_dependencies_to(0)
+    }
+
+    fn rebind_all_stored_query_dependencies_to(&mut self, txid: u32) -> Result<(), SqlError> {
         for slot in 0..self.views.len() {
-            if self.views[slot].ddl_state == CatalogDdlState::Present {
+            if self.views[slot].database == self.current_database
+                && self.views[slot].visible_to(txid)
+            {
                 let serialized = self.view_dependencies[slot];
                 self.view_dependencies[slot] =
-                    self.rebind_stored_query_dependencies(serialized, 0)?;
+                    self.rebind_stored_query_dependencies(serialized, txid)?;
             }
         }
         for slot in 0..self.matviews.len() {
-            if self.matviews[slot].ddl_state == CatalogDdlState::Present {
+            if self.matviews[slot].database == self.current_database
+                && self.matviews[slot].visible_to(txid)
+            {
                 let serialized = self.matview_dependencies[slot];
                 self.matview_dependencies[slot] =
-                    self.rebind_stored_query_dependencies(serialized, 0)?;
+                    self.rebind_stored_query_dependencies(serialized, txid)?;
             }
         }
         for slot in 0..self.policies.len() {
-            if self.policies[slot].ddl_state == CatalogDdlState::Present {
+            if self.policies[slot].database == self.current_database
+                && self.policies[slot].visible_to(txid)
+            {
                 let serialized = self.policies[slot].definition.dependencies;
                 self.policies[slot].definition.dependencies =
-                    self.rebind_stored_query_dependencies(serialized, 0)?;
+                    self.rebind_stored_query_dependencies(serialized, txid)?;
             }
         }
         for slot in 0..self.routines.len() {
-            if self.routines[slot].ddl_state == CatalogDdlState::Present {
+            if self.routines[slot].database == self.current_database
+                && self.routines[slot].visible_to(txid)
+            {
                 let serialized = self.routine_dependencies[slot];
                 self.routine_dependencies[slot] =
-                    self.rebind_stored_query_dependencies(serialized, 0)?;
+                    self.rebind_stored_query_dependencies(serialized, txid)?;
             }
         }
         Ok(())
@@ -8874,6 +9171,7 @@ impl Storage {
             + MAX_ROLES * size_of::<RoleDef>()
             + MAX_ROLE_MEMBERSHIPS * size_of::<RoleMembership>()
             + MAX_ROLE_SETTINGS * size_of::<RoleSetting>()
+            + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
             + MAX_ACL_ENTRIES * size_of::<AclEntry>()
             + MAX_COLUMN_ACL_ENTRIES * size_of::<ColumnAclEntry>()
             + MAX_DEFAULT_ACL_ENTRIES * size_of::<DefaultAclEntry>()
@@ -8881,6 +9179,7 @@ impl Storage {
             + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_ENUMS * size_of::<EnumDef>()
             + MAX_COMPOSITES * size_of::<CompositeDef>()
+            + MAX_DATABASES * size_of::<DatabaseDef>()
             + MAX_TABLESPACES * size_of::<TablespaceDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
             + config.max_connections as usize * size_of::<(u32, u64)>()
@@ -8911,6 +9210,7 @@ impl Storage {
         for _ in 0..config.max_tables {
             tables
                 .push(Table {
+                    database: DatabaseOid::POSTGRES,
                     def: TableDef {
                         name: SqlName::parse("").expect("empty name fits"),
                         columns: [ColumnMeta {
@@ -8963,6 +9263,7 @@ impl Storage {
         for _ in 0..config.max_tables {
             views
                 .push(ViewDef {
+                    database: DatabaseOid::POSTGRES,
                     created_at: 0,
                     schema: SqlName::parse("").expect("empty name fits"),
                     name: SqlName::parse("").expect("empty name fits"),
@@ -9052,6 +9353,7 @@ impl Storage {
         for _ in 0..config.max_tables {
             publications
                 .push(PublicationDef {
+                    database: DatabaseOid::POSTGRES,
                     created_at: 0,
                     name: SqlName::parse("").expect("empty name fits"),
                     pending_name: None,
@@ -9079,6 +9381,7 @@ impl Storage {
         for _ in 0..config.max_replication_slots {
             replication_slots
                 .push(ReplicationSlotDef {
+                    database: DatabaseOid::POSTGRES,
                     name: SqlName::EMPTY,
                     restart_lsn: 0,
                     confirmed_flush_lsn: 0,
@@ -9092,6 +9395,7 @@ impl Storage {
         for _ in 0..config.max_subscriptions {
             subscriptions
                 .push(SubscriptionDef {
+                    database: DatabaseOid::POSTGRES,
                     created_at: 0,
                     definition_generation: 0,
                     name: SqlName::EMPTY,
@@ -9138,6 +9442,7 @@ impl Storage {
         for _ in 0..config.max_tables {
             matviews
                 .push(MatviewDef {
+                    database: DatabaseOid::POSTGRES,
                     created_at: 0,
                     schema: SqlName::parse("").expect("empty name fits"),
                     name: SqlName::parse("").expect("empty name fits"),
@@ -9155,6 +9460,7 @@ impl Storage {
         for _ in 0..MAX_SEQUENCES {
             sequences
                 .push(SequenceDef {
+                    database: DatabaseOid::POSTGRES,
                     created_at: 0,
                     schema: SqlName::EMPTY,
                     name: SqlName::EMPTY,
@@ -9197,15 +9503,21 @@ impl Storage {
         }
         let mut schemas = FixedVec::new(budget, "schemas", MAX_SCHEMAS)?;
         for i in 0..MAX_SCHEMAS {
+            let database = match i {
+                0 => DatabaseOid::TEMPLATE1,
+                1 => DatabaseOid::TEMPLATE0,
+                _ => DatabaseOid::POSTGRES,
+            };
             schemas
                 .push(SchemaDef {
-                    name: if i == 0 {
+                    database,
+                    name: if i < 3 {
                         SqlName::parse("public").expect("fits")
                     } else {
                         SqlName::EMPTY
                     },
                     ownership: Ownership::BOOTSTRAP,
-                    ddl_state: if i == 0 {
+                    ddl_state: if i < 3 {
                         CatalogDdlState::Present
                     } else {
                         CatalogDdlState::Absent
@@ -9285,21 +9597,29 @@ impl Storage {
                 .push(RoleSetting::EMPTY)
                 .expect("sized to MAX_ROLE_SETTINGS");
         }
+        let mut system_settings = FixedVec::new(budget, "system_settings", MAX_SYSTEM_SETTINGS)?;
+        for _ in 0..MAX_SYSTEM_SETTINGS {
+            system_settings
+                .push(SystemSetting::EMPTY)
+                .expect("sized to MAX_SYSTEM_SETTINGS");
+        }
         let mut acl_entries = FixedVec::new(budget, "acl_entries", MAX_ACL_ENTRIES)?;
-        acl_entries
-            .push(AclEntry {
-                object: AccessObject {
-                    class: AccessClass::Schema,
-                    slot: 0,
-                },
-                grantee: PUBLIC_ROLE,
-                grantor: 0,
-                privileges: PrivilegeSet::USAGE,
-                grant_options: PrivilegeSet::NONE,
-                live: true,
-                pending: None,
-            })
-            .expect("ACL pool has room for the public schema default");
+        for slot in 0..3 {
+            acl_entries
+                .push(AclEntry {
+                    object: AccessObject {
+                        class: AccessClass::Schema,
+                        slot,
+                    },
+                    grantee: PUBLIC_ROLE,
+                    grantor: 0,
+                    privileges: PrivilegeSet::USAGE,
+                    grant_options: PrivilegeSet::NONE,
+                    live: true,
+                    pending: None,
+                })
+                .expect("ACL pool has room for public schema defaults");
+        }
         let default_acl_entries =
             FixedVec::new(budget, "default_acl_entries", MAX_DEFAULT_ACL_ENTRIES)?;
         let column_acl_entries =
@@ -9308,6 +9628,7 @@ impl Storage {
         for _ in 0..config.max_tables {
             indexes
                 .push(IndexDef {
+                    database: DatabaseOid::POSTGRES,
                     created_at: 0,
                     schema: SqlName::parse("").expect("empty name fits"),
                     name: SqlName::parse("").expect("empty name fits"),
@@ -9334,17 +9655,67 @@ impl Storage {
                 })
                 .expect("sized to max_tables");
         }
+        let mut databases = FixedVec::new(budget, "databases", MAX_DATABASES)?;
+        databases
+            .push(DatabaseDef::builtin(
+                DatabaseOid::TEMPLATE1,
+                "template1",
+                true,
+                true,
+                config.database_collation_locale.as_str(),
+            ))
+            .expect("database catalog has template1 slot");
+        databases
+            .push(DatabaseDef::builtin(
+                DatabaseOid::TEMPLATE0,
+                "template0",
+                true,
+                false,
+                config.database_collation_locale.as_str(),
+            ))
+            .expect("database catalog has template0 slot");
+        databases
+            .push(DatabaseDef::builtin(
+                DatabaseOid::POSTGRES,
+                "postgres",
+                false,
+                true,
+                config.database_collation_locale.as_str(),
+            ))
+            .expect("database catalog has postgres slot");
+        while databases.len() < MAX_DATABASES {
+            databases
+                .push(DatabaseDef {
+                    oid: DatabaseOid::POSTGRES,
+                    definition: DatabaseDefinition::builtin("", false, false, "C"),
+                    pending: None,
+                    ownership: Ownership::BOOTSTRAP,
+                    ddl_state: CatalogDdlState::Absent,
+                })
+                .expect("sized to MAX_DATABASES");
+        }
         let mut tablespaces = FixedVec::new(budget, "tablespaces", MAX_TABLESPACES)?;
-        for _ in 0..MAX_TABLESPACES {
+        for slot in 0..MAX_TABLESPACES {
+            let builtin = match slot {
+                0 => Some((1_663, "pg_default")),
+                1 => Some((1_664, "pg_global")),
+                _ => None,
+            };
             tablespaces
                 .push(TablespaceDef {
-                    created_at: 0,
-                    name: SqlName::EMPTY,
+                    created_at: builtin.map_or(0, |(oid, _)| oid),
+                    name: builtin.map_or(SqlName::EMPTY, |(_, name)| {
+                        SqlName::parse(name).expect("built-in tablespace name fits")
+                    }),
                     location: StackStr::new(),
                     options: TablespaceOptions::DEFAULT,
                     ownership: Ownership::BOOTSTRAP,
                     pending: None,
-                    ddl_state: CatalogDdlState::Absent,
+                    ddl_state: if builtin.is_some() {
+                        CatalogDdlState::Present
+                    } else {
+                        CatalogDdlState::Absent
+                    },
                 })
                 .expect("sized to MAX_TABLESPACES");
         }
@@ -9397,6 +9768,8 @@ impl Storage {
             enums,
             composites,
             indexes,
+            databases,
+            current_database: DatabaseOid::POSTGRES,
             tablespaces,
             schemas,
             extensions,
@@ -9407,14 +9780,14 @@ impl Storage {
             extension_script_source,
             extension_package_source: ExtensionPackageSource::Durable,
             roles,
-            database_ownership: Ownership::BOOTSTRAP,
             role_memberships,
             role_settings,
+            system_settings,
             acl_entries,
             column_acl_entries,
             default_acl_entries,
             comments,
-            path: PathContext::public_only(),
+            path: PathContext::public_schema(2),
             catalog_seq: 0,
             read_snapshot: SNAPSHOT_ALL,
             commit_snapshot: u64::MAX,
@@ -9892,16 +10265,18 @@ impl Storage {
     /// replay and the durable image.
     pub fn find_schema(&self, name: &str) -> Option<usize> {
         self.schemas.iter().position(|schema| {
-            schema.ddl_state == CatalogDdlState::Present && schema.name.as_str() == name
+            schema.database == self.current_database
+                && schema.ddl_state == CatalogDdlState::Present
+                && schema.name.as_str() == name
         })
     }
 
     /// Transaction-scoped schema lookup: `txid` sees its own uncommitted
     /// CREATE/DROP and every committed schema.
     pub fn find_schema_visible(&self, name: &str, txid: u32) -> Option<usize> {
-        self.schemas
-            .iter()
-            .position(|n| n.visible_to(txid) && n.name.as_str() == name)
+        self.schemas.iter().position(|n| {
+            n.database == self.current_database && n.visible_to(txid) && n.name.as_str() == name
+        })
     }
 
     pub fn schema_def(&self, slot: usize) -> &SchemaDef {
@@ -9916,6 +10291,1359 @@ impl Storage {
         self.roles.len()
     }
 
+    pub(crate) fn databases_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &DatabaseDef)> {
+        self.databases
+            .iter()
+            .enumerate()
+            .filter(move |(_, database)| database.visible_to(txid))
+    }
+
+    pub(crate) fn database_slot(&self, name: &str, txid: u32) -> Option<usize> {
+        self.databases.iter().position(|database| {
+            database.visible_to(txid) && database.definition_for(txid).name.as_str() == name
+        })
+    }
+
+    pub(crate) fn database_slot_by_oid(&self, oid: DatabaseOid, txid: u32) -> Option<usize> {
+        self.databases
+            .iter()
+            .position(|database| database.visible_to(txid) && database.oid == oid)
+    }
+
+    pub(crate) fn database(&self, slot: usize) -> &DatabaseDef {
+        &self.databases[slot]
+    }
+
+    pub(crate) fn database_definition(&self, slot: usize, txid: u32) -> DatabaseDefinition {
+        self.databases[slot].definition_for(txid)
+    }
+
+    pub(crate) fn select_database(&mut self, database: DatabaseOid) -> Result<(), SqlError> {
+        if self.database_slot_by_oid(database, 0).is_none() {
+            return Err(sql_err!(
+                sqlstate::INVALID_CATALOG_NAME,
+                "database with OID {} does not exist",
+                database.get()
+            ));
+        }
+        self.current_database = database;
+        let public = self.find_schema("public").ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "database with OID {} has no public schema",
+                database.get()
+            )
+        })?;
+        let mut entries = [PathEntry::Catalog; MAX_PATH_ENTRIES];
+        entries[1] = PathEntry::Schema(public as u16);
+        self.path = PathContext {
+            entries,
+            n: 2,
+            explicit_catalog: false,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn select_database_for_recovery(
+        &mut self,
+        database: DatabaseOid,
+    ) -> Result<(), SqlError> {
+        if self.database_slot_by_oid(database, 0).is_none() {
+            return Err(sql_err!(
+                sqlstate::INVALID_CATALOG_NAME,
+                "database with OID {} does not exist",
+                database.get()
+            ));
+        }
+        self.current_database = database;
+        Ok(())
+    }
+
+    pub(crate) fn current_database_oid(&self) -> DatabaseOid {
+        self.current_database
+    }
+
+    pub(crate) fn create_database(
+        &mut self,
+        requested_oid: Option<DatabaseOid>,
+        template: DatabaseOid,
+        definition: DatabaseDefinition,
+        owner: u16,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if self.database_slot(definition.name.as_str(), txid).is_some() {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_DATABASE,
+                "database \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
+        if self
+            .roles
+            .get(usize::from(owner))
+            .is_none_or(|role| !role.visible_to(txid))
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "database owner does not exist"
+            ));
+        }
+        let oid = if let Some(oid) = requested_oid {
+            if self
+                .databases
+                .iter()
+                .any(|database| database.visible_to(txid) && database.oid == oid)
+            {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "database OID {} is already in use",
+                    oid.get()
+                ));
+            }
+            oid
+        } else {
+            self.databases
+                .iter()
+                .filter(|database| database.visible_to(txid))
+                .map(|database| database.oid)
+                .filter(|oid| oid.get() > USER_DATABASE_OID_BASE)
+                .max()
+                .unwrap_or(DatabaseOid(USER_DATABASE_OID_BASE))
+                .next_after()
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "database OID space exhausted"
+                    )
+                })?
+        };
+        let slot = self
+            .databases
+            .iter()
+            .position(|database| database.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "database catalog capacity exhausted (limit {})",
+                    MAX_DATABASES
+                )
+            })?;
+        self.databases[slot] = DatabaseDef {
+            oid,
+            definition,
+            pending: None,
+            ownership: Ownership {
+                owner: 0,
+                pending: Some(PendingOwnership { txid, owner }),
+            },
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        if let Err(error) = self.clone_database_catalog(template, oid, txid) {
+            self.clear_database_catalog(oid);
+            self.databases[slot].ddl_state = CatalogDdlState::Absent;
+            return Err(error);
+        }
+        Ok(slot)
+    }
+
+    pub(crate) fn restore_database(
+        &mut self,
+        oid: DatabaseOid,
+        definition: DatabaseDefinition,
+        owner: u16,
+    ) -> Result<usize, SqlError> {
+        let slot = self
+            .databases
+            .iter()
+            .position(|database| database.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "database catalog capacity exhausted (limit {})",
+                    MAX_DATABASES
+                )
+            })?;
+        self.databases[slot] = DatabaseDef {
+            oid,
+            definition,
+            pending: None,
+            ownership: Ownership {
+                owner,
+                pending: None,
+            },
+            ddl_state: CatalogDdlState::Present,
+        };
+        Ok(slot)
+    }
+
+    /// Clones a template's immutable catalog image into a transaction-owned
+    /// database namespace. Row homes and immutable spill generations are
+    /// shared; subsequent writes append new row images, so the source and
+    /// clone diverge without copying provider objects or aliasing mutable
+    /// catalog state.
+    fn clone_database_catalog(
+        &mut self,
+        source: DatabaseOid,
+        target: DatabaseOid,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let prior_database = self.current_database;
+        self.current_database = target;
+        let result = (|| {
+            for source_slot in 0..self.schemas.len() {
+                let source_schema = self.schemas[source_slot];
+                if source_schema.database != source
+                    || source_schema.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot =
+                    self.alloc_schema(source_schema.name, CatalogDdlState::PendingCreate { txid })?;
+                self.schemas[target_slot].ownership = source_schema.ownership.committed();
+            }
+
+            for source_slot in 0..self.domains.len() {
+                let mut definition = self.domains[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .domains
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "domain catalog is full")
+                    })?;
+                definition.database = target;
+                definition.ownership = definition.ownership.committed();
+                definition.pending_definition = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.domains[target_slot] = definition;
+            }
+            for source_slot in 0..self.enums.len() {
+                let mut definition = self.enums[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .enums
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "enum catalog is full")
+                    })?;
+                definition.database = target;
+                definition.ownership = definition.ownership.committed();
+                definition.pending_definition = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.enums[target_slot] = definition;
+            }
+            for source_slot in 0..self.composites.len() {
+                let mut definition = self.composites[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .composites
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "composite catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.ownership = definition.ownership.committed();
+                definition.pending_definition = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.composites[target_slot] = definition;
+            }
+
+            for source_slot in 0..self.tables.len() {
+                if self.tables[source_slot].database != source || !self.tables[source_slot].live {
+                    continue;
+                }
+                if self.tables[source_slot].pending_ddl.is_some()
+                    || self.tables[source_slot].pending_def_txid.is_some()
+                {
+                    return Err(sql_err!(
+                        sqlstate::OBJECT_IN_USE,
+                        "template database has uncommitted relation state"
+                    ));
+                }
+                let definition = self.tables[source_slot].def;
+                let created_at = self.tables[source_slot].created_at;
+                let ownership = self.tables[source_slot].ownership.committed();
+                let statistics = self.tables[source_slot].statistics;
+                let serial_last = self.tables[source_slot].serial_last;
+                let spill_ssts = self.tables[source_slot].spill_ssts;
+                let n_spill_ssts = self.tables[source_slot].n_spill_ssts;
+                let target_slot = self.alloc_table(
+                    definition,
+                    Some(PendingDdl {
+                        txid,
+                        creating: true,
+                    }),
+                )?;
+                {
+                    let target_table = &mut self.tables[target_slot];
+                    target_table.created_at = created_at;
+                    target_table.ownership = ownership;
+                    target_table.statistics = statistics;
+                    target_table.serial_last = serial_last;
+                    target_table.spill_ssts = spill_ssts;
+                    target_table.n_spill_ssts = n_spill_ssts;
+                }
+                let row_count = self.tables[source_slot].rows.len();
+                for position in 0..row_count {
+                    let (rowid, mut state) = self.tables[source_slot]
+                        .rows
+                        .iter()
+                        .nth(position)
+                        .map(|(rowid, state)| (*rowid, *state))
+                        .expect("row position remains stable while cloning another table");
+                    if state.pending.len() != 0 {
+                        return Err(sql_err!(
+                            sqlstate::OBJECT_IN_USE,
+                            "template database has uncommitted row state"
+                        ));
+                    }
+                    state.pending = PendingVersions::empty();
+                    self.tables[target_slot]
+                        .rows
+                        .insert(rowid, state)
+                        .map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "template relation exceeds cloned row-map capacity"
+                            )
+                        })?;
+                }
+            }
+
+            for source_slot in 0..self.sequences.len() {
+                let source_definition = &self.sequences[source_slot];
+                if source_definition.database != source
+                    || source_definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let mut definition = source_definition.clone();
+                let target_slot = self
+                    .sequences
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "sequence catalog is full")
+                    })?;
+                definition.database = target;
+                definition.ownership = definition.ownership.committed();
+                definition.pending_definition = None;
+                definition.pending_dirty.set(false);
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.sequences[target_slot] = definition;
+            }
+
+            for source_slot in 0..self.views.len() {
+                let source_definition = &self.views[source_slot];
+                if source_definition.database != source
+                    || source_definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let mut definition = source_definition.clone();
+                let target_slot = self
+                    .views
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "view catalog is full")
+                    })?;
+                definition.database = target;
+                definition.ownership = definition.ownership.committed();
+                definition.pending_schema = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.views[target_slot] = definition;
+                self.view_dependencies[target_slot] = self.view_dependencies[source_slot];
+            }
+            for source_slot in 0..self.matviews.len() {
+                let source_definition = &self.matviews[source_slot];
+                if source_definition.database != source
+                    || source_definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let mut definition = source_definition.clone();
+                let target_slot = self
+                    .matviews
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "materialized-view catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.ownership = definition.ownership.committed();
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.matviews[target_slot] = definition;
+                self.matview_dependencies[target_slot] = self.matview_dependencies[source_slot];
+            }
+
+            for source_slot in 0..self.routines.len() {
+                let mut definition = self.routines[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .routines
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "routine catalog is full")
+                    })?;
+                definition.database = target;
+                definition.ownership = definition.ownership.committed();
+                definition.pending_identity = None;
+                definition.pending_definition = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.routines[target_slot] = definition;
+                self.routine_dependencies[target_slot] = self.routine_dependencies[source_slot];
+            }
+
+            for source_slot in 0..self.casts.len() {
+                let mut definition = self.casts[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .casts
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "cast catalog is full")
+                    })?;
+                definition.database = target;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.casts[target_slot] = definition;
+            }
+            for source_slot in 0..self.operators.len() {
+                let mut definition = self.operators[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .operators
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "operator catalog is full")
+                    })?;
+                definition.database = target;
+                definition.pending = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.operators[target_slot] = definition;
+            }
+            for source_slot in 0..self.operator_families.len() {
+                let mut definition = self.operator_families[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .operator_families
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "operator-family catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.pending = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.operator_families[target_slot] = definition;
+            }
+            for source_slot in 0..self.operator_classes.len() {
+                let mut definition = self.operator_classes[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .operator_classes
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "operator-class catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.pending = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.operator_classes[target_slot] = definition;
+            }
+
+            for source_slot in 0..self.indexes.len() {
+                let mut definition = self.indexes[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .indexes
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "index catalog is full")
+                    })?;
+                definition.database = target;
+                definition.ownership = definition.ownership.committed();
+                definition.pending_name = None;
+                definition.pending_definition = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.indexes[target_slot] = definition;
+            }
+            for target_slot in 0..self.indexes.len() {
+                if self.indexes[target_slot].database != target
+                    || self.indexes[target_slot].ddl_state
+                        != (CatalogDdlState::PendingCreate { txid })
+                {
+                    continue;
+                }
+                let Some(source_parent_slot) = self.indexes[target_slot].mutable.parent else {
+                    continue;
+                };
+                let source_parent = self.indexes[usize::from(source_parent_slot)];
+                let target_parent = self
+                    .index_slot(
+                        source_parent.schema.as_str(),
+                        source_parent.name.as_str(),
+                        txid,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template partitioned index parent was not cloned"
+                        )
+                    })?;
+                self.indexes[target_slot].mutable.parent = Some(target_parent as u16);
+            }
+
+            for source_slot in 0..self.policies.len() {
+                let mut definition = self.policies[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let source_table = self.tables[usize::from(definition.table)].def;
+                definition.table = self
+                    .find_visible(
+                        source_table.schema.as_str(),
+                        source_table.name.as_str(),
+                        txid,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template policy table was not cloned"
+                        )
+                    })? as u16;
+                let target_slot = self
+                    .policies
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "policy catalog is full")
+                    })?;
+                definition.database = target;
+                definition.pending_definition = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.policies[target_slot] = definition;
+            }
+
+            for source_slot in 0..self.triggers.len() {
+                let mut definition = self.triggers[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                definition.target = match definition.target {
+                    TriggerTarget::Table(source_table) => {
+                        let source_table = self.tables[usize::from(source_table)].def;
+                        TriggerTarget::Table(
+                            self.find_visible(
+                                source_table.schema.as_str(),
+                                source_table.name.as_str(),
+                                txid,
+                            )
+                            .ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "template trigger table was not cloned"
+                                )
+                            })? as u16,
+                        )
+                    }
+                    TriggerTarget::View(source_view) => {
+                        let source_view = &self.views[usize::from(source_view)];
+                        TriggerTarget::View(
+                            self.views
+                                .iter()
+                                .position(|view| {
+                                    view.database == target
+                                        && view.visible_to(txid)
+                                        && view.schema == source_view.schema
+                                        && view.name == source_view.name
+                                })
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::INTERNAL_ERROR,
+                                        "template trigger view was not cloned"
+                                    )
+                                })? as u16,
+                        )
+                    }
+                };
+                let source_routine_oid =
+                    routine_oid(&self.routines[usize::from(definition.function)]);
+                definition.function = self
+                    .routine_slot_by_oid(source_routine_oid, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template trigger routine was not cloned"
+                        )
+                    })? as u16;
+                let target_slot = self
+                    .triggers
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "trigger catalog is full")
+                    })?;
+                definition.database = target;
+                definition.pending_definition = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.triggers[target_slot] = definition;
+            }
+
+            for source_slot in 0..self.extended_statistics.len() {
+                let mut definition = self.extended_statistics[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let source_table = self.tables[usize::from(definition.table)].def;
+                definition.table = self
+                    .find_visible(
+                        source_table.schema.as_str(),
+                        source_table.name.as_str(),
+                        txid,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template statistics table was not cloned"
+                        )
+                    })? as u16;
+                let target_slot = self
+                    .extended_statistics
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "statistics catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.ownership = definition.ownership.committed();
+                definition.pending_definition = None;
+                definition.pending_keys = None;
+                definition.n_pending_data = 0;
+                definition.pending_data_txid = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.extended_statistics[target_slot] = definition;
+            }
+
+            for source_slot in 0..self.publications.len() {
+                let mut definition = self.publications[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                for table in definition.tables[..definition.table_count].iter_mut() {
+                    *table = self
+                        .cloned_access_object(
+                            AccessObject {
+                                class: AccessClass::Table,
+                                slot: *table,
+                            },
+                            source,
+                            target,
+                        )
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template publication relation was not cloned"
+                            )
+                        })?
+                        .slot;
+                }
+                for schema in definition.schemas[..definition.schema_count].iter_mut() {
+                    *schema = u8::try_from(
+                        self.cloned_access_object(
+                            AccessObject {
+                                class: AccessClass::Schema,
+                                slot: u16::from(*schema),
+                            },
+                            source,
+                            target,
+                        )
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template publication schema was not cloned"
+                            )
+                        })?
+                        .slot,
+                    )
+                    .map_err(|_| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "schema slot exceeds publication capacity"
+                        )
+                    })?;
+                }
+                let target_slot = self
+                    .publications
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "publication catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.pending_name = None;
+                definition.pending_definition = None;
+                definition.ownership = definition.ownership.committed();
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.publications[target_slot] = definition;
+            }
+
+            for source_slot in 0..self.extensions.len() {
+                let mut definition = self.extensions[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                definition.namespace = self
+                    .cloned_access_object(
+                        AccessObject {
+                            class: AccessClass::Schema,
+                            slot: definition.namespace,
+                        },
+                        source,
+                        target,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template extension schema was not cloned"
+                        )
+                    })?
+                    .slot;
+                let target_slot = self
+                    .extensions
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "extension catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.ownership = definition.ownership.committed();
+                definition.pending = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.extensions[target_slot] = definition;
+            }
+            for source_slot in 0..self.extension_dependencies.len() {
+                let dependency = self.extension_dependencies[source_slot];
+                if !dependency.live
+                    || self.extensions[usize::from(dependency.extension)].database != source
+                {
+                    continue;
+                }
+                let extension = self
+                    .cloned_access_object(
+                        AccessObject {
+                            class: AccessClass::Extension,
+                            slot: dependency.extension,
+                        },
+                        source,
+                        target,
+                    )
+                    .expect("cloned extension exists");
+                let object = self
+                    .cloned_access_object(dependency.object, source, target)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template extension member was not cloned"
+                        )
+                    })?;
+                let target_slot = self
+                    .extension_dependencies
+                    .iter()
+                    .position(|candidate| !candidate.live && candidate.pending.is_none())
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "extension dependency catalog is full"
+                        )
+                    })?;
+                self.extension_dependencies[target_slot] = ExtensionDependency {
+                    extension: extension.slot,
+                    object,
+                    pending: Some(PendingExtensionDependency { txid, exists: true }),
+                    live: false,
+                    ..dependency
+                };
+            }
+            for source_slot in 0..self.extension_configs.len() {
+                let config = self.extension_configs[source_slot];
+                if !config.live || self.extensions[usize::from(config.extension)].database != source
+                {
+                    continue;
+                }
+                let extension = self
+                    .cloned_access_object(
+                        AccessObject {
+                            class: AccessClass::Extension,
+                            slot: config.extension,
+                        },
+                        source,
+                        target,
+                    )
+                    .expect("cloned extension exists");
+                let relation = self
+                    .cloned_access_object(config.relation.access_object(), source, target)
+                    .and_then(ExtensionConfigRelation::from_access_object)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template extension configuration relation was not cloned"
+                        )
+                    })?;
+                let target_slot = self
+                    .extension_configs
+                    .iter()
+                    .position(|candidate| !candidate.live && candidate.pending.is_none())
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "extension configuration catalog is full"
+                        )
+                    })?;
+                self.extension_configs[target_slot] = ExtensionConfig {
+                    extension: extension.slot,
+                    relation,
+                    live: false,
+                    pending: Some(PendingExtensionConfig {
+                        txid,
+                        exists: true,
+                        condition: config.condition,
+                    }),
+                    ..config
+                };
+            }
+
+            for source_slot in 0..self.acl_entries.len() {
+                let entry = self.acl_entries[source_slot];
+                if !entry.live || self.access_object_database(entry.object) != Some(source) {
+                    continue;
+                }
+                let object = self
+                    .cloned_access_object(entry.object, source, target)
+                    .expect("cloned ACL object exists");
+                self.change_acl(
+                    object,
+                    entry.grantee,
+                    entry.grantor,
+                    entry.privileges,
+                    entry.grant_options,
+                    0,
+                )?;
+            }
+            for source_slot in 0..self.column_acl_entries.len() {
+                let entry = self.column_acl_entries[source_slot];
+                if !entry.live
+                    || self.access_object_database(entry.target.relation()) != Some(source)
+                {
+                    continue;
+                }
+                let relation = self
+                    .cloned_access_object(entry.target.relation(), source, target)
+                    .expect("cloned column ACL relation exists");
+                self.change_column_acl(
+                    ColumnPrivilegeTarget::new(relation, entry.target.column())
+                        .expect("cloned relation remains a column-privilege target"),
+                    entry.grantee,
+                    entry.grantor,
+                    entry.privileges,
+                    entry.grant_options,
+                    0,
+                )?;
+            }
+            for source_slot in 0..self.default_acl_entries.len() {
+                let entry = self.default_acl_entries[source_slot];
+                if entry.database != source || !entry.defined {
+                    continue;
+                }
+                let schema = if entry.schema == DEFAULT_ACL_ALL_SCHEMAS {
+                    DEFAULT_ACL_ALL_SCHEMAS
+                } else {
+                    self.cloned_access_object(
+                        AccessObject {
+                            class: AccessClass::Schema,
+                            slot: entry.schema,
+                        },
+                        source,
+                        target,
+                    )
+                    .expect("cloned default-ACL schema exists")
+                    .slot
+                };
+                self.change_default_acl(
+                    DefaultAclKey {
+                        owner: entry.owner,
+                        schema,
+                        class: entry.class,
+                        grantee: entry.grantee,
+                    },
+                    true,
+                    entry.privileges,
+                    entry.grant_options,
+                    0,
+                )?;
+            }
+            for source_slot in 0..self.comments.len() {
+                let mut entry = self.comments[source_slot];
+                if !entry.used || entry.database != Some(source) || entry.live.is_none() {
+                    continue;
+                }
+                let target_slot = self
+                    .comments
+                    .iter()
+                    .position(|candidate| !candidate.used)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "comment catalog is full")
+                    })?;
+                entry.database = Some(target);
+                entry.pending = None;
+                entry.pending_identity = None;
+                self.comments[target_slot] = entry;
+            }
+
+            // Partition links are runtime table slots. Rebind them only after
+            // every target relation exists; names are the durable identity.
+            for target_slot in 0..self.tables.len() {
+                if self.tables[target_slot].database != target
+                    || self.tables[target_slot].pending_ddl
+                        != Some(PendingDdl {
+                            txid,
+                            creating: true,
+                        })
+                {
+                    continue;
+                }
+                let Some(attachment) = self.tables[target_slot].def.partition.attachment else {
+                    continue;
+                };
+                let source_parent = &self.tables[usize::from(attachment.parent)].def;
+                let target_parent = self
+                    .find_visible(
+                        source_parent.schema.as_str(),
+                        source_parent.name.as_str(),
+                        txid,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template partition parent was not cloned"
+                        )
+                    })?;
+                self.tables[target_slot].def.partition.attachment = Some(PartitionAttachment {
+                    parent: target_parent as u16,
+                    bound: attachment.bound,
+                });
+            }
+            self.rebind_domain_base_types_to(txid)?;
+            self.rebind_user_type_declarations_to(txid)?;
+            self.rebind_routine_types_to(txid)?;
+            self.rebind_all_stored_query_dependencies_to(txid)?;
+            Ok(())
+        })();
+        self.current_database = prior_database;
+        result
+    }
+
+    fn clear_database_catalog(&mut self, database: DatabaseOid) {
+        for entry in self.acl_entries.iter_mut() {
+            if entry.object.slot == u16::MAX {
+                continue;
+            }
+            let object_database = match entry.object.class {
+                AccessClass::Table => self.tables[usize::from(entry.object.slot)].database,
+                AccessClass::View => self.views[usize::from(entry.object.slot)].database,
+                AccessClass::MaterializedView => {
+                    self.matviews[usize::from(entry.object.slot)].database
+                }
+                AccessClass::Sequence => self.sequences[usize::from(entry.object.slot)].database,
+                AccessClass::Schema => self.schemas[usize::from(entry.object.slot)].database,
+                AccessClass::Domain => self.domains[usize::from(entry.object.slot)].database,
+                AccessClass::Enum => self.enums[usize::from(entry.object.slot)].database,
+                AccessClass::Index => self.indexes[usize::from(entry.object.slot)].database,
+                AccessClass::Routine => self.routines[usize::from(entry.object.slot)].database,
+                AccessClass::Composite => self.composites[usize::from(entry.object.slot)].database,
+                AccessClass::Statistics => {
+                    self.extended_statistics[usize::from(entry.object.slot)].database
+                }
+                AccessClass::Extension => self.extensions[usize::from(entry.object.slot)].database,
+                AccessClass::Trigger => self.triggers[usize::from(entry.object.slot)].database,
+                AccessClass::Tablespace | AccessClass::Database => continue,
+            };
+            if object_database == database {
+                entry.object.slot = u16::MAX;
+                entry.live = false;
+                entry.pending = None;
+            }
+        }
+        for entry in self.column_acl_entries.iter_mut() {
+            if entry.target.relation.slot == u16::MAX {
+                continue;
+            }
+            let relation = entry.target.relation;
+            let object_database = match relation.class {
+                AccessClass::Table => self.tables[usize::from(relation.slot)].database,
+                AccessClass::View => self.views[usize::from(relation.slot)].database,
+                AccessClass::MaterializedView => self.matviews[usize::from(relation.slot)].database,
+                _ => continue,
+            };
+            if object_database == database {
+                entry.target.relation.slot = u16::MAX;
+                entry.live = false;
+                entry.pending = None;
+            }
+        }
+        for entry in self.default_acl_entries.iter_mut() {
+            if entry.database == database {
+                entry.database = DatabaseOid::POSTGRES;
+                entry.owner = PUBLIC_ROLE;
+                entry.defined = false;
+                entry.pending = None;
+            }
+        }
+        for entry in self.comments.iter_mut() {
+            if entry.database == Some(database) {
+                *entry = CommentEntry::empty();
+            }
+        }
+        for relation in self.subscription_relations.iter_mut() {
+            let belongs = self.subscriptions.iter().any(|subscription| {
+                subscription.database == database
+                    && subscription.created_at == relation.subscription_created_at
+            });
+            if belongs {
+                relation.ddl_state = CatalogDdlState::Absent;
+            }
+        }
+        for dependency in self.extension_dependencies.iter_mut() {
+            if dependency.extension != u16::MAX
+                && self.extensions[usize::from(dependency.extension)].database == database
+            {
+                *dependency = ExtensionDependency::EMPTY;
+            }
+        }
+        for config in self.extension_configs.iter_mut() {
+            if config.extension != u16::MAX
+                && self.extensions[usize::from(config.extension)].database == database
+            {
+                *config = ExtensionConfig::EMPTY;
+            }
+        }
+        for slot in 0..self.tables.len() {
+            if self.tables[slot].database != database {
+                continue;
+            }
+            self.release_enforcers(slot);
+            self.clear_pending_table_defs(slot);
+            self.clear_pending_table_statistics(slot);
+            self.tables[slot].rows.clear();
+            self.tables[slot].live = false;
+            self.tables[slot].pending_ddl = None;
+            self.tables[slot].database = DatabaseOid::POSTGRES;
+        }
+        for schema in self.schemas.iter_mut() {
+            if schema.database == database {
+                schema.ddl_state = CatalogDdlState::Absent;
+                schema.name = SqlName::EMPTY;
+                schema.database = DatabaseOid::POSTGRES;
+            }
+        }
+        macro_rules! clear_catalog {
+            ($catalog:ident) => {
+                for definition in self.$catalog.iter_mut() {
+                    if definition.database == database {
+                        definition.database = DatabaseOid::POSTGRES;
+                        definition.ddl_state = CatalogDdlState::Absent;
+                    }
+                }
+            };
+        }
+        clear_catalog!(views);
+        clear_catalog!(routines);
+        clear_catalog!(casts);
+        clear_catalog!(operators);
+        clear_catalog!(operator_families);
+        clear_catalog!(operator_classes);
+        clear_catalog!(triggers);
+        clear_catalog!(policies);
+        clear_catalog!(extended_statistics);
+        clear_catalog!(publications);
+        clear_catalog!(subscriptions);
+        clear_catalog!(matviews);
+        clear_catalog!(sequences);
+        clear_catalog!(domains);
+        clear_catalog!(enums);
+        clear_catalog!(composites);
+        clear_catalog!(indexes);
+        clear_catalog!(extensions);
+        for slot in self.replication_slots.iter_mut() {
+            if slot.database == database {
+                slot.database = DatabaseOid::POSTGRES;
+                slot.live = false;
+                slot.active = false;
+            }
+        }
+        for (slot, dependency) in self.view_dependencies.iter_mut().enumerate() {
+            if self.views[slot].database == DatabaseOid::POSTGRES
+                && self.views[slot].ddl_state == CatalogDdlState::Absent
+            {
+                *dependency = StoredQueryDependencies::EMPTY;
+            }
+        }
+        for (slot, dependency) in self.matview_dependencies.iter_mut().enumerate() {
+            if self.matviews[slot].database == DatabaseOid::POSTGRES
+                && self.matviews[slot].ddl_state == CatalogDdlState::Absent
+            {
+                *dependency = StoredQueryDependencies::EMPTY;
+            }
+        }
+        for (slot, dependency) in self.routine_dependencies.iter_mut().enumerate() {
+            if self.routines[slot].database == DatabaseOid::POSTGRES
+                && self.routines[slot].ddl_state == CatalogDdlState::Absent
+            {
+                *dependency = StoredQueryDependencies::EMPTY;
+            }
+        }
+    }
+
+    pub(crate) fn alter_database_definition(
+        &mut self,
+        slot: usize,
+        definition: DatabaseDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingDatabaseDefinition>, SqlError> {
+        if self.databases.iter().enumerate().any(|(other, database)| {
+            other != slot
+                && database.visible_to(txid)
+                && database.definition_for(txid).name == definition.name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_DATABASE,
+                "database \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
+        let prior = self.databases[slot].pending;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                prior.expect("checked").txid,
+                self.databases[slot].definition.name.as_str(),
+            ));
+        }
+        self.databases[slot].pending = Some(PendingDatabaseDefinition { txid, definition });
+        Ok(prior)
+    }
+
+    pub(crate) fn drop_database(&mut self, slot: usize, txid: u32) {
+        self.databases[slot].ddl_state = self.databases[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_database_create(&mut self, slot: usize) {
+        let database = self.databases[slot].oid;
+        let txid = self.databases[slot]
+            .ddl_state
+            .pending_txid()
+            .expect("database create owns its catalog clone");
+        for schema in self.schemas.iter_mut() {
+            if schema.database == database
+                && schema.ddl_state == (CatalogDdlState::PendingCreate { txid })
+            {
+                schema.ddl_state = schema.ddl_state.commit_create();
+            }
+        }
+        for table in self.tables.iter_mut() {
+            if table.database == database
+                && table.pending_ddl
+                    == Some(PendingDdl {
+                        txid,
+                        creating: true,
+                    })
+            {
+                table.live = true;
+                table.pending_ddl = None;
+            }
+        }
+        macro_rules! commit_catalog {
+            ($catalog:ident) => {
+                for definition in self.$catalog.iter_mut() {
+                    if definition.database == database
+                        && definition.ddl_state == (CatalogDdlState::PendingCreate { txid })
+                    {
+                        definition.ddl_state = definition.ddl_state.commit_create();
+                    }
+                }
+            };
+        }
+        commit_catalog!(views);
+        commit_catalog!(routines);
+        commit_catalog!(casts);
+        commit_catalog!(operators);
+        commit_catalog!(operator_families);
+        commit_catalog!(operator_classes);
+        commit_catalog!(triggers);
+        commit_catalog!(policies);
+        commit_catalog!(extended_statistics);
+        commit_catalog!(publications);
+        commit_catalog!(subscriptions);
+        commit_catalog!(matviews);
+        commit_catalog!(sequences);
+        commit_catalog!(domains);
+        commit_catalog!(enums);
+        commit_catalog!(composites);
+        commit_catalog!(indexes);
+        commit_catalog!(extensions);
+        for dependency in self.extension_dependencies.iter_mut() {
+            if dependency
+                .pending
+                .is_some_and(|pending| pending.txid == txid && pending.exists)
+                && self.extensions[usize::from(dependency.extension)].database == database
+            {
+                dependency.live = true;
+                dependency.pending = None;
+            }
+        }
+        for config in self.extension_configs.iter_mut() {
+            if config
+                .pending
+                .is_some_and(|pending| pending.txid == txid && pending.exists)
+                && self.extensions[usize::from(config.extension)].database == database
+            {
+                config.live = true;
+                config.condition = config.pending.expect("checked").condition;
+                config.pending = None;
+            }
+        }
+        self.databases[slot].ddl_state = self.databases[slot].ddl_state.commit_create();
+        self.databases[slot].ownership = self.databases[slot].ownership.committed();
+    }
+
+    pub(crate) fn commit_database_alter(&mut self, slot: usize, txid: u32) {
+        if let Some(pending) = self.databases[slot].pending
+            && pending.txid == txid
+        {
+            let old_name = self.databases[slot].definition.name;
+            self.databases[slot].definition = pending.definition;
+            self.databases[slot].pending = None;
+            for comment in self.comments.iter_mut() {
+                if comment.used
+                    && comment.class == CommentClass::Database
+                    && comment.name == old_name
+                {
+                    comment.name = pending.definition.name;
+                }
+            }
+        }
+        if self.databases[slot]
+            .ownership
+            .pending
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            self.databases[slot].ownership = self.databases[slot].ownership.committed();
+        }
+    }
+
+    pub(crate) fn commit_database_drop(&mut self, slot: usize) {
+        let oid = self.databases[slot].oid;
+        let name = self.databases[slot].definition.name;
+        self.drop_object_comments(CommentClass::Database, "", name.as_str());
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::Database,
+            slot: slot as u16,
+        });
+        for setting in self.role_settings.iter_mut() {
+            if setting.live && setting.scope.database() == Some(oid) {
+                *setting = RoleSetting::EMPTY;
+            }
+        }
+        self.clear_database_catalog(oid);
+        self.databases[slot].ddl_state = self.databases[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_database_create(&mut self, slot: usize) {
+        self.clear_database_catalog(self.databases[slot].oid);
+        self.databases[slot].ddl_state = self.databases[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn rollback_database_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingDatabaseDefinition>,
+    ) {
+        self.databases[slot].pending = prior;
+    }
+
+    pub(crate) fn rollback_database_drop(&mut self, slot: usize, txid: u32) {
+        self.databases[slot].ddl_state = self.databases[slot].ddl_state.rollback_drop(txid);
+    }
+
+    fn current_database_slot(&self, txid: u32) -> usize {
+        self.database_slot_by_oid(self.current_database, txid)
+            .expect("selected database remains visible for the statement")
+    }
+
     pub fn role(&self, slot: usize) -> &RoleDef {
         &self.roles[slot]
     }
@@ -9924,13 +11652,13 @@ impl Storage {
         self.roles[slot].name_to(txid)
     }
 
-    /// The current database is owned by the bootstrap role. `CREATEDB` is a
-    /// cluster role attribute and must never stand in for database `CREATE`.
+    /// `CREATEDB` is a cluster role attribute and must never stand in for the
+    /// current database's `CREATE` privilege.
     pub(crate) fn has_current_database_create_privilege(&self, role: usize, txid: u32) -> bool {
         self.has_object_privilege(
             AccessObject {
                 class: AccessClass::Database,
-                slot: 0,
+                slot: self.current_database_slot(txid) as u16,
             },
             role,
             PrivilegeSet::CREATE,
@@ -9942,7 +11670,7 @@ impl Storage {
         self.has_object_privilege(
             AccessObject {
                 class: AccessClass::Database,
-                slot: 0,
+                slot: self.current_database_slot(txid) as u16,
             },
             role,
             PrivilegeSet::CONNECT,
@@ -10003,7 +11731,7 @@ impl Storage {
                 TriggerTarget::Table(table) => &self.tables[usize::from(table)].ownership,
                 TriggerTarget::View(view) => &self.views[usize::from(view)].ownership,
             },
-            AccessClass::Database => &self.database_ownership,
+            AccessClass::Database => &self.databases[slot].ownership,
         }
     }
 
@@ -10026,7 +11754,7 @@ impl Storage {
             AccessClass::Trigger => {
                 unreachable!("triggers inherit relation ownership and cannot be reassigned")
             }
-            AccessClass::Database => &mut self.database_ownership,
+            AccessClass::Database => &mut self.databases[slot].ownership,
         }
     }
 
@@ -10078,7 +11806,8 @@ impl Storage {
         let slot = match class {
             AccessClass::Table => self.find_visible(schema, name, txid),
             AccessClass::View => self.views.iter().position(|view| {
-                view.visible_to(txid)
+                view.database == self.current_database
+                    && view.visible_to(txid)
                     && view.schema_for(txid).as_str() == schema
                     && view.name.as_str() == name
             }),
@@ -10088,12 +11817,14 @@ impl Storage {
             AccessClass::Domain => self.domain_slot(schema, name, txid),
             AccessClass::Enum => self.enum_slot(schema, name, txid),
             AccessClass::Index => self.indexes.iter().position(|index| {
-                index.visible_to(txid)
+                index.database == self.current_database
+                    && index.visible_to(txid)
                     && index.schema.as_str() == schema
                     && index.name_for(txid).as_str() == name
             }),
             AccessClass::Routine => self.routines.iter().position(|routine| {
-                routine.visible_to(txid)
+                routine.database == self.current_database
+                    && routine.visible_to(txid)
                     && routine.schema_for(txid).as_str() == schema
                     && routine.name_for(txid).as_str() == name
             }),
@@ -10102,9 +11833,10 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics_slot(schema, name, txid),
             AccessClass::Extension => self.extension_slot(name, txid),
             AccessClass::Trigger => None,
-            AccessClass::Database => {
-                (schema.is_empty() && name.eq_ignore_ascii_case("postgres")).then_some(0)
-            }
+            AccessClass::Database => schema
+                .is_empty()
+                .then(|| self.database_slot(name, txid))
+                .flatten(),
         }?;
         u16::try_from(slot)
             .ok()
@@ -10133,7 +11865,9 @@ impl Storage {
             AccessClass::MaterializedView => {
                 let definition = &self.matviews[slot];
                 let backing = self.tables.iter().position(|table| {
-                    table.def.schema == definition.schema && table.def.name == definition.name
+                    table.database == definition.database
+                        && table.def.schema == definition.schema
+                        && table.def.name == definition.name
                 });
                 backing.map_or((definition.schema, definition.name), |table| {
                     let table = self.table_def(table, txid);
@@ -10181,12 +11915,12 @@ impl Storage {
             }
             AccessClass::Database => (
                 SqlName::EMPTY,
-                SqlName::parse("postgres").expect("built-in database name is valid"),
+                self.databases[slot].definition_for(txid).name,
             ),
         }
     }
 
-    pub(crate) fn access_object_is_live(&self, object: AccessObject) -> bool {
+    pub(crate) fn access_object_is_live_in_catalog(&self, object: AccessObject) -> bool {
         let slot = object.slot as usize;
         match object.class {
             AccessClass::Table => self.tables[slot].live,
@@ -10207,11 +11941,14 @@ impl Storage {
             }
             AccessClass::Extension => self.extensions[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Trigger => self.triggers[slot].ddl_state == CatalogDdlState::Present,
-            AccessClass::Database => slot == 0,
+            AccessClass::Database => self.databases[slot].ddl_state == CatalogDdlState::Present,
         }
     }
 
     pub(crate) fn access_object_visible_to(&self, object: AccessObject, txid: u32) -> bool {
+        if !self.access_object_in_current_database(object) {
+            return false;
+        }
         let slot = object.slot as usize;
         match object.class {
             AccessClass::Table => self.tables[slot].visible_to(txid),
@@ -10228,8 +11965,340 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics[slot].visible_to(txid),
             AccessClass::Extension => self.extensions[slot].visible_to(txid),
             AccessClass::Trigger => self.triggers[slot].visible_to(txid),
-            AccessClass::Database => slot == 0,
+            AccessClass::Database => self.databases[slot].visible_to(txid),
         }
+    }
+
+    fn access_object_in_current_database(&self, object: AccessObject) -> bool {
+        self.access_object_database(object)
+            .is_none_or(|database| database == self.current_database)
+    }
+
+    pub(crate) fn access_object_database(&self, object: AccessObject) -> Option<DatabaseOid> {
+        let slot = usize::from(object.slot);
+        match object.class {
+            AccessClass::Table => Some(self.tables[slot].database),
+            AccessClass::View => Some(self.views[slot].database),
+            AccessClass::MaterializedView => Some(self.matviews[slot].database),
+            AccessClass::Sequence => Some(self.sequences[slot].database),
+            AccessClass::Schema => Some(self.schemas[slot].database),
+            AccessClass::Domain => Some(self.domains[slot].database),
+            AccessClass::Enum => Some(self.enums[slot].database),
+            AccessClass::Index => Some(self.indexes[slot].database),
+            AccessClass::Routine => Some(self.routines[slot].database),
+            AccessClass::Composite => Some(self.composites[slot].database),
+            AccessClass::Statistics => Some(self.extended_statistics[slot].database),
+            AccessClass::Extension => Some(self.extensions[slot].database),
+            AccessClass::Trigger => Some(self.triggers[slot].database),
+            AccessClass::Tablespace | AccessClass::Database => None,
+        }
+    }
+
+    fn cloned_access_object(
+        &self,
+        source: AccessObject,
+        source_database: DatabaseOid,
+        target_database: DatabaseOid,
+    ) -> Option<AccessObject> {
+        if self.access_object_database(source) != Some(source_database) {
+            return None;
+        }
+        let source_slot = usize::from(source.slot);
+        let target_slot = match source.class {
+            AccessClass::Schema => {
+                let name = self.schemas[source_slot].name;
+                self.schemas.iter().position(|candidate| {
+                    candidate.database == target_database
+                        && candidate.ddl_state != CatalogDdlState::Absent
+                        && candidate.name == name
+                })?
+            }
+            AccessClass::Table => {
+                let created_at = self.tables[source_slot].created_at;
+                self.tables.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::View => {
+                let created_at = self.views[source_slot].created_at;
+                self.views.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::MaterializedView => {
+                let created_at = self.matviews[source_slot].created_at;
+                self.matviews.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::Sequence => {
+                let created_at = self.sequences[source_slot].created_at;
+                self.sequences.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::Domain => {
+                let created_at = self.domains[source_slot].created_at;
+                self.domains.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::Enum => {
+                let created_at = self.enums[source_slot].created_at;
+                self.enums.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::Composite => {
+                let created_at = self.composites[source_slot].created_at;
+                self.composites.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::Index => {
+                let created_at = self.indexes[source_slot].created_at;
+                self.indexes.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::Routine => {
+                let created_at = self.routines[source_slot].created_at;
+                self.routines.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::Statistics => {
+                let created_at = self.extended_statistics[source_slot].created_at;
+                self.extended_statistics.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::Extension => {
+                let created_at = self.extensions[source_slot].created_at;
+                self.extensions.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::Trigger => {
+                let created_at = self.triggers[source_slot].created_at;
+                self.triggers.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::Database | AccessClass::Tablespace => return None,
+        };
+        Some(AccessObject {
+            class: source.class,
+            slot: u16::try_from(target_slot).ok()?,
+        })
+    }
+
+    pub(crate) fn checkpoint_schemas(&self) -> impl Iterator<Item = (usize, &SchemaDef)> {
+        self.schemas
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_domains(&self) -> impl Iterator<Item = (usize, &DomainDef)> {
+        self.domains
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_enums(&self) -> impl Iterator<Item = (usize, &EnumDef)> {
+        self.enums
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_composites(&self) -> impl Iterator<Item = (usize, &CompositeDef)> {
+        self.composites
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_views(&self) -> impl Iterator<Item = (usize, &ViewDef)> {
+        self.views
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_publications(&self) -> impl Iterator<Item = (usize, &PublicationDef)> {
+        self.publications
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_replication_slots(
+        &self,
+    ) -> impl Iterator<Item = (usize, &ReplicationSlotDef)> {
+        self.replication_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.live)
+    }
+
+    pub(crate) fn checkpoint_subscriptions(
+        &self,
+    ) -> impl Iterator<Item = (usize, &SubscriptionDef)> {
+        self.subscriptions.iter().enumerate().filter(|(_, value)| {
+            value.ddl_state == CatalogDdlState::Present
+                || value.cleanup != SubscriptionCleanup::None
+        })
+    }
+
+    pub(crate) fn checkpoint_matviews(&self) -> impl Iterator<Item = (usize, &MatviewDef)> {
+        self.matviews
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_sequences(&self) -> impl Iterator<Item = &SequenceDef> {
+        self.sequences
+            .iter()
+            .filter(|value| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_sequences_with_slots(
+        &self,
+    ) -> impl Iterator<Item = (usize, &SequenceDef)> {
+        self.sequences
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_casts(&self) -> impl Iterator<Item = (usize, &CastDef)> {
+        self.casts
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_operators(&self) -> impl Iterator<Item = (usize, &OperatorDef)> {
+        self.operators
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_operator_families(
+        &self,
+    ) -> impl Iterator<Item = (usize, &OperatorFamilyDef)> {
+        self.operator_families
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_operator_classes(
+        &self,
+    ) -> impl Iterator<Item = (usize, &OperatorClassDef)> {
+        self.operator_classes
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_triggers(&self) -> impl Iterator<Item = (usize, &TriggerDef)> {
+        self.triggers
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_extended_statistics(
+        &self,
+    ) -> impl Iterator<Item = (usize, &ExtendedStatisticsDef)> {
+        self.extended_statistics
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_policies(&self) -> impl Iterator<Item = (usize, &PolicyDef)> {
+        self.policies
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_extensions(&self) -> impl Iterator<Item = (usize, &ExtensionDef)> {
+        self.extensions
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_extension_dependencies(
+        &self,
+    ) -> impl Iterator<Item = (usize, &ExtensionDependency)> {
+        self.extension_dependencies
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.live)
+    }
+
+    pub(crate) fn checkpoint_extension_configs(
+        &self,
+    ) -> impl Iterator<Item = (usize, &ExtensionConfig)> {
+        self.extension_configs
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.live)
+    }
+
+    pub(crate) fn checkpoint_indexes(&self) -> impl Iterator<Item = (usize, &IndexDef)> {
+        self.indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_comments(&self) -> impl Iterator<Item = &CommentEntry> {
+        self.comments
+            .iter()
+            .filter(|value| value.used && value.live.is_some())
+    }
+
+    pub(crate) fn checkpoint_default_acls(
+        &self,
+    ) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
+        self.default_acl_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.defined)
+    }
+
+    pub(crate) fn checkpoint_acls(&self) -> impl Iterator<Item = (usize, &AclEntry)> {
+        self.acl_entries.iter().enumerate().filter(|(_, value)| {
+            value.object.slot != u16::MAX
+                && (value.live
+                    || (value.object.class == AccessClass::Schema
+                        && value.grantee == PUBLIC_ROLE
+                        && value.grantor == 0)
+                    || (matches!(
+                        value.object.class,
+                        AccessClass::Domain
+                            | AccessClass::Enum
+                            | AccessClass::Composite
+                            | AccessClass::Routine
+                    ) && value.grantee == PUBLIC_ROLE))
+        })
+    }
+
+    pub(crate) fn checkpoint_column_acls(&self) -> impl Iterator<Item = (usize, &ColumnAclEntry)> {
+        self.column_acl_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.live)
     }
 
     pub(crate) fn access_class_slots(&self, class: AccessClass) -> usize {
@@ -10248,7 +12317,7 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics.len(),
             AccessClass::Extension => self.extensions.len(),
             AccessClass::Trigger => self.triggers.len(),
-            AccessClass::Database => 1,
+            AccessClass::Database => self.databases.len(),
         }
     }
 
@@ -10277,7 +12346,11 @@ impl Storage {
         }
     }
 
-    pub(crate) fn role_has_object_dependents(&self, role: usize, txid: u32) -> bool {
+    pub(crate) fn role_object_dependency(
+        &self,
+        role: usize,
+        txid: u32,
+    ) -> Option<RoleObjectDependency> {
         let owned = [
             (AccessClass::Table, self.tables.len()),
             (AccessClass::View, self.views.len()),
@@ -10313,48 +12386,58 @@ impl Storage {
             || self
                 .operator_classes_visible_to(txid)
                 .any(|(_, definition)| definition.owner == Self::role_oid(role));
-        owned
-            || owned_catalog
-            || self.acl_entries.iter().any(|entry| {
-                let (visible, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
-                visible
-                    && self.access_object_visible_to(entry.object, txid)
-                    && (grantee == role as u16 || grantor == role as u16)
+        if owned {
+            return Some(RoleObjectDependency::OwnedObject);
+        }
+        if owned_catalog {
+            return Some(RoleObjectDependency::OwnedCatalogObject);
+        }
+        if self.acl_entries.iter().any(|entry| {
+            let (visible, grantee, grantor, _, _) = Self::acl_visible(entry, txid);
+            visible
+                && self.access_object_visible_to(entry.object, txid)
+                && (grantee == role as u16 || grantor == role as u16)
+        }) {
+            return Some(RoleObjectDependency::ObjectPrivilege);
+        }
+        if self.default_acl_entries.iter().any(|entry| {
+            let (defined, _, _) = Self::default_acl_visible(entry, txid);
+            defined && (entry.owner == role as u16 || entry.grantee == role as u16)
+        }) {
+            return Some(RoleObjectDependency::DefaultPrivilege);
+        }
+        if self.column_acl_entries.iter().any(|entry| {
+            let (visible, grantee, grantor, _, _) = match entry.pending {
+                Some(pending) if pending.txid == txid => (
+                    pending.privileges.0 != 0,
+                    pending.grantee,
+                    pending.grantor,
+                    pending.privileges,
+                    pending.grant_options,
+                ),
+                _ => (
+                    entry.live,
+                    entry.grantee,
+                    entry.grantor,
+                    entry.privileges,
+                    entry.grant_options,
+                ),
+            };
+            visible
+                && self.access_object_visible_to(entry.target.relation, txid)
+                && (grantee == role as u16 || grantor == role as u16)
+        }) {
+            return Some(RoleObjectDependency::ColumnPrivilege);
+        }
+        self.policies_with_slots_visible_to(txid)
+            .any(|(_, policy)| {
+                policy
+                    .definition_for(txid)
+                    .roles
+                    .entries()
+                    .contains(&(role as u16))
             })
-            || self.default_acl_entries.iter().any(|entry| {
-                let (defined, _, _) = Self::default_acl_visible(entry, txid);
-                defined && (entry.owner == role as u16 || entry.grantee == role as u16)
-            })
-            || self.column_acl_entries.iter().any(|entry| {
-                let (visible, grantee, grantor, _, _) = match entry.pending {
-                    Some(pending) if pending.txid == txid => (
-                        pending.privileges.0 != 0,
-                        pending.grantee,
-                        pending.grantor,
-                        pending.privileges,
-                        pending.grant_options,
-                    ),
-                    _ => (
-                        entry.live,
-                        entry.grantee,
-                        entry.grantor,
-                        entry.privileges,
-                        entry.grant_options,
-                    ),
-                };
-                visible
-                    && self.access_object_visible_to(entry.target.relation, txid)
-                    && (grantee == role as u16 || grantor == role as u16)
-            })
-            || self
-                .policies_with_slots_visible_to(txid)
-                .any(|(_, policy)| {
-                    policy
-                        .definition_for(txid)
-                        .roles
-                        .entries()
-                        .contains(&(role as u16))
-                })
+            .then_some(RoleObjectDependency::Policy)
     }
 
     pub(crate) fn set_object_owner(
@@ -10688,7 +12771,8 @@ impl Storage {
         self.default_acl_entries
             .iter()
             .find(|entry| {
-                entry.owner == owner
+                entry.database == self.current_database
+                    && entry.owner == owner
                     && entry.schema == schema
                     && entry.class == class
                     && entry.grantee == grantee
@@ -10732,7 +12816,8 @@ impl Storage {
             .default_acl_entries
             .iter()
             .position(|entry| {
-                entry.owner == owner
+                entry.database == self.current_database
+                    && entry.owner == owner
                     && entry.schema == schema
                     && entry.class == class
                     && entry.grantee == grantee
@@ -10746,6 +12831,7 @@ impl Storage {
         if slot == self.default_acl_entries.len() {
             self.default_acl_entries
                 .push(DefaultAclEntry {
+                    database: self.current_database,
                     owner,
                     schema,
                     class,
@@ -10764,6 +12850,7 @@ impl Storage {
                 })?;
         } else if self.default_acl_entries[slot].owner == PUBLIC_ROLE {
             let entry = &mut self.default_acl_entries[slot];
+            entry.database = self.current_database;
             entry.owner = owner;
             entry.schema = schema;
             entry.class = class;
@@ -10797,8 +12884,15 @@ impl Storage {
         &self.default_acl_entries[slot]
     }
 
+    pub(crate) fn default_acl_entry_count(&self) -> usize {
+        self.default_acl_entries.len()
+    }
+
     pub(crate) fn default_acl_entries(&self) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
-        self.default_acl_entries.iter().enumerate()
+        self.default_acl_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.database == self.current_database)
     }
 
     pub(crate) fn commit_default_acl(&mut self, slot: usize, txid: u32) {
@@ -10828,40 +12922,18 @@ impl Storage {
         }
     }
 
-    pub(crate) fn live_default_acls(&self) -> impl Iterator<Item = (usize, &DefaultAclEntry)> {
-        self.default_acl_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.defined)
-    }
-
-    pub(crate) fn live_acls(&self) -> impl Iterator<Item = (usize, &AclEntry)> {
-        self.acl_entries.iter().enumerate().filter(|(_, entry)| {
-            entry.live
-                || (entry.object
-                    == (AccessObject {
-                        class: AccessClass::Schema,
-                        slot: 0,
-                    })
-                    && entry.grantee == PUBLIC_ROLE
-                    && entry.grantor == 0)
-                || (matches!(
-                    entry.object.class,
-                    AccessClass::Domain
-                        | AccessClass::Enum
-                        | AccessClass::Composite
-                        | AccessClass::Routine
-                ) && entry.object.slot != u16::MAX
-                    && entry.grantee == PUBLIC_ROLE)
-        })
-    }
-
     pub(crate) fn acl_entry(&self, slot: usize) -> &AclEntry {
         &self.acl_entries[slot]
     }
 
+    pub(crate) fn acl_entry_count(&self) -> usize {
+        self.acl_entries.len()
+    }
+
     pub(crate) fn acl_entries(&self) -> impl Iterator<Item = (usize, &AclEntry)> {
-        self.acl_entries.iter().enumerate()
+        self.acl_entries.iter().enumerate().filter(|(_, entry)| {
+            entry.object.slot != u16::MAX && self.access_object_in_current_database(entry.object)
+        })
     }
 
     pub(crate) fn dependent_acl_slots(
@@ -11041,14 +13113,17 @@ impl Storage {
     }
 
     pub(crate) fn column_acl_entries(&self) -> impl Iterator<Item = (usize, &ColumnAclEntry)> {
-        self.column_acl_entries.iter().enumerate()
-    }
-
-    pub(crate) fn live_column_acls(&self) -> impl Iterator<Item = (usize, &ColumnAclEntry)> {
         self.column_acl_entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry.live)
+            .filter(|(_, entry)| {
+                entry.target.relation.slot != u16::MAX
+                    && self.access_object_in_current_database(entry.target.relation)
+            })
+    }
+
+    pub(crate) fn column_acl_entry_count(&self) -> usize {
+        self.column_acl_entries.len()
     }
 
     pub(crate) fn dependent_column_acl_slots(
@@ -12044,6 +14119,124 @@ impl Storage {
         Ok(())
     }
 
+    pub(crate) fn system_settings(&self) -> impl Iterator<Item = (usize, &SystemSetting)> {
+        self.system_settings.iter().enumerate()
+    }
+
+    pub(crate) fn system_setting(&self, slot: usize) -> &SystemSetting {
+        &self.system_settings[slot]
+    }
+
+    pub(crate) fn change_system_setting(
+        &mut self,
+        name: SqlName,
+        value: Option<StackStr<ROLE_SETTING_VALUE_MAX>>,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingRoleSetting>), SqlError> {
+        let existing = self.system_settings.iter().position(|setting| {
+            (setting.live || setting.pending.is_some()) && setting.name == name
+        });
+        let slot = match existing {
+            Some(slot) => slot,
+            None if value.is_none() => {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "system setting does not exist"
+                ));
+            }
+            None => self
+                .system_settings
+                .iter()
+                .position(|setting| !setting.live && setting.pending.is_none())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many system settings (limit {})",
+                        MAX_SYSTEM_SETTINGS
+                    )
+                })?,
+        };
+        if let Some(pending) = self.system_settings[slot].pending
+            && pending.txid != txid
+        {
+            self.row_locks.borrow_mut().wait_for(txid, pending.txid)?;
+            return Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for concurrent system setting DDL"
+            ));
+        }
+        let prior = self.system_settings[slot].pending;
+        if existing.is_none() {
+            self.system_settings[slot].name = name;
+        }
+        self.system_settings[slot].pending = Some(PendingRoleSetting {
+            txid,
+            exists: value.is_some(),
+            value: value.unwrap_or_default(),
+        });
+        Ok((slot, prior))
+    }
+
+    pub(crate) fn commit_system_setting(&mut self, slot: usize) {
+        let Some(pending) = self.system_settings[slot].pending.take() else {
+            return;
+        };
+        self.system_settings[slot].live = pending.exists;
+        self.system_settings[slot].value = pending.value;
+        if !pending.exists {
+            self.system_settings[slot] = SystemSetting::EMPTY;
+        }
+    }
+
+    pub(crate) fn rollback_system_setting(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingRoleSetting>,
+    ) {
+        self.system_settings[slot].pending = prior;
+        if !self.system_settings[slot].live && prior.is_none() {
+            self.system_settings[slot] = SystemSetting::EMPTY;
+        }
+    }
+
+    pub(crate) fn install_system_setting(
+        &mut self,
+        name: SqlName,
+        value: Option<StackStr<ROLE_SETTING_VALUE_MAX>>,
+    ) -> Result<(), SqlError> {
+        if let Some(slot) = self
+            .system_settings
+            .iter()
+            .position(|setting| setting.live && setting.name == name)
+        {
+            if let Some(value) = value {
+                self.system_settings[slot].value = value;
+            } else {
+                self.system_settings[slot] = SystemSetting::EMPTY;
+            }
+            return Ok(());
+        }
+        let Some(value) = value else { return Ok(()) };
+        let slot = self
+            .system_settings
+            .iter()
+            .position(|setting| !setting.live && setting.pending.is_none())
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many system settings (limit {})",
+                    MAX_SYSTEM_SETTINGS
+                )
+            })?;
+        self.system_settings[slot] = SystemSetting {
+            name,
+            value,
+            live: true,
+            pending: None,
+        };
+        Ok(())
+    }
+
     pub fn remove_role_membership(&mut self, role_name: &str, member_name: &str) {
         let (Some(role), Some(member)) = (self.find_role(role_name), self.find_role(member_name))
         else {
@@ -12137,21 +14330,24 @@ impl Storage {
     /// Committed schemas with their slot indices, for checkpoint and catalog
     /// output.
     pub fn live_schemas(&self) -> impl Iterator<Item = (usize, &SchemaDef)> {
-        self.schemas
-            .iter()
-            .enumerate()
-            .filter(|(_, schema)| schema.ddl_state == CatalogDdlState::Present)
+        self.schemas.iter().enumerate().filter(|(_, schema)| {
+            schema.database == self.current_database && schema.ddl_state == CatalogDdlState::Present
+        })
     }
 
     /// Schemas visible to `txid`, for catalog output inside a transaction.
     pub fn visible_schemas(&self, txid: u32) -> impl Iterator<Item = (usize, &SchemaDef)> {
-        self.schemas
-            .iter()
-            .enumerate()
-            .filter(move |(_, n)| n.visible_to(txid))
+        self.schemas.iter().enumerate().filter(move |(_, schema)| {
+            schema.database == self.current_database && schema.visible_to(txid)
+        })
     }
 
     // --- Object comments (`COMMENT ON ...`) ---
+
+    fn comment_database(&self, class: CommentClass) -> Option<DatabaseOid> {
+        (!matches!(class, CommentClass::Tablespace | CommentClass::Database))
+            .then_some(self.current_database)
+    }
 
     /// The comment text `txid` sees on this object, or `None` for none. Reads
     /// the transaction's own uncommitted overlay when present, else committed.
@@ -12165,14 +14361,29 @@ impl Storage {
     ) -> Option<&str> {
         self.comments
             .iter()
-            .find(|c| c.matches_to(class, schema, name, subid, txid))
+            .find(|c| {
+                c.matches_to(
+                    self.comment_database(class),
+                    class,
+                    schema,
+                    name,
+                    subid,
+                    txid,
+                )
+            })
             .and_then(|c| c.visible_text(txid))
     }
 
     /// Committed comment entries carrying text, for the checkpoint and
     /// `pg_description`.
     pub fn live_comments(&self) -> impl Iterator<Item = &CommentEntry> {
-        self.comments.iter().filter(|c| c.used && c.live.is_some())
+        self.comments.iter().filter(|comment| {
+            comment.used
+                && comment.live.is_some()
+                && comment
+                    .database
+                    .is_none_or(|database| database == self.current_database)
+        })
     }
 
     /// Comments `txid` can see (own uncommitted overlay, else committed) that
@@ -12183,16 +14394,20 @@ impl Storage {
         txid: u32,
     ) -> impl Iterator<Item = (CommentClass, &str, &str, u32, &str)> {
         self.comments.iter().filter_map(move |c| {
-            if !c.used {
+            if !c.used
+                || c.database
+                    .is_some_and(|database| database != self.current_database)
+            {
                 return None;
             }
-            let name = c
+            let identity = c
                 .pending_identity
                 .as_ref()
-                .filter(|identity| identity.txid == txid)
-                .map_or(c.name.as_str(), |identity| identity.name.as_str());
+                .filter(|identity| identity.txid == txid);
+            let schema = identity.map_or(c.schema.as_str(), |identity| identity.schema.as_str());
+            let name = identity.map_or(c.name.as_str(), |identity| identity.name.as_str());
             c.visible_text(txid)
-                .map(|t| (c.class, c.schema.as_str(), name, c.subid, t))
+                .map(|t| (c.class, schema, name, c.subid, t))
         })
     }
 
@@ -12204,10 +14419,18 @@ impl Storage {
         txid: u32,
     ) {
         for comment in self.comments.iter_mut().filter(|comment| {
-            comment.matches_to(CommentClass::Trigger, "", old_name.as_str(), subid, txid)
+            comment.matches_to(
+                Some(self.current_database),
+                CommentClass::Trigger,
+                "",
+                old_name.as_str(),
+                subid,
+                txid,
+            )
         }) {
             comment.pending_identity = Some(PendingCommentIdentity {
                 txid,
+                schema: comment.schema,
                 name: new_name,
             });
         }
@@ -12226,11 +14449,10 @@ impl Storage {
         text: Option<StackStr<COMMENT_MAX>>,
         txid: u32,
     ) -> Result<(usize, Option<PendingComment>), SqlError> {
-        if let Some(slot) = self
-            .comments
-            .iter()
-            .position(|c| c.matches_to(class, schema.as_str(), name.as_str(), subid, txid))
-        {
+        let database = self.comment_database(class);
+        if let Some(slot) = self.comments.iter().position(|c| {
+            c.matches_to(database, class, schema.as_str(), name.as_str(), subid, txid)
+        }) {
             let prior = self.comments[slot].pending.take();
             self.comments[slot].pending = Some(PendingComment { txid, text });
             return Ok((slot, prior));
@@ -12244,6 +14466,7 @@ impl Storage {
         };
         self.comments[slot] = CommentEntry {
             used: true,
+            database,
             class,
             schema,
             name,
@@ -12304,10 +14527,11 @@ impl Storage {
         subid: u32,
         text: Option<StackStr<COMMENT_MAX>>,
     ) -> Result<(), SqlError> {
+        let database = self.comment_database(class);
         if let Some(slot) = self
             .comments
             .iter()
-            .position(|c| c.matches(class, schema.as_str(), name.as_str(), subid))
+            .position(|c| c.matches(database, class, schema.as_str(), name.as_str(), subid))
         {
             self.comments[slot].live = text;
             self.reap_comment(slot);
@@ -12325,6 +14549,7 @@ impl Storage {
         };
         self.comments[slot] = CommentEntry {
             used: true,
+            database,
             class,
             schema,
             name,
@@ -12339,9 +14564,11 @@ impl Storage {
     /// Drops every comment on a relation (all columns and the relation itself)
     /// or a schema, for when the object is dropped. Committed removal.
     pub fn drop_object_comments(&mut self, class: CommentClass, schema: &str, name: &str) {
+        let database = self.comment_database(class);
         for slot in 0..self.comments.len() {
             let c = &self.comments[slot];
             if c.used
+                && c.database == database
                 && c.class == class
                 && c.pending.is_none()
                 && c.name.as_str() == name
@@ -12384,9 +14611,11 @@ impl Storage {
             )
         })?;
         if !self.has_current_database_create_privilege(role, txid) {
+            let database = self.database_definition(self.current_database_slot(txid), txid);
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
-                "permission denied for database pos3ql"
+                "permission denied for database {}",
+                database.name.as_str()
             ));
         }
         if self.find_schema_visible(name.as_str(), txid).is_some() {
@@ -12397,7 +14626,7 @@ impl Storage {
             ));
         }
         if let Some(owner) = self.schemas.iter().find_map(|schema| {
-            (schema.name.as_str() == name.as_str())
+            (schema.database == self.current_database && schema.name.as_str() == name.as_str())
                 .then_some(schema.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
@@ -12433,6 +14662,7 @@ impl Storage {
             slot: slot as u16,
         });
         self.schemas[slot] = SchemaDef {
+            database: self.current_database,
             name,
             ownership,
             ddl_state,
@@ -12488,20 +14718,17 @@ impl Storage {
         self.extensions
             .iter()
             .enumerate()
-            .filter(move |(_, extension)| extension.visible_to(txid))
-    }
-
-    pub(crate) fn live_extensions(&self) -> impl Iterator<Item = (usize, &ExtensionDef)> {
-        self.extensions
-            .iter()
-            .enumerate()
-            .filter(|(_, extension)| extension.ddl_state == CatalogDdlState::Present)
+            .filter(move |(_, extension)| {
+                extension.database == self.current_database && extension.visible_to(txid)
+            })
     }
 
     pub(crate) fn extension_slot(&self, name: &str, txid: u32) -> Option<usize> {
-        self.extensions
-            .iter()
-            .position(|extension| extension.visible_to(txid) && extension.name.as_str() == name)
+        self.extensions.iter().position(|extension| {
+            extension.database == self.current_database
+                && extension.visible_to(txid)
+                && extension.name.as_str() == name
+        })
     }
 
     pub(crate) fn create_extension(
@@ -12527,7 +14754,7 @@ impl Storage {
             ));
         }
         if let Some(owner) = self.extensions.iter().find_map(|extension| {
-            (extension.name == name)
+            (extension.database == self.current_database && extension.name == name)
                 .then_some(extension.ddl_state.pending_txid()?)
                 .filter(|owner| *owner != txid)
         }) {
@@ -12551,6 +14778,7 @@ impl Storage {
         self.catalog_seq = self.catalog_seq.saturating_add(1);
         let created_at = self.catalog_seq;
         self.extensions[slot] = ExtensionDef {
+            database: self.current_database,
             created_at,
             name,
             namespace: namespace as u16,
@@ -12574,6 +14802,7 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         if let Some(slot) = self.extension_slot(name.as_str(), 0) {
             self.extensions[slot] = ExtensionDef {
+                database: self.current_database,
                 created_at,
                 name,
                 namespace: namespace as u16,
@@ -12600,6 +14829,7 @@ impl Storage {
                 )
             })?;
         self.extensions[slot] = ExtensionDef {
+            database: self.current_database,
             created_at,
             name,
             namespace: namespace as u16,
@@ -13233,7 +15463,8 @@ impl Storage {
         self.views
             .iter()
             .position(|v| {
-                v.visible_to(txid)
+                v.database == self.current_database
+                    && v.visible_to(txid)
                     && v.schema_for(txid).as_str() == schema
                     && v.name.as_str() == name
             })
@@ -13349,7 +15580,10 @@ impl Storage {
 
     /// Live tables with their slot indices.
     pub fn live_tables(&self) -> impl Iterator<Item = (usize, &Table)> {
-        self.tables.iter().enumerate().filter(|(_, t)| t.live)
+        self.tables
+            .iter()
+            .enumerate()
+            .filter(|(_, table)| table.database == self.current_database && table.live)
     }
 
     /// Floors every serial column's sequence at the maximum value stored in
@@ -14309,6 +16543,9 @@ impl Storage {
             if each(rowid, *state)?.is_break() {
                 return Ok(());
             }
+        }
+        if self.tables[table_slot].n_spill_ssts == 0 {
+            return Ok(());
         }
         // Then everything that lives only in the bucket, synthesized.
         self.spill_merged_walk(table_slot, &mut |rowid, len, member, commit_lsn| {
@@ -15420,17 +17657,27 @@ impl Storage {
             .as_mut_slice()
             .sort_unstable_by_key(|(_, _, _, loc)| loc.offset);
         let mut write_at = 0usize;
+        let mut prior_alias: Option<(RowLoc, RowLoc)> = None;
         for i in 0..scratch.len() {
             let (table_index, rowid, pending_index, loc) = scratch[i];
             let len = loc.len as usize;
             let src = loc.offset as usize;
-            debug_assert!(write_at <= src, "targets never overtake sources");
-            if src != write_at {
-                self.heap.buffer.copy_within(src..src + len, write_at);
-            }
-            let new_loc = RowLoc {
-                offset: write_at as u32,
-                len: loc.len,
+            let new_loc = if let Some((prior, relocated)) = prior_alias
+                && prior == loc
+            {
+                relocated
+            } else {
+                debug_assert!(write_at <= src, "targets never overtake sources");
+                if src != write_at {
+                    self.heap.buffer.copy_within(src..src + len, write_at);
+                }
+                let relocated = RowLoc {
+                    offset: write_at as u32,
+                    len: loc.len,
+                };
+                write_at += len;
+                prior_alias = Some((loc, relocated));
+                relocated
             };
             let table = &mut self.tables[table_index as usize];
             let state = table
@@ -15449,7 +17696,6 @@ impl Storage {
                     .expect("pending image existed");
                 p.loc = Some(new_loc);
             }
-            write_at += len;
         }
         self.heap.used = write_at;
         Ok(())
@@ -16419,9 +18665,12 @@ impl Storage {
     /// Committed-catalog lookup (ignores uncommitted DDL): used by journal
     /// replay and any context that operates on the durable image.
     pub fn find_table(&self, schema: &str, name: &str) -> Option<usize> {
-        self.tables
-            .iter()
-            .position(|t| t.live && t.def.schema.as_str() == schema && t.def.name.as_str() == name)
+        self.tables.iter().position(|t| {
+            t.database == self.current_database
+                && t.live
+                && t.def.schema.as_str() == schema
+                && t.def.name.as_str() == name
+        })
     }
 
     /// Transaction-scoped lookup: `txid` sees its own uncommitted CREATE/DROP
@@ -16429,7 +18678,8 @@ impl Storage {
     /// DDL.
     pub fn find_visible(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.tables.iter().enumerate().position(|(index, table)| {
-            table.visible_to(txid)
+            table.database == self.current_database
+                && table.visible_to(txid)
                 && self.table_def(index, txid).schema.as_str() == schema
                 && self.table_def(index, txid).name.as_str() == name
         })
@@ -16437,6 +18687,10 @@ impl Storage {
 
     pub fn table(&self, index: usize) -> &Table {
         &self.tables[index]
+    }
+
+    pub(crate) fn table_slot_visible_to(&self, index: usize, txid: u32) -> bool {
+        self.tables[index].database == self.current_database && self.tables[index].visible_to(txid)
     }
 
     pub fn table_mut(&mut self, index: usize) -> &mut Table {
@@ -16553,6 +18807,7 @@ impl Storage {
         self.tables[index].pending_def_slots[position] = slot as u32;
         self.tables[index].n_pending_defs += 1;
         self.tables[index].pending_def_txid = Some(txid);
+        self.refresh_table_comment_identity(index, txid);
         Ok(())
     }
 
@@ -16570,6 +18825,28 @@ impl Storage {
         if position == 0 {
             self.tables[index].pending_def_txid = None;
         }
+        self.refresh_table_comment_identity(index, txid);
+    }
+
+    fn refresh_table_comment_identity(&mut self, index: usize, txid: u32) {
+        let database = Some(self.tables[index].database);
+        let committed = self.tables[index].def;
+        let visible = *self.table_def(index, txid);
+        let changed = committed.schema != visible.schema || committed.name != visible.name;
+        for comment in self.comments.iter_mut() {
+            if comment.used
+                && comment.database == database
+                && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
+                && comment.schema == committed.schema
+                && comment.name == committed.name
+            {
+                comment.pending_identity = changed.then_some(PendingCommentIdentity {
+                    txid,
+                    schema: visible.schema,
+                    name: visible.name,
+                });
+            }
+        }
     }
 
     /// Promotes the latest pending definition after its WAL batch is durable.
@@ -16583,12 +18860,6 @@ impl Storage {
         }
         self.set_table_def(index, pending.def, &pending.column_mapping);
         self.clear_pending_table_defs(index);
-        self.rename_stored_query_dependency(
-            DependencyClass::Table,
-            index,
-            pending.def.schema,
-            pending.def.name,
-        );
         pending.rewrites_rows
     }
 
@@ -16625,6 +18896,7 @@ impl Storage {
         self.catalog_seq += 1;
         let stamp = self.catalog_seq;
         let table = &mut self.tables[slot];
+        table.database = self.current_database;
         table.def = def;
         table.ownership = ownership;
         table.created_at = stamp;
@@ -16655,7 +18927,7 @@ impl Storage {
     /// the current catalog slot. Slots are runtime identities and may change
     /// across restart; scalar enums and enum/domain arrays therefore never
     /// trust the slot encoded in the table definition.
-    fn bind_user_type_columns(&self, def: &mut TableDef) -> Result<(), SqlError> {
+    fn bind_user_type_columns_to(&self, def: &mut TableDef, txid: u32) -> Result<(), SqlError> {
         for i in 0..def.n_columns {
             let col = &def.columns[i];
             match col.ctype {
@@ -16667,7 +18939,7 @@ impl Storage {
                         )
                     })?;
                     let slot = self
-                        .enum_slot(schema.as_str(), name.as_str(), 0)
+                        .enum_slot(schema.as_str(), name.as_str(), txid)
                         .ok_or_else(|| {
                             sql_err!(
                                 sqlstate::UNDEFINED_OBJECT,
@@ -16690,7 +18962,7 @@ impl Storage {
                         )
                     })?;
                     let slot = self
-                        .domain_slot(schema.as_str(), name.as_str(), 0)
+                        .domain_slot(schema.as_str(), name.as_str(), txid)
                         .ok_or_else(|| {
                             sql_err!(
                                 sqlstate::UNDEFINED_OBJECT,
@@ -16710,13 +18982,13 @@ impl Storage {
                     def.columns[i].ctype = ColType::Array(element);
                 }
                 _ if col.user_type.is_some_and(|identity| {
-                    self.domain_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                    self.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
                         .is_some()
                 }) =>
                 {
                     let identity = col.user_type.expect("domain identity checked above");
                     let slot = self
-                        .domain_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                        .domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
                         .expect("domain identity checked above");
                     // Scalar domains execute as their base representation, but
                     // their durable identity is the domain.  Resolve it before
@@ -16733,7 +19005,7 @@ impl Storage {
                         )
                     })?;
                     let slot = self
-                        .composite_slot(schema.as_str(), name.as_str(), 0)
+                        .composite_slot(schema.as_str(), name.as_str(), txid)
                         .ok_or_else(|| {
                             sql_err!(
                                 sqlstate::UNDEFINED_OBJECT,
@@ -16752,6 +19024,10 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    fn bind_user_type_columns(&self, def: &mut TableDef) -> Result<(), SqlError> {
+        self.bind_user_type_columns_to(def, 0)
     }
 
     pub fn create_table(&mut self, mut def: TableDef) -> Result<usize, SqlError> {
@@ -16967,36 +19243,38 @@ impl Storage {
 
     /// Whether any live view exists (lets the executor skip view expansion).
     pub fn has_any_view(&self) -> bool {
-        self.views
-            .iter()
-            .any(|view| view.ddl_state != CatalogDdlState::Absent)
+        self.views.iter().any(|view| {
+            view.database == self.current_database && view.ddl_state != CatalogDdlState::Absent
+        })
     }
 
     /// Committed views as (name, SELECT text), for checkpoint serialization.
     pub fn live_views(&self) -> impl Iterator<Item = &ViewDef> {
-        self.views
-            .iter()
-            .filter(|view| view.ddl_state == CatalogDdlState::Present)
+        self.views.iter().filter(|view| {
+            view.database == self.current_database && view.ddl_state == CatalogDdlState::Present
+        })
     }
 
     /// Committed views with their slot indices, for OID assignment.
     pub fn views_with_slots(&self) -> impl Iterator<Item = (usize, &ViewDef)> {
-        self.views
-            .iter()
-            .enumerate()
-            .filter(|(_, view)| view.ddl_state == CatalogDdlState::Present)
+        self.views.iter().enumerate().filter(|(_, view)| {
+            view.database == self.current_database && view.ddl_state == CatalogDdlState::Present
+        })
     }
 
     /// Views visible to `txid`, including the transaction's own DDL.
     pub(crate) fn views_visible_to(&self, txid: u32) -> impl Iterator<Item = (usize, &ViewDef)> {
-        self.views
-            .iter()
-            .enumerate()
-            .filter(move |(_, view)| view.visible_to(txid))
+        self.views.iter().enumerate().filter(move |(_, view)| {
+            view.database == self.current_database && view.visible_to(txid)
+        })
     }
 
     pub(crate) fn view(&self, slot: usize) -> &ViewDef {
         &self.views[slot]
+    }
+
+    pub(crate) fn view_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
+        self.views[slot].database == self.current_database && self.views[slot].visible_to(txid)
     }
 
     pub(crate) fn view_dependencies(&self, slot: usize) -> &StoredQueryDependencies {
@@ -17009,16 +19287,20 @@ impl Storage {
 
     /// Committed publications for catalog visibility and replication setup.
     pub fn live_publications(&self) -> impl Iterator<Item = &PublicationDef> {
-        self.publications
-            .iter()
-            .filter(|publication| publication.ddl_state == CatalogDdlState::Present)
+        self.publications.iter().filter(|publication| {
+            publication.database == self.current_database
+                && publication.ddl_state == CatalogDdlState::Present
+        })
     }
 
     pub fn publications_with_slots(&self) -> impl Iterator<Item = (usize, &PublicationDef)> {
         self.publications
             .iter()
             .enumerate()
-            .filter(|(_, publication)| publication.ddl_state == CatalogDdlState::Present)
+            .filter(|(_, publication)| {
+                publication.database == self.current_database
+                    && publication.ddl_state == CatalogDdlState::Present
+            })
     }
 
     pub(crate) fn publications_with_slots_visible_to(
@@ -17028,7 +19310,9 @@ impl Storage {
         self.publications
             .iter()
             .enumerate()
-            .filter(move |(_, publication)| publication.visible_to(txid))
+            .filter(move |(_, publication)| {
+                publication.database == self.current_database && publication.visible_to(txid)
+            })
     }
 
     /// Committed publication lookup for replication protocol setup.
@@ -17046,7 +19330,9 @@ impl Storage {
             .iter()
             .enumerate()
             .find_map(|(slot, publication)| {
-                (publication.visible_to(txid) && publication.name_for(txid).as_str() == name)
+                (publication.database == self.current_database
+                    && publication.visible_to(txid)
+                    && publication.name_for(txid).as_str() == name)
                     .then_some((slot, publication.definition_for(txid)))
             })
     }
@@ -17099,6 +19385,7 @@ impl Storage {
             .enumerate()
             .any(|(other_slot, publication)| {
                 other_slot != slot
+                    && publication.database == self.current_database
                     && publication.visible_to(txid)
                     && publication.name_for(txid) == name
             })
@@ -17114,7 +19401,7 @@ impl Storage {
                 .iter()
                 .enumerate()
                 .find_map(|(other_slot, publication)| {
-                    (other_slot != slot)
+                    (other_slot != slot && publication.database == self.current_database)
                         .then_some(publication.pending_name)
                         .flatten()
                         .filter(|pending| pending.name == name && pending.txid != txid)
@@ -17163,7 +19450,8 @@ impl Storage {
     ) -> Option<(SqlName, PublicationDefinition)> {
         self.publications.iter().find_map(|publication| {
             let definition = publication.definition_for(txid);
-            (publication.visible_to(txid)
+            (publication.database == self.current_database
+                && publication.visible_to(txid)
                 && definition.schemas[..definition.schema_count].contains(&schema))
             .then_some((publication.name_for(txid), definition))
         })
@@ -17218,6 +19506,7 @@ impl Storage {
             ));
         };
         self.replication_slots[index] = ReplicationSlotDef {
+            database: self.current_database,
             name: name.sql_name(),
             restart_lsn,
             confirmed_flush_lsn: restart_lsn,
@@ -17229,9 +19518,9 @@ impl Storage {
     }
 
     pub(crate) fn replication_slot(&self, name: &str) -> Option<&ReplicationSlotDef> {
-        self.replication_slots
-            .iter()
-            .find(|slot| slot.live && slot.name.as_str() == name)
+        self.replication_slots.iter().find(|slot| {
+            slot.database == self.current_database && slot.live && slot.name.as_str() == name
+        })
     }
 
     pub(crate) fn alter_replication_slot(
@@ -17242,7 +19531,9 @@ impl Storage {
         let slot = self
             .replication_slots
             .iter_mut()
-            .find(|slot| slot.live && slot.name == name.sql_name())
+            .find(|slot| {
+                slot.database == self.current_database && slot.live && slot.name == name.sql_name()
+            })
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -17267,7 +19558,7 @@ impl Storage {
         self.replication_slots
             .iter()
             .enumerate()
-            .filter(|(_, slot)| slot.live)
+            .filter(|(_, slot)| slot.database == self.current_database && slot.live)
     }
 
     pub(crate) fn replication_slot_capacity(&self) -> usize {
@@ -17301,11 +19592,9 @@ impl Storage {
     }
 
     pub(crate) fn drop_replication_slot(&mut self, name: &str) -> Result<(), SqlError> {
-        let Some(slot) = self
-            .replication_slots
-            .iter_mut()
-            .find(|slot| slot.live && slot.name.as_str() == name)
-        else {
+        let Some(slot) = self.replication_slots.iter_mut().find(|slot| {
+            slot.database == self.current_database && slot.live && slot.name.as_str() == name
+        }) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
                 "replication slot \"{}\" does not exist",
@@ -17320,6 +19609,7 @@ impl Storage {
             ));
         }
         *slot = ReplicationSlotDef {
+            database: self.current_database,
             name: SqlName::EMPTY,
             restart_lsn: 0,
             confirmed_flush_lsn: 0,
@@ -17410,7 +19700,9 @@ impl Storage {
         self.subscriptions
             .iter()
             .enumerate()
-            .filter(move |(_, subscription)| subscription.visible_to(txid))
+            .filter(move |(_, subscription)| {
+                subscription.database == self.current_database && subscription.visible_to(txid)
+            })
     }
 
     pub(crate) fn subscriptions_with_slots_durable(
@@ -17420,8 +19712,9 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(|(_, subscription)| {
-                subscription.ddl_state == CatalogDdlState::Present
-                    || subscription.cleanup != SubscriptionCleanup::None
+                subscription.database == self.current_database
+                    && (subscription.ddl_state == CatalogDdlState::Present
+                        || subscription.cleanup != SubscriptionCleanup::None)
             })
     }
 
@@ -17480,7 +19773,9 @@ impl Storage {
             ));
         }
         if self.subscriptions.iter().any(|subscription| {
-            subscription.visible_to(txid) && subscription.name_for(txid) == spec.name
+            subscription.database == self.current_database
+                && subscription.visible_to(txid)
+                && subscription.name_for(txid) == spec.name
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -17502,6 +19797,7 @@ impl Storage {
         publications[..spec.publications.len()].copy_from_slice(spec.publications);
         self.catalog_seq += 1;
         self.subscriptions[slot] = SubscriptionDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             definition_generation: 1,
             name: spec.name,
@@ -17534,7 +19830,9 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         let Some(slot) = self.subscriptions.iter().position(|subscription| {
-            subscription.visible_to(txid) && subscription.name_for(txid).as_str() == name
+            subscription.database == self.current_database
+                && subscription.visible_to(txid)
+                && subscription.name_for(txid).as_str() == name
         }) else {
             return Ok(None);
         };
@@ -17639,6 +19937,7 @@ impl Storage {
             .enumerate()
             .any(|(other, subscription)| {
                 other != slot
+                    && subscription.database == self.current_database
                     && subscription.visible_to(txid)
                     && subscription.name_for(txid) == name
             })
@@ -17966,7 +20265,9 @@ impl Storage {
                 "subscription worker slot is invalid"
             )
         })?;
-        if !subscription.visible_to(0)
+        if subscription.database != self.current_database
+            || stream.database != self.current_database
+            || !subscription.visible_to(0)
             || subscription.created_at != stream.created_at()
             || subscription.definition_generation != stream.definition_generation()
         {
@@ -17997,8 +20298,11 @@ impl Storage {
     pub(crate) fn subscription_stream(&self, slot: usize, txid: u32) -> Option<SubscriptionStream> {
         self.subscriptions
             .get(slot)
-            .filter(|subscription| subscription.visible_to(txid))
+            .filter(|subscription| {
+                subscription.database == self.current_database && subscription.visible_to(txid)
+            })
             .map(|subscription| SubscriptionStream {
+                database: subscription.database,
                 slot,
                 created_at: subscription.created_at,
                 definition_generation: subscription.definition_generation,
@@ -18016,7 +20320,9 @@ impl Storage {
             .subscriptions
             .get(stream.slot)
             .filter(|subscription| {
-                subscription.visible_to(txid)
+                stream.database == self.current_database
+                    && subscription.database == self.current_database
+                    && subscription.visible_to(txid)
                     && subscription.created_at == stream.created_at
                     && subscription.definition_generation == stream.definition_generation
                     && subscription.name == stream.name
@@ -18042,6 +20348,8 @@ impl Storage {
             .get_mut(advance.stream.slot)
             .filter(|subscription| {
                 subscription.ddl_state == CatalogDdlState::Present
+                    && subscription.database == self.current_database
+                    && advance.stream.database == self.current_database
                     && subscription.created_at == advance.stream.created_at
                     && subscription.definition_generation == advance.stream.definition_generation
                     && subscription.name == advance.stream.name
@@ -18068,7 +20376,9 @@ impl Storage {
         self.subscriptions
             .get(stream.slot)
             .filter(|subscription| {
-                subscription.visible_to(txid)
+                stream.database == self.current_database
+                    && subscription.database == self.current_database
+                    && subscription.visible_to(txid)
                     && subscription.created_at == stream.created_at
                     && subscription.definition_generation == stream.definition_generation
                     && subscription.name == stream.name
@@ -18262,14 +20572,17 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.publications.iter().find_map(|publication| {
-            (publication.name_for(txid) == spec.name)
+            (publication.database == self.current_database
+                && publication.name_for(txid) == spec.name)
                 .then_some(publication.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, spec.name.as_str()));
         }
         if self.publications.iter().any(|publication| {
-            publication.visible_to(txid) && publication.name_for(txid) == spec.name
+            publication.database == self.current_database
+                && publication.visible_to(txid)
+                && publication.name_for(txid) == spec.name
         }) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -18278,8 +20591,9 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.publications.iter().find_map(|publication| {
-            publication
-                .pending_name
+            (publication.database == self.current_database)
+                .then_some(publication.pending_name)
+                .flatten()
                 .filter(|pending| pending.name == spec.name && pending.txid != txid)
                 .map(|pending| pending.txid)
         }) {
@@ -18306,6 +20620,7 @@ impl Storage {
         schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
         self.catalog_seq += 1;
         self.publications[slot] = PublicationDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             name: spec.name,
             pending_name: None,
@@ -18331,7 +20646,9 @@ impl Storage {
 
     pub fn drop_publication(&mut self, name: &str, txid: u32) -> Result<Option<usize>, SqlError> {
         let Some(slot) = self.publications.iter().position(|publication| {
-            publication.visible_to(txid) && publication.name_for(txid).as_str() == name
+            publication.database == self.current_database
+                && publication.visible_to(txid)
+                && publication.name_for(txid).as_str() == name
         }) else {
             return Ok(None);
         };
@@ -18371,7 +20688,9 @@ impl Storage {
             ));
         }
         let Some(slot) = self.publications.iter().position(|publication| {
-            publication.visible_to(txid) && publication.name_for(txid).as_str() == name
+            publication.database == self.current_database
+                && publication.visible_to(txid)
+                && publication.name_for(txid).as_str() == name
         }) else {
             return Err(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -18437,7 +20756,10 @@ impl Storage {
     /// (own uncommitted CREATE/DROP included; another transaction's excluded).
     pub fn find_view(&self, schema: &str, name: &str, txid: u32) -> Option<&ViewDef> {
         self.views.iter().find(|v| {
-            v.visible_to(txid) && v.schema_for(txid).as_str() == schema && v.name.as_str() == name
+            v.database == self.current_database
+                && v.visible_to(txid)
+                && v.schema_for(txid).as_str() == schema
+                && v.name.as_str() == name
         })
     }
 
@@ -18446,16 +20768,16 @@ impl Storage {
 
     /// Committed materialized views, for checkpoint serialization.
     pub fn live_matviews(&self) -> impl Iterator<Item = &MatviewDef> {
-        self.matviews
-            .iter()
-            .filter(|m| m.ddl_state == CatalogDdlState::Present)
+        self.matviews.iter().filter(|m| {
+            m.database == self.current_database && m.ddl_state == CatalogDdlState::Present
+        })
     }
 
     pub fn matviews_with_slots(&self) -> impl Iterator<Item = (usize, &MatviewDef)> {
-        self.matviews
-            .iter()
-            .enumerate()
-            .filter(|(_, matview)| matview.ddl_state == CatalogDdlState::Present)
+        self.matviews.iter().enumerate().filter(|(_, matview)| {
+            matview.database == self.current_database
+                && matview.ddl_state == CatalogDdlState::Present
+        })
     }
 
     /// Materialized views visible to `txid`, including the transaction's own DDL.
@@ -18466,7 +20788,9 @@ impl Storage {
         self.matviews
             .iter()
             .enumerate()
-            .filter(move |(_, matview)| matview.visible_to(txid))
+            .filter(move |(_, matview)| {
+                matview.database == self.current_database && matview.visible_to(txid)
+            })
     }
 
     pub(crate) fn matview(&self, slot: usize) -> &MatviewDef {
@@ -18482,16 +20806,22 @@ impl Storage {
     }
 
     pub fn find_matview(&self, schema: &str, name: &str, txid: u32) -> Option<&MatviewDef> {
-        self.matviews
-            .iter()
-            .find(|m| m.visible_to(txid) && m.schema.as_str() == schema && m.name.as_str() == name)
+        self.matviews.iter().find(|m| {
+            m.database == self.current_database
+                && m.visible_to(txid)
+                && m.schema.as_str() == schema
+                && m.name.as_str() == name
+        })
     }
 
     /// The slot of a materialized view visible to `txid`, for later mutation
     /// (REFRESH marks it populated).
     pub fn matview_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.matviews.iter().position(|m| {
-            m.visible_to(txid) && m.schema.as_str() == schema && m.name.as_str() == name
+            m.database == self.current_database
+                && m.visible_to(txid)
+                && m.schema.as_str() == schema
+                && m.name.as_str() == name
         })
     }
 
@@ -18512,9 +20842,11 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.matviews.iter().find_map(|m| {
-            (m.schema.as_str() == schema.as_str() && m.name.as_str() == name.as_str())
-                .then_some(m.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
+            (m.database == self.current_database
+                && m.schema.as_str() == schema.as_str()
+                && m.name.as_str() == name.as_str())
+            .then_some(m.ddl_state.pending_txid()?)
+            .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
@@ -18536,6 +20868,7 @@ impl Storage {
         });
         self.catalog_seq += 1;
         self.matviews[new] = MatviewDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             schema,
             name,
@@ -18556,14 +20889,19 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.matviews.iter().find_map(|m| {
-            (m.schema.as_str() == schema && m.name.as_str() == name)
+            (m.database == self.current_database
+                && m.schema.as_str() == schema
+                && m.name.as_str() == name)
                 .then_some(m.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.matviews.iter().position(|m| {
-            m.visible_to(txid) && m.schema.as_str() == schema && m.name.as_str() == name
+            m.database == self.current_database
+                && m.visible_to(txid)
+                && m.schema.as_str() == schema
+                && m.name.as_str() == name
         }) else {
             return Ok(None);
         };
@@ -18602,16 +20940,17 @@ impl Storage {
     // --- Sequences -------------------------------------------------------
 
     pub fn live_sequences(&self) -> impl Iterator<Item = &SequenceDef> {
-        self.sequences
-            .iter()
-            .filter(|sequence| sequence.ddl_state == CatalogDdlState::Present)
+        self.sequences.iter().filter(|sequence| {
+            sequence.database == self.current_database
+                && sequence.ddl_state == CatalogDdlState::Present
+        })
     }
 
     pub fn sequences_with_slots(&self) -> impl Iterator<Item = (usize, &SequenceDef)> {
-        self.sequences
-            .iter()
-            .enumerate()
-            .filter(|(_, sequence)| sequence.ddl_state == CatalogDdlState::Present)
+        self.sequences.iter().enumerate().filter(|(_, sequence)| {
+            sequence.database == self.current_database
+                && sequence.ddl_state == CatalogDdlState::Present
+        })
     }
 
     pub(crate) fn sequence(&self, slot: usize) -> &SequenceDef {
@@ -18622,10 +20961,16 @@ impl Storage {
         self.sequences.len()
     }
 
+    pub(crate) fn sequence_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
+        self.sequences[slot].database == self.current_database
+            && self.sequences[slot].visible_to(txid)
+    }
+
     pub fn find_sequence(&self, schema: &str, name: &str, txid: u32) -> Option<&SequenceDef> {
         self.sequences.iter().find(|s| {
             let definition = s.definition_for(txid);
-            s.visible_to(txid)
+            s.database == self.current_database
+                && s.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name
         })
@@ -18634,7 +20979,8 @@ impl Storage {
     pub fn sequence_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.sequences.iter().position(|s| {
             let definition = s.definition_for(txid);
-            s.visible_to(txid)
+            s.database == self.current_database
+                && s.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name
         })
@@ -18648,7 +20994,8 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         self.sequences.iter().position(|sequence| {
-            sequence.visible_to(txid)
+            sequence.database == self.current_database
+                && sequence.visible_to(txid)
                 && matches!(
                     sequence.generator_for,
                     Some(owner)
@@ -18701,9 +21048,11 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.sequences.iter().find_map(|s| {
-            (s.schema.as_str() == schema.as_str() && s.name.as_str() == name.as_str())
-                .then_some(s.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
+            (s.database == self.current_database
+                && s.schema.as_str() == schema.as_str()
+                && s.name.as_str() == name.as_str())
+            .then_some(s.ddl_state.pending_txid()?)
+            .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
@@ -18725,6 +21074,7 @@ impl Storage {
         });
         self.catalog_seq += 1;
         self.sequences[new] = SequenceDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             schema,
             name,
@@ -18834,6 +21184,7 @@ impl Storage {
                 let new_schema = self.sequences[slot].schema;
                 for comment in self.comments.iter_mut() {
                     if comment.used
+                        && comment.database == Some(self.current_database)
                         && comment.class == CommentClass::Relation
                         && comment.schema == old_schema
                         && comment.name == name
@@ -19011,14 +21362,19 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.sequences.iter().find_map(|s| {
-            (s.schema.as_str() == schema && s.name.as_str() == name)
+            (s.database == self.current_database
+                && s.schema.as_str() == schema
+                && s.name.as_str() == name)
                 .then_some(s.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.sequences.iter().position(|s| {
-            s.visible_to(txid) && s.schema.as_str() == schema && s.name.as_str() == name
+            s.database == self.current_database
+                && s.visible_to(txid)
+                && s.schema.as_str() == schema
+                && s.name.as_str() == name
         }) else {
             return Ok(None);
         };
@@ -19050,7 +21406,8 @@ impl Storage {
     /// without marking dirty (replay must not re-journal).
     pub fn apply_sequence_advance(&mut self, schema: &str, name: &str, last: i64, is_called: bool) {
         if let Some(i) = self.sequences.iter().position(|s| {
-            (s.ddl_state != CatalogDdlState::Absent)
+            s.database == self.current_database
+                && s.ddl_state != CatalogDdlState::Absent
                 && s.schema.as_str() == schema
                 && s.name.as_str() == name
         }) {
@@ -19078,7 +21435,8 @@ impl Storage {
         if let Some(schema) = qualifier {
             return self.domains.iter().position(|d| {
                 let definition = d.definition_for(txid);
-                d.visible_to(txid)
+                d.database == self.current_database
+                    && d.visible_to(txid)
                     && definition.schema.as_str() == schema
                     && definition.name.as_str() == name
             });
@@ -19088,7 +21446,8 @@ impl Storage {
                 let schema = self.schemas[*slot as usize].name;
                 if let Some(i) = self.domains.iter().position(|d| {
                     let definition = d.definition_for(txid);
-                    d.visible_to(txid)
+                    d.database == self.current_database
+                        && d.visible_to(txid)
                         && definition.schema.as_str() == schema.as_str()
                         && definition.name.as_str() == name
                 }) {
@@ -19116,7 +21475,9 @@ impl Storage {
         self.domains
             .iter()
             .position(|domain| {
-                domain.visible_to(txid) && domain.definition_for(txid).name.as_str() == name
+                domain.database == self.current_database
+                    && domain.visible_to(txid)
+                    && domain.definition_for(txid).name.as_str() == name
             })
             .map(|slot| self.domain_for(slot, txid))
     }
@@ -19125,7 +21486,8 @@ impl Storage {
     pub fn domain_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.domains.iter().position(|d| {
             let definition = d.definition_for(txid);
-            d.visible_to(txid)
+            d.database == self.current_database
+                && d.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name
         })
@@ -19142,7 +21504,8 @@ impl Storage {
     ) -> Option<usize> {
         self.domain_slot(schema, name, txid).or_else(|| {
             self.domains.iter().position(|domain| {
-                domain.visible_to(txid)
+                domain.database == self.current_database
+                    && domain.visible_to(txid)
                     && domain.schema.as_str() == schema
                     && domain.name.as_str() == name
                     && domain
@@ -19320,19 +21683,26 @@ impl Storage {
         self.domains.len()
     }
 
+    pub(crate) fn domain_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
+        self.domains[slot].database == self.current_database && self.domains[slot].visible_to(txid)
+    }
+
     /// Committed domains carrying their slot indices, for the checkpoint and
     /// `pg_type`.
     pub fn live_domains(&self) -> impl Iterator<Item = (usize, &DomainDef)> {
-        self.domains
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.ddl_state == CatalogDdlState::Present)
+        self.domains.iter().enumerate().filter(|(_, d)| {
+            d.database == self.current_database && d.ddl_state == CatalogDdlState::Present
+        })
     }
 
     /// Whether any table column (in any table) is declared with this domain —
     /// the dependency that makes `DROP DOMAIN ... RESTRICT` fail.
     pub fn domain_in_use(&self, schema: &str, name: &str) -> Option<(SqlName, SqlName)> {
-        for table in self.tables.iter().filter(|t| t.live) {
+        for table in self
+            .tables
+            .iter()
+            .filter(|t| t.database == self.current_database && t.live)
+        {
             for col in table.def.columns() {
                 if col.user_type.is_some_and(|identity| {
                     identity.name.as_str() == name && identity.schema.as_str() == schema
@@ -19381,6 +21751,7 @@ impl Storage {
                 ColType::Enum(slot)
                     if slot != ColType::ENUM_SLOT_UNRESOLVED
                         && (slot as usize) < self.enums.len()
+                        && self.enums[slot as usize].database == self.current_database
                         && self.enum_for(slot as usize, txid).visible_to(txid) =>
                 {
                     // WAL preserves the catalog slot. Its spelling can be stale
@@ -19411,6 +21782,7 @@ impl Storage {
                 ColType::Composite(slot)
                     if slot != ColType::COMPOSITE_SLOT_UNRESOLVED
                         && (slot as usize) < self.composites.len()
+                        && self.composites[slot as usize].database == self.current_database
                         && self.composite_for(slot as usize, txid).visible_to(txid) =>
                 {
                     // See the enum case: slot identity is durable; names are a
@@ -19450,10 +21822,13 @@ impl Storage {
         }
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.domains.iter().find_map(|d| {
-            (d.schema == schema && d.name == name
-                || d.pending_definition
-                    .and_then(|pending| pending.identity)
-                    .is_some_and(|identity| identity.schema == schema && identity.name == name))
+            (d.database == self.current_database
+                && (d.schema == schema && d.name == name
+                    || d.pending_definition
+                        .and_then(|pending| pending.identity)
+                        .is_some_and(|identity| {
+                            identity.schema == schema && identity.name == name
+                        })))
             .then(|| {
                 d.pending_definition
                     .map(|pending| pending.txid)
@@ -19465,9 +21840,10 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.enums.iter().find_map(|e| {
-            (e.schema == schema && e.name == name
-                || e.pending_definition
-                    .is_some_and(|pending| pending.schema == schema && pending.name == name))
+            (e.database == self.current_database
+                && (e.schema == schema && e.name == name
+                    || e.pending_definition
+                        .is_some_and(|pending| pending.schema == schema && pending.name == name)))
             .then(|| {
                 e.pending_definition
                     .map(|pending| pending.txid)
@@ -19479,10 +21855,11 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.composites.iter().find_map(|composite| {
-            (composite.schema == schema && composite.name == name
-                || composite
-                    .pending_definition
-                    .is_some_and(|pending| pending.schema == schema && pending.name == name))
+            (composite.database == self.current_database
+                && (composite.schema == schema && composite.name == name
+                    || composite
+                        .pending_definition
+                        .is_some_and(|pending| pending.schema == schema && pending.name == name)))
             .then(|| {
                 composite
                     .pending_definition
@@ -19495,7 +21872,8 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if self.domains.iter().any(|domain| {
-            domain.visible_to(txid)
+            domain.database == self.current_database
+                && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == schema
                 && domain.definition_for(txid).name == name
         }) {
@@ -19506,7 +21884,8 @@ impl Storage {
             ));
         }
         if self.enums.iter().any(|e| {
-            e.visible_to(txid)
+            e.database == self.current_database
+                && e.visible_to(txid)
                 && e.definition_for(txid).schema == schema
                 && e.definition_for(txid).name == name
         }) {
@@ -19517,7 +21896,8 @@ impl Storage {
             ));
         }
         if self.composites.iter().any(|composite| {
-            composite.visible_to(txid)
+            composite.database == self.current_database
+                && composite.visible_to(txid)
                 && composite.definition_for(txid).schema == schema
                 && composite.definition_for(txid).name == name
         }) {
@@ -19545,6 +21925,7 @@ impl Storage {
             slot: new as u16,
         });
         self.domains[new] = DomainDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             schema,
             name,
@@ -19574,9 +21955,14 @@ impl Storage {
     /// Finishes manifest-time user-type binding once every catalog definition
     /// has been installed. Startup never exposes the interim unresolved slot.
     pub(crate) fn rebind_domain_base_types(&mut self) -> Result<(), SqlError> {
+        self.rebind_domain_base_types_to(0)
+    }
+
+    fn rebind_domain_base_types_to(&mut self, txid: u32) -> Result<(), SqlError> {
         fn bind(
             storage: &mut Storage,
             slot: usize,
+            txid: u32,
             state: &mut [u8; MAX_DOMAINS],
         ) -> Result<(), SqlError> {
             match state[slot] {
@@ -19592,7 +21978,7 @@ impl Storage {
             let domain = storage.domains[slot];
             if let Some(parent) = domain.base_domain {
                 let parent_slot = storage
-                    .domain_slot(parent.schema.as_str(), parent.name.as_str(), 0)
+                    .domain_slot(parent.schema.as_str(), parent.name.as_str(), txid)
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::UNDEFINED_OBJECT,
@@ -19601,13 +21987,13 @@ impl Storage {
                             parent.name.as_str()
                         )
                     })?;
-                bind(storage, parent_slot, state)?;
+                bind(storage, parent_slot, txid, state)?;
                 storage.domains[slot].base = storage.domains[parent_slot].base;
             } else if let Some(identity) = domain.base_user_type {
                 storage.domains[slot].base = match domain.base {
                     ColType::Enum(_) => ColType::Enum(
                         storage
-                            .enum_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                            .enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
                             .ok_or_else(|| {
                                 sql_err!(
                                     sqlstate::UNDEFINED_OBJECT,
@@ -19619,7 +22005,7 @@ impl Storage {
                     ),
                     ColType::Composite(_) => ColType::Composite(
                         storage
-                            .composite_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                            .composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
                             .ok_or_else(|| {
                                 sql_err!(
                                     sqlstate::UNDEFINED_OBJECT,
@@ -19644,10 +22030,10 @@ impl Storage {
         let mut state = [0u8; MAX_DOMAINS];
         for slot in 0..self.domains.len() {
             let domain = self.domains[slot];
-            if domain.ddl_state != CatalogDdlState::Present {
+            if domain.database != self.current_database || !domain.visible_to(txid) {
                 continue;
             }
-            bind(self, slot, &mut state)?;
+            bind(self, slot, txid, &mut state)?;
         }
         Ok(())
     }
@@ -19660,9 +22046,11 @@ impl Storage {
         &self,
         ctype: ColType,
         identity: UserTypeName,
+        txid: u32,
     ) -> Result<ColType, SqlError> {
-        if let Some(slot) = self.domain_slot(identity.schema.as_str(), identity.name.as_str(), 0) {
-            let domain = self.domain(slot);
+        if let Some(slot) = self.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
+        {
+            let domain = self.domain_for(slot, txid);
             return match ctype {
                 ColType::Array(ArrElem::Domain { .. }) => ArrElem::domain(slot as u16, domain.base)
                     .map(ColType::Array)
@@ -19676,14 +22064,15 @@ impl Storage {
                 _ => Ok(domain.base),
             };
         }
-        if let Some(slot) = self.enum_slot(identity.schema.as_str(), identity.name.as_str(), 0) {
+        if let Some(slot) = self.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid) {
             return Ok(if matches!(ctype, ColType::Array(_)) {
                 ColType::Array(ArrElem::Enum(slot as u16))
             } else {
                 ColType::Enum(slot as u16)
             });
         }
-        if let Some(slot) = self.composite_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+        if let Some(slot) =
+            self.composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
         {
             return Ok(if matches!(ctype, ColType::Array(_)) {
                 ColType::Array(ArrElem::Composite(slot as u16))
@@ -19702,16 +22091,24 @@ impl Storage {
     /// Completes checkpoint-time binding for every table and composite field.
     /// No recovered declaration is exposed with an unresolved user-type slot.
     pub(crate) fn rebind_user_type_declarations(&mut self) -> Result<(), SqlError> {
+        self.rebind_user_type_declarations_to(0)
+    }
+
+    fn rebind_user_type_declarations_to(&mut self, txid: u32) -> Result<(), SqlError> {
         for table in 0..self.tables.len() {
-            if !self.tables[table].live {
+            if self.tables[table].database != self.current_database
+                || !self.tables[table].visible_to(txid)
+            {
                 continue;
             }
             let mut definition = self.tables[table].def;
-            self.bind_user_type_columns(&mut definition)?;
+            self.bind_user_type_columns_to(&mut definition, txid)?;
             self.tables[table].def = definition;
         }
         for composite in 0..self.composites.len() {
-            if self.composites[composite].ddl_state != CatalogDdlState::Present {
+            if self.composites[composite].database != self.current_database
+                || !self.composites[composite].visible_to(txid)
+            {
                 continue;
             }
             let n_fields = self.composites[composite].n_fields;
@@ -19723,7 +22120,7 @@ impl Storage {
                 let Some(identity) = definition.user_type else {
                     continue;
                 };
-                let rebound = self.rebind_declared_user_type(definition.ctype, identity)?;
+                let rebound = self.rebind_declared_user_type(definition.ctype, identity, txid)?;
                 self.composites[composite].fields[field].ctype = rebound;
             }
         }
@@ -19734,18 +22131,23 @@ impl Storage {
     /// names after a manifest rebuild.  Routine slots are deliberately never
     /// used as identities: a dropped type may free its slot before recovery.
     pub(crate) fn rebind_routine_types(&mut self) -> Result<(), SqlError> {
+        self.rebind_routine_types_to(0)
+    }
+
+    fn rebind_routine_types_to(&mut self, txid: u32) -> Result<(), SqlError> {
         fn rebind(
             storage: &Storage,
             ctype: ColType,
             identity: UserTypeName,
+            txid: u32,
         ) -> Result<ColType, SqlError> {
             if polymorphic_type(ctype, Some(identity)).is_some() {
                 return Ok(ctype);
             }
             if let Some(slot) =
-                storage.domain_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                storage.domain_slot(identity.schema.as_str(), identity.name.as_str(), txid)
             {
-                let domain = storage.domain(slot);
+                let domain = storage.domain_for(slot, txid);
                 return match ctype {
                     ColType::Array(_) => {
                         crate::sql::types::ArrElem::domain(slot as u16, domain.base)
@@ -19761,7 +22163,7 @@ impl Storage {
                 };
             }
             if let Some(slot) =
-                storage.enum_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                storage.enum_slot(identity.schema.as_str(), identity.name.as_str(), txid)
             {
                 return Ok(match ctype {
                     ColType::Array(_) => {
@@ -19771,7 +22173,7 @@ impl Storage {
                 });
             }
             if let Some(slot) =
-                storage.composite_slot(identity.schema.as_str(), identity.name.as_str(), 0)
+                storage.composite_slot(identity.schema.as_str(), identity.name.as_str(), txid)
             {
                 return Ok(match ctype {
                     ColType::Array(_) => {
@@ -19788,41 +22190,44 @@ impl Storage {
             ))
         }
         for slot in 0..self.routines.len() {
-            if self.routines[slot].ddl_state != CatalogDdlState::Present {
+            if self.routines[slot].database != self.current_database
+                || !self.routines[slot].visible_to(txid)
+            {
                 continue;
             }
             let mut routine = self.routines[slot];
             for argument in &mut routine.arguments[..routine.argument_count] {
                 if let Some(identity) = argument.user_type {
-                    argument.ctype = rebind(self, argument.ctype, identity)?;
+                    argument.ctype = rebind(self, argument.ctype, identity, txid)?;
                 }
             }
             for parameter in &mut routine.parameters[..routine.parameter_count] {
                 if let Some(identity) = parameter.user_type {
-                    parameter.ctype = rebind(self, parameter.ctype, identity)?;
+                    parameter.ctype = rebind(self, parameter.ctype, identity, txid)?;
                 }
             }
             for column in &mut routine.result_columns[..routine.result_column_count] {
                 if let Some(identity) = column.user_type {
-                    column.ctype = rebind(self, column.ctype, identity)?;
+                    column.ctype = rebind(self, column.ctype, identity, txid)?;
                 }
             }
             match &mut routine.kind {
                 RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
                     if let Some(identity) = result.user_type {
-                        result.ctype = rebind(self, result.ctype, identity)?;
+                        result.ctype = rebind(self, result.ctype, identity, txid)?;
                     }
                 }
                 RoutineKind::Aggregate(aggregate) => {
                     for result in [&mut aggregate.state_type, &mut aggregate.result_type] {
                         if let Some(identity) = result.user_type {
-                            result.ctype = rebind(self, result.ctype, identity)?;
+                            result.ctype = rebind(self, result.ctype, identity, txid)?;
                         }
                     }
                     if let Some(moving) = &mut aggregate.moving
                         && let Some(identity) = moving.state_type.user_type
                     {
-                        moving.state_type.ctype = rebind(self, moving.state_type.ctype, identity)?;
+                        moving.state_type.ctype =
+                            rebind(self, moving.state_type.ctype, identity, txid)?;
                     }
                 }
                 RoutineKind::RecordFunction { .. }
@@ -19877,7 +22282,10 @@ impl Storage {
             .enumerate()
             .find_map(|(other_slot, domain)| {
                 let definition = domain.definition_for(txid);
-                (other_slot != slot && definition.schema == schema && definition.name == name)
+                (other_slot != slot
+                    && domain.database == self.current_database
+                    && definition.schema == schema
+                    && definition.name == name)
                     .then(|| {
                         domain
                             .pending_definition
@@ -19892,11 +22300,13 @@ impl Storage {
         }
         if self.domains.iter().enumerate().any(|(other_slot, domain)| {
             other_slot != slot
+                && domain.database == self.current_database
                 && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == schema
                 && domain.definition_for(txid).name == name
         }) || self.enums.iter().any(|enumeration| {
-            enumeration.visible_to(txid)
+            enumeration.database == self.current_database
+                && enumeration.visible_to(txid)
                 && enumeration.schema == schema
                 && enumeration.definition_for(txid).name == name
         }) {
@@ -20028,14 +22438,19 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.domains.iter().find_map(|d| {
-            (d.schema.as_str() == schema && d.name.as_str() == name)
+            (d.database == self.current_database
+                && d.schema.as_str() == schema
+                && d.name.as_str() == name)
                 .then_some(d.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.domains.iter().position(|d| {
-            d.visible_to(txid) && d.schema.as_str() == schema && d.name.as_str() == name
+            d.database == self.current_database
+                && d.visible_to(txid)
+                && d.schema.as_str() == schema
+                && d.name.as_str() == name
         }) else {
             return Ok(None);
         };
@@ -20070,7 +22485,8 @@ impl Storage {
     fn find_enum_slot(&self, qualifier: Option<&str>, name: &str, txid: u32) -> Option<usize> {
         if let Some(schema) = qualifier {
             return self.enums.iter().position(|e| {
-                e.visible_to(txid)
+                e.database == self.current_database
+                    && e.visible_to(txid)
                     && e.definition_for(txid).schema.as_str() == schema
                     && e.definition_for(txid).name.as_str() == name
             });
@@ -20079,7 +22495,8 @@ impl Storage {
             if let PathEntry::Schema(slot) = entry {
                 let schema = self.schemas[*slot as usize].name;
                 if let Some(i) = self.enums.iter().position(|e| {
-                    e.visible_to(txid)
+                    e.database == self.current_database
+                        && e.visible_to(txid)
                         && e.definition_for(txid).schema.as_str() == schema.as_str()
                         && e.definition_for(txid).name.as_str() == name
                 }) {
@@ -20103,22 +22520,27 @@ impl Storage {
     /// The definition of an enum named `name` (any schema) visible to `txid` —
     /// for resolving a column whose stored type identity is only the enum name.
     pub fn enum_by_name(&self, name: &str, txid: u32) -> Option<&EnumDef> {
-        self.enums
-            .iter()
-            .find(|e| e.visible_to(txid) && e.definition_for(txid).name.as_str() == name)
+        self.enums.iter().find(|e| {
+            e.database == self.current_database
+                && e.visible_to(txid)
+                && e.definition_for(txid).name.as_str() == name
+        })
     }
 
     /// The slot of an enum named `name` (any schema) visible to `txid`.
     pub fn enum_slot_by_name(&self, name: &str, txid: u32) -> Option<usize> {
-        self.enums
-            .iter()
-            .position(|e| e.visible_to(txid) && e.definition_for(txid).name.as_str() == name)
+        self.enums.iter().position(|e| {
+            e.database == self.current_database
+                && e.visible_to(txid)
+                && e.definition_for(txid).name.as_str() == name
+        })
     }
 
     /// The enum named `(schema, name)` visible to `txid`, by slot.
     pub fn enum_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.enums.iter().position(|e| {
-            e.visible_to(txid)
+            e.database == self.current_database
+                && e.visible_to(txid)
                 && e.definition_for(txid).schema.as_str() == schema
                 && e.definition_for(txid).name.as_str() == name
         })
@@ -20132,19 +22554,26 @@ impl Storage {
         self.enums.len()
     }
 
+    pub(crate) fn enum_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
+        self.enums[slot].database == self.current_database && self.enums[slot].visible_to(txid)
+    }
+
     /// Committed enums carrying their slot indices, for the checkpoint,
     /// `pg_type` and `pg_enum`.
     pub fn live_enums(&self) -> impl Iterator<Item = (usize, &EnumDef)> {
-        self.enums
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.ddl_state == CatalogDdlState::Present)
+        self.enums.iter().enumerate().filter(|(_, e)| {
+            e.database == self.current_database && e.ddl_state == CatalogDdlState::Present
+        })
     }
 
     /// Whether any table column (in any table) is declared with this enum —
     /// the dependency that makes `DROP TYPE ... RESTRICT` fail.
     pub fn enum_in_use(&self, slot: usize) -> Option<(SqlName, SqlName)> {
-        for table in self.tables.iter().filter(|t| t.live) {
+        for table in self
+            .tables
+            .iter()
+            .filter(|t| t.database == self.current_database && t.live)
+        {
             for col in table.def.columns() {
                 if matches!(col.ctype, ColType::Enum(s) if s as usize == slot)
                     || matches!(
@@ -20171,9 +22600,10 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.enums.iter().find_map(|e| {
-            let same_name = e.schema == schema && e.name == name
-                || e.pending_definition
-                    .is_some_and(|pending| pending.schema == schema && pending.name == name);
+            let same_name = e.database == self.current_database
+                && (e.schema == schema && e.name == name
+                    || e.pending_definition
+                        .is_some_and(|pending| pending.schema == schema && pending.name == name));
             same_name
                 .then(|| {
                     e.pending_definition
@@ -20186,7 +22616,8 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if self.enums.iter().any(|e| {
-            e.visible_to(txid)
+            e.database == self.current_database
+                && e.visible_to(txid)
                 && e.definition_for(txid).schema == schema
                 && e.definition_for(txid).name == name
         }) {
@@ -20197,17 +22628,21 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.domains.iter().find_map(|d| {
-            (d.schema == schema && d.name == name
-                || d.pending_definition
-                    .and_then(|pending| pending.identity)
-                    .is_some_and(|identity| identity.schema == schema && identity.name == name))
+            (d.database == self.current_database
+                && (d.schema == schema && d.name == name
+                    || d.pending_definition
+                        .and_then(|pending| pending.identity)
+                        .is_some_and(|identity| {
+                            identity.schema == schema && identity.name == name
+                        })))
             .then_some(d.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if self.domains.iter().any(|d| {
-            d.visible_to(txid)
+            d.database == self.current_database
+                && d.visible_to(txid)
                 && d.definition_for(txid).schema == schema
                 && d.definition_for(txid).name == name
         }) {
@@ -20218,7 +22653,8 @@ impl Storage {
             ));
         }
         if self.composites.iter().any(|composite| {
-            composite.visible_to(txid)
+            composite.database == self.current_database
+                && composite.visible_to(txid)
                 && composite.definition_for(txid).schema == schema
                 && composite.definition_for(txid).name == name
         }) {
@@ -20246,6 +22682,7 @@ impl Storage {
             slot: new as u16,
         });
         self.enums[new] = EnumDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             schema,
             name,
@@ -20274,6 +22711,7 @@ impl Storage {
             .enumerate()
             .find_map(|(other_slot, other)| {
                 (other_slot != slot
+                    && other.database == self.current_database
                     && (other.schema == definition.schema && other.name == definition.name
                         || other.pending_definition.is_some_and(|pending| {
                             pending.schema == definition.schema && pending.name == definition.name
@@ -20291,13 +22729,14 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
         if let Some(blocker) = self.domains.iter().find_map(|domain| {
-            (domain.schema == definition.schema && domain.name == definition.name
-                || domain
-                    .pending_definition
-                    .and_then(|pending| pending.identity)
-                    .is_some_and(|identity| {
-                        identity.schema == definition.schema && identity.name == definition.name
-                    }))
+            (domain.database == self.current_database
+                && (domain.schema == definition.schema && domain.name == definition.name
+                    || domain
+                        .pending_definition
+                        .and_then(|pending| pending.identity)
+                        .is_some_and(|identity| {
+                            identity.schema == definition.schema && identity.name == definition.name
+                        })))
             .then_some(domain.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
@@ -20305,15 +22744,18 @@ impl Storage {
         }
         if self.enums.iter().enumerate().any(|(other_slot, other)| {
             other_slot != slot
+                && other.database == self.current_database
                 && other.visible_to(txid)
                 && other.definition_for(txid).schema == definition.schema
                 && other.definition_for(txid).name == definition.name
         }) || self.domains.iter().any(|domain| {
-            domain.visible_to(txid)
+            domain.database == self.current_database
+                && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == definition.schema
                 && domain.definition_for(txid).name == definition.name
         }) || self.composites.iter().any(|composite| {
-            composite.visible_to(txid)
+            composite.database == self.current_database
+                && composite.visible_to(txid)
                 && composite.definition_for(txid).schema == definition.schema
                 && composite.definition_for(txid).name == definition.name
         }) {
@@ -20526,7 +22968,8 @@ impl Storage {
             .split_once('.')
             .map_or((None, type_name), |(s, n)| (Some(s), n));
         self.composites.iter().enumerate().find_map(|(slot, definition)| {
-            (definition.visible_to(txid)
+            (definition.database == self.current_database
+                && definition.visible_to(txid)
                 && definition.definition_for(txid).name.as_str() == name
                 && qualifier.map_or_else(|| self.path.entries().iter().any(|entry| matches!(entry, PathEntry::Schema(schema_slot) if self.schemas[*schema_slot as usize].name == definition.definition_for(txid).schema)), |schema| definition.definition_for(txid).schema.as_str() == schema))
                 .then_some(slot)
@@ -20535,7 +22978,8 @@ impl Storage {
 
     pub fn composite_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.composites.iter().position(|definition| {
-            definition.visible_to(txid)
+            definition.database == self.current_database
+                && definition.visible_to(txid)
                 && definition.definition_for(txid).schema.as_str() == schema
                 && definition.definition_for(txid).name.as_str() == name
         })
@@ -20553,7 +22997,10 @@ impl Storage {
         self.composites
             .iter()
             .enumerate()
-            .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
+            .filter(|(_, definition)| {
+                definition.database == self.current_database
+                    && definition.ddl_state == CatalogDdlState::Present
+            })
     }
 
     pub(crate) fn composites_with_slots_visible_to(
@@ -20563,8 +23010,15 @@ impl Storage {
         self.composites
             .iter()
             .enumerate()
-            .filter(move |(_, definition)| definition.visible_to(txid))
+            .filter(move |(_, definition)| {
+                definition.database == self.current_database && definition.visible_to(txid)
+            })
             .map(move |(slot, definition)| (slot, definition.definition_for(txid)))
+    }
+
+    pub(crate) fn composite_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
+        self.composites[slot].database == self.current_database
+            && self.composites[slot].visible_to(txid)
     }
 
     pub(crate) fn stage_composite_alter(
@@ -20574,10 +23028,11 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<PendingCompositeDefinition>, SqlError> {
         if let Some(blocker) = self.enums.iter().find_map(|enumeration| {
-            (enumeration.schema == definition.schema && enumeration.name == definition.name
-                || enumeration.pending_definition.is_some_and(|pending| {
-                    pending.schema == definition.schema && pending.name == definition.name
-                }))
+            (enumeration.database == self.current_database
+                && (enumeration.schema == definition.schema && enumeration.name == definition.name
+                    || enumeration.pending_definition.is_some_and(|pending| {
+                        pending.schema == definition.schema && pending.name == definition.name
+                    })))
             .then(|| {
                 enumeration
                     .pending_definition
@@ -20590,13 +23045,14 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
         if let Some(blocker) = self.domains.iter().find_map(|domain| {
-            (domain.schema == definition.schema && domain.name == definition.name
-                || domain
-                    .pending_definition
-                    .and_then(|pending| pending.identity)
-                    .is_some_and(|identity| {
-                        identity.schema == definition.schema && identity.name == definition.name
-                    }))
+            (domain.database == self.current_database
+                && (domain.schema == definition.schema && domain.name == definition.name
+                    || domain
+                        .pending_definition
+                        .and_then(|pending| pending.identity)
+                        .is_some_and(|identity| {
+                            identity.schema == definition.schema && identity.name == definition.name
+                        })))
             .then_some(domain.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
         }) {
@@ -20608,6 +23064,7 @@ impl Storage {
             .enumerate()
             .find_map(|(other_slot, other)| {
                 (other_slot != slot
+                    && other.database == self.current_database
                     && (other.schema == definition.schema && other.name == definition.name
                         || other.pending_definition.is_some_and(|pending| {
                             pending.schema == definition.schema && pending.name == definition.name
@@ -20625,11 +23082,13 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
         if self.enums.iter().any(|enumeration| {
-            enumeration.visible_to(txid)
+            enumeration.database == self.current_database
+                && enumeration.visible_to(txid)
                 && enumeration.definition_for(txid).schema == definition.schema
                 && enumeration.definition_for(txid).name == definition.name
         }) || self.domains.iter().any(|domain| {
-            domain.visible_to(txid)
+            domain.database == self.current_database
+                && domain.visible_to(txid)
                 && domain.definition_for(txid).schema == definition.schema
                 && domain.definition_for(txid).name == definition.name
         }) || self
@@ -20638,6 +23097,7 @@ impl Storage {
             .enumerate()
             .any(|(other_slot, other)| {
                 other_slot != slot
+                    && other.database == self.current_database
                     && other.visible_to(txid)
                     && other.definition_for(txid).schema == definition.schema
                     && other.definition_for(txid).name == definition.name
@@ -20936,11 +23396,14 @@ impl Storage {
     ) -> Result<usize, SqlError> {
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.domains.iter().find_map(|domain| {
-            (domain.schema == schema && domain.name == name
-                || domain
-                    .pending_definition
-                    .and_then(|pending| pending.identity)
-                    .is_some_and(|identity| identity.schema == schema && identity.name == name))
+            (domain.database == self.current_database
+                && (domain.schema == schema && domain.name == name
+                    || domain
+                        .pending_definition
+                        .and_then(|pending| pending.identity)
+                        .is_some_and(|identity| {
+                            identity.schema == schema && identity.name == name
+                        })))
             .then(|| {
                 domain
                     .pending_definition
@@ -20953,10 +23416,11 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.enums.iter().find_map(|enumeration| {
-            (enumeration.schema == schema && enumeration.name == name
-                || enumeration
-                    .pending_definition
-                    .is_some_and(|pending| pending.schema == schema && pending.name == name))
+            (enumeration.database == self.current_database
+                && (enumeration.schema == schema && enumeration.name == name
+                    || enumeration
+                        .pending_definition
+                        .is_some_and(|pending| pending.schema == schema && pending.name == name)))
             .then(|| {
                 enumeration
                     .pending_definition
@@ -20969,10 +23433,11 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if let Some(blocker) = self.composites.iter().find_map(|composite| {
-            (composite.schema == schema && composite.name == name
-                || composite
-                    .pending_definition
-                    .is_some_and(|pending| pending.schema == schema && pending.name == name))
+            (composite.database == self.current_database
+                && (composite.schema == schema && composite.name == name
+                    || composite
+                        .pending_definition
+                        .is_some_and(|pending| pending.schema == schema && pending.name == name)))
             .then(|| {
                 composite
                     .pending_definition
@@ -21096,6 +23561,7 @@ impl Storage {
             slot: slot as u16,
         });
         self.composites[slot] = CompositeDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             schema,
             name,
@@ -21123,7 +23589,8 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.composites.iter().find_map(|definition| {
-            (definition.schema.as_str() == schema
+            (definition.database == self.current_database
+                && definition.schema.as_str() == schema
                 && (definition.name.as_str() == name
                     || definition
                         .pending_definition
@@ -21140,7 +23607,8 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(slot) = self.composites.iter().position(|definition| {
-            definition.visible_to(txid)
+            definition.database == self.current_database
+                && definition.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.definition_for(txid).name.as_str() == name
         }) else {
@@ -21192,14 +23660,17 @@ impl Storage {
             ));
         }
         if let Some(blocker) = self.views.iter().find_map(|v| {
-            (v.schema_for(txid).as_str() == schema.as_str() && v.name.as_str() == name.as_str())
-                .then_some(v.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
+            (v.database == self.current_database
+                && v.schema_for(txid).as_str() == schema.as_str()
+                && v.name.as_str() == name.as_str())
+            .then_some(v.ddl_state.pending_txid()?)
+            .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         let existing = self.views.iter().position(|v| {
-            v.visible_to(txid)
+            v.database == self.current_database
+                && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema.as_str()
                 && v.name.as_str() == name.as_str()
         });
@@ -21231,6 +23702,7 @@ impl Storage {
         });
         self.catalog_seq += 1;
         self.views[new] = ViewDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             schema,
             name,
@@ -21255,14 +23727,19 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.views.iter().find_map(|v| {
-            (v.schema_for(txid).as_str() == schema && v.name.as_str() == name)
+            (v.database == self.current_database
+                && v.schema_for(txid).as_str() == schema
+                && v.name.as_str() == name)
                 .then_some(v.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.views.iter().position(|v| {
-            v.visible_to(txid) && v.schema_for(txid).as_str() == schema && v.name.as_str() == name
+            v.database == self.current_database
+                && v.visible_to(txid)
+                && v.schema_for(txid).as_str() == schema
+                && v.name.as_str() == name
         }) else {
             return Ok(None);
         };
@@ -21279,10 +23756,12 @@ impl Storage {
 
     /// Promotes an uncommitted CREATE VIEW into the committed catalog.
     pub fn commit_view_create(&mut self, slot: usize) {
+        let database = self.views[slot].database;
         let schema = self.views[slot].schema;
         let name = self.views[slot].name;
         if let Some(old_slot) = self.views.iter().enumerate().find_map(|(old_slot, view)| {
             (old_slot != slot
+                && view.database == database
                 && view.ddl_state == CatalogDdlState::Present
                 && view.schema == schema
                 && view.name == name)
@@ -21345,12 +23824,14 @@ impl Storage {
 
     /// Promotes an uncommitted DROP VIEW into the committed catalog.
     pub fn commit_view_drop(&mut self, slot: usize) {
+        let database = self.views[slot].database;
         let (schema, name) = (self.views[slot].schema, self.views[slot].name);
         // CREATE OR REPLACE installs the replacement before retiring this
         // slot. Comments belong to the logical same-named object and survive;
         // an ordinary DROP has no replacement and removes them.
         let replaced = self.views.iter().enumerate().any(|(other, view)| {
             other != slot
+                && view.database == database
                 && view.ddl_state == CatalogDdlState::Present
                 && view.schema == schema
                 && view.name == name
@@ -21379,6 +23860,11 @@ impl Storage {
         self.routines.len()
     }
 
+    pub(crate) fn routine_slot_visible_to(&self, slot: usize, txid: u32) -> bool {
+        self.routines[slot].database == self.current_database
+            && self.routines[slot].visible_to(txid)
+    }
+
     pub(crate) fn routine(&self, slot: usize) -> &RoutineDef {
         &self.routines[slot]
     }
@@ -21391,9 +23877,11 @@ impl Storage {
     }
 
     pub(crate) fn routine_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
-        self.routines
-            .iter()
-            .position(|routine| routine.visible_to(txid) && routine_oid(routine) == oid)
+        self.routines.iter().position(|routine| {
+            routine.database == self.current_database
+                && routine.visible_to(txid)
+                && routine_oid(routine) == oid
+        })
     }
 
     /// Resolves a scalar call from its evaluated values and their SQL type
@@ -21478,7 +23966,8 @@ impl Storage {
                 .enumerate()
                 .filter_map(|(slot, routine)| {
                     let definition = routine.definition_for(txid);
-                    if !routine.visible_to(txid)
+                    if routine.database != self.current_database
+                        || !routine.visible_to(txid)
                         || !kind.accepts(definition.kind)
                         || definition.schema_for(txid).as_str() != schema
                         || definition.name_for(txid).as_str() != routine_name
@@ -21731,7 +24220,8 @@ impl Storage {
             let mut found = None;
             for (slot, stored) in self.routines.iter().enumerate() {
                 let routine = stored.definition_for(txid);
-                if !stored.visible_to(txid)
+                if stored.database != self.current_database
+                    || !stored.visible_to(txid)
                     || !matches!(
                         routine.kind,
                         RoutineKind::Function { .. }
@@ -21955,7 +24445,8 @@ impl Storage {
         let matches = |schema: &str, routine_name: &str| {
             self.routines.iter().any(|routine| {
                 let definition = routine.definition_for(txid);
-                routine.visible_to(txid)
+                routine.database == self.current_database
+                    && routine.visible_to(txid)
                     && accepts(definition)
                     && definition.accepts_input_arity(arity)
                     && definition.schema_for(txid).as_str() == schema
@@ -22077,7 +24568,8 @@ impl Storage {
                 .enumerate()
                 .filter_map(|(slot, routine)| {
                     let definition = routine.definition_for(txid);
-                    (routine.visible_to(txid)
+                    (routine.database == self.current_database
+                        && routine.visible_to(txid)
                         && definition.schema_for(txid).as_str() == schema
                         && definition.name_for(txid).as_str() == routine_name
                         && definition
@@ -22123,7 +24615,8 @@ impl Storage {
             let mut found = None;
             for stored in self.routines.iter() {
                 let routine = stored.definition_for(txid);
-                if !stored.visible_to(txid)
+                if stored.database != self.current_database
+                    || !stored.visible_to(txid)
                     || !matches!(routine.kind, RoutineKind::Procedure)
                     || routine.schema_for(txid).as_str() != schema
                     || routine.name_for(txid).as_str() != routine_name
@@ -22297,7 +24790,8 @@ impl Storage {
     ) -> Option<usize> {
         self.routines.iter().position(|routine| {
             let definition = routine.definition_for(txid);
-            routine.visible_to(txid)
+            routine.database == self.current_database
+                && routine.visible_to(txid)
                 && kind.accepts(definition.kind)
                 && definition.schema_for(txid).as_str() == schema
                 && definition.name_for(txid).as_str() == name
@@ -22320,7 +24814,8 @@ impl Storage {
         let exact =
             self.routines.iter().position(|routine| {
                 let definition = routine.definition_for(txid);
-                routine.visible_to(txid)
+                routine.database == self.current_database
+                    && routine.visible_to(txid)
                     && kind.accepts(definition.kind)
                     && definition.schema_for(txid).as_str() == schema
                     && definition.name_for(txid).as_str() == name
@@ -22338,7 +24833,8 @@ impl Storage {
             .enumerate()
             .filter_map(|(slot, routine)| {
                 let definition = routine.definition_for(txid);
-                (routine.visible_to(txid)
+                (routine.database == self.current_database
+                    && routine.visible_to(txid)
                     && kind.accepts(definition.kind)
                     && definition.schema_for(txid).as_str() == schema
                     && definition.name_for(txid).as_str() == name
@@ -22365,7 +24861,8 @@ impl Storage {
             .enumerate()
             .filter_map(|(slot, routine)| {
                 let definition = routine.definition_for(txid);
-                (routine.visible_to(txid)
+                (routine.database == self.current_database
+                    && routine.visible_to(txid)
                     && kind.accepts(definition.kind)
                     && definition.schema_for(txid).as_str() == schema
                     && definition.name_for(txid).as_str() == name
@@ -22399,7 +24896,8 @@ impl Storage {
     ) -> Option<usize> {
         let matches = |routine: &RoutineDef, implicit: bool, polymorphic: bool| {
             let definition = routine.definition_for(txid);
-            if !routine.visible_to(txid)
+            if routine.database != self.current_database
+                || !routine.visible_to(txid)
                 || !call_kind.accepts(definition.kind)
                 || definition.schema_for(txid).as_str() != schema
                 || definition.name_for(txid).as_str() != name
@@ -22599,55 +25097,61 @@ impl Storage {
         if (oid::FIRST_DOMAIN..oid::FIRST_DOMAIN + MAX_DOMAINS as i32).contains(&type_oid) {
             let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN).ok()?;
             let domain = self.domain_for(slot, txid);
-            return domain.visible_to(txid).then_some(RoutineResult {
-                ctype: domain.base,
-                user_type: identity(domain.schema, domain.name),
-            });
+            return (domain.database == self.current_database && domain.visible_to(txid))
+                .then_some(RoutineResult {
+                    ctype: domain.base,
+                    user_type: identity(domain.schema, domain.name),
+                });
         }
         if (oid::FIRST_DOMAIN_ARRAY..oid::FIRST_DOMAIN_ARRAY + MAX_DOMAINS as i32)
             .contains(&type_oid)
         {
             let slot = usize::try_from(type_oid - oid::FIRST_DOMAIN_ARRAY).ok()?;
             let domain = self.domain_for(slot, txid);
-            return domain.visible_to(txid).then_some(RoutineResult {
-                ctype: ColType::Array(ArrElem::domain(slot as u16, domain.base)?),
-                user_type: identity(domain.schema, domain.name),
-            });
+            return (domain.database == self.current_database && domain.visible_to(txid))
+                .then_some(RoutineResult {
+                    ctype: ColType::Array(ArrElem::domain(slot as u16, domain.base)?),
+                    user_type: identity(domain.schema, domain.name),
+                });
         }
         if (oid::FIRST_ENUM..oid::FIRST_ENUM + MAX_ENUMS as i32).contains(&type_oid) {
             let slot = usize::try_from(type_oid - oid::FIRST_ENUM).ok()?;
             let enumeration = self.enum_for(slot, txid);
-            return enumeration.visible_to(txid).then_some(RoutineResult {
-                ctype: ColType::Enum(slot as u16),
-                user_type: identity(enumeration.schema, enumeration.name),
-            });
+            return (enumeration.database == self.current_database && enumeration.visible_to(txid))
+                .then_some(RoutineResult {
+                    ctype: ColType::Enum(slot as u16),
+                    user_type: identity(enumeration.schema, enumeration.name),
+                });
         }
         if (oid::FIRST_ENUM_ARRAY..oid::FIRST_ENUM_ARRAY + MAX_ENUMS as i32).contains(&type_oid) {
             let slot = usize::try_from(type_oid - oid::FIRST_ENUM_ARRAY).ok()?;
             let enumeration = self.enum_for(slot, txid);
-            return enumeration.visible_to(txid).then_some(RoutineResult {
-                ctype: ColType::Array(ArrElem::Enum(slot as u16)),
-                user_type: identity(enumeration.schema, enumeration.name),
-            });
+            return (enumeration.database == self.current_database && enumeration.visible_to(txid))
+                .then_some(RoutineResult {
+                    ctype: ColType::Array(ArrElem::Enum(slot as u16)),
+                    user_type: identity(enumeration.schema, enumeration.name),
+                });
         }
         if (oid::FIRST_COMPOSITE..oid::FIRST_COMPOSITE + MAX_COMPOSITES as i32).contains(&type_oid)
         {
             let slot = usize::try_from(type_oid - oid::FIRST_COMPOSITE).ok()?;
             let composite = self.composite_for(slot, txid);
-            return composite.visible_to(txid).then_some(RoutineResult {
-                ctype: ColType::Composite(slot as u16),
-                user_type: identity(composite.schema, composite.name),
-            });
+            return (composite.database == self.current_database && composite.visible_to(txid))
+                .then_some(RoutineResult {
+                    ctype: ColType::Composite(slot as u16),
+                    user_type: identity(composite.schema, composite.name),
+                });
         }
         if (oid::FIRST_COMPOSITE_ARRAY..oid::FIRST_COMPOSITE_ARRAY + MAX_COMPOSITES as i32)
             .contains(&type_oid)
         {
             let slot = usize::try_from(type_oid - oid::FIRST_COMPOSITE_ARRAY).ok()?;
             let composite = self.composite_for(slot, txid);
-            return composite.visible_to(txid).then_some(RoutineResult {
-                ctype: ColType::Array(ArrElem::Composite(slot as u16)),
-                user_type: identity(composite.schema, composite.name),
-            });
+            return (composite.database == self.current_database && composite.visible_to(txid))
+                .then_some(RoutineResult {
+                    ctype: ColType::Array(ArrElem::Composite(slot as u16)),
+                    user_type: identity(composite.schema, composite.name),
+                });
         }
         ColType::from_oid(type_oid).map(RoutineResult::builtin)
     }
@@ -22782,7 +25286,8 @@ impl Storage {
     ) -> Option<usize> {
         self.routines.iter().position(|routine| {
             let definition = routine.definition_for(txid);
-            routine.visible_to(txid)
+            routine.database == self.current_database
+                && routine.visible_to(txid)
                 && definition.schema_for(txid).as_str() == schema
                 && definition.name_for(txid).as_str() == name
                 && definition.argument_count == argument_types.len()
@@ -22803,7 +25308,8 @@ impl Storage {
     ) -> Option<usize> {
         self.routines.iter().position(|routine| {
             let definition = routine.definition_for(txid);
-            routine.visible_to(txid)
+            routine.database == self.current_database
+                && routine.visible_to(txid)
                 && definition.schema_for(txid).as_str() == schema
                 && definition.name_for(txid).as_str() == name
                 && definition.argument_count == arguments.len()
@@ -22827,7 +25333,8 @@ impl Storage {
     ) -> Result<Option<usize>, ()> {
         let mut found = None;
         for (slot, routine) in self.routines.iter().enumerate() {
-            if !routine.visible_to(txid)
+            if routine.database != self.current_database
+                || !routine.visible_to(txid)
                 || routine.schema_for(txid).as_str() != schema
                 || routine.name_for(txid).as_str() != name
             {
@@ -22855,6 +25362,7 @@ impl Storage {
         }
         if self.routines.iter().enumerate().any(|(other, candidate)| {
             other != slot
+                && candidate.database == self.current_database
                 && candidate.visible_to(txid)
                 && candidate.schema_for(txid) == schema
                 && candidate.name_for(txid) == name
@@ -23110,7 +25618,8 @@ impl Storage {
         }
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.routines.iter().find_map(|routine| {
-            (routine.schema_for(txid) == schema
+            (routine.database == self.current_database
+                && routine.schema_for(txid) == schema
                 && routine.name_for(txid) == name
                 && routine.argument_count == argument_count
                 && routine.arguments()[..argument_count]
@@ -23125,7 +25634,8 @@ impl Storage {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
         }
         if self.routines.iter().any(|routine| {
-            routine.visible_to(txid)
+            routine.database == self.current_database
+                && routine.visible_to(txid)
                 && routine.schema_for(txid) == schema
                 && routine.name_for(txid) == name
                 && routine.argument_count == argument_count
@@ -23168,6 +25678,7 @@ impl Storage {
             }
         };
         self.routines[slot] = RoutineDef {
+            database: self.current_database,
             created_at,
             schema,
             name,
@@ -23310,7 +25821,9 @@ impl Storage {
         txid: u32,
     ) -> impl Iterator<Item = (usize, &PolicyDef)> {
         self.policies.iter().enumerate().filter(move |(_, policy)| {
-            policy.visible_to(txid) && usize::from(policy.table) == table
+            policy.database == self.current_database
+                && policy.visible_to(txid)
+                && usize::from(policy.table) == table
         })
     }
 
@@ -23318,10 +25831,9 @@ impl Storage {
         &self,
         txid: u32,
     ) -> impl Iterator<Item = (usize, &PolicyDef)> {
-        self.policies
-            .iter()
-            .enumerate()
-            .filter(move |(_, policy)| policy.visible_to(txid))
+        self.policies.iter().enumerate().filter(move |(_, policy)| {
+            policy.database == self.current_database && policy.visible_to(txid)
+        })
     }
 
     /// Whether this role is subject to the table's row-security policies.
@@ -23389,6 +25901,7 @@ impl Storage {
         };
         self.catalog_seq += 1;
         self.policies[slot] = PolicyDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             name: spec.name,
             table: u16::try_from(spec.table).map_err(|_| {
@@ -23530,7 +26043,9 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| {
-                trigger.visible_to(txid) && trigger.target == TriggerTarget::Table(table as u16)
+                trigger.database == self.current_database
+                    && trigger.visible_to(txid)
+                    && trigger.target == TriggerTarget::Table(table as u16)
             })
             .map(move |(slot, trigger)| (slot, trigger.effective_to(txid)))
     }
@@ -23544,7 +26059,9 @@ impl Storage {
             .iter()
             .enumerate()
             .filter(move |(_, trigger)| {
-                trigger.visible_to(txid) && trigger.target == TriggerTarget::View(view as u16)
+                trigger.database == self.current_database
+                    && trigger.visible_to(txid)
+                    && trigger.target == TriggerTarget::View(view as u16)
             })
             .map(move |(slot, trigger)| (slot, trigger.effective_to(txid)))
     }
@@ -23565,7 +26082,9 @@ impl Storage {
         self.triggers
             .iter()
             .enumerate()
-            .filter(move |(_, trigger)| trigger.visible_to(txid))
+            .filter(move |(_, trigger)| {
+                trigger.database == self.current_database && trigger.visible_to(txid)
+            })
             .map(move |(slot, trigger)| (slot, trigger.effective_to(txid)))
     }
 
@@ -23774,6 +26293,7 @@ impl Storage {
         };
         self.catalog_seq += 1;
         self.triggers[slot] = TriggerDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             name: spec.name,
             target: spec.target,
@@ -23934,6 +26454,7 @@ impl Storage {
                 comment.pending_identity =
                     (restored_name != comment.name).then_some(PendingCommentIdentity {
                         txid: current.txid,
+                        schema: comment.schema,
                         name: restored_name,
                     });
             }
@@ -23981,6 +26502,7 @@ impl Storage {
         };
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.triggers[slot] = TriggerDef {
+            database: self.current_database,
             created_at,
             name: spec.name,
             target: spec.target,
@@ -24149,7 +26671,9 @@ impl Storage {
         self.extended_statistics
             .iter()
             .enumerate()
-            .filter(move |(_, statistics)| statistics.visible_to(txid))
+            .filter(move |(_, statistics)| {
+                statistics.database == self.current_database && statistics.visible_to(txid)
+            })
     }
 
     pub(crate) fn extended_statistics_for_table(
@@ -24169,7 +26693,8 @@ impl Storage {
     ) -> Option<usize> {
         self.extended_statistics.iter().position(|statistics| {
             let definition = statistics.definition_for(txid);
-            statistics.visible_to(txid)
+            statistics.database == self.current_database
+                && statistics.visible_to(txid)
                 && definition.schema.as_str() == schema
                 && definition.name.as_str() == name
         })
@@ -24262,6 +26787,7 @@ impl Storage {
             spec.created_at
         };
         self.extended_statistics[slot] = ExtendedStatisticsDef {
+            database: self.current_database,
             created_at,
             table: spec.table,
             mutable: ExtendedStatisticsMutableDefinition {
@@ -24596,7 +27122,8 @@ impl Storage {
 
     pub(crate) fn index_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
         self.indexes.iter().position(|index| {
-            index.visible_to(txid)
+            index.database == self.current_database
+                && index.visible_to(txid)
                 && index.schema.as_str() == schema
                 && index.name_for(txid).as_str() == name
         })
@@ -24696,10 +27223,12 @@ impl Storage {
     /// Registers an index as an uncommitted CREATE owned by `def.pending`'s
     /// transaction; returns its slot. Errors on a duplicate visible name or
     /// another transaction's uncommitted DDL on the name.
-    pub fn create_index(&mut self, def: IndexDef, txid: u32) -> Result<usize, SqlError> {
+    pub fn create_index(&mut self, mut def: IndexDef, txid: u32) -> Result<usize, SqlError> {
+        def.database = self.current_database;
         self.require_schema_create(def.schema.as_str(), txid)?;
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
-            (index.schema.as_str() == def.schema.as_str()
+            (index.database == self.current_database
+                && index.schema.as_str() == def.schema.as_str()
                 && index.name_for(txid).as_str() == def.name.as_str())
             .then_some(index.ddl_state.pending_txid()?)
             .filter(|&owner| owner != txid)
@@ -24792,7 +27321,8 @@ impl Storage {
     /// [`Self::rollback_indexes_for`].
     pub fn drop_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
         for i in 0..self.indexes.len() {
-            if self.indexes[i].visible_to(txid)
+            if self.indexes[i].database == self.current_database
+                && self.indexes[i].visible_to(txid)
                 && self.indexes[i].schema.as_str() == schema
                 && self.indexes[i].table.as_str() == table
             {
@@ -24805,7 +27335,8 @@ impl Storage {
     /// from its DROP TABLE) into the committed catalog.
     pub fn commit_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
         for x in self.indexes.iter_mut() {
-            if x.schema.as_str() == schema
+            if x.database == self.current_database
+                && x.schema.as_str() == schema
                 && x.table.as_str() == table
                 && x.ddl_state == (CatalogDdlState::PendingDrop { txid })
             {
@@ -24818,7 +27349,8 @@ impl Storage {
     /// back DROP TABLE): committed indexes become visible again.
     pub fn rollback_indexes_for(&mut self, schema: &str, table: &str, txid: u32) {
         for x in self.indexes.iter_mut() {
-            if x.schema.as_str() == schema
+            if x.database == self.current_database
+                && x.schema.as_str() == schema
                 && x.table.as_str() == table
                 && x.ddl_state == (CatalogDdlState::PendingDrop { txid })
             {
@@ -24837,7 +27369,9 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
-            (index.schema.as_str() == schema && index.name_for(txid).as_str() == name)
+            (index.database == self.current_database
+                && index.schema.as_str() == schema
+                && index.name_for(txid).as_str() == name)
                 .then_some(index.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
@@ -24919,7 +27453,8 @@ impl Storage {
             .find_visible(schema, table, txid)
             .map(|slot| (self.tables[slot].def.schema, self.tables[slot].def.name));
         self.indexes.iter().filter(move |x| {
-            x.visible_to(txid)
+            x.database == self.current_database
+                && x.visible_to(txid)
                 && ((x.schema.as_str() == schema && x.table.as_str() == table)
                     || committed_binding.is_some_and(|(old_schema, old_table)| {
                         x.schema == old_schema && x.table == old_table
@@ -24938,16 +27473,9 @@ impl Storage {
 
     /// All committed indexes, for checkpoint serialization.
     pub fn live_indexes(&self) -> impl Iterator<Item = &IndexDef> {
-        self.indexes
-            .iter()
-            .filter(|x| x.ddl_state == CatalogDdlState::Present)
-    }
-
-    pub(crate) fn live_indexes_with_slots(&self) -> impl Iterator<Item = (usize, &IndexDef)> {
-        self.indexes
-            .iter()
-            .enumerate()
-            .filter(|(_, index)| index.ddl_state == CatalogDdlState::Present)
+        self.indexes.iter().filter(|index| {
+            index.database == self.current_database && index.ddl_state == CatalogDdlState::Present
+        })
     }
 
     pub(crate) fn index_count(&self) -> usize {
@@ -24958,7 +27486,7 @@ impl Storage {
         self.indexes
             .get(slot)
             .copied()
-            .filter(|index| index.visible_to(txid))
+            .filter(|index| index.database == self.current_database && index.visible_to(txid))
     }
 
     pub(crate) fn tablespace_slot(&self, name: &str, txid: u32) -> Option<usize> {
@@ -24969,6 +27497,9 @@ impl Storage {
 
     pub(crate) fn tablespace_by_id(&self, id: u16, txid: u32) -> Option<TablespaceDef> {
         let slot = usize::from(id.checked_sub(2)?);
+        if slot < 2 {
+            return None;
+        }
         self.tablespaces
             .get(slot)
             .copied()
@@ -25049,6 +27580,21 @@ impl Storage {
         options: TablespaceOptions,
         owner: u16,
     ) -> Result<(), SqlError> {
+        if slot < 2 {
+            let expected = if slot == 0 { "pg_default" } else { "pg_global" };
+            if name.as_str() != expected
+                || created_at != 1_663 + slot as u64
+                || !location.as_str().is_empty()
+                || owner != 0
+            {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid built-in tablespace identity"
+                ));
+            }
+            self.tablespaces[slot].options = options;
+            return Ok(());
+        }
         self.validate_tablespace_identity(name, owner, 0)?;
         let Some(target) = self.tablespaces.get(slot) else {
             return Err(sql_err!(
@@ -25074,6 +27620,7 @@ impl Storage {
             },
             0,
         );
+        self.commit_tablespace_create(slot);
         Ok(())
     }
 
@@ -25083,6 +27630,13 @@ impl Storage {
         owner: u16,
         txid: u32,
     ) -> Result<(), SqlError> {
+        if name.as_str().starts_with("pg_") {
+            return Err(sql_err!(
+                sqlstate::RESERVED_NAME,
+                "unacceptable tablespace name \"{}\"",
+                name.as_str()
+            ));
+        }
         if self.tablespace_id(name.as_str(), txid).is_some() {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_OBJECT,
@@ -25169,6 +27723,13 @@ impl Storage {
     }
 
     pub(crate) fn drop_tablespace(&mut self, slot: usize, txid: u32) -> Result<(), SqlError> {
+        if slot < 2 {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "cannot drop built-in tablespace \"{}\"",
+                self.tablespaces[slot].name.as_str()
+            ));
+        }
         let id = u16::try_from(slot + 2).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -25179,6 +27740,9 @@ impl Storage {
             .indexes
             .iter()
             .any(|index| index.visible_to(txid) && index.mutable_for(txid).tablespace == id)
+            || self.databases.iter().any(|database| {
+                database.visible_to(txid) && database.definition_for(txid).tablespace == id
+            })
         {
             return Err(sql_err!(
                 sqlstate::OBJECT_IN_USE,
@@ -25247,12 +27811,15 @@ impl Storage {
     /// and its indexes change schema, and every inbound foreign key follows —
     /// deterministically, so WAL replay reproduces it from the names alone.
     pub fn move_table_schema(&mut self, index: usize, new_schema: SqlName) {
+        let database_oid = self.tables[index].database;
+        let database = Some(database_oid);
         let old_schema = self.tables[index].def.schema;
         let name = self.tables[index].def.name;
         self.tables[index].def.schema = new_schema;
         self.tables[index].mark_dirty();
         for matview in self.matviews.iter_mut() {
-            if matview.ddl_state == CatalogDdlState::Present
+            if matview.database == database_oid
+                && matview.ddl_state == CatalogDdlState::Present
                 && matview.schema == old_schema
                 && matview.name == name
             {
@@ -25260,7 +27827,8 @@ impl Storage {
             }
         }
         for x in self.indexes.iter_mut() {
-            if x.ddl_state == CatalogDdlState::Present
+            if x.database == database_oid
+                && x.ddl_state == CatalogDdlState::Present
                 && x.schema.as_str() == old_schema.as_str()
                 && x.table.as_str() == name.as_str()
             {
@@ -25268,7 +27836,7 @@ impl Storage {
             }
         }
         for sequence in self.sequences.iter_mut() {
-            if sequence.ddl_state != CatalogDdlState::Present {
+            if sequence.database != database_oid || sequence.ddl_state != CatalogDdlState::Present {
                 continue;
             }
             let moves_with_table = matches!(
@@ -25294,7 +27862,7 @@ impl Storage {
             }
         }
         for t in self.tables.iter_mut() {
-            if !t.live {
+            if t.database != database_oid || !t.live {
                 continue;
             }
             let mut changed = false;
@@ -25313,11 +27881,13 @@ impl Storage {
         }
         for comment in self.comments.iter_mut() {
             if comment.used
+                && comment.database == database
                 && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
                 && comment.schema == old_schema
                 && comment.name == name
             {
                 comment.schema = new_schema;
+                comment.pending_identity = None;
             }
         }
         self.rename_stored_query_dependency(DependencyClass::Table, index, new_schema, name);
@@ -25346,17 +27916,25 @@ impl Storage {
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
     ) {
         let old = self.tables[index].def;
+        let database_oid = self.tables[index].database;
+        let database = Some(database_oid);
         if old.schema != def.schema {
             self.move_table_schema(index, def.schema);
         }
         let current = self.tables[index].def;
         if current.name != def.name {
             for index_def in self.indexes.iter_mut() {
-                if index_def.schema == current.schema && index_def.table == current.name {
+                if index_def.database == database_oid
+                    && index_def.schema == current.schema
+                    && index_def.table == current.name
+                {
                     index_def.table = def.name;
                 }
             }
             for table in self.tables.iter_mut() {
+                if table.database != database_oid {
+                    continue;
+                }
                 let mut changed = false;
                 for foreign_key in &mut table.def.fkeys[..table.def.n_fkeys] {
                     if foreign_key.parent_schema == current.schema
@@ -25372,15 +27950,20 @@ impl Storage {
             }
             for comment in self.comments.iter_mut() {
                 if comment.used
+                    && comment.database == database
                     && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
                     && comment.schema == current.schema
                     && comment.name == current.name
                 {
                     comment.name = def.name;
+                    comment.pending_identity = None;
                 }
             }
         }
         for sequence in self.sequences.iter_mut() {
+            if sequence.database != database_oid {
+                continue;
+            }
             sequence.owner =
                 rebind_sequence_column(sequence.owner, &current, &def, column_mapping, false);
             sequence.generator_for = rebind_sequence_column(
@@ -25392,7 +27975,8 @@ impl Storage {
             );
         }
         for index_def in self.indexes.iter_mut() {
-            if index_def.ddl_state != CatalogDdlState::Present
+            if index_def.database != database_oid
+                || index_def.ddl_state != CatalogDdlState::Present
                 || index_def.schema != old.schema
                 || index_def.table != old.name
             {
@@ -25414,6 +27998,7 @@ impl Storage {
         }
         self.tables[index].def = def;
         self.tables[index].mark_dirty();
+        self.rename_stored_query_dependency(DependencyClass::Table, index, def.schema, def.name);
     }
 
     pub fn next_rowid(&mut self) -> u64 {
@@ -25795,13 +28380,6 @@ impl Storage {
         }
     }
 
-    pub(crate) fn live_casts(&self) -> impl Iterator<Item = (usize, &CastDef)> {
-        self.casts
-            .iter()
-            .enumerate()
-            .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
-    }
-
     pub(crate) fn cast(&self, slot: usize) -> &CastDef {
         &self.casts[slot]
     }
@@ -25810,7 +28388,9 @@ impl Storage {
         self.casts
             .iter()
             .enumerate()
-            .filter(move |(_, definition)| definition.visible_to(txid))
+            .filter(move |(_, definition)| {
+                definition.database == self.current_database && definition.visible_to(txid)
+            })
     }
 
     pub(crate) fn cast_slot(
@@ -25820,7 +28400,8 @@ impl Storage {
         txid: u32,
     ) -> Option<usize> {
         self.casts.iter().position(|definition| {
-            definition.visible_to(txid)
+            definition.database == self.current_database
+                && definition.visible_to(txid)
                 && definition.source == source
                 && definition.target == target
         })
@@ -26069,6 +28650,7 @@ impl Storage {
         }
         self.validate_cast_definition(
             CastDef {
+                database: self.current_database,
                 created_at: 0,
                 source,
                 target,
@@ -26103,6 +28685,7 @@ impl Storage {
         };
         self.catalog_seq += 1;
         self.casts[slot] = CastDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             source,
             target,
@@ -26177,15 +28760,10 @@ impl Storage {
         self.operators
             .iter()
             .enumerate()
-            .filter(move |(_, operator)| operator.visible_to(txid))
+            .filter(move |(_, operator)| {
+                operator.database == self.current_database && operator.visible_to(txid)
+            })
             .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
-    }
-
-    pub(crate) fn live_operators(&self) -> impl Iterator<Item = (usize, &OperatorDef)> {
-        self.operators
-            .iter()
-            .enumerate()
-            .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn operator(&self, slot: usize) -> &OperatorDef {
@@ -26193,9 +28771,11 @@ impl Storage {
     }
 
     pub(crate) fn operator_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
-        self.operators
-            .iter()
-            .position(|operator| operator.visible_to(txid) && operator.oid() == oid)
+        self.operators.iter().position(|operator| {
+            operator.database == self.current_database
+                && operator.visible_to(txid)
+                && operator.oid() == oid
+        })
     }
 
     pub(crate) fn operator_for(&self, slot: usize, txid: u32) -> OperatorDefinition {
@@ -26523,6 +29103,7 @@ impl Storage {
         };
         self.catalog_seq += 1;
         self.operators[slot] = OperatorDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -26586,6 +29167,7 @@ impl Storage {
         };
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.operators[slot] = OperatorDef {
+            database: self.current_database,
             created_at,
             definition,
             pending: None,
@@ -26666,17 +29248,10 @@ impl Storage {
         self.operator_families
             .iter()
             .enumerate()
-            .filter(move |(_, family)| family.visible_to(txid))
+            .filter(move |(_, family)| {
+                family.database == self.current_database && family.visible_to(txid)
+            })
             .map(move |(slot, family)| (slot, family.definition_for(txid)))
-    }
-
-    pub(crate) fn live_operator_families(
-        &self,
-    ) -> impl Iterator<Item = (usize, &OperatorFamilyDef)> {
-        self.operator_families
-            .iter()
-            .enumerate()
-            .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn operator_family(&self, slot: usize) -> &OperatorFamilyDef {
@@ -26684,9 +29259,11 @@ impl Storage {
     }
 
     pub(crate) fn operator_family_slot_by_oid(&self, oid: i32, txid: u32) -> Option<usize> {
-        self.operator_families
-            .iter()
-            .position(|family| family.visible_to(txid) && family.oid() == oid)
+        self.operator_families.iter().position(|family| {
+            family.database == self.current_database
+                && family.visible_to(txid)
+                && family.oid() == oid
+        })
     }
 
     pub(crate) fn operator_family_for(&self, slot: usize, txid: u32) -> OperatorFamilyDefinition {
@@ -26866,6 +29443,7 @@ impl Storage {
         };
         self.catalog_seq += 1;
         self.operator_families[slot] = OperatorFamilyDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -26916,6 +29494,7 @@ impl Storage {
         };
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.operator_families[slot] = OperatorFamilyDef {
+            database: self.current_database,
             created_at,
             definition,
             pending: None,
@@ -26995,15 +29574,10 @@ impl Storage {
         self.operator_classes
             .iter()
             .enumerate()
-            .filter(move |(_, class)| class.visible_to(txid))
+            .filter(move |(_, class)| {
+                class.database == self.current_database && class.visible_to(txid)
+            })
             .map(move |(slot, class)| (slot, class.definition_for(txid)))
-    }
-
-    pub(crate) fn live_operator_classes(&self) -> impl Iterator<Item = (usize, &OperatorClassDef)> {
-        self.operator_classes
-            .iter()
-            .enumerate()
-            .filter(|(_, definition)| definition.ddl_state == CatalogDdlState::Present)
     }
 
     pub(crate) fn operator_class(&self, slot: usize) -> &OperatorClassDef {
@@ -27015,9 +29589,11 @@ impl Storage {
         oid: OperatorClassOid,
         txid: u32,
     ) -> Option<usize> {
-        self.operator_classes
-            .iter()
-            .position(|class| class.visible_to(txid) && class.oid() == oid.get())
+        self.operator_classes.iter().position(|class| {
+            class.database == self.current_database
+                && class.visible_to(txid)
+                && class.oid() == oid.get()
+        })
     }
 
     pub(crate) fn operator_class_for(&self, slot: usize, txid: u32) -> OperatorClassDefinition {
@@ -27281,6 +29857,7 @@ impl Storage {
         };
         self.catalog_seq += 1;
         self.operator_classes[slot] = OperatorClassDef {
+            database: self.current_database,
             created_at: self.catalog_seq,
             definition,
             pending: None,
@@ -27333,6 +29910,7 @@ impl Storage {
         };
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.operator_classes[slot] = OperatorClassDef {
+            database: self.current_database,
             created_at,
             definition,
             pending: None,
@@ -27467,10 +30045,11 @@ mod tests {
             CommentClass::Tablespace,
             CommentClass::Extension,
             CommentClass::Trigger,
+            CommentClass::Database,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(6), None);
+        assert_eq!(CommentClass::from_u8(7), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 

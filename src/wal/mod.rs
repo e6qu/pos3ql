@@ -140,6 +140,11 @@ const KIND_SET_OPERATOR_FAMILY: u8 = 90;
 const KIND_DROP_OPERATOR_FAMILY: u8 = 91;
 const KIND_SET_OPERATOR_CLASS: u8 = 92;
 const KIND_DROP_OPERATOR_CLASS: u8 = 93;
+const KIND_CREATE_DATABASE: u8 = 94;
+const KIND_ALTER_DATABASE: u8 = 95;
+const KIND_DROP_DATABASE: u8 = 96;
+const KIND_SET_SYSTEM_SETTING: u8 = 97;
+const KIND_DATABASE_SCOPE: u8 = 98;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -147,7 +152,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DROP_OPERATOR_CLASS;
+const LAST_KIND: u8 = KIND_DATABASE_SCOPE;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -422,6 +427,10 @@ impl TriggerTargetKind {
     reason = "TableDef is a fixed inline array by design (no heap); WalOp lives briefly on the stack"
 )]
 pub(crate) enum WalOp<'a> {
+    /// Database identity for following records in a staged transaction.
+    DatabaseScope {
+        oid: i32,
+    },
     CreateTable(TableDef),
     /// Begins ALTER TABLE's in-place definition/row rewrite. The immediately
     /// following CreateTable record supplies the final definition; this marker
@@ -720,6 +729,20 @@ pub(crate) enum WalOp<'a> {
     DropTablespace {
         name: &'a str,
     },
+    CreateDatabase {
+        oid: i32,
+        template_oid: i32,
+        definition: crate::storage::DatabaseDefinition,
+        owner: u16,
+    },
+    AlterDatabase {
+        oid: i32,
+        definition: crate::storage::DatabaseDefinition,
+        owner: u16,
+    },
+    DropDatabase {
+        oid: i32,
+    },
     DropIndex {
         schema: &'a str,
         name: &'a str,
@@ -997,7 +1020,11 @@ pub(crate) enum WalOp<'a> {
     },
     SetRoleSetting {
         role: Option<&'a str>,
-        database: bool,
+        database: Option<i32>,
+        name: &'a str,
+        value: Option<&'a str>,
+    },
+    SetSystemSetting {
         name: &'a str,
         value: Option<&'a str>,
     },
@@ -1060,10 +1087,12 @@ pub struct Wal {
     batch_first_lsn: u64,
     /// Bytes appended since the last upload capture.
     batch_start_offset: u64,
+    current_database: crate::storage::DatabaseOid,
 }
 
 struct TransactionStage {
     transaction_id: u32,
+    database: crate::storage::DatabaseOid,
     buffer: FixedBuf,
 }
 
@@ -1163,6 +1192,7 @@ impl Wal {
         for _ in 0..config.max_connections {
             stages.push(TransactionStage {
                 transaction_id: 0,
+                database: crate::storage::DatabaseOid::POSTGRES,
                 buffer: FixedBuf::new(budget, "transaction_wal_stage", config.wal_buffer_bytes)?,
             });
         }
@@ -1176,6 +1206,7 @@ impl Wal {
             dirty: false,
             batch_first_lsn: 0,
             batch_start_offset: 0,
+            current_database: crate::storage::DatabaseOid::POSTGRES,
         })
     }
 
@@ -1281,6 +1312,12 @@ impl Wal {
 
     fn stage_index_or_claim(&mut self, transaction_id: u32) -> Result<usize, SqlError> {
         if let Some(index) = self.stage_index(transaction_id) {
+            if self.stages[index].database != self.current_database {
+                return Err(sql_err!(
+                    sqlstate::INVALID_TRANSACTION_TERMINATION,
+                    "transaction WAL cannot cross database catalogs"
+                ));
+            }
             return Ok(index);
         }
         let Some(index) = self
@@ -1295,8 +1332,13 @@ impl Wal {
             ));
         };
         self.stages[index].transaction_id = transaction_id;
+        self.stages[index].database = self.current_database;
         self.stages[index].buffer.clear();
         Ok(index)
+    }
+
+    pub(crate) fn select_database(&mut self, database: crate::storage::DatabaseOid) {
+        self.current_database = database;
     }
 
     /// Byte position inside one transaction's private stage. Savepoints use
@@ -1355,7 +1397,17 @@ impl Wal {
         provisional_lsn: u64,
         operation: &WalOp,
     ) -> Result<(), SqlError> {
+        let fresh = self.stage_index(transaction_id).is_none();
         let index = self.stage_index_or_claim(transaction_id)?;
+        if fresh {
+            append_record(
+                &mut self.stages[index].buffer,
+                provisional_lsn,
+                &WalOp::DatabaseScope {
+                    oid: self.current_database.get(),
+                },
+            )?;
+        }
         append_record(&mut self.stages[index].buffer, provisional_lsn, operation)
     }
 
@@ -1668,6 +1720,7 @@ fn die(msg: &str) -> ! {
 
 fn op_kind(operation: &WalOp) -> u8 {
     match operation {
+        WalOp::DatabaseScope { .. } => KIND_DATABASE_SCOPE,
         WalOp::CreateTable(_) => KIND_CREATE,
         WalOp::DropTable { .. } => KIND_DROP,
         WalOp::Upsert { .. } => KIND_UPSERT,
@@ -1707,6 +1760,9 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateTablespace { .. } => KIND_CREATE_TABLESPACE,
         WalOp::AlterTablespace { .. } => KIND_ALTER_TABLESPACE,
         WalOp::DropTablespace { .. } => KIND_DROP_TABLESPACE,
+        WalOp::CreateDatabase { .. } => KIND_CREATE_DATABASE,
+        WalOp::AlterDatabase { .. } => KIND_ALTER_DATABASE,
+        WalOp::DropDatabase { .. } => KIND_DROP_DATABASE,
         WalOp::DropIndex { .. } => KIND_DROP_INDEX,
         WalOp::RenameIndex { .. } => KIND_RENAME_INDEX,
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
@@ -1756,6 +1812,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::UpsertRoleMembership { .. } => KIND_UPSERT_ROLE_MEMBERSHIP,
         WalOp::DropRoleMembership { .. } => KIND_DROP_ROLE_MEMBERSHIP,
         WalOp::SetRoleSetting { .. } => KIND_SET_ROLE_SETTING,
+        WalOp::SetSystemSetting { .. } => KIND_SET_SYSTEM_SETTING,
         WalOp::SetObjectOwner { .. } => KIND_SET_OBJECT_OWNER,
         WalOp::SetObjectAcl { .. } => KIND_SET_OBJECT_ACL,
         WalOp::SetColumnAcl { .. } => KIND_SET_COLUMN_ACL,
@@ -1775,6 +1832,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             + signature.right.map_or(0, routine_result_len)
     }
     match operation {
+        WalOp::DatabaseScope { .. } => 4,
         WalOp::CreateTable(def) => {
             let mut n = 1 + def.name.as_str().len() + 2;
             for c in def.columns() {
@@ -2143,6 +2201,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + name.len() + 1 + new_name.len() + 24 + 2
         }
         WalOp::DropTablespace { name } => 1 + name.len(),
+        WalOp::CreateDatabase { definition, .. } => 10 + database_definition_len(*definition),
+        WalOp::AlterDatabase { definition, .. } => 6 + database_definition_len(*definition),
+        WalOp::DropDatabase { .. } => 4,
         WalOp::DropIndex { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::RenameIndex {
             schema,
@@ -2633,12 +2694,19 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => 1 + role.len() + 1 + member.len() + 1 + grantor.len() + 1,
         WalOp::DropRoleMembership { role, member } => 1 + role.len() + 1 + member.len(),
         WalOp::SetRoleSetting {
-            role, name, value, ..
+            role,
+            database,
+            name,
+            value,
         } => {
             1 + role.map_or(0, |role| 1 + role.len())
+                + usize::from(database.is_some()) * 4
                 + 1
                 + name.len()
                 + value.map_or(0, |value| 2 + value.len())
+        }
+        WalOp::SetSystemSetting { name, value } => {
+            1 + name.len() + 1 + value.map_or(0, |value| 2 + value.len())
         }
         WalOp::SetObjectOwner {
             class,
@@ -2688,6 +2756,22 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             ..
         } => 1 + owner.len() + 1 + schema.len() + 1 + 1 + grantee.len() + 1 + 4,
     }
+}
+
+fn database_definition_len(definition: crate::storage::DatabaseDefinition) -> usize {
+    1 + definition.name.as_str().len()
+        + 2
+        + 2
+        + definition.collate.as_str().len()
+        + 2
+        + definition.ctype.as_str().len()
+        + 2
+        + definition.locale.as_str().len()
+        + 2
+        + definition.collation_version.as_str().len()
+        + 1
+        + 4
+        + 2
 }
 
 fn encoded_partition_len(partition: PartitionDef) -> usize {
@@ -2857,6 +2941,33 @@ fn append_tablespace_options(
     )
 }
 
+fn append_database_definition(
+    buffer: &mut FixedBuf,
+    definition: crate::storage::DatabaseDefinition,
+) -> bool {
+    let short = |buffer: &mut FixedBuf, value: &str| {
+        value.len() <= u16::MAX as usize
+            && buffer.append(&(value.len() as u16).to_le_bytes())
+            && buffer.append(value.as_bytes())
+    };
+    definition.name.as_str().len() <= u8::MAX as usize
+        && buffer.append(&[definition.name.as_str().len() as u8])
+        && buffer.append(definition.name.as_str().as_bytes())
+        && buffer.append(&[
+            definition.encoding.code() as u8,
+            definition.locale_provider.code(),
+        ])
+        && short(buffer, definition.collate.as_str())
+        && short(buffer, definition.ctype.as_str())
+        && short(buffer, definition.locale.as_str())
+        && short(buffer, definition.collation_version.as_str())
+        && buffer.append(&[
+            u8::from(definition.allow_connections) | (u8::from(definition.is_template) << 1)
+        ])
+        && buffer.append(&definition.connection_limit.to_le_bytes())
+        && buffer.append(&definition.tablespace.to_le_bytes())
+}
+
 fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
     let name_bytes = |buffer: &mut FixedBuf, s: &str| -> bool {
         buffer.append(&[s.len() as u8]) && buffer.append(s.as_bytes())
@@ -2889,6 +3000,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         ok
     }
     match operation {
+        WalOp::DatabaseScope { oid } => buffer.append(&oid.to_le_bytes()),
         WalOp::CreateTable(def) => {
             let mut ok = name_bytes(buffer, def.name.as_str());
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
@@ -3444,6 +3556,27 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&owner.to_le_bytes())
         }
         WalOp::DropTablespace { name } => name_bytes(buffer, name),
+        WalOp::CreateDatabase {
+            oid,
+            template_oid,
+            definition,
+            owner,
+        } => {
+            buffer.append(&oid.to_le_bytes())
+                && buffer.append(&template_oid.to_le_bytes())
+                && append_database_definition(buffer, *definition)
+                && buffer.append(&owner.to_le_bytes())
+        }
+        WalOp::AlterDatabase {
+            oid,
+            definition,
+            owner,
+        } => {
+            buffer.append(&oid.to_le_bytes())
+                && append_database_definition(buffer, *definition)
+                && buffer.append(&owner.to_le_bytes())
+        }
+        WalOp::DropDatabase { oid } => buffer.append(&oid.to_le_bytes()),
         WalOp::DropIndex { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
         WalOp::RenameIndex {
             schema,
@@ -4061,12 +4194,21 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name,
             value,
         } => {
-            let flags = u8::from(*database)
+            let flags = u8::from(database.is_some())
                 | (u8::from(role.is_some()) << 1)
                 | (u8::from(value.is_some()) << 2);
             buffer.append(&[flags])
                 && role.is_none_or(|role| name_bytes(buffer, role))
+                && database.is_none_or(|database| buffer.append(&database.to_le_bytes()))
                 && name_bytes(buffer, name)
+                && value.is_none_or(|value| {
+                    buffer.append(&(value.len() as u16).to_le_bytes())
+                        && buffer.append(value.as_bytes())
+                })
+        }
+        WalOp::SetSystemSetting { name, value } => {
+            name_bytes(buffer, name)
+                && buffer.append(&[u8::from(value.is_some())])
                 && value.is_none_or(|value| {
                     buffer.append(&(value.len() as u16).to_le_bytes())
                         && buffer.append(value.as_bytes())
@@ -4678,6 +4820,65 @@ fn decode_tablespace_options(
     })
 }
 
+fn decode_database_definition(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::DatabaseDefinition> {
+    let name_len = usize::from(*payload.get(*at)?);
+    *at += 1;
+    let name = core::str::from_utf8(payload.get(*at..*at + name_len)?).ok()?;
+    *at += name_len;
+    let encoding = crate::storage::DatabaseEncoding::from_code(*payload.get(*at)?)?;
+    *at += 1;
+    let locale_provider = crate::storage::DatabaseLocaleProvider::from_code(*payload.get(*at)?)?;
+    *at += 1;
+    let short = |at: &mut usize| -> Option<&str> {
+        let len = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?) as usize;
+        *at += 2;
+        let value = core::str::from_utf8(payload.get(*at..*at + len)?).ok()?;
+        *at += len;
+        Some(value)
+    };
+    let collate = short(at)?;
+    let ctype = short(at)?;
+    let locale = short(at)?;
+    let collation_version = short(at)?;
+    let flags = *payload.get(*at)?;
+    *at += 1;
+    if flags & !3 != 0 {
+        return None;
+    }
+    let connection_limit = i32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
+    let tablespace = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+    *at += 2;
+    let collate = crate::util::StackStr::from_str(collate);
+    let ctype = crate::util::StackStr::from_str(ctype);
+    let locale = crate::util::StackStr::from_str(locale);
+    let collation_version = crate::util::StackStr::from_str(collation_version);
+    if collate.is_truncated()
+        || ctype.is_truncated()
+        || locale.is_truncated()
+        || collation_version.is_truncated()
+        || connection_limit < -1
+    {
+        return None;
+    }
+    Some(crate::storage::DatabaseDefinition {
+        name: crate::storage::SqlName::parse(name).ok()?,
+        encoding,
+        locale_provider,
+        collate,
+        ctype,
+        locale,
+        collation_version,
+        allow_connections: flags & 1 != 0,
+        connection_limit,
+        is_template: flags & 2 != 0,
+        tablespace,
+    })
+}
+
 fn decode_catalog_name<'a>(payload: &'a [u8], at: &mut usize) -> Option<&'a str> {
     let length = usize::from(*payload.get(*at)?);
     *at += 1;
@@ -4738,6 +4939,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         core::str::from_utf8(raw).ok()
     };
     match kind {
+        KIND_DATABASE_SCOPE => {
+            let oid = i32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+            at = 4;
+            (at == payload.len()).then_some(WalOp::DatabaseScope { oid })
+        }
         KIND_CREATE => {
             let name = take_name(&mut at)?;
             let n_cols = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
@@ -5984,6 +6190,38 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTablespace { name })
         }
+        KIND_CREATE_DATABASE => {
+            let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let template_oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let definition = decode_database_definition(payload, &mut at)?;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            (at == payload.len()).then_some(WalOp::CreateDatabase {
+                oid,
+                template_oid,
+                definition,
+                owner,
+            })
+        }
+        KIND_ALTER_DATABASE => {
+            let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let definition = decode_database_definition(payload, &mut at)?;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            (at == payload.len()).then_some(WalOp::AlterDatabase {
+                oid,
+                definition,
+                owner,
+            })
+        }
+        KIND_DROP_DATABASE => {
+            let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            (at == payload.len()).then_some(WalOp::DropDatabase { oid })
+        }
         KIND_DROP_INDEX => {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
@@ -6203,6 +6441,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 };
             }
             (at == payload.len()).then_some(WalOp::CreateDomain(crate::storage::DomainDef {
+                database: crate::storage::DatabaseOid::POSTGRES,
                 created_at: 0,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
@@ -6243,6 +6482,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 };
             }
             (at == payload.len()).then_some(WalOp::CreateEnum(crate::storage::EnumDef {
+                database: crate::storage::DatabaseOid::POSTGRES,
                 created_at: 0,
                 schema: SqlName::parse(schema).ok()?,
                 name: SqlName::parse(name).ok()?,
@@ -6327,6 +6567,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             (at == payload.len()).then_some(WalOp::CreateComposite {
                 slot,
                 definition: crate::storage::CompositeDef {
+                    database: crate::storage::DatabaseOid::POSTGRES,
                     created_at: 0,
                     schema: SqlName::parse(schema).ok()?,
                     name: SqlName::parse(name).ok()?,
@@ -6580,6 +6821,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at = payload.len();
             (at == payload.len()).then_some(WalOp::CreateRoutine {
                 definition: crate::storage::RoutineDef {
+                    database: crate::storage::DatabaseOid::POSTGRES,
                     created_at,
                     schema: SqlName::parse(schema).ok()?,
                     name: SqlName::parse(name).ok()?,
@@ -6636,6 +6878,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let context = crate::storage::CastContext::from_code(*payload.get(at)?)?;
             at += 1;
             (at == payload.len()).then_some(WalOp::SetCast(crate::storage::CastDef {
+                database: crate::storage::DatabaseOid::POSTGRES,
                 created_at,
                 source,
                 target,
@@ -7261,6 +7504,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             } else {
                 None
             };
+            let database = if flags & 0x01 != 0 {
+                let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                Some(oid)
+            } else {
+                None
+            };
             let name = take_name(&mut at)?;
             let value = if flags & 0x04 != 0 {
                 let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
@@ -7273,10 +7523,28 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             };
             (at == payload.len()).then_some(WalOp::SetRoleSetting {
                 role,
-                database: flags & 0x01 != 0,
+                database,
                 name,
                 value,
             })
+        }
+        KIND_SET_SYSTEM_SETTING => {
+            let name = take_name(&mut at)?;
+            let present = *payload.get(at)?;
+            at += 1;
+            let value = match present {
+                0 => None,
+                1 => {
+                    let len =
+                        u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
+                    at += 2;
+                    let value = core::str::from_utf8(payload.get(at..at + len)?).ok()?;
+                    at += len;
+                    Some(value)
+                }
+                _ => return None,
+            };
+            (at == payload.len()).then_some(WalOp::SetSystemSetting { name, value })
         }
         KIND_SET_OBJECT_OWNER => {
             let class = *payload.get(at)?;
@@ -8111,6 +8379,7 @@ mod tests {
         };
         let operations = [
             WalOp::SetCast(crate::storage::CastDef {
+                database: crate::storage::DatabaseOid::POSTGRES,
                 created_at: 9,
                 source: custom,
                 target: crate::storage::RoutineResult::TEXT,
@@ -8360,7 +8629,7 @@ mod tests {
                 1,
                 &WalOp::SetRoleSetting {
                     role: Some("reader"),
-                    database: true,
+                    database: Some(5),
                     name: "application_name",
                     value: Some("durable"),
                 },
@@ -8986,6 +9255,7 @@ mod tests {
         let op = WalOp::CreateComposite {
             slot: 7,
             definition: crate::storage::CompositeDef {
+                database: crate::storage::DatabaseOid::POSTGRES,
                 created_at: 0,
                 schema: crate::storage::SqlName::parse("public").unwrap(),
                 name: crate::storage::SqlName::parse("evolving").unwrap(),
@@ -9674,21 +9944,23 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(wal.commit_stage(22, 50).unwrap(), 52);
+            assert_eq!(wal.commit_stage(22, 50).unwrap(), 53);
             wal.commit();
             wal.discard_stage(33);
-            assert_eq!(wal.commit_stage(11, 52).unwrap(), 54);
+            assert_eq!(wal.commit_stage(11, 53).unwrap(), 56);
             wal.commit();
         }
 
         let mut replay_budget = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut replay_budget).unwrap();
         let seen = collect_replay(&mut wal);
-        assert_eq!(seen.len(), 4);
-        assert!(seen[0].starts_with("51:") && seen[0].contains("middle"));
-        assert!(seen[1].starts_with("52:Commit"));
-        assert!(seen[2].starts_with("53:") && seen[2].contains("late"));
-        assert!(seen[3].starts_with("54:Commit"));
+        assert_eq!(seen.len(), 6);
+        assert!(seen[0].starts_with("51:DatabaseScope"));
+        assert!(seen[1].starts_with("52:") && seen[1].contains("middle"));
+        assert!(seen[2].starts_with("53:Commit"));
+        assert!(seen[3].starts_with("54:DatabaseScope"));
+        assert!(seen[4].starts_with("55:") && seen[4].contains("late"));
+        assert!(seen[5].starts_with("56:Commit"));
         assert!(!seen.iter().any(|record| {
             record.contains("savepoint_discarded") || record.contains("rolled_back")
         }));
@@ -9962,7 +10234,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            assert_eq!(wal.commit_stage(1, 16).unwrap(), 33);
+            assert_eq!(wal.commit_stage(1, 16).unwrap(), 34);
         });
         wal.commit();
     }
@@ -9995,7 +10267,7 @@ mod tests {
 
         let commit_lsn = wal.commit_stage(1, 0).unwrap();
         wal.commit();
-        let mut seen = [(0u64, 0u8); 2];
+        let mut seen = [(0u64, 0u8); 3];
         let mut count = 0;
         assert_eq!(
             wal.next_committed_after(0, &mut scratch, |lsn, record| {
@@ -10017,9 +10289,10 @@ mod tests {
             .unwrap(),
             Some(commit_lsn)
         );
-        assert_eq!(count, 2);
-        assert_eq!(seen[0].1, KIND_DELETE);
-        assert_eq!(seen[1].1, KIND_COMMIT);
+        assert_eq!(count, 3);
+        assert_eq!(seen[0].1, KIND_DATABASE_SCOPE);
+        assert_eq!(seen[1].1, KIND_DELETE);
+        assert_eq!(seen[2].1, KIND_COMMIT);
         let mut transaction_id = 0;
         wal.next_committed_after(0, &mut scratch, |_, transaction| {
             let commit = &transaction[transaction.len() - (HEADER_LEN + 4)..];

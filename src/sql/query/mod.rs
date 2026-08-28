@@ -2413,12 +2413,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Some(role) => role,
             None => return Ok(None),
         };
-        if !database.eq_ignore_ascii_case("postgres") {
+        let Some(slot) = self.storage.database_slot(database, self.txid) else {
             return Ok(None);
-        }
+        };
         let object = crate::storage::AccessObject {
             class: crate::storage::AccessClass::Database,
-            slot: 0,
+            slot: slot as u16,
         };
         privilege_query(
             privileges,
@@ -2436,8 +2436,18 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         .map(Some)
     }
 
-    fn database_name<'a>(&self, oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
-        Ok((oid == 5).then_some("postgres"))
+    fn database_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        let Some(oid) = crate::storage::DatabaseOid::parse(oid) else {
+            return Ok(None);
+        };
+        let Some(slot) = self.storage.database_slot_by_oid(oid, self.txid) else {
+            return Ok(None);
+        };
+        let name = self.storage.database_definition(slot, self.txid).name;
+        arena
+            .alloc_str(name.as_str())
+            .map(Some)
+            .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "query arena exhausted"))
     }
 
     fn has_tablespace_privilege(

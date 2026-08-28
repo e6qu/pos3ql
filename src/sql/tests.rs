@@ -1983,6 +1983,24 @@ fn run_with_guc(
     buffer.readable().to_vec()
 }
 
+fn run_with_session(
+    engine: &mut Engine,
+    budget: &mut Budget,
+    sql_text: &str,
+    guc: &mut GucState,
+    txn: &mut TxnState,
+    pool: &mut SqlPreparedPool,
+    cursors: &mut crate::sql::cursor::CursorPool,
+) -> Vec<u8> {
+    let mut buffer = crate::mem::FixedBuf::new(budget, "session_send", 1 << 18).unwrap();
+    let arena = Arena::new(budget, "session_sql", 1 << 18).unwrap();
+    let mut responder = Responder::new(&mut buffer);
+    engine
+        .execute_simple(sql_text, &arena, txn, pool, cursors, guc, &mut responder, 1)
+        .unwrap();
+    buffer.readable().to_vec()
+}
+
 fn describe_with(engine: &mut Engine, budget: &mut Budget, sql_text: &str) -> Vec<u8> {
     let mut buffer = crate::mem::FixedBuf::new(budget, "describe send", 1 << 18).unwrap();
     let arena = Arena::new(budget, "describe sql", 1 << 18).unwrap();
@@ -2817,6 +2835,12 @@ fn policy_catalog_dependencies_follow_restrict_and_cascade() {
          SELECT count(*) FROM pg_policy WHERE polname = 'policy_owned_dependency';",
     );
     assert_eq!(data_rows(&cascaded), ["0"]);
+    let dropped_role = run_with(&mut engine, &mut budget, "DROP ROLE policy_owned_role");
+    assert!(
+        !String::from_utf8_lossy(&dropped_role).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&dropped_role),
+    );
 
     let schema_setup = run_with(
         &mut engine,
@@ -11366,13 +11390,18 @@ fn interval_field_ranges_survive_checkpoint_and_object_store_cold_start() {
                SELECT id,
                       to_char(value,'DD|HH24|MI') AS value_format,
                       to_char(domain_value,'HH24|MI|SS.MS') AS domain_format
-                 FROM durable_intervals;
-             CHECKPOINT",
+                 FROM durable_intervals",
         );
         assert!(
             !String::from_utf8_lossy(&output).contains("ERROR"),
             "{}",
             String::from_utf8_lossy(&output)
+        );
+        let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+        assert!(
+            !String::from_utf8_lossy(&checkpoint).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&checkpoint)
         );
         engine.commit_wal().unwrap();
     }
@@ -13687,7 +13716,7 @@ fn multiway_equijoin_prunes_early() {
 fn range_table_covers_wide_conformance_queries() {
     std::thread::Builder::new()
         .name("wide-range-table-regression".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(range_table_covers_wide_conformance_queries_on_sized_stack)
         .expect("wide range-table test thread starts")
         .join()
@@ -21794,7 +21823,7 @@ fn journal_full_keeps_sequence_advance_dirty_for_retry() {
     let mut config = test_config("sequence_journal_retry");
     // Reserve the durable transaction marker as well as the CREATE record;
     // this remains too small for the later absolute sequence retry record.
-    config.wal_bytes = 144;
+    config.wal_bytes = 192;
     let mut budget = Budget::new(1 << 26);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let created = run_with(&mut engine, &mut budget, "CREATE SEQUENCE s");
@@ -26394,13 +26423,18 @@ fn dropped_composite_attribute_recovers_without_retired_identity() {
             &mut budget,
             "CREATE TYPE dropped_attribute_root AS (value integer); \
              CREATE TYPE dropped_attribute_leaf AS (root dropped_attribute_root); \
-             DROP TYPE dropped_attribute_root CASCADE; \
-             CHECKPOINT",
+             DROP TYPE dropped_attribute_root CASCADE",
         );
         assert!(
             !message_types(&output).contains(&b'E'),
             "{}",
             String::from_utf8_lossy(&output)
+        );
+        let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+        assert!(
+            !message_types(&checkpoint).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&checkpoint)
         );
         let leaf = engine
             .storage
@@ -27386,13 +27420,18 @@ fn composite_domain_arrays_survive_checkpoint_recovery_and_type_moves() {
              ALTER TYPE domain_point ADD ATTRIBUTE z integer; \
              ALTER TYPE domain_point RENAME ATTRIBUTE x TO east; \
              ALTER TYPE domain_point SET SCHEMA durable_domain; \
-             ALTER TYPE durable_domain.domain_point RENAME TO moved_point; \
-             CHECKPOINT",
+             ALTER TYPE durable_domain.domain_point RENAME TO moved_point",
         );
         assert!(
             !String::from_utf8_lossy(&output).contains("ERROR"),
             "{}",
             String::from_utf8_lossy(&output)
+        );
+        let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+        assert!(
+            !String::from_utf8_lossy(&checkpoint).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&checkpoint)
         );
         let domain = engine.storage.domain(
             engine
@@ -31220,7 +31259,11 @@ fn psql_catalog_listing_contracts() {
              FROM pg_database d
              JOIN pg_tablespace t ON t.oid = d.dattablespace"
         )),
-        ["postgres|pg_default|t"]
+        [
+            "template1|pg_default|t",
+            "template0|pg_default|t",
+            "postgres|pg_default|t"
+        ]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -31574,6 +31617,614 @@ fn psql_catalog_listing_contracts() {
             "SEQUENCE|catalog_sequence_metadata|catalog_table_reader|NO",
         ]
     );
+}
+
+#[test]
+fn database_configuration_and_tablespace_lifecycle_is_typed_and_transactional() {
+    let (mut engine, mut budget) = test_engine_with_budget(1 << 27);
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLESPACE pg_default LOCATION '/object/reserved'",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("42939"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLESPACE pg_default SET
+           (random_page_cost = 1.25, effective_io_concurrency = 7);
+         SELECT spcoptions::text FROM pg_tablespace WHERE spcname = 'pg_default';",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["{random_page_cost=1.25,effective_io_concurrency=7}"]
+    );
+    let output = run_with(&mut engine, &mut budget, "DROP TABLESPACE pg_default");
+    assert!(String::from_utf8_lossy(&output).contains("55000"));
+    for sql in [
+        "CREATE ROLE database_owner",
+        "CREATE TABLESPACE object_archive LOCATION '/object/archive'
+           WITH (random_page_cost = 1.25, effective_io_concurrency = 7)",
+        "CREATE DATABASE application
+           WITH OWNER database_owner TEMPLATE template0 ENCODING 'UTF8'
+                STRATEGY WAL_LOG LOCALE_PROVIDER libc
+                LC_COLLATE 'C' LC_CTYPE 'C'
+                TABLESPACE object_archive ALLOW_CONNECTIONS true
+                CONNECTION_LIMIT 4 IS_TEMPLATE false",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DATABASE application WITH ALLOW_CONNECTIONS false CONNECTION_LIMIT 2;
+         CREATE ROLE database_reader;
+         GRANT CONNECT, CREATE ON DATABASE application TO database_reader WITH GRANT OPTION;
+         ALTER DATABASE application SET application_name TO 'database-default';
+         COMMENT ON DATABASE application IS 'application catalog';
+         SELECT datname, pg_get_userbyid(datdba), encoding, datlocprovider,
+                datistemplate, datallowconn, datconnlimit,
+                t.spcname, shobj_description(d.oid, 'pg_database')
+           FROM pg_database d JOIN pg_tablespace t ON t.oid = d.dattablespace
+          WHERE datname = 'application';
+         SELECT setdatabase <> 0, setrole, setconfig::text
+           FROM pg_db_role_setting
+          WHERE setdatabase = (SELECT oid FROM pg_database WHERE datname = 'application');
+         SELECT datacl::text LIKE '%database_reader=C*c*/database_owner%',
+                has_database_privilege('database_reader', 'application', 'CONNECT, CREATE')
+           FROM pg_database WHERE datname = 'application';",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "application|database_owner|6|c|f|f|2|object_archive|application catalog",
+            "t|0|{application_name=database-default}",
+            "t|t",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DATABASE application RENAME TO application_v2",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let output = run_with(&mut engine, &mut budget, "DROP DATABASE application_v2");
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let output = run_with(&mut engine, &mut budget, "DROP ROLE database_reader");
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let output = run_with(&mut engine, &mut budget, "DROP TABLESPACE object_archive");
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DATABASE copied_files WITH STRATEGY FILE_COPY",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("0A000"), "{text}");
+    assert!(engine.database_login("copied_files").is_none());
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER DATABASE postgres REFRESH COLLATION VERSION",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("0A000"), "{text}");
+}
+
+#[test]
+fn default_index_tablespace_remains_implicit_in_pg_class() {
+    let (mut engine, mut budget) = test_engine_with_budget(1 << 27);
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE partitioned_default_space (id integer) PARTITION BY RANGE (id);
+         CREATE INDEX partitioned_default_space_idx ON partitioned_default_space (id);
+         SELECT reltablespace FROM pg_class
+          WHERE relname = 'partitioned_default_space_idx'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("database-template-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("sql-database-template-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let template = engine
+        .storage
+        .database_slot("template1", 0)
+        .map(|slot| engine.storage.database(slot).oid)
+        .unwrap();
+    engine.select_database(template).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE template_reader;
+         CREATE SCHEMA template_app;
+         CREATE TYPE template_app.state AS ENUM ('ready', 'done');
+         CREATE DOMAIN template_app.positive AS integer CHECK (VALUE > 0);
+         CREATE TABLE template_app.items (
+             id template_app.positive PRIMARY KEY,
+             state template_app.state NOT NULL
+         );
+         INSERT INTO template_app.items VALUES (1, 'ready');
+         CREATE VIEW template_app.ready_items AS
+           SELECT id FROM template_app.items WHERE state = 'ready';
+         CREATE SEQUENCE template_app.item_sequence;
+         SELECT setval('template_app.item_sequence', 7, true);
+         CREATE PUBLICATION template_changes FOR TABLE template_app.items;
+         COMMENT ON TABLE template_app.items IS 'copied template table';
+         GRANT USAGE ON SCHEMA template_app TO template_reader;
+         GRANT SELECT ON template_app.items TO template_reader;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT obj_description('template_app.items'::regclass, 'pg_class')"
+        )),
+        ["copied template table"]
+    );
+
+    engine
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT (SELECT count(*) FROM pg_class WHERE relname IN ('items', 'ready_items', 'item_sequence')),
+                    (SELECT count(*) FROM pg_type WHERE typname IN ('state', 'positive')),
+                    (SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes')"
+        )),
+        ["0|0|0"],
+        "database-local catalogs must not leak template objects into postgres"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DATABASE cloned_application TEMPLATE template1",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let clone = engine
+        .storage
+        .database_slot("cloned_application", 0)
+        .map(|slot| engine.storage.database(slot).oid)
+        .unwrap();
+    engine.select_database(clone).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT current_database(), id, state FROM template_app.items;
+         SELECT id FROM template_app.ready_items;
+         SELECT nextval('template_app.item_sequence');
+         SELECT (SELECT count(*) FROM pg_class WHERE relname IN ('items', 'ready_items', 'item_sequence')),
+                (SELECT count(*) FROM pg_type WHERE typname IN ('state', 'positive'));
+         SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes';
+         SELECT obj_description('template_app.items'::regclass, 'pg_class');
+         SELECT has_table_privilege('template_reader', 'template_app.items', 'SELECT');
+         INSERT INTO template_app.items VALUES (2, 'done');",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "cloned_application|1|ready",
+            "1",
+            "8",
+            "3|2",
+            "1",
+            "copied template table",
+            "t",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let cloned_table = engine
+        .storage
+        .find_visible("template_app", "items", 0)
+        .unwrap();
+    let cloned_view = engine
+        .storage
+        .views_visible_to(0)
+        .find(|(_, view)| {
+            view.schema.as_str() == "template_app" && view.name.as_str() == "ready_items"
+        })
+        .map(|(slot, _)| slot)
+        .unwrap();
+    assert!(
+        engine
+            .storage
+            .view_dependencies(cloned_view)
+            .entries()
+            .iter()
+            .any(|dependency| {
+                dependency.class == crate::storage::DependencyClass::Table
+                    && usize::from(dependency.slot) == cloned_table
+            }),
+        "template clone must rebind stored-query dependencies to cloned slots"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE template_app.items RENAME TO cloned_items",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    assert_eq!(
+        engine.storage.table_def(cloned_table, 0).name.as_str(),
+        "cloned_items"
+    );
+    assert!(
+        engine
+            .storage
+            .view_dependencies(cloned_view)
+            .entries()
+            .iter()
+            .any(|dependency| {
+                dependency.class == crate::storage::DependencyClass::Table
+                    && usize::from(dependency.slot) == cloned_table
+                    && dependency.schema.as_str() == "template_app"
+                    && dependency.name.as_str() == "cloned_items"
+            }),
+        "table rename must move the clone's stored-query identity"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT obj_description('template_app.cloned_items'::regclass, 'pg_class');
+         SELECT id FROM template_app.ready_items;
+         SELECT count(*) FROM pg_indexes
+          WHERE schemaname = 'template_app' AND tablename = 'cloned_items'
+            AND indexname = 'items_pkey';",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["copied template table", "1", "1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    engine.select_database(template).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*), nextval('template_app.item_sequence'),
+                    obj_description('template_app.items'::regclass, 'pg_class'),
+                    (SELECT count(*) FROM pg_indexes
+                      WHERE schemaname = 'template_app' AND tablename = 'items'
+                        AND indexname = 'items_pkey')
+               FROM template_app.items"
+        )),
+        ["1|8|copied template table|1"]
+    );
+    engine.select_database(clone).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SYSTEM SET application_name = 'durable-cluster-default'",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLESPACE pg_default SET
+           (random_page_cost = 1.25, effective_io_concurrency = 7)",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let clone = restarted
+        .storage
+        .database_slot("cloned_application", 0)
+        .map(|slot| restarted.storage.database(slot).oid)
+        .unwrap();
+    restarted.select_database(clone).unwrap();
+    let reloaded_session = GucState::new();
+    restarted.apply_system_settings(&reloaded_session).unwrap();
+    assert_eq!(
+        reloaded_session
+            .get_owned("application_name")
+            .unwrap()
+            .as_str(),
+        "durable-cluster-default"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT spcoptions::text FROM pg_tablespace WHERE spcname = 'pg_default'"
+        )),
+        ["{random_page_cost=1.25,effective_io_concurrency=7}"]
+    );
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT current_database(), id, state FROM template_app.cloned_items ORDER BY id;
+         SELECT id FROM template_app.ready_items;
+         SELECT count(*) FROM pg_indexes
+          WHERE schemaname = 'template_app' AND tablename = 'cloned_items'
+            AND indexname = 'items_pkey';
+         SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes';
+         SELECT has_table_privilege('template_reader', 'template_app.cloned_items', 'SELECT');
+         SELECT obj_description('template_app.cloned_items'::regclass, 'pg_class');",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "cloned_application|1|ready",
+            "cloned_application|2|done",
+            "1",
+            "1",
+            "1",
+            "t",
+            "copied template table"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn drop_database_force_marks_every_live_backend_for_administrative_termination() {
+    let (mut engine, mut budget) = test_engine_with_budget(1 << 27);
+    let output = run_with(&mut engine, &mut budget, "CREATE DATABASE force_target");
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let database = engine.database_login("force_target").unwrap();
+    assert!(engine.reserve_database_connection(database, false));
+    assert!(engine.reserve_database_connection(database, false));
+
+    let output = run_with(&mut engine, &mut budget, "DROP DATABASE force_target");
+    assert!(String::from_utf8_lossy(&output).contains("55006"));
+    assert!(engine.database_login("force_target").is_some());
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP DATABASE force_target WITH (FORCE)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(engine.database_login("force_target").is_none());
+    assert!(engine.dropped_database_connections()[database.slot as usize]);
+    engine.release_database_connection(database.slot);
+    engine.release_database_connection(database.slot);
+    assert!(!engine.dropped_database_connections()[database.slot as usize]);
+}
+
+#[test]
+fn nontransactional_utility_commands_require_one_top_level_statement() {
+    let (mut engine, mut budget) = test_engine_with_budget(1 << 27);
+    for sql in [
+        "SELECT 1; CREATE DATABASE not_top_level",
+        "SELECT 1; CREATE TABLESPACE not_top_level LOCATION '/object/not-top-level'",
+        "SELECT 1; ALTER SYSTEM SET application_name = 'not-top-level'",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("25001"), "{text}");
+    }
+    assert!(engine.database_login("not_top_level").is_none());
+    assert!(engine.storage.tablespace_slot("not_top_level", 0).is_none());
+    assert!(engine.storage.system_settings().all(|(_, setting)| {
+        setting.name.as_str() != "application_name" || setting.value.as_str() != "not-top-level"
+    }));
+}
+
+#[test]
+fn alter_system_and_discard_have_real_session_state() {
+    let (mut engine, mut budget) = test_engine_with_budget(1 << 27);
+    let mut session = GucState::new();
+    run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ALTER SYSTEM SET application_name = 'cluster-default'",
+        1 << 18,
+        &mut session,
+    );
+    let output = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SHOW application_name; SELECT NOT pg_reload_conf(), pg_reload_conf() AND true;",
+        1 << 18,
+        &mut session,
+    );
+    assert_eq!(data_rows(&output), ["", "f|t"]);
+    let output = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SHOW application_name;
+         SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
+        1 << 18,
+        &mut session,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["cluster-default", "configuration file|cluster-default"]
+    );
+
+    let mut reloaded_session = GucState::new();
+    engine.apply_system_settings(&reloaded_session).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut cursors = test_cursors(&mut budget);
+    run_with_session(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE discard_sequence",
+        &mut reloaded_session,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+    );
+    let output = run_with_session(
+        &mut engine,
+        &mut budget,
+        "SELECT nextval('discard_sequence')",
+        &mut reloaded_session,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+    );
+    assert_eq!(data_rows(&output), ["1"]);
+    run_with_session(
+        &mut engine,
+        &mut budget,
+        "SET application_name = 'session-value'",
+        &mut reloaded_session,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+    );
+    run_with_session(
+        &mut engine,
+        &mut budget,
+        "ALTER SYSTEM SET application_name = 'reloaded-cluster-default'",
+        &mut reloaded_session,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+    );
+    let output = run_with_session(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_reload_conf();
+         SHOW application_name;
+         SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
+        &mut reloaded_session,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t", "session-value", "session|reloaded-cluster-default"]
+    );
+    run_with_session(
+        &mut engine,
+        &mut budget,
+        "PREPARE discarded AS SELECT 1",
+        &mut reloaded_session,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+    );
+    run_with_session(
+        &mut engine,
+        &mut budget,
+        "DISCARD ALL",
+        &mut reloaded_session,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+    );
+    let output = run_with_session(
+        &mut engine,
+        &mut budget,
+        "SHOW application_name;
+         SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
+        &mut reloaded_session,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "reloaded-cluster-default",
+            "configuration file|reloaded-cluster-default"
+        ]
+    );
+    let output = run_with_session(
+        &mut engine,
+        &mut budget,
+        "EXECUTE discarded",
+        &mut reloaded_session,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("prepared statement \"discarded\" does not exist"),
+        "{text}"
+    );
+    let output = run_with_session(
+        &mut engine,
+        &mut budget,
+        "SELECT currval('discard_sequence')",
+        &mut reloaded_session,
+        &mut txn,
+        &mut pool,
+        &mut cursors,
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("currval of sequence"), "{text}");
+    run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ALTER SYSTEM RESET application_name",
+        1 << 18,
+        &mut reloaded_session,
+    );
+    run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_reload_conf()",
+        1 << 18,
+        &mut reloaded_session,
+    );
+    let output = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SHOW application_name;
+         SELECT source, reset_val FROM pg_settings WHERE name = 'application_name'",
+        1 << 18,
+        &mut reloaded_session,
+    );
+    assert_eq!(data_rows(&output), ["", "default|"]);
 }
 
 #[test]

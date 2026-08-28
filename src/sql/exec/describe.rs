@@ -3436,7 +3436,7 @@ pub fn infer_type_res(
                 }
             }
             "current_date" => of(ColType::Date),
-            "pg_is_in_recovery" => of(ColType::Bool),
+            "pg_is_in_recovery" | "pg_reload_conf" => of(ColType::Bool),
             // The identifier-returning functions are `name`-typed in PostgreSQL.
             "current_user" | "session_user" | "user" | "current_role" | "current_schema"
             | "current_database" | "current_catalog" => of(ColType::Name),

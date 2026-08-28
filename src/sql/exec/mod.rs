@@ -1338,6 +1338,7 @@ fn copy_like_indexes(
             let name = auto_key_name(def, &columns[..index.n_cols], "idx", true)?;
             let slot = storage.create_index(
                 IndexDef {
+                    database: storage.current_database_oid(),
                     created_at: 0,
                     schema: def.schema,
                     name,
@@ -2888,7 +2889,7 @@ fn rewrite_object_acl_owner(
     if old_owner == new_owner {
         return Ok(());
     }
-    let acl_count = storage.acl_entries().count();
+    let acl_count = storage.acl_entry_count();
     for slot in 0..acl_count {
         let entry = *storage.acl_entry(slot);
         if entry.object != object || entry.object.slot == u16::MAX {
@@ -2920,7 +2921,7 @@ fn rewrite_object_acl_owner(
             return Err(error);
         }
     }
-    let column_acl_count = storage.column_acl_entries().count();
+    let column_acl_count = storage.column_acl_entry_count();
     for slot in 0..column_acl_count {
         let entry = *storage.column_acl_entry(slot);
         if entry.target.relation() != object {
@@ -2961,7 +2962,7 @@ fn preserve_object_acl(
     old_object: crate::storage::AccessObject,
     new_object: crate::storage::AccessObject,
 ) -> Result<(), SqlError> {
-    let acl_count = storage.acl_entries().count();
+    let acl_count = storage.acl_entry_count();
     for acl_slot in 0..acl_count {
         let entry = *storage.acl_entry(acl_slot);
         if entry.object != old_object {
@@ -2985,7 +2986,7 @@ fn preserve_object_acl(
             return Err(error);
         }
     }
-    let column_acl_count = storage.column_acl_entries().count();
+    let column_acl_count = storage.column_acl_entry_count();
     for acl_slot in 0..column_acl_count {
         let entry = *storage.column_acl_entry(acl_slot);
         if entry.target.relation() != old_object {
@@ -3019,7 +3020,7 @@ fn remap_table_column_acls(
     object: crate::storage::AccessObject,
     mapping: &[u16; MAX_COLUMNS],
 ) -> Result<(), SqlError> {
-    let entry_count = storage.column_acl_entries().count();
+    let entry_count = storage.column_acl_entry_count();
     for slot in 0..entry_count {
         let entry = *storage.column_acl_entry(slot);
         if entry.target.relation() != object {
@@ -3755,17 +3756,20 @@ pub fn alter_role_setting(
     guc: &crate::sql::guc::GucState,
     responder: &mut Responder,
 ) -> Outcome {
-    let database = written_database.is_some();
-    if let Some(name) = written_database
-        && !name.eq_ignore_ascii_case("postgres")
-    {
-        return sql_fail(sql_err!(
-            sqlstate::INVALID_CATALOG_NAME,
-            "database \"{}\" does not exist",
-            name
-        ));
-    }
-    if written_role.is_none() && !database {
+    let database = match written_database {
+        Some(name) => {
+            let Some(slot) = storage.database_slot(name, txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_CATALOG_NAME,
+                    "database \"{}\" does not exist",
+                    name
+                ));
+            };
+            Some(storage.database(slot).oid)
+        }
+        None => None,
+    };
+    if written_role.is_none() && database.is_none() {
         return sql_fail(sql_err!(
             sqlstate::SYNTAX_ERROR,
             "ALTER ROLE ALL requires IN DATABASE"
@@ -3795,8 +3799,11 @@ pub fn alter_role_setting(
                 resolved.as_str()
             ));
         }
-        if database {
-            crate::storage::RoleSettingScope::RoleInDatabase(role as u16)
+        if let Some(database) = database {
+            crate::storage::RoleSettingScope::RoleInDatabase {
+                role: role as u16,
+                database,
+            }
         } else {
             crate::storage::RoleSettingScope::RoleAllDatabases(role as u16)
         }
@@ -3807,7 +3814,7 @@ pub fn alter_role_setting(
                 "permission denied to alter database role settings"
             ));
         }
-        crate::storage::RoleSettingScope::AllRolesInDatabase
+        crate::storage::RoleSettingScope::AllRolesInDatabase(database.expect("checked above"))
     };
 
     let result = match action {
@@ -3902,12 +3909,15 @@ fn stage_role_setting(
     let (slot, prior) = storage.change_role_setting(scope, name, value, txn.txid)?;
     let (role, database) = match scope {
         crate::storage::RoleSettingScope::RoleAllDatabases(role) => {
-            (Some(storage.role_name(role as usize, txn.txid)), false)
+            (Some(storage.role_name(role as usize, txn.txid)), None)
         }
-        crate::storage::RoleSettingScope::RoleInDatabase(role) => {
-            (Some(storage.role_name(role as usize, txn.txid)), true)
+        crate::storage::RoleSettingScope::RoleInDatabase { role, database } => (
+            Some(storage.role_name(role as usize, txn.txid)),
+            Some(database.get()),
+        ),
+        crate::storage::RoleSettingScope::AllRolesInDatabase(database) => {
+            (None, Some(database.get()))
         }
-        crate::storage::RoleSettingScope::AllRolesInDatabase => (None, true),
     };
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage(
@@ -3931,6 +3941,112 @@ fn stage_role_setting(
         return Err(error);
     }
     Ok(())
+}
+
+fn stage_system_setting(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: SqlName,
+    value: Option<crate::util::StackStr<{ crate::storage::ROLE_SETTING_VALUE_MAX }>>,
+) -> Result<(), SqlError> {
+    if value.is_none()
+        && !storage
+            .system_settings()
+            .any(|(_, setting)| setting.visible_to(txn.txid) && setting.name == name)
+    {
+        return Ok(());
+    }
+    let (slot, prior) = storage.change_system_setting(name, value, txn.txid)?;
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetSystemSetting {
+            name: name.as_str(),
+            value: value.as_ref().map(|value| value.as_str()),
+        },
+    ) {
+        storage.rollback_system_setting(slot, prior);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SystemSettingChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_system_setting(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn alter_system(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: Option<&str>,
+    raw: Option<&str>,
+    guc: &crate::sql::guc::GucState,
+    responder: &mut Responder,
+) -> Outcome {
+    let current = storage
+        .current_role_slot(txn.txid)
+        .expect("current role exists");
+    if !storage.role(current).attributes_to(txn.txid).superuser {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to alter system configuration"
+        ));
+    }
+    match (name, raw) {
+        (Some(name), Some(raw)) => {
+            let name = match SqlName::parse(name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            let value = match guc.canonical_routine_setting(name.as_str(), raw) {
+                Ok(value) => crate::util::StackStr::from_str(value.as_str()),
+                Err(error) => return sql_fail(error),
+            };
+            if value.is_truncated() {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "system setting value is too long"
+                ));
+            }
+            if let Err(error) = stage_system_setting(storage, wal, txn, name, Some(value)) {
+                return sql_fail(error);
+            }
+        }
+        (Some(name), None) => {
+            let name = match SqlName::parse(name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = stage_system_setting(storage, wal, txn, name, None) {
+                return sql_fail(error);
+            }
+        }
+        (None, None) => {
+            let mut targets = [usize::MAX; crate::storage::MAX_SYSTEM_SETTINGS];
+            let mut count = 0;
+            for (slot, setting) in storage.system_settings() {
+                if setting.visible_to(txn.txid) {
+                    targets[count] = slot;
+                    count += 1;
+                }
+            }
+            for slot in &targets[..count] {
+                let setting = *storage.system_setting(*slot);
+                if let Err(error) = stage_system_setting(storage, wal, txn, setting.name, None) {
+                    return sql_fail(error);
+                }
+            }
+        }
+        (None, Some(_)) => unreachable!("parser gives ALTER SYSTEM SET a name"),
+    }
+    responder.command_complete("ALTER SYSTEM")?;
+    sql_ok()
 }
 
 pub fn rename_role(
@@ -4041,7 +4157,7 @@ pub fn drop_role(
                 "current user cannot be dropped"
             ));
         }
-        if storage.role_has_object_dependents(slot, txn.txid) {
+        if storage.role_object_dependency(slot, txn.txid).is_some() {
             return sql_fail(sql_err!(
                 sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                 "role \"{}\" cannot be dropped because some objects depend on it",
@@ -4059,12 +4175,10 @@ pub fn drop_role(
             .role_settings()
             .filter(|(_, setting)| {
                 setting.visible_to(txn.txid)
-                    && matches!(
-                        setting.scope,
-                        crate::storage::RoleSettingScope::RoleAllDatabases(role)
-                            | crate::storage::RoleSettingScope::RoleInDatabase(role)
-                            if role as usize == slot
-                    )
+                    && setting
+                        .scope
+                        .role()
+                        .is_some_and(|role| role as usize == slot)
             })
             .count();
         if membership_count + setting_count + 1 > super::txn::MAX_TXN_DDL {
@@ -4121,12 +4235,10 @@ pub fn drop_role(
         let mut setting_count = 0usize;
         for (setting_slot, setting) in storage.role_settings() {
             if setting.visible_to(txn.txid)
-                && matches!(
-                    setting.scope,
-                    crate::storage::RoleSettingScope::RoleAllDatabases(role)
-                        | crate::storage::RoleSettingScope::RoleInDatabase(role)
-                        if role as usize == slot
-                )
+                && setting
+                    .scope
+                    .role()
+                    .is_some_and(|role| role as usize == slot)
             {
                 setting_slots[setting_count] = setting_slot;
                 setting_count += 1;
@@ -5315,7 +5427,7 @@ fn drop_owned_privileges(
     let mut queue_privileges = [PrivilegeSet::NONE; MAX_ACL_ENTRIES];
     let mut queue_count = 0usize;
 
-    for slot in 0..storage.acl_entries().count() {
+    for slot in 0..storage.acl_entry_count() {
         let entry = *storage.acl_entry(slot);
         let (grantee, grantor) = storage.acl_identity(slot, txn.txid);
         let (privileges, _) = storage.acl_state(slot, txn.txid);
@@ -5373,7 +5485,7 @@ fn drop_owned_privileges(
         }
     }
 
-    let column_acl_count = storage.column_acl_entries().count();
+    let column_acl_count = storage.column_acl_entry_count();
     for slot in 0..column_acl_count {
         let entry = *storage.column_acl_entry(slot);
         let (grantee, grantor) = storage.column_acl_identity(slot, txn.txid);
@@ -5409,9 +5521,12 @@ fn drop_owned_privileges(
         }
     }
 
-    let default_count = storage.default_acl_entries().count();
+    let default_count = storage.default_acl_entry_count();
     for slot in 0..default_count {
         let entry = *storage.default_acl_entry(slot);
+        if entry.database != storage.current_database_oid() {
+            continue;
+        }
         let (defined, _, _) = storage.default_acl_state(
             entry.owner,
             entry.schema,
@@ -6211,19 +6326,19 @@ fn resolve_privilege_objects(
                         )?;
                     }
                     PrivilegeObjectKind::Database => {
-                        if !name.name.eq_ignore_ascii_case("postgres") {
+                        let Some(slot) = storage.database_slot(name.name, txid) else {
                             return Err(sql_err!(
                                 sqlstate::INVALID_CATALOG_NAME,
                                 "database \"{}\" does not exist",
                                 name.name
                             ));
-                        }
+                        };
                         add_privilege_object(
                             objects,
                             &mut count,
                             AccessObject {
                                 class: AccessClass::Database,
-                                slot: 0,
+                                slot: slot as u16,
                             },
                         )?;
                     }
@@ -8964,12 +9079,6 @@ pub fn alter_subscription(
         }
         crate::sql::ast::AlterSubscriptionAction::SetOptions(patch) => {
             let alters_remote_slot = patch.failover.is_some() || patch.two_phase == Some(false);
-            if alters_remote_slot && txn.is_explicit() {
-                return sql_fail(sql_err!(
-                    sqlstate::ACTIVE_SQL_TRANSACTION,
-                    "ALTER SUBSCRIPTION SET (failover or two_phase) cannot run inside a transaction block"
-                ));
-            }
             let (connection, publications, publication_count, mut publisher_slot, mut behavior) =
                 storage.subscription_definition_to(slot, txn.txid);
             if (patch.failover.is_some() || patch.two_phase.is_some())
@@ -23346,6 +23455,27 @@ pub fn comment(
             };
             (CommentClass::Tablespace, SqlName::EMPTY, stored, 0u32)
         }
+        CommentTarget::Database(database_name) => {
+            let Some(slot) = storage.database_slot(database_name, txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_CATALOG_NAME,
+                    "database \"{}\" does not exist",
+                    database_name
+                ));
+            };
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Database,
+                slot: slot as u16,
+            };
+            if let Err(error) = storage.require_owner(object, txid, "database") {
+                return sql_fail(error);
+            }
+            let stored = match SqlName::parse(database_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (CommentClass::Database, SqlName::EMPTY, stored, 0u32)
+        }
         CommentTarget::Extension(extension_name) => {
             let Some(slot) = storage.extension_slot(extension_name, txid) else {
                 return sql_fail(sql_err!(
@@ -31521,12 +31651,6 @@ pub fn create_index(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{IndexDef, MAX_INDEX_COLS};
-    if command.build == crate::sql::ast::IndexBuildMode::Concurrent && txn.is_explicit() {
-        return sql_fail(sql_err!(
-            sqlstate::ACTIVE_SQL_TRANSACTION,
-            "CREATE INDEX CONCURRENTLY cannot run inside a transaction block"
-        ));
-    }
     let table_index = match resolve_dml_table(storage, &command.table, txn.txid) {
         Ok(i) => i,
         Err(e) => return sql_fail(e),
@@ -31837,6 +31961,7 @@ pub fn create_index(
         Err(error) => return sql_fail(error),
     };
     let def = IndexDef {
+        database: storage.current_database_oid(),
         created_at: 0,
         schema: tdef.schema,
         name: sqlname,
@@ -32661,6 +32786,557 @@ pub struct CreateTablespaceCommand<'a> {
     pub options: crate::sql::ast::TablespaceOptions,
 }
 
+fn database_string<const N: usize>(
+    value: &str,
+    field: &str,
+) -> Result<crate::util::StackStr<N>, SqlError> {
+    let stored = crate::util::StackStr::from_str(value);
+    if stored.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "database {} exceeds {} bytes",
+            field,
+            N
+        ));
+    }
+    Ok(stored)
+}
+
+fn database_encoding(value: &str) -> Result<crate::storage::DatabaseEncoding, SqlError> {
+    if value.eq_ignore_ascii_case("utf8") || value.eq_ignore_ascii_case("utf-8") || value == "6" {
+        Ok(crate::storage::DatabaseEncoding::Utf8)
+    } else if value.eq_ignore_ascii_case("sql_ascii") || value == "0" {
+        Ok(crate::storage::DatabaseEncoding::SqlAscii)
+    } else {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "encoding \"{}\" does not exist",
+            value
+        ))
+    }
+}
+
+pub fn create_database(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    options: crate::sql::ast::CreateDatabaseOptions<'_>,
+    template_connections: u16,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some(current) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "current role does not exist"
+        ));
+    };
+    let current_attributes = storage.role(current).attributes_to(txn.txid);
+    if !current_attributes.create_database && !current_attributes.superuser {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to create database"
+        ));
+    }
+    if matches!(
+        options.strategy,
+        Some(crate::sql::ast::DatabaseStrategy::FileCopy)
+    ) {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "CREATE DATABASE STRATEGY FILE_COPY is not supported by object-native storage"
+        ));
+    }
+    let template_name = options.template.unwrap_or("template1");
+    let Some(template_slot) = storage.database_slot(template_name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_CATALOG_NAME,
+            "template database \"{}\" does not exist",
+            template_name
+        ));
+    };
+    let template = storage.database(template_slot);
+    let template_oid = template.oid;
+    let template_definition = template.definition_for(txn.txid);
+    let template_owner = storage.object_owner(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Database,
+            slot: template_slot as u16,
+        },
+        txn.txid,
+    );
+    if !template_definition.is_template
+        && !current_attributes.superuser
+        && current != template_owner
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to copy database \"{}\"",
+            template_name
+        ));
+    }
+    if template_connections != 0 {
+        return sql_fail(sql_err!(
+            sqlstate::OBJECT_IN_USE,
+            "source database \"{}\" is being accessed by other users",
+            template_name
+        ));
+    }
+    let owner = match options.owner {
+        Some(owner) => {
+            let Some(owner) = storage.find_role_visible(owner, txn.txid) else {
+                return sql_fail(sql_err!(sqlstate::UNDEFINED_OBJECT, "role does not exist"));
+            };
+            if !current_attributes.superuser && !storage.role_can_set(current, owner, txn.txid) {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "must be able to SET ROLE to database owner"
+                ));
+            }
+            owner
+        }
+        None => current,
+    };
+    if matches!(
+        options.locale_provider,
+        Some(crate::sql::ast::DatabaseLocaleProvider::Icu)
+    ) {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "ICU database locales are not supported by this build"
+        ));
+    }
+    let can_override_template = template.oid == crate::storage::DatabaseOid::TEMPLATE0;
+    let encoding = match options.encoding {
+        Some(value) => match database_encoding(value) {
+            Ok(encoding) if can_override_template || encoding == template_definition.encoding => {
+                encoding
+            }
+            Ok(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "new encoding is incompatible with the encoding of the template database"
+                ));
+            }
+            Err(error) => return sql_fail(error),
+        },
+        None => template_definition.encoding,
+    };
+    let locale_provider = match options.locale_provider {
+        Some(crate::sql::ast::DatabaseLocaleProvider::Builtin) => {
+            crate::storage::DatabaseLocaleProvider::Builtin
+        }
+        Some(crate::sql::ast::DatabaseLocaleProvider::Libc) => {
+            crate::storage::DatabaseLocaleProvider::Libc
+        }
+        None => template_definition.locale_provider,
+        Some(crate::sql::ast::DatabaseLocaleProvider::Icu) => unreachable!(),
+    };
+    if !can_override_template && locale_provider != template_definition.locale_provider {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "new locale provider does not match the template database"
+        ));
+    }
+    let common_locale = options.locale;
+    let collate_text = common_locale
+        .or(options.collate)
+        .unwrap_or(template_definition.collate.as_str());
+    let ctype_text = common_locale
+        .or(options.ctype)
+        .unwrap_or(template_definition.ctype.as_str());
+    if !can_override_template
+        && (collate_text != template_definition.collate.as_str()
+            || ctype_text != template_definition.ctype.as_str())
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_PARAMETER_VALUE,
+            "new locale is incompatible with the locale of the template database"
+        ));
+    }
+    let tablespace = match options.tablespace {
+        Some(name) => match storage.tablespace_id(name, txn.txid) {
+            Some(1) => {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "pg_global cannot be used as a default tablespace"
+                ));
+            }
+            Some(id) => id,
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "tablespace \"{}\" does not exist",
+                    name
+                ));
+            }
+        },
+        None => template_definition.tablespace,
+    };
+    let name = match SqlName::parse(name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let definition = match (|| {
+        Ok(crate::storage::DatabaseDefinition {
+            name,
+            encoding,
+            locale_provider,
+            collate: database_string(collate_text, "LC_COLLATE")?,
+            ctype: database_string(ctype_text, "LC_CTYPE")?,
+            locale: database_string(options.locale.unwrap_or(""), "locale")?,
+            collation_version: database_string(
+                options
+                    .collation_version
+                    .unwrap_or(template_definition.collation_version.as_str()),
+                "collation version",
+            )?,
+            allow_connections: options.allow_connections.unwrap_or(true),
+            connection_limit: options.connection_limit.unwrap_or(-1),
+            is_template: options.is_template.unwrap_or(false),
+            tablespace,
+        })
+    })() {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
+    let requested_oid = match options.oid {
+        Some(oid) => match crate::storage::DatabaseOid::parse(oid) {
+            Some(oid) => Some(oid),
+            None => {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "database OID {} is outside the user OID range",
+                    oid
+                ));
+            }
+        },
+        None => None,
+    };
+    let slot = match storage.create_database(
+        requested_oid,
+        template_oid,
+        definition,
+        owner as u16,
+        txn.txid,
+    ) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let oid = storage.database(slot).oid;
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::CreateDatabase {
+            oid: oid.get(),
+            template_oid: template_oid.get(),
+            definition,
+            owner: owner as u16,
+        },
+    ) {
+        storage.rollback_database_create(slot);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DatabaseCreated(slot as u32)) {
+        storage.rollback_database_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE DATABASE")?;
+    sql_ok()
+}
+
+pub struct AlterDatabaseCommand<'a> {
+    pub name: &'a str,
+    pub action: crate::sql::ast::AlterDatabaseAction<'a>,
+    pub active_connections: u16,
+    pub guc: &'a crate::sql::guc::GucState,
+}
+
+pub fn alter_database(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: AlterDatabaseCommand<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let AlterDatabaseCommand {
+        name,
+        action,
+        active_connections,
+        guc,
+    } = command;
+    let Some(slot) = storage.database_slot(name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_CATALOG_NAME,
+            "database \"{}\" does not exist",
+            name
+        ));
+    };
+    let object = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::Database,
+        slot: slot as u16,
+    };
+    if let Err(error) = storage.require_owner(object, txn.txid, "database") {
+        return sql_fail(error);
+    }
+    let mut definition = storage.database_definition(slot, txn.txid);
+    let mut owner = storage.object_owner(object, txn.txid);
+    let current_oid = storage.current_database_oid();
+    match action {
+        crate::sql::ast::AlterDatabaseAction::Options {
+            allow_connections,
+            connection_limit,
+            is_template,
+        } => {
+            if let Some(value) = allow_connections {
+                definition.allow_connections = value;
+            }
+            if let Some(value) = connection_limit {
+                definition.connection_limit = value;
+            }
+            if let Some(value) = is_template {
+                let current = storage
+                    .current_role_slot(txn.txid)
+                    .expect("current role exists");
+                if !storage.role(current).attributes_to(txn.txid).superuser {
+                    return sql_fail(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "must be superuser to change IS_TEMPLATE"
+                    ));
+                }
+                definition.is_template = value;
+            }
+        }
+        crate::sql::ast::AlterDatabaseAction::Rename(new_name) => {
+            if storage.database(slot).oid == current_oid {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "current database cannot be renamed"
+                ));
+            }
+            definition.name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        crate::sql::ast::AlterDatabaseAction::SetOwner(role) => {
+            let Some(new_owner) = storage.find_role_visible(role, txn.txid) else {
+                return sql_fail(sql_err!(sqlstate::UNDEFINED_OBJECT, "role does not exist"));
+            };
+            let current = storage
+                .current_role_slot(txn.txid)
+                .expect("current role exists");
+            let attributes = storage.role(current).attributes_to(txn.txid);
+            if !attributes.superuser
+                && (!attributes.create_database
+                    || !storage.role_can_set(current, new_owner, txn.txid))
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "must have CREATEDB and be able to SET ROLE to the new owner"
+                ));
+            }
+            owner = new_owner;
+        }
+        crate::sql::ast::AlterDatabaseAction::SetTablespace(name) => {
+            if active_connections != 0 {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_IN_USE,
+                    "database \"{}\" is being accessed by other users",
+                    definition.name.as_str()
+                ));
+            }
+            definition.tablespace = match storage.tablespace_id(name, txn.txid) {
+                Some(0) => 0,
+                Some(1) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "pg_global cannot be used as a default tablespace"
+                    ));
+                }
+                Some(id) => id,
+                None => {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "tablespace \"{}\" does not exist",
+                        name
+                    ));
+                }
+            };
+        }
+        crate::sql::ast::AlterDatabaseAction::RefreshCollationVersion => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "database collation version refresh is unavailable without a versioned collation provider"
+            ));
+        }
+        crate::sql::ast::AlterDatabaseAction::Set { name, value } => {
+            let name = match SqlName::parse(name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            let value = match value {
+                crate::sql::ast::RoutineConfigValue::Current => guc.get_owned(name.as_str()),
+                crate::sql::ast::RoutineConfigValue::Value(raw) => {
+                    match guc.canonical_routine_setting(name.as_str(), raw) {
+                        Ok(value) => Some(value),
+                        Err(error) => return sql_fail(error),
+                    }
+                }
+            };
+            let value = value.map(|value| crate::util::StackStr::from_str(value.as_str()));
+            if value
+                .as_ref()
+                .is_some_and(crate::util::StackStr::is_truncated)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "database setting value is too long"
+                ));
+            }
+            if let Err(error) = stage_role_setting(
+                storage,
+                wal,
+                txn,
+                crate::storage::RoleSettingScope::AllRolesInDatabase(storage.database(slot).oid),
+                name,
+                value,
+            ) {
+                return sql_fail(error);
+            }
+            responder.command_complete("ALTER DATABASE")?;
+            return sql_ok();
+        }
+        crate::sql::ast::AlterDatabaseAction::Reset(name) => {
+            let database = storage.database(slot).oid;
+            let mut targets = [usize::MAX; crate::storage::MAX_ROLE_SETTINGS];
+            let mut count = 0;
+            for (setting_slot, setting) in storage.role_settings() {
+                if setting.visible_to(txn.txid)
+                    && setting.scope
+                        == crate::storage::RoleSettingScope::AllRolesInDatabase(database)
+                    && name.is_none_or(|name| setting.name.as_str().eq_ignore_ascii_case(name))
+                {
+                    targets[count] = setting_slot;
+                    count += 1;
+                }
+            }
+            for target in &targets[..count] {
+                let setting = *storage.role_setting(*target);
+                if let Err(error) =
+                    stage_role_setting(storage, wal, txn, setting.scope, setting.name, None)
+                {
+                    return sql_fail(error);
+                }
+            }
+            responder.command_complete("ALTER DATABASE")?;
+            return sql_ok();
+        }
+    }
+    let prior_definition = match storage.alter_database_definition(slot, definition, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    let prior_owner = storage.set_object_owner(object, owner, txn.txid);
+    let oid = storage.database(slot).oid;
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::AlterDatabase {
+            oid: oid.get(),
+            definition,
+            owner: owner as u16,
+        },
+    ) {
+        storage.rollback_database_alter(slot, prior_definition);
+        storage.restore_object_owner(object, prior_owner);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DatabaseAltered {
+        slot: slot as u32,
+        prior_definition,
+        prior_owner,
+    }) {
+        storage.rollback_database_alter(slot, prior_definition);
+        storage.restore_object_owner(object, prior_owner);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER DATABASE")?;
+    sql_ok()
+}
+
+pub struct DropDatabaseCommand<'a> {
+    pub name: &'a str,
+    pub if_exists: bool,
+    pub force: bool,
+    pub active_connections: u16,
+}
+
+pub fn drop_database(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: DropDatabaseCommand<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let DropDatabaseCommand {
+        name,
+        if_exists,
+        force,
+        active_connections,
+    } = command;
+    let Some(slot) = storage.database_slot(name, txn.txid) else {
+        if if_exists {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(128, "database \"{}\" does not exist, skipping", name).as_str(),
+            )?;
+            responder.command_complete("DROP DATABASE")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::INVALID_CATALOG_NAME,
+            "database \"{}\" does not exist",
+            name
+        ));
+    };
+    let oid = storage.database(slot).oid;
+    if oid == storage.current_database_oid() {
+        return sql_fail(sql_err!(
+            sqlstate::OBJECT_IN_USE,
+            "cannot drop the currently open database"
+        ));
+    }
+    let object = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::Database,
+        slot: slot as u16,
+    };
+    if let Err(error) = storage.require_owner(object, txn.txid, "database") {
+        return sql_fail(error);
+    }
+    if active_connections != 0 && !force {
+        return sql_fail(sql_err!(
+            sqlstate::OBJECT_IN_USE,
+            "database \"{}\" is being accessed by other users",
+            name
+        ));
+    }
+    storage.drop_database(slot, txn.txid);
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropDatabase { oid: oid.get() }) {
+        storage.rollback_database_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::DatabaseDropped(slot as u32)) {
+        storage.rollback_database_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    responder.command_complete("DROP DATABASE")?;
+    sql_ok()
+}
+
 pub fn create_tablespace(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -32674,12 +33350,6 @@ pub fn create_tablespace(
         location,
         options,
     } = command;
-    if txn.is_explicit() {
-        return sql_fail(sql_err!(
-            sqlstate::ACTIVE_SQL_TRANSACTION,
-            "CREATE TABLESPACE cannot run inside a transaction block"
-        ));
-    }
     let Some(current) = storage.current_role_slot(txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -32776,6 +33446,19 @@ pub fn alter_tablespace(
         class: crate::storage::AccessClass::Tablespace,
         slot: slot as u16,
     };
+    if slot < 2
+        && !matches!(
+            action,
+            crate::sql::ast::AlterTablespaceAction::SetOptions(_)
+                | crate::sql::ast::AlterTablespaceAction::ResetOptions(_)
+        )
+    {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot change the identity of built-in tablespace \"{}\"",
+            name
+        ));
+    }
     if let Err(error) = storage.require_owner(object, txn.txid, "tablespace") {
         return sql_fail(error);
     }
@@ -32878,12 +33561,6 @@ pub fn drop_tablespace(
     if_exists: bool,
     responder: &mut Responder,
 ) -> Outcome {
-    if txn.is_explicit() {
-        return sql_fail(sql_err!(
-            sqlstate::ACTIVE_SQL_TRANSACTION,
-            "DROP TABLESPACE cannot run inside a transaction block"
-        ));
-    }
     let Some(slot) = storage.tablespace_slot(name, txn.txid) else {
         if if_exists {
             responder.notice(
@@ -32988,12 +33665,6 @@ pub fn drop_index(
         build,
         cascade,
     } = command;
-    if build == crate::sql::ast::IndexBuildMode::Concurrent && txn.is_explicit() {
-        return sql_fail(sql_err!(
-            sqlstate::ACTIVE_SQL_TRANSACTION,
-            "DROP INDEX CONCURRENTLY cannot run inside a transaction block"
-        ));
-    }
     if build == crate::sql::ast::IndexBuildMode::Concurrent && names.len() != 1 {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -33124,12 +33795,6 @@ pub fn reindex(
     options: crate::sql::ast::ReindexOptions<'_>,
     responder: &mut Responder,
 ) -> Outcome {
-    if options.build == crate::sql::ast::IndexBuildMode::Concurrent && txn.is_explicit() {
-        return sql_fail(sql_err!(
-            sqlstate::ACTIVE_SQL_TRANSACTION,
-            "REINDEX CONCURRENTLY cannot run inside a transaction block"
-        ));
-    }
     let mut tables = [usize::MAX; crate::storage::MAX_SCHEMAS * crate::storage::MAX_COLUMNS];
     let mut table_count = 0usize;
     let mut selected_index = None;
@@ -33213,7 +33878,9 @@ pub fn reindex(
         }
         crate::sql::ast::ReindexTarget::Database => {
             if let Some(name) = name
-                && !name.name.eq_ignore_ascii_case("postgres")
+                && storage
+                    .database_slot(name.name, txn.txid)
+                    .is_none_or(|slot| storage.database(slot).oid != storage.current_database_oid())
             {
                 return sql_fail(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -33235,7 +33902,9 @@ pub fn reindex(
         }
         crate::sql::ast::ReindexTarget::System => {
             if let Some(name) = name
-                && !name.name.eq_ignore_ascii_case("postgres")
+                && storage
+                    .database_slot(name.name, txn.txid)
+                    .is_none_or(|slot| storage.database(slot).oid != storage.current_database_oid())
             {
                 return sql_fail(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -43605,6 +44274,9 @@ fn alter_table_inner(
                         new_name
                     ));
                 }
+                if let Err(error) = materialize_flag_key_names(&mut new_def) {
+                    return sql_fail(error);
+                }
                 new_def.name = match SqlName::parse(new_name) {
                     Ok(n) => n,
                     Err(e) => return sql_fail(e),
@@ -44929,6 +45601,31 @@ fn alter_table_inner(
         responder.command_complete("ALTER TABLE")?;
     }
     sql_ok()
+}
+
+/// Inline single-column keys use compact column flags until an operation must
+/// preserve their catalog identity independently of the table name.
+fn materialize_flag_key_names(def: &mut TableDef) -> Result<(), SqlError> {
+    for column in 0..def.n_columns {
+        let metadata = def.columns[column];
+        if !(metadata.primary || metadata.unique) {
+            continue;
+        }
+        let mut indices = [0u16; crate::storage::MAX_INDEX_COLS];
+        indices[0] = column as u16;
+        crate::sql::exec::ddl::add_unique_key(
+            def,
+            None,
+            if metadata.primary { "pkey" } else { "key" },
+            &indices,
+            1,
+            metadata.primary,
+            crate::sql::ast::ConstraintTiming::NotDeferrable,
+        )?;
+        def.columns[column].primary = false;
+        def.columns[column].unique = false;
+    }
+    Ok(())
 }
 
 fn undefined_column(name: &str) -> SqlError {

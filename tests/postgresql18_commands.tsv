@@ -18,7 +18,7 @@ ABORT	complete	05_transactions.sql
 ALTER AGGREGATE	partial	110_user_defined_aggregates.sql
 ALTER COLLATION	missing	-
 ALTER CONVERSION	missing	-
-ALTER DATABASE	missing	-
+ALTER DATABASE	complete	118_database_configuration.sql
 ALTER DEFAULT PRIVILEGES	complete	83_roles_acl.sql
 ALTER DOMAIN	partial	62_domains.sql
 ALTER EVENT TRIGGER	missing	-
@@ -45,9 +45,9 @@ ALTER SEQUENCE	partial	54_sequence.sql
 ALTER SERVER	missing	-
 ALTER STATISTICS	complete	109_extended_statistics.sql
 ALTER SUBSCRIPTION	partial	98_subscription.sql and subscription shard (definition, refresh, initial synchronization)
-ALTER SYSTEM	missing	-
+ALTER SYSTEM	complete	118_database_configuration.sql
 ALTER TABLE	partial	45_alter_column.sql
-ALTER TABLESPACE	partial	index lifecycle recovery test (provider-neutral placement metadata)
+ALTER TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 ALTER TEXT SEARCH CONFIGURATION	missing	-
 ALTER TEXT SEARCH DICTIONARY	missing	-
 ALTER TEXT SEARCH PARSER	missing	-
@@ -72,7 +72,7 @@ CREATE AGGREGATE	complete	110_user_defined_aggregates.sql
 CREATE CAST	complete	117_cast_operator_catalog.sql
 CREATE COLLATION	missing	-
 CREATE CONVERSION	missing	-
-CREATE DATABASE	missing	-
+CREATE DATABASE	complete	118_database_configuration.sql
 CREATE DOMAIN	complete	62_domains.sql
 CREATE EVENT TRIGGER	missing	-
 CREATE EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native libraries are rejected
@@ -98,7 +98,7 @@ CREATE STATISTICS	complete	109_extended_statistics.sql
 CREATE SUBSCRIPTION	partial	98_subscription.sql and subscription shard (disabled and managed initial synchronization)
 CREATE TABLE	partial	14_surface.sql
 CREATE TABLE AS	complete	52_create_table_as.sql
-CREATE TABLESPACE	partial	index lifecycle recovery test (provider-neutral placement metadata)
+CREATE TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 CREATE TEXT SEARCH CONFIGURATION	missing	-
 CREATE TEXT SEARCH DICTIONARY	missing	-
 CREATE TEXT SEARCH PARSER	missing	-
@@ -112,14 +112,14 @@ CREATE VIEW	complete	76_stored_dependencies.sql
 DEALLOCATE	complete	14_surface.sql
 DECLARE	partial	39_cursors.sql
 DELETE	complete	02_dml_returning.sql
-DISCARD	missing	-
+DISCARD	complete	118_database_configuration.sql
 DO	partial	100_plpgsql_procedures.sql and 112_routine_bodies_attributes_do.sql (bounded PL/pgSQL declarations, control flow, diagnostics, exceptions, queries, DML, and lone top-level transaction control)
 DROP ACCESS METHOD	missing	-
 DROP AGGREGATE	complete	110_user_defined_aggregates.sql
 DROP CAST	partial	117_cast_operator_catalog.sql
 DROP COLLATION	missing	-
 DROP CONVERSION	missing	-
-DROP DATABASE	missing	-
+DROP DATABASE	complete	118_database_configuration.sql
 DROP DOMAIN	complete	62_domains.sql
 DROP EVENT TRIGGER	missing	-
 DROP EXTENSION	partial	111_extension_lifecycle.sql covers SQL-package dependency classes; native packages are not loaded
@@ -146,7 +146,7 @@ DROP SERVER	missing	-
 DROP STATISTICS	complete	109_extended_statistics.sql
 DROP SUBSCRIPTION	partial	98_subscription.sql (durable disabled lifecycle)
 DROP TABLE	complete	14_surface.sql
-DROP TABLESPACE	partial	index lifecycle recovery test (provider-neutral placement metadata)
+DROP TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 DROP TEXT SEARCH CONFIGURATION	missing	-
 DROP TEXT SEARCH DICTIONARY	missing	-
 DROP TEXT SEARCH PARSER	missing	-

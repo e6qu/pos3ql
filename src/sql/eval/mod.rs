@@ -164,6 +164,7 @@ pub mod sqlstate {
     pub const AMBIGUOUS_ALIAS: &str = "42P09";
     pub const INVALID_SCHEMA_NAME: &str = "3F000";
     pub const INVALID_CATALOG_NAME: &str = "3D000";
+    pub const DUPLICATE_DATABASE: &str = "42P04";
     pub const DEPENDENT_OBJECTS_STILL_EXIST: &str = "2BP01";
     pub const UNDEFINED_OBJECT: &str = "42704";
     pub const DATATYPE_MISMATCH: &str = "42804";
@@ -217,6 +218,7 @@ pub mod sqlstate {
     pub const TOO_MANY_COLUMNS: &str = "54011";
     pub const TOO_MANY_ARGUMENTS: &str = "54023";
     pub const QUERY_CANCELED: &str = "57014";
+    pub const ADMIN_SHUTDOWN: &str = "57P01";
     pub const IO_ERROR: &str = "58030";
     pub const INTERNAL_ERROR: &str = "XX000";
     pub const ACTIVE_SQL_TRANSACTION: &str = "25001";

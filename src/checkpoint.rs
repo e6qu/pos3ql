@@ -27,7 +27,7 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v2";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v3";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -1113,6 +1113,7 @@ impl Checkpointer {
         )> = Vec::new();
         let mut table_statistics: Vec<(usize, crate::storage::TableStatistics)> = Vec::new();
         struct LoadedExtendedStatistics {
+            database: crate::storage::DatabaseOid,
             created_at: u64,
             table_index: usize,
             schema: crate::storage::SqlName,
@@ -1136,6 +1137,20 @@ impl Checkpointer {
                 }
                 Some("next_rowid") => {
                     next_rowid = parse_field(words.next(), "next_rowid")?;
+                }
+                Some("dbctx") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let oid: i32 = parse_field(words.next(), "database context")?;
+                    let database = crate::storage::DatabaseOid::parse(oid)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid database context"))?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing database context fields",
+                        ));
+                    }
+                    storage
+                        .select_database_for_recovery(database)
+                        .map_err(|_| CheckpointSetupError::Corrupt("unknown database context"))?;
                 }
                 Some("table") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -1389,15 +1404,17 @@ impl Checkpointer {
                         }
                     }
                     if words.next().is_some()
-                        || extended_statistics
-                            .iter()
-                            .any(|statistics| statistics.created_at == created_at)
+                        || extended_statistics.iter().any(|statistics| {
+                            statistics.database == storage.current_database_oid()
+                                && statistics.created_at == created_at
+                        })
                     {
                         return Err(CheckpointSetupError::Corrupt(
                             "duplicate or malformed estat",
                         ));
                     }
                     extended_statistics.push(LoadedExtendedStatistics {
+                        database: storage.current_database_oid(),
                         created_at,
                         table_index,
                         schema,
@@ -1414,7 +1431,10 @@ impl Checkpointer {
                     let created_at: u64 = parse_field(words.next(), "estatdata identity")?;
                     let statistics = extended_statistics
                         .iter_mut()
-                        .find(|statistics| statistics.created_at == created_at)
+                        .find(|statistics| {
+                            statistics.database == storage.current_database_oid()
+                                && statistics.created_at == created_at
+                        })
                         .ok_or(CheckpointSetupError::Corrupt("estatdata precedes estat"))?;
                     if statistics.data.valid {
                         return Err(CheckpointSetupError::Corrupt("duplicate estatdata"));
@@ -1446,7 +1466,10 @@ impl Checkpointer {
                     let strength: u32 = parse_field(words.next(), "estatdep strength")?;
                     let statistics = extended_statistics
                         .iter_mut()
-                        .find(|statistics| statistics.created_at == created_at)
+                        .find(|statistics| {
+                            statistics.database == storage.current_database_oid()
+                                && statistics.created_at == created_at
+                        })
                         .ok_or(CheckpointSetupError::Corrupt("estatdep precedes estat"))?;
                     if index >= statistics.data.dependencies_ppm.len()
                         || strength > 1_000_000
@@ -1462,7 +1485,10 @@ impl Checkpointer {
                     let key: usize = parse_field(words.next(), "estatexpr key")?;
                     let statistics = extended_statistics
                         .iter_mut()
-                        .find(|statistics| statistics.created_at == created_at)
+                        .find(|statistics| {
+                            statistics.database == storage.current_database_oid()
+                                && statistics.created_at == created_at
+                        })
                         .ok_or(CheckpointSetupError::Corrupt("estatexpr precedes estat"))?;
                     if key >= usize::from(statistics.n_keys)
                         || statistics.data.expression_statistics[key].valid
@@ -1497,7 +1523,10 @@ impl Checkpointer {
                         .ok_or(CheckpointSetupError::Corrupt("estatmcv value missing"))?;
                     let statistics = extended_statistics
                         .iter_mut()
-                        .find(|statistics| statistics.created_at == created_at)
+                        .find(|statistics| {
+                            statistics.database == storage.current_database_oid()
+                                && statistics.created_at == created_at
+                        })
                         .ok_or(CheckpointSetupError::Corrupt("estatmcv precedes estat"))?;
                     let position = usize::from(statistics.data.n_mcv);
                     if position >= crate::storage::MAX_EXTENDED_STATISTICS_MCV
@@ -1681,12 +1710,107 @@ impl Checkpointer {
                             ))
                         })?;
                 }
+                Some("db") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let oid: i32 = parse_field(words.next(), "db oid")?;
+                    let oid = crate::storage::DatabaseOid::parse(oid)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid db oid"))?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("db name missing"))?,
+                    )?;
+                    let owner_name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("db owner missing"))?,
+                    )?;
+                    let flags: u8 = parse_field(words.next(), "db flags")?;
+                    let encoding: u8 = parse_field(words.next(), "db encoding")?;
+                    let provider: u8 = parse_field(words.next(), "db locale provider")?;
+                    let tablespace: u16 = parse_field(words.next(), "db tablespace")?;
+                    let connection_limit: i32 = parse_field(words.next(), "db connection limit")?;
+                    let collate = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("db collate missing"))?,
+                    )?;
+                    let ctype = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("db ctype missing"))?,
+                    )?;
+                    let locale = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("db locale missing"))?,
+                    )?;
+                    let collation_version = decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("db collation version missing"),
+                    )?)?;
+                    if words.next().is_some() || flags & !3 != 0 || connection_limit < -1 {
+                        return Err(CheckpointSetupError::Corrupt("invalid db record"));
+                    }
+                    let owner = storage
+                        .find_role(&owner_name)
+                        .ok_or(CheckpointSetupError::Corrupt("db owner does not exist"))?;
+                    let definition = crate::storage::DatabaseDefinition {
+                        name: sql_name(&name)?,
+                        encoding: crate::storage::DatabaseEncoding::from_code(encoding)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid db encoding"))?,
+                        locale_provider: crate::storage::DatabaseLocaleProvider::from_code(
+                            provider,
+                        )
+                        .ok_or(CheckpointSetupError::Corrupt("invalid db locale provider"))?,
+                        collate: crate::util::StackStr::from_str(&collate),
+                        ctype: crate::util::StackStr::from_str(&ctype),
+                        locale: crate::util::StackStr::from_str(&locale),
+                        collation_version: crate::util::StackStr::from_str(&collation_version),
+                        allow_connections: flags & 1 != 0,
+                        is_template: flags & 2 != 0,
+                        connection_limit,
+                        tablespace,
+                    };
+                    if definition.collate.is_truncated()
+                        || definition.ctype.is_truncated()
+                        || definition.locale.is_truncated()
+                        || definition.collation_version.is_truncated()
+                    {
+                        return Err(CheckpointSetupError::Corrupt("db field is too long"));
+                    }
+                    if let Some(slot) = storage.database_slot_by_oid(oid, 0) {
+                        storage
+                            .alter_database_definition(slot, definition, 0)
+                            .map_err(|_| CheckpointSetupError::Corrupt("invalid built-in db"))?;
+                        storage.set_object_owner(
+                            crate::storage::AccessObject {
+                                class: crate::storage::AccessClass::Database,
+                                slot: slot as u16,
+                            },
+                            owner,
+                            0,
+                        );
+                        storage.commit_database_alter(slot, 0);
+                    } else {
+                        storage
+                            .restore_database(oid, definition, owner as u16)
+                            .map_err(|error| {
+                                CheckpointSetupError::ObjectStore(format!(
+                                    "manifest database rejected: {}",
+                                    error.message.as_str()
+                                ))
+                            })?;
+                    }
+                }
                 Some("rset") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let scope: u8 = parse_field(words.next(), "rset scope")?;
                     let role = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("rset role missing"))?;
+                    let database = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rset database missing"))?;
                     let name = decode_hex_name(
                         words
                             .next()
@@ -1705,6 +1829,19 @@ impl Checkpointer {
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid rset record"));
                     }
+                    let database_oid = if database == "-" {
+                        None
+                    } else {
+                        let oid: i32 = database
+                            .parse()
+                            .map_err(|_| CheckpointSetupError::Corrupt("invalid rset database"))?;
+                        let oid = crate::storage::DatabaseOid::parse(oid)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid rset database"))?;
+                        storage.database_slot_by_oid(oid, 0).ok_or(
+                            CheckpointSetupError::Corrupt("rset database does not exist"),
+                        )?;
+                        Some(oid)
+                    };
                     let scope = match scope {
                         0 | 1 => {
                             let role = decode_hex_name(role)?;
@@ -1713,12 +1850,25 @@ impl Checkpointer {
                                 .ok_or(CheckpointSetupError::Corrupt("rset role does not exist"))?
                                 as u16;
                             if scope == 0 {
+                                if database_oid.is_some() {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "invalid global rset database",
+                                    ));
+                                }
                                 crate::storage::RoleSettingScope::RoleAllDatabases(slot)
                             } else {
-                                crate::storage::RoleSettingScope::RoleInDatabase(slot)
+                                crate::storage::RoleSettingScope::RoleInDatabase {
+                                    role: slot,
+                                    database: database_oid.ok_or(CheckpointSetupError::Corrupt(
+                                        "rset database missing",
+                                    ))?,
+                                }
                             }
                         }
-                        2 if role == "-" => crate::storage::RoleSettingScope::AllRolesInDatabase,
+                        2 if role == "-" => crate::storage::RoleSettingScope::AllRolesInDatabase(
+                            database_oid
+                                .ok_or(CheckpointSetupError::Corrupt("rset database missing"))?,
+                        ),
                         _ => return Err(CheckpointSetupError::Corrupt("invalid rset scope")),
                     };
                     storage
@@ -1730,6 +1880,35 @@ impl Checkpointer {
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest role setting rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("sset") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("sset name missing"))?,
+                    )?;
+                    let value = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("sset value missing"))?,
+                    )?;
+                    if words.next().is_some()
+                        || value.len() > crate::storage::ROLE_SETTING_VALUE_MAX
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid sset record"));
+                    }
+                    storage
+                        .install_system_setting(
+                            sql_name(&name)?,
+                            Some(crate::util::StackStr::from_str(&value)),
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest system setting rejected: {}",
                                 error.message.as_str()
                             ))
                         })?;
@@ -1772,7 +1951,15 @@ impl Checkpointer {
                     } else {
                         storage.resolve_access_object(class, &schema, &name, 0)
                     })
-                    .ok_or(CheckpointSetupError::Corrupt("own target does not exist"))?;
+                    .ok_or_else(|| {
+                        CheckpointSetupError::ObjectStore(format!(
+                            "manifest ownership target does not exist: database {} class {} schema {:?} name {:?}",
+                            storage.current_database_oid().get(),
+                            class as u8,
+                            schema,
+                            name,
+                        ))
+                    })?;
                     let owner = storage
                         .find_role(&owner)
                         .ok_or(CheckpointSetupError::Corrupt("own role does not exist"))?;
@@ -2575,6 +2762,7 @@ impl Checkpointer {
                     }
                     storage
                         .create_cast_from_image(crate::storage::CastDef {
+                            database: crate::storage::DatabaseOid::POSTGRES,
                             created_at,
                             source,
                             target,
@@ -3694,7 +3882,6 @@ impl Checkpointer {
                                 error.message.as_str()
                             ))
                         })?;
-                    storage.commit_tablespace_create(slot);
                 }
                 Some("idx") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -3914,6 +4101,7 @@ impl Checkpointer {
                     let slot = storage
                         .create_index(
                             crate::storage::IndexDef {
+                                database: crate::storage::DatabaseOid::POSTGRES,
                                 created_at,
                                 schema: sql_name(&schema)?,
                                 name: sql_name(&name)?,
@@ -4073,6 +4261,9 @@ impl Checkpointer {
             storage.install_table_statistics(slot, statistics);
         }
         for statistics in extended_statistics {
+            storage
+                .select_database_for_recovery(statistics.database)
+                .map_err(|_| CheckpointSetupError::Corrupt("unknown statistics database"))?;
             let table = slot_of
                 .get(statistics.table_index)
                 .copied()
@@ -4113,33 +4304,13 @@ impl Checkpointer {
                 storage.install_extended_statistics_data(slot, statistics.data);
             }
         }
-
-        storage.rebind_domain_base_types().map_err(|error| {
-            CheckpointSetupError::ObjectStore(format!(
-                "manifest domain base type rejected: {}",
-                error.message.as_str()
-            ))
-        })?;
-        storage.rebind_user_type_declarations().map_err(|error| {
-            CheckpointSetupError::ObjectStore(format!(
-                "manifest user-type declaration rejected: {}",
-                error.message.as_str()
-            ))
-        })?;
-        storage.rebind_routine_types().map_err(|error| {
-            CheckpointSetupError::ObjectStore(format!(
-                "manifest routine type rejected: {}",
-                error.message.as_str()
-            ))
-        })?;
+        // Engine startup performs one catalog rebind after it has merged the
+        // manifest and every committed journal source. Rebinding here would
+        // validate an intermediate image and retain this parser's large frame
+        // during the same database-wide work.
         storage
-            .rebind_all_stored_query_dependencies()
-            .map_err(|error| {
-                CheckpointSetupError::ObjectStore(format!(
-                    "manifest stored-query dependency rejected: {}",
-                    error.message.as_str()
-                ))
-            })?;
+            .select_database(crate::storage::DatabaseOid::POSTGRES)
+            .map_err(|_| CheckpointSetupError::Corrupt("postgres database is unavailable"))?;
         storage.set_lsn(lsn);
         if next_rowid > 0 {
             storage.observe_rowid(next_rowid - 1);
@@ -4368,6 +4539,7 @@ impl Checkpointer {
             &mut self.manifest_buf,
             format_args!("writer {:016x}", self.writer_id),
         )?;
+        let mut database_context = None;
 
         // Roles are durable catalog authority. Only SCRAM verifier material
         // crosses this object-backed manifest; plaintext passwords never do.
@@ -4472,15 +4644,67 @@ impl Checkpointer {
                 ),
             )?;
         }
+        for (slot, database) in storage.databases_visible_to(0) {
+            use core::fmt::Write;
+            let definition = storage.database_definition(slot, 0);
+            let owner = storage.object_owner(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Database,
+                    slot: slot as u16,
+                },
+                0,
+            );
+            let hex = |value: &str| {
+                let mut encoded = StackStr::<256>::new();
+                if value.is_empty() {
+                    let _ = write!(encoded, "-");
+                } else {
+                    for byte in value.as_bytes() {
+                        let _ = write!(encoded, "{byte:02x}");
+                    }
+                }
+                encoded
+            };
+            let name = hex(definition.name.as_str());
+            let owner = hex(storage.role_name(owner, 0).as_str());
+            let collate = hex(definition.collate.as_str());
+            let ctype = hex(definition.ctype.as_str());
+            let locale = hex(definition.locale.as_str());
+            let collation_version = hex(definition.collation_version.as_str());
+            let flags =
+                u8::from(definition.allow_connections) | (u8::from(definition.is_template) << 1);
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "db {} {} {} {} {} {} {} {} {} {} {} {}",
+                    database.oid.get(),
+                    name.as_str(),
+                    owner.as_str(),
+                    flags,
+                    definition.encoding.code(),
+                    definition.locale_provider.code(),
+                    definition.tablespace,
+                    definition.connection_limit,
+                    collate.as_str(),
+                    ctype.as_str(),
+                    locale.as_str(),
+                    collation_version.as_str()
+                ),
+            )?;
+        }
         for (_, setting) in storage.role_settings() {
             if !setting.live {
                 continue;
             }
             use core::fmt::Write;
-            let (scope, role_slot) = match setting.scope {
-                crate::storage::RoleSettingScope::RoleAllDatabases(role) => (0, Some(role)),
-                crate::storage::RoleSettingScope::RoleInDatabase(role) => (1, Some(role)),
-                crate::storage::RoleSettingScope::AllRolesInDatabase => (2, None),
+            let (scope, role_slot, database) = match setting.scope {
+                crate::storage::RoleSettingScope::RoleAllDatabases(role) => (0, Some(role), None),
+                crate::storage::RoleSettingScope::RoleInDatabase { role, database } => {
+                    (1, Some(role), Some(database))
+                }
+                crate::storage::RoleSettingScope::AllRolesInDatabase(database) => {
+                    (2, None, Some(database))
+                }
             };
             let mut role = StackStr::<130>::new();
             if let Some(slot) = role_slot {
@@ -4495,6 +4719,12 @@ impl Checkpointer {
                 let _ = write!(name, "{byte:02x}");
             }
             let mut value = StackStr::<{ crate::storage::ROLE_SETTING_VALUE_MAX * 2 }>::new();
+            let mut database_text = StackStr::<16>::new();
+            if let Some(database) = database {
+                let _ = write!(database_text, "{}", database.get());
+            } else {
+                let _ = write!(database_text, "-");
+            }
             if setting.value.as_str().is_empty() {
                 let _ = write!(value, "0");
             } else {
@@ -4505,20 +4735,56 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rset {} {} {} {}",
+                    "rset {} {} {} {} {}",
                     scope,
                     role.as_str(),
+                    database_text.as_str(),
                     name.as_str(),
                     value.as_str()
                 ),
             )?;
         }
-
-        // Schemas: `nsp <hex-name>` (public is implicit and never written).
-        for (_, schema) in storage.live_schemas() {
-            if schema.name.as_str() == "public" {
+        for (_, setting) in storage.system_settings() {
+            if !setting.live {
                 continue;
             }
+            use core::fmt::Write;
+            let mut name = StackStr::<130>::new();
+            for byte in setting.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            let mut value = StackStr::<{ crate::storage::ROLE_SETTING_VALUE_MAX * 2 }>::new();
+            if setting.value.as_str().is_empty() {
+                let _ = write!(value, "-");
+            } else {
+                for byte in setting.value.as_str().as_bytes() {
+                    let _ = write!(value, "{byte:02x}");
+                }
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!("sset {} {}", name.as_str(), value.as_str()),
+            )?;
+        }
+
+        // The bootstrap databases already own their built-in public schemas.
+        // A user database's public schema is template data and is explicit.
+        for (_, schema) in storage.checkpoint_schemas() {
+            if schema.name.as_str() == "public"
+                && matches!(
+                    schema.database,
+                    crate::storage::DatabaseOid::TEMPLATE1
+                        | crate::storage::DatabaseOid::TEMPLATE0
+                        | crate::storage::DatabaseOid::POSTGRES
+                )
+            {
+                continue;
+            }
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                schema.database,
+            )?;
             use core::fmt::Write;
             let mut hex = StackStr::<130>::new();
             for b in schema.name.as_str().as_bytes() {
@@ -4532,7 +4798,8 @@ impl Checkpointer {
         // [<hex-cname> <hex-cexpr>]...`. Like enums, domains precede tables
         // because generated domain-array columns bind their runtime slot while
         // the table definition is rebuilt.
-        for (_, d) in storage.live_domains() {
+        for (_, d) in storage.checkpoint_domains() {
+            write_database_context(&mut self.manifest_buf, &mut database_context, d.database)?;
             use core::fmt::Write;
             let mut line = StackStr::<10_240>::new();
             let hex = |line: &mut StackStr<10_240>, s: &str| {
@@ -4604,7 +4871,8 @@ impl Checkpointer {
         // <sort-bits>]...`. Written before tables so an enum-typed column
         // resolves its type slot when its table is rebuilt on load. The sort
         // key is emitted as its exact f64 bit pattern.
-        for (_, e) in storage.live_enums() {
+        for (_, e) in storage.checkpoint_enums() {
+            write_database_context(&mut self.manifest_buf, &mut database_context, e.database)?;
             use core::fmt::Write;
             let mut line = StackStr::<10_240>::new();
             let hex = |line: &mut StackStr<10_240>, s: &str| {
@@ -4630,7 +4898,12 @@ impl Checkpointer {
         }
         // Named composites precede tables because composite columns rebind by
         // catalog identity while the table definitions are restored.
-        for (_, definition) in storage.live_composites() {
+        for (_, definition) in storage.checkpoint_composites() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                definition.database,
+            )?;
             use core::fmt::Write;
             let mut line = StackStr::<10_240>::new();
             let hex = |line: &mut StackStr<10_240>, value: &str| {
@@ -4690,6 +4963,11 @@ impl Checkpointer {
                 }
                 continue;
             }
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                table.database,
+            )?;
             // Table + columns into the manifest.
             write_manifest(
                 &mut self.manifest_buf,
@@ -5068,7 +5346,12 @@ impl Checkpointer {
                 )?;
             }
         }
-        for (statistics_slot, statistics) in storage.extended_statistics_visible(0) {
+        for (statistics_slot, statistics) in storage.checkpoint_extended_statistics() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                statistics.database,
+            )?;
             use core::fmt::Write as _;
             let mutable = statistics.definition_for(0);
             let mut schema_hex = StackStr::<130>::new();
@@ -5174,7 +5457,8 @@ impl Checkpointer {
             }
         }
         // View SQL and names are hex because the manifest is space-separated.
-        for (view_slot, view) in storage.views_with_slots() {
+        for (view_slot, view) in storage.checkpoint_views() {
+            write_database_context(&mut self.manifest_buf, &mut database_context, view.database)?;
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
             for b in view.sql.as_str().as_bytes() {
@@ -5210,7 +5494,12 @@ impl Checkpointer {
         }
         // Materialized views: like `vw2`, plus a trailing populated flag (0/1).
         // Publications: database-scoped names plus explicit table slots.
-        for (_, publication) in storage.publications_with_slots() {
+        for (_, publication) in storage.checkpoint_publications() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                publication.database,
+            )?;
             use core::fmt::Write;
             let mut name = StackStr::<130>::new();
             for byte in publication.name.as_str().as_bytes() {
@@ -5289,7 +5578,8 @@ impl Checkpointer {
         }
         // A replication slot's active flag is process-local; only its resume
         // positions survive a checkpoint and restart.
-        for (_, slot) in storage.replication_slots_with_slots() {
+        for (_, slot) in storage.checkpoint_replication_slots() {
+            write_database_context(&mut self.manifest_buf, &mut database_context, slot.database)?;
             use core::fmt::Write;
             let mut name = StackStr::<130>::new();
             for byte in slot.name.as_str().as_bytes() {
@@ -5308,7 +5598,12 @@ impl Checkpointer {
         }
         // Subscriptions are catalog state, not a local worker cache. Hex
         // fields preserve conninfo whitespace in the line-oriented manifest.
-        for (_, subscription) in storage.subscriptions_with_slots_durable() {
+        for (_, subscription) in storage.checkpoint_subscriptions() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                subscription.database,
+            )?;
             use core::fmt::Write;
             let mut name = StackStr::<130>::new();
             let mut connection =
@@ -5420,7 +5715,8 @@ impl Checkpointer {
         }
         // The backing table's rows serialize through the ordinary table/dsst
         // loop; this line records only the defining query.
-        for (matview_slot, mv) in storage.matviews_with_slots() {
+        for (matview_slot, mv) in storage.checkpoint_matviews() {
+            write_database_context(&mut self.manifest_buf, &mut database_context, mv.database)?;
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
             for b in mv.sql.as_str().as_bytes() {
@@ -5454,7 +5750,8 @@ impl Checkpointer {
         // Sequences: hex schema/name, then the numeric parameters and the live
         // value state (`last_value`, `is_called`). A sequence stores no rows, so
         // this line is its whole durable form.
-        for seq in storage.live_sequences() {
+        for seq in storage.checkpoint_sequences() {
+            write_database_context(&mut self.manifest_buf, &mut database_context, seq.database)?;
             use core::fmt::Write;
             let mut hschema = StackStr::<130>::new();
             for b in seq.schema.as_str().as_bytes() {
@@ -5529,6 +5826,11 @@ impl Checkpointer {
             if !routine.visible_to(0) {
                 continue;
             }
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                routine.database,
+            )?;
             use core::fmt::Write;
             let mut owner = StackStr::<130>::new();
             let mut schema = StackStr::<130>::new();
@@ -5749,7 +6051,8 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, cast) in storage.live_casts() {
+        for (_, cast) in storage.checkpoint_casts() {
+            write_database_context(&mut self.manifest_buf, &mut database_context, cast.database)?;
             let function = match cast.method {
                 crate::storage::CastMethod::Function(oid) => oid,
                 crate::storage::CastMethod::Binary | crate::storage::CastMethod::InOut => 0,
@@ -5767,7 +6070,12 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, operator) in storage.live_operators() {
+        for (_, operator) in storage.checkpoint_operators() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                operator.database,
+            )?;
             let definition = operator.definition;
             let result = definition
                 .implementation
@@ -5803,11 +6111,16 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, operator) in storage.live_operators() {
+        for (_, operator) in storage.checkpoint_operators() {
             let definition = operator.definition;
             if definition.commutator.is_none() && definition.negator.is_none() {
                 continue;
             }
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                operator.database,
+            )?;
             let linked_oid = |oid: Option<i32>| oid.unwrap_or(0);
             write_manifest(
                 &mut self.manifest_buf,
@@ -5819,7 +6132,12 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, family) in storage.live_operator_families() {
+        for (_, family) in storage.checkpoint_operator_families() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                family.database,
+            )?;
             let definition = family.definition;
             write_manifest(
                 &mut self.manifest_buf,
@@ -5857,7 +6175,12 @@ impl Checkpointer {
                 )?;
             }
         }
-        for (_, class) in storage.live_operator_classes() {
+        for (_, class) in storage.checkpoint_operator_classes() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                class.database,
+            )?;
             let definition = class.definition;
             write_manifest(
                 &mut self.manifest_buf,
@@ -5899,7 +6222,12 @@ impl Checkpointer {
                 )?;
             }
         }
-        for (_, trigger) in storage.triggers_with_slots_visible_to(0) {
+        for (_, trigger) in storage.checkpoint_triggers() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                trigger.database,
+            )?;
             use core::fmt::Write;
             let (target_kind, relation_schema, relation_name) = match trigger.target {
                 crate::storage::TriggerTarget::Table(slot) => {
@@ -6027,6 +6355,11 @@ impl Checkpointer {
         for (trigger_slot, table_slot, enabled) in storage.partition_trigger_states() {
             use core::fmt::Write;
             let trigger = storage.trigger(trigger_slot);
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                trigger.database,
+            )?;
             let table = storage.table_def(table_slot, 0);
             let mut schema = StackStr::<130>::new();
             let mut table_name = StackStr::<130>::new();
@@ -6047,7 +6380,12 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, policy) in storage.policies_with_slots_visible_to(0) {
+        for (_, policy) in storage.checkpoint_policies() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                policy.database,
+            )?;
             use core::fmt::Write;
             let table = storage.table_def(usize::from(policy.table), 0);
             let definition = policy.definition_for(0);
@@ -6113,7 +6451,12 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, extension) in storage.live_extensions() {
+        for (_, extension) in storage.checkpoint_extensions() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                extension.database,
+            )?;
             use core::fmt::Write;
             let mut name = StackStr::<130>::new();
             let mut schema = StackStr::<130>::new();
@@ -6207,7 +6550,10 @@ impl Checkpointer {
         }
         // Object comments: `cmt <class> <subid> <hex-schema> <hex-name>
         // <hex-text>`. Only committed comments carrying text are written.
-        for comment in storage.live_comments() {
+        for comment in storage.checkpoint_comments() {
+            if let Some(database) = comment.database {
+                write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
+            }
             use core::fmt::Write;
             let Some(text) = comment.live else { continue };
             let mut hschema = StackStr::<130>::new();
@@ -6247,6 +6593,9 @@ impl Checkpointer {
             for byte in tablespace.location.as_str().as_bytes() {
                 let _ = write!(location, "{byte:02x}");
             }
+            if location.as_str().is_empty() {
+                location = StackStr::from_str("-");
+            }
             let options = tablespace.options;
             write_manifest(
                 &mut self.manifest_buf,
@@ -6269,7 +6618,12 @@ impl Checkpointer {
             )?;
         }
         // Index definitions are complete catalog state, not a cache rebuild hint.
-        for index in storage.live_indexes() {
+        for (_, index) in storage.checkpoint_indexes() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                index.database,
+            )?;
             use core::fmt::Write;
             let mut columns = StackStr::<128>::new();
             for c in &index.columns[..index.n_cols] {
@@ -6398,7 +6752,14 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, dependency) in storage.extension_dependencies_visible_to(0) {
+        for (_, dependency) in storage.checkpoint_extension_dependencies() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                storage
+                    .access_object_database(dependency.object)
+                    .expect("extension members are database-local"),
+            )?;
             use core::fmt::Write;
             let extension = storage.extension(dependency.extension as usize).name;
             let (schema, name) = storage.access_object_name(dependency.object);
@@ -6440,7 +6801,14 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, config) in storage.extension_configs_visible_to(0) {
+        for (_, config) in storage.checkpoint_extension_configs() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                storage
+                    .access_object_database(config.relation.access_object())
+                    .expect("extension configuration relations are database-local"),
+            )?;
             use core::fmt::Write;
             let extension = storage.extension(config.extension as usize).name;
             let (schema, name) = storage.access_object_name(config.relation.access_object());
@@ -6481,6 +6849,9 @@ impl Checkpointer {
         // cold manifest load can resolve stable runtime slots from names.
         let mut write_owner = |object: crate::storage::AccessObject| -> Result<(), SqlError> {
             use core::fmt::Write;
+            if let Some(database) = storage.access_object_database(object) {
+                write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
+            }
             let (schema, name) = storage.access_object_name(object);
             let owner = storage.role(storage.object_owner(object, 0)).name;
             let mut schema_hex = StackStr::<130>::new();
@@ -6531,49 +6902,49 @@ impl Checkpointer {
                 })?;
             }
         }
-        for (slot, _) in storage.views_with_slots() {
+        for (slot, _) in storage.checkpoint_views() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::View,
                 slot: slot as u16,
             })?;
         }
-        for (slot, _) in storage.matviews_with_slots() {
+        for (slot, _) in storage.checkpoint_matviews() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::MaterializedView,
                 slot: slot as u16,
             })?;
         }
-        for (slot, _) in storage.sequences_with_slots() {
+        for (slot, _) in storage.checkpoint_sequences_with_slots() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Sequence,
                 slot: slot as u16,
             })?;
         }
-        for (slot, _) in storage.live_schemas() {
+        for (slot, _) in storage.checkpoint_schemas() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Schema,
                 slot: slot as u16,
             })?;
         }
-        for (slot, _) in storage.live_extensions() {
+        for (slot, _) in storage.checkpoint_extensions() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Extension,
                 slot: slot as u16,
             })?;
         }
-        for (slot, _) in storage.live_domains() {
+        for (slot, _) in storage.checkpoint_domains() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Domain,
                 slot: slot as u16,
             })?;
         }
-        for (slot, _) in storage.live_enums() {
+        for (slot, _) in storage.checkpoint_enums() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Enum,
                 slot: slot as u16,
             })?;
         }
-        for (slot, _) in storage.live_indexes_with_slots() {
+        for (slot, _) in storage.checkpoint_indexes() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Index,
                 slot: slot as u16,
@@ -6584,9 +6955,12 @@ impl Checkpointer {
                 write_owner(crate::storage::Storage::routine_access_object(slot))?;
             }
         }
-        for (_, acl) in storage.live_acls() {
-            if !storage.access_object_is_live(acl.object) {
+        for (_, acl) in storage.checkpoint_acls() {
+            if !storage.access_object_is_live_in_catalog(acl.object) {
                 continue;
+            }
+            if let Some(database) = storage.access_object_database(acl.object) {
+                write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
             }
             use core::fmt::Write;
             let (schema, name) = storage.access_object_name(acl.object);
@@ -6643,10 +7017,17 @@ impl Checkpointer {
                 )?;
             }
         }
-        for (_, acl) in storage.live_column_acls() {
-            if !storage.access_object_is_live(acl.target.relation()) {
+        for (_, acl) in storage.checkpoint_column_acls() {
+            if !storage.access_object_is_live_in_catalog(acl.target.relation()) {
                 continue;
             }
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                storage
+                    .access_object_database(acl.target.relation())
+                    .expect("column ACL relation is database-local"),
+            )?;
             use core::fmt::Write;
             let relation = acl.target.relation();
             let (schema, name) = storage.access_object_name(relation);
@@ -6687,7 +7068,8 @@ impl Checkpointer {
                 ),
             )?;
         }
-        for (_, acl) in storage.live_default_acls() {
+        for (_, acl) in storage.checkpoint_default_acls() {
+            write_database_context(&mut self.manifest_buf, &mut database_context, acl.database)?;
             use core::fmt::Write;
             let owner = storage.role(acl.owner as usize).name;
             let schema = if acl.schema == crate::storage::DEFAULT_ACL_ALL_SCHEMAS {
@@ -7372,6 +7754,18 @@ fn write_manifest(buffer: &mut FixedBuf, line: impl core::fmt::Display) -> Resul
             "manifest exceeds its fixed buffer"
         )
     })
+}
+
+fn write_database_context(
+    buffer: &mut FixedBuf,
+    current: &mut Option<crate::storage::DatabaseOid>,
+    database: crate::storage::DatabaseOid,
+) -> Result<(), SqlError> {
+    if *current != Some(database) {
+        write_manifest(buffer, format_args!("dbctx {}", database.get()))?;
+        *current = Some(database);
+    }
+    Ok(())
 }
 
 fn object_store_to_sql(e: ObjectError) -> SqlError {

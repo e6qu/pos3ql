@@ -20,6 +20,7 @@ KEEP=${1:-}
 PGBIN=${POS3QL_PGBIN:-/opt/homebrew/opt/postgresql@18/bin}
 REFERENCE_HOST=${POS3QL_REFERENCE_PG_HOST:-}
 REFERENCE_PORT=${POS3QL_REFERENCE_PG_PORT:-}
+REFERENCE_DATABASE=${POS3QL_REFERENCE_PG_DATABASE:-postgres}
 if [[ -n "$REFERENCE_HOST" ]]; then
   if [[ -z "$REFERENCE_PORT" || -z "${POS3QL_REFERENCE_PSQL:-}" ]]; then
     printf '%s\n' 'FAIL: an external PostgreSQL reference requires both POS3QL_REFERENCE_PG_PORT and POS3QL_REFERENCE_PSQL'
@@ -111,7 +112,7 @@ trap cleanup EXIT
 if [[ "$REFERENCE_MODE" == local ]]; then
   printf '=== reference: %s ===\n' "$("$PGBIN/postgres" --version)"
 else
-  if ! reference_version=$("$PSQL" -h "$REFERENCE_HOST" -p "$PG_PORT" -U postgres -X -t -A -c 'SHOW server_version' 2>&1); then
+  if ! reference_version=$("$PSQL" -h "$REFERENCE_HOST" -p "$PG_PORT" -U postgres -d "$REFERENCE_DATABASE" -X -t -A -c 'SHOW server_version' 2>&1); then
     printf 'FAIL: external PostgreSQL reference is unavailable: %s\n' "$reference_version"
     exit 1
   fi
@@ -170,7 +171,7 @@ fi
 P3_PID=$!
 
 for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -d "$REFERENCE_DATABASE" -X -q -c "SELECT 1" >/dev/null 2>&1 && break
   sleep 0.1
 done
 P3_READY=0
@@ -213,7 +214,7 @@ normalize() {
 run_corpus() { # port name file
   if [[ "$1" == "$PG_PORT" ]]; then
     PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
-      "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
+      "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -a -q -P pager=off \
         -v VERBOSITY=verbose -f "$3" 2>&1
   else
     "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
@@ -226,12 +227,14 @@ run_corpus() { # port name file
   fi
 }
 reset_user_extensions() { # port
-  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -A -t -q \
+  local database=postgres
+  [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
+  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -A -t -q \
     -c "SELECT extname FROM pg_extension WHERE extname LIKE 'pos3ql_%' ORDER BY extname DESC" |
   while IFS= read -r extension; do
     [[ -z "$extension" ]] && continue
     extension=${extension//\"/\"\"}
-    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -q \
+    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -q \
       -c "DROP EXTENSION \"$extension\" CASCADE" >/dev/null 2>&1
   done
 }
@@ -240,14 +243,16 @@ reset_user_extensions() { # port
 # relations between suites without replacing `public`, whose identity and ACLs
 # are PostgreSQL-visible state.
 reset_user_relations() { # port
-  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -A -t -q \
+  local database=postgres
+  [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
+  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -A -t -q \
     -F $'\t' \
     -c "SELECT n.nspname, c.relname FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p')" |
   while IFS=$'\t' read -r schema relation; do
     [[ -z "$relation" ]] && continue
     schema=${schema//\"/\"\"}
     relation=${relation//\"/\"\"}
-    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -q \
+    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -q \
       -c "DROP TABLE \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
   done
 }
@@ -305,7 +310,9 @@ normalize_exact() {
 }
 
 run_exact() { # port name file
-  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
+  local database=postgres
+  [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
+  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -a -q -P pager=off \
     -v VERBOSITY=verbose -f "$3" 2>&1 | normalize_exact > "$WORK/$2"
 }
 

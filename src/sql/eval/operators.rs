@@ -729,6 +729,26 @@ pub(crate) fn compare_datums_as(
                 referenced_oid: b, ..
             },
         ) => a.cmp(b),
+        (Datum::Regtype { referenced_oid, .. }, Datum::Oid(value)) => {
+            referenced_oid.cmp(&(*value as i32))
+        }
+        (Datum::Oid(value), Datum::Regtype { referenced_oid, .. }) => {
+            (*value as i32).cmp(referenced_oid)
+        }
+        (Datum::Regtype { referenced_oid, .. }, Datum::Int2(value)) => {
+            referenced_oid.cmp(&i32::from(*value))
+        }
+        (Datum::Int2(value), Datum::Regtype { referenced_oid, .. }) => {
+            i32::from(*value).cmp(referenced_oid)
+        }
+        (Datum::Regtype { referenced_oid, .. }, Datum::Int4(value)) => referenced_oid.cmp(value),
+        (Datum::Int4(value), Datum::Regtype { referenced_oid, .. }) => value.cmp(referenced_oid),
+        (Datum::Regtype { referenced_oid, .. }, Datum::Int8(value)) => {
+            i64::from(*referenced_oid).cmp(value)
+        }
+        (Datum::Int8(value), Datum::Regtype { referenced_oid, .. }) => {
+            value.cmp(&i64::from(*referenced_oid))
+        }
         (
             Datum::RegObject {
                 type_oid: at,
@@ -741,6 +761,12 @@ pub(crate) fn compare_datums_as(
                 ..
             },
         ) if at == bt => a.cmp(b),
+        (Datum::RegObject { referenced_oid, .. }, Datum::Oid(value)) => {
+            referenced_oid.cmp(&(*value as i32))
+        }
+        (Datum::Oid(value), Datum::RegObject { referenced_oid, .. }) => {
+            (*value as i32).cmp(referenced_oid)
+        }
         (Datum::RegObject { referenced_oid, .. }, Datum::Int2(value)) => {
             referenced_oid.cmp(&i32::from(*value))
         }

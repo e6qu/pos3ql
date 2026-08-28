@@ -291,6 +291,45 @@ pub enum Stmt<'a> {
     /// support-function contract. Ordered-set direct arguments are therefore
     /// never accidentally fed to the transition function.
     CreateAggregate(CreateAggregate<'a>),
+    CreateCast(CreateCast<'a>),
+    DropCast(DropCast<'a>),
+    CreateOperator(CreateOperator<'a>),
+    AlterOperator {
+        identity: OperatorIdentity<'a>,
+        action: AlterOperatorAction<'a>,
+    },
+    DropOperator {
+        identities: &'a [OperatorIdentity<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
+    CreateOperatorFamily {
+        name: QualName<'a>,
+        method: IndexAccessMethod,
+    },
+    AlterOperatorFamily {
+        name: QualName<'a>,
+        method: IndexAccessMethod,
+        action: AlterOperatorFamilyAction<'a>,
+    },
+    DropOperatorFamily {
+        names: &'a [QualName<'a>],
+        method: IndexAccessMethod,
+        if_exists: bool,
+        cascade: bool,
+    },
+    CreateOperatorClass(CreateOperatorClass<'a>),
+    AlterOperatorClass {
+        name: QualName<'a>,
+        method: IndexAccessMethod,
+        action: AlterOperatorClassAction<'a>,
+    },
+    DropOperatorClass {
+        names: &'a [QualName<'a>],
+        method: IndexAccessMethod,
+        if_exists: bool,
+        cascade: bool,
+    },
     /// `CALL procedure(args)`: unlike a scalar expression call, this can run a
     /// complete SQL statement body and therefore has its own statement node.
     Call {
@@ -1450,6 +1489,185 @@ impl RoleOptions<'_> {
         password: None,
         valid_until: None,
     };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastContext {
+    Explicit,
+    Assignment,
+    Implicit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastMethod<'a> {
+    Function {
+        name: QualName<'a>,
+        argument_types: &'a [&'a str],
+    },
+    Binary,
+    InOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateCast<'a> {
+    pub source_type: &'a str,
+    pub target_type: &'a str,
+    pub method: CastMethod<'a>,
+    pub context: CastContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropCast<'a> {
+    pub source_type: &'a str,
+    pub target_type: &'a str,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+/// PostgreSQL exposes only the btree access method in pos3ql's modeled index
+/// runtime. Parsing produces this closed value before catalog mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexAccessMethod {
+    Btree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorOperands<'a> {
+    Prefix(&'a str),
+    Binary { left: &'a str, right: &'a str },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorIdentity<'a> {
+    pub name: QualName<'a>,
+    pub operands: OperatorOperands<'a>,
+}
+
+pub(crate) const CATALOG_OPERATOR_CALL_PREFIX: &str = "\u{1}operator\u{1f}";
+
+pub(crate) fn catalog_operator_call(name: &str) -> Option<(Option<&str>, &str)> {
+    let encoded = name.strip_prefix(CATALOG_OPERATOR_CALL_PREFIX)?;
+    let (schema, operator) = encoded.split_once('\u{1f}')?;
+    Some(((!schema.is_empty()).then_some(schema), operator))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateOperator<'a> {
+    pub name: QualName<'a>,
+    pub function: QualName<'a>,
+    pub operands: OperatorOperands<'a>,
+    pub commutator: Option<QualName<'a>>,
+    pub negator: Option<QualName<'a>>,
+    pub hashes: bool,
+    pub merges: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterOperatorAction<'a> {
+    Owner(&'a str),
+    SetSchema(&'a str),
+    Set {
+        commutator: Option<QualName<'a>>,
+        negator: Option<QualName<'a>>,
+        hashes: bool,
+        merges: bool,
+    },
+}
+
+/// Btree operator strategies are a closed 1..=5 domain. A raw integer can
+/// therefore never enter durable operator-family state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BtreeStrategy {
+    Less = 1,
+    LessEqual,
+    Equal,
+    GreaterEqual,
+    Greater,
+}
+
+impl BtreeStrategy {
+    pub const fn from_number(number: u32) -> Option<Self> {
+        match number {
+            1 => Some(Self::Less),
+            2 => Some(Self::LessEqual),
+            3 => Some(Self::Equal),
+            4 => Some(Self::GreaterEqual),
+            5 => Some(Self::Greater),
+            _ => None,
+        }
+    }
+
+    pub const fn number(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorFamilyMember<'a> {
+    Operator {
+        strategy: BtreeStrategy,
+        operator: OperatorIdentity<'a>,
+    },
+    CompareFunction {
+        left_type: &'a str,
+        right_type: &'a str,
+        function: QualName<'a>,
+        argument_types: &'a [&'a str],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterOperatorFamilyAction<'a> {
+    Add(&'a [OperatorFamilyMember<'a>]),
+    Drop(&'a [OperatorFamilyMemberIdentity<'a>]),
+    Rename(&'a str),
+    Owner(&'a str),
+    SetSchema(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorFamilyMemberIdentity<'a> {
+    Operator {
+        strategy: BtreeStrategy,
+        left_type: &'a str,
+        right_type: &'a str,
+    },
+    CompareFunction {
+        left_type: &'a str,
+        right_type: &'a str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorClassMember<'a> {
+    Operator {
+        strategy: BtreeStrategy,
+        operator: QualName<'a>,
+        operand_types: Option<(&'a str, &'a str)>,
+    },
+    CompareFunction {
+        operand_types: Option<(&'a str, &'a str)>,
+        function: QualName<'a>,
+        argument_types: &'a [&'a str],
+    },
+    Storage(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateOperatorClass<'a> {
+    pub name: QualName<'a>,
+    pub default: bool,
+    pub input_type: &'a str,
+    pub method: IndexAccessMethod,
+    pub family: Option<QualName<'a>>,
+    pub members: &'a [OperatorClassMember<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterOperatorClassAction<'a> {
+    Rename(&'a str),
+    Owner(&'a str),
+    SetSchema(&'a str),
 }
 
 /// One btree index key. A plain column retains its resolved name; every other
@@ -4179,6 +4397,86 @@ pub enum BinaryOp {
 }
 
 impl BinaryOp {
+    pub(crate) const fn from_operator_name(name: &str) -> Option<Self> {
+        Some(match name.as_bytes() {
+            b"+" => Self::Add,
+            b"-" => Self::Sub,
+            b"*" => Self::Mul,
+            b"/" => Self::Div,
+            b"%" => Self::Mod,
+            b"=" => Self::Eq,
+            b"<>" | b"!=" => Self::NotEq,
+            b"<" => Self::Lt,
+            b"<=" => Self::LtEq,
+            b">" => Self::Gt,
+            b">=" => Self::GtEq,
+            b"||" => Self::Concat,
+            b"->" => Self::JsonGet,
+            b"->>" => Self::JsonGetText,
+            b"#>" => Self::JsonPath,
+            b"#>>" => Self::JsonPathText,
+            b"#-" => Self::JsonDeletePath,
+            b"?" => Self::JsonExists,
+            b"?|" => Self::JsonExistsAny,
+            b"?&" => Self::JsonExistsAll,
+            b"&" => Self::BitAnd,
+            b"|" => Self::BitOr,
+            b"#" => Self::BitXor,
+            b"<<" => Self::Shl,
+            b">>" => Self::Shr,
+            b"^" => Self::Pow,
+            b"@>" => Self::Contains,
+            b"<@" => Self::ContainedBy,
+            b"&&" => Self::Overlaps,
+            b"&<" => Self::NotRightOf,
+            b"&>" => Self::NotLeftOf,
+            b"-|-" => Self::Adjacent,
+            b"<<=" => Self::NetContainedEq,
+            b">>=" => Self::NetContainsEq,
+            _ => return None,
+        })
+    }
+
+    pub(crate) const fn operator_name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::Mul => "*",
+            Self::Div => "/",
+            Self::Mod => "%",
+            Self::Eq => "=",
+            Self::NotEq => "<>",
+            Self::Lt => "<",
+            Self::LtEq => "<=",
+            Self::Gt => ">",
+            Self::GtEq => ">=",
+            Self::Concat => "||",
+            Self::JsonGet => "->",
+            Self::JsonGetText => "->>",
+            Self::JsonPath => "#>",
+            Self::JsonPathText => "#>>",
+            Self::JsonDeletePath => "#-",
+            Self::JsonExists => "?",
+            Self::JsonExistsAny => "?|",
+            Self::JsonExistsAll => "?&",
+            Self::BitAnd => "&",
+            Self::BitOr => "|",
+            Self::BitXor => "#",
+            Self::Shl => "<<",
+            Self::Shr => ">>",
+            Self::Pow => "^",
+            Self::Contains => "@>",
+            Self::ContainedBy => "<@",
+            Self::Overlaps => "&&",
+            Self::NotRightOf => "&<",
+            Self::NotLeftOf => "&>",
+            Self::Adjacent => concat!("-", "|", "-"),
+            Self::NetContainedEq => "<<=",
+            Self::NetContainsEq => ">>=",
+            Self::And | Self::Or | Self::Like | Self::ILike => return None,
+        })
+    }
+
     /// Binding power for the Pratt parser; higher binds tighter.
     /// Mirrors PostgreSQL's operator precedence table.
     pub fn precedence(self) -> u8 {

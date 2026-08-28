@@ -224,6 +224,53 @@ impl ColTypeResolver for CatalogCols<'_> {
         variadic: bool,
         arguments: &[i32],
     ) -> Option<StaticTypeMeta> {
+        if let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name) {
+            if !(1..=2).contains(&arguments.len()) {
+                return None;
+            }
+            if arguments.len() == 2
+                && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+            {
+                let ctype = crate::sql::query::builtin_operator_result(operator, arguments)?;
+                return Some(StaticTypeMeta {
+                    type_oid: ctype.oid(),
+                    ctype,
+                    type_mod: -1,
+                    collation: if ctype.is_collatable() {
+                        crate::sql::ast::Collation::Default
+                    } else {
+                        crate::sql::ast::Collation::None
+                    },
+                });
+            }
+            let (left, right) = if arguments.len() == 1 {
+                (None, Some(arguments[0]))
+            } else {
+                (Some(arguments[0]), Some(arguments[1]))
+            };
+            let slot = self
+                .storage
+                .operator_slot_for_oids(schema, operator, left, right, self.txid)
+                .ok()??;
+            let result = self
+                .storage
+                .operator_for(slot, self.txid)
+                .implementation
+                .result()?;
+            let ctype = result.ctype;
+            return Some(StaticTypeMeta {
+                type_oid: self
+                    .storage
+                    .routine_type_oid(ctype, result.user_type, self.txid)?,
+                ctype,
+                type_mod: -1,
+                collation: if ctype.is_collatable() {
+                    crate::sql::ast::Collation::Default
+                } else {
+                    crate::sql::ast::Collation::None
+                },
+            });
+        }
         let routine = if argument_names.is_empty() {
             self.storage
                 .function_for_call_syntax_oids(name, arguments, variadic, self.txid)
@@ -250,6 +297,31 @@ impl ColTypeResolver for CatalogCols<'_> {
             type_oid: self
                 .storage
                 .routine_type_oid(result.ctype, result.user_type, self.txid)?,
+            ctype,
+            type_mod: -1,
+            collation: if ctype.is_collatable() {
+                crate::sql::ast::Collation::Default
+            } else {
+                crate::sql::ast::Collation::None
+            },
+        })
+    }
+
+    fn operator_result(&self, name: &str, left_oid: i32, right_oid: i32) -> Option<StaticTypeMeta> {
+        let slot = self
+            .storage
+            .operator_slot_for_oids(None, name, Some(left_oid), Some(right_oid), self.txid)
+            .ok()??;
+        let result = self
+            .storage
+            .operator_for(slot, self.txid)
+            .implementation
+            .result()?;
+        let ctype = result.ctype;
+        Some(StaticTypeMeta {
+            type_oid: self
+                .storage
+                .routine_type_oid(ctype, result.user_type, self.txid)?,
             ctype,
             type_mod: -1,
             collation: if ctype.is_collatable() {
@@ -674,6 +746,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             name: crate::sql::parser::OVERLAPS_PERIODS,
             ..
         } => Some("overlaps"),
+        Expr::Call { name, .. } if crate::sql::ast::catalog_operator_call(name).is_some() => None,
         Expr::Call { name, .. } => Some(name),
         // A cast keeps its operand's name when the operand is a column or
         // function call (`count(*)::int` → `count`); otherwise it takes the
@@ -816,6 +889,17 @@ pub trait ColTypeResolver {
         _argument_names: &[Option<&str>],
         _variadic: bool,
         _arguments: &[i32],
+    ) -> Option<StaticTypeMeta> {
+        None
+    }
+
+    /// Result type of a visible user-defined binary operator. Returning none
+    /// leaves resolution to the built-in PostgreSQL operator table.
+    fn operator_result(
+        &self,
+        _name: &str,
+        _left_oid: i32,
+        _right_oid: i32,
     ) -> Option<StaticTypeMeta> {
         None
     }
@@ -2171,7 +2255,7 @@ fn comparable(a: ColType, b: ColType) -> bool {
     let timeofday = |t: ColType| matches!(t, Time | Timetz);
     let bit = |t: ColType| matches!(t, Bit { .. });
     let stringy = |t: ColType| matches!(t, Text | Varchar | Bpchar | Name);
-    let catalog_object = |t: ColType| t.is_reg_object();
+    let catalog_object = |t: ColType| t == ColType::Regtype || t.is_reg_object();
     let oid_integer = |t: ColType| matches!(t, Int2 | Int4 | Oid | Int8);
     (numeric(a) && numeric(b))
         || (catalog_object(a) && oid_integer(b))
@@ -2402,6 +2486,12 @@ pub fn infer_type_res(
             use crate::sql::ast::BinaryOp::*;
             let lo = infer_type_res(left, columns)?.0;
             let ro = infer_type_res(right, columns)?.0;
+            if let Some(result) = operator
+                .operator_name()
+                .and_then(|name| columns.operator_result(name, lo, ro))
+            {
+                return Ok((result.type_oid, result.ctype.typlen()));
+            }
             let is_bit = |o: i32| matches!(o, oid::BIT | oid::VARBIT);
             match operator {
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {

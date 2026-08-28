@@ -150,13 +150,16 @@ impl<'a> Parser<'a> {
             if min_prec <= 4 && self.peeked == Tok::Ident("operator") {
                 self.advance()?;
                 self.expect_op("(")?;
-                let mut operator = self.any_op_token()?;
+                let first = self.any_op_token()?;
+                let mut schema = None;
+                let mut operator = first;
                 if self.eat_op(".")? {
+                    schema = Some(first);
                     operator = self.any_op_token()?;
                 }
                 self.expect_op(")")?;
                 let right = self.expression(5)?;
-                left = self.build_operator(operator, left, right)?;
+                left = self.build_operator(schema, operator, left, right)?;
                 continue;
             }
             // IN / BETWEEN / LIKE / ILIKE, optionally NOT-prefixed. They
@@ -357,6 +360,15 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let Some(operator) = self.peek_binary_op() else {
+                if min_prec <= 5
+                    && let Tok::Op(operator) = self.peeked
+                    && !matches!(operator, ")" | "]" | "," | ";" | "." | "::" | ":" | "=>")
+                {
+                    self.advance()?;
+                    let right = self.expression(6)?;
+                    left = self.catalog_operator_expr(None, operator, left, right)?;
+                    continue;
+                }
                 return Ok(left);
             };
             if operator.precedence() < min_prec {
@@ -609,6 +621,20 @@ impl<'a> Parser<'a> {
             Tok::Op("+") => {
                 self.advance()?;
                 self.expression(8)
+            }
+            Tok::Ident("operator") => {
+                self.advance()?;
+                self.expect_op("(")?;
+                let first = self.any_op_token()?;
+                let mut schema = None;
+                let mut operator = first;
+                if self.eat_op(".")? {
+                    schema = Some(first);
+                    operator = self.any_op_token()?;
+                }
+                self.expect_op(")")?;
+                let operand = self.expression(6)?;
+                self.catalog_prefix_operator_expr(schema, operator, operand)
             }
             Tok::Ident("not") => {
                 self.advance()?;
@@ -985,6 +1011,11 @@ impl<'a> Parser<'a> {
                     name,
                 })
             }
+            Tok::Op(operator) if !matches!(operator, ")" | "]" | "," | ";" | "." | "::" | "=") => {
+                self.advance()?;
+                let operand = self.expression(6)?;
+                self.catalog_prefix_operator_expr(None, operator, operand)
+            }
             _ => Err(self.unexpected("expected an expression")),
         }
     }
@@ -1317,17 +1348,23 @@ impl<'a> Parser<'a> {
     /// Builds an expression for an explicit `OPERATOR(operator)` symbol.
     pub(super) fn build_operator(
         &self,
-        operator: &str,
+        schema: Option<&'a str>,
+        operator: &'a str,
         left: &'a Expr<'a>,
         right: &'a Expr<'a>,
     ) -> Result<&'a Expr<'a>, ParseError> {
-        if matches!(operator, "~" | "!~" | "~*" | "!~*") {
+        if matches!(operator, "~" | "!~" | "~*" | "!~*")
+            && schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+        {
             return self.arena_expr(Expr::Match {
                 operand: left,
                 pattern: right,
                 negated: operator.starts_with('!'),
                 case_insensitive: operator.ends_with('*'),
             });
+        }
+        if schema.is_some() {
+            return self.catalog_operator_expr(schema, operator, left, right);
         }
         let bop = match operator {
             "=" => BinaryOp::Eq,
@@ -1342,12 +1379,80 @@ impl<'a> Parser<'a> {
             "/" => BinaryOp::Div,
             "%" => BinaryOp::Mod,
             "||" => BinaryOp::Concat,
-            _ => return Err(self.err_here("unsupported operator in OPERATOR()")),
+            _ => return self.catalog_operator_expr(schema, operator, left, right),
         };
         self.arena_expr(Expr::Binary {
             operator: bop,
             left,
             right,
+        })
+    }
+
+    fn catalog_operator_expr(
+        &self,
+        schema: Option<&'a str>,
+        operator: &'a str,
+        left: &'a Expr<'a>,
+        right: &'a Expr<'a>,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let encoded = crate::stack_format!(
+            260,
+            "{}{}\u{1f}{}",
+            crate::sql::ast::CATALOG_OPERATOR_CALL_PREFIX,
+            schema.unwrap_or(""),
+            operator
+        );
+        if encoded.is_truncated() {
+            return Err(self.err_here("operator identity is too long"));
+        }
+        let name = self
+            .arena
+            .alloc_str(encoded.as_str())
+            .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+        let args = self.arena_slice(&[left, right])?;
+        self.arena_expr(Expr::Call {
+            name,
+            args,
+            argument_names: &[],
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over: None,
+            filter: None,
+        })
+    }
+
+    fn catalog_prefix_operator_expr(
+        &self,
+        schema: Option<&'a str>,
+        operator: &'a str,
+        operand: &'a Expr<'a>,
+    ) -> Result<&'a Expr<'a>, ParseError> {
+        let encoded = crate::stack_format!(
+            260,
+            "{}{}\u{1f}{}",
+            crate::sql::ast::CATALOG_OPERATOR_CALL_PREFIX,
+            schema.unwrap_or(""),
+            operator
+        );
+        if encoded.is_truncated() {
+            return Err(self.err_here("operator identity is too long"));
+        }
+        let name = self
+            .arena
+            .alloc_str(encoded.as_str())
+            .map_err(|_| self.err_here("statement too large for SQL arena"))?;
+        self.arena_expr(Expr::Call {
+            name,
+            args: self.arena_slice(&[operand])?,
+            argument_names: &[],
+            variadic: false,
+            star: false,
+            distinct: false,
+            order_by: &[],
+            over: None,
+            filter: None,
         })
     }
 

@@ -3528,8 +3528,11 @@ impl<'a> Parser<'a> {
                     if argument_count == argument_types.len() {
                         return Err(self.limit("routine arguments", argument_types.len()));
                     }
-                    argument_types[argument_count] = self.any_ident("routine argument type")?;
-                    argument_count += 1;
+                    let (argument_type, input) = self.routine_identity_argument()?;
+                    if input {
+                        argument_types[argument_count] = argument_type;
+                        argument_count += 1;
+                    }
                     if self.eat_op(")")? {
                         break;
                     }
@@ -4009,6 +4012,15 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("aggregate")? {
             return self.alter_aggregate();
+        }
+        if self.eat_ident("operator")? {
+            if self.eat_ident("family")? {
+                return self.alter_operator_family();
+            }
+            if self.eat_ident("class")? {
+                return self.alter_operator_class();
+            }
+            return self.alter_operator();
         }
         if self.eat_ident("function")? {
             return self.alter_routine(crate::sql::ast::RoutineTargetKind::Function);
@@ -5996,6 +6008,34 @@ mod tests {
             assert_eq!(alias, Some("half"));
             assert!(p.next_stmt().unwrap().is_none());
         });
+    }
+
+    #[test]
+    fn composite_star_keeps_its_structural_position() {
+        with_parser(
+            "SELECT (NULL::address).*, ROW((NULL::address).*, 42)::text",
+            |parser| {
+                let Stmt::Select(select) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!()
+                };
+                assert!(matches!(select.items[0], SelectItem::RecordStar(_)));
+                let SelectItem::Expr {
+                    expression:
+                        Expr::Cast {
+                            operand:
+                                Expr::Call {
+                                    name: "row", args, ..
+                                },
+                            ..
+                        },
+                    ..
+                } = select.items[1]
+                else {
+                    panic!()
+                };
+                assert!(matches!(args[0], Expr::Field { field: "*", .. }));
+            },
+        );
     }
 
     #[test]

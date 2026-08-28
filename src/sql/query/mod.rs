@@ -1024,7 +1024,265 @@ pub(super) fn storage_catalog<'storage, 'workspace>(
     }
 }
 
+pub(crate) fn execute_index_comparison<'a>(
+    storage: &Storage,
+    txid: u32,
+    function_oid: i32,
+    left: Datum<'a>,
+    right: Datum<'a>,
+    arena: &'a Arena,
+) -> Result<core::cmp::Ordering, SqlError> {
+    let slot = storage
+        .routine_slot_by_oid(function_oid, txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "index support function does not exist"
+            )
+        })?;
+    let catalog = storage_catalog(storage, arena, txid);
+    let result = catalog
+        .execute_routine(slot, storage.routine_for(slot, txid), &[left, right], arena)?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "index comparison function produced no scalar result"
+            )
+        })?;
+    let comparison = match result {
+        Datum::Int4(value) => value,
+        Datum::Null => {
+            return Err(sql_err!(
+                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                "index comparison function returned null"
+            ));
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "index comparison function must return integer"
+            ));
+        }
+    };
+    Ok(comparison.cmp(&0))
+}
+
+pub(crate) fn builtin_operator_result(name: &str, arguments: &[i32]) -> Option<ColType> {
+    if arguments.len() != 2 {
+        return None;
+    }
+    let operator = super::ast::BinaryOp::from_operator_name(name)?;
+    if matches!(
+        operator,
+        super::ast::BinaryOp::Eq
+            | super::ast::BinaryOp::NotEq
+            | super::ast::BinaryOp::Lt
+            | super::ast::BinaryOp::LtEq
+            | super::ast::BinaryOp::Gt
+            | super::ast::BinaryOp::GtEq
+            | super::ast::BinaryOp::Contains
+            | super::ast::BinaryOp::ContainedBy
+            | super::ast::BinaryOp::Overlaps
+            | super::ast::BinaryOp::NotRightOf
+            | super::ast::BinaryOp::NotLeftOf
+            | super::ast::BinaryOp::Adjacent
+            | super::ast::BinaryOp::NetContainedEq
+            | super::ast::BinaryOp::NetContainsEq
+            | super::ast::BinaryOp::JsonExists
+            | super::ast::BinaryOp::JsonExistsAny
+            | super::ast::BinaryOp::JsonExistsAll
+    ) {
+        return Some(ColType::Bool);
+    }
+    let left = ColType::from_oid(arguments[0])?;
+    let right = ColType::from_oid(arguments[1])?;
+    if left == right {
+        return Some(left);
+    }
+    Some(super::exec::unify_numeric_tower(left, right))
+}
+
 impl StorageCatalog<'_, '_, '_, '_> {
+    fn coerce_result<'a>(
+        &self,
+        value: Datum<'a>,
+        target: crate::storage::RoutineResult,
+        arena: &'a Arena,
+    ) -> Result<Datum<'a>, SqlError> {
+        super::exec::coerce_routine_argument(
+            value,
+            crate::storage::RoutineArgumentDef {
+                name: crate::storage::SqlName::EMPTY,
+                ctype: target.ctype,
+                user_type: target.user_type,
+            },
+            self.storage,
+            self.txid,
+            arena,
+        )
+    }
+
+    fn execute_defined_cast<'a>(
+        &self,
+        source_oid: i32,
+        target_oid: i32,
+        value: Datum<'a>,
+        context: super::eval::DefinedCastContext,
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        let Some((_, cast)) = self
+            .storage
+            .cast_for_oids(source_oid, target_oid, self.txid)
+        else {
+            return Ok(None);
+        };
+        if [cast.source, cast.target].into_iter().any(|result| {
+            result.user_type.is_some_and(|identity| {
+                self.storage
+                    .domain_identity_slot(
+                        identity.schema.as_str(),
+                        identity.name.as_str(),
+                        self.txid,
+                    )
+                    .is_some()
+            })
+        }) {
+            return Ok(None);
+        }
+        let permitted = match context {
+            super::eval::DefinedCastContext::Explicit => true,
+            super::eval::DefinedCastContext::Assignment => cast.context.permits_assignment(),
+            super::eval::DefinedCastContext::Implicit => cast.context.permits_implicit(),
+        };
+        if !permitted {
+            return Ok(None);
+        }
+        let result = match cast.method {
+            crate::storage::CastMethod::Binary => value,
+            crate::storage::CastMethod::InOut => {
+                let text = super::eval::datum_to_text(value, arena)?;
+                self.coerce_result(Datum::Text(text), cast.target, arena)?
+            }
+            crate::storage::CastMethod::Function(slot) => {
+                let slot = self
+                    .storage
+                    .routine_slot_by_oid(slot, self.txid)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::UNDEFINED_FUNCTION, "cast function does not exist")
+                    })?;
+                self.storage.require_routine_execute(slot, self.txid)?;
+                let routine = self.storage.routine_for(slot, self.txid);
+                let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+                arguments[0] = value;
+                if routine.argument_count >= 2 {
+                    arguments[1] = Datum::Int4(-1);
+                }
+                if routine.argument_count == 3 {
+                    arguments[2] =
+                        Datum::Bool(matches!(context, super::eval::DefinedCastContext::Explicit));
+                }
+                self.execute_routine(slot, routine, &arguments[..routine.argument_count], arena)?
+                    .unwrap_or(Datum::Null)
+            }
+        };
+        self.coerce_result(result, cast.target, arena).map(Some)
+    }
+
+    fn execute_catalog_operator<'a>(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        arguments: &[Datum<'a>],
+        argument_type_oids: &[i32],
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        if arguments.len() != argument_type_oids.len() || !(1..=2).contains(&arguments.len()) {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "operator expression has an invalid argument contract"
+            ));
+        }
+        let (left_oid, right_oid) = if argument_type_oids.len() == 1 {
+            (None, Some(argument_type_oids[0]))
+        } else {
+            (Some(argument_type_oids[0]), Some(argument_type_oids[1]))
+        };
+        let Some(slot) = self
+            .storage
+            .operator_slot_for_oids(schema, name, left_oid, right_oid, self.txid)?
+        else {
+            return Ok(None);
+        };
+        let operator = self.storage.operator_for(slot, self.txid);
+        let mut expected = [crate::storage::RoutineResult::TEXT; 2];
+        let mut expected_count = 0usize;
+        for argument in [operator.signature.left, operator.signature.right]
+            .into_iter()
+            .flatten()
+        {
+            expected[expected_count] = argument;
+            expected_count += 1;
+        }
+        if expected_count != arguments.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "operator catalog signature has an invalid arity"
+            ));
+        }
+        let mut coerced = [Datum::Null; 2];
+        for index in 0..expected_count {
+            let expected_oid = self
+                .storage
+                .routine_type_oid(expected[index].ctype, expected[index].user_type, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "operator argument type identity is unavailable"
+                    )
+                })?;
+            coerced[index] = if argument_type_oids[index] == expected_oid {
+                self.coerce_result(arguments[index], expected[index], arena)?
+            } else if let Some(value) = self.execute_defined_cast(
+                argument_type_oids[index],
+                expected_oid,
+                arguments[index],
+                super::eval::DefinedCastContext::Implicit,
+                arena,
+            )? {
+                value
+            } else {
+                self.coerce_result(arguments[index], expected[index], arena)?
+            };
+        }
+        let function_oid = operator
+            .implementation
+            .routine()
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_FUNCTION, "operator is only a shell"))?;
+        let function = self
+            .storage
+            .routine_slot_by_oid(function_oid, self.txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "operator function does not exist"
+                )
+            })?;
+        self.storage.require_routine_execute(function, self.txid)?;
+        self.execute_routine(
+            function,
+            self.storage.routine_for(function, self.txid),
+            &coerced[..expected_count],
+            arena,
+        )?
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "operator function produced no scalar result"
+            )
+        })
+        .map(Some)
+    }
+
     fn execute_routine<'a>(
         &self,
         slot: usize,
@@ -1219,6 +1477,14 @@ impl StorageCatalog<'_, '_, '_, '_> {
 }
 
 impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
+    fn has_operator_candidate(&self, name: &str) -> bool {
+        self.storage
+            .operators_visible_to(self.txid)
+            .any(|(_, operator)| {
+                operator.name.as_str() == name && self.storage.schema_is_on_path(operator.schema)
+            })
+    }
+
     fn statistics_definition<'a>(
         &self,
         oid: i32,
@@ -1330,6 +1596,19 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         argument_type_oids: &[i32],
         arena: &'a Arena,
     ) -> Result<Option<Datum<'a>>, SqlError> {
+        if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
+            return self
+                .execute_catalog_operator(schema, operator, arguments, argument_type_oids, arena)
+                .and_then(|value| {
+                    value.map(Some).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_FUNCTION,
+                            "operator does not exist: {}",
+                            operator
+                        )
+                    })
+                });
+        }
         let Some(slot) = (if argument_names.is_empty() {
             self.storage.routine_slot_for_call_syntax_oids(
                 name,
@@ -1452,13 +1731,41 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             )
             .expect("resolved routine call has a valid polymorphic binding");
         for (index, argument) in routine.arguments().iter().copied().enumerate() {
-            completed[index] = super::exec::coerce_routine_argument(
-                completed[index],
-                argument,
-                self.storage,
-                self.txid,
-                arena,
-            )?;
+            let expected_oid = self
+                .storage
+                .routine_type_oid(argument.ctype, argument.user_type, self.txid)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine argument type identity is unavailable"
+                    )
+                })?;
+            completed[index] = if completed_type_oids[index] != expected_oid {
+                match self.execute_defined_cast(
+                    completed_type_oids[index],
+                    expected_oid,
+                    completed[index],
+                    super::eval::DefinedCastContext::Implicit,
+                    arena,
+                )? {
+                    Some(value) => value,
+                    None => super::exec::coerce_routine_argument(
+                        completed[index],
+                        argument,
+                        self.storage,
+                        self.txid,
+                        arena,
+                    )?,
+                }
+            } else {
+                super::exec::coerce_routine_argument(
+                    completed[index],
+                    argument,
+                    self.storage,
+                    self.txid,
+                    arena,
+                )?
+            };
         }
         self.execute_routine(slot, routine, &completed[..declared.argument_count], arena)
     }
@@ -1497,6 +1804,29 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.execute_routine(slot, routine, arguments, arena)
     }
 
+    fn cast_defined<'a>(
+        &self,
+        source_oid: i32,
+        target_oid: i32,
+        value: Datum<'a>,
+        context: super::eval::DefinedCastContext,
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        self.execute_defined_cast(source_oid, target_oid, value, context, arena)
+    }
+
+    fn call_operator<'a>(
+        &self,
+        name: &str,
+        left: Datum<'a>,
+        right: Datum<'a>,
+        left_oid: i32,
+        right_oid: i32,
+        arena: &'a Arena,
+    ) -> Result<Option<Datum<'a>>, SqlError> {
+        self.execute_catalog_operator(None, name, &[left, right], &[left_oid, right_oid], arena)
+    }
+
     fn routine_result_oid(
         &self,
         name: &str,
@@ -1504,6 +1834,33 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         variadic: bool,
         argument_type_oids: &[i32],
     ) -> Option<i32> {
+        if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
+            if !(1..=2).contains(&argument_type_oids.len()) {
+                return None;
+            }
+            if argument_type_oids.len() == 2
+                && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+            {
+                return builtin_operator_result(operator, argument_type_oids).map(ColType::oid);
+            }
+            let (left_oid, right_oid) = if argument_type_oids.len() == 1 {
+                (None, Some(argument_type_oids[0]))
+            } else {
+                (Some(argument_type_oids[0]), Some(argument_type_oids[1]))
+            };
+            let slot = self
+                .storage
+                .operator_slot_for_oids(schema, operator, left_oid, right_oid, self.txid)
+                .ok()??;
+            let result = self
+                .storage
+                .operator_for(slot, self.txid)
+                .implementation
+                .result()?;
+            return self
+                .storage
+                .routine_type_oid(result.ctype, result.user_type, self.txid);
+        }
         let routine = if argument_names.is_empty() {
             self.storage.function_for_call_syntax_oids(
                 name,
@@ -1662,11 +2019,11 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         signature: bool,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
-        super::catalog::operator_name_by_oid(oid, signature, arena)
+        super::catalog::operator_name_by_oid(self.storage, self.txid, oid, signature, arena)
     }
 
     fn operator_oid(&self, name: &str, signature: bool) -> Result<Option<i32>, SqlError> {
-        super::catalog::operator_oid_by_name(name, signature)
+        super::catalog::operator_oid_by_name(self.storage, self.txid, name, signature)
     }
 
     fn has_table_privilege(
@@ -7135,6 +7492,36 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
             .or_else(|| ColType::from_sql_name(type_name).map(ColType::oid))
     }
 
+    fn operator_result(
+        &self,
+        name: &str,
+        left_oid: i32,
+        right_oid: i32,
+    ) -> Option<super::exec::StaticTypeMeta> {
+        let slot = self
+            .storage
+            .operator_slot_for_oids(None, name, Some(left_oid), Some(right_oid), self.txid)
+            .ok()??;
+        let result = self
+            .storage
+            .operator_for(slot, self.txid)
+            .implementation
+            .result()?;
+        let ctype = result.ctype;
+        Some(super::exec::StaticTypeMeta {
+            type_oid: self
+                .storage
+                .routine_type_oid(ctype, result.user_type, self.txid)?,
+            ctype,
+            type_mod: -1,
+            collation: if ctype.is_collatable() {
+                super::ast::Collation::Default
+            } else {
+                super::ast::Collation::None
+            },
+        })
+    }
+
     fn routine_result(
         &self,
         name: &str,
@@ -7142,6 +7529,55 @@ impl super::exec::ColTypeResolver for CatalogScopeCols<'_, '_, '_> {
         variadic: bool,
         arguments: &[i32],
     ) -> Option<super::exec::StaticTypeMeta> {
+        if let Some((schema, operator)) = super::ast::catalog_operator_call(name) {
+            if !(1..=2).contains(&arguments.len()) {
+                return None;
+            }
+            if arguments.len() == 2
+                && schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+            {
+                let ctype = builtin_operator_result(operator, arguments)?;
+                return Some(super::exec::StaticTypeMeta {
+                    type_oid: ctype.oid(),
+                    ctype,
+                    type_mod: -1,
+                    collation: if ctype.is_collatable() {
+                        super::ast::Collation::Default
+                    } else {
+                        super::ast::Collation::None
+                    },
+                });
+            }
+            let (left_oid, right_oid) = if arguments.len() == 1 {
+                (None, Some(arguments[0]))
+            } else {
+                (Some(arguments[0]), Some(arguments[1]))
+            };
+            let slot = self
+                .storage
+                .operator_slot_for_oids(schema, operator, left_oid, right_oid, self.txid)
+                .ok()??;
+            let result = self
+                .storage
+                .operator_for(slot, self.txid)
+                .implementation
+                .result()?;
+            let ctype = result.ctype;
+            return Some(super::exec::StaticTypeMeta {
+                type_oid: self.storage.routine_type_oid(
+                    result.ctype,
+                    result.user_type,
+                    self.txid,
+                )?,
+                ctype,
+                type_mod: -1,
+                collation: if ctype.is_collatable() {
+                    super::ast::Collation::Default
+                } else {
+                    super::ast::Collation::None
+                },
+            });
+        }
         let routine = if argument_names.is_empty() {
             self.storage
                 .function_for_call_syntax_oids(name, arguments, variadic, self.txid)

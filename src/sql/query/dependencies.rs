@@ -1165,6 +1165,68 @@ fn record_routine_call(
     })
 }
 
+fn record_operator_call(
+    identity: crate::sql::ast::QualName<'_>,
+    operands: &[&Expr<'_>],
+    storage: &Storage,
+    txid: u32,
+    resolver: &DependencyTypes<'_, '_, '_>,
+    dependencies: &mut StoredQueryDependencies,
+    needs_scope: &mut bool,
+) -> Result<(), SqlError> {
+    let crate::sql::ast::QualName { schema, name } = identity;
+    let has_catalog_candidate = storage.operators_visible_to(txid).any(|(_, operator)| {
+        operator.name.as_str() == name
+            && schema.map_or_else(
+                || storage.schema_is_on_path(operator.schema),
+                |schema| operator.schema.as_str() == schema,
+            )
+    });
+    if !has_catalog_candidate {
+        return Ok(());
+    }
+    let infer = |expression: &Expr<'_>| {
+        crate::sql::exec::infer_routine_argument_oid(expression, resolver).map(|oid| {
+            if oid == crate::sql::types::oid::UNKNOWN && matches!(expression, Expr::Str(_)) {
+                ColType::Text.oid()
+            } else {
+                oid
+            }
+        })
+    };
+    if !(1..=2).contains(&operands.len()) {
+        return Err(sql_err!(sqlstate::INTERNAL_ERROR, "invalid operator arity"));
+    }
+    let mut inferred = [0; 2];
+    for (slot, operand) in inferred.iter_mut().zip(operands.iter().copied()) {
+        let Ok(oid) = infer(operand) else {
+            *needs_scope = true;
+            return Ok(());
+        };
+        *slot = oid;
+    }
+    let (left_oid, right_oid) = if operands.len() == 1 {
+        (None, Some(inferred[0]))
+    } else {
+        (Some(inferred[0]), Some(inferred[1]))
+    };
+    let Some(slot) = storage.operator_slot_for_oids(schema, name, left_oid, right_oid, txid)?
+    else {
+        return Ok(());
+    };
+    let operator = storage.operator_for(slot, txid);
+    dependencies.push(StoredQueryDependency {
+        class: DependencyClass::Operator,
+        slot: slot as u16,
+        identity: StoredDependencyIdentity::OperatorOid(storage.operator(slot).oid()),
+        referenced_columns: 0,
+        schema: operator.schema,
+        name: operator.name,
+        referenced_schema: SqlName::parse(schema.unwrap_or(""))?,
+        referenced_name: SqlName::parse(name)?,
+    })
+}
+
 fn collect_routine_dependencies_with_resolver(
     select: &Select<'_>,
     storage: &Storage,
@@ -1190,11 +1252,47 @@ fn collect_routine_dependencies_with_resolver(
             ..
         } = expression
         {
-            record_routine_call(
-                name,
-                args,
-                argument_names,
-                *variadic,
+            if let Some((schema, operator)) = crate::sql::ast::catalog_operator_call(name) {
+                if (1..=2).contains(&args.len())
+                    && !schema.is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+                {
+                    record_operator_call(
+                        crate::sql::ast::QualName {
+                            schema,
+                            name: operator,
+                        },
+                        args,
+                        storage,
+                        txid,
+                        resolver,
+                        dependencies,
+                        needs_scope,
+                    )?;
+                }
+            } else {
+                record_routine_call(
+                    name,
+                    args,
+                    argument_names,
+                    *variadic,
+                    storage,
+                    txid,
+                    resolver,
+                    dependencies,
+                    needs_scope,
+                )?;
+            }
+        }
+        if let Expr::Binary {
+            operator,
+            left,
+            right,
+        } = expression
+            && let Some(name) = operator.operator_name()
+        {
+            record_operator_call(
+                crate::sql::ast::QualName { schema: None, name },
+                &[left, right],
                 storage,
                 txid,
                 resolver,

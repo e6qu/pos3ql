@@ -3706,6 +3706,64 @@ def test_join_using_alias_grouping_quantifier_binary_portal():
     s.close()
 
 
+def test_catalog_operator_binary_bind_and_result_description():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE FUNCTION wire_catalog_operator(integer, integer) RETURNS text "
+        "LANGUAGE SQL RETURN 'wire'; "
+        "CREATE FUNCTION wire_prefix_operator(integer) RETURNS integer "
+        "LANGUAGE SQL RETURN -$1; "
+        "CREATE OPERATOR public.@+ (FUNCTION = wire_catalog_operator, "
+        "LEFTARG = integer, RIGHTARG = integer); "
+        "CREATE OPERATOR public.!! (FUNCTION = wire_prefix_operator, RIGHTARG = integer)",
+    )
+    check(
+        "raw wire: catalog operator setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    query = "SELECT $1 OPERATOR(public.@+) $2, OPERATOR(public.!!) $3"
+    parse = frontend_message(
+        b"P", b"wire_operator_statement\x00" + query.encode() + b"\x00" + struct.pack("!h", 0)
+    )
+    bind_body = b"wire_operator_portal\x00wire_operator_statement\x00"
+    bind_body += struct.pack("!hhhh", 3, 1, 1, 1)
+    bind_body += struct.pack("!h", 3)
+    bind_body += (
+        struct.pack("!ii", 4, 7)
+        + struct.pack("!ii", 4, 9)
+        + struct.pack("!ii", 4, 11)
+    )
+    bind_body += struct.pack("!hhh", 2, 1, 1)
+    bind = frontend_message(b"B", bind_body)
+    describe = frontend_message(b"D", b"Pwire_operator_portal\x00")
+    execute = frontend_message(b"E", b"wire_operator_portal\x00" + struct.pack("!i", 0))
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in output if kind == b"T"), None)
+    row = next((payload for kind, payload in output if kind == b"D"), None)
+    check(
+        "raw wire: custom operator keeps inferred binary Bind and text Result identity",
+        not any(kind == b"E" for kind, _ in output)
+        and description is not None
+        and row_description_type_oids(description) == [25, 23]
+        and row_description_formats(description) == [1, 1]
+        and row
+        == b"\x00\x02\x00\x00\x00\x04wire\x00\x00\x00\x04"
+        + struct.pack("!i", -11),
+        output,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

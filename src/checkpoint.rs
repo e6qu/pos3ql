@@ -2550,6 +2550,417 @@ impl Checkpointer {
                         })?;
                     storage.commit_routine_create(slot, 0);
                 }
+                Some("cst") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let created_at = parse_field(words.next(), "cast created_at")?;
+                    let source = manifest_routine_result(&mut words)?;
+                    let target = manifest_routine_result(&mut words)?;
+                    let method_code: u8 = parse_field(words.next(), "cast method")?;
+                    let function_oid: i32 = parse_field(words.next(), "cast function")?;
+                    let method = match method_code {
+                        b'f' if storage.routine_slot_by_oid(function_oid, 0).is_some() => {
+                            crate::storage::CastMethod::Function(function_oid)
+                        }
+                        b'b' if function_oid == 0 => crate::storage::CastMethod::Binary,
+                        b'i' if function_oid == 0 => crate::storage::CastMethod::InOut,
+                        _ => return Err(CheckpointSetupError::Corrupt("invalid cast method")),
+                    };
+                    let context = crate::storage::CastContext::from_code(parse_field(
+                        words.next(),
+                        "cast context",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid cast context"))?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing cast fields"));
+                    }
+                    storage
+                        .create_cast_from_image(crate::storage::CastDef {
+                            created_at,
+                            source,
+                            target,
+                            method,
+                            context,
+                            ddl_state: crate::storage::CatalogDdlState::Absent,
+                        })
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest cast rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("opr") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let created_at = parse_field(words.next(), "operator created_at")?;
+                    let schema =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("operator schema missing"),
+                        )?)?)?;
+                    let name =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("operator name missing"),
+                        )?)?)?;
+                    let owner_oid = parse_field(words.next(), "operator owner")?;
+                    if storage.role_slot_by_oid(owner_oid, 0).is_none() {
+                        return Err(CheckpointSetupError::Corrupt("operator owner missing"));
+                    }
+                    let owner = owner_oid;
+                    let signature_flags: u8 = parse_field(words.next(), "operator signature")?;
+                    if signature_flags == 0 || signature_flags & !3 != 0 {
+                        return Err(CheckpointSetupError::Corrupt("invalid operator signature"));
+                    }
+                    let left = manifest_routine_result(&mut words)?;
+                    let right = manifest_routine_result(&mut words)?;
+                    let result = manifest_routine_result(&mut words)?;
+                    let function_oid = parse_field(words.next(), "operator function")?;
+                    let commutator_oid: i32 = parse_field(words.next(), "operator commutator")?;
+                    let negator_oid: i32 = parse_field(words.next(), "operator negator")?;
+                    let hashes = parse_field::<u8>(words.next(), "operator hashes")?;
+                    let merges = parse_field::<u8>(words.next(), "operator merges")?;
+                    if hashes > 1 || merges > 1 || words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("invalid operator fields"));
+                    }
+                    if function_oid < 0
+                        || (function_oid != 0
+                            && storage.routine_slot_by_oid(function_oid, 0).is_none())
+                    {
+                        return Err(CheckpointSetupError::Corrupt("operator function missing"));
+                    }
+                    let linked = |oid: i32| -> Result<Option<i32>, CheckpointSetupError> {
+                        if oid == 0 {
+                            Ok(None)
+                        } else {
+                            storage
+                                .operator_slot_by_oid(oid, 0)
+                                .map(|_| Some(oid))
+                                .ok_or(CheckpointSetupError::Corrupt("linked operator missing"))
+                        }
+                    };
+                    storage
+                        .replay_set_operator(
+                            created_at,
+                            crate::storage::OperatorDefinition {
+                                schema,
+                                name,
+                                signature: crate::storage::OperatorSignature {
+                                    left: (signature_flags & 1 != 0).then_some(left),
+                                    right: (signature_flags & 2 != 0).then_some(right),
+                                },
+                                implementation: if function_oid == 0 {
+                                    crate::storage::OperatorImplementation::Shell
+                                } else {
+                                    crate::storage::OperatorImplementation::Function {
+                                        routine: function_oid,
+                                        result,
+                                    }
+                                },
+                                commutator: linked(commutator_oid)?,
+                                negator: linked(negator_oid)?,
+                                hashes: hashes != 0,
+                                merges: merges != 0,
+                                owner,
+                            },
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest operator rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("oprl") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let operator_oid = parse_field(words.next(), "operator oid")?;
+                    let commutator_oid: i32 = parse_field(words.next(), "operator commutator")?;
+                    let negator_oid: i32 = parse_field(words.next(), "operator negator")?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing operator link fields",
+                        ));
+                    }
+                    let slot = storage
+                        .operator_slot_by_oid(operator_oid, 0)
+                        .ok_or(CheckpointSetupError::Corrupt("operator missing"))?;
+                    let linked = |oid: i32| -> Result<Option<i32>, CheckpointSetupError> {
+                        if oid == 0 {
+                            Ok(None)
+                        } else {
+                            storage
+                                .operator_slot_by_oid(oid, 0)
+                                .map(|_| Some(oid))
+                                .ok_or(CheckpointSetupError::Corrupt("linked operator missing"))
+                        }
+                    };
+                    let mut definition = storage.operator_for(slot, 0);
+                    definition.commutator = linked(commutator_oid)?;
+                    definition.negator = linked(negator_oid)?;
+                    let created_at = storage.operator(slot).created_at;
+                    storage
+                        .replay_set_operator(created_at, definition)
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest operator links rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("opf") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let created_at = parse_field(words.next(), "operator family created_at")?;
+                    let schema = sql_name(&decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("operator family schema missing"),
+                    )?)?)?;
+                    let name = sql_name(&decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("operator family name missing"),
+                    )?)?)?;
+                    let owner_oid = parse_field(words.next(), "operator family owner")?;
+                    if storage.role_slot_by_oid(owner_oid, 0).is_none() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "operator family owner missing",
+                        ));
+                    }
+                    let owner = owner_oid;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing operator family fields",
+                        ));
+                    }
+                    storage
+                        .replay_set_operator_family(
+                            created_at,
+                            crate::storage::OperatorFamilyDefinition {
+                                schema,
+                                name,
+                                owner,
+                                operators: [crate::storage::OperatorFamilyOperator::EMPTY;
+                                    crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
+                                functions: [crate::storage::OperatorFamilyFunction::EMPTY;
+                                    crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
+                            },
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest operator family rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("opfo") | Some("opff") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let is_operator = line.starts_with("opfo ");
+                    let family_oid = parse_field(words.next(), "operator family oid")?;
+                    let family_slot = storage
+                        .operator_family_slot_by_oid(family_oid, 0)
+                        .ok_or(CheckpointSetupError::Corrupt("operator family missing"))?;
+                    let mut definition = storage.operator_family_for(family_slot, 0);
+                    if is_operator {
+                        let strategy = crate::sql::ast::BtreeStrategy::from_number(parse_field(
+                            words.next(),
+                            "operator family strategy",
+                        )?)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "invalid operator family strategy",
+                        ))?;
+                        let left = manifest_routine_result(&mut words)?;
+                        let right = manifest_routine_result(&mut words)?;
+                        let operator_oid = parse_field(words.next(), "operator family operator")?;
+                        if storage.operator_slot_by_oid(operator_oid, 0).is_none() {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "operator family operator missing",
+                            ));
+                        }
+                        let target = definition
+                            .operators
+                            .iter_mut()
+                            .find(|member| !member.used)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "too many operator family operators",
+                            ))?;
+                        *target = crate::storage::OperatorFamilyOperator {
+                            used: true,
+                            strategy,
+                            left,
+                            right,
+                            operator: operator_oid,
+                        };
+                    } else {
+                        let left = manifest_routine_result(&mut words)?;
+                        let right = manifest_routine_result(&mut words)?;
+                        let function_oid = parse_field(words.next(), "operator family function")?;
+                        if storage.routine_slot_by_oid(function_oid, 0).is_none() {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "operator family function missing",
+                            ));
+                        }
+                        let target = definition
+                            .functions
+                            .iter_mut()
+                            .find(|member| !member.used)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "too many operator family functions",
+                            ))?;
+                        *target = crate::storage::OperatorFamilyFunction {
+                            used: true,
+                            left,
+                            right,
+                            function: function_oid,
+                        };
+                    }
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing operator family member fields",
+                        ));
+                    }
+                    let created_at = storage.operator_family(family_slot).created_at;
+                    storage
+                        .replay_set_operator_family(created_at, definition)
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest operator family member rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("opc") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let created_at = parse_field(words.next(), "operator class created_at")?;
+                    let schema = sql_name(&decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("operator class schema missing"),
+                    )?)?)?;
+                    let name =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("operator class name missing"),
+                        )?)?)?;
+                    let owner_oid = parse_field(words.next(), "operator class owner")?;
+                    if storage.role_slot_by_oid(owner_oid, 0).is_none() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "operator class owner missing",
+                        ));
+                    }
+                    let owner = owner_oid;
+                    let family_oid = parse_field(words.next(), "operator class family")?;
+                    if storage.operator_family_slot_by_oid(family_oid, 0).is_none() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "operator class family missing",
+                        ));
+                    }
+                    let input = manifest_routine_result(&mut words)?;
+                    let key_storage = manifest_routine_result(&mut words)?;
+                    let default = match parse_field::<u8>(words.next(), "operator class default")? {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid operator class default",
+                            ));
+                        }
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing operator class fields",
+                        ));
+                    }
+                    storage
+                        .replay_set_operator_class(
+                            created_at,
+                            crate::storage::OperatorClassDefinition {
+                                schema,
+                                name,
+                                owner,
+                                family: family_oid,
+                                input,
+                                storage: key_storage,
+                                default,
+                                operators: [crate::storage::OperatorFamilyOperator::EMPTY;
+                                    crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
+                                functions: [crate::storage::OperatorFamilyFunction::EMPTY;
+                                    crate::storage::MAX_OPERATOR_FAMILY_MEMBERS],
+                            },
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest operator class rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                tag @ (Some("opco") | Some("opcf")) => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let class_oid: i32 = parse_field(words.next(), "operator class member class")?;
+                    let class_oid = crate::storage::OperatorClassOid::parse(class_oid).ok_or(
+                        CheckpointSetupError::Corrupt("invalid operator class identity"),
+                    )?;
+                    let class_slot = storage.operator_class_slot_by_oid(class_oid, 0).ok_or(
+                        CheckpointSetupError::Corrupt("operator class member class missing"),
+                    )?;
+                    let mut definition = storage.operator_class_for(class_slot, 0);
+                    if tag == Some("opco") {
+                        let strategy = parse_field::<u32>(words.next(), "operator class strategy")
+                            .ok()
+                            .and_then(crate::sql::ast::BtreeStrategy::from_number)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "invalid operator class strategy",
+                            ))?;
+                        let left = manifest_routine_result(&mut words)?;
+                        let right = manifest_routine_result(&mut words)?;
+                        let operator = parse_field(words.next(), "operator class operator")?;
+                        if storage.operator_slot_by_oid(operator, 0).is_none() {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "operator class operator missing",
+                            ));
+                        }
+                        let target = definition
+                            .operators
+                            .iter_mut()
+                            .find(|member| !member.used)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "too many operator class operators",
+                            ))?;
+                        *target = crate::storage::OperatorFamilyOperator {
+                            used: true,
+                            strategy,
+                            left,
+                            right,
+                            operator,
+                        };
+                    } else {
+                        let left = manifest_routine_result(&mut words)?;
+                        let right = manifest_routine_result(&mut words)?;
+                        let function = parse_field(words.next(), "operator class function")?;
+                        if storage.routine_slot_by_oid(function, 0).is_none() {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "operator class function missing",
+                            ));
+                        }
+                        let target = definition
+                            .functions
+                            .iter_mut()
+                            .find(|member| !member.used)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "too many operator class functions",
+                            ))?;
+                        *target = crate::storage::OperatorFamilyFunction {
+                            used: true,
+                            left,
+                            right,
+                            function,
+                        };
+                    }
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing operator class member fields",
+                        ));
+                    }
+                    let created_at = storage.operator_class(class_slot).created_at;
+                    storage
+                        .replay_set_operator_class(created_at, definition)
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest operator class member rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
                 Some("trg") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_trigger(storage, line)?;
@@ -3387,15 +3798,74 @@ impl Checkpointer {
                     }
                     let mut operator_classes = [None; crate::storage::MAX_INDEX_COLS];
                     for operator_class in operator_classes.iter_mut().take(n_cols) {
-                        let code: u8 = parse_field(words.next(), "idx operator class")?;
-                        *operator_class = if code == 0 {
+                        let encoded = words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("idx operator class missing"))?;
+                        *operator_class = if encoded == "0" {
                             None
-                        } else {
-                            Some(
+                        } else if let Some(code) = encoded.strip_prefix('b') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt("bad builtin index operator class")
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Builtin(
                                 crate::sql::types::BtreeOperatorClass::from_code(code).ok_or(
-                                    CheckpointSetupError::Corrupt("bad index operator class"),
+                                    CheckpointSetupError::Corrupt(
+                                        "bad builtin index operator class",
+                                    ),
                                 )?,
-                            )
+                            ))
+                        } else if let Some(oid) = encoded.strip_prefix('c') {
+                            let oid = oid.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt("bad catalog index operator class")
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Catalog(
+                                crate::storage::OperatorClassOid::parse(oid).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad catalog index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "bad index operator class encoding",
+                            ));
+                        };
+                    }
+                    let mut resolved_operator_classes = [None; crate::storage::MAX_INDEX_COLS];
+                    for operator_class in resolved_operator_classes.iter_mut().take(n_cols) {
+                        let encoded = words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "idx resolved operator class missing",
+                        ))?;
+                        *operator_class = if let Some(code) = encoded.strip_prefix('b') {
+                            let code = code.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt(
+                                    "bad builtin resolved index operator class",
+                                )
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Builtin(
+                                crate::sql::types::BtreeOperatorClass::from_code(code).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad builtin resolved index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else if let Some(oid) = encoded.strip_prefix('c') {
+                            let oid = oid.parse().map_err(|_| {
+                                CheckpointSetupError::Corrupt(
+                                    "bad catalog resolved index operator class",
+                                )
+                            })?;
+                            Some(crate::storage::IndexOperatorClass::Catalog(
+                                crate::storage::OperatorClassOid::parse(oid).ok_or(
+                                    CheckpointSetupError::Corrupt(
+                                        "bad catalog resolved index operator class",
+                                    ),
+                                )?,
+                            ))
+                        } else {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "bad resolved index operator class encoding",
+                            ));
                         };
                     }
                     let tablespace: u16 = parse_field(words.next(), "idx tablespace")?;
@@ -3456,6 +3926,7 @@ impl Checkpointer {
                                 collations,
                                 explicit_collations,
                                 operator_classes,
+                                resolved_operator_classes,
                                 descending,
                                 nulls_first,
                                 n_cols,
@@ -5278,6 +5749,156 @@ impl Checkpointer {
                 ),
             )?;
         }
+        for (_, cast) in storage.live_casts() {
+            let function = match cast.method {
+                crate::storage::CastMethod::Function(oid) => oid,
+                crate::storage::CastMethod::Binary | crate::storage::CastMethod::InOut => 0,
+            };
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "cst {} {} {} {} {} {}",
+                    cast.created_at,
+                    ManifestRoutineResult(cast.source),
+                    ManifestRoutineResult(cast.target),
+                    cast.method.code(),
+                    function,
+                    cast.context.code(),
+                ),
+            )?;
+        }
+        for (_, operator) in storage.live_operators() {
+            let definition = operator.definition;
+            let result = definition
+                .implementation
+                .result()
+                .unwrap_or(crate::storage::RoutineResult::TEXT);
+            let function = definition.implementation.routine().unwrap_or(0);
+            let left = definition
+                .signature
+                .left
+                .unwrap_or(crate::storage::RoutineResult::TEXT);
+            let right = definition
+                .signature
+                .right
+                .unwrap_or(crate::storage::RoutineResult::TEXT);
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "opr {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    operator.created_at,
+                    ManifestName(definition.schema.as_str()),
+                    ManifestName(definition.name.as_str()),
+                    definition.owner,
+                    u8::from(definition.signature.left.is_some())
+                        | (u8::from(definition.signature.right.is_some()) << 1),
+                    ManifestRoutineResult(left),
+                    ManifestRoutineResult(right),
+                    ManifestRoutineResult(result),
+                    function,
+                    0,
+                    0,
+                    u8::from(definition.hashes),
+                    u8::from(definition.merges),
+                ),
+            )?;
+        }
+        for (_, operator) in storage.live_operators() {
+            let definition = operator.definition;
+            if definition.commutator.is_none() && definition.negator.is_none() {
+                continue;
+            }
+            let linked_oid = |oid: Option<i32>| oid.unwrap_or(0);
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "oprl {} {} {}",
+                    operator.oid(),
+                    linked_oid(definition.commutator),
+                    linked_oid(definition.negator),
+                ),
+            )?;
+        }
+        for (_, family) in storage.live_operator_families() {
+            let definition = family.definition;
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "opf {} {} {} {}",
+                    family.created_at,
+                    ManifestName(definition.schema.as_str()),
+                    ManifestName(definition.name.as_str()),
+                    definition.owner,
+                ),
+            )?;
+            for member in definition.operators.iter().filter(|member| member.used) {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "opfo {} {} {} {} {}",
+                        family.oid(),
+                        member.strategy.number(),
+                        ManifestRoutineResult(member.left),
+                        ManifestRoutineResult(member.right),
+                        member.operator,
+                    ),
+                )?;
+            }
+            for member in definition.functions.iter().filter(|member| member.used) {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "opff {} {} {} {}",
+                        family.oid(),
+                        ManifestRoutineResult(member.left),
+                        ManifestRoutineResult(member.right),
+                        member.function,
+                    ),
+                )?;
+            }
+        }
+        for (_, class) in storage.live_operator_classes() {
+            let definition = class.definition;
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "opc {} {} {} {} {} {} {} {}",
+                    class.created_at,
+                    ManifestName(definition.schema.as_str()),
+                    ManifestName(definition.name.as_str()),
+                    definition.owner,
+                    definition.family,
+                    ManifestRoutineResult(definition.input),
+                    ManifestRoutineResult(definition.storage),
+                    u8::from(definition.default),
+                ),
+            )?;
+            for member in definition.operators.iter().filter(|member| member.used) {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "opco {} {} {} {} {}",
+                        class.oid(),
+                        member.strategy.number(),
+                        ManifestRoutineResult(member.left),
+                        ManifestRoutineResult(member.right),
+                        member.operator,
+                    ),
+                )?;
+            }
+            for member in definition.functions.iter().filter(|member| member.used) {
+                write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "opcf {} {} {} {}",
+                        class.oid(),
+                        ManifestRoutineResult(member.left),
+                        ManifestRoutineResult(member.right),
+                        member.function,
+                    ),
+                )?;
+            }
+        }
         for (_, trigger) in storage.triggers_with_slots_visible_to(0) {
             use core::fmt::Write;
             let (target_kind, relation_schema, relation_name) = match trigger.target {
@@ -5703,18 +6324,33 @@ impl Checkpointer {
             }
             let mut collations = StackStr::<64>::new();
             let mut operator_classes = StackStr::<128>::new();
+            let mut resolved_operator_classes = StackStr::<128>::new();
             let mut statistics = StackStr::<128>::new();
             for position in 0..index.n_cols {
                 let code = index.collations[position].code()
                     | (u8::from(index.explicit_collations[position]) << 7);
                 let _ = write!(collations, " {code}");
-                let _ = operator_classes.write_str(" ");
-                let _ = write!(
-                    operator_classes,
-                    "{}",
-                    index.operator_classes[position]
-                        .map_or(0, crate::sql::types::BtreeOperatorClass::code)
-                );
+                match index.operator_classes[position] {
+                    None => {
+                        let _ = operator_classes.write_str(" 0");
+                    }
+                    Some(crate::storage::IndexOperatorClass::Builtin(class)) => {
+                        let _ = write!(operator_classes, " b{}", class.code());
+                    }
+                    Some(crate::storage::IndexOperatorClass::Catalog(oid)) => {
+                        let _ = write!(operator_classes, " c{}", oid.get());
+                    }
+                }
+                match index.resolved_operator_classes[position]
+                    .expect("live index key has a resolved operator class")
+                {
+                    crate::storage::IndexOperatorClass::Builtin(class) => {
+                        let _ = write!(resolved_operator_classes, " b{}", class.code());
+                    }
+                    crate::storage::IndexOperatorClass::Catalog(oid) => {
+                        let _ = write!(resolved_operator_classes, " c{}", oid.get());
+                    }
+                }
                 let _ = write!(statistics, " {}", index.mutable.statistics[position]);
             }
             let mutable = index.mutable;
@@ -5732,7 +6368,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{} {} {} {} {}{} {} {}",
+                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {}",
                     index.created_at,
                     u8::from(index.unique),
                     index.n_cols,
@@ -5751,6 +6387,7 @@ impl Checkpointer {
                     index.n_cols,
                     collations.as_str(),
                     operator_classes.as_str(),
+                    resolved_operator_classes.as_str(),
                     mutable.tablespace,
                     fillfactor,
                     deduplicate,
@@ -8083,6 +8720,37 @@ fn load_matview(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
 
 struct ManifestDependencies<'a>(&'a crate::storage::StoredQueryDependencies);
 
+struct ManifestName<'a>(&'a str);
+
+impl core::fmt::Display for ManifestName<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() {
+            return output.write_str("-");
+        }
+        for byte in self.0.as_bytes() {
+            write!(output, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+struct ManifestRoutineResult(crate::storage::RoutineResult);
+
+impl core::fmt::Display for ManifestRoutineResult {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(output, "{} ", self.0.ctype.code())?;
+        match self.0.user_type {
+            Some(identity) => write!(
+                output,
+                "{} {}",
+                ManifestName(identity.schema.as_str()),
+                ManifestName(identity.name.as_str())
+            ),
+            None => output.write_str("- -"),
+        }
+    }
+}
+
 impl core::fmt::Display for ManifestDependencies<'_> {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(output, "{}", self.0.entries().len())?;
@@ -8162,6 +8830,33 @@ fn parse_stored_query_dependencies(
 
 fn sql_name(s: &str) -> Result<SqlName, CheckpointSetupError> {
     SqlName::parse(s).map_err(|_| CheckpointSetupError::Corrupt("name too long in manifest"))
+}
+
+fn manifest_routine_result(
+    words: &mut core::str::Split<'_, char>,
+) -> Result<crate::storage::RoutineResult, CheckpointSetupError> {
+    let code: u8 = parse_field(words.next(), "catalog type code")?;
+    let ctype = ColType::from_code(code)
+        .ok_or(CheckpointSetupError::Corrupt("invalid catalog type code"))?;
+    let schema = words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("catalog type schema missing"))?;
+    let name = words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("catalog type name missing"))?;
+    let user_type = match (schema, name) {
+        ("-", "-") => None,
+        ("-", _) | (_, "-") => {
+            return Err(CheckpointSetupError::Corrupt(
+                "partial catalog type identity",
+            ));
+        }
+        _ => Some(crate::storage::UserTypeName {
+            schema: sql_name(&decode_hex_name(schema)?)?,
+            name: sql_name(&decode_hex_name(name)?)?,
+        }),
+    };
+    Ok(crate::storage::RoutineResult { ctype, user_type })
 }
 
 fn empty_column() -> ColumnMeta {

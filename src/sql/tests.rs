@@ -7,6 +7,512 @@
 use super::*;
 
 #[test]
+fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
+    let config = test_config("cast-operator-ddl");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let duplicate_builtin = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE CAST (integer AS bigint) WITH INOUT",
+    );
+    let duplicate_builtin = String::from_utf8_lossy(&duplicate_builtin);
+    assert!(duplicate_builtin.contains("42710"), "{duplicate_builtin}");
+    for sql in [
+        "CREATE TYPE public.mood AS ENUM ('sad', 'ok')",
+        "CREATE FUNCTION public.mood_text(public.mood) RETURNS text LANGUAGE SQL RETURN CASE WHEN $1 = 'sad' THEN 'sad-cast' ELSE 'ok-cast' END",
+        "CREATE FUNCTION public.int_same(integer, integer) RETURNS boolean LANGUAGE SQL RETURN $1 = $2",
+        "CREATE FUNCTION public.int_compare(integer, integer) RETURNS integer LANGUAGE SQL RETURN CASE WHEN $1 < $2 THEN -1 WHEN $1 > $2 THEN 1 ELSE 0 END",
+        "CREATE CAST (public.mood AS text) WITH FUNCTION public.mood_text(public.mood) AS ASSIGNMENT",
+        "SELECT 'sad'::public.mood::text",
+        "CREATE TABLE cast_assignment(value text)",
+        "INSERT INTO cast_assignment VALUES ('sad'::public.mood)",
+        "SELECT value FROM cast_assignment",
+        "SELECT length('sad'::public.mood)",
+        "CREATE OPERATOR public.=== (FUNCTION = public.int_same, LEFTARG = integer, RIGHTARG = integer, HASHES, MERGES)",
+        "SELECT pg_typeof(oprcode)::text, oprcode::regprocedure::text, oprrest::regprocedure::text, oprjoin::regprocedure::text FROM pg_operator WHERE oprname = '==='",
+        "SET search_path = pg_catalog; SELECT oid::regoperator::text, 'public.===(integer,integer)'::regoperator::oid = oid FROM pg_operator WHERE oprname = '==='; RESET search_path",
+        "CREATE SCHEMA custom_ops",
+        "CREATE FUNCTION custom_ops.int_plus(integer, integer) RETURNS text LANGUAGE SQL RETURN 'custom'",
+        "CREATE OPERATOR custom_ops.+ (FUNCTION = custom_ops.int_plus, LEFTARG = integer, RIGHTARG = integer)",
+        "SELECT 1 OPERATOR(custom_ops.+) 2",
+        "PREPARE custom_add(integer, integer) AS SELECT $1 OPERATOR(custom_ops.+) $2; EXECUTE custom_add(1, 2); DEALLOCATE custom_add",
+        "SET search_path = custom_ops, pg_catalog; SELECT 1 + 2, 1 OPERATOR(pg_catalog.+) 2; RESET search_path",
+        "SET search_path = custom_ops, pg_catalog; SELECT '+(integer,integer)'::regoperator::oid = (SELECT oid FROM pg_operator WHERE oprnamespace='custom_ops'::regnamespace AND oprname='+'); RESET search_path",
+        "CREATE OPERATOR FAMILY public.int_family USING btree",
+        "ALTER OPERATOR FAMILY public.int_family USING btree ADD OPERATOR 3 public.===(integer, integer), FUNCTION 1 (integer, integer) public.int_compare(integer, integer)",
+        "ALTER OPERATOR FAMILY public.int_family USING btree DROP OPERATOR 3 (integer, integer), FUNCTION 1 (integer, integer)",
+        "CREATE OPERATOR CLASS public.int_class FOR TYPE integer USING btree FAMILY public.int_family AS OPERATOR 3 public.===, FUNCTION 1 public.int_compare(integer, integer)",
+        "CREATE TABLE operator_class_index(value integer)",
+        "CREATE INDEX operator_class_index_idx ON operator_class_index (value public.int_class)",
+        "SELECT count(*) FROM pg_cast WHERE castsource = 'public.mood'::regtype AND casttarget = 'text'::regtype",
+        "SELECT count(*) FROM pg_cast; SELECT count(*) FROM pg_operator WHERE oprname='==='; SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; SELECT count(*) FROM pg_amop WHERE amopstrategy=3; SELECT count(*) FROM pg_amproc WHERE amprocnum=1",
+        "SELECT 1 === 1, 1 OPERATOR(public.===) 2",
+        "BEGIN; ALTER OPERATOR CLASS public.int_class USING btree RENAME TO abandoned; ROLLBACK",
+        "ALTER OPERATOR CLASS public.int_class USING btree RENAME TO int_class_renamed",
+        "DROP OPERATOR CLASS public.int_class_renamed USING btree",
+        "SELECT count(*) FROM pg_indexes WHERE indexname = 'operator_class_index_idx'",
+        "DROP OPERATOR CLASS public.int_class_renamed USING btree CASCADE",
+        "SELECT count(*) FROM pg_opclass WHERE opcname='int_class_renamed'; SELECT count(*) FROM pg_indexes WHERE indexname='operator_class_index_idx'; SELECT count(*) FROM pg_amop WHERE amopfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family'); SELECT count(*) FROM pg_amproc WHERE amprocfamily = (SELECT oid FROM pg_opfamily WHERE opfname='int_family')",
+        "DROP OPERATOR FAMILY public.int_family USING btree",
+        "DROP OPERATOR public.===(integer, integer)",
+        "DROP CAST (public.mood AS text)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql);
+        let text = String::from_utf8_lossy(&output);
+        if sql == "SELECT length('sad'::public.mood)" {
+            assert!(text.contains("ERROR"), "{sql}: {text}");
+            continue;
+        }
+        if sql == "DROP OPERATOR CLASS public.int_class_renamed USING btree" {
+            assert!(text.contains("2BP01"), "{sql}: {text}");
+            continue;
+        }
+        assert!(!text.contains("ERROR"), "{sql}: {text}");
+        let rows = data_rows(&output);
+        if matches!(
+            sql,
+            "SELECT 'sad'::public.mood::text" | "SELECT value FROM cast_assignment"
+        ) {
+            assert_eq!(rows, ["sad-cast"], "{sql}: {text}");
+        } else if sql.contains("WHERE castsource") {
+            assert_eq!(rows, ["1"], "{sql}: {text}");
+        } else if sql.starts_with("SELECT count(*) FROM pg_cast") {
+            assert_eq!(rows, ["1", "1", "1", "1", "1", "1"], "{sql}: {text}");
+        } else if sql
+            .starts_with("SELECT count(*) FROM pg_opclass WHERE opcname='int_class_renamed'")
+        {
+            assert_eq!(rows, ["0", "0", "0", "0"], "{sql}: {text}");
+        } else if sql
+            == "SELECT count(*) FROM pg_indexes WHERE indexname = 'operator_class_index_idx'"
+        {
+            assert_eq!(rows, ["1"], "{sql}: {text}");
+        } else if sql.starts_with("SELECT 1 ===") {
+            assert_eq!(rows, ["t|f"], "{sql}: {text}");
+        } else if sql.starts_with("SELECT pg_typeof(oprcode)") {
+            assert_eq!(
+                rows,
+                ["regproc|int_same(integer,integer)|-|-"],
+                "{sql}: {text}"
+            );
+        } else if sql.starts_with("SET search_path = pg_catalog; SELECT oid::regoperator") {
+            assert_eq!(rows, ["public.===(integer,integer)|t"], "{sql}: {text}");
+        } else if matches!(sql, "SELECT 1 OPERATOR(custom_ops.+) 2") {
+            assert_eq!(rows, ["custom"], "{sql}: {text}");
+            assert_eq!(
+                row_description_type_oids(&output),
+                [crate::sql::types::oid::TEXT]
+            );
+            assert_eq!(row_description_names(&output), ["?column?"]);
+            let described = describe_with(&mut engine, &mut budget, sql);
+            assert_eq!(
+                row_description_type_oids(&described),
+                [crate::sql::types::oid::TEXT]
+            );
+            assert_eq!(row_description_names(&described), ["?column?"]);
+        } else if sql.starts_with("CREATE OPERATOR custom_ops.+") {
+            let arena = Arena::new(&mut budget, "operator parameter inference", 1 << 16).unwrap();
+            let transaction = TxnState::new(&mut budget, 32).unwrap();
+            let inferred = engine.infer_param_types(
+                "SELECT $1 OPERATOR(custom_ops.+) $2",
+                &arena,
+                &transaction,
+                &[0; MAX_BIND_PARAMS],
+            );
+            assert_eq!(
+                inferred[..2],
+                [crate::sql::types::oid::INT4, crate::sql::types::oid::INT4]
+            );
+        } else if sql.starts_with("PREPARE custom_add") {
+            assert_eq!(rows, ["custom"], "{sql}: {text}");
+        } else if sql.contains("SELECT '+(integer,integer)'::regoperator") {
+            assert_eq!(rows, ["t"], "{sql}: {text}");
+        } else if sql.starts_with("SET search_path = custom_ops") {
+            assert_eq!(rows, ["custom|3"], "{sql}: {text}");
+        }
+    }
+}
+
+#[test]
+fn cast_function_resolution_matches_postgresql_contracts() {
+    let config = test_config("cast-function-contracts");
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE public.cast_mood AS ENUM ('low', 'high'); \
+         CREATE FUNCTION public.cast_mood_text(public.cast_mood, integer) \
+           RETURNS varchar LANGUAGE SQL RETURN CASE WHEN $2 = -1 THEN \
+             CASE WHEN $1 = 'low' THEN 'low' ELSE 'high' END ELSE 'bad' END; \
+         CREATE CAST (public.cast_mood AS text) WITH FUNCTION public.cast_mood_text; \
+         SELECT 'low'::public.cast_mood::text",
+    );
+    let text = String::from_utf8_lossy(&setup);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&setup), ["low"]);
+
+    let ambiguous = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE public.cast_tone AS ENUM ('quiet', 'loud'); \
+         CREATE FUNCTION public.cast_tone_text(public.cast_tone) RETURNS text \
+           LANGUAGE SQL RETURN $1::text; \
+         CREATE FUNCTION public.cast_tone_text(public.cast_tone, integer) RETURNS text \
+           LANGUAGE SQL RETURN $1::text; \
+         CREATE CAST (public.cast_tone AS text) WITH FUNCTION public.cast_tone_text",
+    );
+    assert!(String::from_utf8_lossy(&ambiguous).contains("42725"));
+
+    let domain = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN public.cast_domain AS integer; \
+         CREATE FUNCTION public.cast_domain_text(public.cast_domain) RETURNS text \
+           LANGUAGE SQL RETURN 'defined'; \
+         CREATE CAST (public.cast_domain AS text) \
+           WITH FUNCTION public.cast_domain_text(public.cast_domain); \
+         SELECT 7::public.cast_domain::text",
+    );
+    let text = String::from_utf8_lossy(&domain);
+    assert!(text.contains("cast will be ignored"), "{text}");
+    assert_eq!(data_rows(&domain), ["7"]);
+}
+
+#[test]
+fn cast_operator_dependencies_enforce_restrict_and_transactional_cascade() {
+    let config = test_config("cast-operator-dependencies");
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = "CREATE TYPE public.mood AS ENUM ('sad', 'ok'); \
+        CREATE FUNCTION public.mood_text(public.mood) RETURNS text LANGUAGE SQL RETURN 'mood'; \
+        CREATE FUNCTION public.mood_same(public.mood, public.mood) RETURNS boolean LANGUAGE SQL RETURN $1 = $2; \
+        CREATE FUNCTION public.mood_compare(public.mood, public.mood) RETURNS integer LANGUAGE SQL \
+          RETURN CASE WHEN $1 < $2 THEN -1 WHEN $1 > $2 THEN 1 ELSE 0 END; \
+        CREATE CAST (public.mood AS text) WITH FUNCTION public.mood_text(public.mood); \
+        CREATE OPERATOR public.=== (FUNCTION = public.mood_same, LEFTARG = public.mood, RIGHTARG = public.mood); \
+        CREATE OPERATOR FAMILY public.mood_family USING btree; \
+        CREATE OPERATOR CLASS public.mood_class FOR TYPE public.mood USING btree \
+          FAMILY public.mood_family AS OPERATOR 3 public.===, \
+          FUNCTION 1 public.mood_compare(public.mood, public.mood)";
+    assert!(!String::from_utf8_lossy(&run_with(&mut engine, &mut budget, setup)).contains("ERROR"));
+
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION public.mood_compare(public.mood, public.mood)",
+    );
+    let restricted = String::from_utf8_lossy(&restricted);
+    assert!(restricted.contains("2BP01"), "{restricted}");
+
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP FUNCTION public.mood_same(public.mood, public.mood) CASCADE; ROLLBACK; \
+         SELECT count(*) FROM pg_operator WHERE oprname='==='; \
+         SELECT count(*) FROM pg_opclass WHERE opcname='mood_class'",
+    );
+    assert_eq!(data_rows(&rolled_back), ["1", "1"]);
+
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION public.mood_compare(public.mood, public.mood) CASCADE; \
+         DROP FUNCTION public.mood_same(public.mood, public.mood) CASCADE; \
+         DROP FUNCTION public.mood_text(public.mood) CASCADE; \
+         SELECT count(*) FROM pg_cast; \
+         SELECT count(*) FROM pg_operator WHERE oprname='==='; \
+         SELECT count(*) FROM pg_opclass WHERE opcname='mood_class'; \
+         SELECT count(*) FROM pg_amop WHERE amopfamily = \
+           (SELECT oid FROM pg_opfamily WHERE opfname='mood_family'); \
+         SELECT count(*) FROM pg_amproc WHERE amprocfamily = \
+           (SELECT oid FROM pg_opfamily WHERE opfname='mood_family')",
+    );
+    let text = String::from_utf8_lossy(&cascaded);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&cascaded), ["0", "0", "0", "0", "0"]);
+
+    let type_setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE public.tone AS ENUM ('low', 'high'); \
+         CREATE FUNCTION public.tone_same(public.tone, public.tone) RETURNS boolean \
+           LANGUAGE SQL RETURN $1 = $2; \
+         CREATE CAST (public.tone AS text) WITH INOUT; \
+         CREATE OPERATOR public.@= (FUNCTION = public.tone_same, \
+           LEFTARG = public.tone, RIGHTARG = public.tone)",
+    );
+    assert!(!String::from_utf8_lossy(&type_setup).contains("ERROR"));
+    let restricted = run_with(&mut engine, &mut budget, "DROP TYPE public.tone");
+    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TYPE public.tone CASCADE; \
+         SELECT count(*) FROM pg_cast; \
+         SELECT count(*) FROM pg_operator WHERE oprname='@='",
+    );
+    let text = String::from_utf8_lossy(&dropped);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&dropped), ["0", "0"]);
+
+    let schema_setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA boxed; \
+         CREATE TYPE boxed.pair AS (value integer); \
+         CREATE TYPE boxed.tone AS ENUM ('low', 'high'); \
+         CREATE FUNCTION boxed.tone_same(boxed.tone, boxed.tone) RETURNS boolean \
+           LANGUAGE SQL RETURN $1 = $2; \
+         CREATE FUNCTION boxed.tone_compare(boxed.tone, boxed.tone) RETURNS integer \
+           LANGUAGE SQL RETURN 0; \
+         CREATE CAST (boxed.tone AS text) WITH INOUT; \
+         CREATE OPERATOR boxed.@= (FUNCTION = boxed.tone_same, \
+           LEFTARG = boxed.tone, RIGHTARG = boxed.tone); \
+         CREATE OPERATOR FAMILY boxed.tone_family USING btree; \
+         CREATE OPERATOR CLASS boxed.tone_class FOR TYPE boxed.tone USING btree \
+           FAMILY boxed.tone_family AS OPERATOR 3 boxed.@=, \
+           FUNCTION 1 boxed.tone_compare(boxed.tone, boxed.tone)",
+    );
+    assert!(!String::from_utf8_lossy(&schema_setup).contains("ERROR"));
+    let restricted = run_with(&mut engine, &mut budget, "DROP SCHEMA boxed");
+    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let schema_drop = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA boxed CASCADE; \
+         SELECT count(*) FROM pg_operator WHERE oprname='@='; \
+         SELECT count(*) FROM pg_opfamily WHERE opfname='tone_family'; \
+         SELECT count(*) FROM pg_opclass WHERE opcname='tone_class'",
+    );
+    let text = String::from_utf8_lossy(&schema_drop);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&schema_drop), ["0", "0", "0"]);
+
+    let stored_setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION public.int_equivalent(integer, integer) RETURNS boolean \
+           LANGUAGE SQL RETURN $1 = $2; \
+         CREATE OPERATOR public.%% (FUNCTION = public.int_equivalent, \
+           LEFTARG = integer, RIGHTARG = integer); \
+         CREATE VIEW public.operator_view AS SELECT 1 OPERATOR(public.%%) 1 AS equivalent",
+    );
+    assert!(!String::from_utf8_lossy(&stored_setup).contains("ERROR"));
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP OPERATOR public.%%(integer, integer)",
+    );
+    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP OPERATOR public.%%(integer, integer) CASCADE; \
+         SELECT count(*) FROM pg_views WHERE viewname = 'operator_view'",
+    );
+    let text = String::from_utf8_lossy(&dropped);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&dropped), ["0"]);
+}
+
+#[test]
+fn forward_operator_shells_are_typed_durable_and_fillable() {
+    let mut config = test_config("operator-shell-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("operator-shell-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION public.shell_same(integer, integer) RETURNS boolean \
+           LANGUAGE SQL RETURN $1 = $2; \
+         CREATE OPERATOR public.## (FUNCTION = public.shell_same, LEFTARG = integer, \
+           RIGHTARG = integer, COMMUTATOR = OPERATOR(public.@@)); \
+         SELECT oprresult = 0, oprcode = 0, oprcom <> 0 \
+           FROM pg_operator WHERE oprname = '@@'",
+    );
+    let text = String::from_utf8_lossy(&created);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&created), ["t|t|t"]);
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let shell_call = run_with(&mut recovered, &mut recovered_budget, "SELECT 1 @@ 1");
+    assert!(String::from_utf8_lossy(&shell_call).contains("42883"));
+    assert!(recovered.checkpoint().unwrap());
+    drop(recovered);
+
+    let mut checkpoint_budget = Budget::new(1 << 29);
+    let mut checkpointed = Engine::new(&config, &mut checkpoint_budget).unwrap();
+    let filled = run_with(
+        &mut checkpointed,
+        &mut checkpoint_budget,
+        "CREATE OPERATOR public.@@ (FUNCTION = public.shell_same, LEFTARG = integer, \
+           RIGHTARG = integer); \
+         SELECT 1 ## 1, 1 @@ 2; \
+         SELECT o1.oprcom = o2.oid FROM pg_operator o1, pg_operator o2 \
+           WHERE o1.oprname = '@@' AND o2.oprname = '##'",
+    );
+    let text = String::from_utf8_lossy(&filled);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&filled), ["t|f", "f"]);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn cast_and_operator_creation_enforces_postgresql_privileges() {
+    let config = test_config("cast-operator-privileges");
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for sql in [
+        "CREATE ROLE catalog_owner; CREATE ROLE catalog_user; CREATE SCHEMA catalog_types AUTHORIZATION catalog_owner",
+        "SET ROLE catalog_owner; CREATE TYPE catalog_types.left_value AS ENUM ('x'); CREATE TYPE catalog_types.right_value AS ENUM ('x'); CREATE FUNCTION catalog_types.same(catalog_types.left_value, catalog_types.left_value) RETURNS boolean LANGUAGE SQL RETURN $1 = $2; CREATE FUNCTION catalog_types.convert(catalog_types.left_value) RETURNS catalog_types.right_value LANGUAGE SQL RETURN 'x'::catalog_types.right_value; RESET ROLE",
+        "GRANT USAGE, CREATE ON SCHEMA catalog_types TO catalog_user",
+        "GRANT USAGE ON TYPE catalog_types.left_value TO catalog_user",
+        "GRANT USAGE ON TYPE catalog_types.right_value TO catalog_user",
+        "REVOKE EXECUTE ON FUNCTION catalog_types.same(catalog_types.left_value, catalog_types.left_value) FROM PUBLIC",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql);
+        let text = String::from_utf8_lossy(&output);
+        assert!(!text.contains("ERROR"), "{sql}: {text}");
+    }
+
+    for sql in [
+        "SET ROLE catalog_user; CREATE CAST (catalog_types.left_value AS catalog_types.right_value) WITH FUNCTION catalog_types.convert(catalog_types.left_value)",
+        "SET ROLE catalog_user; CREATE OPERATOR catalog_types.=== (FUNCTION = catalog_types.same, LEFTARG = catalog_types.left_value, RIGHTARG = catalog_types.left_value)",
+        "SET ROLE catalog_user; CREATE OPERATOR FAMILY catalog_types.denied_family USING btree",
+        "SET ROLE catalog_owner; CREATE CAST (catalog_types.left_value AS catalog_types.right_value) WITHOUT FUNCTION",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("42501"), "{sql}: {text}");
+    }
+
+    let granted = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; GRANT EXECUTE ON FUNCTION catalog_types.same(catalog_types.left_value, catalog_types.left_value) TO catalog_user; \
+         SET ROLE catalog_user; \
+         CREATE OPERATOR catalog_types.=== (FUNCTION = catalog_types.same, \
+           LEFTARG = catalog_types.left_value, RIGHTARG = catalog_types.left_value); \
+         RESET ROLE; SET ROLE catalog_owner; \
+         CREATE CAST (catalog_types.left_value AS catalog_types.right_value) \
+           WITH FUNCTION catalog_types.convert(catalog_types.left_value); \
+         SELECT 'x'::catalog_types.left_value::catalog_types.right_value",
+    );
+    let text = String::from_utf8_lossy(&granted);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&granted), ["x"]);
+}
+
+#[test]
+fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
+    let mut config = test_config("cast-operator-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("cast-operator-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let ddl = "CREATE TYPE public.mood AS ENUM ('sad', 'ok'); \
+        CREATE FUNCTION public.keep_slot(integer) RETURNS integer LANGUAGE SQL RETURN $1; \
+        CREATE FUNCTION public.catalog_gap(integer) RETURNS integer LANGUAGE SQL RETURN $1; \
+        CREATE FUNCTION public.mood_text(public.mood) RETURNS text LANGUAGE SQL \
+          RETURN CASE WHEN $1 = 'sad' THEN 'sad-cast' ELSE 'ok-cast' END; \
+        CREATE FUNCTION public.int_same(integer, integer) RETURNS boolean LANGUAGE SQL RETURN $1 = $2; \
+        CREATE FUNCTION public.int_compare(integer, integer) RETURNS integer LANGUAGE SQL \
+          RETURN CASE WHEN $1 % 10 < $2 % 10 THEN -1 WHEN $1 % 10 > $2 % 10 THEN 1 ELSE 0 END; \
+        CREATE FUNCTION public.int_prefix(integer) RETURNS integer LANGUAGE SQL RETURN -$1; \
+        CREATE CAST (public.mood AS text) WITH FUNCTION public.mood_text(public.mood) AS IMPLICIT; \
+        CREATE OPERATOR public.=== (FUNCTION = public.int_same, LEFTARG = integer, RIGHTARG = integer, HASHES, MERGES); \
+        CREATE OPERATOR public.!! (FUNCTION = public.int_prefix, RIGHTARG = integer); \
+        CREATE OPERATOR FAMILY public.int_family USING btree; \
+        CREATE OPERATOR CLASS public.int_class FOR TYPE integer USING btree \
+          FAMILY public.int_family AS OPERATOR 3 public.===, \
+          FUNCTION 1 public.int_compare(integer, integer); \
+        CREATE TABLE public.catalog_index_values(value integer); \
+        CREATE UNIQUE INDEX catalog_index_values_mod10 ON public.catalog_index_values \
+          (value public.int_class); \
+        INSERT INTO public.catalog_index_values VALUES (1); \
+        CREATE VIEW public.catalog_operator_view AS SELECT 1 === 1 AS same; \
+        CREATE VIEW public.catalog_prefix_view AS SELECT !! 4 AS value; \
+        DROP FUNCTION public.catalog_gap(integer)";
+    let verify = "SELECT 'sad'::public.mood::text, public.mood_text('sad'::public.mood), 1 === 1, !! 4, OPERATOR(public.!!) 5; \
+        SELECT same FROM public.catalog_operator_view; \
+        SELECT value FROM public.catalog_prefix_view; \
+        SELECT value FROM public.catalog_index_values; \
+        SELECT count(*) FROM pg_cast; \
+        SELECT count(*) FROM pg_operator WHERE oprname='==='; \
+        SELECT count(*) FROM pg_opfamily WHERE opfname='int_family'; \
+        SELECT count(*) FROM pg_opclass WHERE opcname='int_class'; \
+        SELECT count(*) FROM pg_amop WHERE amopstrategy=3; \
+        SELECT count(*) FROM pg_amproc WHERE amprocnum=1; \
+        SELECT count(*) FROM pg_depend WHERE classid='pg_class'::regclass AND objid='catalog_index_values_mod10'::regclass AND refclassid='pg_opclass'::regclass; \
+        SELECT castmethod, castcontext, castfunc <> 0 FROM pg_cast";
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(&mut engine, &mut budget, ddl);
+    assert!(!String::from_utf8_lossy(&created).contains("ERROR"));
+    let duplicate = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO public.catalog_index_values VALUES (11)",
+    );
+    assert!(String::from_utf8_lossy(&duplicate).contains("23505"));
+    drop(engine);
+
+    let mut wal_budget = Budget::new(1 << 29);
+    let mut wal_recovered = Engine::new(&config, &mut wal_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut wal_recovered, &mut wal_budget, verify)),
+        [
+            "sad-cast|sad-cast|t|-4|-5",
+            "t",
+            "-4",
+            "1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "f|i|t"
+        ]
+    );
+    assert!(wal_recovered.checkpoint().unwrap());
+    drop(wal_recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(&mut cold, &mut cold_budget, verify)),
+        [
+            "sad-cast|sad-cast|t|-4|-5",
+            "t",
+            "-4",
+            "1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "1",
+            "f|i|t"
+        ]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn extension_packages_execute_transactionally_and_recover_catalog_state() {
     let mut config = test_config("extension-lifecycle");
     let package_root = std::path::Path::new(&config.data_dir).join("extensions");
@@ -3918,11 +4424,23 @@ fn reassign_and_drop_owned_cover_objects_grants_and_default_acls() {
          SET ROLE owned_source;
          CREATE TABLE public.owned_table (id int);
          CREATE FUNCTION public.owned_routine() RETURNS integer LANGUAGE SQL AS 'SELECT 9';
+         CREATE FUNCTION public.owned_same(integer, integer) RETURNS boolean LANGUAGE SQL RETURN $1 = $2;
+         CREATE FUNCTION public.owned_compare(integer, integer) RETURNS integer LANGUAGE SQL RETURN 0;
+         CREATE OPERATOR public.=== (FUNCTION = public.owned_same, LEFTARG = integer, RIGHTARG = integer);
+         RESET ROLE;
+         CREATE OPERATOR FAMILY public.owned_family USING btree;
+         CREATE OPERATOR CLASS public.owned_class FOR TYPE integer USING btree
+           FAMILY public.owned_family AS OPERATOR 3 public.===,
+           FUNCTION 1 public.owned_compare(integer, integer);
+         ALTER OPERATOR FAMILY public.owned_family USING btree OWNER TO owned_source;
+         ALTER OPERATOR CLASS public.owned_class USING btree OWNER TO owned_source;
+         SET ROLE owned_source;
          CREATE TYPE public.owned_type AS ENUM ('ready');
          REVOKE USAGE ON TYPE public.owned_type FROM PUBLIC;
          RESET ROLE;",
     );
-    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let setup_text = String::from_utf8_lossy(&setup);
+    assert!(!setup_text.contains("ERROR"), "{setup_text}");
     let output = run_with(
         &mut engine,
         &mut budget,
@@ -3931,6 +4449,9 @@ fn reassign_and_drop_owned_cover_objects_grants_and_default_acls() {
          SELECT nspname, pg_get_userbyid(nspowner)
            FROM pg_namespace WHERE nspname = 'owned_space';
          SELECT pg_get_userbyid(proowner) FROM pg_proc WHERE proname = 'owned_routine';
+         SELECT pg_get_userbyid(oprowner) FROM pg_operator WHERE oprname = '===';
+         SELECT pg_get_userbyid(opfowner) FROM pg_opfamily WHERE opfname = 'owned_family';
+         SELECT pg_get_userbyid(opcowner) FROM pg_opclass WHERE opcname = 'owned_class';
          SELECT relacl::text FROM pg_class WHERE relname = 'owned_table';
          SELECT typacl::text FROM pg_type WHERE typname = 'owned_type';
          DROP OWNED BY owned_source;
@@ -3939,7 +4460,10 @@ fn reassign_and_drop_owned_cover_objects_grants_and_default_acls() {
          DROP OWNED BY owned_target CASCADE;
          DROP ROLE owned_target;
          SELECT count(*) FROM pg_tables WHERE tablename = 'owned_table';
-         SELECT count(*) FROM pg_proc WHERE proname = 'owned_routine';",
+         SELECT count(*) FROM pg_proc WHERE proname = 'owned_routine';
+         SELECT count(*) FROM pg_operator WHERE oprname = '===';
+         SELECT count(*) FROM pg_opfamily WHERE opfname = 'owned_family';
+         SELECT count(*) FROM pg_opclass WHERE opcname = 'owned_class';",
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
@@ -3952,8 +4476,14 @@ fn reassign_and_drop_owned_cover_objects_grants_and_default_acls() {
             "owned_target",
             "owned_space|owned_target",
             "owned_target",
+            "owned_target",
+            "owned_target",
+            "owned_target",
             "{owned_target=arwdDxtm/owned_target}",
             "{owned_target=U/owned_target}",
+            "0",
+            "0",
+            "0",
             "0",
             "0",
             "0",
@@ -4663,6 +5193,17 @@ fn cast_chains_preserve_names_only_when_the_name_originates_in_an_expression() {
 #[test]
 fn catalog_oid_columns_unify_with_regclass_set_operands() {
     let (mut engine, mut budget) = test_engine();
+    let catalog_relations = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT 'pg_amop'::regclass::oid, 'pg_amproc'::regclass::oid, \
+                'pg_cast'::regclass::oid, 'pg_opclass'::regclass::oid, \
+                'pg_operator'::regclass::oid, 'pg_opfamily'::regclass::oid",
+    );
+    assert_eq!(
+        data_rows(&catalog_relations),
+        ["2602|2603|2605|2616|2617|2753"]
+    );
     let output = run_with(
         &mut engine,
         &mut budget,
@@ -16170,7 +16711,10 @@ fn user_defined_aggregate_ownership_privileges_and_dependencies_are_typed() {
     );
     assert_eq!(
         data_rows(&lifecycle),
-        ["5", "aggregate_target|postgres|moved_total(integer)|bigint"],
+        [
+            "5",
+            "aggregate_target|postgres|aggregate_target.moved_total(integer)|bigint"
+        ],
         "{}",
         String::from_utf8_lossy(&lifecycle)
     );
@@ -26275,15 +26819,26 @@ fn domains_enforce_and_report() {
         &mut b,
         "CREATE TABLE dt (id posint DEFAULT 1, addr email)",
     );
-    run_with(&mut e, &mut b, "INSERT INTO dt VALUES (5, 'a@b.com')");
-    run_with(&mut e, &mut b, "INSERT INTO dt (addr) VALUES ('x@y.com')"); // id defaults to 1
+    for sql in [
+        "INSERT INTO dt VALUES (5, 'a@b.com')",
+        "INSERT INTO dt (addr) VALUES ('x@y.com')",
+    ] {
+        let output = run_with(&mut e, &mut b, sql);
+        let text = String::from_utf8_lossy(&output);
+        assert!(!text.contains("ERROR"), "{sql}: {text}");
+    }
     // pg_typeof: the domain on a bare column, the base through an expression.
     let bytes = run_with(
         &mut e,
         &mut b,
         "SELECT pg_typeof(id), pg_typeof(addr), pg_typeof(id + 1) FROM dt WHERE id = 5",
     );
-    assert_eq!(data_rows(&bytes), ["posint|email|integer"]);
+    assert_eq!(
+        data_rows(&bytes),
+        ["posint|email|integer"],
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     let bytes = run_with(&mut e, &mut b, "SELECT id, addr FROM dt ORDER BY id");
     assert_eq!(data_rows(&bytes), ["1|x@y.com", "5|a@b.com"]);
     // Constraint violations.

@@ -12,20 +12,24 @@ use super::{
 use crate::sql::ast::{
     AggregateArgument, AggregateArguments, AggregateDefinition, AggregateFinal,
     AggregateFinalModify, AggregateIdentity, AggregateMoving, AggregatePartial, AlterDomainAction,
-    AlterExtensionAction, AlterIndexAction, AlterPublicationAction, AlterRoutineAction,
-    AlterStatisticsAction, AlterTablespaceAction, AlterTriggerAction, AlterTypeAction,
-    ConstraintMode, ConstraintTiming, ConstraintValidation, CreateDomain, CreateRoutine,
-    CreateSchemaElement, CreateStatistics, CreateTrigger, DomainCheck, ExclusionOperator, Expr,
-    ExtensionMemberIdentity, ExtensionRelationKind, IndexBuildMode, IndexStorageOptionNames,
-    IndexStorageOptions, IndexTargetScope, PartitionBound, PartitionClause, PartitionStrategy,
-    PolicyCommand, PolicyExpression, PolicyIdentity, PolicyPermissiveness, PolicyRole,
-    PublicationOperations, PublicationTarget, RoleOptions, RoutineArgument, RoutineArgumentMode,
-    RoutineCreateKind, RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind,
-    StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName,
-    StatisticsTarget, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
-    SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
-    SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions, TriggerEvent,
-    TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables, ViewSecurity,
+    AlterExtensionAction, AlterIndexAction, AlterOperatorAction, AlterOperatorClassAction,
+    AlterOperatorFamilyAction, AlterPublicationAction, AlterRoutineAction, AlterStatisticsAction,
+    AlterTablespaceAction, AlterTriggerAction, AlterTypeAction, BtreeStrategy, CastContext,
+    CastMethod, ConstraintMode, ConstraintTiming, ConstraintValidation, CreateCast, CreateDomain,
+    CreateOperator, CreateOperatorClass, CreateRoutine, CreateSchemaElement, CreateStatistics,
+    CreateTrigger, DomainCheck, ExclusionOperator, Expr, ExtensionMemberIdentity,
+    ExtensionRelationKind, IndexAccessMethod, IndexBuildMode, IndexStorageOptionNames,
+    IndexStorageOptions, IndexTargetScope, OperatorClassMember, OperatorFamilyMember,
+    OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands, PartitionBound,
+    PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression, PolicyIdentity,
+    PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget, RoleOptions,
+    RoutineArgument, RoutineArgumentMode, RoutineCreateKind, RoutineIdentity, RoutineParallel,
+    RoutineResultColumn, RoutineTargetKind, StatisticsExpression, StatisticsKey, StatisticsKeys,
+    StatisticsKinds, StatisticsName, StatisticsTarget, SubscriptionBehavior, SubscriptionConnect,
+    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
+    SubscriptionStreaming, SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions,
+    TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables,
+    ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
 use crate::stack_format;
@@ -697,6 +701,18 @@ impl<'a> Parser<'a> {
         if self.eat_ident("aggregate")? {
             return self.create_aggregate(false);
         }
+        if self.eat_ident("cast")? {
+            return self.create_cast();
+        }
+        if self.eat_ident("operator")? {
+            if self.eat_ident("family")? {
+                return self.create_operator_family();
+            }
+            if self.eat_ident("class")? {
+                return self.create_operator_class();
+            }
+            return self.create_operator();
+        }
         if self.eat_ident("extension")? {
             return self.create_extension();
         }
@@ -751,6 +767,600 @@ impl<'a> Parser<'a> {
             return self.create_role(false);
         }
         self.create_table()
+    }
+
+    fn access_method(&mut self) -> Result<IndexAccessMethod, ParseError> {
+        let method = self.col_ident("index access method")?;
+        if method.eq_ignore_ascii_case("btree") {
+            Ok(IndexAccessMethod::Btree)
+        } else {
+            Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    96,
+                    "access method \"{}\" is not supported; pos3ql models btree",
+                    method
+                ),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            })
+        }
+    }
+
+    fn unmodified_type_name(&mut self) -> Result<&'a str, ParseError> {
+        let (name, modifier) = self.type_name_mod()?;
+        if modifier != -1 {
+            return Err(self.err_here("type modifiers are not allowed in this definition"));
+        }
+        Ok(name)
+    }
+
+    fn optional_type_signature(&mut self) -> Result<&'a [&'a str], ParseError> {
+        if !self.eat_op("(")? {
+            return Ok(&[]);
+        }
+        let mut types = [""; MAX_LIST];
+        let mut count = 0usize;
+        if !self.eat_op(")")? {
+            loop {
+                if count == types.len() {
+                    return Err(self.limit("type signature", types.len()));
+                }
+                types[count] = self.unmodified_type_name()?;
+                count += 1;
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
+            }
+        }
+        self.arena_slice(&types[..count])
+    }
+
+    fn operator_qual_name(&mut self, what: &'static str) -> Result<QualName<'a>, ParseError> {
+        let wrapped = self.eat_ident("operator")?;
+        if wrapped {
+            self.expect_op("(")?;
+        }
+        let first = self.any_op_token()?;
+        let qualified = if self.eat_op(".")? {
+            let name = self.any_op_token()?;
+            QualName {
+                schema: Some(first),
+                name,
+            }
+        } else {
+            if first
+                .chars()
+                .any(|character| character.is_alphanumeric() || character == '_')
+            {
+                return Err(self.err_here(what));
+            }
+            QualName::bare(first)
+        };
+        if wrapped {
+            self.expect_op(")")?;
+        }
+        Ok(qualified)
+    }
+
+    fn operator_operand_type(&mut self) -> Result<Option<&'a str>, ParseError> {
+        if self.eat_ident("none")? {
+            Ok(None)
+        } else {
+            Ok(Some(self.unmodified_type_name()?))
+        }
+    }
+
+    fn operator_identity(&mut self) -> Result<OperatorIdentity<'a>, ParseError> {
+        let name = self.operator_qual_name("operator name is invalid")?;
+        self.expect_op("(")?;
+        let left_type = self.operator_operand_type()?;
+        self.expect_op(",")?;
+        let right_type = self.operator_operand_type()?;
+        self.expect_op(")")?;
+        let operands = match (left_type, right_type) {
+            (None, Some(right)) => OperatorOperands::Prefix(right),
+            (Some(left), Some(right)) => OperatorOperands::Binary { left, right },
+            (Some(_), None) => return Err(self.err_here("postfix operators are not supported")),
+            (None, None) => return Err(self.err_here("operator must have at least one argument")),
+        };
+        Ok(OperatorIdentity { name, operands })
+    }
+
+    fn btree_strategy(&mut self) -> Result<BtreeStrategy, ParseError> {
+        let Tok::Num(number) = self.peeked else {
+            return Err(self.err_here("btree strategy number is required"));
+        };
+        self.advance()?;
+        let number = number
+            .parse::<u32>()
+            .ok()
+            .and_then(BtreeStrategy::from_number)
+            .ok_or_else(|| self.err_here("btree strategy number must be between 1 and 5"))?;
+        Ok(number)
+    }
+
+    fn create_cast(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_op("(")?;
+        let source_type = self.unmodified_type_name()?;
+        self.expect_ident("as")?;
+        let target_type = self.unmodified_type_name()?;
+        self.expect_op(")")?;
+        let method = if self.eat_ident("with")? {
+            if self.eat_ident("inout")? {
+                CastMethod::InOut
+            } else {
+                self.expect_ident("function")?;
+                CastMethod::Function {
+                    name: self.qual_name("cast function")?,
+                    argument_types: self.optional_type_signature()?,
+                }
+            }
+        } else {
+            self.expect_ident("without")?;
+            self.expect_ident("function")?;
+            CastMethod::Binary
+        };
+        let context = if self.eat_ident("as")? {
+            if self.eat_ident("assignment")? {
+                CastContext::Assignment
+            } else {
+                self.expect_ident("implicit")?;
+                CastContext::Implicit
+            }
+        } else {
+            CastContext::Explicit
+        };
+        Ok(Stmt::CreateCast(CreateCast {
+            source_type,
+            target_type,
+            method,
+            context,
+        }))
+    }
+
+    fn create_operator(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.operator_qual_name("operator name is invalid")?;
+        self.expect_op("(")?;
+        let mut function = None;
+        let mut left_type = None;
+        let mut right_type = None;
+        let mut commutator = None;
+        let mut negator = None;
+        let mut hashes = false;
+        let mut merges = false;
+        loop {
+            if self.eat_ident("function")? || self.eat_ident("procedure")? {
+                self.expect_op("=")?;
+                if function
+                    .replace(self.qual_name("operator function")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("operator FUNCTION specified more than once"));
+                }
+            } else if self.eat_ident("leftarg")? {
+                self.expect_op("=")?;
+                if left_type.replace(self.unmodified_type_name()?).is_some() {
+                    return Err(self.err_here("operator LEFTARG specified more than once"));
+                }
+            } else if self.eat_ident("rightarg")? {
+                self.expect_op("=")?;
+                if right_type.replace(self.unmodified_type_name()?).is_some() {
+                    return Err(self.err_here("operator RIGHTARG specified more than once"));
+                }
+            } else if self.eat_ident("commutator")? {
+                self.expect_op("=")?;
+                if commutator
+                    .replace(self.operator_qual_name("commutator name is invalid")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("operator COMMUTATOR specified more than once"));
+                }
+            } else if self.eat_ident("negator")? {
+                self.expect_op("=")?;
+                if negator
+                    .replace(self.operator_qual_name("negator name is invalid")?)
+                    .is_some()
+                {
+                    return Err(self.err_here("operator NEGATOR specified more than once"));
+                }
+            } else if self.eat_ident("hashes")? {
+                if hashes {
+                    return Err(self.err_here("operator HASHES specified more than once"));
+                }
+                hashes = true;
+            } else if self.eat_ident("merges")? {
+                if merges {
+                    return Err(self.err_here("operator MERGES specified more than once"));
+                }
+                merges = true;
+            } else if self.eat_ident("restrict")? || self.eat_ident("join")? {
+                self.expect_op("=")?;
+                let _ = self.qual_name("selectivity function")?;
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(
+                        96,
+                        "custom selectivity functions are not supported by the bounded planner"
+                    ),
+                    sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                });
+            } else {
+                return Err(self.err_here("invalid CREATE OPERATOR option"));
+            }
+            if self.eat_op(")")? {
+                break;
+            }
+            self.expect_op(",")?;
+        }
+        let function = function.ok_or_else(|| self.err_here("operator FUNCTION is required"))?;
+        let operands = match (left_type, right_type) {
+            (None, Some(right)) => OperatorOperands::Prefix(right),
+            (Some(left), Some(right)) => OperatorOperands::Binary { left, right },
+            (Some(_), None) => return Err(self.err_here("postfix operators are not supported")),
+            (None, None) => return Err(self.err_here("operator must have at least one argument")),
+        };
+        Ok(Stmt::CreateOperator(CreateOperator {
+            name,
+            function,
+            operands,
+            commutator,
+            negator,
+            hashes,
+            merges,
+        }))
+    }
+
+    fn create_operator_family(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("operator family name")?;
+        self.expect_ident("using")?;
+        Ok(Stmt::CreateOperatorFamily {
+            name,
+            method: self.access_method()?,
+        })
+    }
+
+    fn create_operator_class(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("operator class name")?;
+        let default = self.eat_ident("default")?;
+        self.expect_ident("for")?;
+        self.expect_ident("type")?;
+        let input_type = self.unmodified_type_name()?;
+        self.expect_ident("using")?;
+        let method = self.access_method()?;
+        let family = if self.eat_ident("family")? {
+            Some(self.qual_name("operator family name")?)
+        } else {
+            None
+        };
+        self.expect_ident("as")?;
+        let mut members = [OperatorClassMember::Storage("bool"); MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == members.len() {
+                return Err(self.limit("operator class members", members.len()));
+            }
+            members[count] = if self.eat_ident("operator")? {
+                let strategy = self.btree_strategy()?;
+                let operator = self.operator_qual_name("operator class operator is invalid")?;
+                let operand_types = if self.eat_op("(")? {
+                    let left = self.unmodified_type_name()?;
+                    self.expect_op(",")?;
+                    let right = self.unmodified_type_name()?;
+                    self.expect_op(")")?;
+                    Some((left, right))
+                } else {
+                    None
+                };
+                if self.eat_ident("for")? {
+                    if self.eat_ident("order")? {
+                        self.expect_ident("by")?;
+                        let _ = self.qual_name("sort operator family")?;
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                96,
+                                "btree ordering operators are not supported in a search operator class"
+                            ),
+                            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        });
+                    }
+                    self.expect_ident("search")?;
+                }
+                OperatorClassMember::Operator {
+                    strategy,
+                    operator,
+                    operand_types,
+                }
+            } else if self.eat_ident("function")? {
+                let Tok::Num(number) = self.peeked else {
+                    return Err(self.err_here("btree support function number is required"));
+                };
+                if number != "1" {
+                    return Err(self.err_here("btree comparison support function number must be 1"));
+                }
+                self.advance()?;
+                let operand_types = if self.eat_op("(")? {
+                    let left = self.unmodified_type_name()?;
+                    let right = if self.eat_op(",")? {
+                        self.unmodified_type_name()?
+                    } else {
+                        left
+                    };
+                    self.expect_op(")")?;
+                    Some((left, right))
+                } else {
+                    None
+                };
+                let function = self.qual_name("btree comparison function")?;
+                let argument_types = self.optional_type_signature()?;
+                OperatorClassMember::CompareFunction {
+                    operand_types,
+                    function,
+                    argument_types,
+                }
+            } else {
+                self.expect_ident("storage")?;
+                OperatorClassMember::Storage(self.unmodified_type_name()?)
+            };
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(Stmt::CreateOperatorClass(CreateOperatorClass {
+            name,
+            default,
+            input_type,
+            method,
+            family,
+            members: self.arena_slice(&members[..count])?,
+        }))
+    }
+
+    pub(super) fn alter_operator(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let identity = self.operator_identity()?;
+        let action = if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterOperatorAction::Owner(self.any_ident("role name")?)
+        } else if self.eat_ident("set")? {
+            if self.eat_ident("schema")? {
+                AlterOperatorAction::SetSchema(self.col_ident("schema name")?)
+            } else {
+                self.expect_op("(")?;
+                let mut commutator = None;
+                let mut negator = None;
+                let mut hashes = false;
+                let mut merges = false;
+                loop {
+                    if self.eat_ident("commutator")? {
+                        self.expect_op("=")?;
+                        if commutator
+                            .replace(self.operator_qual_name("commutator name is invalid")?)
+                            .is_some()
+                        {
+                            return Err(self.err_here("COMMUTATOR specified more than once"));
+                        }
+                    } else if self.eat_ident("negator")? {
+                        self.expect_op("=")?;
+                        if negator
+                            .replace(self.operator_qual_name("negator name is invalid")?)
+                            .is_some()
+                        {
+                            return Err(self.err_here("NEGATOR specified more than once"));
+                        }
+                    } else if self.eat_ident("hashes")? {
+                        if hashes {
+                            return Err(self.err_here("HASHES specified more than once"));
+                        }
+                        hashes = true;
+                    } else if self.eat_ident("merges")? {
+                        if merges {
+                            return Err(self.err_here("MERGES specified more than once"));
+                        }
+                        merges = true;
+                    } else if self.eat_ident("restrict")? || self.eat_ident("join")? {
+                        self.expect_op("=")?;
+                        if !self.eat_ident("none")? {
+                            let _ = self.qual_name("selectivity function")?;
+                        }
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                96,
+                                "custom selectivity functions are not supported by the bounded planner"
+                            ),
+                            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        });
+                    } else {
+                        return Err(self.err_here("invalid ALTER OPERATOR option"));
+                    }
+                    if self.eat_op(")")? {
+                        break;
+                    }
+                    self.expect_op(",")?;
+                }
+                AlterOperatorAction::Set {
+                    commutator,
+                    negator,
+                    hashes,
+                    merges,
+                }
+            }
+        } else {
+            return Err(self.err_here("expected OWNER TO or SET in ALTER OPERATOR"));
+        };
+        Ok(Stmt::AlterOperator { identity, action })
+    }
+
+    fn operator_family_add_member(&mut self) -> Result<OperatorFamilyMember<'a>, ParseError> {
+        if self.eat_ident("operator")? {
+            let strategy = self.btree_strategy()?;
+            let operator = self.operator_identity()?;
+            if self.eat_ident("for")? {
+                if self.eat_ident("order")? {
+                    self.expect_ident("by")?;
+                    let _ = self.qual_name("sort operator family")?;
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "btree ordering operators are not supported in a search operator family"
+                        ),
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    });
+                }
+                self.expect_ident("search")?;
+            }
+            Ok(OperatorFamilyMember::Operator { strategy, operator })
+        } else {
+            self.expect_ident("function")?;
+            let Tok::Num(number) = self.peeked else {
+                return Err(self.err_here("btree support function number is required"));
+            };
+            if number != "1" {
+                return Err(self.err_here("btree comparison support function number must be 1"));
+            }
+            self.advance()?;
+            self.expect_op("(")?;
+            let left_type = self.unmodified_type_name()?;
+            let right_type = if self.eat_op(",")? {
+                self.unmodified_type_name()?
+            } else {
+                left_type
+            };
+            self.expect_op(")")?;
+            let function = self.qual_name("btree comparison function")?;
+            let argument_types = self.optional_type_signature()?;
+            Ok(OperatorFamilyMember::CompareFunction {
+                left_type,
+                right_type,
+                function,
+                argument_types,
+            })
+        }
+    }
+
+    fn operator_family_drop_member(
+        &mut self,
+    ) -> Result<OperatorFamilyMemberIdentity<'a>, ParseError> {
+        if self.eat_ident("operator")? {
+            let strategy = self.btree_strategy()?;
+            self.expect_op("(")?;
+            let left_type = self.unmodified_type_name()?;
+            let right_type = if self.eat_op(",")? {
+                self.unmodified_type_name()?
+            } else {
+                left_type
+            };
+            self.expect_op(")")?;
+            Ok(OperatorFamilyMemberIdentity::Operator {
+                strategy,
+                left_type,
+                right_type,
+            })
+        } else {
+            self.expect_ident("function")?;
+            let Tok::Num(number) = self.peeked else {
+                return Err(self.err_here("btree support function number is required"));
+            };
+            if number != "1" {
+                return Err(self.err_here("btree comparison support function number must be 1"));
+            }
+            self.advance()?;
+            self.expect_op("(")?;
+            let left_type = self.unmodified_type_name()?;
+            let right_type = if self.eat_op(",")? {
+                self.unmodified_type_name()?
+            } else {
+                left_type
+            };
+            self.expect_op(")")?;
+            Ok(OperatorFamilyMemberIdentity::CompareFunction {
+                left_type,
+                right_type,
+            })
+        }
+    }
+
+    pub(super) fn alter_operator_family(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("operator family name")?;
+        self.expect_ident("using")?;
+        let method = self.access_method()?;
+        let action = if self.eat_ident("add")? {
+            let mut members = [OperatorFamilyMember::CompareFunction {
+                left_type: "bool",
+                right_type: "bool",
+                function: QualName::bare("boolcmp"),
+                argument_types: &[],
+            }; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == members.len() {
+                    return Err(self.limit("operator family members", members.len()));
+                }
+                members[count] = self.operator_family_add_member()?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            AlterOperatorFamilyAction::Add(self.arena_slice(&members[..count])?)
+        } else if self.eat_ident("drop")? {
+            let mut members = [OperatorFamilyMemberIdentity::CompareFunction {
+                left_type: "bool",
+                right_type: "bool",
+            }; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == members.len() {
+                    return Err(self.limit("operator family members", members.len()));
+                }
+                members[count] = self.operator_family_drop_member()?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            AlterOperatorFamilyAction::Drop(self.arena_slice(&members[..count])?)
+        } else if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterOperatorFamilyAction::Rename(self.col_ident("new operator family name")?)
+        } else if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterOperatorFamilyAction::Owner(self.any_ident("role name")?)
+        } else {
+            self.expect_ident("set")?;
+            self.expect_ident("schema")?;
+            AlterOperatorFamilyAction::SetSchema(self.col_ident("schema name")?)
+        };
+        Ok(Stmt::AlterOperatorFamily {
+            name,
+            method,
+            action,
+        })
+    }
+
+    pub(super) fn alter_operator_class(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.qual_name("operator class name")?;
+        self.expect_ident("using")?;
+        let method = self.access_method()?;
+        let action = if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterOperatorClassAction::Rename(self.col_ident("new operator class name")?)
+        } else if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterOperatorClassAction::Owner(self.any_ident("role name")?)
+        } else {
+            self.expect_ident("set")?;
+            self.expect_ident("schema")?;
+            AlterOperatorClassAction::SetSchema(self.col_ident("schema name")?)
+        };
+        Ok(Stmt::AlterOperatorClass {
+            name,
+            method,
+            action,
+        })
     }
 
     fn create_language(&mut self, or_replace: bool, trusted: bool) -> Result<Stmt<'a>, ParseError> {
@@ -892,7 +1502,7 @@ impl<'a> Parser<'a> {
     /// Parses the identity-bearing portion of one routine argument. OUT-only
     /// arguments are consumed but excluded from the declared signature; the
     /// returned type has already crossed the ordinary typed-name boundary.
-    fn routine_identity_argument(&mut self) -> Result<(&'a str, bool), ParseError> {
+    pub(super) fn routine_identity_argument(&mut self) -> Result<(&'a str, bool), ParseError> {
         let input = match self.peeked {
             Tok::Ident("out") | Tok::Ident("table") => {
                 self.advance()?;
@@ -4017,6 +4627,111 @@ impl<'a> Parser<'a> {
                 false
             };
             return Ok(Stmt::DropOwned { roles, cascade });
+        }
+        if self.eat_ident("cast")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            self.expect_op("(")?;
+            let source_type = self.unmodified_type_name()?;
+            self.expect_ident("as")?;
+            let target_type = self.unmodified_type_name()?;
+            self.expect_op(")")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropCast(crate::sql::ast::DropCast {
+                source_type,
+                target_type,
+                if_exists,
+                cascade,
+            }));
+        }
+        if self.eat_ident("operator")? {
+            if self.eat_ident("family")? {
+                let if_exists = if self.eat_ident("if")? {
+                    self.expect_ident("exists")?;
+                    true
+                } else {
+                    false
+                };
+                let name = self.qual_name("operator family name")?;
+                self.expect_ident("using")?;
+                let method = self.access_method()?;
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
+                return Ok(Stmt::DropOperatorFamily {
+                    names: self.arena_slice(&[name])?,
+                    method,
+                    if_exists,
+                    cascade,
+                });
+            }
+            if self.eat_ident("class")? {
+                let if_exists = if self.eat_ident("if")? {
+                    self.expect_ident("exists")?;
+                    true
+                } else {
+                    false
+                };
+                let name = self.qual_name("operator class name")?;
+                self.expect_ident("using")?;
+                let method = self.access_method()?;
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
+                return Ok(Stmt::DropOperatorClass {
+                    names: self.arena_slice(&[name])?,
+                    method,
+                    if_exists,
+                    cascade,
+                });
+            }
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut identities = [OperatorIdentity {
+                name: QualName::bare("="),
+                operands: OperatorOperands::Prefix("bool"),
+            }; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == identities.len() {
+                    return Err(self.limit("operators", identities.len()));
+                }
+                identities[count] = self.operator_identity()?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropOperator {
+                identities: self.arena_slice(&identities[..count])?,
+                if_exists,
+                cascade,
+            });
         }
         if self.eat_ident("language")? {
             let if_exists = if self.eat_ident("if")? {

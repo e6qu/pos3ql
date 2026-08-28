@@ -175,7 +175,7 @@ impl Config {
             conn_send_buffer_bytes: 64 * KIB,
             sql_arena_bytes: MIB,
             work_arena_bytes: 64 * MIB,
-            max_prepared: 8,
+            max_prepared: 64,
             prepared_bytes: 8 * KIB,
             max_portals: 4,
             portal_bytes: 4 * KIB,

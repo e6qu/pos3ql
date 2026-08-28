@@ -207,6 +207,26 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingRoutineDefinition>,
     },
+    CastCreated(u32),
+    CastDropped(u32),
+    OperatorCreated(u32),
+    OperatorAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingOperatorDefinition>,
+    },
+    OperatorDropped(u32),
+    OperatorFamilyCreated(u32),
+    OperatorFamilyAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingOperatorFamilyDefinition>,
+    },
+    OperatorFamilyDropped(u32),
+    OperatorClassCreated(u32),
+    OperatorClassAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingOperatorClassDefinition>,
+    },
+    OperatorClassDropped(u32),
     TriggerCreated(u32),
     TriggerDropped(u32),
     TriggerAltered {

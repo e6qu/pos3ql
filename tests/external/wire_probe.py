@@ -1914,6 +1914,48 @@ def test_configuration_reload_updates_existing_unoverridden_sessions():
     admin.close()
 
 
+def test_transaction_configuration_crosses_wire_message_boundaries():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    configured = simple_query(
+        s,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION "
+        "ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE",
+    )
+    observed = simple_query(
+        s,
+        "SELECT current_setting('default_transaction_isolation'), "
+        "current_setting('transaction_isolation'), "
+        "current_setting('transaction_read_only'), "
+        "current_setting('transaction_deferrable')",
+    )
+    row = next((payload for kind, payload in observed if kind == b"D"), None)
+    check(
+        "raw wire: session transaction defaults apply to the next message",
+        not any(kind == b"E" for kind, _ in configured + observed)
+        and row is not None
+        and text_row_fields(row) == ["serializable", "serializable", "on", "on"],
+        configured + observed,
+    )
+    current = simple_query(
+        s,
+        "BEGIN; SET TRANSACTION READ WRITE, NOT DEFERRABLE; "
+        "SELECT current_setting('transaction_isolation'), "
+        "current_setting('transaction_read_only'), "
+        "current_setting('transaction_deferrable'); ROLLBACK",
+    )
+    row = next((payload for kind, payload in current if kind == b"D"), None)
+    check(
+        "raw wire: SET TRANSACTION changes only named current characteristics",
+        not any(kind == b"E" for kind, _ in current)
+        and row is not None
+        and text_row_fields(row) == ["serializable", "off", "off"],
+        current,
+    )
+    s.close()
+
+
 def test_catalog_definition_oid_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

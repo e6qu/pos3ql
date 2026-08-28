@@ -49,7 +49,7 @@ use crate::storage::{ColumnMeta, RowHome, RowLoc, SqlName, Storage};
 use crate::wal::{Wal, WalOp, WalSetupError, encoded_record_len};
 
 use crate::pg::conn::MAX_BIND_PARAMS;
-use ast::{Delete, Expr, Insert, Stmt, Update};
+use ast::{Delete, Expr, Insert, Stmt, TransactionIsolation, TransactionTarget, Update};
 use eval::{
     EvalHooks, NO_HOOKS, NO_PARAMS, NoColumns, SequenceAccess, SqlError, SqlState, eval, sqlstate,
 };
@@ -57,7 +57,7 @@ use exec::MAX_PROJ;
 use guc::GucState;
 use parser::{ParseError, Parser};
 use prep::SqlPreparedPool;
-use txn::{DdlUndo, IsolationLevel, StatisticsUndo, TxnMode, TxnState};
+use txn::{DdlUndo, StatisticsUndo, TxnMode, TxnState};
 use types::{ColDesc, ColType, Datum};
 
 type ReturningCapture<'a> = dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), SqlError> + 'a;
@@ -288,77 +288,6 @@ pub enum ExtendedExecutionStatus {
     Blocked { io_wait: bool },
 }
 
-#[derive(Clone, Copy)]
-struct TransactionCharacteristics {
-    isolation: Option<IsolationLevel>,
-    read_only: Option<bool>,
-    deferrable: Option<bool>,
-}
-
-fn transaction_characteristics(text: &str) -> Result<TransactionCharacteristics, &str> {
-    let mut parsed = TransactionCharacteristics {
-        isolation: None,
-        read_only: None,
-        deferrable: None,
-    };
-    let mut words = text
-        .split(|character: char| character.is_whitespace() || character == ',')
-        .filter(|word| !word.is_empty());
-    while let Some(word) = words.next() {
-        if word.eq_ignore_ascii_case("isolation") {
-            let Some(level) = words.next() else {
-                return Err(word);
-            };
-            let Some(first) = words.next() else {
-                return Err(level);
-            };
-            if !level.eq_ignore_ascii_case("level") {
-                return Err(level);
-            }
-            if first.eq_ignore_ascii_case("serializable") {
-                parsed.isolation = Some(IsolationLevel::Serializable);
-            } else {
-                let Some(second) = words.next() else {
-                    return Err(first);
-                };
-                if first.eq_ignore_ascii_case("read") && second.eq_ignore_ascii_case("committed") {
-                    parsed.isolation = Some(IsolationLevel::ReadCommitted);
-                } else if first.eq_ignore_ascii_case("repeatable")
-                    && second.eq_ignore_ascii_case("read")
-                {
-                    parsed.isolation = Some(IsolationLevel::RepeatableRead);
-                } else {
-                    return Err(first);
-                }
-            }
-        } else if word.eq_ignore_ascii_case("read") {
-            let Some(mode) = words.next() else {
-                return Err(word);
-            };
-            if mode.eq_ignore_ascii_case("only") {
-                parsed.read_only = Some(true);
-            } else if mode.eq_ignore_ascii_case("write") {
-                parsed.read_only = Some(false);
-            } else {
-                return Err(mode);
-            }
-        } else if word.eq_ignore_ascii_case("deferrable") {
-            parsed.deferrable = Some(true);
-        } else if word.eq_ignore_ascii_case("not") {
-            let Some(characteristic) = words.next() else {
-                return Err(word);
-            };
-            if !characteristic.eq_ignore_ascii_case("deferrable") {
-                return Err(characteristic);
-            }
-            parsed.deferrable = Some(false);
-        } else {
-            return Err(word);
-        }
-    }
-    Ok(parsed)
-}
-
 fn statement_writes(statement: &Stmt<'_>) -> bool {
     match statement {
         Stmt::Explain { options, statement } => {
@@ -375,8 +304,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::SetConstraints { .. }
         | Stmt::LockTable { .. }
         | Stmt::Set { .. }
+        | Stmt::SetCatalog(_)
         | Stmt::Reset(_)
-        | Stmt::SetTransaction(_)
+        | Stmt::SetTransaction { .. }
         | Stmt::SetTransactionSnapshot(_)
         | Stmt::SetRole { .. }
         | Stmt::SetSessionAuthorization { .. }
@@ -494,6 +424,13 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterDatabase { .. }
         | Stmt::DropDatabase { .. } => true,
     }
+}
+
+fn apply_current_transaction_setting(
+    txn: &mut TxnState,
+    characteristics: ast::TransactionCharacteristics,
+) -> Result<(), SqlError> {
+    txn.apply_characteristics(characteristics)
 }
 
 fn created_access_object(undo: txn::DdlUndo) -> Option<crate::storage::AccessObject> {
@@ -3084,6 +3021,8 @@ impl Engine {
         txn.mode = mode;
         datetime::begin_transaction();
         guc.begin_transaction();
+        let (isolation, read_only, deferrable) = guc.transaction_defaults();
+        txn.set_characteristics(isolation, read_only, deferrable);
         txn.failed = false;
     }
 
@@ -3108,7 +3047,7 @@ impl Engine {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
-        if txn.isolation == IsolationLevel::Serializable
+        if txn.isolation == TransactionIsolation::Serializable
             && (!txn.touched().is_empty() || !txn.ddl().is_empty())
             && let Err(error) = self.storage.validate_serializable(txn.txid)
         {
@@ -4693,6 +4632,8 @@ impl Engine {
         txn.rollback_savepoints_after(index);
         self.wal.truncate_stage(txn.txid, sp.wal_mark);
         guc.rollback_to_savepoint(index);
+        txn.read_only = sp.read_only;
+        txn.restore_read_only_source(sp.read_only_source);
         txn.failed = sp.failed;
     }
 
@@ -8734,7 +8675,7 @@ impl Engine {
             self.disable_async_block_reads();
         }
         let _configuration_reload_scope = ConfigurationReloadScope::new(self, guc);
-        let _guc_eval_scope = guc::enter_eval_scope(guc);
+        let _guc_eval_scope = guc::enter_eval_scope(guc, txn);
         // Reclaim the shared execution arena from the previous top-level
         // statement. A routine entered from an active query keeps that query's
         // materialized state alive until evaluation returns.
@@ -8819,10 +8760,12 @@ impl Engine {
             let mut sources = ["default"; SETTING_NAMES.len()];
             let mut setting_count = 0;
             for &name in SETTING_NAMES {
-                if let Some(value) = self.fixed_setting_for(name, txn.txid) {
+                if let Some(value) = self.fixed_setting_for(name, txn) {
                     names[setting_count] = name;
                     values[setting_count] = value;
-                    reset_values[setting_count] = value;
+                    reset_values[setting_count] =
+                        guc.transaction_reset_owned(name).unwrap_or(value);
+                    sources[setting_count] = txn.setting_source(name).unwrap_or("default");
                     setting_count += 1;
                 } else if let Some(value) = guc.get_owned(name) {
                     names[setting_count] = name;
@@ -8912,19 +8855,24 @@ impl Engine {
                 | Stmt::ReleaseSavepoint(_)
                 | Stmt::RollbackToSavepoint(_)
                 | Stmt::LockTable { .. }
-                | Stmt::SetTransaction(_)
+                | Stmt::Set { .. }
+                | Stmt::SetCatalog(_)
+                | Stmt::Reset(_)
+                | Stmt::SetTransaction { .. }
                 | Stmt::SetTransactionSnapshot(_)
+                | Stmt::Show(_)
+                | Stmt::ShowAll
         );
         let commit_snapshot = if takes_snapshot {
             let snapshot = txn.statement_snapshot(self.storage.lsn());
             if matches!(
                 txn.isolation,
-                IsolationLevel::RepeatableRead | IsolationLevel::Serializable
+                TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
             ) && let Err(error) = self.storage.register_snapshot(txn.txid, snapshot)
             {
                 return Ok(Err(error));
             }
-            if txn.isolation == IsolationLevel::Serializable
+            if txn.isolation == TransactionIsolation::Serializable
                 && let Err(error) = self.storage.begin_serializable(txn.txid)
             {
                 return Ok(Err(error));
@@ -10417,29 +10365,17 @@ impl Engine {
                 Ok(Ok(()))
             }
             Stmt::Begin(characteristics) => {
-                let characteristics = match transaction_characteristics(characteristics) {
-                    Ok(characteristics) => characteristics,
-                    Err(characteristic) => {
-                        return Ok(Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "transaction characteristic \"{}\" is not supported",
-                            characteristic
-                        )));
-                    }
-                };
                 if txn.is_explicit() {
                     // PostgreSQL warns and continues.
                     responder.warning(
                         crate::sql::eval::sqlstate::ACTIVE_SQL_TRANSACTION,
                         "there is already a transaction in progress",
                     )?;
+                    responder.command_complete("BEGIN")?;
+                    return Ok(Ok(()));
                 }
                 self.ensure_txn(txn, TxnMode::Explicit, guc);
-                txn.set_characteristics(
-                    characteristics.isolation.unwrap_or(txn.isolation),
-                    characteristics.read_only.unwrap_or(txn.read_only),
-                    characteristics.deferrable.unwrap_or(txn.deferrable),
-                );
+                txn.apply_begin_characteristics(*characteristics);
                 responder.command_complete("BEGIN")?;
                 Ok(Ok(()))
             }
@@ -10694,14 +10630,76 @@ impl Engine {
                 responder.command_complete("SET CONSTRAINTS")?;
                 Ok(Ok(()))
             }
-            Stmt::Set { name, value, local } => {
+            Stmt::Set {
+                name,
+                value,
+                local,
+                syntax,
+            } => {
                 if *local && !txn.is_explicit() {
                     responder.warning(
                         sqlstate::NO_ACTIVE_SQL_TRANSACTION,
                         "SET LOCAL can only be used in transaction blocks",
                     )?;
                 }
-                match guc.set(name, value, *local) {
+                if *syntax == ast::SettingSyntax::FromCurrent {
+                    if let Some(characteristics) = guc.current_transaction_setting_from_current(
+                        name,
+                        txn.isolation,
+                        txn.read_only,
+                        txn.deferrable,
+                    ) {
+                        let characteristics = match characteristics {
+                            Ok(characteristics) => characteristics,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        if let Err(error) = apply_current_transaction_setting(txn, characteristics)
+                        {
+                            return Ok(Err(error));
+                        }
+                    } else if let Err(error) = guc.set_from_current(name, *local) {
+                        return Ok(Err(error));
+                    }
+                    guc::publish_active_setting(guc, name);
+                    responder.command_complete("SET")?;
+                    return Ok(Ok(()));
+                }
+                if let Some(characteristics) = guc.current_transaction_setting(name, value) {
+                    let characteristics = match characteristics {
+                        Ok(characteristics) => characteristics,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    if let Err(error) = apply_current_transaction_setting(txn, characteristics) {
+                        return Ok(Err(error));
+                    }
+                    responder.command_complete("SET")?;
+                    return Ok(Ok(()));
+                }
+                let changed = match syntax {
+                    ast::SettingSyntax::Generic => guc.set(name, value, *local),
+                    ast::SettingSyntax::FromCurrent => {
+                        unreachable!("FROM CURRENT is handled before value application")
+                    }
+                    ast::SettingSyntax::TimeZone => guc.set_time_zone_sql(value, *local),
+                    ast::SettingSyntax::TimeZoneInterval(type_mod) => {
+                        let interval = match datetime::parse_interval(value) {
+                            Ok(interval) => interval,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        let interval = match exec::apply_typmod(
+                            Datum::Interval(interval),
+                            types::ColType::Interval,
+                            *type_mod,
+                            arena,
+                        ) {
+                            Ok(Datum::Interval(interval)) => interval,
+                            Ok(_) => unreachable!("interval typmod preserves its type"),
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        guc.set_time_zone_interval(interval, *local)
+                    }
+                };
+                match changed {
                     Ok(()) => {
                         if name.eq_ignore_ascii_case("default_tablespace") {
                             let tablespace = guc.default_tablespace();
@@ -10726,6 +10724,10 @@ impl Engine {
                     Err(e) => Ok(Err(e)),
                 }
             }
+            Stmt::SetCatalog(_) => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "current database cannot be changed"
+            ))),
             Stmt::AlterSystem { name, value } => exec::alter_system(
                 &mut self.storage,
                 &mut self.wal,
@@ -10736,6 +10738,15 @@ impl Engine {
                 responder,
             ),
             Stmt::Reset(name) => {
+                if let Some(name) = name
+                    && guc.transaction_reset_owned(name).is_some()
+                {
+                    return Ok(Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "parameter \"{}\" cannot be reset",
+                        name
+                    )));
+                }
                 let result = match name {
                     Some(name) => guc.reset(name),
                     None => {
@@ -10751,17 +10762,17 @@ impl Engine {
                     Err(e) => Ok(Err(e)),
                 }
             }
-            Stmt::SetTransaction(characteristics) => {
-                let characteristics = match transaction_characteristics(characteristics) {
-                    Ok(characteristics) => characteristics,
-                    Err(characteristic) => {
-                        return Ok(Err(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "transaction characteristic \"{}\" is not supported",
-                            characteristic
-                        )));
+            Stmt::SetTransaction {
+                target,
+                characteristics,
+            } => {
+                if *target == TransactionTarget::SessionDefaults {
+                    if let Err(error) = guc.set_transaction_defaults(*characteristics) {
+                        return Ok(Err(error));
                     }
-                };
+                    responder.command_complete("SET")?;
+                    return Ok(Ok(()));
+                }
                 if !txn.is_explicit() {
                     responder.warning(
                         sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -10770,17 +10781,9 @@ impl Engine {
                     responder.command_complete("SET")?;
                     return Ok(Ok(()));
                 }
-                if characteristics.isolation.is_some() && txn.snapshot_taken() {
-                    return Ok(Err(sql_err!(
-                        sqlstate::ACTIVE_SQL_TRANSACTION,
-                        "SET TRANSACTION ISOLATION LEVEL must be called before any query"
-                    )));
+                if let Err(error) = apply_current_transaction_setting(txn, *characteristics) {
+                    return Ok(Err(error));
                 }
-                txn.set_characteristics(
-                    characteristics.isolation.unwrap_or(txn.isolation),
-                    characteristics.read_only.unwrap_or(txn.read_only),
-                    characteristics.deferrable.unwrap_or(txn.deferrable),
-                );
                 responder.command_complete("SET")?;
                 Ok(Ok(()))
             }
@@ -10791,8 +10794,8 @@ impl Engine {
                 responder.command_complete("SET")?;
                 Ok(Ok(()))
             }
-            Stmt::Show(name) => self.show(name, guc, responder),
-            Stmt::ShowAll => self.show_all(guc, responder),
+            Stmt::Show(name) => self.show(name, guc, txn, responder),
+            Stmt::ShowAll => self.show_all(guc, txn, responder),
             Stmt::Discard(target) => {
                 match target {
                     ast::DiscardTarget::All => {
@@ -12394,12 +12397,13 @@ impl Engine {
         &mut self,
         name: &str,
         guc: &GucState,
+        txn: &TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         // Session GUCs come from the per-session store; the rest are fixed
         // server parameters.
         let value = if let Some(value) = self
-            .fixed_setting_for(name, 0)
+            .fixed_setting_for(name, txn)
             .or_else(|| guc.get_owned(name))
         {
             value
@@ -12431,6 +12435,7 @@ impl Engine {
     fn show_all(
         &mut self,
         guc: &GucState,
+        txn: &TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
         responder.row_description(&[
@@ -12440,7 +12445,7 @@ impl Engine {
         ])?;
         for &name in SETTING_NAMES {
             if let Some(value) = self
-                .fixed_setting_for(name, 0)
+                .fixed_setting_for(name, txn)
                 .or_else(|| guc.get_owned(name))
             {
                 responder.data_row(&[
@@ -12454,13 +12459,30 @@ impl Engine {
         Ok(Ok(()))
     }
 
-    fn fixed_setting_for(&self, name: &str, txid: u32) -> Option<crate::util::StackStr<256>> {
+    fn fixed_setting_for(&self, name: &str, txn: &TxnState) -> Option<crate::util::StackStr<256>> {
+        if name.eq_ignore_ascii_case("transaction_isolation") {
+            return Some(crate::util::StackStr::from_str(txn.isolation.as_str()));
+        }
+        if name.eq_ignore_ascii_case("transaction_read_only") {
+            return Some(crate::util::StackStr::from_str(if txn.read_only {
+                "on"
+            } else {
+                "off"
+            }));
+        }
+        if name.eq_ignore_ascii_case("transaction_deferrable") {
+            return Some(crate::util::StackStr::from_str(if txn.deferrable {
+                "on"
+            } else {
+                "off"
+            }));
+        }
         if name.eq_ignore_ascii_case("is_superuser") {
             let role = crate::sql::eval::funcs::system::current_user_owned();
             let superuser = self
                 .storage
-                .find_role_visible(role.as_str(), txid)
-                .is_some_and(|slot| self.storage.role(slot).attributes_to(txid).superuser);
+                .find_role_visible(role.as_str(), txn.txid)
+                .is_some_and(|slot| self.storage.role(slot).attributes_to(txn.txid).superuser);
             return Some(crate::util::StackStr::from_str(if superuser {
                 "on"
             } else {
@@ -12479,7 +12501,6 @@ fn fixed_setting(name: &str) -> Option<&'static str> {
         "server_encoding" => Some("UTF8"),
         "standard_conforming_strings" => Some("on"),
         "integer_datetimes" => Some("on"),
-        "transaction_isolation" => Some("read committed"),
         _ => None,
     }
 }
@@ -12494,6 +12515,9 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "client_encoding",
     "client_min_messages",
     "DateStyle",
+    "default_transaction_deferrable",
+    "default_transaction_isolation",
+    "default_transaction_read_only",
     "default_table_access_method",
     "default_tablespace",
     "extra_float_digits",
@@ -12511,7 +12535,9 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "statement_timeout",
     "synchronize_seqscans",
     "TimeZone",
+    "transaction_deferrable",
     "transaction_isolation",
+    "transaction_read_only",
     "transaction_timeout",
     "xmloption",
 ];

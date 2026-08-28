@@ -9927,6 +9927,316 @@ fn set_show_transaction_and_show_all() {
 }
 
 #[test]
+fn transaction_configuration_distinguishes_session_defaults_and_current_state() {
+    let (mut engine, mut budget) = test_engine();
+    let mut guc = GucState::new();
+
+    let configured = run_session(
+        &mut engine,
+        &mut budget,
+        &mut guc,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION \
+           ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE",
+    );
+    assert!(!String::from_utf8_lossy(&configured).contains("ERROR"));
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SELECT current_setting('default_transaction_isolation'), \
+                    current_setting('default_transaction_read_only'), \
+                    current_setting('default_transaction_deferrable'), \
+                    current_setting('transaction_isolation'), \
+                    current_setting('transaction_read_only'), \
+                    current_setting('transaction_deferrable')"
+        )),
+        ["serializable|on|on|serializable|on|on"]
+    );
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SELECT name, setting, reset_val, source FROM pg_settings \
+             WHERE name IN ('default_transaction_isolation', \
+                            'default_transaction_read_only', \
+                            'default_transaction_deferrable', \
+                            'transaction_isolation', 'transaction_read_only', \
+                            'transaction_deferrable') ORDER BY name"
+        )),
+        [
+            "default_transaction_deferrable|on|off|session",
+            "default_transaction_isolation|serializable|read committed|session",
+            "default_transaction_read_only|on|off|session",
+            "transaction_deferrable|on|off|override",
+            "transaction_isolation|serializable|read committed|override",
+            "transaction_read_only|on|off|override",
+        ]
+    );
+
+    let read_only = run_session(
+        &mut engine,
+        &mut budget,
+        &mut guc,
+        "CREATE TABLE forbidden_by_session_default (id integer)",
+    );
+    assert!(String::from_utf8_lossy(&read_only).contains("25006"));
+
+    run_session(
+        &mut engine,
+        &mut budget,
+        &mut guc,
+        "SET default_transaction_read_only = off; \
+         SET default_transaction_deferrable = off; \
+         SET default_transaction_isolation = 'read committed'",
+    );
+    let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
+    let current = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY; \
+         SHOW transaction_isolation; SHOW transaction_read_only; \
+         SHOW transaction_deferrable; \
+         SELECT name, setting, reset_val, source FROM pg_settings \
+         WHERE name IN ('transaction_isolation', 'transaction_read_only', \
+                        'transaction_deferrable') ORDER BY name",
+    );
+    assert_eq!(
+        data_rows(&current),
+        [
+            "repeatable read",
+            "on",
+            "off",
+            "transaction_deferrable|off|off|override",
+            "transaction_isolation|repeatable read|read committed|session",
+            "transaction_read_only|on|off|session",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            "ROLLBACK; BEGIN; \
+             SELECT set_config('transaction_read_only', 'on', false), \
+                    current_setting('transaction_read_only'); ROLLBACK"
+        )),
+        ["on|on"]
+    );
+
+    let late_characteristic = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN; SELECT 1; SET TRANSACTION DEFERRABLE",
+    );
+    assert!(
+        String::from_utf8_lossy(&late_characteristic)
+            .contains("SET TRANSACTION [NOT] DEFERRABLE must be called before any query"),
+        "{}",
+        String::from_utf8_lossy(&late_characteristic)
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "ROLLBACK",
+    );
+
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SET SCHEMA 'pg_catalog'; SHOW search_path"
+        )),
+        ["pg_catalog"]
+    );
+    let seeded = data_rows(&run_session(
+        &mut engine,
+        &mut budget,
+        &mut guc,
+        "SET seed TO 0.5; SELECT random(); SELECT setseed(0.5); SELECT random()",
+    ));
+    assert_eq!(seeded.len(), 3);
+    assert_eq!(seeded[0], "0.9851677175347999");
+    assert_eq!(seeded[1], "");
+    assert_eq!(seeded[0], seeded[2]);
+    let time_zones = run_session(
+        &mut engine,
+        &mut budget,
+        &mut guc,
+        "SET TIME ZONE +2; SHOW TIME ZONE; \
+         SET TIME ZONE INTERVAL '-03:30'; SHOW TIME ZONE; \
+         SET TIME ZONE INTERVAL '2:30' HOUR TO MINUTE; SHOW TIME ZONE; \
+         SET TIME ZONE INTERVAL(0) '1:45'; SHOW TIME ZONE; \
+         SET TIME ZONE LOCAL; SHOW TIME ZONE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&time_zones).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&time_zones)
+    );
+    assert_eq!(
+        data_rows(&time_zones),
+        [
+            "<+02>-02",
+            "<-03:30>+03:30",
+            "<+02:30>-02:30",
+            "<+01:45>-01:45",
+            "UTC"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SET XML OPTION CONTENT; SHOW xmloption"
+        )),
+        ["content"]
+    );
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SET application_name = 'transaction-suite'; \
+             SET application_name FROM CURRENT; SHOW application_name; \
+             SET NAMES; SHOW client_encoding; \
+             SET TIME ZONE +4; RESET TIME ZONE; SHOW TIME ZONE; \
+             RESET xmloption; SET xmloption FROM CURRENT; \
+             SELECT source FROM pg_settings WHERE name = 'xmloption'"
+        )),
+        ["transaction-suite", "UTF8", "UTC", "session"]
+    );
+    let configuration_before_characteristics = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN; SHOW transaction_deferrable; \
+         SET TRANSACTION DEFERRABLE; SHOW transaction_deferrable; ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&configuration_before_characteristics),
+        ["off", "on"]
+    );
+    let reset_characteristic = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN; RESET TRANSACTION ISOLATION LEVEL",
+    );
+    assert!(
+        String::from_utf8_lossy(&reset_characteristic)
+            .contains("parameter \"transaction_isolation\" cannot be reset"),
+        "{}",
+        String::from_utf8_lossy(&reset_characteristic)
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            "BEGIN READ ONLY; RESET ALL; SHOW transaction_read_only; ROLLBACK"
+        )),
+        ["on"]
+    );
+    assert_eq!(
+        data_rows(&run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            "BEGIN; SAVEPOINT characteristics; \
+             SET TRANSACTION READ ONLY; SHOW transaction_read_only; \
+             ROLLBACK TO characteristics; SHOW transaction_read_only; \
+             SELECT source FROM pg_settings WHERE name = 'transaction_read_only'; \
+             ROLLBACK"
+        )),
+        ["on", "off", "override"]
+    );
+    for sql in [
+        "BEGIN; SAVEPOINT characteristics; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "BEGIN; SAVEPOINT characteristics; SET TRANSACTION DEFERRABLE",
+    ] {
+        let output =
+            run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc, sql);
+        assert!(
+            String::from_utf8_lossy(&output).contains("subtransaction"),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            "ROLLBACK",
+        );
+    }
+    let nested_begin = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN READ ONLY; BEGIN READ WRITE; SHOW transaction_read_only; ROLLBACK",
+    );
+    assert_eq!(data_rows(&nested_begin), ["on"]);
+    for sql in [
+        "SET TRANSACTION READ ONLY, READ WRITE",
+        "SET SESSION TRANSACTION READ ONLY",
+        "SET CHARACTERISTICS AS TRANSACTION READ ONLY",
+        "SET SCHEMA pg_catalog",
+        "SET NAMES UTF8",
+        "SET SEED 0.5",
+        "SET TIME ZONE INTERVAL '1 day' DAY",
+        "SET TIME ZONE UTC junk",
+    ] {
+        let output = run_session(&mut engine, &mut budget, &mut guc, sql);
+        assert!(
+            String::from_utf8_lossy(&output).contains("42601"),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    for sql in ["RESET seed", "SET transaction_read_only = DEFAULT"] {
+        let output = run_session(&mut engine, &mut budget, &mut guc, sql);
+        assert!(
+            String::from_utf8_lossy(&output).contains("cannot be reset"),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let seed_from_current =
+        run_session(&mut engine, &mut budget, &mut guc, "SET seed FROM CURRENT");
+    assert!(
+        String::from_utf8_lossy(&seed_from_current)
+            .contains("invalid value for parameter \"seed\": \"unavailable\""),
+        "{}",
+        String::from_utf8_lossy(&seed_from_current)
+    );
+    let catalog = run_session(&mut engine, &mut budget, &mut guc, "SET CATALOG 'other'");
+    assert!(String::from_utf8_lossy(&catalog).contains("0A000"));
+}
+
+#[test]
 fn smallint_varchar_char_type_fidelity() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
@@ -34816,12 +35126,12 @@ fn set_transaction_changes_only_named_characteristics() {
         &mut transaction,
         "SET TRANSACTION READ ONLY",
     );
-    assert_eq!(transaction.isolation, IsolationLevel::RepeatableRead);
+    assert_eq!(transaction.isolation, TransactionIsolation::RepeatableRead);
     assert!(transaction.read_only);
     assert!(!transaction.deferrable);
     let nested = run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
     assert!(nested.contains("25001"), "{nested}");
-    assert_eq!(transaction.isolation, IsolationLevel::RepeatableRead);
+    assert_eq!(transaction.isolation, TransactionIsolation::RepeatableRead);
     assert!(transaction.read_only);
     assert!(!transaction.deferrable);
     run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
@@ -34941,7 +35251,7 @@ fn serializable_rejects_write_skew_at_commit() {
     );
     assert_eq!(
         first.isolation,
-        IsolationLevel::Serializable,
+        TransactionIsolation::Serializable,
         "SERIALIZABLE is a real transaction mode"
     );
     assert_eq!(

@@ -1460,7 +1460,10 @@ impl<'a> Parser<'a> {
     /// columns and domains. Compact range input is normalized to the verbose
     /// form consumed by the interval value parser; ordinary unit-bearing input
     /// stays intact and is constrained later by the typed coercion boundary.
-    fn interval_with_qualifier(&mut self, lit: &'a str) -> Result<(&'a str, i32), ParseError> {
+    pub(super) fn interval_with_qualifier(
+        &mut self,
+        lit: &'a str,
+    ) -> Result<(&'a str, i32), ParseError> {
         let Some((word, _)) = self.peek_interval_field() else {
             return Ok((lit, -1));
         };

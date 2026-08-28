@@ -209,6 +209,22 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
+        oid: 1598,
+        name: "random",
+        result_oid: 701,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1599,
+        name: "setseed",
+        result_oid: 2278,
+        argument_types: "701",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
         oid: 2077,
         name: "current_setting",
         result_oid: 25,
@@ -11499,6 +11515,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "client_encoding" | "server_encoding" => "UTF8",
             "client_min_messages" => "notice",
             "DateStyle" => "ISO, MDY",
+            "default_transaction_deferrable" | "default_transaction_read_only" => "off",
+            "default_transaction_isolation" => "read committed",
             "default_table_access_method" => "heap",
             "extra_float_digits" => "1",
             "idle_in_transaction_session_timeout"
@@ -11513,6 +11531,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "synchronize_seqscans" => "on",
             "TimeZone" => "UTC",
             "transaction_isolation" => "read committed",
+            "transaction_deferrable" | "transaction_read_only" => "off",
             "xmloption" => "content",
             _ => "",
         };
@@ -11524,6 +11543,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "row_security"
                 | "standard_conforming_strings"
                 | "synchronize_seqscans"
+                | "default_transaction_deferrable"
+                | "default_transaction_read_only"
+                | "transaction_deferrable"
+                | "transaction_read_only"
         ) {
             "bool"
         } else if matches!(

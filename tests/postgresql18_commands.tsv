@@ -185,12 +185,12 @@ SAVEPOINT	complete	05_transactions.sql
 SECURITY LABEL	missing	-
 SELECT	complete	14_surface.sql
 SELECT INTO	complete	69_select_into.sql
-SET	partial	75_guc_mutation.sql
+SET	complete	75_guc_mutation.sql and 119_transaction_configuration.sql
 SET CONSTRAINTS	complete	101_trigger_timing.sql
 SET ROLE	complete	83_roles_acl.sql
 SET SESSION AUTHORIZATION	complete	83_roles_acl.sql
-SET TRANSACTION	partial	05_transactions.sql
-SHOW	partial	68_current_setting.sql
+SET TRANSACTION	complete	05_transactions.sql and 119_transaction_configuration.sql
+SHOW	partial	68_current_setting.sql and 119_transaction_configuration.sql
 START TRANSACTION	complete	05_transactions.sql
 TRUNCATE	complete	35_truncate_sequences.sql
 UNLISTEN	complete	14_surface.sql

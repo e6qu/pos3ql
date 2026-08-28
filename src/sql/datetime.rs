@@ -1252,8 +1252,9 @@ pub fn parse_interval(s: &str) -> Result<super::types::Interval, SqlError> {
                 .ok_or_else(bad)?;
             let second: f64 = parts
                 .next()
-                .and_then(|part| part.parse().ok())
-                .ok_or_else(bad)?;
+                .map(|part| part.parse().map_err(|_| bad()))
+                .transpose()?
+                .unwrap_or(0.0);
             if !(0..60).contains(&minute) || !(0.0..60.0).contains(&second) {
                 return Err(overflow());
             }

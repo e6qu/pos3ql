@@ -10,11 +10,64 @@ use crate::sql_err;
 use crate::storage::MAX_SEQUENCES;
 use crate::util::StackStr;
 
+use super::ast::{TransactionCharacteristics, TransactionIsolation};
 use super::datetime::{DateFormat, DateStyle, FieldOrder, IntervalStyle};
 use super::eval::SqlError;
 
+#[derive(Clone, Copy)]
+struct PrngState {
+    s0: u64,
+    s1: u64,
+    initialized: bool,
+}
+
+impl PrngState {
+    const UNINITIALIZED: Self = Self {
+        s0: 0,
+        s1: 0,
+        initialized: false,
+    };
+
+    fn splitmix64(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut value = *seed;
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    fn seed_u64(&mut self, mut seed: u64) {
+        self.s0 = Self::splitmix64(&mut seed);
+        self.s1 = Self::splitmix64(&mut seed);
+        if self.s0 == 0 && self.s1 == 0 {
+            self.s0 = 0x5851_F42D_4C95_7F2D;
+            self.s1 = 0x1405_7B7E_F767_814F;
+        }
+        self.initialized = true;
+    }
+
+    fn seed_f64(&mut self, seed: f64) {
+        let integer = (((1_u64 << 52) - 1) as f64 * seed) as i64;
+        self.seed_u64(integer as u64);
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let s0 = self.s0;
+        let mixed = self.s1 ^ s0;
+        let value = s0.wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        self.s0 = s0.rotate_left(24) ^ mixed ^ mixed.wrapping_shl(16);
+        self.s1 = mixed.rotate_left(37);
+        value
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        ((self.next_u64() >> 12) as f64) * 2_f64.powi(-52)
+    }
+}
+
 std::thread_local! {
     static ACTIVE_GUC: Cell<*const GucState> = const { Cell::new(core::ptr::null()) };
+    static ACTIVE_TXN: Cell<*mut super::txn::TxnState> = const { Cell::new(core::ptr::null_mut()) };
     static ACTIVE_RENDER: RefCell<Option<RenderContext>> = const { RefCell::new(None) };
 }
 
@@ -24,28 +77,60 @@ std::thread_local! {
 /// statement on either success or error.
 pub struct EvalScope {
     prior: *const GucState,
+    prior_txn: *mut super::txn::TxnState,
     prior_render: Option<RenderContext>,
 }
 
 impl Drop for EvalScope {
     fn drop(&mut self) {
         ACTIVE_GUC.with(|active| active.set(self.prior));
+        ACTIVE_TXN.with(|active| active.set(self.prior_txn));
         ACTIVE_RENDER.with(|active| *active.borrow_mut() = self.prior_render);
     }
 }
 
-pub fn enter_eval_scope(guc: &GucState) -> EvalScope {
+pub fn enter_eval_scope(guc: &GucState, txn: &mut super::txn::TxnState) -> EvalScope {
     let pointer = guc as *const GucState;
     let prior = ACTIVE_GUC.with(|active| active.replace(pointer));
+    let prior_txn = ACTIVE_TXN.with(|active| active.replace(txn as *mut _));
     let prior_render = ACTIVE_RENDER.with(|active| active.replace(Some(guc.render())));
     EvalScope {
         prior,
+        prior_txn,
         prior_render,
     }
 }
 
 pub fn active_render() -> Option<RenderContext> {
     ACTIVE_RENDER.with(|active| *active.borrow())
+}
+
+pub(crate) fn active_random() -> Result<f64, SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "random is unavailable outside statement execution"
+            ));
+        }
+        // SAFETY: EvalScope owns the pointer's dynamic extent.
+        unsafe { &*pointer }.random()
+    })
+}
+
+pub(crate) fn set_active_random_seed(seed: f64) -> Result<(), SqlError> {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "setseed is unavailable outside statement execution"
+            ));
+        }
+        // SAFETY: EvalScope owns the pointer's dynamic extent.
+        unsafe { &*pointer }.set_random_seed(seed)
+    })
 }
 
 /// Whether the active session permits row-security filtering. PostgreSQL's
@@ -80,6 +165,29 @@ pub fn set_active_config(
         // for exactly the dynamic extent of execute_stmt and its Drop guard
         // clears it on every exit. GucState mutation is behind RefCell.
         let guc = unsafe { &*pointer };
+        if let Some(characteristics) =
+            guc.current_transaction_setting(name, value.unwrap_or("DEFAULT"))
+        {
+            let characteristics = characteristics?;
+            let txn_pointer = ACTIVE_TXN.with(Cell::get);
+            if txn_pointer.is_null() {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "transaction configuration is unavailable outside statement execution"
+                ));
+            }
+            // SAFETY: EvalScope installs the live transaction beside the GUC
+            // and clears both pointers on every exit.
+            let txn = unsafe { &mut *txn_pointer };
+            txn.apply_characteristics(characteristics)?;
+            let result =
+                transaction_setting_owned(txn, name).expect("recognized transaction setting");
+            let reset = guc
+                .transaction_reset_owned(name)
+                .expect("recognized transaction setting has a default");
+            crate::sql::eval::funcs::system::update_session_setting(name, result, reset, "session");
+            return Ok(result);
+        }
         let result = guc.set_config(name, value, local)?;
         publish_active_setting(guc, name);
         Ok(result)
@@ -87,6 +195,16 @@ pub fn set_active_config(
 }
 
 pub(crate) fn publish_active_setting(guc: &GucState, name: &str) {
+    let txn_pointer = ACTIVE_TXN.with(Cell::get);
+    if !txn_pointer.is_null() {
+        // SAFETY: EvalScope owns the pointer's dynamic extent.
+        let txn = unsafe { &*txn_pointer };
+        if let Some(value) = transaction_setting_owned(txn, name) {
+            let reset = guc.transaction_reset_owned(name).unwrap_or(value);
+            crate::sql::eval::funcs::system::update_session_setting(name, value, reset, "session");
+            return;
+        }
+    }
     if let Some(value) = guc.get_owned(name) {
         let reset = guc.reset_owned(name).unwrap_or(value);
         crate::sql::eval::funcs::system::update_session_setting(
@@ -99,6 +217,22 @@ pub(crate) fn publish_active_setting(guc: &GucState, name: &str) {
     ACTIVE_RENDER.with(|active| *active.borrow_mut() = Some(guc.render()));
     if name.eq_ignore_ascii_case("timezone") {
         crate::sql::timezone::set_session(guc.timezone());
+    }
+}
+
+fn transaction_setting_owned(txn: &super::txn::TxnState, name: &str) -> Option<StackStr<256>> {
+    if name.eq_ignore_ascii_case("transaction_isolation") {
+        Some(StackStr::from_str(txn.isolation.as_str()))
+    } else if name.eq_ignore_ascii_case("transaction_read_only") {
+        Some(StackStr::from_str(if txn.read_only { "on" } else { "off" }))
+    } else if name.eq_ignore_ascii_case("transaction_deferrable") {
+        Some(StackStr::from_str(if txn.deferrable {
+            "on"
+        } else {
+            "off"
+        }))
+    } else {
+        None
     }
 }
 
@@ -276,6 +410,9 @@ struct GucValues {
     /// rejected before this matters, but the session value is still observable
     /// and is emitted by pg_dump.
     check_function_bodies: bool,
+    default_transaction_isolation: TransactionIsolation,
+    default_transaction_read_only: bool,
+    default_transaction_deferrable: bool,
 }
 
 impl GucValues {
@@ -298,6 +435,9 @@ impl GucValues {
             row_security: StackStr::new(),
             bytea_escape: false,
             check_function_bodies: true,
+            default_transaction_isolation: TransactionIsolation::ReadCommitted,
+            default_transaction_read_only: false,
+            default_transaction_deferrable: false,
         };
         let _ = write!(values.datestyle, "ISO, MDY");
         let _ = write!(values.timezone, "UTC");
@@ -325,7 +465,16 @@ const GUC_STATEMENT_TIMEOUT: u32 = 1 << 10;
 const GUC_ROW_SECURITY: u32 = 1 << 11;
 const GUC_BYTEA_OUTPUT: u32 = 1 << 12;
 const GUC_CHECK_FUNCTION_BODIES: u32 = 1 << 13;
-const GUC_ALL: u32 = (1 << 14) - 1;
+const GUC_DEFAULT_TRANSACTION_ISOLATION: u32 = 1 << 14;
+const GUC_DEFAULT_TRANSACTION_READ_ONLY: u32 = 1 << 15;
+const GUC_DEFAULT_TRANSACTION_DEFERRABLE: u32 = 1 << 16;
+const GUC_STANDARD_CONFORMING_STRINGS: u32 = 1 << 17;
+const GUC_XML_OPTION: u32 = 1 << 18;
+const GUC_DEFAULT_TABLE_ACCESS_METHOD: u32 = 1 << 19;
+const GUC_SYNCHRONIZE_SEQSCANS: u32 = 1 << 20;
+const GUC_IDLE_IN_TRANSACTION_SESSION_TIMEOUT: u32 = 1 << 21;
+const GUC_TRANSACTION_TIMEOUT: u32 = 1 << 22;
+const GUC_ALL: u32 = (1 << 23) - 1;
 
 fn guc_bit(name: &str) -> u32 {
     if name.eq_ignore_ascii_case("datestyle") {
@@ -356,6 +505,24 @@ fn guc_bit(name: &str) -> u32 {
         GUC_BYTEA_OUTPUT
     } else if name.eq_ignore_ascii_case("check_function_bodies") {
         GUC_CHECK_FUNCTION_BODIES
+    } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
+        GUC_DEFAULT_TRANSACTION_ISOLATION
+    } else if name.eq_ignore_ascii_case("default_transaction_read_only") {
+        GUC_DEFAULT_TRANSACTION_READ_ONLY
+    } else if name.eq_ignore_ascii_case("default_transaction_deferrable") {
+        GUC_DEFAULT_TRANSACTION_DEFERRABLE
+    } else if name.eq_ignore_ascii_case("standard_conforming_strings") {
+        GUC_STANDARD_CONFORMING_STRINGS
+    } else if name.eq_ignore_ascii_case("xmloption") {
+        GUC_XML_OPTION
+    } else if name.eq_ignore_ascii_case("default_table_access_method") {
+        GUC_DEFAULT_TABLE_ACCESS_METHOD
+    } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
+        GUC_SYNCHRONIZE_SEQSCANS
+    } else if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout") {
+        GUC_IDLE_IN_TRANSACTION_SESSION_TIMEOUT
+    } else if name.eq_ignore_ascii_case("transaction_timeout") {
+        GUC_TRANSACTION_TIMEOUT
     } else {
         0
     }
@@ -386,6 +553,45 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     copy!(GUC_ROW_SECURITY, row_security);
     copy!(GUC_BYTEA_OUTPUT, bytea_escape);
     copy!(GUC_CHECK_FUNCTION_BODIES, check_function_bodies);
+    copy!(
+        GUC_DEFAULT_TRANSACTION_ISOLATION,
+        default_transaction_isolation
+    );
+    copy!(
+        GUC_DEFAULT_TRANSACTION_READ_ONLY,
+        default_transaction_read_only
+    );
+    copy!(
+        GUC_DEFAULT_TRANSACTION_DEFERRABLE,
+        default_transaction_deferrable
+    );
+}
+
+fn finish_setting_change(
+    state: &mut GucStore,
+    values: GucValues,
+    bit: u32,
+    local: bool,
+    resetting: bool,
+) {
+    state.current = values;
+    if !state.transaction.active {
+        state.defaults = values;
+        state.connection_overrides |= bit;
+        state.database_overrides &= !bit;
+        state.role_overrides &= !bit;
+        state.database_role_overrides &= !bit;
+        state.client_overrides |= bit;
+    } else if !local {
+        copy_guc_values(&mut state.transaction.session, &values, bit);
+        if resetting {
+            state.session_overrides &= !bit;
+            state.transaction.session_overrides &= !bit;
+        } else {
+            state.session_overrides |= bit;
+            state.transaction.session_overrides |= bit;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -435,6 +641,7 @@ pub struct GucState {
     authenticated_user: StackStr<64>,
     /// This connection's `currval`/`lastval` state.
     seq_session: SeqSession,
+    random: Cell<PrngState>,
 }
 
 pub(crate) struct RoutineConfigScope {
@@ -499,6 +706,9 @@ fn merge_session_changes(target: &mut GucValues, before: &GucValues, after: &Guc
     changed!(row_security);
     changed!(bytea_escape);
     changed!(check_function_bodies);
+    changed!(default_transaction_isolation);
+    changed!(default_transaction_read_only);
+    changed!(default_transaction_deferrable);
 }
 
 impl Default for GucState {
@@ -567,6 +777,26 @@ impl GucState {
             } else {
                 "off"
             }))
+        } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
+            Some(StackStr::from_str(
+                values.default_transaction_isolation.as_str(),
+            ))
+        } else if name.eq_ignore_ascii_case("default_transaction_read_only") {
+            Some(StackStr::from_str(
+                if values.default_transaction_read_only {
+                    "on"
+                } else {
+                    "off"
+                },
+            ))
+        } else if name.eq_ignore_ascii_case("default_transaction_deferrable") {
+            Some(StackStr::from_str(
+                if values.default_transaction_deferrable {
+                    "on"
+                } else {
+                    "off"
+                },
+            ))
         } else {
             None
         }
@@ -598,6 +828,7 @@ impl GucState {
             }),
             authenticated_user: StackStr::new(),
             seq_session: SeqSession::new(),
+            random: Cell::new(PrngState::UNINITIALIZED),
         };
         let _ = write!(g.authenticated_user, "postgres");
         g
@@ -613,6 +844,43 @@ impl GucState {
 
     pub fn seq_session(&self) -> &SeqSession {
         &self.seq_session
+    }
+
+    pub(crate) fn set_random_seed(&self, seed: f64) -> Result<(), SqlError> {
+        if !(-1.0..=1.0).contains(&seed) || seed.is_nan() {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "setseed parameter {} is out of allowed range [-1,1]",
+                seed
+            ));
+        }
+        let mut state = self.random.get();
+        state.seed_f64(seed);
+        self.random.set(state);
+        Ok(())
+    }
+
+    pub(crate) fn random(&self) -> Result<f64, SqlError> {
+        let mut state = self.random.get();
+        if !state.initialized {
+            let mut seed = [0_u8; 16];
+            if unsafe { libc::getentropy(seed.as_mut_ptr().cast(), seed.len()) } != 0 {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "could not initialize the session random generator"
+                ));
+            }
+            state.s0 = u64::from_ne_bytes(seed[..8].try_into().expect("fixed seed half"));
+            state.s1 = u64::from_ne_bytes(seed[8..].try_into().expect("fixed seed half"));
+            if state.s0 == 0 && state.s1 == 0 {
+                state.seed_u64(0);
+            } else {
+                state.initialized = true;
+            }
+        }
+        let value = state.next_f64();
+        self.random.set(state);
+        Ok(value)
     }
 
     pub fn session_user(&self) -> StackStr<64> {
@@ -680,36 +948,228 @@ impl GucState {
         parse_timeout_ms(self.store.borrow().current.lock_timeout.as_str()).unwrap_or(0)
     }
 
+    pub(crate) fn transaction_defaults(&self) -> (TransactionIsolation, bool, bool) {
+        let values = self.store.borrow().current;
+        (
+            values.default_transaction_isolation,
+            values.default_transaction_read_only,
+            values.default_transaction_deferrable,
+        )
+    }
+
+    pub(crate) fn set_transaction_defaults(
+        &self,
+        characteristics: TransactionCharacteristics,
+    ) -> Result<(), SqlError> {
+        if let Some(isolation) = characteristics.isolation {
+            self.set("default_transaction_isolation", isolation.as_str(), false)?;
+        }
+        if let Some(read_only) = characteristics.read_only {
+            self.set(
+                "default_transaction_read_only",
+                if read_only { "on" } else { "off" },
+                false,
+            )?;
+        }
+        if let Some(deferrable) = characteristics.deferrable {
+            self.set(
+                "default_transaction_deferrable",
+                if deferrable { "on" } else { "off" },
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn current_transaction_setting(
+        &self,
+        name: &str,
+        raw: &str,
+    ) -> Option<Result<TransactionCharacteristics, SqlError>> {
+        let value = unquote(raw);
+        let mut characteristics = TransactionCharacteristics::EMPTY;
+        let cannot_reset = || {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "parameter \"{}\" cannot be reset",
+                name
+            )
+        };
+        if name.eq_ignore_ascii_case("transaction_isolation") {
+            if value.eq_ignore_ascii_case("default") {
+                return Some(Err(cannot_reset()));
+            }
+            let isolation = match parse_transaction_isolation(value) {
+                Some(isolation) => isolation,
+                None => {
+                    return Some(Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "invalid value for parameter \"transaction_isolation\": \"{}\"",
+                        value
+                    )));
+                }
+            };
+            characteristics.isolation = Some(isolation);
+        } else if name.eq_ignore_ascii_case("transaction_read_only") {
+            if value.eq_ignore_ascii_case("default") {
+                return Some(Err(cannot_reset()));
+            }
+            let read_only = match parse_on_off(value) {
+                Some(read_only) => read_only,
+                None => return Some(Err(unsupported_value("transaction_read_only", value))),
+            };
+            characteristics.read_only = Some(read_only);
+        } else if name.eq_ignore_ascii_case("transaction_deferrable") {
+            if value.eq_ignore_ascii_case("default") {
+                return Some(Err(cannot_reset()));
+            }
+            let deferrable = match parse_on_off(value) {
+                Some(deferrable) => deferrable,
+                None => return Some(Err(unsupported_value("transaction_deferrable", value))),
+            };
+            characteristics.deferrable = Some(deferrable);
+        } else {
+            return None;
+        }
+        Some(Ok(characteristics))
+    }
+
+    pub(crate) fn current_transaction_setting_from_current(
+        &self,
+        name: &str,
+        isolation: TransactionIsolation,
+        read_only: bool,
+        deferrable: bool,
+    ) -> Option<Result<TransactionCharacteristics, SqlError>> {
+        let mut characteristics = TransactionCharacteristics::EMPTY;
+        if name.eq_ignore_ascii_case("transaction_isolation") {
+            characteristics.isolation = Some(isolation);
+        } else if name.eq_ignore_ascii_case("transaction_read_only") {
+            characteristics.read_only = Some(read_only);
+        } else if name.eq_ignore_ascii_case("transaction_deferrable") {
+            characteristics.deferrable = Some(deferrable);
+        } else {
+            return None;
+        }
+        Some(Ok(characteristics))
+    }
+
+    pub(crate) fn set_from_current(&self, name: &str, local: bool) -> Result<(), SqlError> {
+        if name.eq_ignore_ascii_case("seed") {
+            return self.set("seed", "unavailable", local);
+        }
+        let mut state = self.store.borrow_mut();
+        let values = state.current;
+        let mut validation = values;
+        reset_setting(&mut validation, &values, name)?;
+        finish_setting_change(&mut state, values, guc_bit(name), local, false);
+        Ok(())
+    }
+
+    pub(crate) fn transaction_reset_owned(&self, name: &str) -> Option<StackStr<256>> {
+        let values = self.store.borrow().defaults;
+        let isolation = values.default_transaction_isolation;
+        let read_only = values.default_transaction_read_only;
+        let deferrable = values.default_transaction_deferrable;
+        if name.eq_ignore_ascii_case("transaction_isolation") {
+            Some(StackStr::from_str(isolation.as_str()))
+        } else if name.eq_ignore_ascii_case("transaction_read_only") {
+            Some(StackStr::from_str(if read_only { "on" } else { "off" }))
+        } else if name.eq_ignore_ascii_case("transaction_deferrable") {
+            Some(StackStr::from_str(if deferrable { "on" } else { "off" }))
+        } else {
+            None
+        }
+    }
+
     /// Applies `SET name = raw`. `raw` is the raw source text of the value
     /// (surrounding single quotes and whitespace are stripped here). Returns an
     /// error for an unknown parameter, a read-only parameter, or a value the
     /// engine cannot honor.
     pub fn set(&self, name: &str, raw: &str, local: bool) -> Result<(), SqlError> {
+        if name.eq_ignore_ascii_case("seed") {
+            let value = unquote(raw);
+            if value.eq_ignore_ascii_case("default") {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "parameter \"seed\" cannot be reset"
+                ));
+            }
+            let seed = value.parse::<f64>().map_err(|_| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid value for parameter \"seed\": \"{}\"",
+                    value
+                )
+            })?;
+            return self.set_random_seed(seed);
+        }
         let mut state = self.store.borrow_mut();
         let mut values = state.current;
         change_setting(&mut values, &state.defaults, name, raw)?;
-        state.current = values;
         let bit = guc_bit(name);
         let resetting = unquote(raw).eq_ignore_ascii_case("default");
-        if !state.transaction.active {
-            state.defaults = values;
-            state.connection_overrides |= bit;
-            state.database_overrides &= !bit;
-            state.role_overrides &= !bit;
-            state.database_role_overrides &= !bit;
-            state.client_overrides |= bit;
-        } else if !local {
-            let mut session = state.transaction.session;
-            change_setting(&mut session, &state.defaults, name, raw)?;
-            state.transaction.session = session;
-            if resetting {
-                state.session_overrides &= !bit;
-                state.transaction.session_overrides &= !bit;
-            } else {
-                state.session_overrides |= bit;
-                state.transaction.session_overrides |= bit;
-            }
+        finish_setting_change(&mut state, values, bit, local, resetting);
+        Ok(())
+    }
+
+    pub(crate) fn set_time_zone_sql(&self, raw: &str, local: bool) -> Result<(), SqlError> {
+        let value = unquote(raw);
+        if value.eq_ignore_ascii_case("local") || value.eq_ignore_ascii_case("default") {
+            return self.set("timezone", "DEFAULT", local);
         }
+        let text = raw.trim();
+        let numeric = text.strip_prefix(['+', '-']).unwrap_or(text);
+        if numeric.is_empty()
+            || !numeric
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            || numeric.bytes().filter(|byte| *byte == b'.').count() > 1
+        {
+            return self.set("timezone", raw, local);
+        }
+        let hours = text
+            .parse::<f64>()
+            .map_err(|_| unsupported_value("TimeZone", value))?;
+        let seconds = hours * 3600.0;
+        if !seconds.is_finite() || seconds.fract() != 0.0 {
+            return Err(unsupported_value("TimeZone", value));
+        }
+        self.set_time_zone_offset(seconds as i32, local)
+    }
+
+    pub(crate) fn set_time_zone_interval(
+        &self,
+        interval: super::types::Interval,
+        local: bool,
+    ) -> Result<(), SqlError> {
+        if interval.months != 0 {
+            return Err(unsupported_value("TimeZone", "interval containing months"));
+        }
+        let micros = i64::from(interval.days)
+            .checked_mul(86_400_000_000)
+            .and_then(|days| days.checked_add(interval.micros))
+            .ok_or_else(|| unsupported_value("TimeZone", "interval"))?;
+        if micros % 1_000_000 != 0 {
+            return Err(unsupported_value("TimeZone", "fractional-second interval"));
+        }
+        let seconds = i32::try_from(micros / 1_000_000)
+            .map_err(|_| unsupported_value("TimeZone", "interval"))?;
+        self.set_time_zone_offset(seconds, local)
+    }
+
+    fn set_time_zone_offset(&self, seconds_east: i32, local: bool) -> Result<(), SqlError> {
+        if !(-57_599..=57_599).contains(&seconds_east) {
+            return Err(unsupported_value("TimeZone", "UTC offset"));
+        }
+        let east = super::datetime::iso_offset_string(seconds_east);
+        let west = super::datetime::iso_offset_string(-seconds_east);
+        let display = crate::stack_format!(32, "<{}>{}", east.as_str(), west.as_str());
+        let mut state = self.store.borrow_mut();
+        let mut values = state.current;
+        store(&mut values.timezone, display.as_str())?;
+        values.parsed_timezone = super::timezone::Timezone::fixed(seconds_east, "");
+        finish_setting_change(&mut state, values, GUC_TIMEZONE, local, false);
         Ok(())
     }
 
@@ -722,7 +1182,6 @@ impl GucState {
         Self::recompute_cluster_defaults(&mut state);
         Ok(())
     }
-
     pub(crate) fn reset_cluster_defaults(&self) {
         let mut state = self.store.borrow_mut();
         state.cluster_defaults = GucValues::new();
@@ -1068,6 +1527,12 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.check_function_bodies = defaults.check_function_bodies;
     } else if name.eq_ignore_ascii_case("intervalstyle") {
         values.intervalstyle = defaults.intervalstyle;
+    } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
+        values.default_transaction_isolation = defaults.default_transaction_isolation;
+    } else if name.eq_ignore_ascii_case("default_transaction_read_only") {
+        values.default_transaction_read_only = defaults.default_transaction_read_only;
+    } else if name.eq_ignore_ascii_case("default_transaction_deferrable") {
+        values.default_transaction_deferrable = defaults.default_transaction_deferrable;
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
@@ -1333,6 +1798,36 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         };
         return store(&mut values.row_security, if on { "on" } else { "off" });
     }
+    if name.eq_ignore_ascii_case("default_transaction_isolation") {
+        values.default_transaction_isolation = if is_default {
+            TransactionIsolation::ReadCommitted
+        } else {
+            parse_transaction_isolation(v).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid value for parameter \"default_transaction_isolation\": \"{}\"",
+                    v
+                )
+            })?
+        };
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("default_transaction_read_only") {
+        values.default_transaction_read_only = if is_default {
+            false
+        } else {
+            parse_on_off(v).ok_or_else(|| unsupported_value("default_transaction_read_only", v))?
+        };
+        return Ok(());
+    }
+    if name.eq_ignore_ascii_case("default_transaction_deferrable") {
+        values.default_transaction_deferrable = if is_default {
+            false
+        } else {
+            parse_on_off(v).ok_or_else(|| unsupported_value("default_transaction_deferrable", v))?
+        };
+        return Ok(());
+    }
     // Read-only parameters cannot be assigned.
     if is_read_only(name) {
         return Err(sql_err!(
@@ -1400,6 +1895,28 @@ impl GucState {
             Some(StackStr::from_str(values.intervalstyle.as_str()))
         } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
             Some(StackStr::from_str("off"))
+        } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
+            Some(StackStr::from_str(
+                values.default_transaction_isolation.as_str(),
+            ))
+        } else if name.eq_ignore_ascii_case("default_transaction_read_only") {
+            Some(StackStr::from_str(
+                if values.default_transaction_read_only {
+                    "on"
+                } else {
+                    "off"
+                },
+            ))
+        } else if name.eq_ignore_ascii_case("default_transaction_deferrable") {
+            Some(StackStr::from_str(
+                if values.default_transaction_deferrable {
+                    "on"
+                } else {
+                    "off"
+                },
+            ))
+        } else if name.eq_ignore_ascii_case("seed") {
+            Some(StackStr::from_str("unavailable"))
         } else {
             None
         }
@@ -1442,6 +1959,20 @@ fn parse_on_off(v: &str) -> Option<bool> {
         .any(|s| v.eq_ignore_ascii_case(s))
     {
         Some(false)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn parse_transaction_isolation(v: &str) -> Option<TransactionIsolation> {
+    if v.eq_ignore_ascii_case("read uncommitted") {
+        Some(TransactionIsolation::ReadUncommitted)
+    } else if v.eq_ignore_ascii_case("read committed") {
+        Some(TransactionIsolation::ReadCommitted)
+    } else if v.eq_ignore_ascii_case("repeatable read") {
+        Some(TransactionIsolation::RepeatableRead)
+    } else if v.eq_ignore_ascii_case("serializable") {
+        Some(TransactionIsolation::Serializable)
     } else {
         None
     }
@@ -1755,7 +2286,7 @@ fn is_read_only(name: &str) -> bool {
 fn unsupported_value(param: &str, v: &str) -> SqlError {
     sql_err!(
         sqlstate::FEATURE_NOT_SUPPORTED,
-        "{} \"{}\" is not supported yet (only the default is implemented)",
+        "{} \"{}\" is not supported (only the default is implemented)",
         param,
         v
     )

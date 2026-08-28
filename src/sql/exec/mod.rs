@@ -13829,7 +13829,7 @@ impl PlpgsqlExecHost<'_> {
                 "invalid transaction termination"
             ));
         }
-        let prior_characteristics = (txn.isolation, txn.read_only, txn.deferrable);
+        let prior_configuration = txn.capture_configuration();
         let next = match command {
             PlpgsqlTransactionCommand::Commit(next) => {
                 engine.commit_txn_with_triggers(txn, guc, arena, responder)?;
@@ -13845,11 +13845,7 @@ impl PlpgsqlExecHost<'_> {
         };
         engine.ensure_txn(txn, TxnMode::Implicit, guc);
         if next == PlpgsqlNextTransaction::Chained {
-            txn.set_characteristics(
-                prior_characteristics.0,
-                prior_characteristics.1,
-                prior_characteristics.2,
-            );
+            txn.restore_configuration(prior_configuration);
         }
         Ok(())
     }

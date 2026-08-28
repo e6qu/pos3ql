@@ -3230,7 +3230,8 @@ pub fn infer_type_res(
             "starts_with" => of(ColType::Bool),
             "cbrt" | "sin" | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "atan2"
             | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians"
-            | "pi" => of(ColType::Float8),
+            | "pi" | "random" => of(ColType::Float8),
+            "setseed" => of(ColType::Void),
             "bool_and" | "bool_or" | "every" => of(ColType::Bool),
             // Bitwise aggregates preserve the argument's (integer or bit) type.
             "bit_and" | "bit_or" | "bit_xor" => args

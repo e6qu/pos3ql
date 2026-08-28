@@ -16,6 +16,7 @@ use crate::sql_err;
 use crate::storage::RowLoc;
 use crate::util::StackStr;
 
+use super::ast::TransactionIsolation;
 use super::eval::SqlError;
 
 /// A row's pending image before a write, as returned by `write_pending`:
@@ -26,6 +27,8 @@ pub type PriorPending = Option<Option<RowLoc>>;
 #[derive(Clone)]
 pub struct Savepoint {
     pub name: StackStr<63>,
+    pub read_only: bool,
+    pub read_only_source: bool,
     pub touched_mark: usize,
     pub truncate_mark: usize,
     pub ddl_mark: usize,
@@ -105,11 +108,19 @@ pub enum TxnMode {
     Explicit,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IsolationLevel {
-    ReadCommitted,
-    RepeatableRead,
-    Serializable,
+#[derive(Clone, Copy, Default)]
+struct TransactionSources {
+    isolation: bool,
+    read_only: bool,
+    deferrable: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TransactionConfiguration {
+    isolation: TransactionIsolation,
+    read_only: bool,
+    deferrable: bool,
+    sources: TransactionSources,
 }
 
 pub struct TxnState {
@@ -121,9 +132,10 @@ pub struct TxnState {
     /// The isolation level promised to this transaction. READ COMMITTED takes
     /// a fresh durable-LSN snapshot per statement; REPEATABLE READ pins the
     /// first data statement's snapshot until commit or rollback.
-    pub isolation: IsolationLevel,
+    pub isolation: TransactionIsolation,
     pub read_only: bool,
     pub deferrable: bool,
+    sources: TransactionSources,
     /// True only while pgoutput applies one remote transaction. Trigger
     /// dispatch reads this typed execution origin instead of guessing from a
     /// connection or statement string.
@@ -555,9 +567,10 @@ impl TxnState {
             mode: TxnMode::Idle,
             failed: false,
             txid: 0,
-            isolation: IsolationLevel::ReadCommitted,
+            isolation: TransactionIsolation::ReadCommitted,
             read_only: false,
             deferrable: false,
+            sources: TransactionSources::default(),
             replication_apply: false,
             snapshot_lsn: None,
             snapshot_taken: false,
@@ -682,13 +695,115 @@ impl TxnState {
 
     pub fn set_characteristics(
         &mut self,
-        isolation: IsolationLevel,
+        isolation: TransactionIsolation,
         read_only: bool,
         deferrable: bool,
     ) {
         self.isolation = isolation;
         self.read_only = read_only;
         self.deferrable = deferrable;
+        self.sources = TransactionSources::default();
+    }
+
+    pub(crate) fn apply_begin_characteristics(
+        &mut self,
+        characteristics: super::ast::TransactionCharacteristics,
+    ) {
+        if let Some(isolation) = characteristics.isolation {
+            self.isolation = isolation;
+            self.sources.isolation = true;
+        }
+        if let Some(read_only) = characteristics.read_only {
+            self.read_only = read_only;
+            self.sources.read_only = true;
+        }
+        if let Some(deferrable) = characteristics.deferrable {
+            self.deferrable = deferrable;
+            self.sources.deferrable = true;
+        }
+    }
+
+    pub(crate) fn capture_configuration(&self) -> TransactionConfiguration {
+        TransactionConfiguration {
+            isolation: self.isolation,
+            read_only: self.read_only,
+            deferrable: self.deferrable,
+            sources: self.sources,
+        }
+    }
+
+    pub(crate) fn restore_configuration(&mut self, configuration: TransactionConfiguration) {
+        self.isolation = configuration.isolation;
+        self.read_only = configuration.read_only;
+        self.deferrable = configuration.deferrable;
+        self.sources = configuration.sources;
+    }
+
+    pub(crate) fn restore_read_only_source(&mut self, explicitly_set: bool) {
+        self.sources.read_only = explicitly_set;
+    }
+
+    pub(crate) fn setting_source(&self, name: &str) -> Option<&'static str> {
+        let explicitly_set = if name.eq_ignore_ascii_case("transaction_isolation") {
+            self.sources.isolation
+        } else if name.eq_ignore_ascii_case("transaction_read_only") {
+            self.sources.read_only
+        } else if name.eq_ignore_ascii_case("transaction_deferrable") {
+            self.sources.deferrable
+        } else {
+            return None;
+        };
+        Some(if explicitly_set {
+            "session"
+        } else {
+            "override"
+        })
+    }
+
+    pub(crate) fn apply_characteristics(
+        &mut self,
+        characteristics: super::ast::TransactionCharacteristics,
+    ) -> Result<(), SqlError> {
+        if characteristics
+            .isolation
+            .is_some_and(|isolation| isolation != self.isolation)
+            && self.has_savepoints()
+        {
+            return Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "SET TRANSACTION ISOLATION LEVEL must not be called in a subtransaction"
+            ));
+        }
+        if characteristics.deferrable.is_some() && self.has_savepoints() {
+            return Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a subtransaction"
+            ));
+        }
+        if characteristics
+            .isolation
+            .is_some_and(|isolation| isolation != self.isolation)
+            && self.snapshot_taken
+        {
+            return Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "SET TRANSACTION ISOLATION LEVEL must be called before any query"
+            ));
+        }
+        if characteristics.read_only == Some(false) && self.read_only && self.snapshot_taken {
+            return Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "transaction read-write mode must be set before any query"
+            ));
+        }
+        if characteristics.deferrable.is_some() && self.snapshot_taken {
+            return Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "SET TRANSACTION [NOT] DEFERRABLE must be called before any query"
+            ));
+        }
+        self.apply_begin_characteristics(characteristics);
+        Ok(())
     }
 
     /// Selects this statement's durable commit snapshot. A repeatable-read
@@ -697,8 +812,10 @@ impl TxnState {
     pub fn statement_snapshot(&mut self, current_lsn: u64) -> u64 {
         self.snapshot_taken = true;
         match self.isolation {
-            IsolationLevel::ReadCommitted => current_lsn,
-            IsolationLevel::RepeatableRead | IsolationLevel::Serializable => {
+            TransactionIsolation::ReadUncommitted | TransactionIsolation::ReadCommitted => {
+                current_lsn
+            }
+            TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable => {
                 *self.snapshot_lsn.get_or_insert(current_lsn)
             }
         }
@@ -717,7 +834,10 @@ impl TxnState {
                 "SET TRANSACTION SNAPSHOT must be called before any query"
             ));
         }
-        if self.isolation == IsolationLevel::ReadCommitted {
+        if matches!(
+            self.isolation,
+            TransactionIsolation::ReadUncommitted | TransactionIsolation::ReadCommitted
+        ) {
             return Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
                 "a snapshot-importing transaction must use REPEATABLE READ or SERIALIZABLE"
@@ -1386,6 +1506,8 @@ impl TxnState {
                 let _ = core::fmt::Write::write_str(&mut s, name);
                 s
             },
+            read_only: self.read_only,
+            read_only_source: self.sources.read_only,
             touched_mark: self.touched.len(),
             truncate_mark: self.truncates.len(),
             ddl_mark: self.ddl.len(),
@@ -1546,9 +1668,10 @@ impl TxnState {
     pub fn clear(&mut self) {
         self.mode = TxnMode::Idle;
         self.failed = false;
-        self.isolation = IsolationLevel::ReadCommitted;
+        self.isolation = TransactionIsolation::ReadCommitted;
         self.read_only = false;
         self.deferrable = false;
+        self.sources = TransactionSources::default();
         self.replication_apply = false;
         self.snapshot_lsn = None;
         self.snapshot_taken = false;

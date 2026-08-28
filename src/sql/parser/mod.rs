@@ -989,55 +989,146 @@ impl<'a> Parser<'a> {
                         reset: false,
                     });
                 }
-                // SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS
-                // TRANSACTION ...: retain the characteristics so execution can
-                // reject isolation/read modes it cannot actually provide.
                 let transaction = self.eat_ident("transaction")?;
+                if transaction && (session_modifier || local) {
+                    return Err(self.err_here("SET TRANSACTION does not take a scope modifier"));
+                }
                 if transaction && self.eat_ident("snapshot")? {
                     return Ok(Stmt::SetTransactionSnapshot(
                         self.str_literal("snapshot identifier")?,
                     ));
                 }
-                let characteristics = if transaction {
-                    true
-                } else if self.eat_ident("characteristics")? {
+                let target = if transaction {
+                    Some(TransactionTarget::Current)
+                } else if session_modifier && self.eat_ident("characteristics")? {
                     self.expect_ident("as")?;
                     self.expect_ident("transaction")?;
-                    true
+                    Some(TransactionTarget::SessionDefaults)
                 } else {
-                    false
+                    None
                 };
-                if characteristics {
-                    let start = self.peek_at;
-                    while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
-                        self.advance()?;
-                    }
-                    let characteristics = self.text[start..self.peek_at].trim();
-                    if characteristics.is_empty() {
+                if let Some(target) = target {
+                    let characteristics = self.parse_transaction_characteristics()?;
+                    if characteristics == TransactionCharacteristics::EMPTY {
                         return Err(self.unexpected("expected transaction characteristics"));
                     }
-                    return Ok(Stmt::SetTransaction(characteristics));
+                    return Ok(Stmt::SetTransaction {
+                        target,
+                        characteristics,
+                    });
                 }
-                // Special spellings: SET TIME ZONE ..., SET NAMES ...
-                let name = if self.eat_ident("time")? {
+                if self.eat_ident("catalog")? {
+                    return Ok(Stmt::SetCatalog(self.str_literal("catalog name")?));
+                }
+                if self.eat_ident("schema")? {
+                    let start = self.peek_at;
+                    let _ = self.str_literal("schema name")?;
+                    return Ok(Stmt::Set {
+                        name: "search_path",
+                        value: self.text[start..self.peek_at].trim(),
+                        local,
+                        syntax: SettingSyntax::Generic,
+                    });
+                }
+                if self.eat_ident("names")? {
+                    let reset = matches!(self.peeked, Tok::Op(";") | Tok::Eof)
+                        || self.eat_ident("default")?;
+                    let value = if reset {
+                        "DEFAULT"
+                    } else {
+                        let start = self.peek_at;
+                        let _ = self.str_literal("encoding name")?;
+                        self.text[start..self.peek_at].trim()
+                    };
+                    return Ok(Stmt::Set {
+                        name: "client_encoding",
+                        value,
+                        local,
+                        syntax: SettingSyntax::Generic,
+                    });
+                }
+                if self.eat_ident("xml")? {
+                    self.expect_ident("option")?;
+                    let value = if self.eat_ident("document")? {
+                        "document"
+                    } else {
+                        self.expect_ident("content")?;
+                        "content"
+                    };
+                    return Ok(Stmt::Set {
+                        name: "xmloption",
+                        value,
+                        local,
+                        syntax: SettingSyntax::Generic,
+                    });
+                }
+                let (name, syntax) = if self.eat_ident("time")? {
                     self.expect_ident("zone")?;
-                    "timezone"
-                } else if self.eat_ident("names")? {
-                    "client_encoding"
+                    ("timezone", SettingSyntax::TimeZone)
                 } else {
                     let n = self.any_ident("configuration parameter")?;
+                    if self.eat_ident("from")? {
+                        self.expect_ident("current")?;
+                        return Ok(Stmt::Set {
+                            name: n,
+                            value: "",
+                            local,
+                            syntax: SettingSyntax::FromCurrent,
+                        });
+                    }
                     if !self.eat_op("=")? {
                         self.expect_ident("to")?;
                     }
-                    n
+                    (n, SettingSyntax::Generic)
                 };
-                // Capture the raw value text up to the statement terminator.
-                let start = self.peek_at;
-                while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
-                    self.advance()?;
+                if syntax == SettingSyntax::TimeZone && self.eat_ident("interval")? {
+                    let precision = if self.peeked == Tok::Op("(") {
+                        Some(self.type_modifier("interval")?)
+                    } else {
+                        None
+                    };
+                    let literal = self.str_literal("time zone interval")?;
+                    let (value, type_mod) = if let Some(type_mod) = precision {
+                        (literal, type_mod)
+                    } else {
+                        let (value, type_mod) = self.interval_with_qualifier(literal)?;
+                        let valid_range = matches!(
+                            TypeMod::decode(super::types::ColType::Interval, type_mod),
+                            TypeMod::None
+                                | TypeMod::IntervalMod {
+                                    range: IntervalRange::Hour,
+                                    ..
+                                }
+                                | TypeMod::IntervalMod {
+                                    range: IntervalRange::HourToMinute,
+                                    ..
+                                }
+                        );
+                        if !valid_range {
+                            return Err(
+                                self.err_here("time zone interval must be HOUR or HOUR TO MINUTE")
+                            );
+                        }
+                        (value, type_mod)
+                    };
+                    return Ok(Stmt::Set {
+                        name,
+                        value,
+                        local,
+                        syntax: SettingSyntax::TimeZoneInterval(type_mod),
+                    });
                 }
-                let value = self.text[start..self.peek_at].trim();
-                Ok(Stmt::Set { name, value, local })
+                let value = if syntax == SettingSyntax::TimeZone {
+                    self.time_zone_setting_value()?
+                } else {
+                    self.configuration_value_list()?
+                };
+                Ok(Stmt::Set {
+                    name,
+                    value,
+                    local,
+                    syntax,
+                })
             }
             Tok::Ident("reset") => {
                 self.advance()?;
@@ -1056,6 +1147,13 @@ impl<'a> Parser<'a> {
                     })
                 } else if self.eat_ident("all")? {
                     Ok(Stmt::Reset(None))
+                } else if self.eat_ident("time")? {
+                    self.expect_ident("zone")?;
+                    Ok(Stmt::Reset(Some("timezone")))
+                } else if self.eat_ident("transaction")? {
+                    self.expect_ident("isolation")?;
+                    self.expect_ident("level")?;
+                    Ok(Stmt::Reset(Some("transaction_isolation")))
                 } else {
                     Ok(Stmt::Reset(Some(
                         self.any_ident("configuration parameter")?,
@@ -5594,15 +5692,103 @@ impl<'a> Parser<'a> {
         Ok(None)
     }
 
-    fn transaction_modifiers(&mut self, allow_work: bool) -> Result<&'a str, ParseError> {
+    fn transaction_modifiers(
+        &mut self,
+        allow_work: bool,
+    ) -> Result<TransactionCharacteristics, ParseError> {
         if allow_work && !self.eat_ident("work")? {
             let _ = self.eat_ident("transaction")?;
         }
+        self.parse_transaction_characteristics()
+    }
+
+    fn parse_transaction_characteristics(
+        &mut self,
+    ) -> Result<TransactionCharacteristics, ParseError> {
+        let mut parsed = TransactionCharacteristics::EMPTY;
+        loop {
+            let before = parsed;
+            if self.eat_ident("isolation")? {
+                self.expect_ident("level")?;
+                let isolation = if self.eat_ident("serializable")? {
+                    TransactionIsolation::Serializable
+                } else if self.eat_ident("repeatable")? {
+                    self.expect_ident("read")?;
+                    TransactionIsolation::RepeatableRead
+                } else {
+                    self.expect_ident("read")?;
+                    if self.eat_ident("committed")? {
+                        TransactionIsolation::ReadCommitted
+                    } else if self.eat_ident("uncommitted")? {
+                        TransactionIsolation::ReadUncommitted
+                    } else {
+                        return Err(self.unexpected("expected COMMITTED or UNCOMMITTED"));
+                    }
+                };
+                if parsed.isolation.replace(isolation).is_some() {
+                    return Err(self.err_here("conflicting or redundant transaction options"));
+                }
+            } else if self.eat_ident("read")? {
+                let read_only = if self.eat_ident("only")? {
+                    true
+                } else {
+                    self.expect_ident("write")?;
+                    false
+                };
+                if parsed.read_only.replace(read_only).is_some() {
+                    return Err(self.err_here("conflicting or redundant transaction options"));
+                }
+            } else if self.eat_ident("deferrable")? {
+                if parsed.deferrable.replace(true).is_some() {
+                    return Err(self.err_here("conflicting or redundant transaction options"));
+                }
+            } else if self.eat_ident("not")? {
+                self.expect_ident("deferrable")?;
+                if parsed.deferrable.replace(false).is_some() {
+                    return Err(self.err_here("conflicting or redundant transaction options"));
+                }
+            }
+            if parsed == before {
+                break;
+            }
+            if self.eat_op(",")? && matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+                return Err(self.unexpected("expected transaction characteristics"));
+            }
+        }
+        Ok(parsed)
+    }
+
+    fn configuration_value_list(&mut self) -> Result<&'a str, ParseError> {
         let start = self.peek_at;
-        while !matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
-            self.advance()?;
+        loop {
+            if (self.eat_op("+")? || self.eat_op("-")?) && !matches!(self.peeked, Tok::Num(_)) {
+                return Err(self.unexpected("expected a numeric configuration value"));
+            }
+            match self.peeked {
+                Tok::Ident(_) | Tok::QuotedIdent(_) | Tok::Str(_) | Tok::Num(_) => {
+                    self.advance()?;
+                }
+                _ => return Err(self.unexpected("expected a configuration value")),
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
         }
         Ok(self.text[start..self.peek_at].trim())
+    }
+
+    fn time_zone_setting_value(&mut self) -> Result<&'a str, ParseError> {
+        let start = self.peek_at;
+        if (self.eat_op("+")? || self.eat_op("-")?) && !matches!(self.peeked, Tok::Num(_)) {
+            return Err(self.unexpected("expected a numeric time zone"));
+        }
+        match self.peeked {
+            Tok::Ident(_) | Tok::QuotedIdent(_) | Tok::Str(_) | Tok::Num(_) => {
+                self.advance()?;
+                Ok(self.text[start..self.peek_at].trim())
+            }
+            _ => Err(self.unexpected("expected a time zone")),
+        }
     }
 
     // --- token helpers ---
@@ -7110,7 +7296,10 @@ mod tests {
                     panic!()
                 };
                 assert!(matches!(expression, Expr::IsNull { negated: true, .. }));
-                assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Begin("")));
+                assert!(matches!(
+                    p.next_stmt().unwrap().unwrap(),
+                    Stmt::Begin(TransactionCharacteristics::EMPTY)
+                ));
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Commit));
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Rollback));
             },

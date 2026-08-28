@@ -194,6 +194,7 @@ pub mod sqlstate {
     pub const INVALID_ARGUMENT_FOR_WIDTH_BUCKET: &str = "2201G";
     pub const INVALID_ROW_COUNT_IN_RESULT_OFFSET: &str = "2201X";
     pub const CHARACTER_NOT_IN_REPERTOIRE: &str = "22021";
+    pub const UNTRANSLATABLE_CHARACTER: &str = "22P05";
     pub const BAD_COPY_FILE_FORMAT: &str = "22P04";
     pub const INVALID_ESCAPE_SEQUENCE: &str = "22025";
     pub const STRING_DATA_LENGTH_MISMATCH: &str = "22026";
@@ -744,6 +745,10 @@ pub trait SequenceAccess {
 /// `\d` obtains through functions like `pg_get_indexdef`. Implemented over
 /// `Storage`; abstract here so `eval` need not depend on the catalog.
 pub trait CatalogAccess {
+    /// Resolves a transaction-visible collation name to its stable identity.
+    fn resolve_collation(&self, _schema: Option<&str>, _name: &str) -> Option<Collation> {
+        None
+    }
     /// Materializes a durable named-composite row value into its catalog field
     /// layout. The default is a loud capability error: raw composite text is
     /// never treated as an anonymous record.
@@ -778,8 +783,20 @@ pub trait CatalogAccess {
         _right: &str,
     ) -> Result<core::cmp::Ordering, SqlError> {
         Err(sql_err!(
-            sqlstate::INTERNAL_ERROR,
+            sqlstate::FEATURE_NOT_SUPPORTED,
             "database collation comparator is unavailable"
+        ))
+    }
+    fn convert_encoding<'a>(
+        &self,
+        _source: crate::storage::PgEncoding,
+        _destination: crate::storage::PgEncoding,
+        _input: &[u8],
+        _arena: &'a Arena,
+    ) -> Result<&'a [u8], SqlError> {
+        Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "encoding conversion catalog is unavailable"
         ))
     }
     /// Executes a catalog-resolved scalar SQL routine. `None` means this
@@ -1526,7 +1543,12 @@ fn eval_binary_expression<'a>(
             | BinaryOp::Gt
             | BinaryOp::GtEq
     ) {
-        Some(resolve_comparison_collation(left, right, row)?)
+        Some(resolve_comparison_collation(
+            left,
+            right,
+            row,
+            hooks.catalog,
+        )?)
     } else {
         None
     };
@@ -2005,7 +2027,8 @@ pub fn eval_full<'a>(
                 let r = coerce_unknown(member, &l)?;
                 match (&l, &r) {
                     (Datum::Text(_) | Datum::Bpchar(_), Datum::Text(_) | Datum::Bpchar(_)) => {
-                        let collation = resolve_comparison_collation(operand, item, row)?;
+                        let collation =
+                            resolve_comparison_collation(operand, item, row, hooks.catalog)?;
                         if compare_datums_with_catalog(collation, hooks.catalog, &l, &r)?.is_eq() {
                             return Ok(Datum::Bool(!negated));
                         }
@@ -2038,8 +2061,8 @@ pub fn eval_full<'a>(
             let a = coerce_unknown(v, &lo)?;
             let lo = coerce_unknown(lo, &a)?;
             let hi = coerce_unknown(hi, &a)?;
-            let collation = resolve_comparison_collation(operand, low, row)?;
-            let high_collation = resolve_comparison_collation(operand, high, row)?;
+            let collation = resolve_comparison_collation(operand, low, row, hooks.catalog)?;
+            let high_collation = resolve_comparison_collation(operand, high, row, hooks.catalog)?;
             if collation != high_collation {
                 return Err(sql_err!(
                     sqlstate::COLLATION_MISMATCH,
@@ -2133,6 +2156,7 @@ pub fn eval_full<'a>(
                                     operand.expect("simple CASE has an operand"),
                                     cond,
                                     row,
+                                    hooks.catalog,
                                 )?;
                                 compare_datums_with_catalog(collation, hooks.catalog, &l, &r)?
                                     .is_eq()
@@ -2200,7 +2224,13 @@ pub fn eval_full<'a>(
                 ));
             };
             let witness = list.witness;
-            let collations = effective_quantified_collations(operand, list.collations, row, arena)?;
+            let collations = effective_quantified_collations(
+                operand,
+                list.collations,
+                row,
+                hooks.catalog,
+                arena,
+            )?;
             // Coerce the operand to the subquery's column type first: PostgreSQL
             // type-checks `x IN (...)` regardless of the set's contents, so a
             // string literal that cannot become the column type errors even
@@ -2292,7 +2322,13 @@ pub fn eval_full<'a>(
                 arena,
             )?;
             let value = coerce_unknown(value, &list.witness)?;
-            let collations = effective_quantified_collations(operand, list.collations, row, arena)?;
+            let collations = effective_quantified_collations(
+                operand,
+                list.collations,
+                row,
+                hooks.catalog,
+                arena,
+            )?;
             // Resolve the operator against the subquery's declared output
             // type even when it is empty or yields only NULLs.
             let _ = quantified_comparison(
@@ -2793,6 +2829,7 @@ fn effective_quantified_collations<'a>(
     operand: &Expr<'a>,
     right: &[Collation],
     row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
     arena: &'a Arena,
 ) -> Result<&'a [Collation], SqlError> {
     let mut output = [Collation::None; super::parser::MAX_LIST];
@@ -2813,7 +2850,7 @@ fn effective_quantified_collations<'a>(
     for (index, right) in right.iter().copied().enumerate() {
         let left = if let Some(args) = row_args {
             args.get(index)
-                .map(|expression| expression_collation(expression, row))
+                .map(|expression| expression_collation(expression, row, catalog))
                 .transpose()?
                 .flatten()
         } else if let Expr::WholeRow(table) = operand {
@@ -2825,7 +2862,7 @@ fn effective_quantified_collations<'a>(
                     indeterminate: false,
                 })
         } else if index == 0 {
-            expression_collation(operand, row)?
+            expression_collation(operand, row, catalog)?
         } else {
             None
         };
@@ -2992,9 +3029,10 @@ pub(crate) fn resolve_comparison_collation<'a>(
     left: &Expr<'a>,
     right: &Expr<'a>,
     row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
 ) -> Result<crate::sql::ast::Collation, SqlError> {
-    let left = expression_collation(left, row)?;
-    let right = expression_collation(right, row)?;
+    let left = expression_collation(left, row, catalog)?;
+    let right = expression_collation(right, row, catalog)?;
     required_comparison_collation(merge_derived_collations(left, right)?)
 }
 
@@ -3072,6 +3110,7 @@ struct DerivedCollation {
 fn expression_collation<'a>(
     expression: &Expr<'a>,
     row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
 ) -> Result<Option<DerivedCollation>, SqlError> {
     match expression {
         Expr::Collate { operand, collation } => {
@@ -3085,8 +3124,20 @@ fn expression_collation<'a>(
                         .name()
                 ));
             }
+            let value = match *collation {
+                crate::sql::ast::ParsedCollation::Builtin(value) => value,
+                crate::sql::ast::ParsedCollation::Named(name) => catalog
+                    .and_then(|catalog| catalog.resolve_collation(name.schema, name.name))
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "collation \"{}\" does not exist",
+                            name.name
+                        )
+                    })?,
+            };
             Ok(Some(DerivedCollation {
-                value: *collation,
+                value,
                 explicit: true,
                 indeterminate: false,
             }))
@@ -3094,9 +3145,9 @@ fn expression_collation<'a>(
         Expr::Cast {
             operand, type_name, ..
         } => match ColType::from_sql_name(type_name) {
-            Some(ctype) if ctype.is_collatable() => expression_collation(operand, row),
+            Some(ctype) if ctype.is_collatable() => expression_collation(operand, row, catalog),
             Some(_) => Ok(None),
-            None => expression_collation(operand, row),
+            None => expression_collation(operand, row, catalog),
         },
         Expr::Column { qualifier, name } => {
             let value = row.collation(*qualifier, name);
@@ -3126,7 +3177,7 @@ fn expression_collation<'a>(
                     .iter()
                     .position(|name| name.eq_ignore_ascii_case(field));
                 match position.and_then(|position| args.get(position)) {
-                    Some(argument) => expression_collation(argument, row),
+                    Some(argument) => expression_collation(argument, row, catalog),
                     None => Ok(None),
                 }
             }
@@ -3154,18 +3205,20 @@ fn expression_collation<'a>(
             left,
             right,
         } => merge_derived_collations(
-            expression_collation(left, row)?,
-            expression_collation(right, row)?,
+            expression_collation(left, row, catalog)?,
+            expression_collation(right, row, catalog)?,
         ),
         Expr::Case {
             whens, otherwise, ..
         } => {
             let mut derived = None;
             for (_, result) in *whens {
-                derived = merge_derived_collations(derived, expression_collation(result, row)?)?;
+                derived =
+                    merge_derived_collations(derived, expression_collation(result, row, catalog)?)?;
             }
             if let Some(result) = otherwise {
-                derived = merge_derived_collations(derived, expression_collation(result, row)?)?;
+                derived =
+                    merge_derived_collations(derived, expression_collation(result, row, catalog)?)?;
             }
             Ok(derived)
         }
@@ -3177,7 +3230,10 @@ fn expression_collation<'a>(
         {
             let mut derived = None;
             for argument in *args {
-                derived = merge_derived_collations(derived, expression_collation(argument, row)?)?;
+                derived = merge_derived_collations(
+                    derived,
+                    expression_collation(argument, row, catalog)?,
+                )?;
             }
             Ok(derived)
         }
@@ -3191,8 +3247,9 @@ fn expression_collation<'a>(
 pub(crate) fn resolved_expression_collation<'a>(
     expression: &Expr<'a>,
     row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
 ) -> Result<crate::sql::ast::Collation, SqlError> {
-    required_comparison_collation(expression_collation(expression, row)?)
+    required_comparison_collation(expression_collation(expression, row, catalog)?)
 }
 
 /// Returns result metadata without requiring a usable comparison collation.
@@ -3201,6 +3258,7 @@ pub(crate) fn resolved_expression_collation<'a>(
 pub(crate) fn described_expression_collation<'a>(
     expression: &Expr<'a>,
     row: &impl ColumnLookup<'a>,
+    catalog: Option<&dyn CatalogAccess>,
 ) -> Result<
     (
         crate::sql::ast::Collation,
@@ -3209,7 +3267,7 @@ pub(crate) fn described_expression_collation<'a>(
     SqlError,
 > {
     use crate::sql::types::CollationDerivation;
-    Ok(match expression_collation(expression, row)? {
+    Ok(match expression_collation(expression, row, catalog)? {
         Some(value) if value.indeterminate => (
             crate::sql::ast::Collation::None,
             CollationDerivation::Indeterminate,

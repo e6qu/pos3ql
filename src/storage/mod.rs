@@ -2062,6 +2062,297 @@ pub(crate) const MAX_VALUE_ENFORCERS: usize = 16;
 pub(crate) const MAX_EXTENDED_STATISTICS_PER_TABLE: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_KEYS: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_MCV: usize = 100;
+pub(crate) const MAX_COLLATIONS: usize = 128;
+pub(crate) const MAX_CONVERSIONS: usize = 128;
+
+/// PostgreSQL's closed server-encoding identity. Construction is checked once
+/// at SQL and durable decode boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgEncoding(u8);
+
+impl PgEncoding {
+    pub(crate) const SQL_ASCII: Self = Self(0);
+    pub(crate) const UTF8: Self = Self(6);
+    pub(crate) const LATIN1: Self = Self(8);
+
+    pub(crate) const fn code(self) -> i32 {
+        self.0 as i32
+    }
+
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        (code <= 41).then_some(Self(code))
+    }
+
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        const NAMES: [&str; 42] = [
+            "SQL_ASCII",
+            "EUC_JP",
+            "EUC_CN",
+            "EUC_KR",
+            "EUC_TW",
+            "EUC_JIS_2004",
+            "UTF8",
+            "MULE_INTERNAL",
+            "LATIN1",
+            "LATIN2",
+            "LATIN3",
+            "LATIN4",
+            "LATIN5",
+            "LATIN6",
+            "LATIN7",
+            "LATIN8",
+            "LATIN9",
+            "LATIN10",
+            "WIN1256",
+            "WIN1258",
+            "WIN866",
+            "WIN874",
+            "KOI8R",
+            "WIN1251",
+            "WIN1252",
+            "ISO_8859_5",
+            "ISO_8859_6",
+            "ISO_8859_7",
+            "ISO_8859_8",
+            "WIN1250",
+            "WIN1253",
+            "WIN1254",
+            "WIN1255",
+            "WIN1257",
+            "KOI8U",
+            "SJIS",
+            "BIG5",
+            "GBK",
+            "UHC",
+            "GB18030",
+            "JOHAB",
+            "SHIFT_JIS_2004",
+        ];
+        NAMES
+            .iter()
+            .position(|candidate| {
+                candidate
+                    .bytes()
+                    .filter(|byte| !matches!(byte, b'-' | b'_'))
+                    .map(|byte| byte.to_ascii_uppercase())
+                    .eq(name
+                        .bytes()
+                        .filter(|byte| !matches!(byte, b'-' | b'_'))
+                        .map(|byte| byte.to_ascii_uppercase()))
+            })
+            .map(|code| Self(code as u8))
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        const NAMES: [&str; 42] = [
+            "SQL_ASCII",
+            "EUC_JP",
+            "EUC_CN",
+            "EUC_KR",
+            "EUC_TW",
+            "EUC_JIS_2004",
+            "UTF8",
+            "MULE_INTERNAL",
+            "LATIN1",
+            "LATIN2",
+            "LATIN3",
+            "LATIN4",
+            "LATIN5",
+            "LATIN6",
+            "LATIN7",
+            "LATIN8",
+            "LATIN9",
+            "LATIN10",
+            "WIN1256",
+            "WIN1258",
+            "WIN866",
+            "WIN874",
+            "KOI8R",
+            "WIN1251",
+            "WIN1252",
+            "ISO_8859_5",
+            "ISO_8859_6",
+            "ISO_8859_7",
+            "ISO_8859_8",
+            "WIN1250",
+            "WIN1253",
+            "WIN1254",
+            "WIN1255",
+            "WIN1257",
+            "KOI8U",
+            "SJIS",
+            "BIG5",
+            "GBK",
+            "UHC",
+            "GB18030",
+            "JOHAB",
+            "SHIFT_JIS_2004",
+        ];
+        NAMES[self.0 as usize]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum CollationProvider {
+    Default = b'd',
+    Builtin = b'b',
+    Libc = b'c',
+    Icu = b'i',
+}
+
+impl CollationProvider {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Default => "d",
+            Self::Builtin => "b",
+            Self::Libc => "c",
+            Self::Icu => "i",
+        }
+    }
+}
+
+/// Executable semantics selected when the definition is created. Unsupported
+/// providers are rejected instead of being stored as inert catalog rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollationBehavior {
+    Bytewise,
+    Database,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CollationDefinition {
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub owner: i32,
+    pub provider: CollationProvider,
+    pub deterministic: bool,
+    pub encoding: Option<PgEncoding>,
+    pub collate: StackStr<128>,
+    pub ctype: StackStr<128>,
+    pub locale: StackStr<128>,
+    pub rules: StackStr<128>,
+    pub version: StackStr<64>,
+    pub behavior: CollationBehavior,
+}
+
+impl CollationDefinition {
+    pub(crate) const EMPTY: Self = Self {
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        owner: 0,
+        provider: CollationProvider::Default,
+        deterministic: true,
+        encoding: None,
+        collate: StackStr::new(),
+        ctype: StackStr::new(),
+        locale: StackStr::new(),
+        rules: StackStr::new(),
+        version: StackStr::new(),
+        behavior: CollationBehavior::Bytewise,
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingCollationDefinition {
+    pub txid: u32,
+    pub definition: CollationDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CollationDef {
+    pub(crate) database: DatabaseOid,
+    pub created_at: u64,
+    pub definition: CollationDefinition,
+    pub pending: Option<PendingCollationDefinition>,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl CollationDef {
+    pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        definition: CollationDefinition::EMPTY,
+        pending: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(self, txid: u32) -> CollationDefinition {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.definition, |pending| pending.definition)
+    }
+
+    pub(crate) fn oid(self, slot: usize) -> i32 {
+        crate::sql::ast::Collation::Catalog(slot as u8).oid()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConversionDefinition {
+    pub schema: SqlName,
+    pub name: SqlName,
+    pub owner: i32,
+    pub source: PgEncoding,
+    pub destination: PgEncoding,
+    pub procedure: i32,
+    pub default: bool,
+}
+
+impl ConversionDefinition {
+    pub(crate) const EMPTY: Self = Self {
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        owner: 0,
+        source: PgEncoding::SQL_ASCII,
+        destination: PgEncoding::SQL_ASCII,
+        procedure: 0,
+        default: false,
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingConversionDefinition {
+    pub txid: u32,
+    pub definition: ConversionDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConversionDef {
+    pub(crate) database: DatabaseOid,
+    pub created_at: u64,
+    pub definition: ConversionDefinition,
+    pub pending: Option<PendingConversionDefinition>,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl ConversionDef {
+    pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        definition: ConversionDefinition::EMPTY,
+        pending: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(self, txid: u32) -> ConversionDefinition {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.definition, |pending| pending.definition)
+    }
+
+    pub(crate) fn oid(self, slot: usize) -> i32 {
+        21_000 + slot as i32
+    }
+}
 pub(crate) const EXTENDED_STATISTICS_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
 pub(crate) const EXTENDED_STATISTICS_MCV_TEXT_MAX: usize = 128;
 
@@ -2423,6 +2714,7 @@ pub enum DependencyClass {
     Composite = 6,
     Routine = 7,
     Operator = 8,
+    Collation = 9,
 }
 
 impl DependencyClass {
@@ -2436,6 +2728,7 @@ impl DependencyClass {
             6 => Some(Self::Composite),
             7 => Some(Self::Routine),
             8 => Some(Self::Operator),
+            9 => Some(Self::Collation),
             _ => None,
         }
     }
@@ -8183,6 +8476,8 @@ pub enum CommentClass {
     Extension,
     Trigger,
     Database,
+    Collation,
+    Conversion,
 }
 
 impl CommentClass {
@@ -8195,6 +8490,8 @@ impl CommentClass {
             CommentClass::Extension => 4,
             CommentClass::Trigger => 5,
             CommentClass::Database => 6,
+            CommentClass::Collation => 7,
+            CommentClass::Conversion => 8,
         }
     }
 
@@ -8207,6 +8504,8 @@ impl CommentClass {
             4 => CommentClass::Extension,
             5 => CommentClass::Trigger,
             6 => CommentClass::Database,
+            7 => CommentClass::Collation,
+            8 => CommentClass::Conversion,
             _ => return None,
         })
     }
@@ -8438,6 +8737,8 @@ pub struct Storage {
     operators: FixedVec<OperatorDef>,
     operator_families: FixedVec<OperatorFamilyDef>,
     operator_classes: FixedVec<OperatorClassDef>,
+    collations: FixedVec<CollationDef>,
+    conversions: FixedVec<ConversionDef>,
     routine_dependencies: FixedVec<StoredQueryDependencies>,
     pending_routine_dependencies: FixedVec<PendingRoutineDependencies>,
     triggers: FixedVec<TriggerDef>,
@@ -8533,6 +8834,7 @@ struct CollationScratch {
 
 struct CollationRuntime {
     locale: libc::locale_t,
+    name: StackStr<128>,
     scratch: std::cell::RefCell<CollationScratch>,
 }
 
@@ -8599,6 +8901,7 @@ impl CollationRuntime {
         };
         Ok(Self {
             locale,
+            name: StackStr::from_str(config.database_collation_locale.as_str()),
             scratch: std::cell::RefCell::new(scratch),
         })
     }
@@ -8970,6 +9273,7 @@ impl Storage {
                         None
                     }
                 },
+                DependencyClass::Collation => self.collation_slot(schema, name, txid),
             }
             .ok_or_else(|| {
                 sql_err!(
@@ -9152,6 +9456,8 @@ impl Storage {
                     + size_of::<MatviewDef>()
                     + size_of::<StoredQueryDependencies>()
                     + size_of::<IndexDef>())
+            + MAX_COLLATIONS * size_of::<CollationDef>()
+            + MAX_CONVERSIONS * size_of::<ConversionDef>()
             + config.max_replication_slots * size_of::<ReplicationSlotDef>()
             + config.max_subscriptions * size_of::<SubscriptionDef>()
             + config.max_subscriptions
@@ -9297,6 +9603,18 @@ impl Storage {
             operator_classes
                 .push(OperatorClassDef::EMPTY)
                 .expect("sized to max_tables");
+        }
+        let mut collations = FixedVec::new(budget, "collations", MAX_COLLATIONS)?;
+        for _ in 0..MAX_COLLATIONS {
+            collations
+                .push(CollationDef::EMPTY)
+                .expect("sized to collation capacity");
+        }
+        let mut conversions = FixedVec::new(budget, "conversions", MAX_CONVERSIONS)?;
+        for _ in 0..MAX_CONVERSIONS {
+            conversions
+                .push(ConversionDef::EMPTY)
+                .expect("sized to conversion capacity");
         }
         let routine_dependencies =
             stored_query_dependency_slots(budget, "routine_dependencies", config.max_tables)?;
@@ -9749,6 +10067,8 @@ impl Storage {
             operators,
             operator_families,
             operator_classes,
+            collations,
+            conversions,
             routine_dependencies,
             pending_routine_dependencies,
             triggers,
@@ -10217,11 +10537,24 @@ impl Storage {
         left: &str,
         right: &str,
     ) -> Result<core::cmp::Ordering, SqlError> {
-        match collation {
+        let behavior = match collation {
             Collation::None | Collation::C | Collation::Posix | Collation::UcsBasic => {
-                Ok(left.cmp(right))
+                CollationBehavior::Bytewise
             }
-            Collation::Default => self
+            Collation::Default => CollationBehavior::Database,
+            Collation::Catalog(slot) => self
+                .collations
+                .get(usize::from(slot))
+                .filter(|definition| {
+                    definition.database == self.current_database
+                        && definition.ddl_state != CatalogDdlState::Absent
+                })
+                .map(|definition| definition.definition.behavior)
+                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "collation does not exist"))?,
+        };
+        match behavior {
+            CollationBehavior::Bytewise => Ok(left.cmp(right)),
+            CollationBehavior::Database => self
                 .collation
                 .as_ref()
                 .ok_or_else(|| {
@@ -10234,6 +10567,42 @@ impl Storage {
         }
     }
 
+    pub(crate) fn executable_collation_behavior(
+        &self,
+        provider: CollationProvider,
+        collate: &str,
+        ctype: &str,
+        locale: &str,
+    ) -> Result<CollationBehavior, SqlError> {
+        let bytewise =
+            |value: &str| value.eq_ignore_ascii_case("C") || value.eq_ignore_ascii_case("POSIX");
+        match provider {
+            CollationProvider::Builtin if bytewise(locale) => Ok(CollationBehavior::Bytewise),
+            CollationProvider::Libc if bytewise(collate) && bytewise(ctype) => {
+                Ok(CollationBehavior::Bytewise)
+            }
+            CollationProvider::Libc
+                if self.collation.as_ref().is_some_and(|runtime| {
+                    runtime.name.as_str() == collate && runtime.name.as_str() == ctype
+                }) =>
+            {
+                Ok(CollationBehavior::Database)
+            }
+            CollationProvider::Default if collate.is_empty() && ctype.is_empty() => {
+                Ok(CollationBehavior::Database)
+            }
+            CollationProvider::Icu => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "ICU collations are not supported"
+            )),
+            _ => Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "collation locale \"{}\" is not the configured database locale",
+                collate
+            )),
+        }
+    }
+
     /// Validates a value before it enters a sorting comparator, whose callback
     /// type cannot return SQL errors. The subsequent comparison is therefore
     /// infallible for capacity purposes and never turns an error into a tie.
@@ -10242,7 +10611,20 @@ impl Storage {
         collation: Collation,
         value: &Datum<'_>,
     ) -> Result<(), SqlError> {
-        if collation != Collation::Default {
+        let needs_locale = match collation {
+            Collation::Default => true,
+            Collation::Catalog(slot) => self
+                .collations
+                .get(usize::from(slot))
+                .filter(|definition| {
+                    definition.database == self.current_database
+                        && definition.ddl_state != CatalogDdlState::Absent
+                })
+                .map(|definition| definition.definition.behavior == CollationBehavior::Database)
+                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "collation does not exist"))?,
+            _ => false,
+        };
+        if !needs_locale {
             return Ok(());
         }
         let value = match value {
@@ -10493,6 +10875,7 @@ impl Storage {
         let prior_database = self.current_database;
         self.current_database = target;
         let result = (|| {
+            let mut collation_slots = [u8::MAX; MAX_COLLATIONS];
             for source_slot in 0..self.schemas.len() {
                 let source_schema = self.schemas[source_slot];
                 if source_schema.database != source
@@ -10503,6 +10886,54 @@ impl Storage {
                 let target_slot =
                     self.alloc_schema(source_schema.name, CatalogDdlState::PendingCreate { txid })?;
                 self.schemas[target_slot].ownership = source_schema.ownership.committed();
+            }
+
+            for (source_slot, target_mapping) in collation_slots
+                .iter_mut()
+                .enumerate()
+                .take(self.collations.len())
+            {
+                let mut definition = self.collations[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .collations
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "collation catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.pending = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.collations[target_slot] = definition;
+                *target_mapping = target_slot as u8;
+            }
+            for source_slot in 0..self.conversions.len() {
+                let mut definition = self.conversions[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .conversions
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "conversion catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.pending = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.conversions[target_slot] = definition;
             }
 
             for source_slot in 0..self.domains.len() {
@@ -10563,6 +10994,18 @@ impl Storage {
                 definition.ownership = definition.ownership.committed();
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                for field in definition.fields.iter_mut().take(definition.n_fields) {
+                    if let Collation::Catalog(source) = field.collation {
+                        let target = collation_slots[usize::from(source)];
+                        if target == u8::MAX {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template composite references an uncloned collation"
+                            ));
+                        }
+                        field.collation = Collation::Catalog(target);
+                    }
+                }
                 self.composites[target_slot] = definition;
             }
 
@@ -10578,7 +11021,19 @@ impl Storage {
                         "template database has uncommitted relation state"
                     ));
                 }
-                let definition = self.tables[source_slot].def;
+                let mut definition = self.tables[source_slot].def;
+                for column in definition.columns.iter_mut().take(definition.n_columns) {
+                    if let Collation::Catalog(source) = column.collation {
+                        let target = collation_slots[usize::from(source)];
+                        if target == u8::MAX {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template relation references an uncloned collation"
+                            ));
+                        }
+                        column.collation = Collation::Catalog(target);
+                    }
+                }
                 let created_at = self.tables[source_slot].created_at;
                 let ownership = self.tables[source_slot].ownership.committed();
                 let statistics = self.tables[source_slot].statistics;
@@ -10816,6 +11271,18 @@ impl Storage {
                 definition.pending_name = None;
                 definition.pending_definition = None;
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                for collation in definition.collations.iter_mut().take(definition.n_cols) {
+                    if let Collation::Catalog(source) = *collation {
+                        let target = collation_slots[usize::from(source)];
+                        if target == u8::MAX {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "template index references an uncloned collation"
+                            ));
+                        }
+                        *collation = Collation::Catalog(target);
+                    }
+                }
                 self.indexes[target_slot] = definition;
             }
             for target_slot in 0..self.indexes.len() {
@@ -11424,6 +11891,8 @@ impl Storage {
         clear_catalog!(routines);
         clear_catalog!(casts);
         clear_catalog!(operators);
+        clear_catalog!(collations);
+        clear_catalog!(conversions);
         clear_catalog!(operator_families);
         clear_catalog!(operator_classes);
         clear_catalog!(triggers);
@@ -11541,6 +12010,8 @@ impl Storage {
         commit_catalog!(routines);
         commit_catalog!(casts);
         commit_catalog!(operators);
+        commit_catalog!(collations);
+        commit_catalog!(conversions);
         commit_catalog!(operator_families);
         commit_catalog!(operator_classes);
         commit_catalog!(triggers);
@@ -11642,6 +12113,16 @@ impl Storage {
     fn current_database_slot(&self, txid: u32) -> usize {
         self.database_slot_by_oid(self.current_database, txid)
             .expect("selected database remains visible for the statement")
+    }
+
+    pub(crate) fn current_database_encoding(&self, txid: u32) -> PgEncoding {
+        match self
+            .database_definition(self.current_database_slot(txid), txid)
+            .encoding
+        {
+            DatabaseEncoding::Utf8 => PgEncoding::UTF8,
+            DatabaseEncoding::SqlAscii => PgEncoding::SQL_ASCII,
+        }
     }
 
     pub fn role(&self, slot: usize) -> &RoleDef {
@@ -12182,6 +12663,20 @@ impl Storage {
             .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
     }
 
+    pub(crate) fn checkpoint_collations(&self) -> impl Iterator<Item = (usize, &CollationDef)> {
+        self.collations
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_conversions(&self) -> impl Iterator<Item = (usize, &ConversionDef)> {
+        self.conversions
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
     pub(crate) fn checkpoint_operators(&self) -> impl Iterator<Item = (usize, &OperatorDef)> {
         self.operators
             .iter()
@@ -12385,6 +12880,12 @@ impl Storage {
                 .any(|(_, definition)| definition.owner == Self::role_oid(role))
             || self
                 .operator_classes_visible_to(txid)
+                .any(|(_, definition)| definition.owner == Self::role_oid(role))
+            || self
+                .collations_visible_to(txid)
+                .any(|(_, definition)| definition.owner == Self::role_oid(role))
+            || self
+                .conversions_visible_to(txid)
                 .any(|(_, definition)| definition.owner == Self::role_oid(role));
         if owned {
             return Some(RoleObjectDependency::OwnedObject);
@@ -14436,6 +14937,63 @@ impl Storage {
         }
     }
 
+    fn stage_object_comment_identity(
+        &mut self,
+        class: CommentClass,
+        old_schema: SqlName,
+        old_name: SqlName,
+        new_schema: SqlName,
+        new_name: SqlName,
+        txid: u32,
+    ) {
+        let database = Some(self.current_database);
+        for comment in self.comments.iter_mut().filter(|comment| {
+            comment.used
+                && comment.database == database
+                && comment.class == class
+                && ((comment.schema == old_schema && comment.name == old_name)
+                    || comment.pending_identity.is_some_and(|identity| {
+                        identity.txid == txid
+                            && identity.schema == old_schema
+                            && identity.name == old_name
+                    }))
+        }) {
+            let changed = old_schema != new_schema || old_name != new_name;
+            comment.pending_identity = changed.then_some(PendingCommentIdentity {
+                txid,
+                schema: new_schema,
+                name: new_name,
+            });
+        }
+    }
+
+    fn commit_object_comment_identity(
+        &mut self,
+        class: CommentClass,
+        old_schema: SqlName,
+        old_name: SqlName,
+        txid: u32,
+    ) {
+        let database = Some(self.current_database);
+        for comment in self.comments.iter_mut().filter(|comment| {
+            comment.used
+                && comment.database == database
+                && comment.class == class
+                && comment.schema == old_schema
+                && comment.name == old_name
+                && comment
+                    .pending_identity
+                    .is_some_and(|pending| pending.txid == txid)
+        }) {
+            let pending = comment
+                .pending_identity
+                .take()
+                .expect("filtered pending comment identity");
+            comment.schema = pending.schema;
+            comment.name = pending.name;
+        }
+    }
+
     /// Sets (or, with `text == None`, removes) a comment as `txid`'s
     /// uncommitted overlay. Returns the slot and the prior overlay, for the
     /// transaction's undo log. A fresh key claims a free slot; exhausting the
@@ -14501,6 +15059,14 @@ impl Storage {
         let entry = &mut self.comments[slot];
         match entry.pending {
             Some(p) if p.txid == txid => {
+                if let Some(identity) = entry
+                    .pending_identity
+                    .take()
+                    .filter(|identity| identity.txid == txid)
+                {
+                    entry.schema = identity.schema;
+                    entry.name = identity.name;
+                }
                 entry.pending = None;
                 entry.live = p.text;
                 let out = (
@@ -15487,11 +16053,12 @@ impl Storage {
         if self.find_sequence(schema, name, txid).is_some() {
             return Some(StoredRelKind::Sequence);
         }
-        if self
-            .indexes
-            .iter()
-            .any(|i| i.visible_to(txid) && i.schema.as_str() == schema && i.name.as_str() == name)
-        {
+        if self.indexes.iter().any(|i| {
+            i.database == self.current_database
+                && i.visible_to(txid)
+                && i.schema.as_str() == schema
+                && i.name.as_str() == name
+        }) {
             return Some(StoredRelKind::Index);
         }
         None
@@ -27448,18 +28015,22 @@ impl Storage {
         schema: &'a str,
         table: &'a str,
         txid: u32,
-    ) -> impl Iterator<Item = &'a IndexDef> {
+    ) -> impl Iterator<Item = IndexDef> + 'a {
         let committed_binding = self
             .find_visible(schema, table, txid)
             .map(|slot| (self.tables[slot].def.schema, self.tables[slot].def.name));
-        self.indexes.iter().filter(move |x| {
-            x.database == self.current_database
-                && x.visible_to(txid)
-                && ((x.schema.as_str() == schema && x.table.as_str() == table)
-                    || committed_binding.is_some_and(|(old_schema, old_table)| {
-                        x.schema == old_schema && x.table == old_table
-                    }))
-        })
+        self.indexes
+            .iter()
+            .copied()
+            .filter(move |x| {
+                x.database == self.current_database
+                    && x.visible_to(txid)
+                    && ((x.schema.as_str() == schema && x.table.as_str() == table)
+                        || committed_binding.is_some_and(|(old_schema, old_table)| {
+                            x.schema == old_schema && x.table == old_table
+                        }))
+            })
+            .map(move |index| self.project_index_binding(index, txid))
     }
 
     pub fn unique_indexes_for<'a>(
@@ -27467,7 +28038,7 @@ impl Storage {
         schema: &'a str,
         table: &'a str,
         txid: u32,
-    ) -> impl Iterator<Item = &'a IndexDef> {
+    ) -> impl Iterator<Item = IndexDef> + 'a {
         self.indexes_for(schema, table, txid).filter(|x| x.unique)
     }
 
@@ -27487,6 +28058,58 @@ impl Storage {
             .get(slot)
             .copied()
             .filter(|index| index.database == self.current_database && index.visible_to(txid))
+            .map(|index| self.project_index_binding(index, txid))
+    }
+
+    /// Projects committed index column ordinals through this transaction's
+    /// pending table shape. A visible index that names a removed column is an
+    /// executor invariant violation: DROP COLUMN must mark it pending-drop
+    /// before publishing the pending table definition.
+    fn project_index_binding(&self, mut index: IndexDef, txid: u32) -> IndexDef {
+        // A transaction-private CREATE INDEX is already expressed against the
+        // table shape visible at its creation point. Committed indexes alone
+        // need projection from their committed table binding.
+        if index.ddl_state != CatalogDdlState::Present {
+            return index;
+        }
+        let Some(table_slot) = self.tables.iter().position(|table| {
+            table.database == index.database
+                && table.def.schema == index.schema
+                && table.def.name == index.table
+        }) else {
+            return index;
+        };
+        let Some(pending) = self
+            .pending_table_def(table_slot)
+            .filter(|pending| pending.txid == txid)
+        else {
+            return index;
+        };
+        for key in 0..index.n_cols {
+            if index.expressions[key].is_some() {
+                continue;
+            }
+            let committed = usize::from(index.columns[key]);
+            let target_name = pending.column_mapping[committed]
+                .expect("visible index key cannot reference a dropped column");
+            index.columns[key] = pending
+                .def
+                .column_index(target_name.as_str())
+                .expect("pending index key name must exist in pending table definition")
+                as u16;
+        }
+        for column in &mut index.include_columns[..index.n_include_cols] {
+            let target_name = pending.column_mapping[usize::from(*column)]
+                .expect("visible included index column cannot reference a dropped column");
+            *column = pending
+                .def
+                .column_index(target_name.as_str())
+                .expect("pending included column name must exist in pending table definition")
+                as u16;
+        }
+        index.schema = pending.def.schema;
+        index.table = pending.def.name;
+        index
     }
 
     pub(crate) fn tablespace_slot(&self, name: &str, txid: u32) -> Option<usize> {
@@ -27983,6 +28606,17 @@ impl Storage {
                 continue;
             }
             for column in &mut index_def.columns[..index_def.n_cols] {
+                let Some(target_name) = column_mapping
+                    .get(*column as usize)
+                    .and_then(|target| *target)
+                else {
+                    continue;
+                };
+                if let Some(target_column) = def.column_index(target_name.as_str()) {
+                    *column = target_column as u16;
+                }
+            }
+            for column in &mut index_def.include_columns[..index_def.n_include_cols] {
                 let Some(target_name) = column_mapping
                     .get(*column as usize)
                     .and_then(|target| *target)
@@ -28764,6 +29398,547 @@ impl Storage {
                 operator.database == self.current_database && operator.visible_to(txid)
             })
             .map(move |(slot, operator)| (slot, operator.definition_for(txid)))
+    }
+
+    pub(crate) fn collations_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, CollationDefinition)> + '_ {
+        self.collations
+            .iter()
+            .enumerate()
+            .filter(move |(_, collation)| {
+                collation.database == self.current_database && collation.visible_to(txid)
+            })
+            .map(move |(slot, collation)| (slot, collation.definition_for(txid)))
+    }
+
+    pub(crate) fn conversions_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, ConversionDefinition)> + '_ {
+        self.conversions
+            .iter()
+            .enumerate()
+            .filter(move |(_, conversion)| {
+                conversion.database == self.current_database && conversion.visible_to(txid)
+            })
+            .map(move |(slot, conversion)| (slot, conversion.definition_for(txid)))
+    }
+
+    pub(crate) fn collation(&self, slot: usize) -> CollationDef {
+        self.collations[slot]
+    }
+
+    pub(crate) fn conversion(&self, slot: usize) -> ConversionDef {
+        self.conversions[slot]
+    }
+
+    pub(crate) fn collation_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.collations_visible_to(txid)
+            .find_map(|(slot, definition)| {
+                (definition.schema.as_str() == schema && definition.name.as_str() == name)
+                    .then_some(slot)
+            })
+    }
+
+    pub(crate) fn collation_slot_on_path(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        match schema {
+            Some(schema) => self.collation_slot(schema, name, txid),
+            None => self.path.entries().iter().find_map(|entry| match entry {
+                PathEntry::Schema(slot) => {
+                    self.collation_slot(self.schemas[*slot as usize].name.as_str(), name, txid)
+                }
+                PathEntry::Catalog => None,
+            }),
+        }
+    }
+
+    pub(crate) fn resolve_collation(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<Collation> {
+        let catalog = schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"));
+        if catalog {
+            let builtin = Collation::BUILTIN
+                .into_iter()
+                .find(|collation| collation.name().eq_ignore_ascii_case(name));
+            if builtin.is_some() {
+                return builtin;
+            }
+        }
+        let slot = self.collation_slot_on_path(schema, name, txid)?;
+        u8::try_from(slot).ok().map(Collation::Catalog)
+    }
+
+    pub(crate) fn conversion_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
+        self.conversions_visible_to(txid)
+            .find_map(|(slot, definition)| {
+                (definition.schema.as_str() == schema && definition.name.as_str() == name)
+                    .then_some(slot)
+            })
+    }
+
+    pub(crate) fn conversion_slot_on_path(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        match schema {
+            Some(schema) => self.conversion_slot(schema, name, txid),
+            None => self.path.entries().iter().find_map(|entry| match entry {
+                PathEntry::Schema(slot) => {
+                    self.conversion_slot(self.schemas[*slot as usize].name.as_str(), name, txid)
+                }
+                PathEntry::Catalog => None,
+            }),
+        }
+    }
+
+    pub(crate) fn default_conversion(
+        &self,
+        source: PgEncoding,
+        destination: PgEncoding,
+        txid: u32,
+    ) -> Option<ConversionDefinition> {
+        self.path.entries().iter().find_map(|entry| {
+            let PathEntry::Schema(schema_slot) = entry else {
+                return None;
+            };
+            let schema = self.schemas[*schema_slot as usize].name;
+            self.conversions_visible_to(txid)
+                .find_map(|(_, definition)| {
+                    (definition.schema == schema
+                        && definition.source == source
+                        && definition.destination == destination
+                        && definition.default)
+                        .then_some(definition)
+                })
+        })
+    }
+
+    pub(crate) fn create_collation(
+        &mut self,
+        definition: CollationDefinition,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        let behavior = self.executable_collation_behavior(
+            definition.provider,
+            definition.collate.as_str(),
+            definition.ctype.as_str(),
+            definition.locale.as_str(),
+        )?;
+        if behavior != definition.behavior {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "collation execution behavior does not match its definition"
+            ));
+        }
+        self.require_schema_create(definition.schema.as_str(), txid)?;
+        if self
+            .collation_slot(definition.schema.as_str(), definition.name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "collation \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
+        let slot = self
+            .collations
+            .iter()
+            .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many collations (limit {})",
+                    MAX_COLLATIONS
+                )
+            })?;
+        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        self.collations[slot] = CollationDef {
+            database: self.current_database,
+            created_at: self.catalog_seq,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn create_conversion(
+        &mut self,
+        definition: ConversionDefinition,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        self.require_schema_create(definition.schema.as_str(), txid)?;
+        if self
+            .conversion_slot(definition.schema.as_str(), definition.name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "conversion \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
+        if definition.default
+            && self.conversions_visible_to(txid).any(|(_, candidate)| {
+                candidate.schema == definition.schema
+                    && candidate.source == definition.source
+                    && candidate.destination == definition.destination
+                    && candidate.default
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "default conversion for {} to {} already exists",
+                definition.source.name(),
+                definition.destination.name()
+            ));
+        }
+        let slot = self
+            .conversions
+            .iter()
+            .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many conversions (limit {})",
+                    MAX_CONVERSIONS
+                )
+            })?;
+        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        self.conversions[slot] = ConversionDef {
+            database: self.current_database,
+            created_at: self.catalog_seq,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn alter_collation(
+        &mut self,
+        slot: usize,
+        definition: CollationDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingCollationDefinition>, SqlError> {
+        let old = self.collations[slot].definition_for(txid);
+        if let Some(other) =
+            self.collation_slot(definition.schema.as_str(), definition.name.as_str(), txid)
+            && other != slot
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "collation already exists"
+            ));
+        }
+        let prior = self.collations[slot].pending;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "collation is being altered by another transaction"
+            ));
+        }
+        self.collations[slot].pending = Some(PendingCollationDefinition { txid, definition });
+        self.stage_object_comment_identity(
+            CommentClass::Collation,
+            old.schema,
+            old.name,
+            definition.schema,
+            definition.name,
+            txid,
+        );
+        Ok(prior)
+    }
+
+    pub(crate) fn alter_conversion(
+        &mut self,
+        slot: usize,
+        definition: ConversionDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingConversionDefinition>, SqlError> {
+        let old = self.conversions[slot].definition_for(txid);
+        if let Some(other) =
+            self.conversion_slot(definition.schema.as_str(), definition.name.as_str(), txid)
+            && other != slot
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "conversion already exists"
+            ));
+        }
+        let prior = self.conversions[slot].pending;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "conversion is being altered by another transaction"
+            ));
+        }
+        self.conversions[slot].pending = Some(PendingConversionDefinition { txid, definition });
+        self.stage_object_comment_identity(
+            CommentClass::Conversion,
+            old.schema,
+            old.name,
+            definition.schema,
+            definition.name,
+            txid,
+        );
+        Ok(prior)
+    }
+
+    pub(crate) fn drop_collation(&mut self, slot: usize, txid: u32) {
+        self.collations[slot].ddl_state = self.collations[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn drop_conversion(&mut self, slot: usize, txid: u32) {
+        self.conversions[slot].ddl_state = self.conversions[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_collation_create(&mut self, slot: usize) {
+        self.collations[slot].ddl_state = self.collations[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_collation_create(&mut self, slot: usize) {
+        self.collations[slot].ddl_state = self.collations[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_collation_alter(&mut self, slot: usize, txid: u32) {
+        let old = self.collations[slot].definition;
+        let changed = self.collations[slot]
+            .pending
+            .filter(|pending| pending.txid == txid)
+            .map(|pending| (pending.definition.schema, pending.definition.name));
+        if let Some(pending) = self.collations[slot].pending
+            && pending.txid == txid
+        {
+            self.collations[slot].definition = pending.definition;
+            self.collations[slot].pending = None;
+        }
+        if let Some((schema, name)) = changed {
+            self.rename_stored_query_dependency(DependencyClass::Collation, slot, schema, name);
+            self.commit_object_comment_identity(
+                CommentClass::Collation,
+                old.schema,
+                old.name,
+                txid,
+            );
+        }
+    }
+
+    pub(crate) fn rollback_collation_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingCollationDefinition>,
+    ) {
+        let txid = self.collations[slot]
+            .pending
+            .map_or(0, |pending| pending.txid);
+        self.collations[slot].pending = prior;
+        let committed = self.collations[slot].definition;
+        let visible = prior.map_or(committed, |pending| pending.definition);
+        self.stage_object_comment_identity(
+            CommentClass::Collation,
+            committed.schema,
+            committed.name,
+            visible.schema,
+            visible.name,
+            txid,
+        );
+    }
+
+    pub(crate) fn commit_collation_drop(&mut self, slot: usize) {
+        let definition = self.collations[slot].definition;
+        self.drop_object_comments(
+            CommentClass::Collation,
+            definition.schema.as_str(),
+            definition.name.as_str(),
+        );
+        self.collations[slot].pending = None;
+        self.collations[slot].ddl_state = self.collations[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_collation_drop(&mut self, slot: usize, txid: u32) {
+        self.collations[slot].ddl_state = self.collations[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn commit_conversion_create(&mut self, slot: usize) {
+        self.conversions[slot].ddl_state = self.conversions[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_conversion_create(&mut self, slot: usize) {
+        self.conversions[slot].ddl_state = self.conversions[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_conversion_alter(&mut self, slot: usize, txid: u32) {
+        let old = self.conversions[slot].definition;
+        if let Some(pending) = self.conversions[slot].pending
+            && pending.txid == txid
+        {
+            self.conversions[slot].definition = pending.definition;
+            self.conversions[slot].pending = None;
+            self.commit_object_comment_identity(
+                CommentClass::Conversion,
+                old.schema,
+                old.name,
+                txid,
+            );
+        }
+    }
+
+    pub(crate) fn rollback_conversion_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingConversionDefinition>,
+    ) {
+        let txid = self.conversions[slot]
+            .pending
+            .map_or(0, |pending| pending.txid);
+        self.conversions[slot].pending = prior;
+        let committed = self.conversions[slot].definition;
+        let visible = prior.map_or(committed, |pending| pending.definition);
+        self.stage_object_comment_identity(
+            CommentClass::Conversion,
+            committed.schema,
+            committed.name,
+            visible.schema,
+            visible.name,
+            txid,
+        );
+    }
+
+    pub(crate) fn commit_conversion_drop(&mut self, slot: usize) {
+        let definition = self.conversions[slot].definition;
+        self.drop_object_comments(
+            CommentClass::Conversion,
+            definition.schema.as_str(),
+            definition.name.as_str(),
+        );
+        self.conversions[slot].pending = None;
+        self.conversions[slot].ddl_state = self.conversions[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_conversion_drop(&mut self, slot: usize, txid: u32) {
+        self.conversions[slot].ddl_state = self.conversions[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn replay_collation(
+        &mut self,
+        slot: usize,
+        created_at: u64,
+        definition: CollationDefinition,
+    ) -> Result<(), SqlError> {
+        let behavior = self.executable_collation_behavior(
+            definition.provider,
+            definition.collate.as_str(),
+            definition.ctype.as_str(),
+            definition.locale.as_str(),
+        )?;
+        if behavior != definition.behavior {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "journal collation behavior does not match its definition"
+            ));
+        }
+        if slot >= self.collations.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "journal collation slot is out of range"
+            ));
+        }
+        if self
+            .collations
+            .iter()
+            .enumerate()
+            .any(|(other, candidate)| {
+                other != slot
+                    && candidate.database == self.current_database
+                    && candidate.ddl_state != CatalogDdlState::Absent
+                    && candidate.definition.schema == definition.schema
+                    && candidate.definition.name == definition.name
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "journal replays duplicate collation \"{}\"",
+                definition.name.as_str()
+            ));
+        }
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.collations[slot] = CollationDef {
+            database: self.current_database,
+            created_at,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn replay_drop_collation(&mut self, schema: &str, name: &str) {
+        if let Some(slot) = self.collation_slot(schema, name, 0) {
+            self.drop_object_comments(CommentClass::Collation, schema, name);
+            self.collations[slot] = CollationDef::EMPTY;
+        }
+    }
+
+    pub(crate) fn replay_conversion(
+        &mut self,
+        slot: usize,
+        created_at: u64,
+        definition: ConversionDefinition,
+    ) -> Result<(), SqlError> {
+        if slot >= self.conversions.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "journal conversion slot is out of range"
+            ));
+        }
+        if self
+            .conversions
+            .iter()
+            .enumerate()
+            .any(|(other, candidate)| {
+                other != slot
+                    && candidate.database == self.current_database
+                    && candidate.ddl_state != CatalogDdlState::Absent
+                    && candidate.definition.schema == definition.schema
+                    && candidate.definition.name == definition.name
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "journal replays duplicate conversion \"{}\"",
+                definition.name.as_str()
+            ));
+        }
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.conversions[slot] = ConversionDef {
+            database: self.current_database,
+            created_at,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn replay_drop_conversion(&mut self, schema: &str, name: &str) {
+        if let Some(slot) = self.conversion_slot(schema, name, 0) {
+            self.drop_object_comments(CommentClass::Conversion, schema, name);
+            self.conversions[slot] = ConversionDef::EMPTY;
+        }
     }
 
     pub(crate) fn operator(&self, slot: usize) -> &OperatorDef {
@@ -30046,10 +31221,12 @@ mod tests {
             CommentClass::Extension,
             CommentClass::Trigger,
             CommentClass::Database,
+            CommentClass::Collation,
+            CommentClass::Conversion,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(7), None);
+        assert_eq!(CommentClass::from_u8(9), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 

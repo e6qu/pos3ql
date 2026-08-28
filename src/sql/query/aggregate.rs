@@ -1022,7 +1022,8 @@ impl<'a> AggState<'a> {
                 let mut tuple = [Datum::Null; 1 + MAX_PROJ];
                 tuple[0] = value;
                 for (i, o) in self.ord_spec.iter().enumerate() {
-                    self.ord_collations[i] = resolved_expression_collation(o.expression, row)?;
+                    self.ord_collations[i] =
+                        resolved_expression_collation(o.expression, row, hooks.catalog)?;
                     tuple[1 + i] = eval_full(o.expression, arena, params, row, hooks)?;
                 }
                 let enc = crate::sql::exec::encode_projected_pub(
@@ -1079,7 +1080,7 @@ impl<'a> AggState<'a> {
             if value.is_null() {
                 return Ok(());
             }
-            self.collation = resolved_expression_collation(item.expression, row)?;
+            self.collation = resolved_expression_collation(item.expression, row, hooks.catalog)?;
             return self.push_distinct(value, arena);
         }
         // Two-argument statistical aggregates `agg(Y, X)`: skip a row where
@@ -1110,7 +1111,7 @@ impl<'a> AggState<'a> {
                 "aggregate requires an argument"
             ));
         };
-        self.collation = resolved_expression_collation(arg, row)?;
+        self.collation = resolved_expression_collation(arg, row, hooks.catalog)?;
         let v = eval_full(arg, arena, params, row, hooks)?;
         if v.is_null() {
             return Ok(());
@@ -1158,7 +1159,8 @@ impl<'a> AggState<'a> {
         let mut values = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
         for (index, expression) in transition_expressions.iter().enumerate() {
             values[index] = eval_full(expression, arena, params, row, hooks)?;
-            self.ord_collations[index] = resolved_expression_collation(expression, row)?;
+            self.ord_collations[index] =
+                resolved_expression_collation(expression, row, hooks.catalog)?;
         }
         if self.ordered || *distinct {
             let mut tuple = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS * 2];
@@ -1169,7 +1171,7 @@ impl<'a> AggState<'a> {
                     tuple[transition_expressions.len() + index] =
                         eval_full(ordering.expression, arena, params, row, hooks)?;
                     self.ord_collations[transition_expressions.len() + index] =
-                        resolved_expression_collation(ordering.expression, row)?;
+                        resolved_expression_collation(ordering.expression, row, hooks.catalog)?;
                 }
             }
             let encoded = crate::sql::exec::encode_projected_pub(
@@ -1494,7 +1496,8 @@ impl<'a> AggState<'a> {
             let mut tuple = [Datum::Null; 1 + MAX_PROJ];
             tuple[0] = Datum::Text(val_str);
             for (i, o) in self.ord_spec.iter().enumerate() {
-                self.ord_collations[i] = resolved_expression_collation(o.expression, row)?;
+                self.ord_collations[i] =
+                    resolved_expression_collation(o.expression, row, hooks.catalog)?;
                 tuple[1 + i] = eval_full(o.expression, arena, params, row, hooks)?;
             }
             let enc =

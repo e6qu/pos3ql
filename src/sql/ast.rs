@@ -14,6 +14,25 @@ pub struct QualName<'a> {
     pub name: &'a str,
 }
 
+/// A syntactically valid collation reference. Catalog lookup happens at the
+/// statement's transaction-visible binding boundary, never in the lexer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedCollation<'a> {
+    Builtin(Collation),
+    Named(&'a QualName<'a>),
+}
+
+impl ParsedCollation<'_> {
+    pub const DEFAULT: Self = Self::Builtin(Collation::Default);
+
+    pub const fn builtin(self) -> Option<Collation> {
+        match self {
+            Self::Builtin(collation) => Some(collation),
+            Self::Named(_) => None,
+        }
+    }
+}
+
 /// The privilege identity used while expanding a view body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewSecurity {
@@ -43,6 +62,9 @@ pub enum Collation {
     C,
     Posix,
     UcsBasic,
+    /// A database-local catalog slot. The slot, rather than a spelling, is the
+    /// durable identity across rename and schema moves.
+    Catalog(u8),
 }
 
 impl Collation {
@@ -56,7 +78,8 @@ impl Collation {
             Self::Default => 100,
             Self::C => 950,
             Self::Posix => 951,
-            Self::UcsBasic => 12_340,
+            Self::UcsBasic => 962,
+            Self::Catalog(slot) => 20_000 + slot as i32,
         }
     }
 
@@ -67,6 +90,7 @@ impl Collation {
             Self::C => "C",
             Self::Posix => "POSIX",
             Self::UcsBasic => "ucs_basic",
+            Self::Catalog(_) => "<catalog collation>",
         }
     }
 
@@ -76,6 +100,7 @@ impl Collation {
             Self::Default => "d",
             Self::C | Self::Posix => "c",
             Self::UcsBasic => "b",
+            Self::Catalog(_) => "",
         }
     }
 
@@ -83,6 +108,7 @@ impl Collation {
         match self {
             Self::UcsBasic => 6,
             Self::None | Self::Default | Self::C | Self::Posix => -1,
+            Self::Catalog(_) => -1,
         }
     }
 
@@ -91,6 +117,7 @@ impl Collation {
             Self::C => "C",
             Self::Posix => "POSIX",
             Self::None | Self::Default | Self::UcsBasic => "",
+            Self::Catalog(_) => "",
         }
     }
 
@@ -101,6 +128,7 @@ impl Collation {
             Self::Posix => 2,
             Self::UcsBasic => 3,
             Self::None => 4,
+            Self::Catalog(slot) => 5 + slot,
         }
     }
 
@@ -111,6 +139,7 @@ impl Collation {
             2 => Some(Self::Posix),
             3 => Some(Self::UcsBasic),
             4 => Some(Self::None),
+            5..=132 => Some(Self::Catalog(code - 5)),
             _ => None,
         }
     }
@@ -181,6 +210,54 @@ pub enum ExplainSerialize {
     Binary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionIsolation {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl TransactionIsolation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadUncommitted => "read uncommitted",
+            Self::ReadCommitted => "read committed",
+            Self::RepeatableRead => "repeatable read",
+            Self::Serializable => "serializable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionCharacteristics {
+    pub isolation: Option<TransactionIsolation>,
+    pub read_only: Option<bool>,
+    pub deferrable: Option<bool>,
+}
+
+impl TransactionCharacteristics {
+    pub const EMPTY: Self = Self {
+        isolation: None,
+        read_only: None,
+        deferrable: None,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionTarget {
+    Current,
+    SessionDefaults,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingSyntax {
+    Generic,
+    FromCurrent,
+    TimeZone,
+    TimeZoneInterval(i32),
+}
+
 /// PostgreSQL EXPLAIN options. Keeping the complete option state in the AST
 /// prevents accepted syntax from being forgotten between parse and execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,9 +321,7 @@ pub enum Stmt<'a> {
     Update(Update<'a>),
     Delete(Delete<'a>),
     Merge(Merge<'a>),
-    /// BEGIN / START TRANSACTION plus the retained transaction
-    /// characteristics (empty when none were written).
-    Begin(&'a str),
+    Begin(TransactionCharacteristics),
     Commit,
     Rollback,
     /// SAVEPOINT name.
@@ -409,6 +484,26 @@ pub enum Stmt<'a> {
     /// DROP VIEW [IF EXISTS] name.
     DropView {
         names: &'a [QualName<'a>],
+        if_exists: bool,
+        cascade: bool,
+    },
+    CreateCollation(CreateCollation<'a>),
+    AlterCollation {
+        name: QualName<'a>,
+        action: AlterCollationAction<'a>,
+    },
+    DropCollation {
+        name: QualName<'a>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    CreateConversion(CreateConversion<'a>),
+    AlterConversion {
+        name: QualName<'a>,
+        action: AlterConversionAction<'a>,
+    },
+    DropConversion {
+        name: QualName<'a>,
         if_exists: bool,
         cascade: bool,
     },
@@ -623,15 +718,19 @@ pub enum Stmt<'a> {
         name: &'a str,
         value: &'a str,
         local: bool,
+        syntax: SettingSyntax,
     },
+    SetCatalog(&'a str),
     /// RESET name / RESET ALL restores one or every settable GUC to default.
     Reset(Option<&'a str>),
     AlterSystem {
         name: Option<&'a str>,
         value: Option<&'a str>,
     },
-    /// SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS TRANSACTION ....
-    SetTransaction(&'a str),
+    SetTransaction {
+        target: TransactionTarget,
+        characteristics: TransactionCharacteristics,
+    },
     /// SET TRANSACTION SNAPSHOT 'snapshot_id'.
     SetTransactionSnapshot(&'a str),
     /// SET ROLE role | NONE and RESET ROLE.
@@ -838,6 +937,58 @@ pub enum Stmt<'a> {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateCollationDefinition<'a> {
+    From(QualName<'a>),
+    Options {
+        locale: Option<&'a str>,
+        lc_collate: Option<&'a str>,
+        lc_ctype: Option<&'a str>,
+        provider: Option<ParsedCollationProvider>,
+        deterministic: Option<bool>,
+        rules: Option<&'a str>,
+        version: Option<&'a str>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParsedCollationProvider {
+    Builtin,
+    Libc,
+    Icu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateCollation<'a> {
+    pub name: QualName<'a>,
+    pub if_not_exists: bool,
+    pub definition: CreateCollationDefinition<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterCollationAction<'a> {
+    RefreshVersion,
+    Rename(&'a str),
+    Owner(&'a str),
+    SetSchema(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateConversion<'a> {
+    pub default: bool,
+    pub name: QualName<'a>,
+    pub source_encoding: crate::storage::PgEncoding,
+    pub destination_encoding: crate::storage::PgEncoding,
+    pub function: QualName<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterConversionAction<'a> {
+    Rename(&'a str),
+    Owner(&'a str),
+    SetSchema(&'a str),
+}
+
 /// A parsed named-composite attribute. Keeping the field name and type spelling
 /// together prevents the executor from accepting a name-only half-definition.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -845,7 +996,7 @@ pub struct CompositeField<'a> {
     pub name: &'a str,
     pub type_name: &'a str,
     pub type_mod: i32,
-    pub collation: Collation,
+    pub collation: ParsedCollation<'a>,
 }
 
 /// A parsed ALTER INDEX operation. Keeping the supported operation typed
@@ -1772,7 +1923,7 @@ pub struct IndexColumn<'a> {
     pub column: Option<&'a str>,
     pub expression: &'a Expr<'a>,
     pub expression_text: &'a str,
-    pub collation: Option<Collation>,
+    pub collation: Option<ParsedCollation<'a>>,
     pub operator_class: Option<QualName<'a>>,
     pub descending: bool,
     pub nulls_first: bool,
@@ -1850,6 +2001,8 @@ pub enum CommentTarget<'a> {
     /// TABLESPACE name.
     Tablespace(&'a str),
     Database(&'a str),
+    Collation(QualName<'a>),
+    Conversion(QualName<'a>),
     /// EXTENSION name.
     Extension(&'a str),
     /// TRIGGER name ON relation; trigger names are relation-local.
@@ -2956,7 +3109,7 @@ pub enum AlterTypeAction<'a> {
         name: &'a str,
         type_name: &'a str,
         type_mod: i32,
-        collation: Collation,
+        collation: ParsedCollation<'a>,
     },
     /// ALTER ATTRIBUTE name SET NOT NULL.
     SetAttributeNotNull(&'a str),
@@ -2991,7 +3144,7 @@ pub struct ColumnDef<'a> {
     /// varchar(n)/char(n) encode `n + 4`; numeric(p,s) encodes `((p<<16)|s)+4`.
     pub type_mod: i32,
     /// The collation selected by `COLLATE` or the database default.
-    pub collation: Collation,
+    pub collation: ParsedCollation<'a>,
     pub not_null: bool,
     pub unique: bool,
     pub primary: bool,
@@ -3351,7 +3504,7 @@ pub enum AlterAction<'a> {
         column: &'a str,
         type_name: &'a str,
         type_mod: i32,
-        collation: Option<Collation>,
+        collation: Option<ParsedCollation<'a>>,
         using: Option<&'a Expr<'a>>,
     },
     /// ALTER TABLE ... ADD [CONSTRAINT name] <table constraint>. Existing rows
@@ -3655,7 +3808,7 @@ pub enum Expr<'a> {
     /// the comparison, ordering, or key path consumes it.
     Collate {
         operand: &'a Expr<'a>,
-        collation: Collation,
+        collation: ParsedCollation<'a>,
     },
     IsNull {
         operand: &'a Expr<'a>,
@@ -3797,6 +3950,57 @@ pub enum Expr<'a> {
     },
 }
 
+fn is_volatile_function(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        "clock_timestamp",
+        "timeofday",
+        "random",
+        "random_normal",
+        "setseed",
+        "nextval",
+        "currval",
+        "lastval",
+        "setval",
+        "gen_random_uuid",
+        "uuid_generate_v1",
+        "uuid_generate_v4",
+        "txid_current",
+        "pg_current_xact_id",
+        "pg_is_in_recovery",
+        "pg_reload_conf",
+        "set_config",
+    ];
+    NAMES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+fn is_nonimmutable_function(name: &str) -> bool {
+    const STABLE_NAMES: &[&str] = &[
+        "now",
+        "current_timestamp",
+        "current_date",
+        "current_time",
+        "localtime",
+        "localtimestamp",
+        "statement_timestamp",
+        "transaction_timestamp",
+        "current_user",
+        "session_user",
+        "user",
+        "current_role",
+        "current_schema",
+        "current_database",
+        "current_catalog",
+        "pg_backend_pid",
+        "current_setting",
+    ];
+    is_volatile_function(name)
+        || STABLE_NAMES
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
 impl Expr<'_> {
     /// Whether this expression is an aggregate-function call.
     pub fn is_aggregate(&self) -> bool {
@@ -3822,15 +4026,6 @@ impl Expr<'_> {
     pub fn is_constant(&self) -> bool {
         /// Set-returning functions expand to multiple rows and are never a
         /// foldable constant.
-        /// Volatile sequence functions: never a foldable constant (they have
-        /// side effects and must reach the sequence engine).
-        fn is_side_effecting_function(name: &str) -> bool {
-            name.eq_ignore_ascii_case("nextval")
-                || name.eq_ignore_ascii_case("currval")
-                || name.eq_ignore_ascii_case("lastval")
-                || name.eq_ignore_ascii_case("setval")
-                || name.eq_ignore_ascii_case("set_config")
-        }
         fn is_set_returning(name: &str) -> bool {
             super::query::is_builtin_set_routine(name)
         }
@@ -3892,17 +4087,16 @@ impl Expr<'_> {
                         .all(|(c, r)| c.is_constant() && r.is_constant())
                     && otherwise.map(|e| e.is_constant()).unwrap_or(true)
             }
-            // Aggregates, window functions, set-returning functions, and the
-            // side-effecting sequence functions are never constant (the last
-            // must reach the sequence engine, not be folded at plan time); other
-            // calls are constant when their arguments are.
+            // Aggregates, windows, set-returning functions, and non-immutable
+            // calls are never constants. In particular, probing a volatile
+            // call for plan-time errors would itself change session state.
             Expr::Call {
                 name, args, over, ..
             } => {
                 over.is_none()
                     && !self.is_aggregate()
                     && !is_set_returning(name)
-                    && !is_side_effecting_function(name)
+                    && !is_nonimmutable_function(name)
                     && args.iter().all(|a| a.is_constant())
             }
             Expr::Array(items) => items.iter().all(|e| e.is_constant()),
@@ -4070,71 +4264,12 @@ impl Expr<'_> {
     /// (PostgreSQL requires immutability, 42P17). Every other function is treated
     /// as immutable.
     pub fn contains_nonimmutable_function(&self) -> Option<&str> {
-        fn is_nonimmutable(name: &str) -> bool {
-            const NAMES: &[&str] = &[
-                "now",
-                "current_timestamp",
-                "current_date",
-                "current_time",
-                "localtime",
-                "localtimestamp",
-                "statement_timestamp",
-                "transaction_timestamp",
-                "clock_timestamp",
-                "timeofday",
-                "random",
-                "random_normal",
-                "nextval",
-                "currval",
-                "lastval",
-                "setval",
-                "gen_random_uuid",
-                "uuid_generate_v1",
-                "uuid_generate_v4",
-                "current_user",
-                "session_user",
-                "user",
-                "current_role",
-                "current_schema",
-                "current_database",
-                "current_catalog",
-                "pg_backend_pid",
-                "txid_current",
-                "pg_current_xact_id",
-                "pg_is_in_recovery",
-                "pg_reload_conf",
-                "current_setting",
-                "set_config",
-            ];
-            NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
-        }
-        self.find_function(is_nonimmutable)
+        self.find_function(is_nonimmutable_function)
     }
 
     /// The volatile subset relevant to PostgreSQL's CTE inlining rule.
     pub fn contains_volatile_function(&self) -> Option<&str> {
-        fn is_volatile(name: &str) -> bool {
-            const NAMES: &[&str] = &[
-                "clock_timestamp",
-                "timeofday",
-                "random",
-                "random_normal",
-                "nextval",
-                "currval",
-                "lastval",
-                "setval",
-                "gen_random_uuid",
-                "uuid_generate_v1",
-                "uuid_generate_v4",
-                "txid_current",
-                "pg_current_xact_id",
-                "pg_is_in_recovery",
-                "pg_reload_conf",
-                "set_config",
-            ];
-            NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
-        }
-        self.find_function(is_volatile)
+        self.find_function(is_volatile_function)
     }
 
     fn find_function(&self, matches: fn(&str) -> bool) -> Option<&str> {

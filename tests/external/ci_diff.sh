@@ -349,6 +349,11 @@ CREATE ROLE outbound_reader;
 CREATE TYPE outbound_dump.mood AS ENUM ('ok', 'great');
 CREATE TYPE outbound_dump.location AS (x integer, y integer);
 CREATE TYPE outbound_dump.metadata AS (code varchar(3) COLLATE "C");
+CREATE COLLATION outbound_dump.byte_order (PROVIDER = libc, LOCALE = 'C');
+CREATE DEFAULT CONVERSION outbound_dump.latin1_to_utf8
+  FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8;
+COMMENT ON COLLATION outbound_dump.byte_order IS 'dumped collation';
+COMMENT ON CONVERSION outbound_dump.latin1_to_utf8 IS 'dumped conversion';
 CREATE DOMAIN outbound_dump.location_domain AS outbound_dump.location CHECK ((VALUE).x > 0);
 CREATE TABLE outbound_dump.items (
   id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -358,7 +363,7 @@ CREATE TABLE outbound_dump.items (
   locations outbound_dump.location[] NOT NULL,
   marked_location outbound_dump.location_domain NOT NULL,
   marked_locations outbound_dump.location_domain[] NOT NULL,
-  note text DEFAULT 'hello',
+  note text COLLATE outbound_dump.byte_order DEFAULT 'hello',
   CONSTRAINT outbound_items_note_check CHECK (char_length(note) > 0)
 );
 INSERT INTO outbound_dump.items(mood,location,moods,locations,marked_location,marked_locations,note) VALUES
@@ -662,8 +667,18 @@ else
            FROM pg_amproc
           WHERE amprocfamily=(SELECT oid FROM pg_opfamily
                                WHERE opfname='outbound_int_family'));
+      SELECT c.collname,c.collprovider,c.collisdeterministic,
+             conversion.conname,conversion.condefault
+        FROM pg_collation AS c CROSS JOIN pg_conversion AS conversion
+       WHERE c.collname='byte_order' AND conversion.conname='latin1_to_utf8';
+      SELECT note FROM outbound_dump.items ORDER BY note;
+      SELECT encode(convert(decode('e9','hex'),'LATIN1','UTF8'),'hex');
+      SELECT obj_description(c.oid,'pg_collation'),
+             obj_description(conversion.oid,'pg_conversion')
+        FROM pg_collation AS c CROSS JOIN pg_conversion AS conversion
+       WHERE c.collname='byte_order' AND conversion.conname='latin1_to_utf8';
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1\nbyte_order|c|t|latin1_to_utf8|t\none\nthree\ntwo\nc3a9\ndumped collation|dumped conversion'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else
@@ -783,7 +798,7 @@ normalize() {
 }
 run_corpus() { # host port outfile file
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
-    PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
       psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off \
         -v VERBOSITY=verbose -f "$4" 2>&1
   else

@@ -213,7 +213,7 @@ normalize() {
 
 run_corpus() { # port name file
   if [[ "$1" == "$PG_PORT" ]]; then
-    PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
       "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -a -q -P pager=off \
         -v VERBOSITY=verbose -f "$3" 2>&1
   else

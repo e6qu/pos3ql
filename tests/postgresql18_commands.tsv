@@ -16,8 +16,8 @@
 # states without pretending that the remaining surface is complete.
 ABORT	complete	05_transactions.sql
 ALTER AGGREGATE	partial	110_user_defined_aggregates.sql
-ALTER COLLATION	missing	-
-ALTER CONVERSION	missing	-
+ALTER COLLATION	complete	120_collation_conversion.sql
+ALTER CONVERSION	complete	120_collation_conversion.sql
 ALTER DATABASE	complete	118_database_configuration.sql
 ALTER DEFAULT PRIVILEGES	complete	83_roles_acl.sql
 ALTER DOMAIN	partial	62_domains.sql
@@ -70,8 +70,8 @@ COPY	complete	40_copy.sql
 CREATE ACCESS METHOD	missing	-
 CREATE AGGREGATE	complete	110_user_defined_aggregates.sql
 CREATE CAST	complete	117_cast_operator_catalog.sql
-CREATE COLLATION	missing	-
-CREATE CONVERSION	missing	-
+CREATE COLLATION	complete	120_collation_conversion.sql
+CREATE CONVERSION	complete	120_collation_conversion.sql
 CREATE DATABASE	complete	118_database_configuration.sql
 CREATE DOMAIN	complete	62_domains.sql
 CREATE EVENT TRIGGER	missing	-
@@ -117,8 +117,8 @@ DO	partial	100_plpgsql_procedures.sql and 112_routine_bodies_attributes_do.sql (
 DROP ACCESS METHOD	missing	-
 DROP AGGREGATE	complete	110_user_defined_aggregates.sql
 DROP CAST	partial	117_cast_operator_catalog.sql
-DROP COLLATION	missing	-
-DROP CONVERSION	missing	-
+DROP COLLATION	complete	120_collation_conversion.sql
+DROP CONVERSION	complete	120_collation_conversion.sql
 DROP DATABASE	complete	118_database_configuration.sql
 DROP DOMAIN	complete	62_domains.sql
 DROP EVENT TRIGGER	missing	-
@@ -185,12 +185,12 @@ SAVEPOINT	complete	05_transactions.sql
 SECURITY LABEL	missing	-
 SELECT	complete	14_surface.sql
 SELECT INTO	complete	69_select_into.sql
-SET	partial	75_guc_mutation.sql
+SET	complete	75_guc_mutation.sql and 119_transaction_configuration.sql
 SET CONSTRAINTS	complete	101_trigger_timing.sql
 SET ROLE	complete	83_roles_acl.sql
 SET SESSION AUTHORIZATION	complete	83_roles_acl.sql
-SET TRANSACTION	partial	05_transactions.sql
-SHOW	partial	68_current_setting.sql
+SET TRANSACTION	complete	05_transactions.sql and 119_transaction_configuration.sql
+SHOW	partial	68_current_setting.sql and 119_transaction_configuration.sql
 START TRANSACTION	complete	05_transactions.sql
 TRUNCATE	complete	35_truncate_sequences.sql
 UNLISTEN	complete	14_surface.sql

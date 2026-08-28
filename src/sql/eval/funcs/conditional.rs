@@ -111,8 +111,12 @@ pub(crate) fn dispatch<'a>(
                     best = Some(match best {
                         None => v,
                         Some(cur) => {
-                            let collation =
-                                crate::sql::eval::resolve_comparison_collation(a, args[0], row)?;
+                            let collation = crate::sql::eval::resolve_comparison_collation(
+                                a,
+                                args[0],
+                                row,
+                                hooks.catalog,
+                            )?;
                             let ord = crate::sql::eval::compare_datums_with_catalog(
                                 collation,
                                 hooks.catalog,
@@ -171,8 +175,12 @@ pub(crate) fn dispatch<'a>(
                     let b2 = crate::sql::eval::coerce_unknown_pub(b, &a2)?;
                     (a2, b2)
                 };
-                let collation =
-                    crate::sql::eval::resolve_comparison_collation(args[0], args[1], row)?;
+                let collation = crate::sql::eval::resolve_comparison_collation(
+                    args[0],
+                    args[1],
+                    row,
+                    hooks.catalog,
+                )?;
                 if !a.is_null()
                     && !b.is_null()
                     && crate::sql::eval::compare_datums_with_catalog(

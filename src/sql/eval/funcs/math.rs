@@ -97,6 +97,8 @@ pub(crate) fn dispatch<'a>(
             | "radians"
             | "atan2"
             | "pi"
+            | "random"
+            | "setseed"
             | "factorial"
     ) {
         return None;
@@ -593,6 +595,18 @@ pub(crate) fn dispatch<'a>(
             "pi" => {
                 arity(0)?;
                 Ok(Datum::Float8(core::f64::consts::PI))
+            }
+            "random" => {
+                arity(0)?;
+                Ok(Datum::Float8(crate::sql::guc::active_random()?))
+            }
+            "setseed" => {
+                arity(1)?;
+                let Some(seed) = num_f64(name, args, 0, arena, params, row, hooks)? else {
+                    return Ok(Datum::Null);
+                };
+                crate::sql::guc::set_active_random_seed(seed)?;
+                Ok(Datum::Text(""))
             }
             "factorial" => {
                 arity(1)?;

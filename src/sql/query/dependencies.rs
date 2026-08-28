@@ -1766,6 +1766,41 @@ fn collect_expression<'a>(
     if let Expr::Cast { type_name, .. } = expression {
         collect_type(type_name, storage, txid, path, dependencies)?;
     }
+    if let Expr::Collate {
+        collation: crate::sql::ast::ParsedCollation::Named(name),
+        ..
+    } = expression
+    {
+        let found = match name.schema {
+            Some(schema) => storage.collation_slot(schema, name.name, txid),
+            None => path.entries().iter().find_map(|entry| match entry {
+                PathEntry::Schema(schema_slot) => storage.collation_slot(
+                    storage.schema_def(*schema_slot as usize).name.as_str(),
+                    name.name,
+                    txid,
+                ),
+                PathEntry::Catalog => None,
+            }),
+        };
+        let slot = found.ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "collation \"{}\" does not exist",
+                name.name
+            )
+        })?;
+        let definition = storage.collation(slot).definition_for(txid);
+        dependencies.push(StoredQueryDependency {
+            class: DependencyClass::Collation,
+            slot: slot as u16,
+            identity: StoredDependencyIdentity::Name,
+            referenced_columns: 0,
+            schema: definition.schema,
+            name: definition.name,
+            referenced_schema: SqlName::parse(name.schema.unwrap_or(""))?,
+            referenced_name: SqlName::parse(name.name)?,
+        })?;
+    }
     if let Expr::Call { name, args, .. } = expression
         && matches!(*name, "nextval" | "currval" | "setval")
         && let Some(sequence_name) = args.first().and_then(|argument| regclass_literal(argument))

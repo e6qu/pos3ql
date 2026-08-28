@@ -39,6 +39,92 @@ pub fn describe_items<'q>(
     txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
+    struct DescribeCatalog<'a> {
+        storage: &'a crate::storage::Storage,
+        txid: u32,
+    }
+    impl super::super::eval::CatalogAccess for DescribeCatalog<'_> {
+        fn resolve_collation(
+            &self,
+            schema: Option<&str>,
+            name: &str,
+        ) -> Option<crate::sql::ast::Collation> {
+            self.storage.resolve_collation(schema, name, self.txid)
+        }
+        fn relation_is_visible(&self, oid: i32) -> Option<bool> {
+            super::super::catalog::relation_oid_is_visible(self.storage, self.txid, oid)
+                .then_some(true)
+        }
+        fn type_is_visible(&self, oid: i32) -> Option<bool> {
+            super::super::catalog::type_oid_is_visible(self.storage, self.txid, oid).then_some(true)
+        }
+        fn function_is_visible(&self, oid: i32) -> Option<bool> {
+            (super::super::catalog::function_oid_is_visible(oid)
+                || self.storage.routine_slot_by_oid(oid, self.txid).is_some())
+            .then_some(true)
+        }
+        fn collation_is_visible(&self, oid: i32) -> Option<bool> {
+            super::super::catalog::collation_oid_is_visible(self.storage, self.txid, oid)
+                .then_some(true)
+        }
+        fn relation_is_publishable(&self, oid: i32) -> Option<bool> {
+            super::super::catalog::relation_oid_is_visible(self.storage, self.txid, oid).then_some(
+                super::super::catalog::relation_oid_is_publishable(self.storage, self.txid, oid),
+            )
+        }
+        fn index_def<'a>(
+            &self,
+            oid: i32,
+            column: usize,
+            arena: &'a crate::mem::arena::Arena,
+        ) -> Result<Option<&'a str>, SqlError> {
+            super::super::catalog::index_def_text(self.storage, self.txid, oid, column, arena)
+        }
+        fn constraint_def<'a>(
+            &self,
+            oid: i32,
+            arena: &'a crate::mem::arena::Arena,
+        ) -> Result<Option<&'a str>, SqlError> {
+            super::super::catalog::constraint_def_text(self.storage, self.txid, oid, arena)
+        }
+        fn partition_key_def<'a>(
+            &self,
+            oid: i32,
+            arena: &'a crate::mem::arena::Arena,
+        ) -> Result<Option<&'a str>, SqlError> {
+            super::super::catalog::partition_key_def_text(self.storage, self.txid, oid, arena)
+        }
+        fn relname<'a>(
+            &self,
+            oid: i32,
+            arena: &'a crate::mem::arena::Arena,
+        ) -> Result<Option<&'a str>, SqlError> {
+            super::super::catalog::relname_text(self.storage, self.txid, oid, arena)
+        }
+        fn reloid(&self, name: &str) -> Option<i32> {
+            super::super::catalog::reloid_of_name(self.storage, self.txid, name)
+        }
+        fn comment<'a>(
+            &self,
+            catalog_name: &str,
+            oid: i32,
+            subid: i32,
+            arena: &'a crate::mem::arena::Arena,
+        ) -> Result<Option<&'a str>, SqlError> {
+            super::super::catalog::comment_text_for(
+                self.storage,
+                self.txid,
+                catalog_name,
+                oid,
+                subid,
+                arena,
+            )
+        }
+    }
+    let describe_catalog = storage.map(|storage| DescribeCatalog { storage, txid });
+    let catalog_access = describe_catalog
+        .as_ref()
+        .map(|catalog| catalog as &dyn super::super::eval::CatalogAccess);
     let mut n = 0;
     for item in items {
         let mut push = |desc: ColDesc<'q>| -> Result<(), SqlError> {
@@ -149,8 +235,13 @@ pub fn describe_items<'q>(
                                 definition,
                                 alias: table_alias,
                             },
+                            catalog_access,
                         )?,
-                        None => described_expression_collation(expression, &NoColumnLookup)?,
+                        None => described_expression_collation(
+                            expression,
+                            &NoColumnLookup,
+                            catalog_access,
+                        )?,
                     };
                     (description.collation, description.collation_derivation) = metadata;
                 } else if let Some(meta) = field_meta {
@@ -1355,7 +1446,7 @@ fn expression_static_metadata(
         }
         Expr::Collate { operand, collation } => {
             let mut meta = expression_static_metadata(operand, columns)?;
-            meta.collation = *collation;
+            meta.collation = collation.builtin()?;
             Some(meta)
         }
         _ => {
@@ -3230,7 +3321,8 @@ pub fn infer_type_res(
             "starts_with" => of(ColType::Bool),
             "cbrt" | "sin" | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "atan2"
             | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" | "degrees" | "radians"
-            | "pi" => of(ColType::Float8),
+            | "pi" | "random" => of(ColType::Float8),
+            "setseed" => of(ColType::Void),
             "bool_and" | "bool_or" | "every" => of(ColType::Bool),
             // Bitwise aggregates preserve the argument's (integer or bit) type.
             "bit_and" | "bit_or" | "bit_xor" => args
@@ -3360,7 +3452,7 @@ pub fn infer_type_res(
             "isfinite" => of(ColType::Bool),
             // Encoding / hashing / bytea manipulation.
             "sha224" | "sha256" | "sha384" | "sha512" | "decode" | "set_byte" | "set_bit"
-            | "convert_to" => of(ColType::Bytea),
+            | "convert_to" | "convert" => of(ColType::Bytea),
             "encode" | "convert_from" | "quote_ident" | "quote_literal" | "quote_nullable" => {
                 of(ColType::Text)
             }

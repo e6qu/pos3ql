@@ -1029,8 +1029,13 @@ fn subquery_collations<'a>(
     for item in select.items {
         match item {
             SelectItem::Expr { expression, .. } => {
-                output[count] =
-                    crate::sql::eval::described_expression_collation(expression, &lookup)?.0;
+                let catalog = super::storage_catalog(storage, arena, txid);
+                output[count] = crate::sql::eval::described_expression_collation(
+                    expression,
+                    &lookup,
+                    Some(&catalog),
+                )?
+                .0;
                 count += 1;
             }
             SelectItem::Wildcard => {

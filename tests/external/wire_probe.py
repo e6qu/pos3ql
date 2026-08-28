@@ -1914,6 +1914,48 @@ def test_configuration_reload_updates_existing_unoverridden_sessions():
     admin.close()
 
 
+def test_transaction_configuration_crosses_wire_message_boundaries():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    configured = simple_query(
+        s,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION "
+        "ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE",
+    )
+    observed = simple_query(
+        s,
+        "SELECT current_setting('default_transaction_isolation'), "
+        "current_setting('transaction_isolation'), "
+        "current_setting('transaction_read_only'), "
+        "current_setting('transaction_deferrable')",
+    )
+    row = next((payload for kind, payload in observed if kind == b"D"), None)
+    check(
+        "raw wire: session transaction defaults apply to the next message",
+        not any(kind == b"E" for kind, _ in configured + observed)
+        and row is not None
+        and text_row_fields(row) == ["serializable", "serializable", "on", "on"],
+        configured + observed,
+    )
+    current = simple_query(
+        s,
+        "BEGIN; SET TRANSACTION READ WRITE, NOT DEFERRABLE; "
+        "SELECT current_setting('transaction_isolation'), "
+        "current_setting('transaction_read_only'), "
+        "current_setting('transaction_deferrable'); ROLLBACK",
+    )
+    row = next((payload for kind, payload in current if kind == b"D"), None)
+    check(
+        "raw wire: SET TRANSACTION changes only named current characteristics",
+        not any(kind == b"E" for kind, _ in current)
+        and row is not None
+        and text_row_fields(row) == ["serializable", "off", "off"],
+        current,
+    )
+    s.close()
+
+
 def test_catalog_definition_oid_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))
@@ -3824,6 +3866,66 @@ def test_catalog_operator_binary_bind_and_result_description():
         == b"\x00\x02\x00\x00\x00\x04wire\x00\x00\x00\x04"
         + struct.pack("!i", -11),
         output,
+    )
+    s.close()
+
+
+def test_collation_and_conversion_extended_wire_metadata():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE COLLATION wire_byte_order (PROVIDER = libc, LOCALE = 'C'); "
+        "CREATE DEFAULT CONVERSION wire_latin1_to_utf8 FOR 'LATIN1' TO 'UTF8' "
+        "FROM pg_catalog.iso8859_1_to_utf8; "
+        "CREATE TABLE wire_collated_values(value text COLLATE wire_byte_order); "
+        "INSERT INTO wire_collated_values VALUES ('wire')",
+    )
+    check(
+        "raw wire: collation and conversion setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+
+    messages = extended_binary_result(
+        s, "SELECT value COLLATE wire_byte_order FROM wire_collated_values"
+    )
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    row = next((payload for kind, payload in messages if kind == b"D"), None)
+    check(
+        "raw wire: named collation retains text type and binary result metadata",
+        not any(kind == b"E" for kind, _ in messages)
+        and description is not None
+        and row_description_type_oids(description) == [25]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01\x00\x00\x00\x04wire",
+        messages,
+    )
+
+    messages = extended_binary_result(
+        s, "SELECT convert(decode('e9', 'hex'), 'LATIN1', 'UTF8')"
+    )
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    row = next((payload for kind, payload in messages if kind == b"D"), None)
+    check(
+        "raw wire: conversion retains bytea type and binary result metadata",
+        not any(kind == b"E" for kind, _ in messages)
+        and description is not None
+        and row_description_type_oids(description) == [17]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01\x00\x00\x00\x02\xc3\xa9",
+        messages,
+    )
+    catalog = simple_query(
+        s,
+        "SELECT collprovider || '|' || collencoding::text FROM pg_collation "
+        "WHERE collname = 'wire_byte_order'",
+    )
+    check(
+        "raw wire: named collation is visible through pg_catalog",
+        first_text_row(catalog) == "c|6",
+        catalog,
     )
     s.close()
 

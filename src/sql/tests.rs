@@ -7,6 +7,214 @@
 use super::*;
 
 #[test]
+fn collation_and_conversion_lifecycle_is_typed_transactional_and_executable() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE COLLATION public.byte_order (PROVIDER = libc, LOCALE = 'C', DETERMINISTIC = TRUE, VERSION = '1'); \
+         CREATE DEFAULT CONVERSION public.latin1_to_utf8 FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8; \
+         COMMENT ON COLLATION public.byte_order IS 'byte ordering'; \
+         COMMENT ON CONVERSION public.latin1_to_utf8 IS 'latin1 conversion'; \
+         CREATE TABLE public.collated_values(value text COLLATE public.byte_order); \
+         INSERT INTO public.collated_values VALUES ('z'), ('a'); \
+         CREATE VIEW public.collated_view AS SELECT value COLLATE public.byte_order AS value FROM public.collated_values; \
+         SELECT value FROM public.collated_view ORDER BY value; \
+         SELECT collprovider, collisdeterministic, collencoding, collcollate, collctype, collversion FROM pg_collation WHERE collname = 'byte_order'; \
+         SELECT conforencoding, contoencoding, conproc::regproc, condefault FROM pg_conversion WHERE conname = 'latin1_to_utf8'; \
+         SELECT encode(convert_to('é', 'LATIN1'), 'hex'), convert_from(decode('e9', 'hex'), 'LATIN1'), encode(convert(decode('e9', 'hex'), 'LATIN1', 'UTF8'), 'hex')",
+    );
+    let text = String::from_utf8_lossy(&setup);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&setup),
+        [
+            "a",
+            "z",
+            "c|t|6|C|C|1",
+            "8|6|iso8859_1_to_utf8|t",
+            "e9|é|c3a9",
+        ]
+    );
+
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER COLLATION public.byte_order RENAME TO byte_order_renamed; \
+         ALTER CONVERSION public.latin1_to_utf8 RENAME TO latin1_to_utf8_renamed; \
+         SELECT collname FROM pg_collation WHERE oid = (SELECT attcollation FROM pg_attribute WHERE attrelid = 'collated_values'::regclass AND attname = 'value'); \
+         SELECT conname FROM pg_conversion WHERE conname = 'latin1_to_utf8_renamed'; \
+         SELECT obj_description(oid, 'pg_collation') FROM pg_collation WHERE collname = 'byte_order_renamed'; \
+         SELECT obj_description(oid, 'pg_conversion') FROM pg_conversion WHERE conname = 'latin1_to_utf8_renamed'; \
+         SELECT value FROM public.collated_view ORDER BY value",
+    );
+    let text = String::from_utf8_lossy(&renamed);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&renamed),
+        [
+            "byte_order_renamed",
+            "latin1_to_utf8_renamed",
+            "byte ordering",
+            "latin1 conversion",
+            "a",
+            "z"
+        ]
+    );
+
+    let rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP CONVERSION public.latin1_to_utf8_renamed; DROP COLLATION public.byte_order_renamed CASCADE; ROLLBACK; \
+         SELECT count(*) FROM pg_collation WHERE collname = 'byte_order_renamed'; \
+         SELECT count(*) FROM pg_conversion WHERE conname = 'latin1_to_utf8_renamed'; \
+         SELECT value FROM public.collated_view ORDER BY value",
+    );
+    let text = String::from_utf8_lossy(&rollback);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&rollback), ["1", "1", "a", "z"]);
+}
+
+#[test]
+fn locale_catalog_ownership_schema_and_dependency_lifecycle_is_complete() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE locale_owner; \
+         CREATE SCHEMA locale_lifecycle; \
+         CREATE COLLATION locale_lifecycle.byte_order (PROVIDER = libc, LOCALE = 'C'); \
+         CREATE CONVERSION locale_lifecycle.latin1_to_utf8 \
+           FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8; \
+         ALTER COLLATION locale_lifecycle.byte_order OWNER TO locale_owner; \
+         ALTER CONVERSION locale_lifecycle.latin1_to_utf8 OWNER TO locale_owner; \
+         SELECT count(*) FROM pg_depend \
+          WHERE classid = 'pg_collation'::regclass \
+            AND objid = (SELECT oid FROM pg_collation WHERE collname = 'byte_order'); \
+         SELECT count(*) FROM pg_depend \
+          WHERE classid = 'pg_conversion'::regclass \
+            AND objid = (SELECT oid FROM pg_conversion WHERE conname = 'latin1_to_utf8')",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1", "2"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let drop_role = run_with(&mut engine, &mut budget, "DROP ROLE locale_owner");
+    assert!(
+        String::from_utf8_lossy(&drop_role).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&drop_role)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "REASSIGN OWNED BY locale_owner TO postgres; DROP ROLE locale_owner",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA locale_lifecycle RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA locale_lifecycle CASCADE; \
+         SELECT count(*) FROM pg_collation WHERE collname = 'byte_order'; \
+         SELECT count(*) FROM pg_conversion WHERE conname = 'latin1_to_utf8'; \
+         CREATE ROLE locale_owner; \
+         CREATE COLLATION public.owned_byte_order (PROVIDER = libc, LOCALE = 'C'); \
+         CREATE CONVERSION public.owned_latin1_to_utf8 \
+           FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8; \
+         ALTER COLLATION public.owned_byte_order OWNER TO locale_owner; \
+         ALTER CONVERSION public.owned_latin1_to_utf8 OWNER TO locale_owner; \
+         DROP OWNED BY locale_owner; \
+         DROP ROLE locale_owner; \
+         SELECT count(*) FROM pg_collation WHERE collname = 'owned_byte_order'; \
+         SELECT count(*) FROM pg_conversion WHERE conname = 'owned_latin1_to_utf8'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0", "0", "0", "0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn collation_and_conversion_survive_wal_checkpoint_and_cold_object_recovery() {
+    let mut config = test_config("collation-conversion-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("collation-conversion-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE COLLATION public.durable_c (PROVIDER = libc, LOCALE = 'C'); \
+             CREATE DEFAULT CONVERSION public.durable_latin1 FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8; \
+             COMMENT ON COLLATION public.durable_c IS 'durable collation'; \
+             COMMENT ON CONVERSION public.durable_latin1 IS 'durable conversion'; \
+             CREATE TABLE public.durable_text(value text COLLATE public.durable_c); \
+             INSERT INTO public.durable_text VALUES ('b'), ('a')",
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+        assert!(
+            !String::from_utf8_lossy(&checkpoint).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&checkpoint)
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value FROM public.durable_text ORDER BY value; \
+         SELECT collprovider, collcollate FROM pg_collation WHERE collname = 'durable_c'; \
+         SELECT conproc::regproc, condefault FROM pg_conversion WHERE conname = 'durable_latin1'; \
+         SELECT obj_description(oid, 'pg_collation') FROM pg_collation WHERE collname = 'durable_c'; \
+         SELECT obj_description(oid, 'pg_conversion') FROM pg_conversion WHERE conname = 'durable_latin1'; \
+         SELECT convert_from(decode('e9', 'hex'), 'LATIN1')",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "a",
+            "b",
+            "c|C",
+            "iso8859_1_to_utf8|t",
+            "durable collation",
+            "durable conversion",
+            "é"
+        ]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
     let config = test_config("cast-operator-ddl");
     let mut budget = Budget::new(1 << 29);
@@ -9927,6 +10135,316 @@ fn set_show_transaction_and_show_all() {
 }
 
 #[test]
+fn transaction_configuration_distinguishes_session_defaults_and_current_state() {
+    let (mut engine, mut budget) = test_engine();
+    let mut guc = GucState::new();
+
+    let configured = run_session(
+        &mut engine,
+        &mut budget,
+        &mut guc,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION \
+           ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE",
+    );
+    assert!(!String::from_utf8_lossy(&configured).contains("ERROR"));
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SELECT current_setting('default_transaction_isolation'), \
+                    current_setting('default_transaction_read_only'), \
+                    current_setting('default_transaction_deferrable'), \
+                    current_setting('transaction_isolation'), \
+                    current_setting('transaction_read_only'), \
+                    current_setting('transaction_deferrable')"
+        )),
+        ["serializable|on|on|serializable|on|on"]
+    );
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SELECT name, setting, reset_val, source FROM pg_settings \
+             WHERE name IN ('default_transaction_isolation', \
+                            'default_transaction_read_only', \
+                            'default_transaction_deferrable', \
+                            'transaction_isolation', 'transaction_read_only', \
+                            'transaction_deferrable') ORDER BY name"
+        )),
+        [
+            "default_transaction_deferrable|on|off|session",
+            "default_transaction_isolation|serializable|read committed|session",
+            "default_transaction_read_only|on|off|session",
+            "transaction_deferrable|on|off|override",
+            "transaction_isolation|serializable|read committed|override",
+            "transaction_read_only|on|off|override",
+        ]
+    );
+
+    let read_only = run_session(
+        &mut engine,
+        &mut budget,
+        &mut guc,
+        "CREATE TABLE forbidden_by_session_default (id integer)",
+    );
+    assert!(String::from_utf8_lossy(&read_only).contains("25006"));
+
+    run_session(
+        &mut engine,
+        &mut budget,
+        &mut guc,
+        "SET default_transaction_read_only = off; \
+         SET default_transaction_deferrable = off; \
+         SET default_transaction_isolation = 'read committed'",
+    );
+    let mut transaction = TxnState::new(&mut budget, 1024).unwrap();
+    let current = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN; SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY; \
+         SHOW transaction_isolation; SHOW transaction_read_only; \
+         SHOW transaction_deferrable; \
+         SELECT name, setting, reset_val, source FROM pg_settings \
+         WHERE name IN ('transaction_isolation', 'transaction_read_only', \
+                        'transaction_deferrable') ORDER BY name",
+    );
+    assert_eq!(
+        data_rows(&current),
+        [
+            "repeatable read",
+            "on",
+            "off",
+            "transaction_deferrable|off|off|override",
+            "transaction_isolation|repeatable read|read committed|session",
+            "transaction_read_only|on|off|session",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            "ROLLBACK; BEGIN; \
+             SELECT set_config('transaction_read_only', 'on', false), \
+                    current_setting('transaction_read_only'); ROLLBACK"
+        )),
+        ["on|on"]
+    );
+
+    let late_characteristic = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN; SELECT 1; SET TRANSACTION DEFERRABLE",
+    );
+    assert!(
+        String::from_utf8_lossy(&late_characteristic)
+            .contains("SET TRANSACTION [NOT] DEFERRABLE must be called before any query"),
+        "{}",
+        String::from_utf8_lossy(&late_characteristic)
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "ROLLBACK",
+    );
+
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SET SCHEMA 'pg_catalog'; SHOW search_path"
+        )),
+        ["pg_catalog"]
+    );
+    let seeded = data_rows(&run_session(
+        &mut engine,
+        &mut budget,
+        &mut guc,
+        "SET seed TO 0.5; SELECT random(); SELECT setseed(0.5); SELECT random()",
+    ));
+    assert_eq!(seeded.len(), 3);
+    assert_eq!(seeded[0], "0.9851677175347999");
+    assert_eq!(seeded[1], "");
+    assert_eq!(seeded[0], seeded[2]);
+    let time_zones = run_session(
+        &mut engine,
+        &mut budget,
+        &mut guc,
+        "SET TIME ZONE +2; SHOW TIME ZONE; \
+         SET TIME ZONE INTERVAL '-03:30'; SHOW TIME ZONE; \
+         SET TIME ZONE INTERVAL '2:30' HOUR TO MINUTE; SHOW TIME ZONE; \
+         SET TIME ZONE INTERVAL(0) '1:45'; SHOW TIME ZONE; \
+         SET TIME ZONE LOCAL; SHOW TIME ZONE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&time_zones).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&time_zones)
+    );
+    assert_eq!(
+        data_rows(&time_zones),
+        [
+            "<+02>-02",
+            "<-03:30>+03:30",
+            "<+02:30>-02:30",
+            "<+01:45>-01:45",
+            "UTC"
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SET XML OPTION CONTENT; SHOW xmloption"
+        )),
+        ["content"]
+    );
+    assert_eq!(
+        data_rows(&run_session(
+            &mut engine,
+            &mut budget,
+            &mut guc,
+            "SET application_name = 'transaction-suite'; \
+             SET application_name FROM CURRENT; SHOW application_name; \
+             SET NAMES; SHOW client_encoding; \
+             SET TIME ZONE +4; RESET TIME ZONE; SHOW TIME ZONE; \
+             RESET xmloption; SET xmloption FROM CURRENT; \
+             SELECT source FROM pg_settings WHERE name = 'xmloption'"
+        )),
+        ["transaction-suite", "UTF8", "UTC", "session"]
+    );
+    let configuration_before_characteristics = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN; SHOW transaction_deferrable; \
+         SET TRANSACTION DEFERRABLE; SHOW transaction_deferrable; ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&configuration_before_characteristics),
+        ["off", "on"]
+    );
+    let reset_characteristic = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN; RESET TRANSACTION ISOLATION LEVEL",
+    );
+    assert!(
+        String::from_utf8_lossy(&reset_characteristic)
+            .contains("parameter \"transaction_isolation\" cannot be reset"),
+        "{}",
+        String::from_utf8_lossy(&reset_characteristic)
+    );
+    run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            "BEGIN READ ONLY; RESET ALL; SHOW transaction_read_only; ROLLBACK"
+        )),
+        ["on"]
+    );
+    assert_eq!(
+        data_rows(&run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            "BEGIN; SAVEPOINT characteristics; \
+             SET TRANSACTION READ ONLY; SHOW transaction_read_only; \
+             ROLLBACK TO characteristics; SHOW transaction_read_only; \
+             SELECT source FROM pg_settings WHERE name = 'transaction_read_only'; \
+             ROLLBACK"
+        )),
+        ["on", "off", "override"]
+    );
+    for sql in [
+        "BEGIN; SAVEPOINT characteristics; SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "BEGIN; SAVEPOINT characteristics; SET TRANSACTION DEFERRABLE",
+    ] {
+        let output =
+            run_session_transaction(&mut engine, &mut budget, &mut transaction, &mut guc, sql);
+        assert!(
+            String::from_utf8_lossy(&output).contains("subtransaction"),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        run_session_transaction(
+            &mut engine,
+            &mut budget,
+            &mut transaction,
+            &mut guc,
+            "ROLLBACK",
+        );
+    }
+    let nested_begin = run_session_transaction(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        &mut guc,
+        "BEGIN READ ONLY; BEGIN READ WRITE; SHOW transaction_read_only; ROLLBACK",
+    );
+    assert_eq!(data_rows(&nested_begin), ["on"]);
+    for sql in [
+        "SET TRANSACTION READ ONLY, READ WRITE",
+        "SET SESSION TRANSACTION READ ONLY",
+        "SET CHARACTERISTICS AS TRANSACTION READ ONLY",
+        "SET SCHEMA pg_catalog",
+        "SET NAMES UTF8",
+        "SET SEED 0.5",
+        "SET TIME ZONE INTERVAL '1 day' DAY",
+        "SET TIME ZONE UTC junk",
+    ] {
+        let output = run_session(&mut engine, &mut budget, &mut guc, sql);
+        assert!(
+            String::from_utf8_lossy(&output).contains("42601"),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    for sql in ["RESET seed", "SET transaction_read_only = DEFAULT"] {
+        let output = run_session(&mut engine, &mut budget, &mut guc, sql);
+        assert!(
+            String::from_utf8_lossy(&output).contains("cannot be reset"),
+            "{sql}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let seed_from_current =
+        run_session(&mut engine, &mut budget, &mut guc, "SET seed FROM CURRENT");
+    assert!(
+        String::from_utf8_lossy(&seed_from_current)
+            .contains("invalid value for parameter \"seed\": \"unavailable\""),
+        "{}",
+        String::from_utf8_lossy(&seed_from_current)
+    );
+    let catalog = run_session(&mut engine, &mut budget, &mut guc, "SET CATALOG 'other'");
+    assert!(String::from_utf8_lossy(&catalog).contains("0A000"));
+}
+
+#[test]
 fn smallint_varchar_char_type_fidelity() {
     let (mut e, mut b) = test_engine();
     let mut t = TxnState::new(&mut b, 256).unwrap();
@@ -12092,7 +12610,7 @@ fn collate_is_retained_in_the_expression_tree() {
         expression,
         crate::sql::ast::Expr::Collate {
             operand: crate::sql::ast::Expr::Column { name: "value", .. },
-            collation: crate::sql::ast::Collation::C,
+            collation: crate::sql::ast::ParsedCollation::Builtin(crate::sql::ast::Collation::C,),
         }
     ));
 }
@@ -22728,6 +23246,74 @@ fn altered_table_survives_restart() {
 }
 
 #[test]
+fn drop_column_removes_dependent_indexes_and_rebinds_survivors_transactionally() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE index_column_drop (a int, b int, c int);
+         CREATE INDEX index_column_drop_key ON index_column_drop (b);
+         CREATE INDEX index_column_drop_expression ON index_column_drop ((b + 1));
+         CREATE INDEX index_column_drop_predicate ON index_column_drop (a) WHERE b > 0;
+         CREATE INDEX index_column_drop_include ON index_column_drop (a) INCLUDE (b);
+         CREATE INDEX index_column_drop_survivor ON index_column_drop (c) INCLUDE (a);
+         INSERT INTO index_column_drop VALUES (1, 2, 3);",
+    );
+
+    let altered = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER TABLE index_column_drop DROP COLUMN b;
+         INSERT INTO index_column_drop VALUES (4, 5);
+         SELECT indexname FROM pg_indexes
+         WHERE tablename = 'index_column_drop' ORDER BY indexname;
+         ROLLBACK;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&altered).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&altered)
+    );
+    assert_eq!(data_rows(&altered), ["index_column_drop_survivor"]);
+
+    let restored = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT indexname FROM pg_indexes
+         WHERE tablename = 'index_column_drop' ORDER BY indexname;",
+    );
+    assert_eq!(
+        data_rows(&restored),
+        [
+            "index_column_drop_expression",
+            "index_column_drop_include",
+            "index_column_drop_key",
+            "index_column_drop_predicate",
+            "index_column_drop_survivor",
+        ]
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE index_column_drop DROP COLUMN b;
+         INSERT INTO index_column_drop VALUES (6, 7);",
+    );
+    let rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT a, c FROM index_column_drop ORDER BY a;
+         SELECT indexname FROM pg_indexes
+         WHERE tablename = 'index_column_drop' ORDER BY indexname;",
+    );
+    assert_eq!(
+        data_rows(&rows),
+        ["1|3", "6|7", "index_column_drop_survivor"]
+    );
+}
+
+#[test]
 fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
     let mut config = test_config("typed-complex-defaults");
     config.object_store_on = true;
@@ -23280,9 +23866,7 @@ fn named_single_column_key_retains_name() {
 
 #[test]
 fn alter_table_multi_action() {
-    let config = test_config("alter-multi");
-    let mut b = Budget::new(1 << 26);
-    let mut e = Engine::new(&config, &mut b).unwrap();
+    let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE m (a int)");
     run_with(&mut e, &mut b, "INSERT INTO m VALUES (1), (2), (3)");
     // Several ADD COLUMNs with defaults applied in one statement.
@@ -31771,13 +32355,20 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          CREATE SCHEMA template_app;
          CREATE TYPE template_app.state AS ENUM ('ready', 'done');
          CREATE DOMAIN template_app.positive AS integer CHECK (VALUE > 0);
+         CREATE COLLATION template_app.byte_order
+           (PROVIDER = libc, LOCALE = 'C', VERSION = '1');
+         CREATE DEFAULT CONVERSION template_app.latin1_to_utf8
+           FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8;
          CREATE TABLE template_app.items (
              id template_app.positive PRIMARY KEY,
-             state template_app.state NOT NULL
+             state template_app.state NOT NULL,
+             label text COLLATE template_app.byte_order
          );
-         INSERT INTO template_app.items VALUES (1, 'ready');
+         CREATE INDEX items_label_idx ON template_app.items(label);
+         INSERT INTO template_app.items VALUES (1, 'ready', 'z');
          CREATE VIEW template_app.ready_items AS
-           SELECT id FROM template_app.items WHERE state = 'ready';
+           SELECT id, label COLLATE template_app.byte_order AS label
+             FROM template_app.items WHERE state = 'ready';
          CREATE SEQUENCE template_app.item_sequence;
          SELECT setval('template_app.item_sequence', 7, true);
          CREATE PUBLICATION template_changes FOR TABLE template_app.items;
@@ -31840,7 +32431,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes';
          SELECT obj_description('template_app.items'::regclass, 'pg_class');
          SELECT has_table_privilege('template_reader', 'template_app.items', 'SELECT');
-         INSERT INTO template_app.items VALUES (2, 'done');",
+         SELECT collname FROM pg_collation WHERE collname = 'byte_order';
+         SELECT conname FROM pg_conversion WHERE conname = 'latin1_to_utf8';
+         SELECT label FROM template_app.items ORDER BY label;
+         SELECT convert_from(decode('e9', 'hex'), 'LATIN1');
+         INSERT INTO template_app.items VALUES (2, 'done', 'a');",
     );
     assert_eq!(
         data_rows(&output),
@@ -31852,6 +32447,10 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "1",
             "copied template table",
             "t",
+            "byte_order",
+            "latin1_to_utf8",
+            "z",
+            "é",
         ],
         "{}",
         String::from_utf8_lossy(&output)
@@ -31868,6 +32467,10 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         })
         .map(|(slot, _)| slot)
         .unwrap();
+    let cloned_collation = engine
+        .storage
+        .collation_slot("template_app", "byte_order", 0)
+        .unwrap();
     assert!(
         engine
             .storage
@@ -31879,6 +32482,18 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
                     && usize::from(dependency.slot) == cloned_table
             }),
         "template clone must rebind stored-query dependencies to cloned slots"
+    );
+    assert!(
+        engine
+            .storage
+            .view_dependencies(cloned_view)
+            .entries()
+            .iter()
+            .any(|dependency| {
+                dependency.class == crate::storage::DependencyClass::Collation
+                    && usize::from(dependency.slot) == cloned_collation
+            }),
+        "template clone must rebind collation dependencies to cloned slots"
     );
     let output = run_with(
         &mut engine,
@@ -31986,7 +32601,12 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             AND indexname = 'items_pkey';
          SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes';
          SELECT has_table_privilege('template_reader', 'template_app.cloned_items', 'SELECT');
-         SELECT obj_description('template_app.cloned_items'::regclass, 'pg_class');",
+         SELECT obj_description('template_app.cloned_items'::regclass, 'pg_class');
+         SELECT collname FROM pg_collation WHERE oid = (
+           SELECT attcollation FROM pg_attribute
+            WHERE attrelid = 'template_app.cloned_items'::regclass AND attname = 'label');
+         SELECT conname FROM pg_conversion WHERE conname = 'latin1_to_utf8';
+         SELECT label FROM template_app.cloned_items ORDER BY label;",
     );
     assert_eq!(
         data_rows(&output),
@@ -31997,7 +32617,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "1",
             "1",
             "t",
-            "copied template table"
+            "copied template table",
+            "byte_order",
+            "latin1_to_utf8",
+            "a",
+            "z"
         ],
         "{}",
         String::from_utf8_lossy(&output)
@@ -34816,12 +35440,12 @@ fn set_transaction_changes_only_named_characteristics() {
         &mut transaction,
         "SET TRANSACTION READ ONLY",
     );
-    assert_eq!(transaction.isolation, IsolationLevel::RepeatableRead);
+    assert_eq!(transaction.isolation, TransactionIsolation::RepeatableRead);
     assert!(transaction.read_only);
     assert!(!transaction.deferrable);
     let nested = run_txn(&mut engine, &mut budget, &mut transaction, "BEGIN");
     assert!(nested.contains("25001"), "{nested}");
-    assert_eq!(transaction.isolation, IsolationLevel::RepeatableRead);
+    assert_eq!(transaction.isolation, TransactionIsolation::RepeatableRead);
     assert!(transaction.read_only);
     assert!(!transaction.deferrable);
     run_txn(&mut engine, &mut budget, &mut transaction, "ROLLBACK");
@@ -34941,7 +35565,7 @@ fn serializable_rejects_write_skew_at_commit() {
     );
     assert_eq!(
         first.isolation,
-        IsolationLevel::Serializable,
+        TransactionIsolation::Serializable,
         "SERIALIZABLE is a real transaction mode"
     );
     assert_eq!(
@@ -35499,7 +36123,7 @@ fn selective_object_resident_query_prunes_durable_blocks_without_warming_during_
 fn cold_pax_scan_decodes_only_filter_and_projection_columns() {
     std::thread::Builder::new()
         .name("cold-pax-regression".into())
-        .stack_size(4 << 20)
+        .stack_size(8 << 20)
         .spawn(cold_pax_scan_decodes_only_filter_and_projection_columns_on_sized_stack)
         .expect("cold PAX test thread starts")
         .join()

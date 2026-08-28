@@ -39,6 +39,7 @@ const PG_PROC_OID: i32 = 1255;
 const PG_AMOP_OID: i32 = 2602;
 const PG_AMPROC_OID: i32 = 2603;
 const PG_CAST_OID: i32 = 2605;
+const PG_CONVERSION_OID: i32 = 2607;
 const PG_OPCLASS_OID: i32 = 2616;
 const PG_OPERATOR_OID: i32 = 2617;
 const PG_OPFAMILY_OID: i32 = 2753;
@@ -185,6 +186,46 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         volatility: "s",
     },
     IntrinsicRoutine {
+        oid: 1714,
+        name: "convert_from",
+        result_oid: 25,
+        argument_types: "17 19",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1717,
+        name: "convert_to",
+        result_oid: 17,
+        argument_types: "25 19",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1813,
+        name: "convert",
+        result_oid: 17,
+        argument_types: "17 19 19",
+        argument_count: 3,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 4374,
+        name: "iso8859_1_to_utf8",
+        result_oid: 23,
+        argument_types: "23 23 2275 2281 23 16",
+        argument_count: 6,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 4375,
+        name: "utf8_to_iso8859_1",
+        result_oid: 23,
+        argument_types: "23 23 2275 2281 23 16",
+        argument_count: 6,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
         oid: 1662,
         name: "pg_get_triggerdef",
         result_oid: 25,
@@ -207,6 +248,22 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_types: "194 26",
         argument_count: 2,
         volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 1598,
+        name: "random",
+        result_oid: 701,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1599,
+        name: "setseed",
+        result_oid: 2278,
+        argument_types: "701",
+        argument_count: 1,
+        volatility: "v",
     },
     IntrinsicRoutine {
         oid: 2077,
@@ -532,6 +589,7 @@ const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_statistic_ext", 3381),
     ("pg_statistic_ext_data", 3429),
     ("pg_collation", PG_COLLATION_OID),
+    ("pg_conversion", PG_CONVERSION_OID),
     ("pg_depend", 2608),
     ("pg_rewrite", 2618),
     ("pg_namespace", PG_NAMESPACE_OID),
@@ -688,25 +746,8 @@ pub fn synthesize<'a>(
         (false, "pg_class") => pg_class(storage, txid, arena),
         (false, "pg_attribute") => pg_attribute(storage, txid, arena),
         (false, "pg_attrdef") => pg_attrdef(storage, txid, arena),
-        (false, "pg_collation") => pg_collation(arena),
-        (false, "pg_conversion") => finish(
-            def_of(
-                "pg_conversion",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("conname", ColType::Name),
-                    ("connamespace", ColType::Int4),
-                    ("conowner", ColType::Int4),
-                    ("conforencoding", ColType::Int4),
-                    ("contoencoding", ColType::Int4),
-                    ("conproc", ColType::Int4),
-                    ("condefault", ColType::Bool),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_collation") => pg_collation(storage, txid, arena),
+        (false, "pg_conversion") => pg_conversion(storage, txid, arena),
         (false, "pg_type") => pg_type(storage, txid, arena),
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
@@ -1068,9 +1109,9 @@ pub fn synthesize<'a>(
         (true, "column_domain_usage") => info_column_domain_usage(storage, txid, arena),
         (true, "column_udt_usage") => info_column_udt_usage(storage, txid, arena),
         (true, "domain_udt_usage") => info_domain_udt_usage(storage, txid, arena),
-        (true, "collations") => info_collations(arena),
+        (true, "collations") => info_collations(storage, txid, arena),
         (true, "collation_character_set_applicability") => {
-            info_collation_character_set_applicability(arena)
+            info_collation_character_set_applicability(storage, txid, arena)
         }
         (true, "applicable_roles") => info_applicable_roles(storage, txid, arena, false),
         (true, "administrable_role_authorizations") => {
@@ -2064,7 +2105,7 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 crate::storage::ConstraintTiming::NotDeferrable,
                 stack_str_64(index.name_for(txid).as_str()),
             );
-            info.oid = explicit_index_oid(index);
+            info.oid = explicit_index_oid(&index);
             info.collations = index.collations;
             info.explicit_collations = index.explicit_collations;
             info.operator_classes = index.operator_classes;
@@ -3620,10 +3661,13 @@ pub fn function_result_text<'a>(
         .map_err(|_| super::eval::arena_full())
 }
 
-pub fn collation_oid_is_visible(oid: i32) -> bool {
+pub fn collation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
     crate::sql::ast::Collation::BUILTIN
         .iter()
         .any(|collation| collation.oid() == oid)
+        || storage
+            .collations_visible_to(txid)
+            .any(|(slot, _)| crate::sql::ast::Collation::Catalog(slot as u8).oid() == oid)
 }
 
 pub fn relation_oid_is_publishable(storage: &Storage, txid: u32, oid: i32) -> bool {
@@ -3786,6 +3830,18 @@ fn pg_description<'a>(
                     });
                 let Some(trigger) = trigger else { continue };
                 (crate::storage::trigger_oid(&trigger), 2620)
+            }
+            crate::storage::CommentClass::Collation => {
+                let Some(slot) = storage.collation_slot(schema, name, txid) else {
+                    continue;
+                };
+                (storage.collation(slot).oid(slot), PG_COLLATION_OID)
+            }
+            crate::storage::CommentClass::Conversion => {
+                let Some(slot) = storage.conversion_slot(schema, name, txid) else {
+                    continue;
+                };
+                (storage.conversion(slot).oid(slot), PG_CONVERSION_OID)
             }
         };
         let catalog_subid = if class == crate::storage::CommentClass::Trigger {
@@ -4134,6 +4190,20 @@ pub fn comment_text_for<'a>(
                                 && trigger.target.comment_subid() == csub
                                 && crate::storage::trigger_oid(&trigger) == oid
                         })
+            }
+            "pg_collation" => {
+                class == crate::storage::CommentClass::Collation
+                    && subid == 0
+                    && storage
+                        .collation_slot(schema, name, txid)
+                        .is_some_and(|slot| storage.collation(slot).oid(slot) == oid)
+            }
+            "pg_conversion" => {
+                class == crate::storage::CommentClass::Conversion
+                    && subid == 0
+                    && storage
+                        .conversion_slot(schema, name, txid)
+                        .is_some_and(|slot| storage.conversion(slot).oid(slot) == oid)
             }
             _ => {
                 class == crate::storage::CommentClass::Relation
@@ -4869,7 +4939,21 @@ pub(crate) fn describe_view<'a>(
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
-    super::query::describe_query_under(view.sql.as_str(), storage, txid, path, arena, out)
+    let slot = storage
+        .views_visible_to(txid)
+        .find_map(|(slot, candidate)| {
+            (candidate.schema == view.schema && candidate.name == view.name).then_some(slot)
+        })
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "view does not exist"))?;
+    super::query::describe_stored_query(
+        view.sql.as_str(),
+        storage,
+        txid,
+        path,
+        storage.view_dependencies(slot),
+        arena,
+        out,
+    )
 }
 
 fn describe_stored_view<'a>(
@@ -7699,6 +7783,36 @@ fn pg_depend<'a>(
         }
     }
 
+    for (slot, collation) in storage.collations_visible_to(txid) {
+        push(
+            PG_COLLATION_OID,
+            storage.collation(slot).oid(slot),
+            PG_NAMESPACE_OID,
+            namespace_oid(storage, collation.schema.as_str()),
+            0,
+            "n",
+        )?;
+    }
+    for (slot, conversion) in storage.conversions_visible_to(txid) {
+        let oid = 21_000 + slot as i32;
+        push(
+            PG_CONVERSION_OID,
+            oid,
+            PG_NAMESPACE_OID,
+            namespace_oid(storage, conversion.schema.as_str()),
+            0,
+            "n",
+        )?;
+        push(
+            PG_CONVERSION_OID,
+            oid,
+            PG_PROC_OID,
+            conversion.procedure,
+            0,
+            "n",
+        )?;
+    }
+
     for (slot, family) in storage.operator_families_visible_to(txid) {
         push(
             PG_OPFAMILY_OID,
@@ -7910,6 +8024,10 @@ fn pg_depend<'a>(
                 crate::storage::StoredDependencyIdentity::Name
                 | crate::storage::StoredDependencyIdentity::RoutineOid(_) => return None,
             },
+        )),
+        crate::storage::DependencyClass::Collation => Some((
+            PG_COLLATION_OID,
+            crate::sql::ast::Collation::Catalog(dependency.slot as u8).oid(),
         )),
     };
     for (view_slot, _) in storage.views_visible_to(txid) {
@@ -8278,7 +8396,8 @@ fn index_collations<'a>(
             let source = index_expression_source(storage, info, position, txid)
                 .expect("expression index has source");
             let expression = crate::sql::parser::parse_expr(source.as_str(), arena)?;
-            resolved_expression_collation(expression, &TableColumnTypes(table))?
+            let catalog = super::query::storage_catalog(storage, arena, txid);
+            resolved_expression_collation(expression, &TableColumnTypes(table), Some(&catalog))?
         } else {
             table.columns()[info.columns[position] as usize].collation
         };
@@ -9986,7 +10105,11 @@ fn pg_aggregate<'a>(
     finish(definition, &rows[..index], arena)
 }
 
-fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_collation<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_collation",
         &[
@@ -9995,16 +10118,20 @@ fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             ("collname", ColType::Name),
             ("collnamespace", ColType::Oid),
             ("collowner", ColType::Oid),
-            ("collcollate", ColType::Text),
-            ("collctype", ColType::Text),
-            ("colliculocale", ColType::Text),
             ("collprovider", ColType::Bpchar),
             ("collisdeterministic", ColType::Bool),
             ("collencoding", ColType::Int4),
+            ("collcollate", ColType::Text),
+            ("collctype", ColType::Text),
+            ("colllocale", ColType::Text),
+            ("collicurules", ColType::Text),
+            ("collversion", ColType::Text),
         ],
     );
-    let mut output: [&[Datum]; 4] = [&[]; 4];
+    let mut output: [&[Datum]; 4 + crate::storage::MAX_COLLATIONS] =
+        [&[]; 4 + crate::storage::MAX_COLLATIONS];
     for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {
+        let locale = collation.libc_locale();
         output[index] = row(
             &[
                 Datum::Int4(PG_COLLATION_OID),
@@ -10012,17 +10139,105 @@ fn pg_collation<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 text(collation.name(), arena)?,
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(10),
-                text(collation.libc_locale(), arena)?,
-                text(collation.libc_locale(), arena)?,
-                Datum::Null,
                 Datum::Bpchar(collation.provider()),
                 Datum::Bool(true),
                 Datum::Int4(collation.encoding()),
+                if locale.is_empty() {
+                    Datum::Null
+                } else {
+                    text(locale, arena)?
+                },
+                if locale.is_empty() {
+                    Datum::Null
+                } else {
+                    text(locale, arena)?
+                },
+                match collation {
+                    crate::sql::ast::Collation::UcsBasic => text("C", arena)?,
+                    _ => Datum::Null,
+                },
+                Datum::Null,
+                match collation {
+                    crate::sql::ast::Collation::UcsBasic => text("1", arena)?,
+                    _ => Datum::Null,
+                },
             ],
             arena,
         )?;
     }
-    finish(definition, &output, arena)
+    let mut count = 4;
+    for (slot, collation) in storage.collations_visible_to(txid) {
+        let stored = storage.collation(slot);
+        let optional = |value: &str| {
+            if value.is_empty() {
+                Ok(Datum::Null)
+            } else {
+                text(value, arena)
+            }
+        };
+        output[count] = row(
+            &[
+                Datum::Int4(PG_COLLATION_OID),
+                Datum::Int4(stored.oid(slot)),
+                text(collation.name.as_str(), arena)?,
+                Datum::Int4(namespace_oid(storage, collation.schema.as_str())),
+                Datum::Int4(collation.owner),
+                Datum::Bpchar(collation.provider.code()),
+                Datum::Bool(collation.deterministic),
+                Datum::Int4(collation.encoding.map_or(-1, |encoding| encoding.code())),
+                optional(collation.collate.as_str())?,
+                optional(collation.ctype.as_str())?,
+                optional(collation.locale.as_str())?,
+                optional(collation.rules.as_str())?,
+                optional(collation.version.as_str())?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &output[..count], arena)
+}
+
+fn pg_conversion<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_conversion",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("conname", ColType::Name),
+            ("connamespace", ColType::Int4),
+            ("conowner", ColType::Int4),
+            ("conforencoding", ColType::Int4),
+            ("contoencoding", ColType::Int4),
+            ("conproc", ColType::Regproc),
+            ("condefault", ColType::Bool),
+        ],
+    );
+    let mut output: [&[Datum]; crate::storage::MAX_CONVERSIONS] =
+        [&[]; crate::storage::MAX_CONVERSIONS];
+    let mut count = 0;
+    for (slot, conversion) in storage.conversions_visible_to(txid) {
+        output[count] = row(
+            &[
+                Datum::Int4(PG_CONVERSION_OID),
+                Datum::Int4(storage.conversion(slot).oid(slot)),
+                text(conversion.name.as_str(), arena)?,
+                Datum::Int4(namespace_oid(storage, conversion.schema.as_str())),
+                Datum::Int4(conversion.owner),
+                Datum::Int4(conversion.source.code()),
+                Datum::Int4(conversion.destination.code()),
+                catalog_regproc(storage, txid, conversion.procedure, arena)?,
+                Datum::Bool(conversion.default),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &output[..count], arena)
 }
 
 fn pg_enum<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
@@ -11499,6 +11714,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "client_encoding" | "server_encoding" => "UTF8",
             "client_min_messages" => "notice",
             "DateStyle" => "ISO, MDY",
+            "default_transaction_deferrable" | "default_transaction_read_only" => "off",
+            "default_transaction_isolation" => "read committed",
             "default_table_access_method" => "heap",
             "extra_float_digits" => "1",
             "idle_in_transaction_session_timeout"
@@ -11513,6 +11730,7 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "synchronize_seqscans" => "on",
             "TimeZone" => "UTC",
             "transaction_isolation" => "read committed",
+            "transaction_deferrable" | "transaction_read_only" => "off",
             "xmloption" => "content",
             _ => "",
         };
@@ -11524,6 +11742,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "row_security"
                 | "standard_conforming_strings"
                 | "synchronize_seqscans"
+                | "default_transaction_deferrable"
+                | "default_transaction_read_only"
+                | "transaction_deferrable"
+                | "transaction_read_only"
         ) {
             "bool"
         } else if matches!(
@@ -14720,7 +14942,11 @@ fn info_schemata<'a>(
     finish(def, &out[..n], arena)
 }
 
-fn info_collations<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn info_collations<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "collations",
         &[
@@ -14730,7 +14956,10 @@ fn info_collations<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             ("pad_attribute", ColType::Text),
         ],
     );
-    let mut output: [&[Datum]; 4] = [&[]; 4];
+    let output = arena
+        .alloc_slice_with(4 + crate::storage::MAX_COLLATIONS, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
     for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {
         output[index] = row(
             &[
@@ -14741,11 +14970,26 @@ fn info_collations<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             ],
             arena,
         )?;
+        count += 1;
     }
-    finish(definition, &output, arena)
+    for (_, collation) in storage.collations_visible_to(txid) {
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(collation.schema.as_str(), arena)?,
+                text(collation.name.as_str(), arena)?,
+                text("NO PAD", arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &output[..count], arena)
 }
 
 fn info_collation_character_set_applicability<'a>(
+    storage: &Storage,
+    txid: u32,
     arena: &'a Arena,
 ) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
@@ -14759,7 +15003,10 @@ fn info_collation_character_set_applicability<'a>(
             ("character_set_name", ColType::Text),
         ],
     );
-    let mut output: [&[Datum]; 4] = [&[]; 4];
+    let output = arena
+        .alloc_slice_with(4 + crate::storage::MAX_COLLATIONS, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
     for (index, collation) in crate::sql::ast::Collation::BUILTIN.iter().enumerate() {
         output[index] = row(
             &[
@@ -14772,8 +15019,29 @@ fn info_collation_character_set_applicability<'a>(
             ],
             arena,
         )?;
+        count += 1;
     }
-    finish(definition, &output, arena)
+    for (_, collation) in storage.collations_visible_to(txid) {
+        output[count] = row(
+            &[
+                text("postgres", arena)?,
+                text(collation.schema.as_str(), arena)?,
+                text(collation.name.as_str(), arena)?,
+                Datum::Null,
+                Datum::Null,
+                text(
+                    collation
+                        .encoding
+                        .unwrap_or(crate::storage::PgEncoding::UTF8)
+                        .name(),
+                    arena,
+                )?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &output[..count], arena)
 }
 
 fn info_enabled_roles<'a>(

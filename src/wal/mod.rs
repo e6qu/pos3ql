@@ -145,6 +145,10 @@ const KIND_ALTER_DATABASE: u8 = 95;
 const KIND_DROP_DATABASE: u8 = 96;
 const KIND_SET_SYSTEM_SETTING: u8 = 97;
 const KIND_DATABASE_SCOPE: u8 = 98;
+const KIND_SET_COLLATION: u8 = 99;
+const KIND_DROP_COLLATION: u8 = 100;
+const KIND_SET_CONVERSION: u8 = 101;
+const KIND_DROP_CONVERSION: u8 = 102;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -152,7 +156,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DATABASE_SCOPE;
+const LAST_KIND: u8 = KIND_DROP_CONVERSION;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -929,6 +933,24 @@ pub(crate) enum WalOp<'a> {
         definition: crate::storage::OperatorClassDefinition,
     },
     DropOperatorClass {
+        schema: &'a str,
+        name: &'a str,
+    },
+    SetCollation {
+        slot: u8,
+        created_at: u64,
+        definition: crate::storage::CollationDefinition,
+    },
+    DropCollation {
+        schema: &'a str,
+        name: &'a str,
+    },
+    SetConversion {
+        slot: u8,
+        created_at: u64,
+        definition: crate::storage::ConversionDefinition,
+    },
+    DropConversion {
         schema: &'a str,
         name: &'a str,
     },
@@ -1800,6 +1822,10 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropOperatorFamily { .. } => KIND_DROP_OPERATOR_FAMILY,
         WalOp::SetOperatorClass { .. } => KIND_SET_OPERATOR_CLASS,
         WalOp::DropOperatorClass { .. } => KIND_DROP_OPERATOR_CLASS,
+        WalOp::SetCollation { .. } => KIND_SET_COLLATION,
+        WalOp::DropCollation { .. } => KIND_DROP_COLLATION,
+        WalOp::SetConversion { .. } => KIND_SET_CONVERSION,
+        WalOp::DropConversion { .. } => KIND_DROP_CONVERSION,
         WalOp::DropRoutine { .. } => KIND_DROP_ROUTINE,
         WalOp::AlterRoutineIdentity { .. } => KIND_ALTER_ROUTINE_IDENTITY,
         WalOp::AlterDomainIdentity { .. } => KIND_ALTER_DOMAIN_IDENTITY,
@@ -2179,7 +2205,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .filter(|(_, value)| value.is_some())
                     .map(|(_, value)| 2 + value.unwrap().len())
                     .sum::<usize>()
-                + n_cols
+                + n_cols * 2
                 + n_cols * 5
                 + 1
                 + n_cols * 5
@@ -2568,6 +2594,32 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         }
         WalOp::DropOperatorFamily { schema, name } | WalOp::DropOperatorClass { schema, name } => {
             1 + schema.len() + 1 + name.len()
+        }
+        WalOp::SetCollation { definition, .. } => {
+            1 + 8
+                + 1
+                + definition.schema.as_str().len()
+                + 1
+                + definition.name.as_str().len()
+                + 4
+                + 3
+                + 1
+                + definition.collate.as_str().len()
+                + 1
+                + definition.ctype.as_str().len()
+                + 1
+                + definition.locale.as_str().len()
+                + 1
+                + definition.rules.as_str().len()
+                + 1
+                + definition.version.as_str().len()
+                + 1
+        }
+        WalOp::DropCollation { schema, name } | WalOp::DropConversion { schema, name } => {
+            1 + schema.len() + 1 + name.len()
+        }
+        WalOp::SetConversion { definition, .. } => {
+            1 + 8 + 1 + definition.schema.as_str().len() + 1 + definition.name.as_str().len() + 11
         }
         WalOp::SetOperatorClass { definition, .. } => {
             8 + 1
@@ -3090,13 +3142,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= name_bytes(buffer, fk.parent_schema.as_str());
             }
             for column in def.columns() {
-                ok &= buffer.append(&[match column.collation {
-                    crate::sql::ast::Collation::None => 4,
-                    crate::sql::ast::Collation::Default => 0,
-                    crate::sql::ast::Collation::C => 1,
-                    crate::sql::ast::Collation::Posix => 2,
-                    crate::sql::ast::Collation::UcsBasic => 3,
-                }]);
+                ok &= buffer.append(&[column.collation.code()]);
             }
             ok &= append_partition(buffer, def.partition);
             ok &= buffer.append(&[
@@ -3489,9 +3535,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             ok &= buffer.append(&[0xa6]);
             for position in 0..*n_cols {
-                ok &= buffer
-                    .append(&[collations[position].code()
-                        | (u8::from(explicit_collations[position]) << 7)]);
+                ok &= buffer.append(&[
+                    collations[position].code(),
+                    u8::from(explicit_collations[position]),
+                ]);
             }
             ok &= buffer.append(&[0xa7]);
             for operator_class in &operator_classes[..*n_cols] {
@@ -4003,6 +4050,53 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, schema)
                 && name_bytes(buffer, name)
                 && append_operator_signature(buffer, *signature)
+        }
+        WalOp::SetCollation {
+            slot,
+            created_at,
+            definition,
+        } => {
+            buffer.append(&[*slot])
+                && buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, definition.schema.as_str())
+                && name_bytes(buffer, definition.name.as_str())
+                && buffer.append(&definition.owner.to_le_bytes())
+                && buffer.append(&[
+                    definition.provider as u8,
+                    u8::from(definition.deterministic),
+                    definition
+                        .encoding
+                        .map_or(u8::MAX, |encoding| encoding.code() as u8),
+                ])
+                && name_bytes(buffer, definition.collate.as_str())
+                && name_bytes(buffer, definition.ctype.as_str())
+                && name_bytes(buffer, definition.locale.as_str())
+                && name_bytes(buffer, definition.rules.as_str())
+                && name_bytes(buffer, definition.version.as_str())
+                && buffer.append(&[match definition.behavior {
+                    crate::storage::CollationBehavior::Bytewise => 0,
+                    crate::storage::CollationBehavior::Database => 1,
+                }])
+        }
+        WalOp::DropCollation { schema, name } | WalOp::DropConversion { schema, name } => {
+            name_bytes(buffer, schema) && name_bytes(buffer, name)
+        }
+        WalOp::SetConversion {
+            slot,
+            created_at,
+            definition,
+        } => {
+            buffer.append(&[*slot])
+                && buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, definition.schema.as_str())
+                && name_bytes(buffer, definition.name.as_str())
+                && buffer.append(&definition.owner.to_le_bytes())
+                && buffer.append(&[
+                    definition.source.code() as u8,
+                    definition.destination.code() as u8,
+                ])
+                && buffer.append(&definition.procedure.to_le_bytes())
+                && buffer.append(&[u8::from(definition.default)])
         }
         WalOp::SetOperatorFamily {
             created_at,
@@ -6065,9 +6159,14 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let mut explicit_collations = [false; MAX_INDEX_COLS];
             for position in 0..n_cols {
                 let code = *payload.get(at)?;
-                explicit_collations[position] = code & 0x80 != 0;
-                collations[position] = crate::sql::ast::Collation::from_code(code & 0x7f)?;
                 at += 1;
+                explicit_collations[position] = match *payload.get(at)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                at += 1;
+                collations[position] = crate::sql::ast::Collation::from_code(code)?;
             }
             if *payload.get(at)? != 0xa7 {
                 return None;
@@ -6948,6 +7047,131 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 name,
                 signature,
+            })
+        }
+        KIND_SET_COLLATION => {
+            let slot = *payload.get(at)?;
+            at += 1;
+            if usize::from(slot) >= crate::storage::MAX_COLLATIONS {
+                return None;
+            }
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let schema = SqlName::parse(take_name(&mut at)?).ok()?;
+            let name = SqlName::parse(take_name(&mut at)?).ok()?;
+            let owner = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            if owner <= 0 {
+                return None;
+            }
+            let provider = match *payload.get(at)? {
+                b'd' => crate::storage::CollationProvider::Default,
+                b'b' => crate::storage::CollationProvider::Builtin,
+                b'c' => crate::storage::CollationProvider::Libc,
+                b'i' => crate::storage::CollationProvider::Icu,
+                _ => return None,
+            };
+            at += 1;
+            let deterministic = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            let encoding = match *payload.get(at)? {
+                u8::MAX => None,
+                code => Some(crate::storage::PgEncoding::from_code(code)?),
+            };
+            at += 1;
+            let fixed128 = |value: &str| {
+                let value = StackStr::<128>::from_str(value);
+                (!value.is_truncated()).then_some(value)
+            };
+            let collate = fixed128(take_name(&mut at)?)?;
+            let ctype = fixed128(take_name(&mut at)?)?;
+            let locale = fixed128(take_name(&mut at)?)?;
+            let rules = fixed128(take_name(&mut at)?)?;
+            let version_text = take_name(&mut at)?;
+            let version = StackStr::<64>::from_str(version_text);
+            if version.is_truncated() {
+                return None;
+            }
+            let behavior = match *payload.get(at)? {
+                0 => crate::storage::CollationBehavior::Bytewise,
+                1 => crate::storage::CollationBehavior::Database,
+                _ => return None,
+            };
+            at += 1;
+            (at == payload.len()).then_some(WalOp::SetCollation {
+                slot,
+                created_at,
+                definition: crate::storage::CollationDefinition {
+                    schema,
+                    name,
+                    owner,
+                    provider,
+                    deterministic,
+                    encoding,
+                    collate,
+                    ctype,
+                    locale,
+                    rules,
+                    version,
+                    behavior,
+                },
+            })
+        }
+        KIND_DROP_COLLATION | KIND_DROP_CONVERSION => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            if at != payload.len() {
+                return None;
+            }
+            Some(if kind == KIND_DROP_COLLATION {
+                WalOp::DropCollation { schema, name }
+            } else {
+                WalOp::DropConversion { schema, name }
+            })
+        }
+        KIND_SET_CONVERSION => {
+            let slot = *payload.get(at)?;
+            at += 1;
+            if usize::from(slot) >= crate::storage::MAX_CONVERSIONS {
+                return None;
+            }
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let schema = SqlName::parse(take_name(&mut at)?).ok()?;
+            let name = SqlName::parse(take_name(&mut at)?).ok()?;
+            let owner = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            if owner <= 0 {
+                return None;
+            }
+            let source = crate::storage::PgEncoding::from_code(*payload.get(at)?)?;
+            at += 1;
+            let destination = crate::storage::PgEncoding::from_code(*payload.get(at)?)?;
+            at += 1;
+            let procedure = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let default = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            (at == payload.len()).then_some(WalOp::SetConversion {
+                slot,
+                created_at,
+                definition: crate::storage::ConversionDefinition {
+                    schema,
+                    name,
+                    owner,
+                    source,
+                    destination,
+                    procedure,
+                    default,
+                },
             })
         }
         KIND_SET_OPERATOR_FAMILY => {
@@ -8377,6 +8601,29 @@ mod tests {
             operators: family.operators,
             functions: family.functions,
         };
+        let collation = crate::storage::CollationDefinition {
+            schema: public,
+            name: SqlName::parse("byte_order").unwrap(),
+            owner: 10,
+            provider: crate::storage::CollationProvider::Libc,
+            deterministic: true,
+            encoding: None,
+            collate: StackStr::from_str("C"),
+            ctype: StackStr::from_str("C"),
+            locale: StackStr::from_str("C"),
+            rules: StackStr::new(),
+            version: StackStr::from_str("1"),
+            behavior: crate::storage::CollationBehavior::Bytewise,
+        };
+        let conversion = crate::storage::ConversionDefinition {
+            schema: public,
+            name: SqlName::parse("latin1_to_utf8").unwrap(),
+            owner: 10,
+            source: crate::storage::PgEncoding::LATIN1,
+            destination: crate::storage::PgEncoding::UTF8,
+            procedure: 4374,
+            default: true,
+        };
         let operations = [
             WalOp::SetCast(crate::storage::CastDef {
                 database: crate::storage::DatabaseOid::POSTGRES,
@@ -8415,6 +8662,24 @@ mod tests {
             WalOp::DropOperatorClass {
                 schema: "public",
                 name: "mood_ops",
+            },
+            WalOp::SetCollation {
+                slot: 7,
+                created_at: 14,
+                definition: collation,
+            },
+            WalOp::DropCollation {
+                schema: "public",
+                name: "byte_order",
+            },
+            WalOp::SetConversion {
+                slot: 9,
+                created_at: 15,
+                definition: conversion,
+            },
+            WalOp::DropConversion {
+                schema: "public",
+                name: "latin1_to_utf8",
             },
         ];
         for operation in operations {

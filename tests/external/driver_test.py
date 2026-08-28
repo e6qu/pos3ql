@@ -11,6 +11,31 @@ cur = conn.cursor()
 
 print("server version reported:", conn.info.server_version)
 
+# Session defaults and current characteristics cross separate extended-query
+# messages without collapsing into one implicit configuration state.
+cur.execute(
+    "SET SESSION CHARACTERISTICS AS TRANSACTION "
+    "ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE"
+)
+cur.execute(
+    "SELECT current_setting('default_transaction_isolation'), "
+    "current_setting('transaction_isolation'), "
+    "current_setting('transaction_read_only'), "
+    "current_setting('transaction_deferrable')"
+)
+assert cur.fetchone() == ("serializable", "serializable", "on", "on")
+cur.execute("BEGIN")
+cur.execute("SET TRANSACTION READ WRITE, NOT DEFERRABLE")
+cur.execute(
+    "SELECT current_setting('transaction_isolation'), "
+    "current_setting('transaction_read_only'), "
+    "current_setting('transaction_deferrable')"
+)
+assert cur.fetchone() == ("serializable", "off", "off")
+cur.execute("ROLLBACK")
+cur.execute("RESET ALL")
+print("transaction configuration extended protocol ok")
+
 cur.execute("DROP TABLE IF EXISTS drv")
 cur.execute("CREATE TABLE drv (id int NOT NULL, name text, score float8)")
 

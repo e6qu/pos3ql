@@ -783,7 +783,7 @@ normalize() {
 }
 run_corpus() { # host port outfile file
   if [[ "$1" == "$PGHOST" && "$2" == "$PGPORT" ]]; then
-    PGOPTIONS="-c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+    PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
       psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -a -q -P pager=off \
         -v VERBOSITY=verbose -f "$4" 2>&1
   else

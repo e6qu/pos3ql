@@ -18986,8 +18986,11 @@ pub fn create_collation(
                     owner,
                     provider,
                     deterministic: deterministic.unwrap_or(true),
-                    encoding: (provider == CollationProvider::Builtin)
-                        .then_some(crate::storage::PgEncoding::UTF8),
+                    encoding: Some(if provider == CollationProvider::Builtin {
+                        crate::storage::PgEncoding::UTF8
+                    } else {
+                        storage.current_database_encoding(txn.txid)
+                    }),
                     collate: fixed_catalog_text(stored_collate, "LC_COLLATE")?,
                     ctype: fixed_catalog_text(stored_ctype, "LC_CTYPE")?,
                     locale: fixed_catalog_text(stored_locale, "LOCALE")?,

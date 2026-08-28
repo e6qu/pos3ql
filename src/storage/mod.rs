@@ -12115,6 +12115,16 @@ impl Storage {
             .expect("selected database remains visible for the statement")
     }
 
+    pub(crate) fn current_database_encoding(&self, txid: u32) -> PgEncoding {
+        match self
+            .database_definition(self.current_database_slot(txid), txid)
+            .encoding
+        {
+            DatabaseEncoding::Utf8 => PgEncoding::UTF8,
+            DatabaseEncoding::SqlAscii => PgEncoding::SQL_ASCII,
+        }
+    }
+
     pub fn role(&self, slot: usize) -> &RoleDef {
         &self.roles[slot]
     }

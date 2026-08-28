@@ -20,7 +20,7 @@ fn collation_and_conversion_lifecycle_is_typed_transactional_and_executable() {
          INSERT INTO public.collated_values VALUES ('z'), ('a'); \
          CREATE VIEW public.collated_view AS SELECT value COLLATE public.byte_order AS value FROM public.collated_values; \
          SELECT value FROM public.collated_view ORDER BY value; \
-         SELECT collprovider, collisdeterministic, collcollate, collctype, collversion FROM pg_collation WHERE collname = 'byte_order'; \
+         SELECT collprovider, collisdeterministic, collencoding, collcollate, collctype, collversion FROM pg_collation WHERE collname = 'byte_order'; \
          SELECT conforencoding, contoencoding, conproc::regproc, condefault FROM pg_conversion WHERE conname = 'latin1_to_utf8'; \
          SELECT encode(convert_to('é', 'LATIN1'), 'hex'), convert_from(decode('e9', 'hex'), 'LATIN1'), encode(convert(decode('e9', 'hex'), 'LATIN1', 'UTF8'), 'hex')",
     );
@@ -31,7 +31,7 @@ fn collation_and_conversion_lifecycle_is_typed_transactional_and_executable() {
         [
             "a",
             "z",
-            "c|t|C|C|1",
+            "c|t|6|C|C|1",
             "8|6|iso8859_1_to_utf8|t",
             "e9|é|c3a9",
         ]

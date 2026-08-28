@@ -3924,7 +3924,7 @@ def test_collation_and_conversion_extended_wire_metadata():
     )
     check(
         "raw wire: named collation is visible through pg_catalog",
-        first_text_row(catalog) == "c|-1",
+        first_text_row(catalog) == "c|6",
         catalog,
     )
     s.close()

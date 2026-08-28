@@ -2064,6 +2064,9 @@ pub(crate) const MAX_EXTENDED_STATISTICS_KEYS: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_MCV: usize = 100;
 pub(crate) const MAX_COLLATIONS: usize = 128;
 pub(crate) const MAX_CONVERSIONS: usize = 128;
+pub(crate) const MAX_EVENT_TRIGGERS: usize = 64;
+pub(crate) const MAX_EVENT_TRIGGER_TAGS: usize = 32;
+pub(crate) const EVENT_TRIGGER_TAG_MAX: usize = 64;
 
 /// PostgreSQL's closed server-encoding identity. Construction is checked once
 /// at SQL and durable decode boundaries.
@@ -2351,6 +2354,126 @@ impl ConversionDef {
 
     pub(crate) fn oid(self, slot: usize) -> i32 {
         21_000 + slot as i32
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EventTriggerTags {
+    values: [StackStr<EVENT_TRIGGER_TAG_MAX>; MAX_EVENT_TRIGGER_TAGS],
+    count: u8,
+}
+
+impl EventTriggerTags {
+    pub(crate) const EMPTY: Self = Self {
+        values: [StackStr::new(); MAX_EVENT_TRIGGER_TAGS],
+        count: 0,
+    };
+
+    pub(crate) fn parse(tags: &[&str]) -> Result<Self, SqlError> {
+        use core::fmt::Write as _;
+
+        let mut parsed = Self::EMPTY;
+        for tag in tags {
+            if parsed
+                .values()
+                .iter()
+                .any(|known| known.as_str().eq_ignore_ascii_case(tag))
+            {
+                continue;
+            }
+            if usize::from(parsed.count) == MAX_EVENT_TRIGGER_TAGS {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "an event trigger can filter at most {} command tags",
+                    MAX_EVENT_TRIGGER_TAGS
+                ));
+            }
+            let mut canonical = StackStr::new();
+            for character in tag.chars() {
+                let _ = canonical.write_char(character.to_ascii_uppercase());
+            }
+            if canonical.as_str().is_empty() || canonical.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "invalid event trigger command tag"
+                ));
+            }
+            parsed.values[usize::from(parsed.count)] = canonical;
+            parsed.count += 1;
+        }
+        Ok(parsed)
+    }
+
+    pub(crate) fn values(&self) -> &[StackStr<EVENT_TRIGGER_TAG_MAX>] {
+        &self.values[..usize::from(self.count)]
+    }
+
+    pub(crate) fn matches(&self, tag: &str) -> bool {
+        self.values().is_empty()
+            || self
+                .values()
+                .iter()
+                .any(|known| known.as_str().eq_ignore_ascii_case(tag))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EventTriggerDefinition {
+    pub name: SqlName,
+    pub event: crate::sql::ast::EventTriggerEvent,
+    pub function: u16,
+    pub tags: EventTriggerTags,
+    pub enabled: TriggerEnabled,
+    pub ownership: Ownership,
+}
+
+impl EventTriggerDefinition {
+    const EMPTY: Self = Self {
+        name: SqlName::EMPTY,
+        event: crate::sql::ast::EventTriggerEvent::DdlCommandStart,
+        function: u16::MAX,
+        tags: EventTriggerTags::EMPTY,
+        enabled: TriggerEnabled::Origin,
+        ownership: Ownership::BOOTSTRAP,
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingEventTriggerDefinition {
+    pub txid: u32,
+    pub definition: EventTriggerDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EventTriggerDef {
+    pub(crate) database: DatabaseOid,
+    pub created_at: u64,
+    pub definition: EventTriggerDefinition,
+    pub pending: Option<PendingEventTriggerDefinition>,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl EventTriggerDef {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        definition: EventTriggerDefinition::EMPTY,
+        pending: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(self, txid: u32) -> EventTriggerDefinition {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.definition, |pending| pending.definition)
+    }
+
+    pub(crate) fn oid(self) -> i32 {
+        catalog_object_oid(22_000, self.created_at)
     }
 }
 pub(crate) const EXTENDED_STATISTICS_EXPRESSION_MAX: usize = CHECK_SQL_MAX;
@@ -4746,6 +4869,7 @@ pub(crate) enum RoutineKind {
     },
     TableFunction,
     Trigger,
+    EventTrigger,
     Procedure,
     Aggregate(AggregateRoutine),
 }
@@ -5230,7 +5354,7 @@ impl RoutineKind {
         match self {
             Self::Function { result } | Self::SetFunction { result } => Some(result.ctype),
             Self::RecordFunction { .. } | Self::TableFunction => Some(ColType::Record),
-            Self::Trigger | Self::Procedure | Self::Aggregate(_) => None,
+            Self::Trigger | Self::EventTrigger | Self::Procedure | Self::Aggregate(_) => None,
         }
     }
 
@@ -5251,7 +5375,8 @@ impl RoutineKind {
             | Self::SetFunction { .. }
             | Self::RecordFunction { .. }
             | Self::TableFunction
-            | Self::Trigger => "f",
+            | Self::Trigger
+            | Self::EventTrigger => "f",
             Self::Procedure => "p",
             Self::Aggregate(_) => "a",
         }
@@ -5271,6 +5396,7 @@ impl RoutineKind {
             Self::RecordFunction {
                 set_returning: true,
             } => 7,
+            Self::EventTrigger => 8,
         }
     }
 
@@ -5287,6 +5413,7 @@ impl RoutineKind {
             7 => Some(Self::RecordFunction {
                 set_returning: true,
             }),
+            8 => Some(Self::EventTrigger),
             _ => None,
         }
     }
@@ -5297,6 +5424,7 @@ enum RoutineCallKind {
     Scalar,
     Set,
     Trigger,
+    EventTrigger,
     Procedure,
     Aggregate,
 }
@@ -5307,6 +5435,7 @@ impl RoutineCallKind {
             Self::Scalar => kind.function_result().is_some() && !kind.is_set_returning(),
             Self::Set => kind.is_set_returning(),
             Self::Trigger => matches!(kind, RoutineKind::Trigger),
+            Self::EventTrigger => matches!(kind, RoutineKind::EventTrigger),
             Self::Procedure => matches!(kind, RoutineKind::Procedure),
             Self::Aggregate => matches!(kind, RoutineKind::Aggregate(_)),
         }
@@ -7926,6 +8055,7 @@ pub(crate) enum AccessClass {
     Extension = 12,
     Trigger = 13,
     Database = 14,
+    EventTrigger = 15,
 }
 
 /// Object classes addressable by ALTER DEFAULT PRIVILEGES.
@@ -7988,6 +8118,7 @@ impl AccessClass {
             12 => Self::Extension,
             13 => Self::Trigger,
             14 => Self::Database,
+            15 => Self::EventTrigger,
             _ => return None,
         })
     }
@@ -8072,7 +8203,8 @@ pub(crate) const fn all_object_privileges(class: AccessClass) -> PrivilegeSet {
         AccessClass::Index
         | AccessClass::Statistics
         | AccessClass::Extension
-        | AccessClass::Trigger => PrivilegeSet::NONE,
+        | AccessClass::Trigger
+        | AccessClass::EventTrigger => PrivilegeSet::NONE,
     }
 }
 
@@ -8478,6 +8610,7 @@ pub enum CommentClass {
     Database,
     Collation,
     Conversion,
+    EventTrigger,
 }
 
 impl CommentClass {
@@ -8492,6 +8625,7 @@ impl CommentClass {
             CommentClass::Database => 6,
             CommentClass::Collation => 7,
             CommentClass::Conversion => 8,
+            CommentClass::EventTrigger => 9,
         }
     }
 
@@ -8506,6 +8640,7 @@ impl CommentClass {
             6 => CommentClass::Database,
             7 => CommentClass::Collation,
             8 => CommentClass::Conversion,
+            9 => CommentClass::EventTrigger,
             _ => return None,
         })
     }
@@ -8739,6 +8874,7 @@ pub struct Storage {
     operator_classes: FixedVec<OperatorClassDef>,
     collations: FixedVec<CollationDef>,
     conversions: FixedVec<ConversionDef>,
+    event_triggers: FixedVec<EventTriggerDef>,
     routine_dependencies: FixedVec<StoredQueryDependencies>,
     pending_routine_dependencies: FixedVec<PendingRoutineDependencies>,
     triggers: FixedVec<TriggerDef>,
@@ -9458,6 +9594,7 @@ impl Storage {
                     + size_of::<IndexDef>())
             + MAX_COLLATIONS * size_of::<CollationDef>()
             + MAX_CONVERSIONS * size_of::<ConversionDef>()
+            + MAX_EVENT_TRIGGERS * size_of::<EventTriggerDef>()
             + config.max_replication_slots * size_of::<ReplicationSlotDef>()
             + config.max_subscriptions * size_of::<SubscriptionDef>()
             + config.max_subscriptions
@@ -9615,6 +9752,12 @@ impl Storage {
             conversions
                 .push(ConversionDef::EMPTY)
                 .expect("sized to conversion capacity");
+        }
+        let mut event_triggers = FixedVec::new(budget, "event_triggers", MAX_EVENT_TRIGGERS)?;
+        for _ in 0..MAX_EVENT_TRIGGERS {
+            event_triggers
+                .push(EventTriggerDef::EMPTY)
+                .expect("sized to event trigger capacity");
         }
         let routine_dependencies =
             stored_query_dependency_slots(budget, "routine_dependencies", config.max_tables)?;
@@ -10069,6 +10212,7 @@ impl Storage {
             operator_classes,
             collations,
             conversions,
+            event_triggers,
             routine_dependencies,
             pending_routine_dependencies,
             triggers,
@@ -11175,6 +11319,40 @@ impl Storage {
                 self.routine_dependencies[target_slot] = self.routine_dependencies[source_slot];
             }
 
+            for source_slot in 0..self.event_triggers.len() {
+                let mut event_trigger = self.event_triggers[source_slot];
+                if event_trigger.database != source
+                    || event_trigger.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let source_routine_oid =
+                    routine_oid(&self.routines[usize::from(event_trigger.definition.function)]);
+                event_trigger.definition.function = self
+                    .routine_slot_by_oid(source_routine_oid, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "template event trigger routine was not cloned"
+                        )
+                    })? as u16;
+                let target_slot = self
+                    .event_triggers
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "event-trigger catalog is full"
+                        )
+                    })?;
+                event_trigger.database = target;
+                event_trigger.definition.ownership = event_trigger.definition.ownership.committed();
+                event_trigger.pending = None;
+                event_trigger.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.event_triggers[target_slot] = event_trigger;
+            }
+
             for source_slot in 0..self.casts.len() {
                 let mut definition = self.casts[source_slot];
                 if definition.database != source || definition.ddl_state != CatalogDdlState::Present
@@ -11797,6 +11975,9 @@ impl Storage {
                 }
                 AccessClass::Extension => self.extensions[usize::from(entry.object.slot)].database,
                 AccessClass::Trigger => self.triggers[usize::from(entry.object.slot)].database,
+                AccessClass::EventTrigger => {
+                    self.event_triggers[usize::from(entry.object.slot)].database
+                }
                 AccessClass::Tablespace | AccessClass::Database => continue,
             };
             if object_database == database {
@@ -12012,6 +12193,7 @@ impl Storage {
         commit_catalog!(operators);
         commit_catalog!(collations);
         commit_catalog!(conversions);
+        commit_catalog!(event_triggers);
         commit_catalog!(operator_families);
         commit_catalog!(operator_classes);
         commit_catalog!(triggers);
@@ -12212,6 +12394,7 @@ impl Storage {
                 TriggerTarget::Table(table) => &self.tables[usize::from(table)].ownership,
                 TriggerTarget::View(view) => &self.views[usize::from(view)].ownership,
             },
+            AccessClass::EventTrigger => &self.event_triggers[slot].definition.ownership,
             AccessClass::Database => &self.databases[slot].ownership,
         }
     }
@@ -12235,6 +12418,7 @@ impl Storage {
             AccessClass::Trigger => {
                 unreachable!("triggers inherit relation ownership and cannot be reassigned")
             }
+            AccessClass::EventTrigger => &mut self.event_triggers[slot].definition.ownership,
             AccessClass::Database => &mut self.databases[slot].ownership,
         }
     }
@@ -12314,6 +12498,7 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics_slot(schema, name, txid),
             AccessClass::Extension => self.extension_slot(name, txid),
             AccessClass::Trigger => None,
+            AccessClass::EventTrigger => self.event_trigger_slot(name, txid),
             AccessClass::Database => schema
                 .is_empty()
                 .then(|| self.database_slot(name, txid))
@@ -12394,6 +12579,10 @@ impl Storage {
                 };
                 (schema, trigger.name_to(txid))
             }
+            AccessClass::EventTrigger => (
+                SqlName::EMPTY,
+                self.event_triggers[slot].definition_for(txid).name,
+            ),
             AccessClass::Database => (
                 SqlName::EMPTY,
                 self.databases[slot].definition_for(txid).name,
@@ -12422,6 +12611,9 @@ impl Storage {
             }
             AccessClass::Extension => self.extensions[slot].ddl_state == CatalogDdlState::Present,
             AccessClass::Trigger => self.triggers[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::EventTrigger => {
+                self.event_triggers[slot].ddl_state == CatalogDdlState::Present
+            }
             AccessClass::Database => self.databases[slot].ddl_state == CatalogDdlState::Present,
         }
     }
@@ -12446,6 +12638,7 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics[slot].visible_to(txid),
             AccessClass::Extension => self.extensions[slot].visible_to(txid),
             AccessClass::Trigger => self.triggers[slot].visible_to(txid),
+            AccessClass::EventTrigger => self.event_triggers[slot].visible_to(txid),
             AccessClass::Database => self.databases[slot].visible_to(txid),
         }
     }
@@ -12471,6 +12664,7 @@ impl Storage {
             AccessClass::Statistics => Some(self.extended_statistics[slot].database),
             AccessClass::Extension => Some(self.extensions[slot].database),
             AccessClass::Trigger => Some(self.triggers[slot].database),
+            AccessClass::EventTrigger => Some(self.event_triggers[slot].database),
             AccessClass::Tablespace | AccessClass::Database => None,
         }
     }
@@ -12563,6 +12757,12 @@ impl Storage {
             AccessClass::Trigger => {
                 let created_at = self.triggers[source_slot].created_at;
                 self.triggers.iter().position(|candidate| {
+                    candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::EventTrigger => {
+                let created_at = self.event_triggers[source_slot].created_at;
+                self.event_triggers.iter().position(|candidate| {
                     candidate.database == target_database && candidate.created_at == created_at
                 })?
             }
@@ -12672,6 +12872,15 @@ impl Storage {
 
     pub(crate) fn checkpoint_conversions(&self) -> impl Iterator<Item = (usize, &ConversionDef)> {
         self.conversions
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_event_triggers(
+        &self,
+    ) -> impl Iterator<Item = (usize, &EventTriggerDef)> {
+        self.event_triggers
             .iter()
             .enumerate()
             .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
@@ -12812,6 +13021,7 @@ impl Storage {
             AccessClass::Statistics => self.extended_statistics.len(),
             AccessClass::Extension => self.extensions.len(),
             AccessClass::Trigger => self.triggers.len(),
+            AccessClass::EventTrigger => self.event_triggers.len(),
             AccessClass::Database => self.databases.len(),
         }
     }
@@ -12860,6 +13070,7 @@ impl Storage {
             (AccessClass::Tablespace, self.tablespaces.len()),
             (AccessClass::Statistics, self.extended_statistics.len()),
             (AccessClass::Extension, self.extensions.len()),
+            (AccessClass::EventTrigger, self.event_triggers.len()),
         ]
         .into_iter()
         .any(|(class, count)| {
@@ -22800,6 +23011,7 @@ impl Storage {
                 RoutineKind::RecordFunction { .. }
                 | RoutineKind::TableFunction
                 | RoutineKind::Trigger
+                | RoutineKind::EventTrigger
                 | RoutineKind::Procedure => {}
             }
             self.routines[slot] = routine;
@@ -24947,6 +25159,7 @@ impl Storage {
             RoutineKind::RecordFunction { .. }
             | RoutineKind::TableFunction
             | RoutineKind::Trigger
+            | RoutineKind::EventTrigger
             | RoutineKind::Procedure => {}
         }
         Some(routine)
@@ -25056,7 +25269,10 @@ impl Storage {
             RoutineKind::RecordFunction { .. } | RoutineKind::TableFunction => {
                 return Some(crate::sql::types::oid::RECORD);
             }
-            RoutineKind::Trigger | RoutineKind::Procedure | RoutineKind::Aggregate(_) => {
+            RoutineKind::Trigger
+            | RoutineKind::EventTrigger
+            | RoutineKind::Procedure
+            | RoutineKind::Aggregate(_) => {
                 return None;
             }
         };
@@ -25297,6 +25513,10 @@ impl Storage {
 
     pub(crate) fn trigger_slot_for_call(&self, name: &str, txid: u32) -> Option<usize> {
         self.routine_slot_on_path(name, &[], txid, RoutineCallKind::Trigger)
+    }
+
+    pub(crate) fn event_trigger_slot_for_call(&self, name: &str, txid: u32) -> Option<usize> {
+        self.routine_slot_on_path(name, &[], txid, RoutineCallKind::EventTrigger)
     }
 
     fn routine_slot_on_path(
@@ -26173,7 +26393,10 @@ impl Storage {
                 ));
             }
             RoutineKind::Function { .. } | RoutineKind::SetFunction { .. } => {}
-            RoutineKind::Trigger | RoutineKind::Procedure | RoutineKind::Aggregate(_)
+            RoutineKind::Trigger
+            | RoutineKind::EventTrigger
+            | RoutineKind::Procedure
+            | RoutineKind::Aggregate(_)
                 if result_column_count != 0 =>
             {
                 return Err(sql_err!(
@@ -26181,7 +26404,10 @@ impl Storage {
                     "routine kind cannot define result columns"
                 ));
             }
-            RoutineKind::Trigger | RoutineKind::Procedure | RoutineKind::Aggregate(_) => {}
+            RoutineKind::Trigger
+            | RoutineKind::EventTrigger
+            | RoutineKind::Procedure
+            | RoutineKind::Aggregate(_) => {}
         }
         self.require_schema_create(schema.as_str(), txid)?;
         if let Some(blocker) = self.routines.iter().find_map(|routine| {
@@ -29941,6 +30167,261 @@ impl Storage {
         }
     }
 
+    pub(crate) fn event_triggers_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, EventTriggerDefinition)> + '_ {
+        self.event_triggers
+            .iter()
+            .enumerate()
+            .filter(move |(_, trigger)| {
+                trigger.database == self.current_database && trigger.visible_to(txid)
+            })
+            .map(move |(slot, trigger)| (slot, trigger.definition_for(txid)))
+    }
+
+    pub(crate) fn event_trigger(&self, slot: usize) -> EventTriggerDef {
+        self.event_triggers[slot]
+    }
+
+    pub(crate) fn event_trigger_slot(&self, name: &str, txid: u32) -> Option<usize> {
+        self.event_triggers_visible_to(txid)
+            .find_map(|(slot, definition)| {
+                definition
+                    .name
+                    .as_str()
+                    .eq_ignore_ascii_case(name)
+                    .then_some(slot)
+            })
+    }
+
+    fn validate_event_trigger_definition(
+        &self,
+        definition: EventTriggerDefinition,
+        txid: u32,
+    ) -> Result<(), SqlError> {
+        let routine = self
+            .routines
+            .get(usize::from(definition.function))
+            .filter(|routine| routine.database == self.current_database && routine.visible_to(txid))
+            .map(|routine| routine.definition_for(txid))
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_FUNCTION,
+                    "event trigger function does not exist"
+                )
+            })?;
+        if !matches!(routine.kind, RoutineKind::EventTrigger) {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "event trigger function must return type event_trigger"
+            ));
+        }
+        if !definition.event.supports_tag_filter() && !definition.tags.values().is_empty() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "WHEN clause is not supported for event {}",
+                definition.event.name()
+            ));
+        }
+        if self
+            .roles
+            .get(usize::from(definition.ownership.owner_to(txid)))
+            .is_none_or(|role| !role.visible_to(txid))
+        {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "event trigger owner does not exist"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_event_trigger(
+        &mut self,
+        definition: EventTriggerDefinition,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        self.validate_event_trigger_definition(definition, txid)?;
+        if self
+            .event_trigger_slot(definition.name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "event trigger \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
+        let slot = self
+            .event_triggers
+            .iter()
+            .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many event triggers (limit {})",
+                    MAX_EVENT_TRIGGERS
+                )
+            })?;
+        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        self.event_triggers[slot] = EventTriggerDef {
+            database: self.current_database,
+            created_at: self.catalog_seq,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn alter_event_trigger(
+        &mut self,
+        slot: usize,
+        definition: EventTriggerDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingEventTriggerDefinition>, SqlError> {
+        self.validate_event_trigger_definition(definition, txid)?;
+        let old = self.event_triggers[slot].definition_for(txid);
+        if let Some(other) = self.event_trigger_slot(definition.name.as_str(), txid)
+            && other != slot
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "event trigger \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
+        let prior = self.event_triggers[slot].pending;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                prior.expect("checked").txid,
+                definition.name.as_str(),
+            ));
+        }
+        self.event_triggers[slot].pending =
+            Some(PendingEventTriggerDefinition { txid, definition });
+        self.stage_object_comment_identity(
+            CommentClass::EventTrigger,
+            SqlName::EMPTY,
+            old.name,
+            SqlName::EMPTY,
+            definition.name,
+            txid,
+        );
+        Ok(prior)
+    }
+
+    pub(crate) fn drop_event_trigger(&mut self, slot: usize, txid: u32) {
+        self.event_triggers[slot].ddl_state = self.event_triggers[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_event_trigger_create(&mut self, slot: usize) {
+        self.event_triggers[slot].ddl_state = self.event_triggers[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_event_trigger_create(&mut self, slot: usize) {
+        self.event_triggers[slot].ddl_state = self.event_triggers[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_event_trigger_alter(&mut self, slot: usize, txid: u32) {
+        let old = self.event_triggers[slot].definition;
+        if let Some(pending) = self.event_triggers[slot].pending
+            && pending.txid == txid
+        {
+            self.event_triggers[slot].definition = pending.definition;
+            self.event_triggers[slot].pending = None;
+            self.commit_object_comment_identity(
+                CommentClass::EventTrigger,
+                SqlName::EMPTY,
+                old.name,
+                txid,
+            );
+        }
+    }
+
+    pub(crate) fn rollback_event_trigger_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingEventTriggerDefinition>,
+    ) {
+        let txid = self.event_triggers[slot]
+            .pending
+            .map_or(0, |pending| pending.txid);
+        self.event_triggers[slot].pending = prior;
+        let committed = self.event_triggers[slot].definition;
+        let visible = prior.map_or(committed, |pending| pending.definition);
+        self.stage_object_comment_identity(
+            CommentClass::EventTrigger,
+            SqlName::EMPTY,
+            committed.name,
+            SqlName::EMPTY,
+            visible.name,
+            txid,
+        );
+    }
+
+    pub(crate) fn commit_event_trigger_drop(&mut self, slot: usize) {
+        let name = self.event_triggers[slot].definition.name;
+        self.drop_object_comments(CommentClass::EventTrigger, "", name.as_str());
+        self.event_triggers[slot].pending = None;
+        self.event_triggers[slot].ddl_state = self.event_triggers[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_event_trigger_drop(&mut self, slot: usize, txid: u32) {
+        self.event_triggers[slot].ddl_state =
+            self.event_triggers[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn replay_event_trigger(
+        &mut self,
+        slot: usize,
+        created_at: u64,
+        definition: EventTriggerDefinition,
+    ) -> Result<(), SqlError> {
+        if slot >= self.event_triggers.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "journal event trigger slot is out of range"
+            ));
+        }
+        self.validate_event_trigger_definition(definition, 0)?;
+        if self
+            .event_triggers
+            .iter()
+            .enumerate()
+            .any(|(other, candidate)| {
+                other != slot
+                    && candidate.database == self.current_database
+                    && candidate.ddl_state != CatalogDdlState::Absent
+                    && candidate.definition.name == definition.name
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "journal replays duplicate event trigger \"{}\"",
+                definition.name.as_str()
+            ));
+        }
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.event_triggers[slot] = EventTriggerDef {
+            database: self.current_database,
+            created_at,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn replay_drop_event_trigger(&mut self, name: &str) {
+        if let Some(slot) = self.event_trigger_slot(name, 0) {
+            self.drop_object_comments(CommentClass::EventTrigger, "", name);
+            self.event_triggers[slot] = EventTriggerDef::EMPTY;
+        }
+    }
+
     pub(crate) fn operator(&self, slot: usize) -> &OperatorDef {
         &self.operators[slot]
     }
@@ -31223,10 +31704,11 @@ mod tests {
             CommentClass::Database,
             CommentClass::Collation,
             CommentClass::Conversion,
+            CommentClass::EventTrigger,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(9), None);
+        assert_eq!(CommentClass::from_u8(10), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 
@@ -31247,6 +31729,7 @@ mod tests {
             AccessClass::Tablespace,
             AccessClass::Extension,
             AccessClass::Trigger,
+            AccessClass::EventTrigger,
             AccessClass::Database,
         ] {
             assert_eq!(AccessClass::from_u8(class as u8), Some(class));

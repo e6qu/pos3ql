@@ -251,6 +251,12 @@ pub(crate) enum DdlUndo {
         prior: Option<crate::storage::PendingConversionDefinition>,
     },
     ConversionDropped(u32),
+    EventTriggerCreated(u32),
+    EventTriggerAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingEventTriggerDefinition>,
+    },
+    EventTriggerDropped(u32),
     TriggerCreated(u32),
     TriggerDropped(u32),
     TriggerAltered {

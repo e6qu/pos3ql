@@ -21,7 +21,7 @@ ALTER CONVERSION	complete	120_collation_conversion.sql
 ALTER DATABASE	complete	118_database_configuration.sql
 ALTER DEFAULT PRIVILEGES	complete	83_roles_acl.sql
 ALTER DOMAIN	partial	62_domains.sql
-ALTER EVENT TRIGGER	missing	-
+ALTER EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
 ALTER EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native-library update execution is outside the architecture
 ALTER FOREIGN DATA WRAPPER	missing	-
 ALTER FOREIGN TABLE	missing	-
@@ -74,7 +74,7 @@ CREATE COLLATION	complete	120_collation_conversion.sql
 CREATE CONVERSION	complete	120_collation_conversion.sql
 CREATE DATABASE	complete	118_database_configuration.sql
 CREATE DOMAIN	complete	62_domains.sql
-CREATE EVENT TRIGGER	missing	-
+CREATE EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
 CREATE EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native libraries are rejected
 CREATE FOREIGN DATA WRAPPER	missing	-
 CREATE FOREIGN TABLE	missing	-
@@ -121,7 +121,7 @@ DROP COLLATION	complete	120_collation_conversion.sql
 DROP CONVERSION	complete	120_collation_conversion.sql
 DROP DATABASE	complete	118_database_configuration.sql
 DROP DOMAIN	complete	62_domains.sql
-DROP EVENT TRIGGER	missing	-
+DROP EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
 DROP EXTENSION	partial	111_extension_lifecycle.sql covers SQL-package dependency classes; native packages are not loaded
 DROP FOREIGN DATA WRAPPER	missing	-
 DROP FOREIGN TABLE	missing	-

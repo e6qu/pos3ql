@@ -50,6 +50,7 @@ pub mod oid {
     pub const VOID: i32 = 2278;
     /// PostgreSQL's pseudo-type for trigger function results.
     pub const TRIGGER: i32 = 2279;
+    pub const EVENT_TRIGGER: i32 = 3838;
     /// PostgreSQL's opaque server-state pseudo-type.
     pub const INTERNAL: i32 = 2281;
     pub const ANYELEMENT: i32 = 2283;

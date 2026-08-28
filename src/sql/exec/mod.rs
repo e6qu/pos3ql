@@ -4813,9 +4813,10 @@ fn privilege_mask(
         AccessClass::Composite => PrivilegeSet::TYPE_ALL,
         AccessClass::Tablespace => PrivilegeSet::CREATE,
         AccessClass::Database => PrivilegeSet::DATABASE_ALL,
-        AccessClass::Statistics | AccessClass::Extension | AccessClass::Trigger => {
-            PrivilegeSet::NONE
-        }
+        AccessClass::Statistics
+        | AccessClass::Extension
+        | AccessClass::Trigger
+        | AccessClass::EventTrigger => PrivilegeSet::NONE,
     };
     let allowed = if columns {
         if !matches!(
@@ -5119,7 +5120,7 @@ fn apply_default_privileges_to_new_object(
         AccessClass::Tablespace => return Ok(()),
         AccessClass::Database => return Ok(()),
         AccessClass::Statistics => return Ok(()),
-        AccessClass::Extension | AccessClass::Trigger => return Ok(()),
+        AccessClass::Extension | AccessClass::Trigger | AccessClass::EventTrigger => return Ok(()),
     };
     let owner = storage.object_owner(object, txn.txid) as u16;
     let schema = if object.class == AccessClass::Schema {
@@ -5281,6 +5282,7 @@ pub fn reassign_owned(
         AccessClass::Statistics,
         AccessClass::Tablespace,
         AccessClass::Extension,
+        AccessClass::EventTrigger,
     ];
     let mut changes = 0usize;
     for class in classes {
@@ -5689,6 +5691,7 @@ pub fn drop_owned(
     let mut conversions = [false; crate::storage::MAX_CONVERSIONS];
     let mut statistics =
         [false; MAX_DEPENDENT_STORED_QUERIES * crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
+    let mut event_triggers = [false; crate::storage::MAX_EVENT_TRIGGERS];
     let mut schemas = [false; MAX_SCHEMAS];
     for (class, selected) in [
         (AccessClass::Table, &mut tables[..]),
@@ -5700,6 +5703,7 @@ pub fn drop_owned(
         (AccessClass::Composite, &mut composites[..]),
         (AccessClass::Routine, &mut routines[..]),
         (AccessClass::Statistics, &mut statistics[..]),
+        (AccessClass::EventTrigger, &mut event_triggers[..]),
         (AccessClass::Schema, &mut schemas[..]),
     ] {
         for (slot, selected) in selected
@@ -5858,6 +5862,44 @@ pub fn drop_owned(
         drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines)
     {
         return sql_fail(error);
+    }
+
+    for (slot, selected) in event_triggers.iter().copied().enumerate().rev() {
+        if !selected
+            || storage.event_trigger_slot(
+                storage
+                    .event_trigger(slot)
+                    .definition_for(txn.txid)
+                    .name
+                    .as_str(),
+                txn.txid,
+            ) != Some(slot)
+        {
+            continue;
+        }
+        let definition = storage.event_trigger(slot).definition_for(txn.txid);
+        let owner = storage.role_name(
+            usize::from(definition.ownership.owner_to(txn.txid)),
+            txn.txid,
+        );
+        let outcome = run_as_role(owner, || {
+            responder.without_command_complete(|responder| {
+                drop_event_trigger(
+                    storage,
+                    wal,
+                    txn,
+                    definition.name.as_str(),
+                    false,
+                    cascade,
+                    responder,
+                )
+            })
+        });
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return sql_fail(error),
+            Err(error) => return Err(error),
+        }
     }
 
     let owned_catalog = |owner: i32| {
@@ -10334,6 +10376,7 @@ enum TriggerReturn {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PlpgsqlProgramKind {
     Trigger,
+    EventTrigger,
     Procedure,
     Anonymous,
 }
@@ -10376,6 +10419,8 @@ struct TriggerInvocation<'a> {
     level: &'static str,
     operation: &'static str,
     argv: Datum<'a>,
+    event: &'a str,
+    tag: &'a str,
     exception: Option<TriggerExceptionDiagnostic<'a>>,
 }
 
@@ -10399,6 +10444,8 @@ enum TriggerContextField {
     Tablespace,
     Nargs,
     Argv,
+    Event,
+    Tag,
 }
 
 impl TriggerContextField {
@@ -10425,6 +10472,10 @@ impl TriggerContextField {
             Some(Self::Nargs)
         } else if name.eq_ignore_ascii_case("tg_argv") {
             Some(Self::Argv)
+        } else if name.eq_ignore_ascii_case("tg_event") {
+            Some(Self::Event)
+        } else if name.eq_ignore_ascii_case("tg_tag") {
+            Some(Self::Tag)
         } else {
             None
         }
@@ -10441,8 +10492,25 @@ impl TriggerContextField {
             | Self::Relname
             | Self::TableName
             | Self::TableSchema
-            | Self::Tablespace => ColType::Text,
+            | Self::Tablespace
+            | Self::Event
+            | Self::Tag => ColType::Text,
         }
+    }
+}
+
+fn plpgsql_context_field(kind: PlpgsqlProgramKind, name: &str) -> Option<TriggerContextField> {
+    let field = TriggerContextField::parse(name)?;
+    match (kind, field) {
+        (
+            PlpgsqlProgramKind::EventTrigger,
+            TriggerContextField::Event | TriggerContextField::Tag,
+        ) => Some(field),
+        (PlpgsqlProgramKind::Trigger, TriggerContextField::Event | TriggerContextField::Tag) => {
+            None
+        }
+        (PlpgsqlProgramKind::Trigger, field) => Some(field),
+        _ => None,
     }
 }
 
@@ -10513,6 +10581,8 @@ impl<'a> TriggerInvocation<'a> {
             },
             operation,
             argv,
+            event: "",
+            tag: "",
             exception: None,
         })
     }
@@ -10532,6 +10602,8 @@ impl<'a> TriggerInvocation<'a> {
             level: "",
             operation: "",
             argv: Datum::Null,
+            event: "",
+            tag: "",
             exception: None,
         }
     }
@@ -10555,6 +10627,38 @@ impl<'a> TriggerInvocation<'a> {
             level: "",
             operation: "",
             argv: Datum::Null,
+            event: "",
+            tag: "",
+            exception: None,
+        })
+    }
+
+    fn event_trigger(
+        routine: &crate::storage::RoutineDef,
+        event: &'a str,
+        tag: &'a str,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        Ok(Self {
+            program_kind: PlpgsqlProgramKind::EventTrigger,
+            name: "",
+            routine_schema: arena
+                .alloc_str(routine.schema.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            routine_name: arena
+                .alloc_str(routine.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            table_schema: "",
+            table_name: "",
+            relid: 0,
+            routine_oid: crate::storage::routine_oid(routine),
+            nargs: 0,
+            when: "",
+            level: "",
+            operation: "",
+            argv: Datum::Null,
+            event,
+            tag,
             exception: None,
         })
     }
@@ -10567,6 +10671,12 @@ impl<'a> TriggerInvocation<'a> {
     fn context(self) -> StackStr<192> {
         match self.program_kind {
             PlpgsqlProgramKind::Trigger => stack_format!(
+                192,
+                "PL/pgSQL function {}.{}()",
+                self.routine_schema,
+                self.routine_name
+            ),
+            PlpgsqlProgramKind::EventTrigger => stack_format!(
                 192,
                 "PL/pgSQL function {}.{}()",
                 self.routine_schema,
@@ -10597,6 +10707,8 @@ impl<'a> TriggerInvocation<'a> {
             TriggerContextField::Tablespace => Datum::Null,
             TriggerContextField::Nargs => Datum::Int4(self.nargs),
             TriggerContextField::Argv => self.argv,
+            TriggerContextField::Event => Datum::Text(self.event),
+            TriggerContextField::Tag => Datum::Text(self.tag),
         }
     }
 }
@@ -11609,8 +11721,7 @@ fn parse_trigger_local<'a>(
         return Err(unsupported_trigger_body());
     };
     let name = SqlName::parse(declaration[..split].trim())?;
-    if (program_kind == PlpgsqlProgramKind::Trigger
-        && TriggerContextField::parse(name.as_str()).is_some())
+    if plpgsql_context_field(program_kind, name.as_str()).is_some()
         || TriggerExceptionVariable::parse(name.as_str()).is_some()
     {
         return Err(sql_err!(
@@ -12205,7 +12316,11 @@ fn parse_trigger_return(
         PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("new") => TriggerReturn::New,
         PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("old") => TriggerReturn::Old,
         PlpgsqlProgramKind::Trigger if value.eq_ignore_ascii_case("null") => TriggerReturn::Null,
-        PlpgsqlProgramKind::Procedure | PlpgsqlProgramKind::Anonymous if value.is_empty() => {
+        PlpgsqlProgramKind::EventTrigger
+        | PlpgsqlProgramKind::Procedure
+        | PlpgsqlProgramKind::Anonymous
+            if value.is_empty() =>
+        {
             TriggerReturn::Void
         }
         _ => return Err(unsupported_trigger_body()),
@@ -13203,6 +13318,13 @@ fn parse_trigger_program<'a>(
     parse_plpgsql_program(body, arena, PlpgsqlProgramKind::Trigger)
 }
 
+fn parse_event_trigger_program<'a>(
+    body: &'a str,
+    arena: &'a Arena,
+) -> Result<TriggerProgram<'a>, SqlError> {
+    parse_plpgsql_program(body, arena, PlpgsqlProgramKind::EventTrigger)
+}
+
 fn validate_plpgsql_procedure_namespace(
     program: &TriggerProgram<'_>,
     parameters: &[RoutineParameterDef],
@@ -13261,6 +13383,76 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
             guc,
             cursors,
             transaction_context,
+        },
+        txn,
+        arena,
+        params: crate::sql::eval::NO_PARAMS,
+        seq_session: guc.seq_session(),
+        responder,
+    };
+    let mut local_values = [Datum::Null; MAX_COLUMNS];
+    let mut status = TriggerExecutionStatus::default();
+    initialize_trigger_locals(
+        &context,
+        invocation,
+        TriggerTransition {
+            definition: &definition,
+            old: None,
+            new: None,
+        },
+        program.locals,
+        &[],
+        &mut local_values,
+    )?;
+    let mut no_new = None;
+    match execute_trigger_block(
+        &mut context,
+        &definition,
+        invocation,
+        None,
+        &mut no_new,
+        false,
+        None,
+        program.locals,
+        &mut local_values,
+        program.body,
+        &mut status,
+        None,
+    )? {
+        None | Some(TriggerFlow::Return(TriggerReturn::Void)) => Ok(()),
+        Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
+            Err(unsupported_trigger_body())
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "event-trigger execution carries its transaction-capable call context"
+)]
+pub(crate) fn execute_event_trigger<'a>(
+    engine: &mut super::Engine,
+    txn: &mut TxnState,
+    cursors: &mut super::cursor::CursorPool,
+    guc: &super::guc::GucState,
+    routine: &crate::storage::RoutineDef,
+    event: &'a str,
+    tag: &'a str,
+    arena: &'a Arena,
+    responder: &mut Responder<'_>,
+) -> Result<(), SqlError> {
+    let source = arena
+        .alloc_str(routine.body.as_str())
+        .map_err(|_| super::query::arena_full_pub())?;
+    let program = parse_event_trigger_program(source, arena)?;
+    let definition = TableDef::empty();
+    let invocation = TriggerInvocation::event_trigger(routine, event, tag, arena)?;
+    let mut context = TriggerExecContext {
+        host: PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            cursors,
+            transaction_context: PlpgsqlTransactionContext::Atomic,
         },
         txn,
         arena,
@@ -13638,9 +13830,8 @@ where
         {
             return self.transition.lookup(qualifier, name);
         }
-        if self.invocation.program_kind == PlpgsqlProgramKind::Trigger
-            && qualifier.is_none()
-            && let Some(field) = TriggerContextField::parse(name)
+        if qualifier.is_none()
+            && let Some(field) = plpgsql_context_field(self.invocation.program_kind, name)
         {
             return Ok(self.invocation.value(field));
         }
@@ -13686,9 +13877,8 @@ where
         {
             return self.transition.col_type(qualifier, name);
         }
-        if self.invocation.program_kind == PlpgsqlProgramKind::Trigger
-            && qualifier.is_none()
-            && let Some(field) = TriggerContextField::parse(name)
+        if qualifier.is_none()
+            && let Some(field) = plpgsql_context_field(self.invocation.program_kind, name)
         {
             return Some(field.ctype());
         }
@@ -13726,9 +13916,7 @@ where
         }
         if qualifier.is_none() {
             let local_type = self.local_index(name).map(|index| self.locals[index].ctype);
-            let runtime_type = (self.invocation.program_kind == PlpgsqlProgramKind::Trigger)
-                .then(|| TriggerContextField::parse(name))
-                .flatten()
+            let runtime_type = plpgsql_context_field(self.invocation.program_kind, name)
                 .map(TriggerContextField::ctype)
                 .or_else(|| TriggerStatusVariable::parse(name).map(|_| ColType::Bool))
                 .or_else(|| {
@@ -13784,8 +13972,7 @@ where
         }
         if qualifier.is_none()
             && (self.local_index(name).is_some()
-                || (self.invocation.program_kind == PlpgsqlProgramKind::Trigger
-                    && TriggerContextField::parse(name).is_some())
+                || plpgsql_context_field(self.invocation.program_kind, name).is_some()
                 || TriggerStatusVariable::parse(name).is_some())
             || (TriggerExceptionVariable::parse(name).is_some()
                 && self.invocation.exception.is_some())
@@ -13919,9 +14106,7 @@ where
         if let Some(index) = self.local_index(name) {
             return Ok(self.values[index]);
         }
-        if self.invocation.program_kind == PlpgsqlProgramKind::Trigger
-            && let Some(field) = TriggerContextField::parse(name)
-        {
+        if let Some(field) = plpgsql_context_field(self.invocation.program_kind, name) {
             return Ok(self.invocation.value(field));
         }
         if let Some(variable) = TriggerExceptionVariable::parse(name)
@@ -13945,9 +14130,7 @@ where
                 .local_index(name)
                 .map(|index| self.locals[index].ctype)
                 .or_else(|| {
-                    (self.invocation.program_kind == PlpgsqlProgramKind::Trigger)
-                        .then(|| TriggerContextField::parse(name))
-                        .flatten()
+                    plpgsql_context_field(self.invocation.program_kind, name)
                         .map(TriggerContextField::ctype)
                 })
                 .or_else(|| {
@@ -13968,9 +14151,7 @@ where
                 .local_index(name)
                 .map(|index| self.locals[index].ctype)
                 .or_else(|| {
-                    (self.invocation.program_kind == PlpgsqlProgramKind::Trigger)
-                        .then(|| TriggerContextField::parse(name))
-                        .flatten()
+                    plpgsql_context_field(self.invocation.program_kind, name)
                         .map(TriggerContextField::ctype)
                 })
                 .or_else(|| {
@@ -16816,6 +16997,238 @@ fn transition_capture_required(
                 crate::storage::TriggerTransitionTables::None
             )
     })
+}
+
+fn require_event_trigger_superuser(storage: &Storage, txid: u32) -> Result<u16, SqlError> {
+    let current = storage
+        .current_role_slot(txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "current role does not exist"))?;
+    if !storage.role(current).attributes_to(txid).superuser {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to create event trigger"
+        ));
+    }
+    Ok(current as u16)
+}
+
+fn stage_event_trigger(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &TxnState,
+    slot: usize,
+    definition: crate::storage::EventTriggerDefinition,
+) -> Result<(), SqlError> {
+    let lsn = storage.lsn() + 1;
+    wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetEventTrigger {
+            slot: slot as u8,
+            created_at: storage.event_trigger(slot).created_at,
+            definition,
+        },
+    )?;
+    storage.set_lsn(lsn);
+    Ok(())
+}
+
+pub fn create_event_trigger(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &crate::sql::ast::CreateEventTrigger<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let owner = match require_event_trigger_superuser(storage, txn.txid) {
+        Ok(owner) => owner,
+        Err(error) => return sql_fail(error),
+    };
+    let function = if let Some(schema) = command.function.schema {
+        storage.routine_slot_by_signature(schema, command.function.name, &[], txn.txid)
+    } else {
+        storage.event_trigger_slot_for_call(command.function.name, txn.txid)
+    };
+    let Some(function) = function else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {}() does not exist",
+            command.function.name
+        ));
+    };
+    if !matches!(
+        storage.routine(function).definition_for(txn.txid).kind,
+        crate::storage::RoutineKind::EventTrigger
+    ) {
+        return sql_fail(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "function {}() must return type event_trigger",
+            command.function.name
+        ));
+    }
+    let definition = match (|| {
+        for tag in command.tags {
+            if !super::event_trigger_tag_supported(tag) {
+                return Err(sql_err!(
+                    sqlstate::SYNTAX_ERROR,
+                    "filter value \"{}\" not recognized for filter variable \"tag\"",
+                    tag
+                ));
+            }
+        }
+        Ok(crate::storage::EventTriggerDefinition {
+            name: SqlName::parse(command.name)?,
+            event: command.event,
+            function: function as u16,
+            tags: crate::storage::EventTriggerTags::parse(command.tags)?,
+            enabled: crate::storage::TriggerEnabled::Origin,
+            ownership: crate::storage::Ownership {
+                owner,
+                pending: None,
+            },
+        })
+    })() {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
+    let slot = match storage.create_event_trigger(definition, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = stage_event_trigger(storage, wal, txn, slot, definition) {
+        storage.rollback_event_trigger_create(slot);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EventTriggerCreated(slot as u32)) {
+        storage.rollback_event_trigger_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE EVENT TRIGGER")?;
+    sql_ok()
+}
+
+pub fn alter_event_trigger(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    action: crate::sql::ast::AlterEventTriggerAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    if let Err(error) = require_event_trigger_superuser(storage, txn.txid) {
+        return sql_fail(error);
+    }
+    let Some(slot) = storage.event_trigger_slot(name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "event trigger \"{}\" does not exist",
+            name
+        ));
+    };
+    let mut definition = storage.event_trigger(slot).definition_for(txn.txid);
+    match action {
+        crate::sql::ast::AlterEventTriggerAction::SetEnabled(mode) => {
+            definition.enabled = match mode {
+                crate::sql::ast::TriggerEnableMode::Origin => {
+                    crate::storage::TriggerEnabled::Origin
+                }
+                crate::sql::ast::TriggerEnableMode::Replica => {
+                    crate::storage::TriggerEnabled::Replica
+                }
+                crate::sql::ast::TriggerEnableMode::Always => {
+                    crate::storage::TriggerEnabled::Always
+                }
+                crate::sql::ast::TriggerEnableMode::Disabled => {
+                    crate::storage::TriggerEnabled::Disabled
+                }
+            };
+        }
+        crate::sql::ast::AlterEventTriggerAction::SetOwner(written) => {
+            let resolved = resolve_role_name(written);
+            let Some(owner) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role \"{}\" does not exist",
+                    resolved.as_str()
+                ));
+            };
+            if !storage.role(owner).attributes_to(txn.txid).superuser {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to change owner of event trigger"
+                ));
+            }
+            definition.ownership = crate::storage::Ownership {
+                owner: owner as u16,
+                pending: None,
+            };
+        }
+        crate::sql::ast::AlterEventTriggerAction::Rename(new_name) => {
+            definition.name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+        }
+    }
+    let prior = match storage.alter_event_trigger(slot, definition, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = stage_event_trigger(storage, wal, txn, slot, definition) {
+        storage.rollback_event_trigger_alter(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EventTriggerAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_event_trigger_alter(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER EVENT TRIGGER")?;
+    sql_ok()
+}
+
+pub fn drop_event_trigger(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    if_exists: bool,
+    _cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    if let Err(error) = require_event_trigger_superuser(storage, txn.txid) {
+        return sql_fail(error);
+    }
+    let Some(slot) = storage.event_trigger_slot(name, txn.txid) else {
+        if if_exists {
+            responder.notice(
+                sqlstate::UNDEFINED_OBJECT,
+                stack_format!(128, "event trigger \"{}\" does not exist, skipping", name).as_str(),
+            )?;
+            responder.command_complete("DROP EVENT TRIGGER")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "event trigger \"{}\" does not exist",
+            name
+        ));
+    };
+    storage.drop_event_trigger(slot, txn.txid);
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropEventTrigger { name }) {
+        storage.rollback_event_trigger_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EventTriggerDropped(slot as u32)) {
+        storage.rollback_event_trigger_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    responder.command_complete("DROP EVENT TRIGGER")?;
+    sql_ok()
 }
 
 pub fn create_trigger(
@@ -21302,6 +21715,15 @@ pub fn create_routine(
             }
             crate::storage::RoutineKind::Trigger
         }
+        super::ast::RoutineCreateKind::EventTrigger => {
+            if !routine.arguments.is_empty() {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "event trigger functions cannot have declared arguments"
+                ));
+            }
+            crate::storage::RoutineKind::EventTrigger
+        }
         super::ast::RoutineCreateKind::Procedure => crate::storage::RoutineKind::Procedure,
     };
     let mut arguments = [RoutineArgumentDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
@@ -21505,6 +21927,17 @@ pub fn create_routine(
                 ));
             }
             if let Err(error) = parse_trigger_program(body_text, arena) {
+                return sql_fail(error);
+            }
+        }
+        crate::storage::RoutineKind::EventTrigger => {
+            if body_kind != crate::storage::RoutineBodyKind::String {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "event trigger functions require a string-literal body"
+                ));
+            }
+            if let Err(error) = parse_event_trigger_program(body_text, arena) {
                 return sql_fail(error);
             }
         }
@@ -21748,6 +22181,7 @@ pub fn create_routine(
         | crate::storage::RoutineKind::RecordFunction { .. }
         | crate::storage::RoutineKind::TableFunction => "CREATE FUNCTION",
         crate::storage::RoutineKind::Trigger => "CREATE FUNCTION",
+        crate::storage::RoutineKind::EventTrigger => "CREATE FUNCTION",
         crate::storage::RoutineKind::Procedure => "CREATE PROCEDURE",
         crate::storage::RoutineKind::Aggregate(_) => {
             unreachable!("CREATE ROUTINE cannot construct an aggregate")
@@ -24175,6 +24609,45 @@ pub fn drop_routine(
             }
         }
         if storage
+            .event_triggers_visible_to(txn.txid)
+            .any(|(_, trigger)| usize::from(trigger.function) == slot)
+            && !cascade
+        {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop function {} because event trigger objects depend on it",
+                routine.name_for(txn.txid).as_str()
+            ));
+        }
+        loop {
+            let dependency =
+                storage
+                    .event_triggers_visible_to(txn.txid)
+                    .find_map(|(trigger_slot, trigger)| {
+                        (usize::from(trigger.function) == slot).then_some((trigger_slot, trigger))
+                    });
+            let Some((trigger_slot, trigger)) = dependency else {
+                break;
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::DropEventTrigger {
+                    name: trigger.name.as_str(),
+                },
+            ) {
+                return sql_fail(error);
+            }
+            storage.drop_event_trigger(trigger_slot, txn.txid);
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::EventTriggerDropped(
+                trigger_slot as u32,
+            )) {
+                storage.rollback_event_trigger_drop(trigger_slot, txn.txid);
+                return sql_fail(error);
+            }
+        }
+        if storage
             .triggers_with_slots_visible_to(txn.txid)
             .any(|(_, trigger)| usize::from(trigger.function) == slot)
             && !cascade
@@ -24630,6 +25103,29 @@ pub fn comment(
             (
                 CommentClass::Conversion,
                 definition.schema,
+                definition.name,
+                0u32,
+            )
+        }
+        CommentTarget::EventTrigger(event_trigger_name) => {
+            let Some(slot) = storage.event_trigger_slot(event_trigger_name, txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "event trigger \"{}\" does not exist",
+                    event_trigger_name
+                ));
+            };
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::EventTrigger,
+                slot: slot as u16,
+            };
+            if let Err(error) = storage.require_owner(object, txid, "event trigger") {
+                return sql_fail(error);
+            }
+            let definition = storage.event_trigger(slot).definition_for(txid);
+            (
+                CommentClass::EventTrigger,
+                SqlName::EMPTY,
                 definition.name,
                 0u32,
             )
@@ -26495,6 +26991,7 @@ fn routine_uses_selected_type(
         crate::storage::RoutineKind::TableFunction
         | crate::storage::RoutineKind::RecordFunction { .. }
         | crate::storage::RoutineKind::Trigger
+        | crate::storage::RoutineKind::EventTrigger
         | crate::storage::RoutineKind::Procedure => false,
     }
 }
@@ -43780,6 +44277,25 @@ fn alter_type_auto_castable(from: ColType, to: ColType) -> bool {
     if numeric(from) && numeric(to) {
         return true;
     }
+    let oid_reference = |ctype| {
+        matches!(
+            ctype,
+            Oid | Regtype
+                | Regproc
+                | Regprocedure
+                | Regoper
+                | Regoperator
+                | Regclass
+                | Regnamespace
+                | Regrole
+        )
+    };
+    if (from == Int4 && oid_reference(to))
+        || (to == Int4 && oid_reference(from))
+        || (oid_reference(from) && oid_reference(to))
+    {
+        return true;
+    }
     // The remaining assignment/implicit pairs among the date/time and json
     // families, per pg_cast.
     matches!(
@@ -43792,6 +44308,9 @@ fn alter_type_auto_castable(from: ColType, to: ColType) -> bool {
             | (Interval, Time)
             | (Json, Jsonb)
             | (Jsonb, Json)
+            | (Cidr, Inet)
+            | (Bit { varying: false }, Bit { varying: true })
+            | (Bit { varying: true }, Bit { varying: false })
     )
 }
 

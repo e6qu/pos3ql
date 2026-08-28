@@ -2732,6 +2732,99 @@ impl Checkpointer {
                         })?;
                     storage.commit_routine_create(slot, 0);
                 }
+                Some("evt") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let slot: usize = parse_field(words.next(), "event trigger slot")?;
+                    let created_at = parse_field(words.next(), "event trigger created_at")?;
+                    let name =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("event trigger name missing"),
+                        )?)?)?;
+                    let event = crate::sql::ast::EventTriggerEvent::from_code(parse_field(
+                        words.next(),
+                        "event trigger event",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid event trigger event"))?;
+                    let function_schema = decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("event trigger function schema missing"),
+                    )?)?;
+                    let function_name = decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("event trigger function name missing"),
+                    )?)?;
+                    let function = storage
+                        .routine_slot_by_signature(&function_schema, &function_name, &[], 0)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "event trigger function missing",
+                        ))? as u16;
+                    let enabled = crate::storage::TriggerEnabled::from_code(parse_field(
+                        words.next(),
+                        "event trigger enabled mode",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt(
+                        "invalid event trigger enabled mode",
+                    ))?;
+                    let owner_name =
+                        decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "event trigger owner missing",
+                        ))?)?;
+                    let owner =
+                        storage
+                            .find_role(&owner_name)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "event trigger owner does not exist",
+                            ))? as u16;
+                    let tag_count: usize = parse_field(words.next(), "event trigger tag count")?;
+                    if tag_count > crate::storage::MAX_EVENT_TRIGGER_TAGS {
+                        return Err(CheckpointSetupError::Corrupt("too many event trigger tags"));
+                    }
+                    let mut decoded_tags =
+                        [StackStr::<{ crate::storage::EVENT_TRIGGER_TAG_MAX }>::new();
+                            crate::storage::MAX_EVENT_TRIGGER_TAGS];
+                    for decoded in decoded_tags.iter_mut().take(tag_count) {
+                        *decoded =
+                            StackStr::from_str(&decode_hex_name(words.next().ok_or(
+                                CheckpointSetupError::Corrupt("event trigger tag missing"),
+                            )?)?);
+                        if decoded.is_truncated() {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "event trigger tag too long",
+                            ));
+                        }
+                    }
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing event trigger fields",
+                        ));
+                    }
+                    let mut tag_values = [""; crate::storage::MAX_EVENT_TRIGGER_TAGS];
+                    for (index, decoded) in decoded_tags.iter().take(tag_count).enumerate() {
+                        tag_values[index] = decoded.as_str();
+                    }
+                    let tags = crate::storage::EventTriggerTags::parse(&tag_values[..tag_count])
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid event trigger tags"))?;
+                    storage
+                        .replay_event_trigger(
+                            slot,
+                            created_at,
+                            crate::storage::EventTriggerDefinition {
+                                name,
+                                event,
+                                function,
+                                tags,
+                                enabled,
+                                ownership: crate::storage::Ownership {
+                                    owner,
+                                    pending: None,
+                                },
+                            },
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest event trigger rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
                 Some("cst") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let created_at = parse_field(words.next(), "cast created_at")?;
@@ -6201,6 +6294,7 @@ impl Checkpointer {
                         crate::storage::RoutineKind::TableFunction
                         | crate::storage::RoutineKind::RecordFunction { .. }
                         | crate::storage::RoutineKind::Trigger
+                        | crate::storage::RoutineKind::EventTrigger
                         | crate::storage::RoutineKind::Procedure => ColType::Text,
                     }
                     .code(),
@@ -6226,6 +6320,37 @@ impl Checkpointer {
                     result_columns.as_str(),
                     creation_path.as_str(),
                     ManifestDependencies(storage.routine_dependencies_for(slot, 0)),
+                ),
+            )?;
+        }
+        for (slot, event_trigger) in storage.checkpoint_event_triggers() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                event_trigger.database,
+            )?;
+            use core::fmt::Write as _;
+            let definition = event_trigger.definition;
+            let routine = storage.routine(usize::from(definition.function));
+            let owner = storage.role(usize::from(definition.ownership.owner_to(0)));
+            let mut tags = StackStr::<{ crate::storage::MAX_EVENT_TRIGGER_TAGS * 132 + 4 }>::new();
+            let _ = write!(tags, "{}", definition.tags.values().len());
+            for tag in definition.tags.values() {
+                let _ = write!(tags, " {}", ManifestName(tag.as_str()));
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "evt {} {} {} {} {} {} {} {} {}",
+                    slot,
+                    event_trigger.created_at,
+                    ManifestName(definition.name.as_str()),
+                    definition.event.code(),
+                    ManifestName(routine.schema.as_str()),
+                    ManifestName(routine.name.as_str()),
+                    definition.enabled.code(),
+                    ManifestName(owner.name.as_str()),
+                    tags.as_str(),
                 ),
             )?;
         }

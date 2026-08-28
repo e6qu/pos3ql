@@ -7,6 +7,378 @@
 use super::*;
 
 #[test]
+fn event_trigger_lifecycle_firing_catalog_and_transactionality() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE event_trigger_audit(seq serial, event text, tag text); \
+         CREATE FUNCTION record_event_trigger() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO event_trigger_audit(event, tag) VALUES (TG_EVENT, TG_TAG); RETURN; END'; \
+         CREATE EVENT TRIGGER z_end ON ddl_command_end WHEN TAG IN ('CREATE TABLE') \
+           EXECUTE FUNCTION record_event_trigger(); \
+         CREATE EVENT TRIGGER a_start ON ddl_command_start WHEN TAG IN ('CREATE TABLE') \
+           EXECUTE PROCEDURE record_event_trigger(); \
+         CREATE TABLE event_trigger_first(value integer); \
+         SELECT event, tag FROM event_trigger_audit ORDER BY seq; \
+         SELECT evtname, evtevent, evtenabled, evttags::text \
+           FROM pg_event_trigger ORDER BY evtname; \
+         SELECT oid, typname, typtype, typcategory FROM pg_type \
+           WHERE typname IN ('trigger', 'event_trigger') ORDER BY oid; \
+         SELECT oid, proname, prorettype FROM pg_proc \
+           WHERE proname LIKE 'pg_event_trigger_table_rewrite_%' ORDER BY oid",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "ddl_command_start|CREATE TABLE",
+            "ddl_command_end|CREATE TABLE",
+            "a_start|ddl_command_start|O|{\"CREATE TABLE\"}",
+            "z_end|ddl_command_end|O|{\"CREATE TABLE\"}",
+            "2279|trigger|p|P",
+            "3838|event_trigger|p|P",
+            "4566|pg_event_trigger_table_rewrite_oid|26",
+            "4567|pg_event_trigger_table_rewrite_reason|23",
+        ]
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER EVENT TRIGGER a_start DISABLE; \
+         ALTER EVENT TRIGGER z_end RENAME TO b_end; \
+         CREATE TABLE event_trigger_second(value integer); \
+         SELECT event, tag FROM event_trigger_audit ORDER BY seq; \
+         SELECT evtname FROM pg_event_trigger ORDER BY evtname",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "ddl_command_start|CREATE TABLE",
+            "ddl_command_end|CREATE TABLE",
+            "ddl_command_end|CREATE TABLE",
+            "a_start",
+            "b_end",
+        ]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP EVENT TRIGGER b_end; ROLLBACK; \
+         SELECT count(*) FROM pg_event_trigger WHERE evtname = 'b_end'",
+    );
+    assert_eq!(data_rows(&output), ["1"]);
+
+    let original_oid = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid FROM pg_event_trigger WHERE evtname = 'b_end'",
+    ))
+    .pop()
+    .expect("event trigger has an OID");
+    let replacement = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP EVENT TRIGGER b_end; \
+         CREATE EVENT TRIGGER b_end ON ddl_command_end WHEN TAG IN ('CREATE TABLE') \
+           EXECUTE FUNCTION record_event_trigger(); \
+         SELECT oid FROM pg_event_trigger WHERE evtname = 'b_end'",
+    );
+    let replacement_oid = data_rows(&replacement)
+        .pop()
+        .expect("recreated event trigger has an OID");
+    assert_ne!(original_oid, replacement_oid);
+}
+
+#[test]
+fn event_trigger_rewrite_context_guc_and_dependencies_are_strict() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE rewrite_audit(relation_oid oid, reason integer, event text, tag text); \
+         CREATE TABLE rewrite_target(value integer); \
+         CREATE FUNCTION record_rewrite() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO rewrite_audit VALUES \
+              (pg_event_trigger_table_rewrite_oid(), \
+               pg_event_trigger_table_rewrite_reason(), TG_EVENT, TG_TAG); RETURN; END'; \
+         CREATE EVENT TRIGGER rewrite_event ON table_rewrite EXECUTE FUNCTION record_rewrite(); \
+         ALTER TABLE rewrite_target ALTER COLUMN value TYPE bigint; \
+         SELECT relation_oid = 'rewrite_target'::regclass::oid, reason, event, tag \
+           FROM rewrite_audit",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t|4|table_rewrite|ALTER TABLE"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "TRUNCATE rewrite_audit; \
+         CREATE TABLE rewrite_compatible(value varchar(10), address cidr); \
+         ALTER TABLE rewrite_compatible ALTER COLUMN value TYPE text; \
+         ALTER TABLE rewrite_compatible ALTER COLUMN value TYPE varchar; \
+         ALTER TABLE rewrite_compatible ALTER COLUMN address TYPE inet; \
+         ALTER TABLE rewrite_compatible ALTER COLUMN value TYPE text USING value::text; \
+         SELECT count(*) FROM rewrite_audit; \
+         CREATE TABLE rewrite_typmod(value numeric(10,4)); \
+         ALTER TABLE rewrite_typmod ALTER COLUMN value TYPE numeric(12,4); \
+         SELECT count(*) FROM rewrite_audit WHERE relation_oid IS NOT NULL; \
+         ALTER TABLE rewrite_typmod ALTER COLUMN value TYPE numeric(8,4); \
+         SELECT reason FROM rewrite_audit WHERE relation_oid = 'rewrite_typmod'::regclass::oid",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0", "0", "4"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let outside = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_event_trigger_table_rewrite_oid()",
+    );
+    let outside = String::from_utf8_lossy(&outside);
+    assert!(
+        outside.contains("can only be called in a table_rewrite event trigger function"),
+        "{outside}"
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION record_create() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO rewrite_audit(event, tag) VALUES (TG_EVENT, TG_TAG); RETURN; END'; \
+         CREATE EVENT TRIGGER create_event ON ddl_command_end WHEN TAG IN ('CREATE TABLE') \
+           EXECUTE FUNCTION record_create(); \
+         SET event_triggers = off; CREATE TABLE muted_event(value integer); \
+         RESET event_triggers; CREATE TABLE audible_event(value integer); \
+         SELECT event, tag FROM rewrite_audit WHERE relation_oid IS NULL",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["ddl_command_end|CREATE TABLE"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE EVENT TRIGGER utility_event ON ddl_command_end \
+           EXECUTE FUNCTION record_create()",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT 1 AS value INTO select_into_event; \
+         SELECT event, tag FROM rewrite_audit WHERE tag = 'SELECT INTO'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["ddl_command_end|SELECT INTO"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    for command in [
+        "ANALYZE rewrite_audit",
+        "VACUUM rewrite_audit",
+        "TRUNCATE rewrite_audit",
+    ] {
+        let output = run_with(&mut engine, &mut budget, command);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{command}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM rewrite_audit"
+        )),
+        ["0"]
+    );
+
+    let restrict = run_with(&mut engine, &mut budget, "DROP FUNCTION record_create()");
+    assert!(
+        String::from_utf8_lossy(&restrict).contains("event trigger objects depend on it"),
+        "{}",
+        String::from_utf8_lossy(&restrict)
+    );
+    let cascade = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP FUNCTION record_create() CASCADE; \
+         SELECT count(*) FROM pg_event_trigger WHERE evtname = 'create_event'",
+    );
+    assert_eq!(data_rows(&cascade), ["0"]);
+
+    let invalid = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE EVENT TRIGGER invalid_event ON login WHEN TAG IN ('CREATE TABLE') \
+           EXECUTE FUNCTION record_rewrite()",
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid).contains("WHEN clause is not supported for this event"),
+        "{}",
+        String::from_utf8_lossy(&invalid)
+    );
+
+    let invalid = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE EVENT TRIGGER invalid_tag ON ddl_command_end \
+           WHEN TAG IN (' CREATE TABLE ') EXECUTE FUNCTION record_rewrite()",
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid)
+            .contains("filter value \" CREATE TABLE \" not recognized"),
+        "{}",
+        String::from_utf8_lossy(&invalid)
+    );
+}
+
+#[test]
+fn event_triggers_survive_wal_checkpoint_and_object_recovery() {
+    let mut config = test_config("event-trigger-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("event-trigger-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_event_audit(event text, tag text); \
+             CREATE FUNCTION durable_event_function() RETURNS event_trigger LANGUAGE plpgsql AS \
+               'BEGIN INSERT INTO durable_event_audit VALUES (TG_EVENT, TG_TAG); RETURN; END'; \
+             CREATE EVENT TRIGGER durable_event ON ddl_command_end \
+               WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION durable_event_function(); \
+             COMMENT ON EVENT TRIGGER durable_event IS 'durable event trigger'",
+        );
+        assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+        engine.commit_wal().unwrap();
+    }
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE after_wal_replay(value integer); \
+             SELECT event, tag FROM durable_event_audit; \
+             SELECT obj_description(oid, 'pg_event_trigger') \
+               FROM pg_event_trigger WHERE evtname = 'durable_event'",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["ddl_command_end|CREATE TABLE", "durable event trigger"],
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "TRUNCATE durable_event_audit; \
+         CREATE TABLE after_checkpoint_recovery(value integer); \
+         SELECT event, tag FROM durable_event_audit",
+    );
+    assert_eq!(data_rows(&output), ["ddl_command_end|CREATE TABLE"]);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn login_event_triggers_commit_or_reject_the_login_atomically() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE login_audit(username text, event text, tag text); \
+         CREATE FUNCTION record_login() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO login_audit VALUES (current_user, TG_EVENT, TG_TAG); RETURN; END'; \
+         CREATE EVENT TRIGGER login_record ON login EXECUTE FUNCTION record_login()",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+
+    let guc = GucState::new();
+    let arena = Arena::new(&mut budget, "login event test", 1 << 18).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut cursors = test_cursors(&mut budget);
+    let mut buffer =
+        crate::mem::FixedBuf::new(&mut budget, "login event response", 1 << 16).unwrap();
+    engine
+        .execute_login_event_triggers(
+            &mut txn,
+            &mut cursors,
+            &guc,
+            &arena,
+            &mut Responder::new(&mut buffer),
+        )
+        .unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT username, event, tag FROM login_audit"
+        )),
+        ["postgres|login|LOGIN"]
+    );
+
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION reject_login() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN RAISE EXCEPTION ''login rejected''; END'; \
+         CREATE EVENT TRIGGER z_login_reject ON login EXECUTE FUNCTION reject_login()",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let arena = Arena::new(&mut budget, "rejected login event test", 1 << 18).unwrap();
+    let mut txn = TxnState::new(&mut budget, 1024).unwrap();
+    let mut cursors = test_cursors(&mut budget);
+    let mut buffer =
+        crate::mem::FixedBuf::new(&mut budget, "rejected login response", 1 << 16).unwrap();
+    let error = engine
+        .execute_login_event_triggers(
+            &mut txn,
+            &mut cursors,
+            &guc,
+            &arena,
+            &mut Responder::new(&mut buffer),
+        )
+        .expect_err("a failing login trigger rejects the login");
+    assert!(error.message.as_str().contains("login rejected"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM login_audit"
+        )),
+        ["1"]
+    );
+}
+
+#[test]
 fn collation_and_conversion_lifecycle_is_typed_transactional_and_executable() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(

@@ -37836,7 +37836,7 @@ fn decode_binary_field_with_context<'a>(
     };
     let via = |oid| crate::pg::conn::decode_binary_param(oid, bytes, arena).map_err(|_| bad());
     match ctype {
-        ColType::Void | ColType::Internal => Err(bad()),
+        ColType::Void | ColType::Internal | ColType::PgDdlCommand => Err(bad()),
         ColType::Bool => via(oids::BOOL),
         ColType::Int2 => {
             let b: [u8; 2] = bytes.try_into().map_err(|_| bad())?;
@@ -44616,6 +44616,105 @@ fn rename_stored_constraint(def: &mut TableDef, from: &str, to: SqlName) -> bool
     false
 }
 
+fn drop_column_constraints(
+    definition: &mut TableDef,
+    column: usize,
+    arena: &Arena,
+    removed: &mut [SqlName],
+) -> Result<usize, SqlError> {
+    let mut removed_count = 0usize;
+    let mut remember = |name: SqlName| -> Result<(), SqlError> {
+        let slot = removed.get_mut(removed_count).ok_or_else(|| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many constraints depend on one column"
+            )
+        })?;
+        *slot = name;
+        removed_count += 1;
+        Ok(())
+    };
+
+    let mut write = 0usize;
+    for read in 0..definition.n_checks {
+        let check = definition.checks[read];
+        let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+        if check_referenced_columns(expression, definition)? & (1u64 << column) != 0 {
+            remember(check.name)?;
+        } else {
+            definition.checks[write] = check;
+            write += 1;
+        }
+    }
+    definition.n_checks = write;
+
+    write = 0;
+    for read in 0..definition.n_uniques {
+        let mut key = definition.uniques[read];
+        if key.columns().contains(&(column as u16)) {
+            remember(key.name)?;
+            continue;
+        }
+        for key_column in &mut key.columns[..key.n_cols] {
+            if usize::from(*key_column) > column {
+                *key_column -= 1;
+            }
+        }
+        definition.uniques[write] = key;
+        write += 1;
+    }
+    definition.n_uniques = write;
+
+    write = 0;
+    for read in 0..definition.n_exclusions {
+        let mut exclusion = definition.exclusions[read];
+        if exclusion.columns().contains(&(column as u16)) {
+            remember(exclusion.name)?;
+            continue;
+        }
+        for key_column in &mut exclusion.columns[..exclusion.n_cols] {
+            if usize::from(*key_column) > column {
+                *key_column -= 1;
+            }
+        }
+        definition.exclusions[write] = exclusion;
+        write += 1;
+    }
+    definition.n_exclusions = write;
+
+    write = 0;
+    for read in 0..definition.n_fkeys {
+        let mut foreign_key = definition.fkeys[read];
+        if foreign_key.columns().contains(&(column as u16)) {
+            remember(foreign_key.name)?;
+            continue;
+        }
+        for child_column in &mut foreign_key.columns[..foreign_key.n_cols] {
+            if usize::from(*child_column) > column {
+                *child_column -= 1;
+            }
+        }
+        // A self-referential key's parent column numbers share this table's
+        // physical layout. Inbound keys on other tables are rewritten by the
+        // dependency path before this helper runs.
+        if foreign_key.parent_schema == definition.schema && foreign_key.parent == definition.name {
+            if foreign_key.parent_cols().contains(&(column as u16)) {
+                remember(foreign_key.name)?;
+                continue;
+            }
+            for parent_column in &mut foreign_key.parent_cols[..foreign_key.n_parent_cols] {
+                if usize::from(*parent_column) > column {
+                    *parent_column -= 1;
+                }
+            }
+        }
+        definition.fkeys[write] = foreign_key;
+        write += 1;
+    }
+    definition.n_fkeys = write;
+    Ok(removed_count)
+}
+
 /// If two rewritten rows `a` and `b` collide on a uniqueness constraint of
 /// `new_def` — a single-column UNIQUE/PRIMARY KEY flag or a multi-column key,
 /// with every key column non-NULL and equal — returns the constraint's
@@ -46108,6 +46207,57 @@ fn alter_table_inner(
                     )
                 {
                     return sql_fail(error);
+                }
+                let mut referenced_keys = [StackStr::<128>::new(); crate::storage::MAX_UNIQUES + 1];
+                let mut referenced_key_count = 0usize;
+                if new_def.columns[i].primary || new_def.columns[i].unique {
+                    referenced_keys[referenced_key_count] = if new_def.columns[i].primary {
+                        stack_format!(128, "{}_pkey", new_def.name.as_str())
+                    } else {
+                        stack_format!(
+                            128,
+                            "{}_{}_key",
+                            new_def.name.as_str(),
+                            new_def.columns[i].name.as_str()
+                        )
+                    };
+                    referenced_key_count += 1;
+                }
+                for key in new_def.uniques() {
+                    if key.columns().contains(&(i as u16)) {
+                        referenced_keys[referenced_key_count] =
+                            StackStr::from_str(key.name.as_str());
+                        referenced_key_count += 1;
+                    }
+                }
+                for key_name in &referenced_keys[..referenced_key_count] {
+                    if let Err(error) = drop_dependent_foreign_keys(
+                        storage,
+                        wal,
+                        txn,
+                        table_index,
+                        &mut new_def,
+                        key_name.as_str(),
+                        *cascade,
+                    ) {
+                        return sql_fail(error);
+                    }
+                }
+                let mut removed_constraints = [SqlName::EMPTY;
+                    crate::storage::MAX_CHECKS
+                        + crate::storage::MAX_UNIQUES
+                        + crate::storage::MAX_FKEYS
+                        + crate::storage::MAX_EXCLUSIONS];
+                let removed_count =
+                    match drop_column_constraints(&mut new_def, i, arena, &mut removed_constraints)
+                    {
+                        Ok(count) => count,
+                        Err(error) => return sql_fail(error),
+                    };
+                for name in &removed_constraints[..removed_count] {
+                    if let Err(error) = txn.drop_constraint(table_index as u32, *name) {
+                        return sql_fail(error);
+                    }
                 }
                 for slot in 0..storage.sequence_count() {
                     if matches!(

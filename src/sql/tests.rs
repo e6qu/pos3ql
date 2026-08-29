@@ -95,6 +95,568 @@ fn event_trigger_lifecycle_firing_catalog_and_transactionality() {
 }
 
 #[test]
+fn event_trigger_command_and_drop_graphs_are_queryable() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE ddl_graph_audit(seq serial, tag text, kind text, schema_name text, identity text, command_present boolean); \
+         CREATE TABLE drop_graph_audit(seq serial, kind text, original boolean, normal boolean, schema_name text, object_name text, identity text, address_names text[], address_args text[]); \
+         CREATE FUNCTION record_ddl_graph() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO ddl_graph_audit(tag, kind, schema_name, identity, command_present) \
+              SELECT command_tag, object_type, schema_name, object_identity, command IS NOT NULL \
+              FROM pg_event_trigger_ddl_commands(); RETURN; END'; \
+         CREATE FUNCTION record_drop_graph() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO drop_graph_audit(kind, original, normal, schema_name, object_name, identity, address_names, address_args) \
+              SELECT object_type, original, normal, schema_name, object_name, object_identity, address_names, address_args \
+              FROM pg_event_trigger_dropped_objects(); RETURN; END'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE EVENT TRIGGER record_ddl_graph_end ON ddl_command_end EXECUTE FUNCTION record_ddl_graph(); \
+         CREATE EVENT TRIGGER record_drop_graph_end ON sql_drop EXECUTE FUNCTION record_drop_graph()",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE graph_parent(id integer PRIMARY KEY, value integer CHECK (value > 0))",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let setup = run_with(&mut engine, &mut budget, "DROP TABLE graph_parent");
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT tag, kind, schema_name, identity, command_present FROM ddl_graph_audit ORDER BY seq; \
+         SELECT kind, original, normal, schema_name, object_name, identity, address_names::text, address_args::text FROM drop_graph_audit ORDER BY seq; \
+         SELECT oid, proname, proretset, prorettype, proallargtypes::text, proargmodes::text, proargnames::text \
+           FROM pg_proc WHERE oid IN (3566, 4568) ORDER BY oid; \
+         SELECT oid, typname, typlen, typtype, typcategory FROM pg_type WHERE oid = 32",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert!(
+        data_rows(&output)
+            .iter()
+            .any(|row| row == "CREATE TABLE|table|public|public.graph_parent|t"),
+        "{text}"
+    );
+    assert!(
+        data_rows(&output)
+            .iter()
+            .any(|row| row == "CREATE INDEX|index|public|public.graph_parent_pkey|t"),
+        "{text}"
+    );
+    assert!(
+        data_rows(&output).iter().any(|row| row
+            == "table|t|f|public|graph_parent|public.graph_parent|{public,graph_parent}|{}"),
+        "{text}"
+    );
+    for expected in [
+        "type|f|f|public|graph_parent|public.graph_parent|{public.graph_parent}|{}",
+        "type|f|f|public|_graph_parent|public.graph_parent[]|{public.graph_parent[]}|{}",
+        "table constraint|f|t|public|NULL|graph_parent_value_check on public.graph_parent|{public,graph_parent,graph_parent_value_check}|{}",
+        "table constraint|f|f|public|NULL|graph_parent_id_not_null on public.graph_parent|{public,graph_parent,graph_parent_id_not_null}|{}",
+        "table constraint|f|f|public|NULL|graph_parent_pkey on public.graph_parent|{public,graph_parent,graph_parent_pkey}|{}",
+        "index|f|f|public|graph_parent_pkey|public.graph_parent_pkey|{public,graph_parent_pkey}|{}",
+    ] {
+        assert!(
+            data_rows(&output).iter().any(|row| row == expected),
+            "missing {expected}: {text}"
+        );
+    }
+    assert!(
+        data_rows(&output)
+            .iter()
+            .any(|row| row.starts_with("3566|pg_event_trigger_dropped_objects|t|2249|")),
+        "{text}"
+    );
+    assert!(
+        data_rows(&output)
+            .iter()
+            .any(|row| row.starts_with("4568|pg_event_trigger_ddl_commands|t|2249|")),
+        "{text}"
+    );
+    assert!(
+        data_rows(&output)
+            .iter()
+            .any(|row| row == "32|pg_ddl_command|8|p|P"),
+        "{text}"
+    );
+
+    for statement in [
+        "CREATE SCHEMA graph_schema",
+        "CREATE TABLE graph_schema.base(value integer)",
+        "CREATE VIEW graph_schema.visible AS SELECT value FROM graph_schema.base",
+        "TRUNCATE drop_graph_audit",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}: {}",
+            statement,
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let schema_drop = run_with(&mut engine, &mut budget, "DROP SCHEMA graph_schema CASCADE");
+    let schema_drop_text = String::from_utf8_lossy(&schema_drop);
+    assert!(!schema_drop_text.contains("ERROR"), "{schema_drop_text}");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT kind,original,normal FROM drop_graph_audit \
+          WHERE kind IN ('schema','view','rule') ORDER BY seq",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["schema|t|f", "view|f|t", "rule|f|t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn event_trigger_original_routine_uses_the_typed_signature() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE routine_drop_graph(seq serial, original boolean, normal boolean, identity text, arg_count integer); \
+         CREATE FUNCTION capture_routine_drop() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO routine_drop_graph(original,normal,identity,arg_count) \
+              SELECT original,normal,object_identity,cardinality(address_args) \
+                FROM pg_event_trigger_dropped_objects() \
+               WHERE object_type = ''function''; RETURN; END'; \
+         CREATE EVENT TRIGGER capture_routine_drop_end ON sql_drop \
+           EXECUTE FUNCTION capture_routine_drop(); \
+         CREATE FUNCTION overloaded_drop(value integer) RETURNS integer \
+           LANGUAGE SQL RETURN value; \
+         CREATE FUNCTION overloaded_drop(value text) RETURNS integer \
+           LANGUAGE SQL RETURN overloaded_drop(1); \
+         DROP FUNCTION overloaded_drop(integer) CASCADE; \
+         SELECT original,normal,identity,arg_count FROM routine_drop_graph ORDER BY seq",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "t|f|public.overloaded_drop(integer)|1",
+            "f|t|public.overloaded_drop(pg_catalog.text)|1",
+        ]
+    );
+
+    const SCHEMA: &str = "event_identity_schema_with_a_deliberately_long_name";
+    const TYPE: &str = "event_identity_type_with_a_deliberately_long_name";
+    let argument = format!("{SCHEMA}.{TYPE}");
+    let signature = (0..16)
+        .map(|_| argument.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    for statement in [
+        format!("CREATE SCHEMA {SCHEMA}"),
+        format!("CREATE TYPE {SCHEMA}.{TYPE} AS ENUM ('value')"),
+        format!(
+            "CREATE FUNCTION {SCHEMA}.wide_identity({signature}) \
+             RETURNS integer LANGUAGE SQL RETURN 1"
+        ),
+        "TRUNCATE routine_drop_graph".to_owned(),
+        format!("DROP FUNCTION {SCHEMA}.wide_identity({signature})"),
+    ] {
+        let output = run_with(&mut engine, &mut budget, &statement);
+        let text = String::from_utf8_lossy(&output);
+        assert!(!text.contains("ERROR"), "{statement}: {text}");
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT length(identity) > 256,arg_count FROM routine_drop_graph",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["t|16"]);
+}
+
+#[test]
+fn event_trigger_alter_comment_owner_and_privilege_graphs_are_exact() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE ddl_detail(seq serial, classid oid, objid oid, objsubid integer, tag text, kind text, schema_name text, identity text); \
+         CREATE TABLE drop_detail(seq serial, classid oid, objsubid integer, original boolean, normal boolean, kind text, schema_name text, object_name text, identity text, names text[], args text[]); \
+         CREATE FUNCTION capture_ddl_detail() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO ddl_detail(classid,objid,objsubid,tag,kind,schema_name,identity) \
+              SELECT classid,objid,objsubid,command_tag,object_type,schema_name,object_identity \
+                FROM pg_event_trigger_ddl_commands(); RETURN; END'; \
+         CREATE FUNCTION capture_drop_detail() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO drop_detail(classid,objsubid,original,normal,kind,schema_name,object_name,identity,names,args) \
+              SELECT classid,objsubid,original,normal,object_type,schema_name,object_name,object_identity,address_names,address_args \
+                FROM pg_event_trigger_dropped_objects(); RETURN; END'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE EVENT TRIGGER capture_ddl_detail_end ON ddl_command_end EXECUTE FUNCTION capture_ddl_detail(); \
+         CREATE EVENT TRIGGER capture_drop_detail_end ON sql_drop EXECUTE FUNCTION capture_drop_detail()",
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE alter_graph(a integer NOT NULL, b text, \
+           CONSTRAINT alter_graph_check CHECK (a > 0), \
+           CONSTRAINT alter_graph_unique UNIQUE (b))",
+    );
+    run_with(&mut engine, &mut budget, "TRUNCATE ddl_detail, drop_detail");
+    let altered = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE alter_graph DROP COLUMN b CASCADE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&altered).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&altered)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT tag,kind,schema_name,identity FROM ddl_detail ORDER BY seq; \
+         SELECT classid::regclass::text,objsubid,original,normal,kind,schema_name,object_name,identity,names::text,args::text \
+           FROM drop_detail ORDER BY seq",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "ALTER TABLE|table|public|public.alter_graph",
+            "pg_class|2|t|f|table column|public|NULL|public.alter_graph.b|{public,alter_graph,b}|{}",
+            "pg_constraint|0|f|f|table constraint|public|NULL|alter_graph_unique on public.alter_graph|{public,alter_graph,alter_graph_unique}|{}",
+            "pg_class|0|f|f|index|public|alter_graph_unique|public.alter_graph_unique|{public,alter_graph_unique}|{}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_constraint \
+              WHERE conrelid = 'alter_graph'::regclass AND conname = 'alter_graph_unique'",
+        )),
+        ["0"]
+    );
+
+    run_with(&mut engine, &mut budget, "TRUNCATE ddl_detail, drop_detail");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE alter_graph DROP CONSTRAINT alter_graph_check",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT original,normal,kind,identity,names::text FROM drop_detail ORDER BY seq",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "t|f|table constraint|alter_graph_check on public.alter_graph|{public,alter_graph,alter_graph_check}"
+        ]
+    );
+
+    run_with(&mut engine, &mut budget, "TRUNCATE ddl_detail, drop_detail");
+    for statement in [
+        "COMMENT ON TABLE alter_graph IS 'table'",
+        "COMMENT ON COLUMN alter_graph.a IS 'column'",
+        "ALTER TABLE alter_graph OWNER TO postgres",
+        "GRANT SELECT ON alter_graph TO PUBLIC",
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC",
+    ] {
+        let result = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&result).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&result)
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT classid::regclass::text,objid IS NULL,objsubid,tag,kind,schema_name,identity \
+           FROM ddl_detail ORDER BY seq",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "pg_class|f|0|COMMENT|table|public|public.alter_graph",
+            "pg_class|f|1|COMMENT|table column|public|public.alter_graph.a",
+            "pg_class|f|0|ALTER TABLE|table|public|public.alter_graph",
+            "NULL|t|NULL|GRANT|TABLE|NULL|NULL",
+            "NULL|t|NULL|ALTER DEFAULT PRIVILEGES|TABLES|NULL|NULL",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE graph_fk_parent(id integer PRIMARY KEY); \
+         CREATE TABLE graph_fk_child(parent_id integer REFERENCES graph_fk_parent(id))",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_trigger t JOIN pg_constraint c ON c.oid=t.tgconstraint \
+              WHERE c.conname='graph_fk_child_parent_id_fkey' AND t.tgisinternal",
+        )),
+        ["4"]
+    );
+    run_with(&mut engine, &mut budget, "TRUNCATE ddl_detail, drop_detail");
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE graph_fk_parent DROP COLUMN id",
+    );
+    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM ddl_detail; SELECT count(*) FROM drop_detail",
+        )),
+        ["0", "0"]
+    );
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE graph_fk_parent DROP COLUMN id CASCADE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&cascaded).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&cascaded)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT tag,kind,identity FROM ddl_detail ORDER BY seq; \
+         SELECT original,normal,kind,identity FROM drop_detail ORDER BY seq; \
+         SELECT count(*) FROM pg_constraint WHERE conname='graph_fk_child_parent_id_fkey'; \
+         SELECT count(*) FROM pg_trigger t JOIN pg_constraint c ON c.oid=t.tgconstraint \
+           WHERE c.conname='graph_fk_child_parent_id_fkey'",
+    );
+    let rows = data_rows(&output);
+    assert_eq!(rows[0], "ALTER TABLE|table|public.graph_fk_parent");
+    assert!(rows.iter().any(|row| {
+        row == "f|t|table constraint|graph_fk_child_parent_id_fkey on public.graph_fk_child"
+    }));
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.starts_with("f|f|trigger|\"RI_ConstraintTrigger_"))
+            .count(),
+        4,
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(&rows[rows.len() - 2..], ["0", "0"]);
+}
+
+#[test]
+fn event_trigger_catalog_dependents_and_toast_state_survive_recovery() {
+    let mut config = test_config("event-trigger-catalog-dependents");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace =
+        format!("event-trigger-catalog-dependents-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE recovered_drop(kind text, identity text); \
+             CREATE FUNCTION capture_recovered_drop() RETURNS event_trigger LANGUAGE plpgsql AS \
+               'BEGIN INSERT INTO recovered_drop SELECT object_type, object_identity \
+                  FROM pg_event_trigger_dropped_objects(); RETURN; END'; \
+             CREATE EVENT TRIGGER capture_recovered_drop_end ON sql_drop \
+               EXECUTE FUNCTION capture_recovered_drop(); \
+             CREATE TABLE recovered_toast(id integer PRIMARY KEY, payload text); \
+             ALTER TABLE recovered_toast DROP COLUMN payload; \
+             CREATE TABLE ri_parent(id integer PRIMARY KEY); \
+             CREATE TABLE ri_child(\
+               cascade_id integer REFERENCES ri_parent(id) ON DELETE CASCADE ON UPDATE CASCADE, \
+               restricted_id integer REFERENCES ri_parent(id) ON DELETE RESTRICT ON UPDATE RESTRICT, \
+               nullable_id integer REFERENCES ri_parent(id) ON DELETE SET NULL ON UPDATE SET NULL, \
+               defaulted_id integer REFERENCES ri_parent(id) ON DELETE SET DEFAULT ON UPDATE SET DEFAULT); \
+             SELECT toast.relkind,index_relation.relkind,toast.relnatts,index_relation.relnatts,\
+                    toast.relam,index_relation.relam,toast.relhasindex,index_relation.relhasindex \
+               FROM pg_class base \
+               JOIN pg_class toast ON toast.oid=base.reltoastrelid \
+               JOIN pg_index index_catalog ON index_catalog.indrelid=toast.oid \
+               JOIN pg_class index_relation ON index_relation.oid=index_catalog.indexrelid \
+              WHERE base.oid='recovered_toast'::regclass; \
+             SELECT count(*) FROM pg_attribute attribute JOIN pg_class toast \
+               ON toast.oid=attribute.attrelid \
+              WHERE toast.oid=(SELECT reltoastrelid FROM pg_class \
+                                WHERE oid='recovered_toast'::regclass) \
+                AND attribute.attnum>0; \
+             SELECT count(*) FROM pg_attribute attribute JOIN pg_index index_catalog \
+               ON index_catalog.indexrelid=attribute.attrelid \
+              WHERE index_catalog.indrelid=(SELECT reltoastrelid FROM pg_class \
+                                             WHERE oid='recovered_toast'::regclass) \
+                AND attribute.attnum>0; \
+             SELECT string_agg(DISTINCT routine.proname, ',' ORDER BY routine.proname) \
+               FROM pg_trigger trigger_catalog \
+               JOIN pg_proc routine ON routine.oid=trigger_catalog.tgfoid \
+              WHERE trigger_catalog.tgconstraint IN \
+                    (SELECT oid FROM pg_constraint WHERE conrelid='ri_child'::regclass)",
+        );
+        let text = String::from_utf8_lossy(&output);
+        assert!(!text.contains("ERROR"), "{text}");
+        assert_eq!(
+            data_rows(&output),
+            [
+                "t|i|3|2|2|403|t|f",
+                "3",
+                "2",
+                "RI_FKey_cascade_del,RI_FKey_cascade_upd,RI_FKey_check_ins,RI_FKey_check_upd,RI_FKey_restrict_del,RI_FKey_restrict_upd,RI_FKey_setdefault_del,RI_FKey_setdefault_upd,RI_FKey_setnull_del,RI_FKey_setnull_upd",
+            ]
+        );
+        engine.commit_wal().unwrap();
+    }
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        assert_eq!(
+            data_rows(&run_with(
+                &mut engine,
+                &mut budget,
+                "SELECT reltoastrelid <> 0 FROM pg_class WHERE oid='recovered_toast'::regclass"
+            )),
+            ["t"]
+        );
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
+    }
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "TRUNCATE recovered_drop; DROP TABLE recovered_toast; \
+         SELECT kind, identity LIKE 'pg_toast.pg_toast_%' \
+           FROM recovered_drop \
+          WHERE kind='toast table' OR (kind='index' AND identity LIKE 'pg_toast.%') \
+          ORDER BY kind",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["index|t", "toast table|t"]);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn event_trigger_comment_identities_include_builtin_types_and_view_columns() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE comment_command(kind text, schema_name text, identity text, subid integer); \
+         CREATE FUNCTION capture_comment_command() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO comment_command \
+              SELECT object_type,schema_name,object_identity,objsubid \
+                FROM pg_event_trigger_ddl_commands(); RETURN; END'; \
+         CREATE EVENT TRIGGER capture_comment_command_end ON ddl_command_end \
+           WHEN TAG IN ('COMMENT') EXECUTE FUNCTION capture_comment_command(); \
+         CREATE VIEW comment_view AS SELECT 1 AS value; \
+         COMMENT ON TYPE integer IS 'built in'; \
+         COMMENT ON COLUMN comment_view.value IS 'view field'; \
+         SELECT kind,schema_name,identity,subid FROM comment_command ORDER BY subid",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "type|pg_catalog|integer|0",
+            "view column|public|public.comment_view.value|1",
+        ]
+    );
+}
+
+#[test]
+fn event_trigger_extension_commands_mark_script_members() {
+    let mut config = test_config("event-trigger-extension-commands");
+    config.extension_control_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/external/extensions")
+        .to_str()
+        .unwrap()
+        .to_string();
+    config.work_arena_bytes = 8 << 20;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE extension_commands(tag text,kind text,identity text,in_extension boolean); \
+         CREATE FUNCTION capture_extension_commands() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO public.extension_commands \
+              SELECT command_tag,object_type,object_identity,in_extension \
+                FROM pg_event_trigger_ddl_commands(); RETURN; END'; \
+         CREATE EVENT TRIGGER capture_extension_commands_end ON ddl_command_end \
+           EXECUTE FUNCTION capture_extension_commands(); \
+         CREATE SCHEMA extension_event; \
+         CREATE EXTENSION pos3ql_base SCHEMA extension_event",
+    );
+    let setup_text = String::from_utf8_lossy(&setup);
+    assert!(!setup_text.contains("ERROR"), "{setup_text}");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT tag,kind,identity,in_extension FROM extension_commands \
+          WHERE identity IN ('pos3ql_base','extension_event.extension_base_marker') \
+          ORDER BY in_extension,kind",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "CREATE EXTENSION|extension|pos3ql_base|f",
+            "CREATE TABLE|table|extension_event.extension_base_marker|t",
+        ]
+    );
+}
+
+#[test]
 fn event_trigger_rewrite_context_guc_and_dependencies_are_strict() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -12665,7 +13227,10 @@ fn catalog_indexes_and_constraints_for_psql_d() {
         &mut e,
         &mut b,
         &mut t,
-        "SELECT relname FROM pg_class WHERE relkind = 'i' ORDER BY relname",
+        "SELECT relation.relname FROM pg_class relation JOIN pg_namespace namespace \
+           ON namespace.oid=relation.relnamespace \
+          WHERE relation.relkind = 'i' AND namespace.nspname = 'public' \
+          ORDER BY relation.relname",
     ));
     assert_eq!(
         index,

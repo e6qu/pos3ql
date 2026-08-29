@@ -20,7 +20,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
         n += match v {
             // Records are transient values, never stored in a row (a column
             // cannot be composite-typed here).
-            Datum::Record(_) | Datum::Composite { .. } => {
+            Datum::Record(_) | Datum::Composite { .. } | Datum::PgDdlCommand => {
                 unreachable!("record cannot be a stored column value")
             }
             Datum::CompositeText { text, .. } => 5 + text.len(),
@@ -80,7 +80,7 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
         }
         let take;
         match v {
-            Datum::Record(_) | Datum::Composite { .. } => {
+            Datum::Record(_) | Datum::Composite { .. } | Datum::PgDdlCommand => {
                 unreachable!("record cannot be a stored column value")
             }
             Datum::CompositeText {
@@ -344,6 +344,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         }
         ColType::Void
         | ColType::Internal
+        | ColType::PgDdlCommand
         | ColType::Int2Vector
         | ColType::OidVector
         | ColType::PgNodeTree
@@ -395,7 +396,7 @@ pub(crate) fn decode<'a>(
         // int2/float4/varchar/bpchar share the byte layout of their storage
         // type (int4/float8/text), so they decode through the same arm.
         match schema[i] {
-            ColType::Void | ColType::Internal => return Err(corrupt()),
+            ColType::Void | ColType::Internal | ColType::PgDdlCommand => return Err(corrupt()),
             ColType::Int2Vector => {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,

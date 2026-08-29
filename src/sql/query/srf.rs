@@ -26,7 +26,8 @@ use super::{QueryScope, arena_full, describe_scope_items, record_star_width};
 
 /// Whether `name` is one of the supported set-returning functions.
 pub(crate) fn is_srf_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("_pg_expandarray")
+    is_event_trigger_introspection(name)
+        || name.eq_ignore_ascii_case("_pg_expandarray")
         || name.eq_ignore_ascii_case("unnest")
         || name.eq_ignore_ascii_case("generate_series")
         || name.eq_ignore_ascii_case("regexp_matches")
@@ -42,6 +43,191 @@ pub(crate) fn is_srf_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("pg_options_to_table")
         || name.eq_ignore_ascii_case("pg_get_sequence_data")
         || is_json_each_name(name)
+}
+
+fn is_event_trigger_introspection(name: &str) -> bool {
+    name.eq_ignore_ascii_case("pg_event_trigger_ddl_commands")
+        || name.eq_ignore_ascii_case("pg_event_trigger_dropped_objects")
+}
+
+fn require_no_arguments(name: &str, arguments: &[&Expr<'_>]) -> Result<(), SqlError> {
+    if arguments.is_empty() {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "function {}(...) does not exist",
+            name
+        ))
+    }
+}
+
+fn event_trigger_column_names(name: &str) -> &'static [&'static str] {
+    if name.eq_ignore_ascii_case("pg_event_trigger_ddl_commands") {
+        &[
+            "classid",
+            "objid",
+            "objsubid",
+            "command_tag",
+            "object_type",
+            "schema_name",
+            "object_identity",
+            "in_extension",
+            "command",
+        ]
+    } else {
+        &[
+            "classid",
+            "objid",
+            "objsubid",
+            "original",
+            "normal",
+            "is_temporary",
+            "object_type",
+            "schema_name",
+            "object_name",
+            "object_identity",
+            "address_names",
+            "address_args",
+        ]
+    }
+}
+
+fn event_trigger_column_types(name: &str) -> &'static [ColType] {
+    if name.eq_ignore_ascii_case("pg_event_trigger_ddl_commands") {
+        &[
+            ColType::Oid,
+            ColType::Oid,
+            ColType::Int4,
+            ColType::Text,
+            ColType::Text,
+            ColType::Text,
+            ColType::Text,
+            ColType::Bool,
+            ColType::PgDdlCommand,
+        ]
+    } else {
+        &[
+            ColType::Oid,
+            ColType::Oid,
+            ColType::Int4,
+            ColType::Bool,
+            ColType::Bool,
+            ColType::Bool,
+            ColType::Text,
+            ColType::Text,
+            ColType::Text,
+            ColType::Text,
+            ColType::Array(crate::sql::types::ArrElem::Text),
+            ColType::Array(crate::sql::types::ArrElem::Text),
+        ]
+    }
+}
+
+fn event_text_array<'a, const N: usize>(
+    parts: &[StackStr<N>],
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; crate::sql::event_trigger::MAX_ADDRESS_PARTS];
+    for (value, part) in values.iter_mut().zip(parts) {
+        *value = Datum::Text(part.as_str());
+    }
+    Ok(Datum::Array {
+        element: crate::sql::types::ArrElem::Text,
+        raw: crate::sql::array::build(&values[..parts.len()], arena)?,
+    })
+}
+
+fn event_trigger_rows<'a>(
+    name: &str,
+    arguments: &[&Expr<'_>],
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [&'a [u8]], SqlError> {
+    require_no_arguments(name, arguments)?;
+    const EMPTY: &[u8] = &[];
+    if name.eq_ignore_ascii_case("pg_event_trigger_ddl_commands") {
+        return crate::sql::event_trigger::with_ddl_commands(|commands| {
+            let rows = arena
+                .alloc_slice_with(commands.len(), |_| EMPTY)
+                .map_err(|_| arena_full())?;
+            for (slot, command) in rows.iter_mut().zip(commands) {
+                let object = command.object(storage, txid)?;
+                let addressed = command.addressed();
+                let class_id = if addressed {
+                    Datum::Oid(object.class_id as u32)
+                } else {
+                    Datum::Null
+                };
+                let object_id = if addressed {
+                    Datum::Oid(object.object_id as u32)
+                } else {
+                    Datum::Null
+                };
+                let sub_id = if addressed {
+                    Datum::Int4(object.sub_id)
+                } else {
+                    Datum::Null
+                };
+                let identity = if addressed {
+                    Datum::Text(object.identity.as_str())
+                } else {
+                    Datum::Null
+                };
+                *slot = crate::sql::exec::encode_projected_pub(
+                    &[
+                        class_id,
+                        object_id,
+                        sub_id,
+                        Datum::Text(command.command_tag.as_str()),
+                        Datum::Text(object.object_type.as_str()),
+                        object
+                            .schema_name
+                            .as_ref()
+                            .map_or(Datum::Null, |v| Datum::Text(v.as_str())),
+                        identity,
+                        Datum::Bool(command.in_extension),
+                        Datum::PgDdlCommand,
+                    ],
+                    arena,
+                )?;
+            }
+            Ok(&*rows)
+        })?;
+    }
+    crate::sql::event_trigger::with_dropped_objects(|objects| {
+        let rows = arena
+            .alloc_slice_with(objects.len(), |_| EMPTY)
+            .map_err(|_| arena_full())?;
+        for (slot, dropped) in rows.iter_mut().zip(objects) {
+            let object = dropped.object(storage, txid)?;
+            *slot = crate::sql::exec::encode_projected_pub(
+                &[
+                    Datum::Oid(object.class_id as u32),
+                    Datum::Oid(object.object_id as u32),
+                    Datum::Int4(object.sub_id),
+                    Datum::Bool(dropped.original),
+                    Datum::Bool(dropped.normal),
+                    Datum::Bool(dropped.temporary),
+                    Datum::Text(object.object_type.as_str()),
+                    object
+                        .schema_name
+                        .as_ref()
+                        .map_or(Datum::Null, |v| Datum::Text(v.as_str())),
+                    object
+                        .object_name
+                        .as_ref()
+                        .map_or(Datum::Null, |v| Datum::Text(v.as_str())),
+                    Datum::Text(object.identity.as_str()),
+                    event_text_array(&object.address_names[..object.address_name_count], arena)?,
+                    event_text_array(&object.address_args[..object.address_arg_count], arena)?,
+                ],
+                arena,
+            )?;
+        }
+        Ok(&*rows)
+    })?
 }
 
 fn srf_signature_error(name: &str) -> SqlError {
@@ -310,6 +496,29 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
         let Expr::Call { name, args, .. } = expression else {
             unreachable!("project-set materialization requires a call")
         };
+        if is_event_trigger_introspection(name) {
+            let rows = event_trigger_rows(name, args, storage, txid, arena)?;
+            let names = event_trigger_column_names(name);
+            let types = event_trigger_column_types(name);
+            let values = arena
+                .alloc_slice_with(rows.len(), |_| Datum::Null)
+                .map_err(|_| arena_full())?;
+            for (value, encoded) in values.iter_mut().zip(rows) {
+                let fields = arena
+                    .alloc_slice_with(names.len(), |index| crate::sql::types::RecordField {
+                        name: names[index],
+                        type_oid: types[index].oid(),
+                        value: Datum::Null,
+                    })
+                    .map_err(|_| arena_full())?;
+                for (index, field) in fields.iter_mut().enumerate() {
+                    field.value =
+                        crate::sql::exec::decode_projected_col_record(encoded, index, arena)?;
+                }
+                *value = Datum::Record(fields);
+            }
+            return Ok(values);
+        }
         if is_srf_name(name) {
             let count = srf_count(expression, arena, params, row, hooks)?;
             let values = arena
@@ -446,6 +655,14 @@ pub(super) fn srf_count<'a, R: ColumnLookup<'a>>(
     let Expr::Call { name, args, .. } = call else {
         return Ok(1);
     };
+    if is_event_trigger_introspection(name) {
+        require_no_arguments(name, args)?;
+        return if name.eq_ignore_ascii_case("pg_event_trigger_ddl_commands") {
+            crate::sql::event_trigger::with_ddl_commands(|rows| rows.len())
+        } else {
+            crate::sql::event_trigger::with_dropped_objects(|rows| rows.len())
+        };
+    }
     let as_i64 = |d: &Datum| -> Option<i64> {
         match d {
             Datum::Int4(v) => Some(*v as i64),
@@ -1140,6 +1357,7 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     let is_stt = tref.table.eq_ignore_ascii_case("string_to_table");
     let is_options = tref.table.eq_ignore_ascii_case("pg_options_to_table");
     let is_sequence_data = tref.table.eq_ignore_ascii_case("pg_get_sequence_data");
+    let is_event_introspection = is_event_trigger_introspection(tref.table);
     let built_in = is_gs
         || is_unnest
         || is_re
@@ -1150,7 +1368,8 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
         || is_gsub
         || is_stt
         || is_options
-        || is_sequence_data;
+        || is_sequence_data
+        || is_event_introspection;
     let routine = if built_in {
         None
     } else {
@@ -1170,7 +1389,21 @@ pub(super) fn table_func_def_outer<'a, C: ColumnLookup<'a>>(
     // text[]; unnest yields the array's element type; array_elements' default
     // column is `value`.
     let mut default_cols = [ColumnMeta::EMPTY; MAX_COLUMNS];
-    let n_default = if let Some((_, routine)) = routine {
+    let n_default = if is_event_introspection {
+        require_no_arguments(tref.table, tref.func_args.unwrap_or(&[]))?;
+        let names = event_trigger_column_names(tref.table);
+        let types = event_trigger_column_types(tref.table);
+        for index in 0..names.len() {
+            default_cols[index] = table_function_column(
+                SqlName::parse(names[index])?,
+                types[index],
+                None,
+                -1,
+                crate::sql::ast::Collation::None,
+            );
+        }
+        names.len()
+    } else if let Some((_, routine)) = routine {
         if let Some(output) = routine.table_columns() {
             for (slot, column) in output.iter().enumerate() {
                 default_cols[slot] = table_function_column(
@@ -1617,6 +1850,9 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         );
     }
     let args = tref.func_args.expect("table function carries arguments");
+    if is_event_trigger_introspection(tref.table) {
+        return event_trigger_rows(tref.table, args, storage, txid, arena);
+    }
     let eval_argument = |argument| match eval_hooks {
         Some(hooks) => crate::sql::eval::eval_full(argument, arena, params, columns, hooks),
         None => crate::sql::eval::eval(argument, arena, params, columns),

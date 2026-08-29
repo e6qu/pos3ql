@@ -149,7 +149,7 @@ pub(crate) fn projected_row_width(bytes: &[u8]) -> usize {
 /// The projected-encoding byte length of one value (tag + payload).
 pub fn projected_value_len(v: &Datum) -> usize {
     1 + match v {
-        Datum::Null => 0,
+        Datum::Null | Datum::PgDdlCommand => 0,
         Datum::Bool(_) => 1,
         Datum::Int2(_) => 2,
         Datum::Float4(_) => 4,
@@ -224,6 +224,10 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
     match v {
         Datum::Null => {
             out[0] = 0;
+            1
+        }
+        Datum::PgDdlCommand => {
+            out[0] = 36;
             1
         }
         Datum::Bool(b) => {
@@ -525,6 +529,7 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
 pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, usize) {
     match tag {
         0 => (Datum::Null, 0),
+        36 => (Datum::PgDdlCommand, 0),
         1 => (Datum::Bool(bytes[at] != 0), 1),
         2 => (
             Datum::Int4(i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),

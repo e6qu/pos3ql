@@ -9,6 +9,7 @@ pub mod cursor;
 pub mod datetime;
 pub mod encoding;
 pub mod eval;
+pub(crate) mod event_trigger;
 pub mod exec;
 mod explain;
 pub(crate) mod external;
@@ -787,7 +788,9 @@ fn event_trigger_drop_command(statement: &Stmt<'_>) -> bool {
         Stmt::AlterTable(alter) => alter.actions.iter().any(|action| {
             matches!(
                 action,
-                ast::AlterAction::DropColumn { .. } | ast::AlterAction::DropConstraint { .. }
+                ast::AlterAction::DropColumn { .. }
+                    | ast::AlterAction::DropConstraint { .. }
+                    | ast::AlterAction::DropNotNull { .. }
             )
         }),
         Stmt::DropOwned { .. } => true,
@@ -847,6 +850,27 @@ struct EventTriggerExecution<'a, 'response> {
     guc: &'a GucState,
     arena: &'a Arena,
     responder: &'a mut Responder<'response>,
+}
+
+fn has_event_trigger(
+    storage: &Storage,
+    txn: &TxnState,
+    guc: &GucState,
+    event: ast::EventTriggerEvent,
+    tag: &str,
+) -> bool {
+    guc.event_triggers()
+        && storage
+            .event_triggers_visible_to(txn.txid)
+            .any(|(_, trigger)| {
+                trigger.event == event
+                    && trigger.tags.matches(tag)
+                    && if txn.replication_apply {
+                        trigger.enabled.fires_for_replication()
+                    } else {
+                        trigger.enabled.fires_for_origin()
+                    }
+            })
 }
 
 impl<'a> EventTriggerInvocation<'a> {
@@ -9249,7 +9273,8 @@ impl Engine {
         routine_transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        self.execute_stmt_with_workspace(
+        let prior_origin = txn.enter_ddl_origin();
+        let result = self.execute_stmt_with_workspace(
             statement,
             arena,
             params,
@@ -9261,7 +9286,9 @@ impl Engine {
             responder,
             true,
             None,
-        )
+        );
+        txn.leave_ddl_origin(prior_origin);
+        result
     }
 
     /// Dispatches a statement entered from an SQL routine.  The enclosing
@@ -9280,7 +9307,8 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        self.execute_stmt_with_workspace(
+        let prior_origin = txn.enter_ddl_origin();
+        let result = self.execute_stmt_with_workspace(
             statement,
             arena,
             params,
@@ -9292,7 +9320,9 @@ impl Engine {
             responder,
             false,
             capture,
-        )
+        );
+        txn.leave_ddl_origin(prior_origin);
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9559,6 +9589,38 @@ impl Engine {
         {
             return Ok(Err(error));
         }
+        // Event-trigger introspection is scoped to mutations performed by this
+        // command. DDL executed by a start trigger has already completed its
+        // own nested invocation and must not leak into the outer command set.
+        let event_ddl_mark = txn.ddl().len();
+        let event_ddl_origin = txn.ddl_origin();
+        let event_drop = event_tag.is_some_and(|tag| {
+            event_trigger_drop_command(statement)
+                && has_event_trigger(
+                    &self.storage,
+                    txn,
+                    guc,
+                    ast::EventTriggerEvent::SqlDrop,
+                    tag,
+                )
+        });
+        let event_end = event_tag.is_some_and(|tag| {
+            has_event_trigger(
+                &self.storage,
+                txn,
+                guc,
+                ast::EventTriggerEvent::DdlCommandEnd,
+                tag,
+            )
+        });
+        let event_before = if event_drop || event_end {
+            match event_trigger::capture_before(&self.storage, txn.txid, statement, arena) {
+                Ok(before) => before,
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            event_trigger::BeforeDdl::EMPTY
+        };
         let outcome = match statement {
             Stmt::Explain { options, statement } => {
                 let plan = match statement {
@@ -11904,11 +11966,35 @@ impl Engine {
                 Ok(Ok(()))
             }
         };
-        if outcome.is_ok()
+        if matches!(outcome, Ok(Ok(())))
+            && (event_drop || event_end)
             && let Some(tag) = event_tag
         {
-            if event_trigger_drop_command(statement)
-                && let Err(error) = self.fire_event_triggers(
+            let mut commands = [event_trigger::DdlCommand::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
+            let mut drops = [event_trigger::DroppedObject::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
+            let (command_count, drop_count) = match event_trigger::collect(
+                &self.storage,
+                txn.txid,
+                statement,
+                tag,
+                event_trigger::CollectChanges {
+                    before: event_before,
+                    undo: &txn.ddl()[event_ddl_mark..],
+                    undo_origins: &txn.ddl_origins()[event_ddl_mark..],
+                    origin: event_ddl_origin,
+                    in_extension: txn.in_extension_script(),
+                },
+                event_trigger::EventGraphs {
+                    commands: &mut commands,
+                    drops: &mut drops,
+                },
+            ) {
+                Ok(counts) => counts,
+                Err(error) => return Ok(Err(error)),
+            };
+            if event_drop {
+                let _scope = event_trigger::enter_dropped_objects(&drops[..drop_count]);
+                if let Err(error) = self.fire_event_triggers(
                     EventTriggerInvocation::SqlDrop { tag },
                     EventTriggerExecution {
                         txn,
@@ -11917,21 +12003,24 @@ impl Engine {
                         arena,
                         responder,
                     },
-                )
-            {
-                return Ok(Err(error));
+                ) {
+                    return Ok(Err(error));
+                }
             }
-            if let Err(error) = self.fire_event_triggers(
-                EventTriggerInvocation::DdlCommandEnd { tag },
-                EventTriggerExecution {
-                    txn,
-                    cursors,
-                    guc,
-                    arena,
-                    responder,
-                },
-            ) {
-                return Ok(Err(error));
+            if event_end {
+                let _scope = event_trigger::enter_ddl_commands(&commands[..command_count]);
+                if let Err(error) = self.fire_event_triggers(
+                    EventTriggerInvocation::DdlCommandEnd { tag },
+                    EventTriggerExecution {
+                        txn,
+                        cursors,
+                        guc,
+                        arena,
+                        responder,
+                    },
+                ) {
+                    return Ok(Err(error));
+                }
             }
         }
         outcome
@@ -11963,7 +12052,8 @@ impl Engine {
                 }
                 return Ok(Err(error));
             }
-            match self.execute_extension_script(
+            txn.enter_extension_script();
+            let script_result = self.execute_extension_script(
                 plan.extension,
                 plan.package,
                 *script as usize,
@@ -11975,7 +12065,9 @@ impl Engine {
                 cursors,
                 guc,
                 responder,
-            ) {
+            );
+            txn.leave_extension_script();
+            match script_result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     if plan.run_as_bootstrap {
@@ -12191,6 +12283,7 @@ impl Engine {
             }
         };
         loop {
+            let statement_mark = arena.mark();
             let statement = match parser.next_stmt() {
                 Ok(Some(statement)) => statement,
                 Ok(None) => break,
@@ -12261,6 +12354,9 @@ impl Engine {
                     return Ok(Err(error));
                 }
             }
+            // The parser cursor and rendered script live below this mark; the
+            // completed statement has published every durable effect.
+            unsafe { arena.rewind_to(statement_mark) };
         }
         let _ = guc.set("search_path", old_path.as_str(), true);
         Ok(Ok(()))

@@ -847,9 +847,13 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
         Expr::Cast {
             operand, type_name, ..
         } => match operand {
-            Expr::Column { .. } | Expr::Call { .. } | Expr::Array(_) | Expr::ArraySubquery(_) => {
-                name_of(operand)
-            }
+            Expr::Column { .. }
+            | Expr::Call { .. }
+            | Expr::Array(_)
+            | Expr::ArraySubquery(_)
+            | Expr::Case {
+                synthetic: false, ..
+            } => name_of(operand),
             Expr::Cast { operand, .. } => {
                 cast_source_name(operand).or_else(|| cast_target_name(type_name))
             }

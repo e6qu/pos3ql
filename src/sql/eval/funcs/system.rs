@@ -1512,6 +1512,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Record(_) => "record",
                     Datum::Enum { .. } => "enum",
                     Datum::Composite { .. } | Datum::CompositeText { .. } => "record",
+                    Datum::PgDdlCommand => "pg_ddl_command",
                 };
                 Ok(regtype(referenced_oid, name))
             }

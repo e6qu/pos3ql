@@ -1159,13 +1159,15 @@ impl Checkpointer {
                     if n_cols > MAX_COLUMNS {
                         return Err(CheckpointSetupError::Corrupt("too many columns"));
                     }
-                    let name = rest_of(line, 3)?;
+                    let has_toast = parse_bool_field(words.next(), "table toast relation")?;
+                    let name = rest_of(line, 4)?;
                     let def = TableDef {
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
                         name: sql_name(name)?,
                         columns: [empty_column(); MAX_COLUMNS],
                         n_columns: n_cols,
+                        has_toast,
                         ..TableDef::empty()
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
@@ -5249,8 +5251,9 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "table {slot} {} {}",
+                    "table {slot} {} {} {}",
                     table.def.n_columns,
+                    u8::from(table.def.has_toast),
                     table.def.name.as_str()
                 ),
             )?;

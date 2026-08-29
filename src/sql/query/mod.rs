@@ -2851,6 +2851,15 @@ pub(crate) fn emit_data_row(
     responder: &mut Responder,
     values: &[Datum],
 ) -> Outcome {
+    if values
+        .iter()
+        .any(|value| matches!(value, Datum::PgDdlCommand))
+    {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot display a value of type pg_ddl_command"
+        ));
+    }
     let formats = responder.result_formats();
     let alternate_formats = responder.alternate_result_formats();
     let catalog = storage_catalog(storage, arena, txid);

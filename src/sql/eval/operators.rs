@@ -587,6 +587,7 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
     // compare equal; a timestamp and timestamptz denote the same instant).
     match datum {
         Datum::Null => hasher.write(&[0]),
+        Datum::PgDdlCommand => hasher.write(&[36]),
         Datum::Bool(b) => hasher.write(&[1, *b as u8]),
         Datum::Int2(v) => {
             hasher.write(&[2]);

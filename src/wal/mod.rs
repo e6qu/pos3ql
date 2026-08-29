@@ -1872,7 +1872,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
     match operation {
         WalOp::DatabaseScope { .. } => 4,
         WalOp::CreateTable(def) => {
-            let mut n = 1 + def.name.as_str().len() + 2;
+            let mut n = 1 + def.name.as_str().len() + 2 + 1;
             for c in def.columns() {
                 let default_value = c.default.constant().copied();
                 n += 1 + c.name.as_str().len() + 3 + 4 + encoded_default_len(&default_value);
@@ -3082,6 +3082,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::CreateTable(def) => {
             let mut ok = name_bytes(buffer, def.name.as_str());
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
+            ok &= buffer.append(&[u8::from(def.has_toast)]);
             for c in def.columns() {
                 ok &= name_bytes(buffer, c.name.as_str());
                 // Bit 7 (the last free per-column flag bit) marks a domain-typed
@@ -5091,6 +5092,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             if n_cols > MAX_COLUMNS {
                 return None;
             }
+            let has_toast = *payload.get(at)? != 0;
+            at += 1;
             let mut def = TableDef {
                 name: SqlName::parse(name).ok()?,
                 columns: [ColumnMeta {
@@ -5109,6 +5112,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     user_type: None,
                 }; MAX_COLUMNS],
                 n_columns: n_cols,
+                has_toast,
                 ..TableDef::empty()
             };
             for i in 0..n_cols {

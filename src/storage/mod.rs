@@ -496,6 +496,12 @@ impl OwnedDatum {
                     "cannot store a composite (record) value in a column"
                 ));
             }
+            Datum::PgDdlCommand => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot store a pseudo-type value in a column"
+                ));
+            }
             Datum::Int2Vector(_) => {
                 return Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -1268,6 +1274,9 @@ pub struct TableDef {
     pub n_fkeys: usize,
     pub exclusions: [ExclusionConstraint; MAX_EXCLUSIONS],
     pub n_exclusions: usize,
+    /// PostgreSQL retains a table's TOAST relation after the last toastable
+    /// column is dropped. This catalog bit records that irreversible creation.
+    pub has_toast: bool,
     pub row_level_security: RowLevelSecurityState,
     pub partition: PartitionDef,
 }
@@ -1402,6 +1411,7 @@ impl TableDef {
             n_fkeys: 0,
             exclusions: [ExclusionConstraint::EMPTY; MAX_EXCLUSIONS],
             n_exclusions: 0,
+            has_toast: false,
             row_level_security: RowLevelSecurityState::DISABLED,
             partition: PartitionDef::NONE,
         }
@@ -15123,6 +15133,27 @@ impl Storage {
         })
     }
 
+    pub(crate) fn comment_for_event_trigger(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> Option<(CommentClass, SqlName, SqlName, u32)> {
+        let comment = self
+            .comments
+            .get(slot)?
+            .used
+            .then_some(&self.comments[slot])?;
+        let identity = comment
+            .pending_identity
+            .filter(|identity| identity.txid == txid);
+        Some((
+            comment.class,
+            identity.map_or(comment.schema, |identity| identity.schema),
+            identity.map_or(comment.name, |identity| identity.name),
+            comment.subid,
+        ))
+    }
+
     fn stage_trigger_comment_rename(
         &mut self,
         old_name: SqlName,
@@ -19511,7 +19542,7 @@ impl Storage {
         &mut self,
         index: usize,
         txid: u32,
-        def: TableDef,
+        mut def: TableDef,
         column_mapping: &[Option<SqlName>; MAX_COLUMNS],
         rewrites_rows: bool,
     ) -> Result<(), SqlError> {
@@ -19531,6 +19562,11 @@ impl Storage {
             ));
         }
         let current = *self.table_def(index, txid);
+        def.has_toast |= current.has_toast
+            || def
+                .columns()
+                .iter()
+                .any(|column| column.ctype.typlen() == -1);
         let prior = self.pending_table_def(index).copied();
         let mut composed = [None; MAX_COLUMNS];
         for (committed_column, target) in composed
@@ -19809,6 +19845,10 @@ impl Storage {
     }
 
     pub fn create_table(&mut self, mut def: TableDef) -> Result<usize, SqlError> {
+        def.has_toast |= def
+            .columns()
+            .iter()
+            .any(|column| column.ctype.typlen() == -1);
         if self
             .find_table(def.schema.as_str(), def.name.as_str())
             .is_some()
@@ -19881,6 +19921,11 @@ impl Storage {
             column_mapping[old_column] = Some(target.name);
         }
         let index = rewrite.table;
+        def.has_toast |= self.tables[index].def.has_toast
+            || def
+                .columns()
+                .iter()
+                .any(|column| column.ctype.typlen() == -1);
         self.set_table_def(index, def, &column_mapping);
         if !rewrite.preserve_rows {
             self.tables[index].rows.clear();
@@ -19904,7 +19949,11 @@ impl Storage {
     /// Transactional create: the table exists only for `txid` until commit.
     /// A name already visible to `txid` is a duplicate (42P07); a name held by
     /// another transaction's uncommitted DDL joins the shared wait graph.
-    pub fn create_table_in(&mut self, def: TableDef, txid: u32) -> Result<usize, SqlError> {
+    pub fn create_table_in(&mut self, mut def: TableDef, txid: u32) -> Result<usize, SqlError> {
+        def.has_toast |= def
+            .columns()
+            .iter()
+            .any(|column| column.ctype.typlen() == -1);
         self.require_schema_create(def.schema.as_str(), txid)?;
         if self
             .find_visible(def.schema.as_str(), def.name.as_str(), txid)
@@ -20079,6 +20128,10 @@ impl Storage {
                 publication.database == self.current_database
                     && publication.ddl_state == CatalogDdlState::Present
             })
+    }
+
+    pub(crate) fn publication_for_event_trigger(&self, slot: usize) -> &PublicationDef {
+        &self.publications[slot]
     }
 
     pub(crate) fn publications_with_slots_visible_to(
@@ -20481,6 +20534,10 @@ impl Storage {
             .filter(move |(_, subscription)| {
                 subscription.database == self.current_database && subscription.visible_to(txid)
             })
+    }
+
+    pub(crate) fn subscription_for_event_trigger(&self, slot: usize) -> &SubscriptionDef {
+        &self.subscriptions[slot]
     }
 
     pub(crate) fn subscriptions_with_slots_durable(
@@ -28277,6 +28334,15 @@ impl Storage {
 
     pub(crate) fn index_count(&self) -> usize {
         self.indexes.len()
+    }
+
+    /// Keeps the dropped catalog identity available during `sql_drop`.
+    pub(crate) fn index_for_event_trigger(&self, slot: usize, txid: u32) -> Option<IndexDef> {
+        self.indexes
+            .get(slot)
+            .copied()
+            .filter(|index| index.database == self.current_database)
+            .map(|index| self.project_index_binding(index, txid))
     }
 
     pub(crate) fn index_visible_to(&self, slot: usize, txid: u32) -> Option<IndexDef> {

@@ -58,6 +58,22 @@ struct IntrinsicRoutine {
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
+        oid: 4566,
+        name: "pg_event_trigger_table_rewrite_oid",
+        result_oid: 26,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 4567,
+        name: "pg_event_trigger_table_rewrite_reason",
+        result_oid: 23,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 3415,
         name: "pg_get_statisticsobjdef",
         result_oid: 25,
@@ -814,23 +830,7 @@ pub fn synthesize<'a>(
         (false, "pg_inherits") => pg_inherits(storage, txid, arena),
         (false, "pg_rewrite") => pg_rewrite(storage, txid, arena),
         (false, "pg_trigger") => pg_trigger(storage, txid, arena),
-        (false, "pg_event_trigger") => finish(
-            def_of(
-                "pg_event_trigger",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("evtname", ColType::Name),
-                    ("evtevent", ColType::Name),
-                    ("evtowner", ColType::Int4),
-                    ("evtfoid", ColType::Int4),
-                    ("evtenabled", ColType::Bpchar),
-                    ("evttags", ColType::Array(super::types::ArrElem::Text)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_event_trigger") => pg_event_trigger(storage, txid, arena),
         (false, "pg_foreign_table") => finish(
             def_of(
                 "pg_foreign_table",
@@ -1280,7 +1280,8 @@ fn acl<'a>(
         crate::storage::AccessClass::Database => crate::storage::PrivilegeSet::DATABASE_ALL,
         crate::storage::AccessClass::Statistics
         | crate::storage::AccessClass::Extension
-        | crate::storage::AccessClass::Trigger => crate::storage::PrivilegeSet::NONE,
+        | crate::storage::AccessClass::Trigger
+        | crate::storage::AccessClass::EventTrigger => crate::storage::PrivilegeSet::NONE,
     };
     let render = |grantee: &str,
                   grantor: &str,
@@ -3190,6 +3191,9 @@ pub fn function_def_text<'a>(
             )
         }
         crate::storage::RoutineKind::Trigger => write!(definition, ") RETURNS trigger"),
+        crate::storage::RoutineKind::EventTrigger => {
+            write!(definition, ") RETURNS event_trigger")
+        }
         crate::storage::RoutineKind::Procedure => write!(definition, ")"),
         crate::storage::RoutineKind::Aggregate(_) => unreachable!("rejected above"),
     }
@@ -3639,6 +3643,9 @@ pub fn function_result_text<'a>(
         crate::storage::RoutineKind::Trigger => {
             write!(output, "trigger").map_err(|_| super::eval::arena_full())?;
         }
+        crate::storage::RoutineKind::EventTrigger => {
+            write!(output, "event_trigger").map_err(|_| super::eval::arena_full())?;
+        }
         crate::storage::RoutineKind::Procedure => {
             write!(output, "void").map_err(|_| super::eval::arena_full())?;
         }
@@ -3842,6 +3849,12 @@ fn pg_description<'a>(
                     continue;
                 };
                 (storage.conversion(slot).oid(slot), PG_CONVERSION_OID)
+            }
+            crate::storage::CommentClass::EventTrigger => {
+                let Some(slot) = storage.event_trigger_slot(name, txid) else {
+                    continue;
+                };
+                (storage.event_trigger(slot).oid(), 3466)
             }
         };
         let catalog_subid = if class == crate::storage::CommentClass::Trigger {
@@ -4204,6 +4217,13 @@ pub fn comment_text_for<'a>(
                     && storage
                         .conversion_slot(schema, name, txid)
                         .is_some_and(|slot| storage.conversion(slot).oid(slot) == oid)
+            }
+            "pg_event_trigger" => {
+                class == crate::storage::CommentClass::EventTrigger
+                    && subid == 0
+                    && storage
+                        .event_trigger_slot(name, txid)
+                        .is_some_and(|slot| storage.event_trigger(slot).oid() == oid)
             }
             _ => {
                 class == crate::storage::CommentClass::Relation
@@ -7614,6 +7634,7 @@ fn extension_dependency_catalog_identity(
         AccessClass::Tablespace => return None,
         AccessClass::Extension => (3079, extension_oid(slot)),
         AccessClass::Trigger => (2620, crate::storage::trigger_oid(storage.trigger(slot))),
+        AccessClass::EventTrigger => (3466, storage.event_trigger(slot).oid()),
         AccessClass::Database => (1262, 5),
     })
 }
@@ -9519,6 +9540,66 @@ fn pg_trigger<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+fn pg_event_trigger<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_event_trigger",
+        &[
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("evtname", ColType::Name),
+            ("evtevent", ColType::Name),
+            ("evtowner", ColType::Oid),
+            ("evtfoid", ColType::Oid),
+            ("evtenabled", ColType::Bpchar),
+            ("evttags", ColType::Array(super::types::ArrElem::Text)),
+        ],
+    );
+    let mut rows: [&[Datum]; crate::storage::MAX_EVENT_TRIGGERS] =
+        [&[]; crate::storage::MAX_EVENT_TRIGGERS];
+    let mut count = 0usize;
+    for (slot, event_trigger) in storage.event_triggers_visible_to(txid) {
+        let routine = storage.routine(usize::from(event_trigger.function));
+        let mut tag_values = [Datum::Null; crate::storage::MAX_EVENT_TRIGGER_TAGS];
+        for (index, tag) in event_trigger.tags.values().iter().enumerate() {
+            tag_values[index] = text(tag.as_str(), arena)?;
+        }
+        let tags = if event_trigger.tags.values().is_empty() {
+            Datum::Null
+        } else {
+            Datum::Array {
+                element: super::types::ArrElem::Text,
+                raw: super::array::build(&tag_values[..event_trigger.tags.values().len()], arena)?,
+            }
+        };
+        rows[count] = row(
+            &[
+                Datum::Int4(3466),
+                Datum::Int4(storage.event_trigger(slot).oid()),
+                text(event_trigger.name.as_str(), arena)?,
+                text(event_trigger.event.name(), arena)?,
+                Datum::Int4(Storage::role_oid(usize::from(
+                    event_trigger.ownership.owner_to(txid),
+                ))),
+                Datum::Int4(crate::storage::routine_oid(routine)),
+                Datum::Bpchar(match event_trigger.enabled {
+                    crate::storage::TriggerEnabled::Origin => "O",
+                    crate::storage::TriggerEnabled::Replica => "R",
+                    crate::storage::TriggerEnabled::Always => "A",
+                    crate::storage::TriggerEnabled::Disabled => "D",
+                }),
+                tags,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
 fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_language",
@@ -9811,6 +9892,9 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                         }),
                     crate::storage::RoutineKind::TableFunction => crate::sql::types::oid::RECORD,
                     crate::storage::RoutineKind::Trigger => crate::sql::types::oid::TRIGGER,
+                    crate::storage::RoutineKind::EventTrigger => {
+                        crate::sql::types::oid::EVENT_TRIGGER
+                    }
                     crate::storage::RoutineKind::Procedure => crate::sql::types::oid::VOID,
                     crate::storage::RoutineKind::Aggregate(aggregate) => storage
                         .routine_type_oid(
@@ -10431,6 +10515,17 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     let mut n = types.len();
     for (oid, name, length, category, element, array, relation, kind) in [
         (18, "char", 1, "Z", 0, 1002, 0, "b"),
+        (super::types::oid::TRIGGER, "trigger", 4, "P", 0, 0, 0, "p"),
+        (
+            super::types::oid::EVENT_TRIGGER,
+            "event_trigger",
+            4,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
         (
             super::types::oid::ACLITEM,
             "aclitem",

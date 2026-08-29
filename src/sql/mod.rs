@@ -368,6 +368,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateConversion(_)
         | Stmt::AlterConversion { .. }
         | Stmt::DropConversion { .. }
+        | Stmt::CreateEventTrigger(_)
+        | Stmt::AlterEventTrigger { .. }
+        | Stmt::DropEventTrigger { .. }
         | Stmt::CreatePublication { .. }
         | Stmt::AlterPublication { .. }
         | Stmt::DropPublication { .. }
@@ -652,6 +655,462 @@ fn statement_tag(statement: &Stmt<'_>) -> &'static str {
         Stmt::Notify { .. } => "NOTIFY",
         _ => "DDL",
     }
+}
+
+fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
+    Some(match statement {
+        Stmt::CreateTable(_) => "CREATE TABLE",
+        Stmt::DropTable(_) => "DROP TABLE",
+        Stmt::Truncate { .. } => return None,
+        Stmt::AlterTable(_) => "ALTER TABLE",
+        Stmt::CreateView { .. } => "CREATE VIEW",
+        Stmt::DropView { .. } => "DROP VIEW",
+        Stmt::RefreshMaterializedView { .. } => "REFRESH MATERIALIZED VIEW",
+        Stmt::DropMaterializedView { .. } => "DROP MATERIALIZED VIEW",
+        Stmt::CreateTableAs { kind, .. } => match kind {
+            ast::CreateTableAsKind::Table => "CREATE TABLE AS",
+            ast::CreateTableAsKind::MaterializedView => "CREATE MATERIALIZED VIEW",
+            ast::CreateTableAsKind::SelectInto => "SELECT INTO",
+        },
+        Stmt::CreateRoutine(routine) => match routine.kind {
+            ast::RoutineCreateKind::Procedure => "CREATE PROCEDURE",
+            ast::RoutineCreateKind::Function { .. }
+            | ast::RoutineCreateKind::OutputFunction { .. }
+            | ast::RoutineCreateKind::TableFunction { .. }
+            | ast::RoutineCreateKind::Trigger
+            | ast::RoutineCreateKind::EventTrigger => "CREATE FUNCTION",
+        },
+        Stmt::AlterRoutine { kind, .. } => match kind {
+            ast::RoutineTargetKind::Function => "ALTER FUNCTION",
+            ast::RoutineTargetKind::Procedure => "ALTER PROCEDURE",
+            ast::RoutineTargetKind::Aggregate => "ALTER AGGREGATE",
+            ast::RoutineTargetKind::Either => "ALTER ROUTINE",
+        },
+        Stmt::DropFunction { .. } => "DROP FUNCTION",
+        Stmt::DropProcedure { .. } => "DROP PROCEDURE",
+        Stmt::DropRoutine { .. } => "DROP ROUTINE",
+        Stmt::CreateAggregate(_) => "CREATE AGGREGATE",
+        Stmt::AlterAggregate { .. } => "ALTER AGGREGATE",
+        Stmt::DropAggregate { .. } => "DROP AGGREGATE",
+        Stmt::CreateCast(_) => "CREATE CAST",
+        Stmt::DropCast { .. } => "DROP CAST",
+        Stmt::CreateOperator(_) => "CREATE OPERATOR",
+        Stmt::AlterOperator { .. } => "ALTER OPERATOR",
+        Stmt::DropOperator { .. } => "DROP OPERATOR",
+        Stmt::CreateOperatorFamily { .. } => "CREATE OPERATOR FAMILY",
+        Stmt::AlterOperatorFamily { .. } => "ALTER OPERATOR FAMILY",
+        Stmt::DropOperatorFamily { .. } => "DROP OPERATOR FAMILY",
+        Stmt::CreateOperatorClass(_) => "CREATE OPERATOR CLASS",
+        Stmt::AlterOperatorClass { .. } => "ALTER OPERATOR CLASS",
+        Stmt::DropOperatorClass { .. } => "DROP OPERATOR CLASS",
+        Stmt::CreateLanguage(_) => "CREATE LANGUAGE",
+        Stmt::AlterLanguage { .. } => "ALTER LANGUAGE",
+        Stmt::DropLanguage { .. } => "DROP LANGUAGE",
+        Stmt::CreateExtension { .. } => "CREATE EXTENSION",
+        Stmt::AlterExtension { .. } => "ALTER EXTENSION",
+        Stmt::AlterMaterializedViewExtensionDependency { .. } => "ALTER MATERIALIZED VIEW",
+        Stmt::DropExtension { .. } => "DROP EXTENSION",
+        Stmt::CreateCollation(_) => "CREATE COLLATION",
+        Stmt::AlterCollation { .. } => "ALTER COLLATION",
+        Stmt::DropCollation { .. } => "DROP COLLATION",
+        Stmt::CreateConversion(_) => "CREATE CONVERSION",
+        Stmt::AlterConversion { .. } => "ALTER CONVERSION",
+        Stmt::DropConversion { .. } => "DROP CONVERSION",
+        Stmt::CreatePublication { .. } => "CREATE PUBLICATION",
+        Stmt::AlterPublication { .. } => "ALTER PUBLICATION",
+        Stmt::DropPublication { .. } => "DROP PUBLICATION",
+        Stmt::CreateSubscription { .. } => "CREATE SUBSCRIPTION",
+        Stmt::AlterSubscription { .. } => "ALTER SUBSCRIPTION",
+        Stmt::DropSubscription { .. } => "DROP SUBSCRIPTION",
+        Stmt::CreateTrigger(_) => "CREATE TRIGGER",
+        Stmt::AlterTrigger { .. } => "ALTER TRIGGER",
+        Stmt::DropTrigger { .. } => "DROP TRIGGER",
+        Stmt::CreatePolicy(_) => "CREATE POLICY",
+        Stmt::AlterPolicy(_) => "ALTER POLICY",
+        Stmt::DropPolicy { .. } => "DROP POLICY",
+        Stmt::CreateStatistics(_) => "CREATE STATISTICS",
+        Stmt::AlterStatistics { .. } => "ALTER STATISTICS",
+        Stmt::DropStatistics { .. } => "DROP STATISTICS",
+        Stmt::CreateSequence { .. } => "CREATE SEQUENCE",
+        Stmt::AlterSequence { .. } => "ALTER SEQUENCE",
+        Stmt::DropSequence { .. } => "DROP SEQUENCE",
+        Stmt::CreateDomain(_) => "CREATE DOMAIN",
+        Stmt::AlterDomain { .. } => "ALTER DOMAIN",
+        Stmt::DropDomain { .. } => "DROP DOMAIN",
+        Stmt::CreateEnum { .. } | Stmt::CreateComposite { .. } => "CREATE TYPE",
+        Stmt::AlterType { .. } => "ALTER TYPE",
+        Stmt::DropType { .. } => "DROP TYPE",
+        Stmt::CreateIndex { .. } => "CREATE INDEX",
+        Stmt::AlterIndex { .. } | Stmt::AlterIndexesTablespace { .. } => "ALTER INDEX",
+        Stmt::DropIndex { .. } => "DROP INDEX",
+        Stmt::Reindex { .. } => "REINDEX",
+        Stmt::CreateSchema { .. } => "CREATE SCHEMA",
+        Stmt::DropSchema { .. } => "DROP SCHEMA",
+        Stmt::Comment { target, .. }
+            if !matches!(
+                target,
+                ast::CommentTarget::Tablespace(_)
+                    | ast::CommentTarget::Database(_)
+                    | ast::CommentTarget::EventTrigger(_)
+            ) =>
+        {
+            "COMMENT"
+        }
+        Stmt::AlterOwner { kind, .. } => match kind {
+            ast::AlterOwnerKind::Schema => "ALTER SCHEMA",
+            ast::AlterOwnerKind::Type => "ALTER TYPE",
+            ast::AlterOwnerKind::Domain => "ALTER DOMAIN",
+            ast::AlterOwnerKind::Table => "ALTER TABLE",
+            ast::AlterOwnerKind::View => "ALTER VIEW",
+            ast::AlterOwnerKind::MaterializedView => "ALTER MATERIALIZED VIEW",
+            ast::AlterOwnerKind::Sequence => "ALTER SEQUENCE",
+            ast::AlterOwnerKind::Statistics => "ALTER STATISTICS",
+        },
+        Stmt::GrantPrivileges { target, .. } if privilege_target_is_database_local(*target) => {
+            "GRANT"
+        }
+        Stmt::RevokePrivileges { target, .. } if privilege_target_is_database_local(*target) => {
+            "REVOKE"
+        }
+        Stmt::AlterDefaultPrivileges { .. } => "ALTER DEFAULT PRIVILEGES",
+        Stmt::DropOwned { .. } => "DROP OWNED",
+        Stmt::Analyze(_) | Stmt::Vacuum { .. } => return None,
+        Stmt::CreateEventTrigger(_)
+        | Stmt::AlterEventTrigger { .. }
+        | Stmt::DropEventTrigger { .. } => return None,
+        _ => return None,
+    })
+}
+
+fn event_trigger_drop_command(statement: &Stmt<'_>) -> bool {
+    match statement {
+        Stmt::AlterTable(alter) => alter.actions.iter().any(|action| {
+            matches!(
+                action,
+                ast::AlterAction::DropColumn { .. } | ast::AlterAction::DropConstraint { .. }
+            )
+        }),
+        Stmt::DropOwned { .. } => true,
+        statement => matches!(
+            statement,
+            Stmt::DropTable(_)
+                | Stmt::DropView { .. }
+                | Stmt::DropMaterializedView { .. }
+                | Stmt::DropFunction { .. }
+                | Stmt::DropProcedure { .. }
+                | Stmt::DropRoutine { .. }
+                | Stmt::DropAggregate { .. }
+                | Stmt::DropCast { .. }
+                | Stmt::DropOperator { .. }
+                | Stmt::DropOperatorFamily { .. }
+                | Stmt::DropOperatorClass { .. }
+                | Stmt::DropLanguage { .. }
+                | Stmt::DropExtension { .. }
+                | Stmt::DropCollation { .. }
+                | Stmt::DropConversion { .. }
+                | Stmt::DropPublication { .. }
+                | Stmt::DropSubscription { .. }
+                | Stmt::DropTrigger { .. }
+                | Stmt::DropPolicy { .. }
+                | Stmt::DropStatistics { .. }
+                | Stmt::DropSequence { .. }
+                | Stmt::DropDomain { .. }
+                | Stmt::DropType { .. }
+                | Stmt::DropIndex { .. }
+                | Stmt::DropSchema { .. }
+        ),
+    }
+}
+
+fn privilege_target_is_database_local(target: ast::PrivilegeTarget<'_>) -> bool {
+    !matches!(
+        target,
+        ast::PrivilegeTarget::Objects {
+            kind: ast::PrivilegeObjectKind::Database | ast::PrivilegeObjectKind::Tablespace,
+            ..
+        }
+    )
+}
+
+#[derive(Clone, Copy)]
+enum EventTriggerInvocation<'a> {
+    Login,
+    DdlCommandStart { tag: &'a str },
+    DdlCommandEnd { tag: &'a str },
+    SqlDrop { tag: &'a str },
+    TableRewrite { relation_oid: i32, reason: i32 },
+}
+
+struct EventTriggerExecution<'a, 'response> {
+    txn: &'a mut TxnState,
+    cursors: &'a mut cursor::CursorPool,
+    guc: &'a GucState,
+    arena: &'a Arena,
+    responder: &'a mut Responder<'response>,
+}
+
+impl<'a> EventTriggerInvocation<'a> {
+    const fn event(self) -> ast::EventTriggerEvent {
+        match self {
+            Self::Login => ast::EventTriggerEvent::Login,
+            Self::DdlCommandStart { .. } => ast::EventTriggerEvent::DdlCommandStart,
+            Self::DdlCommandEnd { .. } => ast::EventTriggerEvent::DdlCommandEnd,
+            Self::SqlDrop { .. } => ast::EventTriggerEvent::SqlDrop,
+            Self::TableRewrite { .. } => ast::EventTriggerEvent::TableRewrite,
+        }
+    }
+
+    const fn tag(self) -> &'a str {
+        match self {
+            Self::Login => "LOGIN",
+            Self::DdlCommandStart { tag } | Self::DdlCommandEnd { tag } | Self::SqlDrop { tag } => {
+                tag
+            }
+            Self::TableRewrite { .. } => "ALTER TABLE",
+        }
+    }
+}
+
+fn table_rewrite_target(
+    statement: &Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+) -> Option<(usize, i32)> {
+    let Stmt::AlterTable(alter) = statement else {
+        return None;
+    };
+    let Some(crate::storage::ResolvedRelation::Table(slot)) =
+        storage.resolve_relation(alter.table.schema, alter.table.name, txid)
+    else {
+        return None;
+    };
+    let definition = storage.table_def(slot, txid);
+    alter
+        .actions
+        .iter()
+        .any(|action| {
+            let ast::AlterAction::AlterColumnType {
+                column,
+                type_name,
+                type_mod,
+                using,
+                ..
+            } = action
+            else {
+                return false;
+            };
+            let Some(column) = definition.column_index(column) else {
+                return false;
+            };
+            let Some(target) = types::ColType::from_sql_name(type_name) else {
+                return false;
+            };
+            let source = definition.columns()[column];
+            alter_column_requires_rewrite(
+                source.ctype,
+                source.type_mod,
+                source.name.as_str(),
+                target,
+                *type_mod,
+                *using,
+            )
+        })
+        .then_some((slot, 4))
+}
+
+fn alter_column_requires_rewrite(
+    source: types::ColType,
+    source_type_mod: i32,
+    column: &str,
+    target: types::ColType,
+    target_type_mod: i32,
+    using: Option<&Expr<'_>>,
+) -> bool {
+    let (expression_type, expression_type_mod) = match using {
+        Some(expression) => {
+            match relabelled_column_type(expression, column, source, source_type_mod) {
+                Some(result) => result,
+                None => return true,
+            }
+        }
+        None => (source, source_type_mod),
+    };
+    type_change_requires_rewrite(expression_type, target)
+        || typmod_change_requires_rewrite(target, expression_type_mod, target_type_mod)
+}
+
+fn relabelled_column_type(
+    expression: &Expr<'_>,
+    column: &str,
+    source: types::ColType,
+    source_type_mod: i32,
+) -> Option<(types::ColType, i32)> {
+    match expression {
+        Expr::Column { name, .. } if name.eq_ignore_ascii_case(column) => {
+            Some((source, source_type_mod))
+        }
+        Expr::Cast {
+            operand,
+            type_name,
+            type_mod,
+        } => {
+            let (from, from_type_mod) =
+                relabelled_column_type(operand, column, source, source_type_mod)?;
+            let to = types::ColType::from_sql_name(type_name)?;
+            (!type_change_requires_rewrite(from, to)
+                && !typmod_change_requires_rewrite(to, from_type_mod, *type_mod))
+            .then_some((to, *type_mod))
+        }
+        Expr::Collate { operand, .. } => {
+            relabelled_column_type(operand, column, source, source_type_mod)
+        }
+        _ => None,
+    }
+}
+
+fn type_change_requires_rewrite(source: types::ColType, target: types::ColType) -> bool {
+    use types::ColType::*;
+    if source == target {
+        return false;
+    }
+    let oid_reference = |ctype| {
+        matches!(
+            ctype,
+            Oid | Regtype
+                | Regproc
+                | Regprocedure
+                | Regoper
+                | Regoperator
+                | Regclass
+                | Regnamespace
+                | Regrole
+        )
+    };
+    !matches!(
+        (source, target),
+        (Text, Varchar)
+            | (Varchar, Text)
+            | (Cidr, Inet)
+            | (Regproc, Regprocedure)
+            | (Regprocedure, Regproc)
+            | (Regoper, Regoperator)
+            | (Regoperator, Regoper)
+    ) && !(source == Int4 && oid_reference(target))
+        && !(target == Int4 && oid_reference(source))
+        && !(source == Oid && oid_reference(target))
+        && !(target == Oid && oid_reference(source))
+}
+
+fn typmod_change_requires_rewrite(ctype: types::ColType, old: i32, new: i32) -> bool {
+    use types::TypeMod;
+    let (old, new) = (TypeMod::decode(ctype, old), TypeMod::decode(ctype, new));
+    match (old, new) {
+        (old, new) if old == new => false,
+        (_, TypeMod::None) => false,
+        (TypeMod::None, _) => true,
+        (TypeMod::Length(old), TypeMod::Length(new)) => new < old,
+        (
+            TypeMod::NumericPS {
+                precision: old_precision,
+                scale: old_scale,
+            },
+            TypeMod::NumericPS {
+                precision: new_precision,
+                scale: new_scale,
+            },
+        ) => new_scale != old_scale || new_precision < old_precision,
+        (TypeMod::TemporalPrecision(old), TypeMod::TemporalPrecision(new)) => new < old,
+        _ => true,
+    }
+}
+
+pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
+    [
+        "ALTER AGGREGATE",
+        "ALTER COLLATION",
+        "ALTER CONVERSION",
+        "ALTER DEFAULT PRIVILEGES",
+        "ALTER DOMAIN",
+        "ALTER EXTENSION",
+        "ALTER FUNCTION",
+        "ALTER INDEX",
+        "ALTER LANGUAGE",
+        "ALTER OPERATOR",
+        "ALTER OPERATOR CLASS",
+        "ALTER OPERATOR FAMILY",
+        "ALTER MATERIALIZED VIEW",
+        "ALTER SCHEMA",
+        "ALTER VIEW",
+        "ALTER POLICY",
+        "ALTER PROCEDURE",
+        "ALTER PUBLICATION",
+        "ALTER ROUTINE",
+        "ALTER SEQUENCE",
+        "ALTER STATISTICS",
+        "ALTER SUBSCRIPTION",
+        "ALTER TABLE",
+        "ALTER TRIGGER",
+        "ALTER TYPE",
+        "COMMENT",
+        "CREATE AGGREGATE",
+        "CREATE CAST",
+        "CREATE COLLATION",
+        "CREATE CONVERSION",
+        "CREATE DOMAIN",
+        "CREATE EXTENSION",
+        "CREATE FUNCTION",
+        "CREATE INDEX",
+        "CREATE LANGUAGE",
+        "CREATE MATERIALIZED VIEW",
+        "CREATE OPERATOR",
+        "CREATE OPERATOR CLASS",
+        "CREATE OPERATOR FAMILY",
+        "CREATE POLICY",
+        "CREATE PROCEDURE",
+        "CREATE PUBLICATION",
+        "CREATE SCHEMA",
+        "CREATE SEQUENCE",
+        "CREATE STATISTICS",
+        "CREATE SUBSCRIPTION",
+        "CREATE TABLE",
+        "CREATE TABLE AS",
+        "CREATE TRIGGER",
+        "CREATE TYPE",
+        "CREATE VIEW",
+        "DROP AGGREGATE",
+        "DROP CAST",
+        "DROP COLLATION",
+        "DROP CONVERSION",
+        "DROP DOMAIN",
+        "DROP EXTENSION",
+        "DROP FUNCTION",
+        "DROP INDEX",
+        "DROP LANGUAGE",
+        "DROP MATERIALIZED VIEW",
+        "DROP OWNED",
+        "DROP OPERATOR",
+        "DROP OPERATOR CLASS",
+        "DROP OPERATOR FAMILY",
+        "DROP POLICY",
+        "DROP PROCEDURE",
+        "DROP PUBLICATION",
+        "DROP ROUTINE",
+        "DROP SCHEMA",
+        "DROP SEQUENCE",
+        "DROP STATISTICS",
+        "DROP SUBSCRIPTION",
+        "DROP TABLE",
+        "DROP TRIGGER",
+        "DROP TYPE",
+        "DROP VIEW",
+        "GRANT",
+        "REFRESH MATERIALIZED VIEW",
+        "REINDEX",
+        "REVOKE",
+        "SELECT INTO",
+    ]
+    .iter()
+    .any(|known| known.eq_ignore_ascii_case(tag))
 }
 
 fn top_level_only_command(statement: &Stmt<'_>) -> Option<&'static str> {
@@ -3875,6 +4334,15 @@ impl Engine {
                 DdlUndo::ConversionDropped(slot) => {
                     self.storage.commit_conversion_drop(*slot as usize)
                 }
+                DdlUndo::EventTriggerCreated(slot) => {
+                    self.storage.commit_event_trigger_create(*slot as usize)
+                }
+                DdlUndo::EventTriggerAltered { slot, .. } => self
+                    .storage
+                    .commit_event_trigger_alter(*slot as usize, txn.txid),
+                DdlUndo::EventTriggerDropped(slot) => {
+                    self.storage.commit_event_trigger_drop(*slot as usize)
+                }
                 DdlUndo::OperatorAltered { slot, .. } => {
                     self.storage.commit_operator_alter(*slot as usize, txn.txid)
                 }
@@ -4281,6 +4749,15 @@ impl Engine {
             DdlUndo::ConversionDropped(slot) => {
                 self.storage.rollback_conversion_drop(slot as usize, txid)
             }
+            DdlUndo::EventTriggerCreated(slot) => {
+                self.storage.rollback_event_trigger_create(slot as usize)
+            }
+            DdlUndo::EventTriggerAltered { slot, prior } => self
+                .storage
+                .rollback_event_trigger_alter(slot as usize, prior),
+            DdlUndo::EventTriggerDropped(slot) => self
+                .storage
+                .rollback_event_trigger_drop(slot as usize, txid),
             DdlUndo::OperatorAltered { slot, prior } => {
                 self.storage.rollback_operator_alter(slot as usize, prior)
             }
@@ -8632,6 +9109,132 @@ impl Engine {
         responder.command_complete("CALL").map(|_| Ok(()))
     }
 
+    fn fire_event_triggers(
+        &mut self,
+        invocation: EventTriggerInvocation<'_>,
+        execution: EventTriggerExecution<'_, '_>,
+    ) -> Result<(), SqlError> {
+        let EventTriggerExecution {
+            txn,
+            cursors,
+            guc,
+            arena,
+            responder,
+        } = execution;
+        let tag = invocation.tag();
+        if !guc.event_triggers() {
+            return Ok(());
+        }
+        let event = invocation.event();
+        let _rewrite_scope = match invocation {
+            EventTriggerInvocation::TableRewrite {
+                relation_oid,
+                reason,
+            } => Some(eval::funcs::system::enter_table_rewrite_context(
+                eval::funcs::system::TableRewriteContext {
+                    relation_oid,
+                    reason,
+                },
+            )),
+            _ => None,
+        };
+        let mut last_name = None;
+        while let Some((definition, routine)) = self
+            .storage
+            .event_triggers_visible_to(txn.txid)
+            .filter(|(_, trigger)| {
+                trigger.event == event
+                    && trigger.tags.matches(tag)
+                    && if txn.replication_apply {
+                        trigger.enabled.fires_for_replication()
+                    } else {
+                        trigger.enabled.fires_for_origin()
+                    }
+                    && last_name.is_none_or(|last: SqlName| trigger.name.as_str() > last.as_str())
+            })
+            .min_by(|(_, left), (_, right)| left.name.as_str().cmp(right.name.as_str()))
+            .map(|(_, trigger)| {
+                (
+                    trigger,
+                    self.storage
+                        .routine_for(usize::from(trigger.function), txn.txid),
+                )
+            })
+        {
+            last_name = Some(definition.name);
+            let owner = self
+                .storage
+                .role_name(usize::from(routine.ownership.owner_to(txn.txid)), txn.txid);
+            let _security = routine
+                .attributes
+                .security_definer
+                .then(|| eval::funcs::system::enter_current_user(owner.as_str()));
+            let _configuration = (!routine.configs().is_empty())
+                .then(|| guc::enter_active_routine_configs(routine.configs()))
+                .transpose()?;
+            exec::execute_event_trigger(
+                self,
+                txn,
+                cursors,
+                guc,
+                &routine,
+                event.name(),
+                tag,
+                arena,
+                responder,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execute_login_event_triggers(
+        &mut self,
+        txn: &mut TxnState,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        arena: &Arena,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        self.ensure_txn(txn, TxnMode::Implicit, guc);
+        let result = (|| {
+            let _guc_scope = guc::enter_eval_scope(guc, txn);
+            let database = self
+                .storage
+                .database_slot_by_oid(self.storage.current_database_oid(), txn.txid)
+                .ok_or_else(|| {
+                    sql_err!(sqlstate::INVALID_CATALOG_NAME, "database does not exist")
+                })?;
+            let database_name = self.storage.database_definition(database, txn.txid).name;
+            eval::funcs::system::set_current_database(database_name.as_str());
+            let session_user = guc.session_user();
+            eval::funcs::system::set_session_user(session_user.as_str());
+            let current_role = guc.current_role();
+            eval::funcs::system::set_current_user(current_role.as_str());
+            let path = self.storage.compute_path(
+                guc.search_path().as_str(),
+                current_role.as_str(),
+                txn.txid,
+            );
+            self.storage.swap_path(path);
+            self.fire_event_triggers(
+                EventTriggerInvocation::Login,
+                EventTriggerExecution {
+                    txn,
+                    cursors,
+                    guc,
+                    arena,
+                    responder,
+                },
+            )?;
+            self.commit_txn(txn, guc)?;
+            self.commit_wal()
+        })();
+        if result.is_err() && txn.is_active() {
+            self.rollback_txn(txn, guc);
+        }
+        result
+    }
+
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
     #[allow(clippy::too_many_arguments)]
     fn execute_stmt(
@@ -8924,7 +9527,39 @@ impl Engine {
             self.storage.lsn()
         };
         self.storage.set_commit_snapshot(commit_snapshot);
-        match statement {
+        let event_tag = event_trigger_tag(statement);
+        if let Some(tag) = event_tag
+            && let Err(error) = self.fire_event_triggers(
+                EventTriggerInvocation::DdlCommandStart { tag },
+                EventTriggerExecution {
+                    txn,
+                    cursors,
+                    guc,
+                    arena,
+                    responder,
+                },
+            )
+        {
+            return Ok(Err(error));
+        }
+        if let Some((slot, reason)) = table_rewrite_target(statement, &self.storage, txn.txid)
+            && let Err(error) = self.fire_event_triggers(
+                EventTriggerInvocation::TableRewrite {
+                    relation_oid: catalog::user_table_oid(slot),
+                    reason,
+                },
+                EventTriggerExecution {
+                    txn,
+                    cursors,
+                    guc,
+                    arena,
+                    responder,
+                },
+            )
+        {
+            return Ok(Err(error));
+        }
+        let outcome = match statement {
             Stmt::Explain { options, statement } => {
                 let plan = match statement {
                     Stmt::Select(select) => {
@@ -9448,6 +10083,34 @@ impl Engine {
                 *cascade,
                 responder,
             ),
+            Stmt::CreateEventTrigger(command) => exec::create_event_trigger(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                responder,
+            ),
+            Stmt::AlterEventTrigger { name, action } => exec::alter_event_trigger(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *action,
+                responder,
+            ),
+            Stmt::DropEventTrigger {
+                name,
+                if_exists,
+                cascade,
+            } => exec::drop_event_trigger(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
             Stmt::CreatePublication {
                 name,
                 all_tables,
@@ -9611,7 +10274,7 @@ impl Engine {
                 sql,
                 with_data,
                 if_not_exists,
-                materialized,
+                kind,
             } => exec::create_table_as(
                 &mut self.storage,
                 &mut self.wal,
@@ -9621,7 +10284,7 @@ impl Engine {
                 sql,
                 *with_data,
                 *if_not_exists,
-                *materialized,
+                *kind == ast::CreateTableAsKind::MaterializedView,
                 guc.search_path().as_str(),
                 guc.seq_session(),
                 arena,
@@ -10729,6 +11392,16 @@ impl Engine {
                 local,
                 syntax,
             } => {
+                if name.eq_ignore_ascii_case("event_triggers")
+                    && self.storage.current_role_slot(txn.txid).is_none_or(|role| {
+                        !self.storage.role(role).attributes_to(txn.txid).superuser
+                    })
+                {
+                    return Ok(Err(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "permission denied to set parameter \"event_triggers\""
+                    )));
+                }
                 if *local && !txn.is_explicit() {
                     responder.warning(
                         sqlstate::NO_ACTIVE_SQL_TRANSACTION,
@@ -10831,6 +11504,16 @@ impl Engine {
                 responder,
             ),
             Stmt::Reset(name) => {
+                if name.is_some_and(|name| name.eq_ignore_ascii_case("event_triggers"))
+                    && self.storage.current_role_slot(txn.txid).is_none_or(|role| {
+                        !self.storage.role(role).attributes_to(txn.txid).superuser
+                    })
+                {
+                    return Ok(Err(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "permission denied to set parameter \"event_triggers\""
+                    )));
+                }
                 if let Some(name) = name
                     && guc.transaction_reset_owned(name).is_some()
                 {
@@ -11220,7 +11903,38 @@ impl Engine {
                 responder.command_complete("DEALLOCATE")?;
                 Ok(Ok(()))
             }
+        };
+        if outcome.is_ok()
+            && let Some(tag) = event_tag
+        {
+            if event_trigger_drop_command(statement)
+                && let Err(error) = self.fire_event_triggers(
+                    EventTriggerInvocation::SqlDrop { tag },
+                    EventTriggerExecution {
+                        txn,
+                        cursors,
+                        guc,
+                        arena,
+                        responder,
+                    },
+                )
+            {
+                return Ok(Err(error));
+            }
+            if let Err(error) = self.fire_event_triggers(
+                EventTriggerInvocation::DdlCommandEnd { tag },
+                EventTriggerExecution {
+                    txn,
+                    cursors,
+                    guc,
+                    arena,
+                    responder,
+                },
+            ) {
+                return Ok(Err(error));
+            }
         }
+        outcome
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11934,6 +12648,12 @@ impl Engine {
                     return Ok(Err(error));
                 }
                 ""
+            }
+            crate::storage::AccessClass::EventTrigger => {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "event triggers cannot be extension members"
+                )));
             }
             crate::storage::AccessClass::Tablespace
             | crate::storage::AccessClass::Extension
@@ -12912,6 +13632,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::DropConversion { schema, name } => {
             storage.replay_drop_conversion(schema, name);
         }
+        WalOp::SetEventTrigger {
+            slot,
+            created_at,
+            definition,
+        } => storage.replay_event_trigger(usize::from(slot), created_at, definition)?,
+        WalOp::DropEventTrigger { name } => storage.replay_drop_event_trigger(name),
         WalOp::SetOperatorFamily {
             created_at,
             definition,

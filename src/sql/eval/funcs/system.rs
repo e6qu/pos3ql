@@ -188,6 +188,37 @@ std::thread_local! {
             s
         });
     static CONFIGURATION_RELOAD_REQUESTED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    static TABLE_REWRITE_CONTEXT: core::cell::Cell<Option<TableRewriteContext>> = const { core::cell::Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TableRewriteContext {
+    pub relation_oid: i32,
+    pub reason: i32,
+}
+
+pub(crate) struct TableRewriteScope(Option<TableRewriteContext>);
+
+impl Drop for TableRewriteScope {
+    fn drop(&mut self) {
+        TABLE_REWRITE_CONTEXT.with(|context| context.set(self.0));
+    }
+}
+
+pub(crate) fn enter_table_rewrite_context(context: TableRewriteContext) -> TableRewriteScope {
+    TableRewriteScope(TABLE_REWRITE_CONTEXT.with(|active| active.replace(Some(context))))
+}
+
+fn table_rewrite_context(function: &str) -> Result<TableRewriteContext, SqlError> {
+    TABLE_REWRITE_CONTEXT.with(|context| {
+        context.get().ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "{}() can only be called in a table_rewrite event trigger function",
+                function
+            )
+        })
+    })
 }
 
 pub(crate) fn clear_configuration_reload_request() {
@@ -413,6 +444,8 @@ pub(crate) fn dispatch<'a>(
         "version"
             | "pg_is_in_recovery"
             | "pg_reload_conf"
+            | "pg_event_trigger_table_rewrite_oid"
+            | "pg_event_trigger_table_rewrite_reason"
             | "pg_extension_config_dump"
             | "current_database"
             | "current_catalog"
@@ -503,6 +536,18 @@ pub(crate) fn dispatch<'a>(
                 arity(0)?;
                 CONFIGURATION_RELOAD_REQUESTED.with(|requested| requested.set(true));
                 Ok(Datum::Bool(true))
+            }
+            "pg_event_trigger_table_rewrite_oid" => {
+                arity(0)?;
+                let context = table_rewrite_context(name)?;
+                let oid = u32::try_from(context.relation_oid).map_err(|_| {
+                    sql_err!(sqlstate::INTERNAL_ERROR, "table rewrite OID is invalid")
+                })?;
+                Ok(Datum::Oid(oid))
+            }
+            "pg_event_trigger_table_rewrite_reason" => {
+                arity(0)?;
+                Ok(Datum::Int4(table_rewrite_context(name)?.reason))
             }
             "pg_extension_config_dump" => {
                 arity(2)?;

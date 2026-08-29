@@ -12,12 +12,13 @@ use super::{
 use crate::sql::ast::{
     AggregateArgument, AggregateArguments, AggregateDefinition, AggregateFinal,
     AggregateFinalModify, AggregateIdentity, AggregateMoving, AggregatePartial, AlterDomainAction,
-    AlterExtensionAction, AlterIndexAction, AlterOperatorAction, AlterOperatorClassAction,
-    AlterOperatorFamilyAction, AlterPublicationAction, AlterRoutineAction, AlterStatisticsAction,
-    AlterTablespaceAction, AlterTriggerAction, AlterTypeAction, BtreeStrategy, CastContext,
-    CastMethod, ConstraintMode, ConstraintTiming, ConstraintValidation, CreateCast, CreateDomain,
-    CreateOperator, CreateOperatorClass, CreateRoutine, CreateSchemaElement, CreateStatistics,
-    CreateTrigger, DomainCheck, ExclusionOperator, Expr, ExtensionMemberIdentity,
+    AlterEventTriggerAction, AlterExtensionAction, AlterIndexAction, AlterOperatorAction,
+    AlterOperatorClassAction, AlterOperatorFamilyAction, AlterPublicationAction,
+    AlterRoutineAction, AlterStatisticsAction, AlterTablespaceAction, AlterTriggerAction,
+    AlterTypeAction, BtreeStrategy, CastContext, CastMethod, ConstraintMode, ConstraintTiming,
+    ConstraintValidation, CreateCast, CreateDomain, CreateEventTrigger, CreateOperator,
+    CreateOperatorClass, CreateRoutine, CreateSchemaElement, CreateStatistics, CreateTrigger,
+    DomainCheck, EventTriggerEvent, ExclusionOperator, Expr, ExtensionMemberIdentity,
     ExtensionRelationKind, IndexAccessMethod, IndexBuildMode, IndexStorageOptionNames,
     IndexStorageOptions, IndexTargetScope, OperatorClassMember, OperatorFamilyMember,
     OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands, PartitionBound,
@@ -100,6 +101,114 @@ impl AggregateOptions<'_> {
 }
 
 impl<'a> Parser<'a> {
+    fn event_trigger_event(&mut self) -> Result<EventTriggerEvent, ParseError> {
+        let event = self.any_ident("event trigger event")?;
+        if event.eq_ignore_ascii_case("login") {
+            Ok(EventTriggerEvent::Login)
+        } else if event.eq_ignore_ascii_case("ddl_command_start") {
+            Ok(EventTriggerEvent::DdlCommandStart)
+        } else if event.eq_ignore_ascii_case("ddl_command_end") {
+            Ok(EventTriggerEvent::DdlCommandEnd)
+        } else if event.eq_ignore_ascii_case("sql_drop") {
+            Ok(EventTriggerEvent::SqlDrop)
+        } else if event.eq_ignore_ascii_case("table_rewrite") {
+            Ok(EventTriggerEvent::TableRewrite)
+        } else {
+            Err(self.err_here("unrecognized event name"))
+        }
+    }
+
+    fn create_event_trigger(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("event trigger name")?;
+        self.expect_ident("on")?;
+        let event = self.event_trigger_event()?;
+        let tags = if self.eat_ident("when")? {
+            if !event.supports_tag_filter() {
+                return Err(self.err_here("WHEN clause is not supported for this event"));
+            }
+            self.expect_ident("tag")?;
+            self.expect_ident("in")?;
+            self.expect_op("(")?;
+            let mut tags = [""; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == tags.len() {
+                    return Err(self.limit("event trigger tags", tags.len()));
+                }
+                tags[count] = self.str_literal("command tag")?;
+                count += 1;
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
+            }
+            if self.eat_ident("and")? {
+                return Err(self.err_here("filter variable TAG specified more than once"));
+            }
+            self.arena_slice(&tags[..count])?
+        } else {
+            &[]
+        };
+        self.expect_ident("execute")?;
+        if !self.eat_ident("function")? {
+            self.expect_ident("procedure")?;
+        }
+        let function = self.qual_name("event trigger function")?;
+        self.expect_op("(")?;
+        self.expect_op(")")?;
+        Ok(Stmt::CreateEventTrigger(CreateEventTrigger {
+            name,
+            event,
+            tags,
+            function,
+        }))
+    }
+
+    pub(super) fn alter_event_trigger(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("event trigger name")?;
+        let action = if self.eat_ident("disable")? {
+            AlterEventTriggerAction::SetEnabled(crate::sql::ast::TriggerEnableMode::Disabled)
+        } else if self.eat_ident("enable")? {
+            AlterEventTriggerAction::SetEnabled(if self.eat_ident("replica")? {
+                crate::sql::ast::TriggerEnableMode::Replica
+            } else if self.eat_ident("always")? {
+                crate::sql::ast::TriggerEnableMode::Always
+            } else {
+                crate::sql::ast::TriggerEnableMode::Origin
+            })
+        } else if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterEventTriggerAction::SetOwner(self.any_ident("role name")?)
+        } else if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterEventTriggerAction::Rename(self.col_ident("new event trigger name")?)
+        } else {
+            return Err(self.err_here("expected an ALTER EVENT TRIGGER action"));
+        };
+        Ok(Stmt::AlterEventTrigger { name, action })
+    }
+
+    pub(super) fn drop_event_trigger(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.col_ident("event trigger name")?;
+        let cascade = if self.eat_ident("cascade")? {
+            true
+        } else {
+            let _ = self.eat_ident("restrict")?;
+            false
+        };
+        Ok(Stmt::DropEventTrigger {
+            name,
+            if_exists,
+            cascade,
+        })
+    }
+
     fn aggregate_argument(&mut self) -> Result<AggregateArgument<'a>, ParseError> {
         let _ = self.eat_ident("in")?;
         let variadic = self.eat_ident("variadic")?;
@@ -847,6 +956,10 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("subscription")? {
             return self.create_subscription();
+        }
+        if self.eat_ident("event")? {
+            self.expect_ident("trigger")?;
+            return self.create_event_trigger();
         }
         if self.eat_ident("trigger")? {
             return self.create_trigger(false, false);
@@ -2795,6 +2908,11 @@ impl<'a> Parser<'a> {
                     return Err(self.err_here("trigger functions cannot have OUT parameters"));
                 }
                 RoutineCreateKind::Trigger
+            } else if has_returns && self.eat_ident("event_trigger")? {
+                if output_count != 0 {
+                    return Err(self.err_here("event trigger functions cannot have OUT parameters"));
+                }
+                RoutineCreateKind::EventTrigger
             } else if has_returns && self.eat_ident("table")? {
                 if output_count != 0 {
                     return Err(ParseError {
@@ -3168,15 +3286,19 @@ impl<'a> Parser<'a> {
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
             });
         }
-        if matches!(kind, RoutineCreateKind::Trigger)
-            && language != crate::sql::ast::RoutineLanguage::PlPgSql
+        if matches!(
+            kind,
+            RoutineCreateKind::Trigger | RoutineCreateKind::EventTrigger
+        ) && language != crate::sql::ast::RoutineLanguage::PlPgSql
         {
             return Err(self.unexpected("trigger functions require LANGUAGE plpgsql"));
         }
         if language == crate::sql::ast::RoutineLanguage::PlPgSql
             && !matches!(
                 kind,
-                RoutineCreateKind::Trigger | RoutineCreateKind::Procedure
+                RoutineCreateKind::Trigger
+                    | RoutineCreateKind::EventTrigger
+                    | RoutineCreateKind::Procedure
             )
         {
             return Err(ParseError {
@@ -3374,7 +3496,7 @@ impl<'a> Parser<'a> {
         name: QualName<'a>,
         columns: &'a [&'a str],
         if_not_exists: bool,
-        materialized: bool,
+        kind: crate::sql::ast::CreateTableAsKind,
     ) -> Result<Stmt<'a>, ParseError> {
         let start = self.peek_at;
         let _ = self.query_select()?;
@@ -3393,7 +3515,7 @@ impl<'a> Parser<'a> {
             sql,
             with_data,
             if_not_exists,
-            materialized,
+            kind,
         })
     }
 
@@ -3997,7 +4119,12 @@ impl<'a> Parser<'a> {
             columns = self.arena_slice(&list[..m])?;
         }
         self.expect_ident("as")?;
-        self.create_table_as(name, columns, if_not_exists, true)
+        self.create_table_as(
+            name,
+            columns,
+            if_not_exists,
+            crate::sql::ast::CreateTableAsKind::MaterializedView,
+        )
     }
 
     /// CREATE SCHEMA [IF NOT EXISTS] { name [AUTHORIZATION role] |
@@ -5260,6 +5387,10 @@ impl<'a> Parser<'a> {
                 if_exists,
             });
         }
+        if self.eat_ident("event")? {
+            self.expect_ident("trigger")?;
+            return self.drop_event_trigger();
+        }
         if self.eat_ident("trigger")? {
             return self.drop_trigger();
         }
@@ -5916,7 +6047,12 @@ impl<'a> Parser<'a> {
         }
         // `CREATE TABLE name AS <query>` — no explicit column list.
         if self.eat_ident("as")? {
-            return self.create_table_as(name, &[], if_not_exists, false);
+            return self.create_table_as(
+                name,
+                &[],
+                if_not_exists,
+                crate::sql::ast::CreateTableAsKind::Table,
+            );
         }
         self.expect_op("(")?;
         // A `(` is either column definitions or — for `CREATE TABLE ... AS` — a
@@ -5943,7 +6079,12 @@ impl<'a> Parser<'a> {
                 self.expect_op(")")?;
                 self.expect_ident("as")?;
                 let cols = self.arena_slice(&list[..m])?;
-                return self.create_table_as(name, cols, if_not_exists, false);
+                return self.create_table_as(
+                    name,
+                    cols,
+                    if_not_exists,
+                    crate::sql::ast::CreateTableAsKind::Table,
+                );
             }
             // Otherwise it is a column definition whose name we already read.
             pending_first_col = Some(first_ident);

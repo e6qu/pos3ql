@@ -2054,7 +2054,7 @@ impl<'a> Parser<'a> {
                 sql: sql.trim(),
                 with_data: true,
                 if_not_exists: false,
-                materialized: false,
+                kind: CreateTableAsKind::SelectInto,
             });
         }
         if let SetTree::Select(s) = body {
@@ -4155,6 +4155,10 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::AlterSubscription { name, action });
         }
+        if self.eat_ident("event")? {
+            self.expect_ident("trigger")?;
+            return self.alter_event_trigger();
+        }
         if self.eat_ident("trigger")? {
             return self.alter_trigger();
         }
@@ -5267,6 +5271,9 @@ impl<'a> Parser<'a> {
             CommentTarget::Collation(self.qual_name("collation name")?)
         } else if self.eat_ident("conversion")? {
             CommentTarget::Conversion(self.qual_name("conversion name")?)
+        } else if self.eat_ident("event")? {
+            self.expect_ident("trigger")?;
+            CommentTarget::EventTrigger(self.col_ident("event trigger name")?)
         } else if self.eat_ident("extension")? {
             CommentTarget::Extension(self.col_ident("extension name")?)
         } else if self.eat_ident("trigger")? {
@@ -6666,6 +6673,83 @@ mod tests {
                 }
             );
         });
+    }
+
+    #[test]
+    fn event_trigger_lifecycle_is_typed_without_allocation() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "event trigger parser", 1 << 18).unwrap();
+        let mut parser = Parser::new(
+            "CREATE EVENT TRIGGER audit_ddl ON ddl_command_end \
+             WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE') \
+             EXECUTE FUNCTION public.audit_ddl(); \
+             ALTER EVENT TRIGGER audit_ddl ENABLE REPLICA; \
+             DROP EVENT TRIGGER IF EXISTS audit_ddl CASCADE",
+            &arena,
+        )
+        .unwrap();
+        crate::mem::guard::forbid_alloc(|| {
+            let Some(Stmt::CreateEventTrigger(trigger)) = parser.next_stmt().unwrap() else {
+                panic!("CREATE EVENT TRIGGER did not parse")
+            };
+            assert_eq!(trigger.name, "audit_ddl");
+            assert_eq!(
+                trigger.event,
+                crate::sql::ast::EventTriggerEvent::DdlCommandEnd
+            );
+            assert_eq!(trigger.tags, ["CREATE TABLE", "ALTER TABLE"]);
+            assert_eq!(
+                trigger.function,
+                QualName {
+                    schema: Some("public"),
+                    name: "audit_ddl",
+                }
+            );
+            let Some(Stmt::AlterEventTrigger { name, action }) = parser.next_stmt().unwrap() else {
+                panic!("ALTER EVENT TRIGGER did not parse")
+            };
+            assert_eq!(name, "audit_ddl");
+            assert_eq!(
+                action,
+                crate::sql::ast::AlterEventTriggerAction::SetEnabled(
+                    crate::sql::ast::TriggerEnableMode::Replica
+                )
+            );
+            let Some(Stmt::DropEventTrigger {
+                name,
+                if_exists,
+                cascade,
+            }) = parser.next_stmt().unwrap()
+            else {
+                panic!("DROP EVENT TRIGGER did not parse")
+            };
+            assert_eq!(name, "audit_ddl");
+            assert!(if_exists);
+            assert!(cascade);
+        });
+    }
+
+    #[test]
+    fn table_producing_ddl_keeps_its_postgresql_command_kind() {
+        with_parser(
+            "CREATE TABLE from_query AS SELECT 1; \
+             CREATE MATERIALIZED VIEW materialized_query AS SELECT 1; \
+             SELECT 1 INTO selected_query",
+            |parser| {
+                let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("CREATE TABLE AS did not parse")
+                };
+                assert_eq!(kind, crate::sql::ast::CreateTableAsKind::Table);
+                let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("CREATE MATERIALIZED VIEW did not parse")
+                };
+                assert_eq!(kind, crate::sql::ast::CreateTableAsKind::MaterializedView);
+                let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("SELECT INTO did not parse")
+                };
+                assert_eq!(kind, crate::sql::ast::CreateTableAsKind::SelectInto);
+            },
+        );
     }
 
     #[test]

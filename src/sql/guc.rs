@@ -404,6 +404,7 @@ struct GucValues {
     /// boundaries during execution.
     statement_timeout: StackStr<24>,
     row_security: StackStr<4>,
+    event_triggers: bool,
     /// bytea_output = escape (false = hex, the default).
     bytea_escape: bool,
     /// Whether function bodies are checked at definition time. Function DDL is
@@ -433,6 +434,7 @@ impl GucValues {
             lock_timeout: StackStr::new(),
             statement_timeout: StackStr::new(),
             row_security: StackStr::new(),
+            event_triggers: true,
             bytea_escape: false,
             check_function_bodies: true,
             default_transaction_isolation: TransactionIsolation::ReadCommitted,
@@ -474,7 +476,8 @@ const GUC_DEFAULT_TABLE_ACCESS_METHOD: u32 = 1 << 19;
 const GUC_SYNCHRONIZE_SEQSCANS: u32 = 1 << 20;
 const GUC_IDLE_IN_TRANSACTION_SESSION_TIMEOUT: u32 = 1 << 21;
 const GUC_TRANSACTION_TIMEOUT: u32 = 1 << 22;
-const GUC_ALL: u32 = (1 << 23) - 1;
+const GUC_EVENT_TRIGGERS: u32 = 1 << 23;
+const GUC_ALL: u32 = (1 << 24) - 1;
 
 fn guc_bit(name: &str) -> u32 {
     if name.eq_ignore_ascii_case("datestyle") {
@@ -523,6 +526,8 @@ fn guc_bit(name: &str) -> u32 {
         GUC_IDLE_IN_TRANSACTION_SESSION_TIMEOUT
     } else if name.eq_ignore_ascii_case("transaction_timeout") {
         GUC_TRANSACTION_TIMEOUT
+    } else if name.eq_ignore_ascii_case("event_triggers") {
+        GUC_EVENT_TRIGGERS
     } else {
         0
     }
@@ -551,6 +556,7 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     copy!(GUC_LOCK_TIMEOUT, lock_timeout);
     copy!(GUC_STATEMENT_TIMEOUT, statement_timeout);
     copy!(GUC_ROW_SECURITY, row_security);
+    copy!(GUC_EVENT_TRIGGERS, event_triggers);
     copy!(GUC_BYTEA_OUTPUT, bytea_escape);
     copy!(GUC_CHECK_FUNCTION_BODIES, check_function_bodies);
     copy!(
@@ -704,6 +710,7 @@ fn merge_session_changes(target: &mut GucValues, before: &GucValues, after: &Guc
     changed!(lock_timeout);
     changed!(statement_timeout);
     changed!(row_security);
+    changed!(event_triggers);
     changed!(bytea_escape);
     changed!(check_function_bodies);
     changed!(default_transaction_isolation);
@@ -765,6 +772,12 @@ impl GucState {
             Some(StackStr::from_str(values.statement_timeout.as_str()))
         } else if name.eq_ignore_ascii_case("row_security") {
             Some(StackStr::from_str(values.row_security.as_str()))
+        } else if name.eq_ignore_ascii_case("event_triggers") {
+            Some(StackStr::from_str(if values.event_triggers {
+                "on"
+            } else {
+                "off"
+            }))
         } else if name.eq_ignore_ascii_case("bytea_output") {
             Some(StackStr::from_str(if values.bytea_escape {
                 "escape"
@@ -946,6 +959,10 @@ impl GucState {
 
     pub fn lock_timeout_ms(&self) -> u64 {
         parse_timeout_ms(self.store.borrow().current.lock_timeout.as_str()).unwrap_or(0)
+    }
+
+    pub(crate) fn event_triggers(&self) -> bool {
+        self.store.borrow().current.event_triggers
     }
 
     pub(crate) fn transaction_defaults(&self) -> (TransactionIsolation, bool, bool) {
@@ -1521,6 +1538,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.statement_timeout = defaults.statement_timeout;
     } else if name.eq_ignore_ascii_case("row_security") {
         values.row_security = defaults.row_security;
+    } else if name.eq_ignore_ascii_case("event_triggers") {
+        values.event_triggers = defaults.event_triggers;
     } else if name.eq_ignore_ascii_case("bytea_output") {
         values.bytea_escape = defaults.bytea_escape;
     } else if name.eq_ignore_ascii_case("check_function_bodies") {
@@ -1798,6 +1817,14 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         };
         return store(&mut values.row_security, if on { "on" } else { "off" });
     }
+    if name.eq_ignore_ascii_case("event_triggers") {
+        values.event_triggers = if is_default {
+            true
+        } else {
+            parse_on_off(v).ok_or_else(|| unsupported_value("event_triggers", v))?
+        };
+        return Ok(());
+    }
     if name.eq_ignore_ascii_case("default_transaction_isolation") {
         values.default_transaction_isolation = if is_default {
             TransactionIsolation::ReadCommitted
@@ -1867,6 +1894,12 @@ impl GucState {
             Some(StackStr::from_str(values.lock_timeout.as_str()))
         } else if name.eq_ignore_ascii_case("row_security") {
             Some(StackStr::from_str(values.row_security.as_str()))
+        } else if name.eq_ignore_ascii_case("event_triggers") {
+            Some(StackStr::from_str(if values.event_triggers {
+                "on"
+            } else {
+                "off"
+            }))
         } else if name.eq_ignore_ascii_case("statement_timeout") {
             Some(StackStr::from_str(values.statement_timeout.as_str()))
         } else if name.eq_ignore_ascii_case("idle_in_transaction_session_timeout")

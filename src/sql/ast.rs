@@ -552,6 +552,16 @@ pub enum Stmt<'a> {
     /// function identity are separate typed fields so execution cannot
     /// reinterpret a trigger as a different DML event.
     CreateTrigger(CreateTrigger<'a>),
+    CreateEventTrigger(CreateEventTrigger<'a>),
+    AlterEventTrigger {
+        name: &'a str,
+        action: AlterEventTriggerAction<'a>,
+    },
+    DropEventTrigger {
+        name: &'a str,
+        if_exists: bool,
+        cascade: bool,
+    },
     /// ALTER TRIGGER has only identity/enabled-state operations; the typed
     /// action keeps those distinct from a definition replacement.
     AlterTrigger {
@@ -587,17 +597,15 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
-    /// `CREATE TABLE [IF NOT EXISTS] name [(cols)] AS <select> [WITH [NO] DATA]`
-    /// and, with `materialized`, `CREATE MATERIALIZED VIEW`. `sql` is the raw
-    /// SELECT text, run once to populate the new (backing) table; `columns`
-    /// optionally renames the query's output columns.
+    /// Table-producing DDL retains its written command kind because PostgreSQL
+    /// exposes distinct event-trigger tags for SELECT INTO and CREATE TABLE AS.
     CreateTableAs {
         name: QualName<'a>,
         columns: &'a [&'a str],
         sql: &'a str,
         with_data: bool,
         if_not_exists: bool,
-        materialized: bool,
+        kind: CreateTableAsKind,
     },
     /// REFRESH MATERIALIZED VIEW name — re-run the stored query, replacing rows.
     RefreshMaterializedView {
@@ -935,6 +943,13 @@ pub enum Stmt<'a> {
         roles: &'a [&'a str],
         cascade: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateTableAsKind {
+    Table,
+    MaterializedView,
+    SelectInto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2003,6 +2018,7 @@ pub enum CommentTarget<'a> {
     Database(&'a str),
     Collation(QualName<'a>),
     Conversion(QualName<'a>),
+    EventTrigger(&'a str),
     /// EXTENSION name.
     Extension(&'a str),
     /// TRIGGER name ON relation; trigger names are relation-local.
@@ -2988,6 +3004,7 @@ pub enum RoutineCreateKind<'a> {
         columns: &'a [RoutineResultColumn<'a>],
     },
     Trigger,
+    EventTrigger,
     Procedure,
 }
 
@@ -3557,6 +3574,70 @@ pub enum TriggerEnableMode {
     Replica,
     Always,
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventTriggerEvent {
+    Login,
+    DdlCommandStart,
+    DdlCommandEnd,
+    SqlDrop,
+    TableRewrite,
+}
+
+impl EventTriggerEvent {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::DdlCommandStart => "ddl_command_start",
+            Self::DdlCommandEnd => "ddl_command_end",
+            Self::SqlDrop => "sql_drop",
+            Self::TableRewrite => "table_rewrite",
+        }
+    }
+
+    pub const fn supports_tag_filter(self) -> bool {
+        matches!(
+            self,
+            Self::DdlCommandStart | Self::DdlCommandEnd | Self::SqlDrop
+        )
+    }
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Login => 0,
+            Self::DdlCommandStart => 1,
+            Self::DdlCommandEnd => 2,
+            Self::SqlDrop => 3,
+            Self::TableRewrite => 4,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Login),
+            1 => Some(Self::DdlCommandStart),
+            2 => Some(Self::DdlCommandEnd),
+            3 => Some(Self::SqlDrop),
+            4 => Some(Self::TableRewrite),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateEventTrigger<'a> {
+    pub name: &'a str,
+    pub event: EventTriggerEvent,
+    pub tags: &'a [&'a str],
+    pub function: QualName<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterEventTriggerAction<'a> {
+    SetEnabled(TriggerEnableMode),
+    SetOwner(&'a str),
+    Rename(&'a str),
 }
 
 /// `ALL` and `USER` are command selectors, not trigger names. Keeping them

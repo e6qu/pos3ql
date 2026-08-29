@@ -149,6 +149,8 @@ const KIND_SET_COLLATION: u8 = 99;
 const KIND_DROP_COLLATION: u8 = 100;
 const KIND_SET_CONVERSION: u8 = 101;
 const KIND_DROP_CONVERSION: u8 = 102;
+const KIND_SET_EVENT_TRIGGER: u8 = 103;
+const KIND_DROP_EVENT_TRIGGER: u8 = 104;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -156,7 +158,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DROP_CONVERSION;
+const LAST_KIND: u8 = KIND_DROP_EVENT_TRIGGER;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -952,6 +954,14 @@ pub(crate) enum WalOp<'a> {
     },
     DropConversion {
         schema: &'a str,
+        name: &'a str,
+    },
+    SetEventTrigger {
+        slot: u8,
+        created_at: u64,
+        definition: crate::storage::EventTriggerDefinition,
+    },
+    DropEventTrigger {
         name: &'a str,
     },
     DropRoutine {
@@ -1826,6 +1836,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropCollation { .. } => KIND_DROP_COLLATION,
         WalOp::SetConversion { .. } => KIND_SET_CONVERSION,
         WalOp::DropConversion { .. } => KIND_DROP_CONVERSION,
+        WalOp::SetEventTrigger { .. } => KIND_SET_EVENT_TRIGGER,
+        WalOp::DropEventTrigger { .. } => KIND_DROP_EVENT_TRIGGER,
         WalOp::DropRoutine { .. } => KIND_DROP_ROUTINE,
         WalOp::AlterRoutineIdentity { .. } => KIND_ALTER_ROUTINE_IDENTITY,
         WalOp::AlterDomainIdentity { .. } => KIND_ALTER_DOMAIN_IDENTITY,
@@ -2525,6 +2537,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     crate::storage::RoutineKind::Function { .. }
                     | crate::storage::RoutineKind::SetFunction { .. }
                     | crate::storage::RoutineKind::Trigger
+                    | crate::storage::RoutineKind::EventTrigger
                     | crate::storage::RoutineKind::Procedure
                     | crate::storage::RoutineKind::Aggregate(_) => 0,
                 }
@@ -2621,6 +2634,19 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::SetConversion { definition, .. } => {
             1 + 8 + 1 + definition.schema.as_str().len() + 1 + definition.name.as_str().len() + 11
         }
+        WalOp::SetEventTrigger { definition, .. } => {
+            1 + 8
+                + 1
+                + definition.name.as_str().len()
+                + 7
+                + definition
+                    .tags
+                    .values()
+                    .iter()
+                    .map(|tag| 1 + tag.as_str().len())
+                    .sum::<usize>()
+        }
+        WalOp::DropEventTrigger { name } => 1 + name.len(),
         WalOp::SetOperatorClass { definition, .. } => {
             8 + 1
                 + definition.schema.as_str().len()
@@ -4098,6 +4124,26 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&definition.procedure.to_le_bytes())
                 && buffer.append(&[u8::from(definition.default)])
         }
+        WalOp::SetEventTrigger {
+            slot,
+            created_at,
+            definition,
+        } => {
+            buffer.append(&[*slot])
+                && buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, definition.name.as_str())
+                && buffer.append(&[definition.event.code()])
+                && buffer.append(&definition.function.to_le_bytes())
+                && buffer.append(&[definition.enabled.code()])
+                && buffer.append(&definition.ownership.committed().owner.to_le_bytes())
+                && buffer.append(&[definition.tags.values().len() as u8])
+                && definition
+                    .tags
+                    .values()
+                    .iter()
+                    .all(|tag| name_bytes(buffer, tag.as_str()))
+        }
+        WalOp::DropEventTrigger { name } => name_bytes(buffer, name),
         WalOp::SetOperatorFamily {
             created_at,
             definition,
@@ -7174,6 +7220,53 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 },
             })
         }
+        KIND_SET_EVENT_TRIGGER => {
+            let slot = *payload.get(at)?;
+            at += 1;
+            if usize::from(slot) >= crate::storage::MAX_EVENT_TRIGGERS {
+                return None;
+            }
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let name = SqlName::parse(take_name(&mut at)?).ok()?;
+            let event = crate::sql::ast::EventTriggerEvent::from_code(*payload.get(at)?)?;
+            at += 1;
+            let function = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let enabled = crate::storage::TriggerEnabled::from_code(*payload.get(at)?)?;
+            at += 1;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let tag_count = usize::from(*payload.get(at)?);
+            at += 1;
+            if tag_count > crate::storage::MAX_EVENT_TRIGGER_TAGS {
+                return None;
+            }
+            let mut tag_values = [""; crate::storage::MAX_EVENT_TRIGGER_TAGS];
+            for tag in tag_values.iter_mut().take(tag_count) {
+                *tag = take_name(&mut at)?;
+            }
+            let tags = crate::storage::EventTriggerTags::parse(&tag_values[..tag_count]).ok()?;
+            (at == payload.len()).then_some(WalOp::SetEventTrigger {
+                slot,
+                created_at,
+                definition: crate::storage::EventTriggerDefinition {
+                    name,
+                    event,
+                    function,
+                    tags,
+                    enabled,
+                    ownership: crate::storage::Ownership {
+                        owner,
+                        pending: None,
+                    },
+                },
+            })
+        }
+        KIND_DROP_EVENT_TRIGGER => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropEventTrigger { name })
+        }
         KIND_SET_OPERATOR_FAMILY => {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
@@ -8624,6 +8717,18 @@ mod tests {
             procedure: 4374,
             default: true,
         };
+        let event_trigger = crate::storage::EventTriggerDefinition {
+            name: SqlName::parse("audit_ddl").unwrap(),
+            event: crate::sql::ast::EventTriggerEvent::DdlCommandEnd,
+            function: 7,
+            tags: crate::storage::EventTriggerTags::parse(&["CREATE TABLE", "ALTER TABLE"])
+                .unwrap(),
+            enabled: crate::storage::TriggerEnabled::Always,
+            ownership: crate::storage::Ownership {
+                owner: 0,
+                pending: None,
+            },
+        };
         let operations = [
             WalOp::SetCast(crate::storage::CastDef {
                 database: crate::storage::DatabaseOid::POSTGRES,
@@ -8681,6 +8786,12 @@ mod tests {
                 schema: "public",
                 name: "latin1_to_utf8",
             },
+            WalOp::SetEventTrigger {
+                slot: 3,
+                created_at: 16,
+                definition: event_trigger,
+            },
+            WalOp::DropEventTrigger { name: "audit_ddl" },
         ];
         for operation in operations {
             let mut bytes = [0; 4096];

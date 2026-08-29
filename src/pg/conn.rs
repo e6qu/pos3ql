@@ -47,7 +47,7 @@ fn reject_replication_login(mode: ReplicationMode, role: crate::sql::RoleLogin) 
     mode != ReplicationMode::None && !role.superuser && !role.replication
 }
 
-fn apply_startup_options(guc: &GucState, options: &str) -> Result<(), SqlError> {
+fn apply_startup_options(guc: &GucState, options: &str, superuser: bool) -> Result<(), SqlError> {
     let mut words = options.split_ascii_whitespace();
     while let Some(word) = words.next() {
         let assignment = if word == "-c" {
@@ -79,6 +79,12 @@ fn apply_startup_options(guc: &GucState, options: &str) -> Result<(), SqlError> 
             return Err(sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "startup configuration parameter name is empty"
+            ));
+        }
+        if name.eq_ignore_ascii_case("event_triggers") && !superuser {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to set parameter \"event_triggers\""
             ));
         }
         guc.set(name, value, false)?;
@@ -916,6 +922,8 @@ impl Conn {
         }
 
         let session_user = self.guc.session_user();
+        let startup_login = engine.role_login(session_user.as_str());
+        let startup_superuser = startup_login.is_some_and(|role| role.superuser);
         self.auth_database = engine.database_login(self.database.as_str());
         if let Some(database) = self.auth_database {
             if engine.select_database(database.oid).is_err() {
@@ -946,9 +954,15 @@ impl Conn {
                 return Step::Close;
             };
             let result = match key {
-                "options" => apply_startup_options(&self.guc, value),
+                "options" => apply_startup_options(&self.guc, value, startup_superuser),
                 "user" | "database" | "replication" => Ok(()),
                 _ if key.starts_with("_pq_.") => Ok(()),
+                _ if key.eq_ignore_ascii_case("event_triggers") && !startup_superuser => {
+                    Err(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "permission denied to set parameter \"event_triggers\""
+                    ))
+                }
                 _ => self.guc.set(key, value, false),
             };
             if let Err(error) = result {
@@ -964,7 +978,7 @@ impl Conn {
         self.role_scram = None;
         self.login_verifier = LoginVerifier::Rejected;
         self.auth_login = None;
-        if let Some(role) = engine.role_login(session_user.as_str()) {
+        if let Some(role) = startup_login {
             self.auth_login = Some(role);
             self.login_verifier =
                 login_verifier_for(session_user.as_str(), role, !auth.password.is_empty());
@@ -1098,6 +1112,23 @@ impl Conn {
             .get_owned("timezone")
             .unwrap_or_else(|| StackStr::from_str("UTC"));
         let mut responder = Responder::new(&mut self.send);
+        self.arena.reset();
+        if let Err(error) = engine.execute_login_event_triggers(
+            &mut self.txn,
+            &mut self.cursors,
+            &self.guc,
+            &self.arena,
+            &mut responder,
+        ) {
+            let _ = responder.error(error.sqlstate, error.message.as_str());
+            if let Some(role) = self.authenticated_role.take() {
+                engine.release_role_connection(role);
+            }
+            if let Some(database) = self.authenticated_database.take() {
+                engine.release_database_connection(database);
+            }
+            return Step::Close;
+        }
         let mut write_all = || -> Result<(), WireFull> {
             responder.auth_ok()?;
             for (k, v) in [
@@ -4356,6 +4387,17 @@ fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, messa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_event_trigger_escape_hatch_is_superuser_only() {
+        let guc = GucState::new();
+        let error = apply_startup_options(&guc, "-c event_triggers=off", false)
+            .expect_err("ordinary roles cannot disable login event triggers");
+        assert_eq!(error.sqlstate, sqlstate::INSUFFICIENT_PRIVILEGE);
+        apply_startup_options(&guc, "-c event_triggers=off", true)
+            .expect("a superuser may disable login event triggers");
+        assert!(!guc.event_triggers());
+    }
 
     #[test]
     fn portal_completion_tags_count_only_the_current_execute() {

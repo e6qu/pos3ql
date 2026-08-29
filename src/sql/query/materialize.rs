@@ -21,8 +21,8 @@ use super::{
     Chained, JoinRow, MAX_SUBQUERIES, Outcome, QueryScope, ResolvedColumn, arena_full,
     correlated_in_expression, correlated_scan_conjuncts, correlated_where_passes, has_project_set,
     merge_correlated, pax_column_demand, postpone_cost, prepare_project_set, project_row_skipping,
-    record_star_width, resolve_order_target, scan_source_recycling_with_pax_columns,
-    scan_source_with_pax_columns, sql_fail, sql_ok,
+    record_star_width, resolve_order_target, scan_source_recycling_with_pax_columns, sql_fail,
+    sql_ok,
 };
 
 /// A flat decoded source row (every column of every scope table, in scope
@@ -226,6 +226,45 @@ fn for_each_materialized_projection<'a>(
         consume(row, &projected[..width], &keys[..n_keys])?;
     }
     Ok(())
+}
+
+#[expect(clippy::too_many_arguments, reason = "materialized row layout")]
+fn materialized_value_at<'a>(
+    scope: &QueryScope<'a>,
+    row: &JoinRow<'_, 'a, '_>,
+    projected: &[Datum<'a>],
+    keys: &[Datum<'a>],
+    width: usize,
+    n_keys: usize,
+    identities_at: usize,
+    index: usize,
+) -> Datum<'a> {
+    if index < width {
+        return projected[index];
+    }
+    if index < width + n_keys {
+        return keys[index - width];
+    }
+    if index >= identities_at {
+        return row.rowids[index - identities_at]
+            .and_then(|rowid| i64::try_from(rowid).ok())
+            .map(Datum::Int8)
+            .unwrap_or(Datum::Null);
+    }
+    let mut raw_index = index - width - n_keys;
+    for table in 0..scope.n {
+        let column_count = scope.defs[table].expect("resolved").n_columns;
+        if raw_index < column_count {
+            let values = row.values[table].expect("bound");
+            return if values.is_empty() {
+                Datum::Null
+            } else {
+                values[raw_index]
+            };
+        }
+        raw_index -= column_count;
+    }
+    unreachable!("raw projected column is within scope width")
 }
 
 /// A schema-only lookup for aggregate and grouped projections: it exposes the
@@ -648,7 +687,8 @@ pub(crate) fn materialized_rows<'a>(
     let sequence_cursor = hooks
         .sequences
         .and_then(crate::sql::eval::SequenceAccess::statement_cursor);
-    // Pass 1: count — and evaluate the projection and ORDER BY keys per row
+    let stored_width = width + n_keys + n_raw + n_identities;
+    // Pass 1: count and measure — and evaluate the projection and ORDER BY keys per row
     // (discarding the values). PostgreSQL scans, filters, and projects in a
     // single per-row pass below the Sort, so an early row's projection error
     // surfaces before a later row's WHERE error. We materialize in two passes
@@ -657,7 +697,8 @@ pub(crate) fn materialized_rows<'a>(
     // items are exactly the ones PostgreSQL does not evaluate below the Sort,
     // so they are skipped here too.
     let mut count = 0usize;
-    scan_source_with_pax_columns(
+    let mut encoded_bytes = 0usize;
+    scan_source_recycling_with_pax_columns(
         storage,
         scope,
         from,
@@ -690,7 +731,23 @@ pub(crate) fn materialized_rows<'a>(
                 },
                 has_srf,
                 outer,
-                &mut |_, _, _| {
+                &mut |row, projected, keys| {
+                    let row_bytes =
+                        crate::sql::exec::projected_row_len_by(stored_width, |index| {
+                            materialized_value_at(
+                                scope,
+                                row,
+                                projected,
+                                keys,
+                                width,
+                                n_keys,
+                                identities_at,
+                                index,
+                            )
+                        })?;
+                    encoded_bytes = encoded_bytes
+                        .checked_add(row_bytes)
+                        .ok_or_else(arena_full)?;
                     count += 1;
                     Ok(())
                 },
@@ -702,16 +759,23 @@ pub(crate) fn materialized_rows<'a>(
     let rows: &mut [&[u8]] = arena
         .alloc_slice_with(count, |_| empty)
         .map_err(|_| arena_full())?;
+    let encoded_rows = arena
+        .alloc_slice_with(encoded_bytes, |_| 0_u8)
+        .map_err(|_| arena_full())?;
+    let encoded_rows_ptr = encoded_rows.as_mut_ptr();
     if let (Some(catalog), Some(cursor)) = (hooks.catalog, routine_cursor) {
         catalog.restore_routine_invocation_cursor(cursor);
     }
     if let (Some(sequences), Some(cursor)) = (hooks.sequences, sequence_cursor) {
         sequences.restore_statement_cursor(cursor);
     }
-    // Pass 2: project + keys, encode.
+    // Pass 2: project + keys, encode into the persistent block measured above.
+    // The recycling scan can then release catalog rows and correlated-subquery
+    // scratch after each source row without releasing a materialized result.
     {
         let mut at = 0usize;
-        scan_source_with_pax_columns(
+        let mut encoded_at = 0usize;
+        scan_source_recycling_with_pax_columns(
             storage,
             scope,
             from,
@@ -746,39 +810,42 @@ pub(crate) fn materialized_rows<'a>(
                     outer,
                     &mut |row, projected, keys| {
                         debug_assert_eq!(projected.len(), width);
-                        rows[at] = crate::sql::exec::encode_projected_by(
-                            width + n_keys + n_raw + n_identities,
+                        let remaining = encoded_bytes
+                            .checked_sub(encoded_at)
+                            .ok_or_else(arena_full)?;
+                        // SAFETY: pass 1 measured this persistent block exactly.
+                        // Each callback receives the still-unwritten suffix, so
+                        // its mutable slice is disjoint from every stored row.
+                        let output = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                encoded_rows_ptr.add(encoded_at),
+                                remaining,
+                            )
+                        };
+                        let len = crate::sql::exec::encode_projected_by_into(
+                            stored_width,
                             |index| {
-                                if index < width {
-                                    return projected[index];
-                                }
-                                if index < width + n_keys {
-                                    return keys[index - width];
-                                }
-                                if index >= identities_at {
-                                    return row.rowids[index - identities_at]
-                                        .and_then(|rowid| i64::try_from(rowid).ok())
-                                        .map(Datum::Int8)
-                                        .unwrap_or(Datum::Null);
-                                }
-                                let mut raw_index = index - width - n_keys;
-                                for table in 0..scope.n {
-                                    let column_count =
-                                        scope.defs[table].expect("resolved").n_columns;
-                                    if raw_index < column_count {
-                                        let values = row.values[table].expect("bound");
-                                        return if values.is_empty() {
-                                            Datum::Null
-                                        } else {
-                                            values[raw_index]
-                                        };
-                                    }
-                                    raw_index -= column_count;
-                                }
-                                unreachable!("raw projected column is within scope width")
+                                materialized_value_at(
+                                    scope,
+                                    row,
+                                    projected,
+                                    keys,
+                                    width,
+                                    n_keys,
+                                    identities_at,
+                                    index,
+                                )
                             },
-                            arena,
+                            output,
                         )?;
+                        // SAFETY: encoding initialized this prefix of the
+                        // current disjoint suffix, and the arena owns the block
+                        // for 'a. Later callbacks only write after this slice.
+                        let encoded_row: &'a [u8] = unsafe {
+                            core::slice::from_raw_parts(encoded_rows_ptr.add(encoded_at), len)
+                        };
+                        rows[at] = encoded_row;
+                        encoded_at += len;
                         at += 1;
                         Ok(())
                     },
@@ -786,6 +853,8 @@ pub(crate) fn materialized_rows<'a>(
                 Ok(true)
             },
         )?;
+        debug_assert_eq!(at, count);
+        debug_assert_eq!(encoded_at, encoded_bytes);
     }
 
     // Plain DISTINCT dedups on the visible prefix before the ORDER BY sort.

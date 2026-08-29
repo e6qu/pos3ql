@@ -25,27 +25,6 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
     Ok(&*out)
 }
 
-/// Encodes a projected row whose values are available by index.
-///
-/// The accessor is called twice: once to size the exact arena allocation and
-/// once to encode it. It must therefore only retrieve already-evaluated
-/// values; expression evaluation belongs before this encoding boundary.
-pub(crate) fn encode_projected_by<'a>(
-    count: usize,
-    mut value_at: impl FnMut(usize) -> Datum<'a>,
-    arena: &'a Arena,
-) -> Result<&'a [u8], SqlError> {
-    let len = projected_row_len_by(count, &mut value_at)?;
-    let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "DISTINCT row exceeds the statement arena"
-        )
-    })?;
-    encode_projected_by_into(count, &mut value_at, out)?;
-    Ok(&*out)
-}
-
 /// Exact byte length of a projected row whose values are read by index.
 pub(crate) fn projected_row_len_by<'a>(
     count: usize,

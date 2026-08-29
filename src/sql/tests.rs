@@ -2901,6 +2901,64 @@ fn view_trigger_is_a_drop_dependency_and_cascades_transactionally() {
     assert_eq!(data_rows(&dropped), ["0"]);
 }
 
+#[test]
+fn ordered_catalog_query_recycles_correlated_subquery_scratch() {
+    let mut config = test_config("ordered-catalog-correlated-scratch");
+    config.max_tables = 64;
+    config.max_value_indexes = 64;
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for relation in 0..14 {
+        let statement = format!(
+            "CREATE TABLE arena_catalog_{relation}(\
+               id integer PRIMARY KEY, value text)"
+        );
+        let output = run_with(&mut engine, &mut budget, &statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let relation_oids = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid FROM pg_class \
+         WHERE relname LIKE 'arena_catalog_%' AND relkind = 'r' ORDER BY oid",
+    ));
+    assert_eq!(relation_oids.len(), 14);
+    let oid_array = relation_oids.join(",");
+    let query = format!(
+        r#"SELECT t.tableoid,t.oid,i.indrelid,t.relname,t.relpages,t.reltuples,
+                  t.relallvisible,t.relallfrozen,pg_get_indexdef(i.indexrelid),
+                  i.indkey,i.indisclustered,c.contype,c.conname,c.condeferrable,
+                  c.condeferred,c.tableoid,c.oid,pg_get_constraintdef(c.oid,false),
+                  CASE WHEN i.indexprs IS NOT NULL THEN
+                    (SELECT array_agg(attname ORDER BY attnum) FROM pg_attribute
+                      WHERE attrelid=i.indexrelid) ELSE NULL END,
+                  (SELECT spcname FROM pg_tablespace s WHERE s.oid=t.reltablespace),
+                  t.reloptions,i.indisreplident,inh.inhparent,i.indnkeyatts,i.indnatts,
+                  (SELECT array_agg(attnum ORDER BY attnum) FROM pg_attribute
+                    WHERE attrelid=i.indexrelid AND attstattarget>=0),
+                  (SELECT array_agg(attstattarget ORDER BY attnum) FROM pg_attribute
+                    WHERE attrelid=i.indexrelid AND attstattarget>=0),
+                  i.indnullsnotdistinct,c.conperiod
+             FROM unnest('{{{oid_array}}}'::oid[]) AS src(tbloid)
+             JOIN pg_index i ON src.tbloid=i.indrelid
+             JOIN pg_class t ON t.oid=i.indexrelid
+             JOIN pg_class t2 ON t2.oid=i.indrelid
+             LEFT JOIN pg_constraint c ON i.indrelid=c.conrelid
+               AND i.indexrelid=c.conindid AND c.contype IN ('p','u','x')
+             LEFT JOIN pg_inherits inh ON inh.inhrelid=i.indexrelid
+            WHERE (i.indisvalid OR t2.relkind='p') AND i.indisready
+            ORDER BY i.indrelid,t.relname"#
+    );
+    let output = run_with_arena_bytes(&mut engine, &mut budget, &query, 1 << 20);
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output).len(), 14, "{text}");
+}
+
 fn test_engine() -> (Engine, Budget) {
     test_engine_with_budget(1 << 27)
 }

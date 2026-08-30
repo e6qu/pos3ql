@@ -25,27 +25,6 @@ pub fn encode_projected_pub<'a>(values: &[Datum], arena: &'a Arena) -> Result<&'
     Ok(&*out)
 }
 
-/// Encodes a projected row whose values are available by index.
-///
-/// The accessor is called twice: once to size the exact arena allocation and
-/// once to encode it. It must therefore only retrieve already-evaluated
-/// values; expression evaluation belongs before this encoding boundary.
-pub(crate) fn encode_projected_by<'a>(
-    count: usize,
-    mut value_at: impl FnMut(usize) -> Datum<'a>,
-    arena: &'a Arena,
-) -> Result<&'a [u8], SqlError> {
-    let len = projected_row_len_by(count, &mut value_at)?;
-    let out = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| {
-        sql_err!(
-            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "DISTINCT row exceeds the statement arena"
-        )
-    })?;
-    encode_projected_by_into(count, &mut value_at, out)?;
-    Ok(&*out)
-}
-
 /// Exact byte length of a projected row whose values are read by index.
 pub(crate) fn projected_row_len_by<'a>(
     count: usize,
@@ -149,7 +128,7 @@ pub(crate) fn projected_row_width(bytes: &[u8]) -> usize {
 /// The projected-encoding byte length of one value (tag + payload).
 pub fn projected_value_len(v: &Datum) -> usize {
     1 + match v {
-        Datum::Null => 0,
+        Datum::Null | Datum::PgDdlCommand => 0,
         Datum::Bool(_) => 1,
         Datum::Int2(_) => 2,
         Datum::Float4(_) => 4,
@@ -224,6 +203,10 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
     match v {
         Datum::Null => {
             out[0] = 0;
+            1
+        }
+        Datum::PgDdlCommand => {
+            out[0] = 36;
             1
         }
         Datum::Bool(b) => {
@@ -525,6 +508,7 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
 pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, usize) {
     match tag {
         0 => (Datum::Null, 0),
+        36 => (Datum::PgDdlCommand, 0),
         1 => (Datum::Bool(bytes[at] != 0), 1),
         2 => (
             Datum::Int4(i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())),

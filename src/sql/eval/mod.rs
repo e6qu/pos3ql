@@ -5929,6 +5929,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Int2Vector(_) => "int2vector",
         Datum::OidVector(_) => "oidvector",
         Datum::Null => "unknown",
+        Datum::PgDdlCommand => "pg_ddl_command",
         Datum::Bool(_) => "boolean",
         Datum::Int2(_) => "smallint",
         Datum::Int4(_) => "integer",

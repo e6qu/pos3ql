@@ -39,6 +39,10 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
     let out = match target {
         ColType::Void => return Ok(Datum::Null),
         ColType::Internal => return Err(cast_unsupported(&v, "internal")),
+        ColType::PgDdlCommand => match v {
+            Datum::PgDdlCommand => v,
+            _ => return Err(cast_unsupported(&v, "pg_ddl_command")),
+        },
         // A cast *to* record has no source but a record itself; PostgreSQL
         // has no input conversion for anonymous records either.
         ColType::Record => match v {

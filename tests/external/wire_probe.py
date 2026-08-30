@@ -3930,6 +3930,59 @@ def test_collation_and_conversion_extended_wire_metadata():
     s.close()
 
 
+def test_event_trigger_introspection_extended_wire_contract():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+
+    def describe(name, query, expected_oids):
+        statement = (name + "_statement").encode()
+        portal = (name + "_portal").encode()
+        parse = frontend_message(
+            b"P", statement + b"\x00" + query.encode() + b"\x00\x00\x00"
+        )
+        bind = frontend_message(
+            b"B", portal + b"\x00" + statement + b"\x00" + struct.pack("!hhh", 0, 0, 0)
+        )
+        portal_description = frontend_message(b"D", b"P" + portal + b"\x00")
+        execute = frontend_message(b"E", portal + b"\x00" + struct.pack("!i", 0))
+        s.sendall(parse + bind + portal_description + execute + frontend_message(b"S"))
+        messages = []
+        while True:
+            item = read_message(s)
+            messages.append(item)
+            if item[0] == b"Z":
+                break
+        description = next(
+            (payload for kind, payload in messages if kind == b"T"), None
+        )
+        check(
+            f"event-trigger wire: {name} Describe exposes PostgreSQL OIDs",
+            description is not None
+            and row_description_type_oids(description) == expected_oids
+            and row_description_formats(description) == [0] * len(expected_oids),
+            messages,
+        )
+        error = next((payload for kind, payload in messages if kind == b"E"), b"")
+        check(
+            f"event-trigger wire: {name} Execute rejects an absent trigger context",
+            b"C0A000" in error and b"can only be called in an event trigger function" in error,
+            messages,
+        )
+
+    describe(
+        "ddl_commands",
+        "SELECT * FROM pg_event_trigger_ddl_commands()",
+        [26, 26, 23, 25, 25, 25, 25, 16, 32],
+    )
+    describe(
+        "dropped_objects",
+        "SELECT * FROM pg_event_trigger_dropped_objects()",
+        [26, 26, 23, 16, 16, 16, 25, 25, 25, 25, 1009, 1009],
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

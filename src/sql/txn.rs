@@ -140,6 +140,7 @@ pub struct TxnState {
     /// dispatch reads this typed execution origin instead of guessing from a
     /// connection or statement string.
     pub replication_apply: bool,
+    extension_script: bool,
     snapshot_lsn: Option<u64>,
     snapshot_taken: bool,
     /// PostgreSQL's command-id: a monotonically increasing counter bumped once
@@ -160,6 +161,9 @@ pub struct TxnState {
     truncate_wal_tables: FixedBuf,
     /// DDL performed in this transaction, for rollback.
     ddl: FixedVec<DdlUndo>,
+    ddl_origins: FixedVec<u32>,
+    ddl_origin: u32,
+    next_ddl_origin: u32,
     /// Transaction-private ANALYZE versions, kept outside `DdlUndo`. The
     /// images themselves live in Storage's startup-sized slab; undo needs only
     /// the table whose latest version is popped.
@@ -562,6 +566,7 @@ impl TxnState {
             + MAX_TXN_DDL * core::mem::size_of::<TruncateEvent>()
             + MAX_TRUNCATE_WAL_TABLE_BYTES
             + MAX_TXN_DDL * core::mem::size_of::<DdlUndo>()
+            + MAX_TXN_DDL * core::mem::size_of::<u32>()
             + MAX_TXN_ANALYZE * core::mem::size_of::<StatisticsUndo>()
             + MAX_SAVEPOINTS * core::mem::size_of::<Savepoint>()
             + crate::sql::notify::PER_TXN
@@ -590,6 +595,7 @@ impl TxnState {
             deferrable: false,
             sources: TransactionSources::default(),
             replication_apply: false,
+            extension_script: false,
             snapshot_lsn: None,
             snapshot_taken: false,
             command_id: 1,
@@ -602,6 +608,9 @@ impl TxnState {
                 MAX_TRUNCATE_WAL_TABLE_BYTES,
             )?,
             ddl: FixedVec::new(budget, "txn_ddl", MAX_TXN_DDL)?,
+            ddl_origins: FixedVec::new(budget, "txn_ddl_origins", MAX_TXN_DDL)?,
+            ddl_origin: 0,
+            next_ddl_origin: 0,
             statistics_undo: FixedVec::new(budget, "txn_statistics_undo", MAX_TXN_ANALYZE)?,
             savepoints: FixedVec::new(budget, "txn_savepoints", MAX_SAVEPOINTS)?,
             pending_notifies: FixedVec::new(
@@ -702,6 +711,20 @@ impl TxnState {
 
     pub(crate) fn trigger_depth(&self) -> u16 {
         self.trigger_depth
+    }
+
+    pub(crate) fn enter_extension_script(&mut self) {
+        assert!(!self.extension_script, "extension scripts cannot nest");
+        self.extension_script = true;
+    }
+
+    pub(crate) fn leave_extension_script(&mut self) {
+        assert!(self.extension_script, "extension script scope is paired");
+        self.extension_script = false;
+    }
+
+    pub(crate) fn in_extension_script(&self) -> bool {
+        self.extension_script
     }
 
     pub fn leave_trigger_sql(&mut self) {
@@ -1626,6 +1649,7 @@ impl TxnState {
     pub fn rewind_ddl(&mut self, ddl_mark: usize) {
         while self.ddl.len() > ddl_mark {
             self.ddl.pop();
+            self.ddl_origins.pop();
         }
     }
 
@@ -1676,11 +1700,37 @@ impl TxnState {
                 "more than {} DDL statements in one transaction",
                 MAX_TXN_DDL
             )
-        })
+        })?;
+        self.ddl_origins
+            .push(self.ddl_origin)
+            .expect("parallel DDL origin pool has the same capacity");
+        Ok(())
     }
 
     pub(crate) fn ddl(&self) -> &[DdlUndo] {
         &self.ddl
+    }
+
+    pub(crate) fn ddl_origins(&self) -> &[u32] {
+        &self.ddl_origins
+    }
+
+    pub(crate) fn enter_ddl_origin(&mut self) -> u32 {
+        let prior = self.ddl_origin;
+        self.next_ddl_origin = self
+            .next_ddl_origin
+            .checked_add(1)
+            .expect("bounded statement nesting cannot exhaust DDL origins");
+        self.ddl_origin = self.next_ddl_origin;
+        prior
+    }
+
+    pub(crate) fn leave_ddl_origin(&mut self, prior: u32) {
+        self.ddl_origin = prior;
+    }
+
+    pub(crate) fn ddl_origin(&self) -> u32 {
+        self.ddl_origin
     }
 
     pub fn clear(&mut self) {
@@ -1691,12 +1741,16 @@ impl TxnState {
         self.deferrable = false;
         self.sources = TransactionSources::default();
         self.replication_apply = false;
+        self.extension_script = false;
         self.snapshot_lsn = None;
         self.snapshot_taken = false;
         self.touched.clear();
         self.truncates.clear();
         self.truncate_wal_tables.clear();
         self.ddl.clear();
+        self.ddl_origins.clear();
+        self.ddl_origin = 0;
+        self.next_ddl_origin = 0;
         self.statistics_undo.clear();
         self.savepoints.clear();
         // Commit flushes these before clearing; rollback drops them here.

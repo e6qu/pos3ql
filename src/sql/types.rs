@@ -15,6 +15,7 @@ pub mod oid {
     pub const INT2: i32 = 21;
     pub const INT2VECTOR: i32 = 22;
     pub const OIDVECTOR: i32 = 30;
+    pub const PG_DDL_COMMAND: i32 = 32;
     pub const PG_NODE_TREE: i32 = 194;
     pub const PG_NDISTINCT: i32 = 3361;
     pub const PG_DEPENDENCIES: i32 = 3402;
@@ -172,6 +173,9 @@ pub enum ColType {
     /// Opaque aggregate state. It is legal only in routine contracts and is
     /// never a SQL value or stored column.
     Internal,
+    /// Opaque event-trigger command state. It is observable only for nullness;
+    /// PostgreSQL rejects attempts to display or store it.
+    PgDdlCommand,
     Bool,
     /// `smallint`/`int2`. A real i16 datum with PostgreSQL's OID 21 and
     /// two-byte binary wire representation.
@@ -359,7 +363,7 @@ impl BtreeOperatorClass {
             Timetz => Self::Timetz,
             Uuid => Self::Uuid,
             Bit { varying: true } => Self::Varbit,
-            Void | Internal | Int2Vector | OidVector | PgNodeTree | PgNdistinct
+            Void | Internal | PgDdlCommand | Int2Vector | OidVector | PgNodeTree | PgNdistinct
             | PgDependencies | PgMcvList | PgStatisticArray | Json => return None,
         })
     }
@@ -538,7 +542,10 @@ impl ColType {
 
     /// Pseudo-types describe executor contracts rather than stored values.
     pub const fn is_pseudo(self) -> bool {
-        matches!(self, Self::Void | Self::Internal | Self::Record)
+        matches!(
+            self,
+            Self::Void | Self::Internal | Self::PgDdlCommand | Self::Record
+        )
     }
 
     pub const fn is_reg_object(self) -> bool {
@@ -569,6 +576,7 @@ impl ColType {
         Some(match name {
             "void" => Self::Void,
             "internal" => Self::Internal,
+            "pg_ddl_command" => Self::PgDdlCommand,
             "bool" | "boolean" => Self::Bool,
             "int" | "int4" | "integer" | "serial" | "serial4" => Self::Int4,
             "smallint" | "int2" | "smallserial" | "serial2" => Self::Int2,
@@ -615,6 +623,7 @@ impl ColType {
         match self {
             Self::Void => oid::VOID,
             Self::Internal => oid::INTERNAL,
+            Self::PgDdlCommand => oid::PG_DDL_COMMAND,
             Self::Bool => oid::BOOL,
             Self::Int2 => oid::INT2,
             Self::Int2Vector => oid::INT2VECTOR,
@@ -675,6 +684,7 @@ impl ColType {
         let scalar = match type_oid {
             oid::VOID => Some(Self::Void),
             oid::INTERNAL => Some(Self::Internal),
+            oid::PG_DDL_COMMAND => Some(Self::PgDdlCommand),
             oid::BOOL => Some(Self::Bool),
             oid::INT2 => Some(Self::Int2),
             oid::INT2VECTOR => Some(Self::Int2Vector),
@@ -782,6 +792,7 @@ impl ColType {
     pub fn typlen(self) -> i16 {
         match self {
             Self::Void | Self::Internal => 4,
+            Self::PgDdlCommand => 8,
             Self::Bool | Self::Char => 1,
             Self::Int2 => 2,
             Self::Int2Vector
@@ -858,6 +869,7 @@ impl ColType {
         match self {
             Self::Void => "void",
             Self::Internal => "internal",
+            Self::PgDdlCommand => "pg_ddl_command",
             Self::Bool => "bool",
             Self::Int2 => "int2",
             Self::Int2Vector => "int2vector",
@@ -926,6 +938,7 @@ impl ColType {
         match self {
             Self::Void => "void",
             Self::Internal => "internal",
+            Self::PgDdlCommand => "pg_ddl_command",
             Self::Bool => "boolean",
             Self::Int2 => "smallint",
             Self::Int2Vector => "int2vector",
@@ -988,6 +1001,7 @@ impl ColType {
             // Row encoding separately rejects pseudo-types.
             Self::Void => 57,
             Self::Internal => 73,
+            Self::PgDdlCommand => 75,
             Self::Char => 74,
             Self::Bool => 1,
             Self::Int4 => 2,
@@ -2238,6 +2252,9 @@ impl RangeKind {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Datum<'a> {
     Null,
+    /// A non-null opaque value returned only by
+    /// `pg_event_trigger_ddl_commands()`.
+    PgDdlCommand,
     Bool(bool),
     /// `smallint`. The width is the type: an i16 cannot hold what PostgreSQL's
     /// smallint cannot, so out-of-range states are unrepresentable. Stored
@@ -2389,6 +2406,7 @@ impl<'a> Datum<'a> {
             Datum::Composite { slot, .. } => oid::composite_oid(*slot),
             Datum::CompositeText { slot, .. } => oid::composite_oid(*slot),
             Datum::Null => oid::TEXT,
+            Datum::PgDdlCommand => oid::PG_DDL_COMMAND,
             Datum::Bool(_) => oid::BOOL,
             Datum::Int2(_) => oid::INT2,
             Datum::Int4(_) => oid::INT4,
@@ -2553,6 +2571,7 @@ impl fmt::Display for Datum<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Datum::Null => Ok(()), // never rendered; NULL is a column-length of -1
+            Datum::PgDdlCommand => f.write_str("<pg_ddl_command>"),
             Datum::Bool(true) => f.write_str("t"),
             Datum::Bool(false) => f.write_str("f"),
             Datum::Int2(v) => write!(f, "{v}"),

@@ -31,20 +31,29 @@ pub struct SynthTable<'a> {
 const FIRST_USER_OID: i32 = 16384;
 const PUBLIC_NS_OID: i32 = 2200;
 const PG_CATALOG_NS_OID: i32 = 11;
+const PG_TOAST_NS_OID: i32 = 99;
 /// Well-known catalog OIDs, for `pg_description.classoid`.
-const PG_CLASS_OID: i32 = 1259;
-const PG_NAMESPACE_OID: i32 = 2615;
-const PG_TYPE_OID: i32 = 1247;
-const PG_PROC_OID: i32 = 1255;
+pub(crate) const PG_CLASS_OID: i32 = 1259;
+pub(crate) const PG_NAMESPACE_OID: i32 = 2615;
+pub(crate) const PG_TYPE_OID: i32 = 1247;
+pub(crate) const PG_PROC_OID: i32 = 1255;
 const PG_AMOP_OID: i32 = 2602;
 const PG_AMPROC_OID: i32 = 2603;
-const PG_CAST_OID: i32 = 2605;
-const PG_CONVERSION_OID: i32 = 2607;
-const PG_OPCLASS_OID: i32 = 2616;
-const PG_OPERATOR_OID: i32 = 2617;
-const PG_OPFAMILY_OID: i32 = 2753;
-const PG_COLLATION_OID: i32 = 3456;
-const PG_TABLESPACE_OID: i32 = 1213;
+pub(crate) const PG_CAST_OID: i32 = 2605;
+pub(crate) const PG_CONSTRAINT_OID: i32 = 2606;
+pub(crate) const PG_CONVERSION_OID: i32 = 2607;
+pub(crate) const PG_OPCLASS_OID: i32 = 2616;
+pub(crate) const PG_OPERATOR_OID: i32 = 2617;
+pub(crate) const PG_OPFAMILY_OID: i32 = 2753;
+pub(crate) const PG_COLLATION_OID: i32 = 3456;
+pub(crate) const PG_REWRITE_OID: i32 = 2618;
+pub(crate) const PG_TRIGGER_OID: i32 = 2620;
+pub(crate) const PG_TABLESPACE_OID: i32 = 1213;
+pub(crate) const PG_POLICY_OID: i32 = 3256;
+pub(crate) const PG_STATISTIC_EXT_OID: i32 = 3381;
+pub(crate) const PG_EXTENSION_OID: i32 = 3079;
+pub(crate) const PG_PUBLICATION_OID: i32 = 6104;
+pub(crate) const PG_SUBSCRIPTION_OID: i32 = 6107;
 
 #[derive(Clone, Copy)]
 struct IntrinsicRoutine {
@@ -57,6 +66,118 @@ struct IntrinsicRoutine {
 }
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
+    IntrinsicRoutine {
+        oid: 1644,
+        name: "RI_FKey_check_ins",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1645,
+        name: "RI_FKey_check_upd",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1646,
+        name: "RI_FKey_cascade_del",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1647,
+        name: "RI_FKey_cascade_upd",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1648,
+        name: "RI_FKey_restrict_del",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1649,
+        name: "RI_FKey_restrict_upd",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1650,
+        name: "RI_FKey_setnull_del",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1651,
+        name: "RI_FKey_setnull_upd",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1652,
+        name: "RI_FKey_setdefault_del",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1653,
+        name: "RI_FKey_setdefault_upd",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1654,
+        name: "RI_FKey_noaction_del",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1655,
+        name: "RI_FKey_noaction_upd",
+        result_oid: 2279,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 4568,
+        name: "pg_event_trigger_ddl_commands",
+        result_oid: super::types::oid::RECORD,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
+        oid: 3566,
+        name: "pg_event_trigger_dropped_objects",
+        result_oid: super::types::oid::RECORD,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "s",
+    },
     IntrinsicRoutine {
         oid: 4566,
         name: "pg_event_trigger_table_rewrite_oid",
@@ -500,14 +621,52 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
 ];
 
 fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
-    !matches!(routine.oid, 1081 | 2078)
+    !matches!(routine.oid, 1081 | 2078 | 3566 | 4568)
 }
 
 fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
         1402 | 1403 | 2078 | 3086 => "u",
-        1641 => "r",
+        1641 | 3566 | 4568 => "r",
         _ => "s",
+    }
+}
+
+const DDL_COMMAND_OUTPUT_OIDS: &[i32] = &[26, 26, 23, 25, 25, 25, 25, 16, 32];
+const DDL_COMMAND_OUTPUT_NAMES: &[&str] = &[
+    "classid",
+    "objid",
+    "objsubid",
+    "command_tag",
+    "object_type",
+    "schema_name",
+    "object_identity",
+    "in_extension",
+    "command",
+];
+const DROPPED_OBJECT_OUTPUT_OIDS: &[i32] = &[26, 26, 23, 16, 16, 16, 25, 25, 25, 25, 1009, 1009];
+const DROPPED_OBJECT_OUTPUT_NAMES: &[&str] = &[
+    "classid",
+    "objid",
+    "objsubid",
+    "original",
+    "normal",
+    "is_temporary",
+    "object_type",
+    "schema_name",
+    "object_name",
+    "object_identity",
+    "address_names",
+    "address_args",
+];
+
+fn intrinsic_record_outputs(
+    routine: IntrinsicRoutine,
+) -> Option<(&'static [i32], &'static [&'static str])> {
+    match routine.oid {
+        4568 => Some((DDL_COMMAND_OUTPUT_OIDS, DDL_COMMAND_OUTPUT_NAMES)),
+        3566 => Some((DROPPED_OBJECT_OUTPUT_OIDS, DROPPED_OBJECT_OUTPUT_NAMES)),
+        _ => None,
     }
 }
 
@@ -1597,7 +1756,7 @@ fn pg_default_acl<'a>(
 /// Schema OIDs: the two built-ins keep PostgreSQL's well-known values; a user
 /// schema's OID is derived from its registry slot, above the table range.
 const FIRST_SCHEMA_OID: i32 = 80_000;
-const fn namespace_oid_for_slot(slot: usize) -> i32 {
+pub(crate) const fn namespace_oid_for_slot(slot: usize) -> i32 {
     FIRST_SCHEMA_OID + slot as i32
 }
 
@@ -1605,6 +1764,7 @@ fn namespace_oid(storage: &Storage, schema: &str) -> i32 {
     match schema {
         "public" => PUBLIC_NS_OID,
         "pg_catalog" => PG_CATALOG_NS_OID,
+        "pg_toast" => PG_TOAST_NS_OID,
         _ => storage
             .find_schema(schema)
             .map(namespace_oid_for_slot)
@@ -1616,6 +1776,7 @@ pub(crate) fn schema_name_by_oid(storage: &Storage, txid: u32, oid: i32) -> Opti
     match oid {
         PUBLIC_NS_OID => Some("public"),
         PG_CATALOG_NS_OID => Some("pg_catalog"),
+        PG_TOAST_NS_OID => Some("pg_toast"),
         _ => storage
             .visible_schemas(txid)
             .find(|(_, schema)| namespace_oid(storage, schema.name.as_str()) == oid)
@@ -1627,6 +1788,7 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
     match name {
         "public" => Some(PUBLIC_NS_OID),
         "pg_catalog" => Some(PG_CATALOG_NS_OID),
+        "pg_toast" => Some(PG_TOAST_NS_OID),
         _ => storage
             .find_schema_visible(name, txid)
             .map(namespace_oid_for_slot),
@@ -1638,18 +1800,18 @@ pub(crate) fn schema_oid_by_name(storage: &Storage, txid: u32, name: &str) -> Op
 const FIRST_INDEX_OID: i32 = 90_000;
 const FIRST_EXPLICIT_INDEX_OID: i32 = 190_000;
 const MAX_INDEXES_PER_TABLE: i32 = 64;
-fn index_oid(slot: usize, pos: usize) -> i32 {
+pub(crate) fn index_oid(slot: usize, pos: usize) -> i32 {
     FIRST_INDEX_OID + slot as i32 * MAX_INDEXES_PER_TABLE + pos as i32
 }
 
-fn explicit_index_oid(index: &crate::storage::IndexDef) -> i32 {
+pub(crate) fn explicit_index_oid(index: &crate::storage::IndexDef) -> i32 {
     FIRST_EXPLICIT_INDEX_OID
         + i32::try_from(index.created_at).unwrap_or(i32::MAX - FIRST_EXPLICIT_INDEX_OID)
 }
 
 /// Sequence relations get OIDs from their own range, above the index range.
 const FIRST_SEQUENCE_OID: i32 = 95_000;
-fn sequence_oid(slot: usize) -> i32 {
+pub(crate) fn sequence_oid(slot: usize) -> i32 {
     FIRST_SEQUENCE_OID + slot as i32
 }
 
@@ -1702,25 +1864,64 @@ pub(crate) fn view_oid(slot: usize) -> i32 {
 /// from the view relation. Keeping the mapping slot-based makes rule and
 /// dependency rows survive rename, checkpoint, recovery, and replacement.
 const FIRST_VIEW_REWRITE_OID: i32 = 110_000;
-fn view_rewrite_oid(slot: usize) -> i32 {
+pub(crate) fn view_rewrite_oid(slot: usize) -> i32 {
     FIRST_VIEW_REWRITE_OID + slot as i32
 }
 
-fn domain_oid(slot: usize) -> i32 {
+pub(crate) fn domain_oid(slot: usize) -> i32 {
     crate::sql::types::oid::domain_oid(slot as u16)
 }
 
 /// Tables/materialized views and plain views have distinct composite-type OID
 /// bands. PostgreSQL gives every row-bearing relation a separate pg_type row.
-const FIRST_TABLE_COMPOSITE_TYPE_OID: i32 = 130_000;
-const FIRST_VIEW_COMPOSITE_TYPE_OID: i32 = 140_000;
+pub(crate) const FIRST_TABLE_COMPOSITE_TYPE_OID: i32 = 130_000;
+pub(crate) const FIRST_VIEW_COMPOSITE_TYPE_OID: i32 = 140_000;
+pub(crate) const FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID: i32 = 1_300_000;
+pub(crate) const FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID: i32 = 1_400_000;
+pub(crate) const FIRST_TOAST_RELATION_OID: i32 = 1_500_000;
+pub(crate) const FIRST_TOAST_INDEX_OID: i32 = 1_600_000;
+pub(crate) const FIRST_FOREIGN_KEY_TRIGGER_OID: i32 = 1_700_000;
+
+pub(crate) const fn toast_relation_oid(slot: usize) -> i32 {
+    FIRST_TOAST_RELATION_OID + slot as i32
+}
+
+pub(crate) const fn toast_index_oid(slot: usize) -> i32 {
+    FIRST_TOAST_INDEX_OID + slot as i32
+}
+
+pub(crate) const fn foreign_key_trigger_oid(
+    table_slot: usize,
+    foreign_key: usize,
+    ordinal: usize,
+) -> i32 {
+    FIRST_FOREIGN_KEY_TRIGGER_OID
+        + (table_slot * crate::storage::MAX_FKEYS * 4 + foreign_key * 4 + ordinal) as i32
+}
+
+const fn foreign_key_action_routine(action: crate::storage::FkAction, update: bool) -> i32 {
+    use crate::storage::FkAction;
+
+    match (action, update) {
+        (FkAction::Cascade, false) => 1646,
+        (FkAction::Cascade, true) => 1647,
+        (FkAction::Restrict, false) => 1648,
+        (FkAction::Restrict, true) => 1649,
+        (FkAction::SetNull, false) => 1650,
+        (FkAction::SetNull, true) => 1651,
+        (FkAction::SetDefault, false) => 1652,
+        (FkAction::SetDefault, true) => 1653,
+        (FkAction::NoAction, false) => 1654,
+        (FkAction::NoAction, true) => 1655,
+    }
+}
 /// PostgreSQL gives every named composite a backing `pg_class` relation whose
 /// OID links `pg_type.typrelid` and its `pg_attribute` rows.
 const FIRST_NAMED_COMPOSITE_RELATION_OID: i32 = 180_000;
 const FIRST_EXTENDED_STATISTICS_OID: i32 = 300_000;
 const FIRST_EXTENSION_OID: i32 = 500_000;
 
-fn extension_oid(slot: usize) -> i32 {
+pub(crate) fn extension_oid(slot: usize) -> i32 {
     FIRST_EXTENSION_OID + slot as i32
 }
 
@@ -1846,7 +2047,7 @@ pub(crate) fn extended_statistics_expressions_by_oid<'a>(
     }))
 }
 
-fn named_composite_relation_oid(slot: usize) -> i32 {
+pub(crate) fn named_composite_relation_oid(slot: usize) -> i32 {
     FIRST_NAMED_COMPOSITE_RELATION_OID + slot as i32
 }
 
@@ -4252,10 +4453,10 @@ struct FkInfo {
     name: StackStr<64>,
 }
 
-const FIRST_FK_OID: i32 = 200_000;
-const FIRST_CHECK_OID: i32 = 300_000;
-const FIRST_DOMAIN_CHECK_OID: i32 = 400_000;
-const FIRST_NOT_NULL_OID: i32 = 450_000;
+pub(crate) const FIRST_FK_OID: i32 = 200_000;
+pub(crate) const FIRST_CHECK_OID: i32 = 300_000;
+pub(crate) const FIRST_DOMAIN_CHECK_OID: i32 = 400_000;
+pub(crate) const FIRST_NOT_NULL_OID: i32 = 450_000;
 
 /// Enumerates every foreign-key constraint, resolving each child/parent table to
 /// its OID. A child whose parent no longer exists is skipped (it cannot be
@@ -5089,7 +5290,7 @@ fn pg_stats<'a>(
     finish(def, &rows[..count], arena)
 }
 
-fn publication_oid(slot: usize) -> i32 {
+pub(crate) fn publication_oid(slot: usize) -> i32 {
     FIRST_USER_OID + 80_000 + slot as i32
 }
 
@@ -6464,9 +6665,13 @@ fn pg_class<'a>(
                 Datum::Bool(table_def.row_level_security.enabled),
                 Datum::Bool(table_def.row_level_security.forced),
                 Datum::Bool(table_def.partition.is_attached()),
-                Datum::Int4(0),    // reltablespace
-                Datum::Int4(0),    // reloftype
-                Datum::Int4(0),    // reltoastrelid
+                Datum::Int4(0), // reltablespace
+                Datum::Int4(0), // reloftype
+                Datum::Int4(if table_def.has_toast {
+                    toast_relation_oid(slot)
+                } else {
+                    0
+                }),
                 text("p", arena)?, // relpersistence: permanent
                 text("d", arena)?, // relreplident: default
                 Datum::Int4(PG_CLASS_OID),
@@ -6485,6 +6690,98 @@ fn pg_class<'a>(
                     .transpose()?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null),
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    for slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(slot, txid) || !storage.table_def(slot, txid).has_toast {
+            continue;
+        }
+        if n + 2 > out.len() {
+            return Err(catalog_capacity_exceeded("pg_class"));
+        }
+        let table_oid = table_oid(storage, slot);
+        let toast_name = crate::stack_format!(64, "pg_toast_{}", table_oid);
+        let toast_index_name = crate::stack_format!(72, "{}_index", toast_name.as_str());
+        let owner = Storage::role_oid(storage.object_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Table,
+                slot: slot as u16,
+            },
+            txid,
+        ));
+        out[n] = row(
+            &[
+                Datum::Int4(toast_relation_oid(slot)),
+                text(toast_name.as_str(), arena)?,
+                Datum::Int4(PG_TOAST_NS_OID),
+                text("t", arena)?,
+                Datum::Int4(3),
+                Datum::Float8(-1.0),
+                Datum::Int4(0),
+                Datum::Int4(2),
+                Datum::Int4(owner),
+                Datum::Int4(0),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                text("p", arena)?,
+                text("n", arena)?,
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Bool(true),
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+        out[n] = row(
+            &[
+                Datum::Int4(toast_index_oid(slot)),
+                text(toast_index_name.as_str(), arena)?,
+                Datum::Int4(PG_TOAST_NS_OID),
+                text("i", arena)?,
+                Datum::Int4(2),
+                Datum::Float8(-1.0),
+                Datum::Int4(0),
+                Datum::Int4(403),
+                Datum::Int4(owner),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                text("p", arena)?,
+                text("n", arena)?,
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Bool(true),
+                Datum::Null,
             ],
             arena,
         )?;
@@ -6739,7 +7036,7 @@ fn pg_class<'a>(
     finish(def, &out[..n], arena)
 }
 
-fn tablespace_oid(tablespace: crate::storage::TablespaceDef) -> i32 {
+pub(crate) fn tablespace_oid(tablespace: crate::storage::TablespaceDef) -> i32 {
     210_000 + i32::try_from(tablespace.created_at).unwrap_or(i32::MAX - 210_000)
 }
 
@@ -8329,8 +8626,13 @@ fn pg_index<'a>(
         ],
     );
     let indexes = collect_indexes(storage, txid, arena)?;
+    let toast_indexes = (0..storage.table_count())
+        .filter(|slot| {
+            storage.table_slot_visible_to(*slot, txid) && storage.table_def(*slot, txid).has_toast
+        })
+        .count();
     let out = arena
-        .alloc_slice_with(indexes.len(), |_| &[] as &[Datum])
+        .alloc_slice_with(indexes.len() + toast_indexes, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut n = 0;
     for info in indexes {
@@ -8380,6 +8682,47 @@ fn pg_index<'a>(
                 },
                 index_collations(storage, info, txid, arena)?,
                 index_operator_classes(storage, info, txid, arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    for slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(slot, txid) || !storage.table_def(slot, txid).has_toast {
+            continue;
+        }
+        let keys = [1_u16, 2];
+        let options = [Datum::Int4(0), Datum::Int4(0)];
+        let collations = [Datum::Oid(0), Datum::Oid(0)];
+        let operator_classes = [1981_i32, 1978];
+        out[n] = row(
+            &[
+                Datum::Int4(toast_index_oid(slot)),
+                Datum::Int4(toast_relation_oid(slot)),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(2),
+                Datum::Int4(2),
+                int2vector(&keys, arena)?,
+                Datum::Array {
+                    element: super::types::ArrElem::Int4,
+                    raw: super::array::build(&options, arena)?,
+                },
+                Datum::Null,
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Null,
+                Datum::Array {
+                    element: super::types::ArrElem::Oid,
+                    raw: super::array::build(&collations, arena)?,
+                },
+                oidvector(&operator_classes, arena)?,
             ],
             arena,
         )?;
@@ -8636,6 +8979,56 @@ fn pg_attribute<'a>(
                 arena,
             )?;
             n += 1;
+        }
+    }
+    for slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(slot, txid) || !storage.table_def(slot, txid).has_toast {
+            continue;
+        }
+        let attributes = [
+            ("chunk_id", 26, 4),
+            ("chunk_seq", 23, 4),
+            ("chunk_data", 17, -1),
+        ];
+        for (relation_oid, count) in [
+            (toast_relation_oid(slot), attributes.len()),
+            (toast_index_oid(slot), 2),
+        ] {
+            for (attribute, (name, type_oid, type_length)) in attributes[..count].iter().enumerate()
+            {
+                if n == out.len() {
+                    return Err(catalog_capacity_exceeded("pg_attribute"));
+                }
+                out[n] = row(
+                    &[
+                        Datum::Int4(relation_oid),
+                        text(name, arena)?,
+                        Datum::Int4(*type_oid),
+                        Datum::Int4(attribute as i32 + 1),
+                        Datum::Bool(false),
+                        Datum::Int4(*type_length),
+                        Datum::Int4(-1),
+                        Datum::Bool(false),
+                        Datum::Int4(0),
+                        text("", arena)?,
+                        text("", arena)?,
+                        text("p", arena)?,
+                        text("", arena)?,
+                        Datum::Int4(-1),
+                        Datum::Bool(false),
+                        Datum::Int4(attribute as i32 + 1),
+                        text("i", arena)?,
+                        Datum::Bool(true),
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Bool(false),
+                        Datum::Null,
+                        Datum::Null,
+                    ],
+                    arena,
+                )?;
+                n += 1;
+            }
         }
     }
     // Standalone composite fields belong to the generated `pg_class` relation
@@ -9355,6 +9748,84 @@ fn pg_trigger<'a>(
     );
     let mut rows: [&[Datum]; 512] = [&[]; 512];
     let mut count = 0usize;
+    let indexes = collect_indexes(storage, txid, arena)?;
+    for child_slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(child_slot, txid) {
+            continue;
+        }
+        let child = storage.table_def(child_slot, txid);
+        for (foreign_key_index, foreign_key) in child.fkeys().iter().enumerate() {
+            let Some(parent_slot) = storage.find_visible(
+                foreign_key.parent_schema.as_str(),
+                foreign_key.parent.as_str(),
+                txid,
+            ) else {
+                continue;
+            };
+            let parent_oid = table_oid(storage, parent_slot);
+            let child_oid = table_oid(storage, child_slot);
+            let parent_index = indexes
+                .iter()
+                .find(|index| {
+                    index.table_slot == parent_slot
+                        && index.is_unique
+                        && index.columns[..index.n_cols] == *foreign_key.parent_cols()
+                })
+                .map_or(0, |index| index.oid);
+            let constraint_oid =
+                FIRST_FK_OID + child_slot as i32 * MAX_INDEXES_PER_TABLE + foreign_key_index as i32;
+            for ordinal in 0..4 {
+                if count == rows.len() {
+                    return Err(catalog_capacity_exceeded("pg_trigger"));
+                }
+                let oid = foreign_key_trigger_oid(child_slot, foreign_key_index, ordinal);
+                let side = if ordinal < 2 { "a" } else { "c" };
+                let name = crate::stack_format!(64, "RI_ConstraintTrigger_{}_{}", side, oid);
+                let (relation, function, trigger_type, constrained_relation) = match ordinal {
+                    0 => (
+                        parent_oid,
+                        foreign_key_action_routine(foreign_key.on_delete, false),
+                        9,
+                        child_oid,
+                    ),
+                    1 => (
+                        parent_oid,
+                        foreign_key_action_routine(foreign_key.on_update, true),
+                        17,
+                        child_oid,
+                    ),
+                    2 => (child_oid, 1644, 5, parent_oid),
+                    _ => (child_oid, 1645, 17, parent_oid),
+                };
+                rows[count] = row(
+                    &[
+                        Datum::Int4(PG_TRIGGER_OID),
+                        Datum::Int4(oid),
+                        Datum::Int4(relation),
+                        Datum::Int4(0),
+                        text(name.as_str(), arena)?,
+                        Datum::Int4(function),
+                        Datum::Int2(trigger_type),
+                        Datum::Bpchar("O"),
+                        Datum::Bool(true),
+                        Datum::Int4(constrained_relation),
+                        Datum::Int4(parent_index),
+                        Datum::Int4(constraint_oid),
+                        Datum::Bool(foreign_key.timing.is_deferrable()),
+                        Datum::Bool(foreign_key.timing.initially_deferred()),
+                        Datum::Int2(0),
+                        int2vector(&[], arena)?,
+                        Datum::Bytea(&[]),
+                        Datum::Null,
+                        Datum::Null,
+                        Datum::Null,
+                    ],
+                    arena,
+                )?;
+                count += 1;
+            }
+        }
+    }
     for (trigger_slot, trigger) in storage.triggers_with_slots_visible_to(txid) {
         if count == rows.len() {
             return Err(catalog_capacity_exceeded("pg_trigger"));
@@ -9739,6 +10210,17 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 "intrinsic routine argument count does not match its OID vector"
             ));
         }
+        let record_outputs = intrinsic_record_outputs(*routine);
+        let mut all_types = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
+        let mut modes = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
+        let mut names = [Datum::Null; MAX_ROUTINE_ARGUMENTS];
+        if let Some((output_oids, output_names)) = record_outputs {
+            for output in 0..output_oids.len() {
+                all_types[output] = Datum::Oid(output_oids[output] as u32);
+                modes[output] = Datum::Bpchar("o");
+                names[output] = Datum::Text(output_names[output]);
+            }
+        }
         rows[index] = row(
             &[
                 Datum::Int4(1255),
@@ -9747,7 +10229,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(PG_CATALOG_NS_OID),
                 Datum::Int4(routine.argument_count),
                 Datum::Int4(routine.result_oid),
-                Datum::Bool(false),
+                Datum::Bool(record_outputs.is_some()),
                 Datum::Bpchar("f"),
                 oidvector(&argument_oids[..argument_count], arena)?,
                 Datum::Bpchar(routine.volatility),
@@ -9778,9 +10260,27 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 },
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Null,
-                Datum::Null,
-                Datum::Null,
+                match record_outputs {
+                    Some((output_oids, _)) => Datum::Array {
+                        element: super::types::ArrElem::Oid,
+                        raw: super::array::build(&all_types[..output_oids.len()], arena)?,
+                    },
+                    None => Datum::Null,
+                },
+                match record_outputs {
+                    Some((output_oids, _)) => Datum::Array {
+                        element: super::types::ArrElem::Char,
+                        raw: super::array::build(&modes[..output_oids.len()], arena)?,
+                    },
+                    None => Datum::Null,
+                },
+                match record_outputs {
+                    Some((_, output_names)) => Datum::Array {
+                        element: super::types::ArrElem::Text,
+                        raw: super::array::build(&names[..output_names.len()], arena)?,
+                    },
+                    None => Datum::Null,
+                },
                 Datum::Null,
                 Datum::Null,
             ],
@@ -10396,6 +10896,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
     let types = [
         ColType::Void,
         ColType::Internal,
+        ColType::PgDdlCommand,
         ColType::Bool,
         ColType::Int2,
         ColType::Int2Vector,
@@ -10453,7 +10954,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Record,
     ];
     let category = |t: &ColType| match t {
-        ColType::Void | ColType::Internal | ColType::Record => "P",
+        ColType::Void | ColType::Internal | ColType::PgDdlCommand | ColType::Record => "P",
         ColType::Bool => "B",
         ColType::Int2
         | ColType::Int4
@@ -11029,7 +11530,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 text("C", arena)?,
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Int4(0),
+                Datum::Int4(FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
                 Datum::Int4(table_oid(storage, slot)),
                 Datum::Int4(-1),
                 Datum::Bool(false),
@@ -11061,6 +11562,49 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         )?;
         n += 1;
     }
+    for slot in 0..storage.table_count() {
+        let table = storage.table(slot);
+        if !storage.table_slot_visible_to(slot, txid) {
+            continue;
+        }
+        if n == out.len() {
+            return Err(catalog_capacity_exceeded("pg_type"));
+        }
+        let array_name = stack_format!(128, "_{}", table.def.name.as_str());
+        out[n] = row(
+            &[
+                Datum::Int4(FIRST_TABLE_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
+                text(array_name.as_str(), arena)?,
+                Datum::Int4(-1),
+                Datum::Int4(0),
+                Datum::Int4(namespace_oid(storage, table.def.schema.as_str())),
+                text("b", arena)?,
+                text("A", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::Table,
+                    slot,
+                    txid,
+                )),
+                Datum::Bool(true),
+                text("x", arena)?,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
     for (slot, view) in storage.views_visible_to(txid) {
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_type"));
@@ -11076,8 +11620,47 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 text("C", arena)?,
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Int4(0),
+                Datum::Int4(FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
                 Datum::Int4(view_oid(slot)),
+                Datum::Int4(-1),
+                Datum::Bool(false),
+                Datum::Null,
+                text("", arena)?,
+                text("", arena)?,
+                Datum::Null,
+                Datum::Int4(PG_TYPE_OID),
+                Datum::Int4(owner_oid(
+                    storage,
+                    crate::storage::AccessClass::View,
+                    slot,
+                    txid,
+                )),
+                Datum::Bool(true),
+                text("x", arena)?,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    for (slot, view) in storage.views_visible_to(txid) {
+        if n == out.len() {
+            return Err(catalog_capacity_exceeded("pg_type"));
+        }
+        let array_name = stack_format!(128, "_{}", view.name.as_str());
+        out[n] = row(
+            &[
+                Datum::Int4(FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
+                text(array_name.as_str(), arena)?,
+                Datum::Int4(-1),
+                Datum::Int4(0),
+                Datum::Int4(namespace_oid(storage, view.schema.as_str())),
+                text("b", arena)?,
+                text("A", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32),
+                Datum::Int4(0),
+                Datum::Int4(0),
                 Datum::Int4(-1),
                 Datum::Bool(false),
                 Datum::Null,
@@ -11117,8 +11700,8 @@ fn pg_namespace<'a>(
             ("nspacl", ColType::Array(super::types::ArrElem::AclItem)),
         ],
     );
-    let mut out: [&[Datum]; 2 + crate::storage::MAX_SCHEMAS] =
-        [&[]; 2 + crate::storage::MAX_SCHEMAS];
+    let mut out: [&[Datum]; 3 + crate::storage::MAX_SCHEMAS] =
+        [&[]; 3 + crate::storage::MAX_SCHEMAS];
     out[0] = row(
         &[
             Datum::Int4(PG_NAMESPACE_OID),
@@ -11129,7 +11712,17 @@ fn pg_namespace<'a>(
         ],
         arena,
     )?;
-    let mut n = 1;
+    out[1] = row(
+        &[
+            Datum::Int4(PG_NAMESPACE_OID),
+            Datum::Int4(PG_TOAST_NS_OID),
+            text("pg_toast", arena)?,
+            Datum::Int4(10),
+            Datum::Null,
+        ],
+        arena,
+    )?;
+    let mut n = 2;
     for (slot, schema) in storage.visible_schemas(txid) {
         out[n] = row(
             &[

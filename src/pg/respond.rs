@@ -129,6 +129,7 @@ fn display_len(value: impl core::fmt::Display) -> usize {
 fn text_value_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usize {
     match value {
         Datum::Null => 0,
+        Datum::PgDdlCommand => unreachable!("pg_ddl_command output is rejected before encoding"),
         Datum::Text(text)
         | Datum::Bpchar(text)
         | Datum::Regtype { name: text, .. }
@@ -168,6 +169,7 @@ fn text_value_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usiz
 fn binary_value_len(value: &Datum) -> usize {
     match value {
         Datum::Null => 0,
+        Datum::PgDdlCommand => unreachable!("pg_ddl_command output is rejected before encoding"),
         Datum::Bool(_) => 1,
         Datum::Int2(_) => 2,
         Datum::Int4(_)
@@ -952,6 +954,12 @@ impl<'b> Responder<'b> {
         };
         Ok(Some(match v {
             Datum::Null => return Ok(None),
+            Datum::PgDdlCommand => {
+                return Err(crate::sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot display a value of type pg_ddl_command"
+                ));
+            }
             Datum::Text(s) | Datum::Bpchar(s) => s,
             Datum::Bytea(b) if render.bytea_escape => {
                 let escaped_len: usize = b
@@ -1019,6 +1027,9 @@ impl<'b> Responder<'b> {
             match v {
                 Datum::Null => {
                     m.i32(-1);
+                }
+                Datum::PgDdlCommand => {
+                    unreachable!("pg_ddl_command output is rejected before encoding")
                 }
                 Datum::Bool(b) => {
                     m.i32(1);

@@ -4,11 +4,9 @@
 # suite all drive the server binary as a subprocess. tools/coverage.sh
 # instruments that binary too, which is what takes the figure to ~80%.
 #
-# The external suite uses six workers whose paired workloads fit under five
-# minutes. Coverage-producing runs retain separate lcov files for the merge
-# gate; correctness-only crash workloads run after their paired trace. This
-# preserves every workload while avoiding a long runner queue on the small
-# hosted pool.
+# Coverage-producing runs retain separate lcov files for the merge gate.
+# Instrumented unit tests are partitioned after one build per worker so test
+# growth cannot consume the fixed five-minute job budget.
 name: coverage
 on:
   push:
@@ -31,7 +29,8 @@ jobs:
           # Coverage and crash-torture builds use incompatible instrumentation.
           # Keep them in distinct jobs: serializing either pair can exceed the
           # hard five-minute bound even though each workload fits on its own.
-          - { name: lib, shards: "lib", needs_pg18: false }
+          - { name: lib-a, shards: "lib:0/2", needs_pg18: false }
+          - { name: lib-b, shards: "lib:1/2", needs_pg18: false }
           - { name: protocol-durability, shards: "run:proto,dur", needs_pg18_client: true }
           - { name: spill-overlay, shards: "runtest:overlay", needs_pg18: false }
           - { name: ingest, shards: "runtest:ingest", needs_pg18: false }
@@ -54,6 +53,7 @@ jobs:
       # psycopg2-binary serves the sqllogictest replay; psycopg (v3) serves
       # the crash-torture and fuzz harnesses, which use its API directly.
       - name: Python venv for the differential harnesses
+        if: ${{ !startsWith(matrix.shards, 'lib:') }}
         run: python3 -m venv venv && ./venv/bin/pip install --quiet psycopg2-binary 'psycopg[binary]'
       - name: Measure
         env:

@@ -171,6 +171,7 @@ object_store = off
 max_tables = 64
 table_rows = 8192
 max_value_indexes = 64
+max_prepared_transactions = 8
 memtable_bytes = 256MiB
 extension_control_path = ${EXTENSION_CONTROL_ROOT}
 EOF

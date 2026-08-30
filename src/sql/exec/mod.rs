@@ -1481,9 +1481,7 @@ fn next_auto_value<'x>(
                 storage.sequence_for(slot, txid).name.as_str()
             ));
         }
-        let sequence = storage.sequence_for(slot, txid);
-        let next = storage.next_sequence_value(slot, txid)?;
-        seq_session.record_nextval(slot, sequence.created_at, next);
+        let next = crate::sql::sequence::next_cached(storage, seq_session, slot, txid)?;
         return match ctype {
             ColType::Int8 => Ok(Datum::Int8(next)),
             ColType::Int2 => i16::try_from(next)
@@ -27094,6 +27092,7 @@ pub fn alter_sequence(
     wal: &mut Wal,
     txn: &mut TxnState,
     command: AlterSequenceCommand<'_>,
+    seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
 ) -> Outcome {
     let AlterSequenceCommand {
@@ -27250,6 +27249,7 @@ pub fn alter_sequence(
         storage.rollback_sequence_alter(slot, prior_definition);
         return sql_fail(error);
     }
+    seq_session.invalidate_cache(slot);
     responder.command_complete("ALTER SEQUENCE")?;
     sql_ok()
 }
@@ -38812,6 +38812,10 @@ fn decode_binary_field_with_context<'a>(
         | ColType::PgStatisticArray => Err(bad()),
         ColType::Int4 => via(oids::INT4),
         ColType::Oid => via(oids::OID),
+        ColType::Xid => {
+            let value: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
+            Ok(Datum::Oid(u32::from_be_bytes(value)))
+        }
         ColType::Regtype => {
             let bytes: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
             crate::sql::eval::regtype_of_oid(i64::from(i32::from_be_bytes(bytes)), arena)

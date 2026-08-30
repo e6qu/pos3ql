@@ -36,6 +36,27 @@ cur.execute("ROLLBACK")
 cur.execute("RESET ALL")
 print("transaction configuration extended protocol ok")
 
+# Two-phase transaction control crosses separate extended-protocol messages.
+# PREPARE returns the connection to idle while retaining the transaction, and
+# the catalog preserves PostgreSQL's xid identity for driver introspection.
+cur.execute("CREATE TABLE drv_two_phase (id integer PRIMARY KEY, value text)")
+cur.execute("INSERT INTO drv_two_phase VALUES (1, 'before')")
+cur.execute("BEGIN")
+cur.execute("UPDATE drv_two_phase SET value = %s WHERE id = %s", ("after", 1))
+cur.execute("PREPARE TRANSACTION 'driver-two-phase'")
+assert conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+cur.execute("SELECT transaction, gid FROM pg_prepared_xacts")
+assert [column.type_code for column in cur.description] == [28, 25]
+prepared_xid, prepared_gid = cur.fetchone()
+assert prepared_gid == "driver-two-phase"
+assert str(prepared_xid).isdigit(), prepared_xid
+cur.execute("SELECT value FROM drv_two_phase WHERE id = 1")
+assert cur.fetchone() == ("before",)
+cur.execute("COMMIT PREPARED 'driver-two-phase'")
+cur.execute("SELECT value FROM drv_two_phase WHERE id = 1")
+assert cur.fetchone() == ("after",)
+print("two-phase transaction extended protocol ok")
+
 cur.execute("DROP TABLE IF EXISTS drv")
 cur.execute("CREATE TABLE drv (id int NOT NULL, name text, score float8)")
 

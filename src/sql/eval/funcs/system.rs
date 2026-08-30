@@ -273,7 +273,7 @@ fn session_schemas() -> SessionSchemas {
 
 /// Maximum number of readable settings published per statement for
 /// `current_setting`. Comfortably covers the `SHOW ALL` set plus a margin.
-pub const MAX_SESSION_SETTINGS: usize = 32;
+pub const MAX_SESSION_SETTINGS: usize = 64;
 
 /// A per-statement snapshot of the session's readable settings (name → value),
 /// published like the session user so `current_setting` reads exactly what
@@ -1460,8 +1460,12 @@ pub(crate) fn dispatch<'a>(
                         exec::typeof_static_oid(args[0], row, hooks.catalog)
                 {
                     let consistent = v.is_null()
-                        || exec::typeof_static_coltype(args[0], row, hooks.catalog)
-                            .is_some_and(|ct| ct.storage().oid() == v.type_oid());
+                        || exec::typeof_static_coltype(args[0], row, hooks.catalog).is_some_and(
+                            |ct| {
+                                ct.storage().oid() == v.type_oid()
+                                    || matches!((ct, v), (ColType::Xid, Datum::Oid(_)))
+                            },
+                        );
                     if consistent {
                         return Ok(regtype(referenced_oid, name));
                     }

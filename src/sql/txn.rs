@@ -689,6 +689,13 @@ impl TxnState {
         self.mode != TxnMode::Idle
     }
 
+    pub(crate) fn restore_prepared_identity(&mut self, transaction_id: u32) {
+        debug_assert_eq!(self.txid, 0);
+        debug_assert_eq!(self.mode, TxnMode::Idle);
+        self.txid = transaction_id;
+        self.mode = TxnMode::Explicit;
+    }
+
     pub fn is_explicit(&self) -> bool {
         self.mode == TxnMode::Explicit
     }
@@ -1046,6 +1053,10 @@ impl TxnState {
 
     pub fn pending_listen_ops(&self) -> &[crate::sql::notify::ListenOp] {
         &self.pending_listen_ops
+    }
+
+    pub(crate) fn has_session_notification_actions(&self) -> bool {
+        !self.pending_notifies.is_empty() || !self.pending_listen_ops.is_empty()
     }
 
     /// An apply transaction belongs to exactly one subscription. A later

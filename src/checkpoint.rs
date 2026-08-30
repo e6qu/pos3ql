@@ -1912,6 +1912,58 @@ impl Checkpointer {
                             ))
                         })?;
                 }
+                Some("ptx") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let transaction_id = parse_field(words.next(), "ptx transaction")?;
+                    let first_lsn = parse_field(words.next(), "ptx first lsn")?;
+                    let prepared_lsn = parse_field(words.next(), "ptx prepared lsn")?;
+                    let prepared_at = parse_field(words.next(), "ptx prepared time")?;
+                    let database = parse_field::<i32>(words.next(), "ptx database")?;
+                    let database = crate::storage::DatabaseOid::parse(database)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid ptx database"))?;
+                    if storage.database_slot_by_oid(database, 0).is_none() {
+                        return Err(CheckpointSetupError::Corrupt("ptx database does not exist"));
+                    }
+                    let owner = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("ptx owner missing"))?,
+                    )?;
+                    let owner = storage
+                        .find_role(&owner)
+                        .ok_or(CheckpointSetupError::Corrupt("ptx owner does not exist"))?
+                        as u16;
+                    let gid = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("ptx gid missing"))?,
+                    )?;
+                    if words.next().is_some()
+                        || first_lsn == 0
+                        || prepared_lsn < first_lsn
+                        || gid.len() > 199
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid ptx record"));
+                    }
+                    storage
+                        .install_prepared_transaction_catalog_entry(
+                            crate::storage::PreparedTransactionCatalogEntry {
+                                transaction_id,
+                                gid: crate::util::StackStr::from_str(&gid),
+                                prepared_at,
+                                owner,
+                                database,
+                                first_lsn,
+                                prepared_lsn,
+                            },
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest prepared transaction rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
                 Some("own") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let class: u8 = parse_field(words.next(), "own class")?;
@@ -3570,10 +3622,7 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_policy(storage, line)?;
                 }
-                tag @ (Some("sq2") | Some("sq3") | Some("sq4")) => {
-                    let has_owner = tag == Some("sq3");
-                    let has_links = matches!(tag, Some("sq3") | Some("sq4"));
-                    let has_generator = tag == Some("sq4");
+                Some("sq5") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let read_hex = |w: Option<&str>, what: &'static str| {
                         w.ok_or(CheckpointSetupError::Corrupt(what))
@@ -3585,17 +3634,18 @@ impl Checkpointer {
                                 }
                             })
                     };
-                    let schema = read_hex(words.next(), "sq2 schema missing")?;
-                    let name = read_hex(words.next(), "sq2 name missing")?;
-                    let data_type: u8 = parse_field(words.next(), "sq2 type")?;
-                    let increment: i64 = parse_field(words.next(), "sq2 increment")?;
-                    let min_value: i64 = parse_field(words.next(), "sq2 min")?;
-                    let max_value: i64 = parse_field(words.next(), "sq2 max")?;
-                    let start_value: i64 = parse_field(words.next(), "sq2 start")?;
-                    let cache: i64 = parse_field(words.next(), "sq2 cache")?;
-                    let cycle: u8 = parse_field(words.next(), "sq2 cycle")?;
-                    let last_value: i64 = parse_field(words.next(), "sq2 last")?;
-                    let is_called: u8 = parse_field(words.next(), "sq2 is_called")?;
+                    let schema = read_hex(words.next(), "sq5 schema missing")?;
+                    let name = read_hex(words.next(), "sq5 name missing")?;
+                    let data_type: u8 = parse_field(words.next(), "sq5 type")?;
+                    let increment: i64 = parse_field(words.next(), "sq5 increment")?;
+                    let min_value: i64 = parse_field(words.next(), "sq5 min")?;
+                    let max_value: i64 = parse_field(words.next(), "sq5 max")?;
+                    let start_value: i64 = parse_field(words.next(), "sq5 start")?;
+                    let cache: i64 = parse_field(words.next(), "sq5 cache")?;
+                    let cycle: u8 = parse_field(words.next(), "sq5 cycle")?;
+                    let last_value: i64 = parse_field(words.next(), "sq5 last")?;
+                    let is_called: u8 = parse_field(words.next(), "sq5 is_called")?;
+                    let log_count: i64 = parse_field(words.next(), "sq5 log_count")?;
                     let read_link = |words: &mut core::str::Split<'_, char>,
                                      label: &'static str|
                      -> Result<
@@ -3621,20 +3671,8 @@ impl Checkpointer {
                             }))
                         }
                     };
-                    let owner = if has_links {
-                        read_link(&mut words, "sequence owner missing")?
-                    } else {
-                        None
-                    };
-                    // sq3 briefly represented ownership and generation as one
-                    // link; preserve that manifest's semantics on upgrade.
-                    let generator_for = if has_generator {
-                        read_link(&mut words, "sequence generator missing")?
-                    } else if has_owner {
-                        owner
-                    } else {
-                        None
-                    };
+                    let owner = read_link(&mut words, "sequence owner missing")?;
+                    let generator_for = read_link(&mut words, "sequence generator missing")?;
                     let slot = storage
                         .create_sequence(
                             sql_name(&schema)?,
@@ -3662,6 +3700,7 @@ impl Checkpointer {
                     let seq = storage.sequence(slot);
                     seq.last_value.set(last_value);
                     seq.is_called.set(is_called != 0);
+                    seq.log_count.set(log_count);
                     seq.dirty.set(false);
                 }
                 tag @ (Some("dom") | Some("dom2") | Some("dom3")) => {
@@ -5183,6 +5222,38 @@ impl Checkpointer {
                 format_args!("sset {} {}", name.as_str(), value.as_str()),
             )?;
         }
+        for prepared in storage.prepared_transaction_catalog() {
+            use core::fmt::Write;
+            let mut owner = StackStr::<130>::new();
+            for byte in storage
+                .role_name(usize::from(prepared.owner), 0)
+                .as_str()
+                .as_bytes()
+            {
+                let _ = write!(owner, "{byte:02x}");
+            }
+            let mut gid = StackStr::<398>::new();
+            if prepared.gid.as_str().is_empty() {
+                let _ = write!(gid, "-");
+            } else {
+                for byte in prepared.gid.as_str().as_bytes() {
+                    let _ = write!(gid, "{byte:02x}");
+                }
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "ptx {} {} {} {} {} {} {}",
+                    prepared.transaction_id,
+                    prepared.first_lsn,
+                    prepared.prepared_lsn,
+                    prepared.prepared_at,
+                    prepared.database.get(),
+                    owner.as_str(),
+                    gid.as_str()
+                ),
+            )?;
+        }
 
         // The bootstrap databases already own their built-in public schemas.
         // A user database's public schema is template data and is explicit.
@@ -6161,7 +6232,7 @@ impl Checkpointer {
             )?;
         }
         // Sequences: hex schema/name, then the numeric parameters and the live
-        // value state (`last_value`, `is_called`). A sequence stores no rows, so
+        // value state. A sequence stores no rows, so
         // this line is its whole durable form.
         for seq in storage.checkpoint_sequences() {
             write_database_context(&mut self.manifest_buf, &mut database_context, seq.database)?;
@@ -6213,7 +6284,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "sq4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "sq5 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     hschema.as_str(),
                     hname.as_str(),
                     seq.data_type.to_u8(),
@@ -6225,6 +6296,7 @@ impl Checkpointer {
                     u8::from(seq.cycle),
                     seq.last_value.get(),
                     u8::from(seq.is_called.get()),
+                    seq.log_count.get(),
                     owner_schema.as_str(),
                     owner_table.as_str(),
                     owner_column.as_str(),

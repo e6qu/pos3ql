@@ -69,6 +69,28 @@ impl LockManager {
         self.generation
     }
 
+    pub(crate) fn visit_owner(
+        &self,
+        owner: u32,
+        mut visit: impl FnMut(usize, u64, LockStrength) -> Result<(), SqlError>,
+    ) -> Result<(), SqlError> {
+        for lock in self.locks.iter().filter(|lock| lock.owner == owner) {
+            for (index, acquired_at) in lock.modes.iter().enumerate() {
+                if *acquired_at == 0 {
+                    continue;
+                }
+                let strength = match index {
+                    0 => LockStrength::Update,
+                    1 => LockStrength::NoKeyUpdate,
+                    2 => LockStrength::Share,
+                    _ => LockStrength::KeyShare,
+                };
+                visit(lock.table as usize, lock.rowid, strength)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn acquire(
         &mut self,
         table: usize,

@@ -166,15 +166,21 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 Datum::Int4(i32::try_from(x).map_err(|_| overflow("integer"))?)
             }
         }
-        ColType::Oid => match v {
+        ColType::Oid | ColType::Xid => match v {
             Datum::Oid(_) => v,
-            Datum::Bit { bits, .. } => Datum::Oid(bits_to_uint(bits, 32, "oid")? as u32),
+            Datum::Bit { bits, .. } => Datum::Oid(bits_to_uint(bits, 32, target.name())? as u32),
             Datum::Text(s) => Datum::Oid(parse_oid(s)?),
             Datum::RegObject { referenced_oid, .. } => Datum::Oid(referenced_oid as u32),
-            Datum::Int2(value) => Datum::Oid(u32::try_from(value).map_err(|_| overflow("oid"))?),
-            Datum::Int4(value) => Datum::Oid(u32::try_from(value).map_err(|_| overflow("oid"))?),
-            Datum::Int8(value) => Datum::Oid(u32::try_from(value).map_err(|_| overflow("oid"))?),
-            _ => return Err(cast_unsupported(&v, "oid")),
+            Datum::Int2(value) => {
+                Datum::Oid(u32::try_from(value).map_err(|_| overflow(target.name()))?)
+            }
+            Datum::Int4(value) => {
+                Datum::Oid(u32::try_from(value).map_err(|_| overflow(target.name()))?)
+            }
+            Datum::Int8(value) => {
+                Datum::Oid(u32::try_from(value).map_err(|_| overflow(target.name()))?)
+            }
+            _ => return Err(cast_unsupported(&v, target.name())),
         },
         ColType::Int8 => {
             if let Datum::Bit { bits, .. } = v {

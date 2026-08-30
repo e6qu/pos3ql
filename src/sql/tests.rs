@@ -7,6 +7,488 @@
 use super::*;
 
 #[test]
+fn prepared_transactions_commit_rollback_catalog_and_lock_contracts() {
+    let mut config = test_config("prepared-transactions");
+    config.max_prepared_transactions = 3;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE prepared_rows(id integer PRIMARY KEY, value text); \
+         INSERT INTO prepared_rows VALUES (1, 'before')",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let prepared = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; UPDATE prepared_rows SET value = 'committed' WHERE id = 1; \
+         INSERT INTO prepared_rows VALUES (2, 'inserted'); \
+         PREPARE TRANSACTION 'commit-me'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&prepared).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&prepared)
+    );
+    let hidden = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id, value FROM prepared_rows ORDER BY id; \
+         SELECT gid, owner, database FROM pg_prepared_xacts; \
+         SELECT pg_typeof(transaction) FROM pg_prepared_xacts",
+    );
+    assert_eq!(
+        data_rows(&hidden),
+        ["1|before", "commit-me|postgres|postgres", "xid"],
+        "{}",
+        String::from_utf8_lossy(&hidden)
+    );
+    let locked = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; LOCK TABLE prepared_rows IN ACCESS EXCLUSIVE MODE NOWAIT",
+    );
+    assert!(
+        String::from_utf8_lossy(&locked).contains("55P03"),
+        "{}",
+        String::from_utf8_lossy(&locked)
+    );
+
+    let committed = run_with(&mut engine, &mut budget, "COMMIT PREPARED 'commit-me'");
+    assert!(
+        !String::from_utf8_lossy(&committed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, value FROM prepared_rows ORDER BY id; SELECT count(*) FROM pg_prepared_xacts",
+        )),
+        ["1|committed", "2|inserted", "0"]
+    );
+
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DELETE FROM prepared_rows WHERE id = 1; PREPARE TRANSACTION 'rollback-me'",
+    );
+    assert!(!String::from_utf8_lossy(&rolled_back).contains("ERROR"));
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "ROLLBACK PREPARED 'rollback-me'; SELECT value FROM prepared_rows WHERE id = 1",
+    );
+    assert!(
+        String::from_utf8_lossy(&rolled_back)
+            .contains("ROLLBACK PREPARED cannot run inside a transaction block"),
+        "{}",
+        String::from_utf8_lossy(&rolled_back)
+    );
+    let rolled_back = run_with(&mut engine, &mut budget, "ROLLBACK PREPARED 'rollback-me'");
+    assert!(!String::from_utf8_lossy(&rolled_back).contains("ERROR"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM prepared_rows WHERE id = 1",
+        )),
+        ["committed"]
+    );
+}
+
+#[test]
+fn prepare_transaction_is_strictly_configured_and_eligible() {
+    assert!(ast::PreparedTransactionId::parse("").is_some());
+    assert!(ast::PreparedTransactionId::parse(&"g".repeat(199)).is_some());
+    assert!(ast::PreparedTransactionId::parse(&"g".repeat(200)).is_none());
+
+    let (mut disabled, mut disabled_budget) = test_engine();
+    let output = run_with(
+        &mut disabled,
+        &mut disabled_budget,
+        "BEGIN; PREPARE TRANSACTION 'disabled'",
+    );
+    assert!(
+        String::from_utf8_lossy(&output)
+            .contains("maximum number of prepared transactions reached"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let mut config = test_config("prepared-eligibility");
+    config.max_prepared_transactions = 1;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for statement in [
+        "PREPARE TRANSACTION 'outside'",
+        "BEGIN; NOTIFY prepared_channel; PREPARE TRANSACTION 'notify'",
+        "BEGIN; LISTEN prepared_channel; PREPARE TRANSACTION 'listen'",
+        "BEGIN; DECLARE prepared_cursor CURSOR WITH HOLD FOR SELECT 1; \
+         PREPARE TRANSACTION 'cursor'",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
+fn prepared_transaction_identity_capacity_privilege_and_database_contracts() {
+    let mut config = test_config("prepared-identity-contracts");
+    config.max_prepared_transactions = 1;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE prepared_identity_rows(id integer PRIMARY KEY); \
+         CREATE ROLE prepared_owner; CREATE ROLE prepared_other; \
+         GRANT INSERT ON prepared_identity_rows TO prepared_owner",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let mut guc = GucState::new();
+    let prepared = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SET SESSION AUTHORIZATION prepared_owner; BEGIN; \
+         INSERT INTO prepared_identity_rows VALUES (1); \
+         PREPARE TRANSACTION 'owned'",
+        1 << 18,
+        &mut guc,
+    );
+    assert!(!String::from_utf8_lossy(&prepared).contains("ERROR"));
+
+    let duplicate = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "BEGIN; PREPARE TRANSACTION 'owned'",
+        1 << 18,
+        &mut guc,
+    );
+    assert!(
+        String::from_utf8_lossy(&duplicate)
+            .contains("transaction identifier \"owned\" is already in use"),
+        "{}",
+        String::from_utf8_lossy(&duplicate)
+    );
+
+    let full = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "RESET SESSION AUTHORIZATION; BEGIN; PREPARE TRANSACTION 'second'",
+        1 << 18,
+        &mut guc,
+    );
+    assert!(
+        String::from_utf8_lossy(&full).contains("maximum number of prepared transactions reached"),
+        "{}",
+        String::from_utf8_lossy(&full)
+    );
+    run_with_guc(
+        &mut engine,
+        &mut budget,
+        "SET SESSION AUTHORIZATION prepared_other",
+        1 << 18,
+        &mut guc,
+    );
+    let denied = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "COMMIT PREPARED 'owned'",
+        1 << 18,
+        &mut guc,
+    );
+    assert!(
+        String::from_utf8_lossy(&denied)
+            .contains("permission denied to finish prepared transaction"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+    run_with_guc(
+        &mut engine,
+        &mut budget,
+        "RESET SESSION AUTHORIZATION",
+        1 << 18,
+        &mut guc,
+    );
+    let committed = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "COMMIT PREPARED 'owned'",
+        1 << 18,
+        &mut guc,
+    );
+    assert!(!String::from_utf8_lossy(&committed).contains("ERROR"));
+
+    let prepared = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "BEGIN; PREPARE TRANSACTION 'database-bound'",
+        1 << 18,
+        &mut guc,
+    );
+    assert!(!String::from_utf8_lossy(&prepared).contains("ERROR"));
+    let template = engine
+        .storage
+        .database_slot("template1", 0)
+        .map(|slot| engine.storage.database(slot).oid)
+        .unwrap();
+    engine.select_database(template).unwrap();
+    let wrong_database = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ROLLBACK PREPARED 'database-bound'",
+        1 << 18,
+        &mut guc,
+    );
+    assert!(
+        String::from_utf8_lossy(&wrong_database)
+            .contains("prepared transaction belongs to another database"),
+        "{}",
+        String::from_utf8_lossy(&wrong_database)
+    );
+    engine
+        .select_database(crate::storage::DatabaseOid::POSTGRES)
+        .unwrap();
+    let rolled_back = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ROLLBACK PREPARED 'database-bound'",
+        1 << 18,
+        &mut guc,
+    );
+    assert!(!String::from_utf8_lossy(&rolled_back).contains("ERROR"));
+}
+
+#[test]
+fn prepared_transactions_survive_checkpoint_and_object_cold_recovery() {
+    let mut config = test_config("prepared-object-cold-recovery");
+    config.max_prepared_transactions = 3;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("prepared-object-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_prepared(id integer PRIMARY KEY, value text); \
+         INSERT INTO durable_prepared VALUES (1, 'checkpoint')",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let prepared = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; UPDATE durable_prepared SET value = 'resolved' WHERE id = 1; \
+         INSERT INTO durable_prepared VALUES (2, 'new'); \
+         PREPARE TRANSACTION 'object-cold'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&prepared).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&prepared)
+    );
+    let prepared_ddl = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         CREATE TABLE durable_prepared_created(id integer PRIMARY KEY, value text); \
+         INSERT INTO durable_prepared_created VALUES (7, 'created'); \
+         CREATE SEQUENCE durable_prepared_sequence START 40; \
+         SELECT nextval('durable_prepared_sequence'); \
+         PREPARE TRANSACTION 'object-ddl'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&prepared_ddl).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&prepared_ddl)
+    );
+    let prepared_rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         CREATE TABLE durable_prepared_discarded(id integer); \
+         CREATE SEQUENCE durable_prepared_discarded_sequence; \
+         PREPARE TRANSACTION 'object-ddl-rollback'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&prepared_rollback).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&prepared_rollback)
+    );
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_gid = ast::PreparedTransactionId::parse("object-cold").unwrap();
+    let recovered_slot = recovered
+        .prepared_transactions
+        .find(recovered_gid)
+        .expect("prepared transaction recovered");
+    let mut recovered_lock_bytes = 0usize;
+    recovered
+        .prepared_transactions
+        .slot(recovered_slot)
+        .visit_records(|_, raw| {
+            if let Some(WalOp::PreparedLocks { encoded, .. }) = crate::wal::decode_record(raw) {
+                recovered_lock_bytes = encoded.len();
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        recovered_lock_bytes > 0,
+        "prepared lock inventory recovered"
+    );
+    let durable_slot = recovered
+        .storage
+        .find_table("public", "durable_prepared")
+        .expect("durable table recovered");
+    assert!(
+        recovered
+            .storage
+            .table(durable_slot)
+            .rows
+            .iter()
+            .any(|(_, state)| state.pending.last().is_some_and(|pending| {
+                pending.txid
+                    == recovered
+                        .prepared_transactions
+                        .slot(recovered_slot)
+                        .metadata()
+                        .transaction_id
+            })),
+        "prepared row overlays recovered"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id, value FROM durable_prepared ORDER BY id; \
+             SELECT gid FROM pg_prepared_xacts",
+        )),
+        [
+            "1|checkpoint",
+            "object-cold",
+            "object-ddl",
+            "object-ddl-rollback"
+        ]
+    );
+    for statement in [
+        "SELECT * FROM durable_prepared_created",
+        "SELECT nextval('durable_prepared_sequence')",
+        "SELECT * FROM durable_prepared_discarded",
+        "SELECT nextval('durable_prepared_discarded_sequence')",
+    ] {
+        let hidden = run_with(&mut recovered, &mut recovered_budget, statement);
+        assert!(
+            String::from_utf8_lossy(&hidden).contains("42P01"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&hidden)
+        );
+    }
+    let lock = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "BEGIN; LOCK TABLE durable_prepared IN ACCESS EXCLUSIVE MODE NOWAIT",
+    );
+    assert!(
+        String::from_utf8_lossy(&lock).contains("55P03"),
+        "{}",
+        String::from_utf8_lossy(&lock)
+    );
+    let committed = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "COMMIT PREPARED 'object-cold'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&committed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id, value FROM durable_prepared ORDER BY id",
+        )),
+        ["1|resolved", "2|new"]
+    );
+    let resolved_ddl = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "COMMIT PREPARED 'object-ddl'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&resolved_ddl).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&resolved_ddl)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT id, value FROM durable_prepared_created; \
+             SELECT last_value, is_called FROM durable_prepared_sequence",
+        )),
+        ["7|created", "40|t"]
+    );
+    let discarded = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "ROLLBACK PREPARED 'object-ddl-rollback'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&discarded).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&discarded)
+    );
+    let reused = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "CREATE TABLE durable_prepared_discarded(id integer); \
+         CREATE SEQUENCE durable_prepared_discarded_sequence",
+    );
+    assert!(
+        !String::from_utf8_lossy(&reused).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&reused)
+    );
+    assert!(recovered.checkpoint().unwrap());
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut final_budget = Budget::new(1 << 29);
+    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut final_engine,
+            &mut final_budget,
+            "SELECT id, value FROM durable_prepared ORDER BY id; \
+             SELECT count(*) FROM pg_prepared_xacts",
+        )),
+        ["1|resolved", "2|new", "0"]
+    );
+    drop(final_engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn rewrite_rule_lifecycle_catalogs_and_transactionality() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -577,6 +1059,88 @@ fn rewrite_rules_survive_object_cold_checkpoint_recovery() {
         ["24", "12", "18", "24", "object durable", "t"]
     );
     drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn prepared_transaction_publication_failure_recovers_from_object_storage() {
+    let mut config = test_config("prepared-publication-recovery");
+    config.max_prepared_transactions = 1;
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("prepared-publication-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let namespace = crate::object_store::sim::open_namespace(&config.object_store_namespace, 19);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE prepared_publication(id integer PRIMARY KEY, value text); \
+         INSERT INTO prepared_publication VALUES (1, 'before')",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+
+    namespace.borrow_mut().faults.transient_per_mille = 1000;
+    let failed = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; UPDATE prepared_publication SET value = 'after' WHERE id = 1; \
+         PREPARE TRANSACTION 'publication-failed'",
+    );
+    assert!(
+        String::from_utf8_lossy(&failed).contains("58030"),
+        "{}",
+        String::from_utf8_lossy(&failed)
+    );
+    let fenced = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_prepared_xacts",
+    );
+    assert!(String::from_utf8_lossy(&fenced).contains("58030"));
+    drop(engine);
+
+    namespace.borrow_mut().faults.transient_per_mille = 0;
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT value FROM prepared_publication; SELECT gid FROM pg_prepared_xacts",
+        )),
+        ["before", "publication-failed"]
+    );
+    drop(recovered);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let committed = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "COMMIT PREPARED 'publication-failed'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&committed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT value FROM prepared_publication",
+        )),
+        ["after"]
+    );
+
+    drop(cold);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -23867,6 +24431,183 @@ fn sequence_basics() {
     run_with(&mut e, &mut b, "DROP SEQUENCE s");
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('s')")).contains("42P01")
+    );
+}
+
+#[test]
+fn sequence_relations_have_postgresql_shape_aliases_and_select_privilege() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE sequence_relation START 10; \
+         SELECT * FROM sequence_relation; \
+         SELECT nextval('sequence_relation'); \
+         SELECT last_value, log_cnt, is_called FROM public.sequence_relation; \
+         SELECT renamed.value, renamed.called \
+           FROM sequence_relation AS renamed(value, log, called); \
+         CREATE ROLE sequence_reader; \
+         GRANT USAGE ON SEQUENCE sequence_relation TO sequence_reader",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["10|0|f", "10", "10|32|t", "10|t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE sequence_reader; SELECT last_value FROM sequence_relation",
+    );
+    let text = String::from_utf8_lossy(&denied);
+    assert!(
+        text.contains("42501") && text.contains("permission denied for sequence sequence_relation"),
+        "{text}"
+    );
+
+    let allowed = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; \
+         GRANT SELECT ON SEQUENCE sequence_relation TO sequence_reader; \
+         SET ROLE sequence_reader; \
+         SELECT last_value FROM sequence_relation",
+    );
+    assert_eq!(
+        data_rows(&allowed),
+        ["10"],
+        "{}",
+        String::from_utf8_lossy(&allowed)
+    );
+
+    let sampled = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; SELECT * FROM sequence_relation TABLESAMPLE SYSTEM (10)",
+    );
+    let text = String::from_utf8_lossy(&sampled);
+    assert!(
+        text.contains("0A000")
+            && text.contains(
+                "TABLESAMPLE clause can only be applied to tables and materialized views"
+            ),
+        "{text}"
+    );
+}
+
+#[test]
+fn sequence_cache_reservations_are_session_scoped_durable_and_bounded() {
+    let config = test_config("sequence-cache-reservations");
+    let mut budget = Budget::new(1 << 27);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE cached_sequence CACHE 5; \
+         CREATE SEQUENCE cycling_cache MINVALUE 1 MAXVALUE 3 CACHE 5 CYCLE; \
+         CREATE SEQUENCE bounded_cache MINVALUE 1 MAXVALUE 3 CACHE 5 NO CYCLE",
+    );
+    let mut first = GucState::new();
+    let mut second = GucState::new();
+    assert_eq!(
+        data_rows(&run_with_guc(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('cached_sequence')",
+            1 << 18,
+            &mut first,
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with_guc(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('cached_sequence')",
+            1 << 18,
+            &mut second,
+        )),
+        ["6"]
+    );
+    assert_eq!(
+        data_rows(&run_with_guc(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('cached_sequence')",
+            1 << 18,
+            &mut first,
+        )),
+        ["2"]
+    );
+    assert_eq!(
+        data_rows(&run_with_guc(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('cached_sequence')",
+            1 << 18,
+            &mut second,
+        )),
+        ["7"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT last_value, log_cnt FROM cached_sequence; \
+             SELECT nextval('cycling_cache') FROM generate_series(1,5); \
+             SELECT last_value, log_cnt FROM cycling_cache; \
+             SELECT nextval('bounded_cache') FROM generate_series(1,3)",
+        )),
+        ["10|27", "1", "2", "3", "1", "2", "3|0", "1", "2", "3"]
+    );
+    run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ALTER SEQUENCE cached_sequence INCREMENT 10",
+        1 << 18,
+        &mut first,
+    );
+    assert_eq!(
+        data_rows(&run_with_guc(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('cached_sequence')",
+            1 << 18,
+            &mut second,
+        )),
+        ["20"]
+    );
+    assert_eq!(
+        data_rows(&run_with_guc(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('cached_sequence'); \
+             SELECT setval('cached_sequence', 100); \
+             SELECT nextval('cached_sequence'); \
+             SELECT last_value, log_cnt FROM cached_sequence",
+            1 << 18,
+            &mut first,
+        )),
+        ["70", "100", "110", "150|32"]
+    );
+    let exhausted = run_with(&mut engine, &mut budget, "SELECT nextval('bounded_cache')");
+    assert!(String::from_utf8_lossy(&exhausted).contains("2200H"));
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 27);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT nextval('cached_sequence')",
+        )),
+        ["160"]
     );
 }
 

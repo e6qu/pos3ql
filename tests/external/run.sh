@@ -8,7 +8,7 @@
 # Usage: tests/external/run.sh [--keep]
 
 set -u
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../.." || exit
 ROOT=$(pwd)
 EXT=tests/external
 WORK=$(mktemp -d /tmp/pos3ql-external.XXXXXX)
@@ -99,14 +99,14 @@ START_PID=0
 
 start_pos3ql() { # <config> <log> <port>
   local conf=$1 log=$2 port=$3
-  if nc -z 127.0.0.1 $port 2>/dev/null; then
+  if nc -z 127.0.0.1 "$port" 2>/dev/null; then
     bad "port $port is already in use (stale pos3ql from an earlier run?) — kill it first"
     exit 1
   fi
   "${POS3QL_BIN:-./target/release/pos3ql}" --config "$conf" >> "$log" 2>&1 &
   START_PID=$!
   for _ in {1..50}; do
-    "$PSQL" -h 127.0.0.1 -p $port -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+    "$PSQL" -h 127.0.0.1 -p "$port" -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1 && break
     sleep 0.1
   done
   if ! server_alive "$START_PID"; then
@@ -158,7 +158,7 @@ step "start generic object-store gateway"
 python3 "$EXT/object_store_gateway.py" --root "$WORK/object-store" --port "$GATEWAY_PORT" \
   > "$WORK/object-store.log" 2>&1 &
 GATEWAY_PID=$!
-for i in {1..50}; do
+for _ in {1..50}; do
   nc -z 127.0.0.1 "$GATEWAY_PORT" && break
   sleep 0.1
 done
@@ -186,6 +186,7 @@ max_tables = 64
 # capacity, not a cache bound, so it must cover the declared workload.
 table_rows = 32768
 max_value_indexes = 64
+max_prepared_transactions = 8
 max_subscriptions = 2
 subscription_relation_capacity = 16
 subscription_arena_bytes = 256KiB
@@ -201,7 +202,7 @@ EOF
 
 step "write config and start pos3ql"
 write_main_config "run-$$/"
-start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
 SERVER_PID=$START_PID
 ok "server up (pid $SERVER_PID)"
 
@@ -210,7 +211,7 @@ restart_main_server() { # <fixture name>
   stop_pos3ql "$SERVER_PID"
   SERVER_PID=""
   write_main_config "run-$$-${fixture}/" "data-${fixture}"
-  start_pos3ql "$WORK/server.conf" "$WORK/server-${fixture}.log" $PG_PORT
+  start_pos3ql "$WORK/server.conf" "$WORK/server-${fixture}.log" "$PG_PORT"
   SERVER_PID=$START_PID
 }
 
@@ -223,7 +224,7 @@ psql_run() { # <name>
   awk -v out="$expected_out" -v err="$expected_err" \
     '/^psql:/ { print > err; next } { print > out }' \
     "$EXT/expected/$name.out"
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -a -q -P pager=off \
+  "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -a -q -P pager=off \
     -f "$EXT/sql/$name.sql" > "$WORK/$name.out" 2> "$WORK/$name.err"
   if diff -u "$expected_out" "$WORK/$name.out" > "$WORK/$name.diff" \
     && diff -u "$expected_err" "$WORK/$name.err" >> "$WORK/$name.diff"; then
@@ -243,7 +244,7 @@ psql_run extended
 
 step "protocol 3.0 and 3.2 with the newest psql"
 for v in 3.0 3.2; do
-  out=$(PGMAXPROTOCOLVERSION=$v "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -c "SELECT 'proto $v ok'" 2>&1)
+  out=$(PGMAXPROTOCOLVERSION=$v "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -c "SELECT 'proto $v ok'" 2>&1)
   [[ "$out" == "proto $v ok" ]] && ok "psql protocol $v" || bad "psql protocol $v: $out"
 done
 
@@ -275,14 +276,14 @@ fi
 
 step "COPY: client-side round trip through psql \\copy"
 restart_main_server copy
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
   -c "CREATE TABLE copy_rt (id int, v text, w text)" \
   -c "INSERT INTO copy_rt VALUES (1, E'tab\\there', 'plain'), (2, E'nl\\nhere', NULL), (3, 'back\\slash', 'x')"
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "\\copy copy_rt TO '$WORK/copy_rt.tsv'"
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -c "\\copy copy_rt TO '$WORK/copy_rt.tsv'"
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
   -c "CREATE TABLE copy_rt2 (id int, v text, w text)" \
   -c "\\copy copy_rt2 FROM '$WORK/copy_rt.tsv'"
-out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A \
+out=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A \
   -c "SELECT count(*) FROM copy_rt2 t2 JOIN copy_rt t ON t.id = t2.id AND t.v = t2.v AND t.w IS NOT DISTINCT FROM t2.w" 2>&1)
 [[ "$out" == "3" ]] && ok "psql \\copy round trip (escapes and NULLs intact)" \
   || bad "copy round trip: '$out'"
@@ -296,12 +297,12 @@ if want proto; then
   stop_pos3ql "$SERVER_PID"
   rm -rf "$WORK/data"
   write_main_config "dur-$$/"
-  start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+  start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
   SERVER_PID=$START_PID
 fi
 
 step "durability: kill -9, restart, data intact"
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
   -c "CREATE TABLE crashy (id int, v text)" \
   -c "INSERT INTO crashy VALUES (1,'pre-crash'),(2,'also here')" \
   -c "CREATE TABLE crashy_types (a int[], b bool[], c text[], m tsmultirange, r int4range, ip inet, mac macaddr)" \
@@ -341,73 +342,73 @@ step "durability: kill -9, restart, data intact"
 # WAL upload is synchronous in durable mode. The trailing query still gives
 # the event loop an ordinary turn before this broader crash/restart fixture;
 # local recovery below replays the on-disk journal.
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -c "SELECT 1" >/dev/null
 sleep 1
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
-start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
 SERVER_PID=$START_PID
 # A column's type is stored as a one-byte code; two families once shared codes,
 # so an int4[]/bool[] column came back as a multirange with its values gone.
-types=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+types=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
   -c "SELECT pg_typeof(a),pg_typeof(b),pg_typeof(c),pg_typeof(m),pg_typeof(r) FROM crashy_types" 2>&1)
 want="integer[]|boolean[]|text[]|tsmultirange|int4range"
 # A serial column's sequence position survives the crash even with the rows
 # gone: a max-based scan would restart at 1 and reuse committed ids.
-seq_id=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+seq_id=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -q \
   -c "INSERT INTO crashy_seq(v) VALUES (9) RETURNING id" 2>&1 | head -1)
 [[ "$seq_id" == "4" ]] && ok "serial sequence survives restart" \
   || bad "serial sequence survives restart (got: $seq_id)"
 # Schemas, their tables and their views survive the crash: the journal
 # replays CREATE SCHEMA and the qualified objects, and the view still
 # resolves under its stored creation path.
-ns=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+ns=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT (SELECT count(*) FROM crashy_ns.t), (SELECT a FROM crashy_ns.v), (SELECT count(*) FROM pg_namespace WHERE nspname = 'crashy_ns')" 2>&1)
 [[ "$ns" == "1|7|1" ]] && ok "schema objects survive restart" \
   || bad "schema objects after restart: '$ns'"
 [[ "$types" == "$want" ]] && ok "column types survive restart" \
   || bad "column types after restart: got '$types' want '$want'"
-vals=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -c "SELECT a,b,c FROM crashy_types" 2>&1)
+vals=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -c "SELECT a,b,c FROM crashy_types" 2>&1)
 [[ "$vals" == "{1,2}|{t,f}|{x}" ]] && ok "array values survive restart" \
   || bad "array values after restart: '$vals'"
 # Network address values survive the crash (the inet/macaddr row codec).
-net=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -c "SELECT ip, mac FROM crashy_types" 2>&1)
+net=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -c "SELECT ip, mac FROM crashy_types" 2>&1)
 [[ "$net" == "2001:db8::1/64|08:00:2b:01:02:03" ]] && ok "network values survive restart" \
   || bad "network values after restart: '$net'"
-out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -c "SELECT count(*) FROM crashy" 2>&1)
+out=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -c "SELECT count(*) FROM crashy" 2>&1)
 [[ "$out" == "2" ]] && ok "kill -9 recovery" || bad "kill -9 recovery: '$out'"
 # A domain and its column identity + constraints survive the crash: the journal
 # replays CREATE DOMAIN, and the domain still enforces and reports its name.
-dom=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+dom=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT pg_typeof(n), n, ns::text FROM crashy_dom" 2>&1)
 # The domain's CHECK still enforces after replay (psql default verbosity prints
 # the message, not the SQLSTATE, so match the message).
-dom_bad=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+dom_bad=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -q \
   -c "INSERT INTO crashy_dom(n) VALUES (-1)" 2>&1 | grep -c 'violates check constraint')
-dom_array_bad=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+dom_array_bad=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -q \
   -c "INSERT INTO crashy_dom VALUES (50, ARRAY[101]::crashy_small[])" 2>&1 | grep -c 'violates check constraint')
 [[ "$dom" == "crashy_small|42|{1,2}" && "$dom_bad" -ge 1 && "$dom_array_bad" -ge 1 ]] && ok "domains survive restart" \
   || bad "domains after restart: '$dom' / '$dom_bad' / '$dom_array_bad'"
 # An enum, its ordering, column identity and label enforcement survive the crash:
 # the journal replays CREATE TYPE and the enum-typed column binds back to it.
-enm=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+enm=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT pg_typeof(m), string_agg(id::text, ',' ORDER BY m) FROM crashy_enum GROUP BY m ORDER BY m" 2>&1 | tr '\n' ';')
-enm_bad=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+enm_bad=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -q \
   -c "INSERT INTO crashy_enum VALUES (3,'bogus',NULL)" 2>&1 | grep -c 'invalid input value for enum')
 [[ "$enm" == "crashy_feeling|2;crashy_feeling|1;" && "$enm_bad" -ge 1 ]] && ok "enums survive restart" \
   || bad "enums after restart: '$enm' / '$enm_bad'"
 # A composite type and a domain over it preserve their separate identities
 # through a physical attribute change and schema/name move.  The arrays prove
 # that the same rewrite reaches nested row payloads, not merely column metadata.
-composites=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+composites=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT (direct).east,(direct).z IS NULL,(direct_values[1]).y,(marked).east,(marked_values[1]).y,(child).east,(child_values[1]).y FROM crashy_composites" 2>&1)
-composite_dependents=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+composite_dependents=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT (SELECT observed FROM crashy_composite_view),(SELECT observed FROM crashy_composite_rules),(SELECT position('((direct).east)' in indexdef) > 0 FROM pg_indexes WHERE indexname = 'crashy_composite_field_idx')" 2>&1)
-if composite_error=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+if composite_error=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -q \
   -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
   -c "INSERT INTO crashy_composites(marked) VALUES (ROW(-1,2,NULL)::crashy_types.crashy_point)" 2>&1); then
   composite_error="invalid composite-domain value was accepted"
 fi
-if composite_child_error=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+if composite_child_error=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -q \
   -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
   -c "INSERT INTO crashy_composites(child) VALUES (ROW(1,12,NULL)::crashy_coordinate_child)" 2>&1); then
   composite_child_error="invalid child-domain value was accepted"
@@ -415,7 +416,7 @@ fi
 [[ "$composites" == "1|t|4|5|8|9|8" && "$composite_dependents" == "1|6|t" && "$composite_error" == *23514* && "$composite_child_error" == *23514* ]] && ok "composite dependents survive restart and type move" \
   || bad "composite dependents after restart: '$composites' / '$composite_dependents' / '$composite_error' / '$composite_child_error'"
 # Object comments survive the crash: the journal replays the COMMENT records.
-cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+cmt=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT obj_description('crashy'::regclass), col_description('crashy'::regclass, 2)" 2>&1)
 [[ "$cmt" == "crash-comment|crash-col" ]] && ok "comments survive restart" \
   || bad "comments after restart: '$cmt'"
@@ -423,7 +424,7 @@ cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
 step "durable WAL upload: commit, wipe disk (no checkpoint), rebuild from MinIO WAL"
 # Commit without any CHECKPOINT, then destroy the local disk: recovery must
 # come entirely from WAL segments synchronously acknowledged by MinIO.
-if ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+if ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
   -v ON_ERROR_STOP=1 \
   -c "CREATE TABLE waltest (id int, v text)" \
   -c "INSERT INTO waltest VALUES (10,'durable-a'),(20,'durable-b'),(30,'durable-c')"; then
@@ -433,19 +434,19 @@ fi
 # One commit whose WAL batch (~600 KiB of row images, within the statement
 # arena) exceeds the 256 KiB response buffer: its uploaded segment must
 # still replay, in ranged windows, after the wipe.
-if ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+if ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
   -v ON_ERROR_STOP=1 \
   -c "INSERT INTO waltest SELECT 1000 + g, repeat('w', 1024) FROM generate_series(1, 600) g"; then
   bad "durable WAL ranged-replay fixture setup"
   exit 1
 fi
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "SELECT 1" >/dev/null
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -c "SELECT 1" >/dev/null
 sleep 1
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"
-start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
 SERVER_PID=$START_PID
-out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -c "SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM waltest WHERE id < 1000), (SELECT count(*) FROM waltest WHERE id >= 1000)" 2>&1)
+out=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -c "SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM waltest WHERE id < 1000), (SELECT count(*) FROM waltest WHERE id >= 1000)" 2>&1)
 [[ "$out" == "durable-a,durable-b,durable-c|600" ]] && ok "durable WAL upload recovers through the gateway (segments beyond the response buffer)" || bad "durable WAL recovery: '$out'"
 
 step "commit-durable-on-bucket by default: ack, kill -9 at once, wipe, cold start"
@@ -477,31 +478,31 @@ kill -9 $RPO0_PID 2>/dev/null; wait $RPO0_PID 2>/dev/null
   || bad "commit-durable-on-bucket default: '$out'"
 
 step "cold start: checkpoint, wipe the disk, rebuild from MinIO"
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "CHECKPOINT"
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -c "CHECKPOINT"
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"
-start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
 SERVER_PID=$START_PID
-out=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -c "SELECT v FROM crashy ORDER BY id LIMIT 1" 2>&1)
+out=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -c "SELECT v FROM crashy ORDER BY id LIMIT 1" 2>&1)
 [[ "$out" == "pre-crash" ]] && ok "cold start from bucket" || bad "cold start from bucket: '$out'"
 # Schemas and their contents rebuild from the manifest alone (wiped disk).
-ns=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+ns=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT (SELECT count(*) FROM crashy_ns.t), (SELECT a FROM crashy_ns.v)" 2>&1)
 [[ "$ns" == "1|7" ]] && ok "schema objects survive a cold start" \
   || bad "schema objects after cold start: '$ns'"
 # The manifest and replayed object batches retain evolved composite layouts,
 # direct-composite arrays, and arrays whose element is a domain over the same
 # moved composite type.
-composites=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+composites=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT (direct).east,(direct).z IS NULL,(direct_values[1]).y,(marked).east,(marked_values[1]).y,(child).east,(child_values[1]).y FROM crashy_composites" 2>&1)
-composite_dependents=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+composite_dependents=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT (SELECT observed FROM crashy_composite_view),(SELECT observed FROM crashy_composite_rules),(SELECT position('((direct).east)' in indexdef) > 0 FROM pg_indexes WHERE indexname = 'crashy_composite_field_idx')" 2>&1)
-if composite_error=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+if composite_error=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -q \
   -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
   -c "INSERT INTO crashy_composites(marked) VALUES (ROW(-1,2,NULL)::crashy_types.crashy_point)" 2>&1); then
   composite_error="invalid composite-domain value was accepted"
 fi
-if composite_child_error=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -q \
+if composite_child_error=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -q \
   -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
   -c "INSERT INTO crashy_composites(child) VALUES (ROW(1,12,NULL)::crashy_coordinate_child)" 2>&1); then
   composite_child_error="invalid child-domain value was accepted"
@@ -509,19 +510,19 @@ fi
 [[ "$composites" == "1|t|4|5|8|9|8" && "$composite_dependents" == "1|6|t" && "$composite_error" == *23514* && "$composite_child_error" == *23514* ]] && ok "composite dependents survive a cold start" \
   || bad "composite dependents after cold start: '$composites' / '$composite_dependents' / '$composite_error' / '$composite_child_error'"
 # Object comments rebuild from the manifest alone (the `cmt` line), wiped disk.
-cmt=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+cmt=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT obj_description('crashy'::regclass), col_description('crashy'::regclass, 2)" 2>&1)
 [[ "$cmt" == "crash-comment|crash-col" ]] && ok "comments survive a cold start" \
   || bad "comments after cold start: '$cmt'"
 # Domains rebuild from the manifest `dom2` line alone (wiped disk), including
 # immediate parent identity and generated array identity.
-dom=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+dom=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT pg_typeof(n), n, ns::text FROM crashy_dom" 2>&1)
 [[ "$dom" == "crashy_small|42|{1,2}" ]] && ok "domains survive a cold start" \
   || bad "domains after cold start: '$dom'"
 # Enums rebuild from the manifest `enm` line alone (wiped disk); the enum-typed
 # column binds back to it and still reports and enforces its type.
-enm=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' -q \
+enm=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' -q \
   -c "SELECT pg_typeof(m), m, ms::text FROM crashy_enum WHERE id = 1" 2>&1)
 [[ "$enm" == "crashy_feeling|glad|{glad,ok}" ]] && ok "enums survive a cold start" \
   || bad "enums after cold start: '$enm'"
@@ -610,29 +611,29 @@ step "ingest beyond memtable_bytes: rows spill to the bucket and read back"
 # The Stage D milestone: sustained inserts well past the heap's capacity,
 # with checkpoints spilling committed bytes to block SSTs. Reads (point and
 # aggregate) then fetch spilled rows back through the cache tiers.
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "CREATE TABLE spilly (id serial, pad text)"
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -c "CREATE TABLE spilly (id serial, pad text)"
 # ~24 MiB of row bytes against a 16 MiB memtable, in modest batches so the
 # auto-checkpoint between messages can drain the heap.
 for i in {1..24}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q     -c "INSERT INTO spilly(pad) SELECT repeat('x', 1024) FROM generate_series(1, 1000)"     || { bad "spill ingest batch $i"; break; }
+  "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q     -c "INSERT INTO spilly(pad) SELECT repeat('x', 1024) FROM generate_series(1, 1000)"     || { bad "spill ingest batch $i"; break; }
 done
-spill_count=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -c "SELECT count(*) FROM spilly" 2>&1)
+spill_count=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -c "SELECT count(*) FROM spilly" 2>&1)
 [[ "$spill_count" == "24000" ]] && ok "ingest 1.5x memtable_bytes (24000 rows)"   || bad "ingest beyond memtable (count: $spill_count)"
-spill_point=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -c "SELECT length(pad) FROM spilly WHERE id = 12345" 2>&1)
+spill_point=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -c "SELECT length(pad) FROM spilly WHERE id = 12345" 2>&1)
 [[ "$spill_point" == "1024" ]] && ok "point read of a spilled row"   || bad "point read of a spilled row (got: $spill_point)"
 # Deltas and tombstones across a cold start: delete a slice of spilled rows,
 # update one, checkpoint (a delta SST with tombstones joins the table's list),
 # wipe the disk, and rebuild from the bucket. The deleted rows must not
 # resurrect from older SSTs; the update must win over its old version.
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
   -c "DELETE FROM spilly WHERE id BETWEEN 100 AND 599" \
   -c "UPDATE spilly SET pad = 'updated' WHERE id = 700" \
   -c "CHECKPOINT"
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"
-start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
 SERVER_PID=$START_PID
-after=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+after=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
   -c "SELECT count(*), count(*) FILTER (WHERE id BETWEEN 100 AND 599), max(CASE WHEN id = 700 THEN pad END) FROM spilly" 2>&1)
 [[ "$after" == "23500|0|updated" ]] && ok "delta SSTs + tombstones survive a cold start" \
   || bad "delta/tombstone cold start (got: $after)"
@@ -642,26 +643,26 @@ after=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
 # repointed spilled rows must still point-read, and a final wiped-disk cold
 # start must rebuild the merged lists from the manifest alone.
 for i in {1..7}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+  "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
     -c "INSERT INTO spilly(pad) SELECT repeat('m', 512) FROM generate_series(1, 200)" \
     -c "DELETE FROM spilly WHERE id BETWEEN $((23000 + i * 100)) AND $((23000 + i * 100 + 49))" \
     -c "UPDATE spilly SET pad = 'cycle-$i' WHERE id = 650" \
     -c "CHECKPOINT" \
     || { bad "paced merge cycle $i"; break; }
 done
-merged=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+merged=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
   -c "SELECT count(*), (SELECT pad FROM spilly WHERE id = 650), (SELECT count(*) FROM spilly WHERE id BETWEEN 23100 AND 23749), (SELECT length(pad) FROM spilly WHERE id = 12345) FROM spilly" 2>&1)
 [[ "$merged" == "24550|cycle-7|300|1024" ]] && ok "paced compaction keeps every row" \
   || bad "paced compaction (got: $merged)"
 kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
 rm -rf "$WORK/data"
-start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
 SERVER_PID=$START_PID
-merged_cold=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+merged_cold=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
   -c "SELECT count(*), (SELECT pad FROM spilly WHERE id = 650) FROM spilly" 2>&1)
 [[ "$merged_cold" == "24550|cycle-7" ]] && ok "merged SST lists survive a cold start" \
   || bad "merged-list cold start (got: $merged_cold)"
-"$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q -c "DROP TABLE spilly" >/dev/null 2>&1
+"$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q -c "DROP TABLE spilly" >/dev/null 2>&1
 
 fi # ingest
 
@@ -706,9 +707,9 @@ if [[ -n "${POS3QL_VENV:-}" && -x "$POS3QL_VENV/bin/python" && ( -x "$TORTURE_PG
     rm -rf "$TORTURE_SOCK"
   fi
   # The torture script may have restarted the server under its own pid.
-  lsof -ti tcp:$PG_PORT -sTCP:LISTEN | xargs kill -9 2>/dev/null || true
+  lsof -ti tcp:"$PG_PORT" -sTCP:LISTEN | xargs kill -9 2>/dev/null || true
   sleep 0.3
-  start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+  start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
   SERVER_PID=$START_PID
 else
   printf '%s\n' 'SKIP: torture needs POS3QL_VENV and a reference PostgreSQL'
@@ -735,7 +736,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     rm -rf "$SUB_PG_SOCK"
   else
   SUB_PSQL="$SUB_PGBIN/psql"
-  if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+  if ! "$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -q \
     -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'subscription_apply%' OR slot_name LIKE 'pos3ql_%_sync'" \
     -c "DROP PUBLICATION IF EXISTS subscription_apply_pub, subscription_apply_pub_after_alter" \
     -c "DROP TABLE IF EXISTS subscription_target, subscription_refresh_target, subscription_typed" \
@@ -755,7 +756,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     -c "CREATE PUBLICATION subscription_apply_pub_after_alter FOR TABLE subscription_refresh_target" \
     >/dev/null 2>&1; then
     bad "logical subscription publisher setup"
-  elif ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+  elif ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
     -c "CREATE TYPE subscription_state AS ENUM ('ready', 'done')" \
     -c "CREATE DOMAIN subscription_positive AS integer CHECK (VALUE > 0)" \
     -c "CREATE TYPE subscription_pair AS (label text, amount integer)" \
@@ -771,7 +772,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     bad "logical subscription subscriber setup"
   else
   subscription_rows() {
-    "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+    "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
       -c "SELECT id, body FROM subscription_target ORDER BY id" 2>&1
   }
   subscription_wait() { # <expected rows>
@@ -791,15 +792,15 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     tail -100 "$WORK/subscription-pg.log"
   }
   subscription_typed_row() {
-    "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+    "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
       -c "SELECT id, state, positive, labels, span, spans, pair FROM subscription_typed ORDER BY id" 2>&1
   }
   if subscription_wait $'1|first\n2|second'; then
-    copied_default=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A \
+    copied_default=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A \
       -c "SELECT string_agg(publisher_only, ',' ORDER BY id) FROM subscription_target")
-    relation_state=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+    relation_state=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
       -c "SELECT count(*), min(srsubstate), bool_and(srsublsn IS NOT NULL) FROM pg_subscription_rel")
-    trigger_rows=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A \
+    trigger_rows=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A \
       -c "SELECT string_agg(id::text, ',' ORDER BY id) FROM subscription_trigger_audit")
     [[ "$copied_default" == "subscriber-default,subscriber-default" ]] \
       && ok "initial COPY applies publication projection and subscriber defaults" \
@@ -814,7 +815,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     [[ "$typed_row" == '1|ready|7|{left,right}|[1,4)|{[1,3),[5,8)}|(first,9)' ]] \
       && ok "binary initial COPY preserves enum, domain, array, range, multirange, and composite values" \
       || bad "binary initial COPY typed values (got $typed_row)"
-    slot_flags=$("$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -t -A -F'|' \
+    slot_flags=$("$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -t -A -F'|' \
       -c "SELECT two_phase, failover FROM pg_replication_slots WHERE slot_name = 'subscription_apply'")
     [[ "$slot_flags" == "f|t" ]] \
       && ok "managed publisher slot retains explicit two-phase and failover properties" \
@@ -823,7 +824,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     bad "filtered initial COPY (got $(subscription_rows))"
     subscription_diagnostics
   fi
-  if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+  if ! "$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -q \
     -c "UPDATE subscription_typed SET state = 'done', positive = 8, labels = ARRAY['changed'], span = '[2,6)', spans = '{[2,6)}', pair = ROW('second', 10) WHERE id = 1" \
     >/dev/null 2>&1; then
     bad "binary logical subscription typed update"
@@ -838,12 +839,12 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
       && ok "binary pgoutput update preserves every catalog-resolved structured value" \
       || bad "binary pgoutput typed update (got $typed_row)"
   fi
-  if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+  if ! "$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -q \
     -c "BEGIN; INSERT INTO subscription_target VALUES (-2, 'also-filtered', 'publisher'), (3, 'streamed', 'publisher'); SAVEPOINT rolled_back; INSERT INTO subscription_target VALUES (6, 'aborted-subtransaction', 'publisher'); ROLLBACK TO SAVEPOINT rolled_back; INSERT INTO subscription_target VALUES (7, 'committed-subtransaction', 'publisher'); COMMIT" \
     >/dev/null 2>&1; then
     bad "logical subscription publisher transaction"
   elif subscription_wait $'1|first\n2|second\n3|streamed\n7|committed-subtransaction'; then
-    trigger_rows=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A \
+    trigger_rows=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A \
       -c "SELECT string_agg(id::text, ',' ORDER BY id) FROM subscription_trigger_audit")
     [[ "$trigger_rows" == "1,2,3,7" ]] \
       && ok "streamed apply preserves filters, triggers, and subtransaction abort scope" \
@@ -852,7 +853,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     bad "subscription initial stream (got $(subscription_rows))"
     subscription_diagnostics
   fi
-  if ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+  if ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
     -c "ALTER SUBSCRIPTION subscription_apply SET PUBLICATION subscription_apply_pub, subscription_apply_pub_after_alter" \
     -c "ALTER SUBSCRIPTION subscription_apply CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres application_name=pos3ql_subscription_rebound sslmode=disable'" \
     >/dev/null 2>&1; then
@@ -860,18 +861,18 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
   else
     refresh_rows=""
     for _ in {1..100}; do
-      refresh_rows=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+      refresh_rows=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
         -c "SELECT id, body FROM subscription_refresh_target ORDER BY id" 2>&1)
       [[ "$refresh_rows" == "10|refresh-copy" ]] && break
       sleep 0.1
     done
-    relation_state=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+    relation_state=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
       -c "SELECT count(*), min(srsubstate), bool_and(srsublsn IS NOT NULL) FROM pg_subscription_rel")
     [[ "$refresh_rows" == "10|refresh-copy" && "$relation_state" == "3|r|t" ]] \
       && ok "publication refresh copies only the newly subscribed table and records both states" \
       || bad "publication refresh (rows $refresh_rows, state $relation_state)"
   fi
-  if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+  if ! "$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -q \
     -c "INSERT INTO subscription_target VALUES (4, 'after-alter', 'publisher')" >/dev/null 2>&1; then
     bad "logical subscription post-alter publisher transaction"
   elif subscription_wait $'1|first\n2|second\n3|streamed\n4|after-alter\n7|committed-subtransaction'; then
@@ -881,14 +882,14 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     subscription_diagnostics
   fi
   kill -9 $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null
-  start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+  start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
   SERVER_PID=$START_PID
   if subscription_wait $'1|first\n2|second\n3|streamed\n4|after-alter\n7|committed-subtransaction'; then
-    if ! "$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -q \
+    if ! "$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -q \
       -c "INSERT INTO subscription_target VALUES (5, 'after-crash', 'publisher')" >/dev/null 2>&1; then
     bad "logical subscription post-crash publisher transaction"
     elif subscription_wait $'1|first\n2|second\n3|streamed\n4|after-alter\n5|after-crash\n7|committed-subtransaction'; then
-      slot_lsn=$("$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -t -A \
+      slot_lsn=$("$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -t -A \
         -c "SELECT confirmed_flush_lsn <> '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'subscription_apply'")
       [[ "$slot_lsn" == "t" ]] && ok "subscription crash recovery resumes from durable acknowledgement" \
         || bad "subscription publisher acknowledgement was not durable (got $slot_lsn)"
@@ -899,18 +900,18 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     bad "subscription local WAL recovery (got $(subscription_rows))"
     subscription_diagnostics
   fi
-  if ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+  if ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
     -c "DROP SUBSCRIPTION subscription_apply" >/dev/null 2>&1; then
     bad "managed subscription drop"
   else
     publisher_slot_count=1
     for _ in {1..100}; do
-      publisher_slot_count=$("$SUB_PSQL" -h 127.0.0.1 -p $SUB_PG_PORT -U postgres -X -t -A \
+      publisher_slot_count=$("$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -t -A \
         -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'subscription_apply'")
       [[ "$publisher_slot_count" == "0" ]] && break
       sleep 0.1
     done
-    local_subscription_count=$("$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A \
+    local_subscription_count=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A \
       -c "SELECT count(*) FROM pg_subscription WHERE subname = 'subscription_apply'")
     [[ "$publisher_slot_count" == "0" && "$local_subscription_count" == "0" ]] \
       && ok "managed subscription drop removes the publisher slot and local catalog object" \
@@ -946,22 +947,22 @@ max_value_indexes = 16
 max_replication_slots = 4
 work_arena_bytes = 16MiB
 EOF
-start_pos3ql "$WORK/subscription-pos3ql.conf" "$WORK/subscription-pos3ql.log" $SUB_POS3QL_PORT
+start_pos3ql "$WORK/subscription-pos3ql.conf" "$WORK/subscription-pos3ql.log" "$SUB_POS3QL_PORT"
 SUB_POS3QL_PID=$START_PID
-if ! "$PSQL" -h 127.0.0.1 -p $SUB_POS3QL_PORT -U postgres -X -q \
+if ! "$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -q \
   -c "CREATE TABLE pos3ql_subscription_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text)" \
   -c "INSERT INTO pos3ql_subscription_target VALUES (-1, 'filtered', 'private'), (1, 'snapshot', 'private')" \
   -c "CREATE PUBLICATION pos3ql_subscription_pub FOR TABLE pos3ql_subscription_target (id, body) WHERE (id > 0)" \
   >/dev/null 2>&1; then
   bad "pos3ql logical publisher setup"
-elif ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+elif ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
   -c "CREATE TABLE pos3ql_subscription_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text DEFAULT 'subscriber-default')" \
   -c "CREATE SUBSCRIPTION pos3ql_subscription CONNECTION 'host=127.0.0.1 port=$SUB_POS3QL_PORT user=postgres dbname=postgres application_name=pos3ql_to_pos3ql sslmode=disable' PUBLICATION pos3ql_subscription_pub" \
   >/dev/null 2>&1; then
   bad "pos3ql logical subscriber setup"
 else
   pos3ql_subscription_rows() {
-    "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -t -A -F'|' \
+    "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
       -c "SELECT id, body, publisher_only FROM pos3ql_subscription_target ORDER BY id" 2>&1
   }
   pos3ql_subscription_wait() {
@@ -981,7 +982,7 @@ else
     tail -60 "$WORK/subscription-pos3ql.log"
     tail -60 "$WORK/server.log"
   fi
-  if ! "$PSQL" -h 127.0.0.1 -p $SUB_POS3QL_PORT -U postgres -X -q \
+  if ! "$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -q \
     -c "INSERT INTO pos3ql_subscription_target VALUES (-2, 'filtered-stream', 'private'), (2, 'stream', 'private')" \
     >/dev/null 2>&1; then
     bad "pos3ql logical publisher transaction"
@@ -990,11 +991,11 @@ else
   else
     bad "pos3ql publisher steady stream (got $(pos3ql_subscription_rows))"
   fi
-  if "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+  if "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
     -c "DROP SUBSCRIPTION pos3ql_subscription" >/dev/null 2>&1; then
     pos3ql_slot_count=1
     for _ in {1..100}; do
-      pos3ql_slot_count=$("$PSQL" -h 127.0.0.1 -p $SUB_POS3QL_PORT -U postgres -X -t -A \
+      pos3ql_slot_count=$("$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -t -A \
         -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'pos3ql_subscription'")
       [[ "$pos3ql_slot_count" == "0" ]] && break
       sleep 0.1
@@ -1006,14 +1007,14 @@ else
     bad "pos3ql managed subscription drop"
   fi
 
-  if ! "$PSQL" -h 127.0.0.1 -p $SUB_POS3QL_PORT -U postgres -X -q \
+  if ! "$PSQL" -h 127.0.0.1 -p "$SUB_POS3QL_PORT" -U postgres -X -q \
     -c "CREATE TABLE pos3ql_subscription_mismatch (id int PRIMARY KEY, body text NOT NULL)" \
     -c "INSERT INTO pos3ql_subscription_mismatch VALUES (1, 'incompatible')" \
     -c "CREATE PUBLICATION pos3ql_subscription_mismatch_pub FOR TABLE pos3ql_subscription_mismatch" \
     >"$WORK/subscription-mismatch-publisher.out" 2>&1; then
     bad "subscription mismatch publisher setup"
     cat "$WORK/subscription-mismatch-publisher.out"
-  elif ! "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+  elif ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
     -c "CREATE TABLE pos3ql_subscription_mismatch (id int PRIMARY KEY)" \
     -c "CREATE SUBSCRIPTION pos3ql_subscription_mismatch CONNECTION 'host=127.0.0.1 port=$SUB_POS3QL_PORT user=postgres dbname=postgres application_name=pos3ql_mismatch sslmode=disable' PUBLICATION pos3ql_subscription_mismatch_pub" \
     >"$WORK/subscription-mismatch-subscriber.out" 2>&1; then
@@ -1029,7 +1030,7 @@ else
   sleep 0.3
   mismatch_count_after=$(grep -c 'pos3ql_subscription_mismatch.*invalid published column list' "$WORK/server.log" || true)
   stop_pos3ql "$SERVER_PID"
-  start_pos3ql "$WORK/server.conf" "$WORK/server.log" $PG_PORT
+  start_pos3ql "$WORK/server.conf" "$WORK/server.log" "$PG_PORT"
   SERVER_PID=$START_PID
   sleep 0.3
   mismatch_count_restarted=$(grep -c 'pos3ql_subscription_mismatch.*invalid published column list' "$WORK/server.log" || true)
@@ -1039,7 +1040,7 @@ else
     bad "subscription schema failure persistence (counts $mismatch_count/$mismatch_count_after/$mismatch_count_restarted)"
     tail -60 "$WORK/server.log"
   fi
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -X -q \
+  "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
     -c "DROP SUBSCRIPTION pos3ql_subscription_mismatch" >/dev/null 2>&1
   fi
 fi
@@ -1072,7 +1073,7 @@ tls_on = on
 tls_cert_file = ${WORK}/server-tls/cert.pem
 tls_key_file = ${WORK}/server-tls/key.pem
 EOF
-start_pos3ql "$WORK/server-tls.conf" "$WORK/server-tls.log" ${STLS_PORT}
+start_pos3ql "$WORK/server-tls.conf" "$WORK/server-tls.log" "${STLS_PORT}"
 STLS_PID=$START_PID
 # A query under sslmode=require only completes if the server negotiated TLS
 # (psql aborts if the SSLRequest is declined), so this both runs SQL over the

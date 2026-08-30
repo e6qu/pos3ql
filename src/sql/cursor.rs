@@ -407,6 +407,12 @@ impl CursorPool {
         }
     }
 
+    pub(crate) fn has_uncommitted_hold_cursor(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| slot.active && slot.tentative && slot.hold)
+    }
+
     /// Transaction commit: cursors become holdable or die.
     pub fn on_commit(&mut self) {
         for s in &mut self.slots {

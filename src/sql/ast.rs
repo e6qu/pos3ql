@@ -3,6 +3,27 @@
 //! per-statement arena and costs nothing to drop.
 
 use crate::sql::types::ColType;
+use crate::util::StackStr;
+
+/// A PostgreSQL two-phase transaction identifier. PostgreSQL requires a
+/// quoted value shorter than 200 bytes; constructing the closed value at the
+/// parse boundary keeps overlong or truncated identifiers out of execution,
+/// catalogs, and durability records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedTransactionId(StackStr<199>);
+
+impl PreparedTransactionId {
+    pub const EMPTY: Self = Self(StackStr::new());
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let value = StackStr::from_str(value);
+        (!value.is_truncated()).then_some(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
 
 /// A possibly schema-qualified relation name, as written. `schema: None`
 /// means the statement spelled a bare name that resolves through the session
@@ -324,6 +345,9 @@ pub enum Stmt<'a> {
     Begin(TransactionCharacteristics),
     Commit,
     Rollback,
+    PrepareTransaction(PreparedTransactionId),
+    CommitPrepared(PreparedTransactionId),
+    RollbackPrepared(PreparedTransactionId),
     /// SAVEPOINT name.
     Savepoint(&'a str),
     /// RELEASE [SAVEPOINT] name.

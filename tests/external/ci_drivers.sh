@@ -12,8 +12,7 @@
 # Env: PGHOST/PGPORT/PGUSER (reference PostgreSQL), P3_PORT (pos3ql listen port).
 
 set -u
-cd "$(dirname "$0")/../.."
-ROOT=$(pwd)
+cd "$(dirname "$0")/../.." || exit
 DRV=tests/external/drivers
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/pos3ql-drivers.XXXXXX")
 
@@ -40,6 +39,7 @@ table_rows = 65536
 max_value_indexes = 64
 memtable_bytes = 256MiB
 max_prepared = 64
+max_prepared_transactions = 8
 EOF
 "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
 P3_PID=$!

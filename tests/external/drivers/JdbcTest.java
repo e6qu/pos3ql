@@ -26,6 +26,7 @@ public class JdbcTest {
         try (Connection c = DriverManager.getConnection(url, "postgres", "")) {
             ddlAndCrud(c);
             transactions(c);
+            twoPhaseTransactions(c);
             typedValuesAndPortalPaging(c);
             standardRoutine(c);
             tableSampling(c);
@@ -142,6 +143,31 @@ public class JdbcTest {
             line("after rollback id=9 count=" + rs.getInt(1));
         }
         c.setAutoCommit(true);
+    }
+
+    static void twoPhaseTransactions(Connection c) throws SQLException {
+        try (Statement s = c.createStatement()) {
+            s.execute("DROP TABLE IF EXISTS jdbc_two_phase");
+            s.execute("CREATE TABLE jdbc_two_phase (id integer PRIMARY KEY, value text)");
+            s.execute("INSERT INTO jdbc_two_phase VALUES (1, 'before')");
+            s.execute("BEGIN");
+            s.execute("UPDATE jdbc_two_phase SET value = 'after' WHERE id = 1");
+            s.execute("PREPARE TRANSACTION 'jdbc-two-phase'");
+            try (ResultSet rs = s.executeQuery(
+                    "SELECT gid, pg_typeof(transaction)::text FROM pg_prepared_xacts")) {
+                rs.next();
+                line("two-phase prepared " + rs.getString(1) + "|" + rs.getString(2));
+            }
+            try (ResultSet rs = s.executeQuery("SELECT value FROM jdbc_two_phase WHERE id = 1")) {
+                rs.next();
+                line("two-phase hidden " + rs.getString(1));
+            }
+            s.execute("COMMIT PREPARED 'jdbc-two-phase'");
+            try (ResultSet rs = s.executeQuery("SELECT value FROM jdbc_two_phase WHERE id = 1")) {
+                rs.next();
+                line("two-phase committed " + rs.getString(1));
+            }
+        }
     }
 
     static void typedValuesAndPortalPaging(Connection c) throws SQLException {

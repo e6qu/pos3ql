@@ -117,6 +117,24 @@ func main() {
 	must("rollback count", conn.QueryRow(ctx, "SELECT count(*) FROM pgx_drv WHERE id = 9").Scan(&n))
 	fmt.Printf("after rollback id=9 count=%d\n", n)
 
+	exec("DROP TABLE IF EXISTS pgx_two_phase")
+	exec("CREATE TABLE pgx_two_phase (id integer PRIMARY KEY, value text)")
+	exec("INSERT INTO pgx_two_phase VALUES (1, 'before')")
+	exec("BEGIN")
+	exec("UPDATE pgx_two_phase SET value = $1 WHERE id = $2", "after", 1)
+	exec("PREPARE TRANSACTION 'pgx-two-phase'")
+	var preparedGid, preparedType, preparedValue string
+	must("prepared catalog", conn.QueryRow(ctx,
+		"SELECT gid, pg_typeof(transaction)::text FROM pg_prepared_xacts").Scan(&preparedGid, &preparedType))
+	fmt.Printf("two-phase prepared %s|%s\n", preparedGid, preparedType)
+	must("prepared hidden value", conn.QueryRow(ctx,
+		"SELECT value FROM pgx_two_phase WHERE id = 1").Scan(&preparedValue))
+	fmt.Printf("two-phase hidden %s\n", preparedValue)
+	exec("COMMIT PREPARED 'pgx-two-phase'")
+	must("prepared committed value", conn.QueryRow(ctx,
+		"SELECT value FROM pgx_two_phase WHERE id = 1").Scan(&preparedValue))
+	fmt.Printf("two-phase committed %s\n", preparedValue)
+
 	// Catalog introspection.
 	crows, err := conn.Query(ctx,
 		"SELECT attname, format_type(atttypid, atttypmod), attnotnull "+

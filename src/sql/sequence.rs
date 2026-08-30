@@ -184,17 +184,31 @@ impl<'a> SeqEval<'a> {
     }
 }
 
+pub(crate) fn next_cached(
+    storage: &Storage,
+    session: &SeqSession,
+    slot: usize,
+    txid: u32,
+) -> Result<i64, SqlError> {
+    let sequence = storage.sequence_for(slot, txid);
+    if let Some(value) = session.take_cached(slot, sequence.cache_identity()) {
+        session.record_nextval(slot, sequence.created_at, value);
+        return Ok(value);
+    }
+    let (value, reserved) = storage.reserve_sequence_values(slot, txid, sequence.cache)?;
+    session.store_cache(slot, value, reserved, &sequence);
+    session.record_nextval(slot, sequence.created_at, value);
+    Ok(value)
+}
+
 impl SequenceAccess for SeqEval<'_> {
     fn nextval(&self, name: &str) -> Result<i64, SqlError> {
         let slot = self.resolve(name)?;
         self.require_any(slot, PrivilegeSet::USAGE, Some(PrivilegeSet::UPDATE))?;
-        let seq = self.storage.sequence_for(slot, self.txid);
         if self.dry {
             return Ok(self.storage.sequence_value_for(slot, self.txid).0);
         }
-        let value = self.storage.next_sequence_value(slot, self.txid)?;
-        self.session.record_nextval(slot, seq.created_at, value);
-        Ok(value)
+        next_cached(self.storage, self.session, slot, self.txid)
     }
 
     fn currval(&self, name: &str) -> Result<i64, SqlError> {

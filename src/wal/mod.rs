@@ -153,6 +153,10 @@ const KIND_SET_EVENT_TRIGGER: u8 = 103;
 const KIND_DROP_EVENT_TRIGGER: u8 = 104;
 const KIND_SET_RULE: u8 = 105;
 const KIND_DROP_RULE: u8 = 106;
+const KIND_PREPARE_TRANSACTION: u8 = 107;
+const KIND_COMMIT_PREPARED: u8 = 108;
+const KIND_ROLLBACK_PREPARED: u8 = 109;
+const KIND_PREPARED_LOCKS: u8 = 110;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -160,7 +164,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DROP_RULE;
+const LAST_KIND: u8 = KIND_PREPARED_LOCKS;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -697,6 +701,26 @@ pub(crate) enum WalOp<'a> {
     /// transaction. It has no storage replay effect of its own.
     Commit {
         transaction_id: u32,
+    },
+    /// Terminates a durable batch without making its preceding operations
+    /// visible. The batch remains addressable by `gid` until a later typed
+    /// resolution record commits or rolls it back.
+    PrepareTransaction {
+        transaction_id: u32,
+        owner: u16,
+        database: i32,
+        prepared_at: i64,
+        gid: &'a str,
+    },
+    PreparedLocks {
+        transaction_id: u32,
+        encoded: &'a [u8],
+    },
+    CommitPrepared {
+        gid: &'a str,
+    },
+    RollbackPrepared {
+        gid: &'a str,
     },
     CreateReplicationSlot {
         name: &'a str,
@@ -1279,16 +1303,10 @@ impl Wal {
         self.capacity
     }
 
-    /// Replays every valid record from the start of the journal, stopping
-    /// at the first invalid or non-monotonic one (the tail). Positions the
-    /// write cursor there. Records with `lsn <= floor` are scanned but not
-    /// yielded — they are already covered by the checkpoint the caller
-    /// loaded (a crash between manifest publication and journal reset
-    /// leaves such records behind). Each yielded record is the raw bytes
-    /// from the kind byte onward, as [`decode_record`] accepts; the caller
-    /// merges them with uploaded-segment records by LSN before applying, so
-    /// a journal that restarts mid-history (disk wipe) or ends early (torn
-    /// write) cannot reorder or lose committed records. Startup only.
+    /// Replays complete committed or prepared batches from the journal.
+    /// Valid records preceding a torn terminal marker are discarded together;
+    /// no transaction prefix can become visible after a crash. Positions the
+    /// write cursor at the last complete boundary. Startup only.
     pub(crate) fn replay(
         &mut self,
         floor: u64,
@@ -1296,6 +1314,9 @@ impl Wal {
     ) -> Result<(), WalSetupError> {
         self.buffer.clear();
         let mut file_offset = 0u64; // next byte to read from the file
+        let mut parsed_offset = 0u64;
+        let mut last_seen_lsn = 0u64;
+        let mut pending: Vec<(u64, Vec<u8>)> = Vec::new();
         'outer: loop {
             let space = self.buffer.writable();
             if space.is_empty() {
@@ -1328,7 +1349,7 @@ impl Wal {
                 let kind = data[16];
                 if !(KIND_CREATE..=LAST_KIND).contains(&kind)
                     || payload_len > self.buffer.capacity() - HEADER_LEN
-                    || lsn <= self.last_lsn
+                    || lsn <= last_seen_lsn
                 {
                     break 'outer;
                 }
@@ -1339,18 +1360,25 @@ impl Wal {
                 if crc32c(&data[4..total]) != stored_crc {
                     break 'outer;
                 }
-                // Validate the framing while the record is contiguous in the
-                // buffer, then hand the caller the raw bytes from the kind
-                // byte onward (as `decode_record` accepts).
                 if decode_op(kind, &data[HEADER_LEN..total]).is_none() {
                     break 'outer;
                 }
-                if lsn > floor {
-                    apply(lsn, &data[16..total]).map_err(WalSetupError::Replay)?;
+                last_seen_lsn = lsn;
+                pending.push((lsn, data[16..total].to_vec()));
+                parsed_offset += total as u64;
+                self.buffer.consume(total);
+                if !matches!(kind, KIND_COMMIT | KIND_PREPARE_TRANSACTION) {
+                    continue;
+                }
+
+                for (record_lsn, record) in &pending {
+                    if *record_lsn > floor {
+                        apply(*record_lsn, record).map_err(WalSetupError::Replay)?;
+                    }
                 }
                 self.last_lsn = lsn;
-                self.write_offset += total as u64;
-                self.buffer.consume(total);
+                self.write_offset = parsed_offset;
+                pending.clear();
             }
         }
         self.buffer.clear();
@@ -1427,6 +1455,23 @@ impl Wal {
         (records, staged.len() as u64)
     }
 
+    pub(crate) fn commit_boundary_bytes() -> usize {
+        HEADER_LEN + encoded_payload_len(&WalOp::Commit { transaction_id: 0 })
+    }
+
+    pub(crate) fn prepare_boundary_bytes(
+        metadata: crate::sql::two_phase::PreparedTransactionMetadata,
+    ) -> usize {
+        HEADER_LEN
+            + encoded_payload_len(&WalOp::PrepareTransaction {
+                transaction_id: metadata.transaction_id,
+                owner: metadata.owner,
+                database: metadata.database.get(),
+                prepared_at: metadata.prepared_at,
+                gid: metadata.gid.as_str(),
+            })
+    }
+
     pub fn truncate_stage(&mut self, transaction_id: u32, mark: usize) {
         let Some(index) = self.stage_index(transaction_id) else {
             debug_assert_eq!(mark, 0);
@@ -1472,6 +1517,51 @@ impl Wal {
     /// batch, assigning monotonically increasing commit-order LSNs. Returns
     /// the last assigned LSN, or `lsn_floor` for a transaction with no WAL.
     pub fn commit_stage(&mut self, transaction_id: u32, lsn_floor: u64) -> Result<u64, SqlError> {
+        self.finish_stage(
+            transaction_id,
+            lsn_floor,
+            &WalOp::Commit { transaction_id },
+            None,
+        )
+    }
+
+    pub(crate) fn prepare_stage(
+        &mut self,
+        metadata: crate::sql::two_phase::PreparedTransactionMetadata,
+        lsn_floor: u64,
+        records: &mut FixedBuf,
+    ) -> Result<u64, SqlError> {
+        if self.stage_index(metadata.transaction_id).is_none() {
+            let index = self.stage_index_or_claim(metadata.transaction_id)?;
+            append_record(
+                &mut self.stages[index].buffer,
+                lsn_floor,
+                &WalOp::DatabaseScope {
+                    oid: metadata.database.get(),
+                },
+            )?;
+        }
+        self.finish_stage(
+            metadata.transaction_id,
+            lsn_floor,
+            &WalOp::PrepareTransaction {
+                transaction_id: metadata.transaction_id,
+                owner: metadata.owner,
+                database: metadata.database.get(),
+                prepared_at: metadata.prepared_at,
+                gid: metadata.gid.as_str(),
+            },
+            Some(records),
+        )
+    }
+
+    fn finish_stage(
+        &mut self,
+        transaction_id: u32,
+        lsn_floor: u64,
+        boundary: &WalOp<'_>,
+        mut captured_records: Option<&mut FixedBuf>,
+    ) -> Result<u64, SqlError> {
         let Some(index) = self.stage_index(transaction_id) else {
             return Ok(lsn_floor);
         };
@@ -1506,8 +1596,8 @@ impl Wal {
             .checked_add(record_count)
             .and_then(|lsn| lsn.checked_add(1))
             .ok_or_else(|| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "WAL LSN space exhausted"))?;
-        let commit_bytes = HEADER_LEN;
-        if self.buffer.capacity() - self.buffer.len() < staged_len + commit_bytes {
+        let boundary_bytes = HEADER_LEN + encoded_payload_len(boundary);
+        if self.buffer.capacity() - self.buffer.len() < staged_len + boundary_bytes {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "transaction exceeds wal_buffer_bytes ({}); raise it or commit in smaller batches",
@@ -1517,7 +1607,7 @@ impl Wal {
         if self
             .write_offset
             .checked_add(self.buffer.len() as u64)
-            .and_then(|used| used.checked_add((staged_len + commit_bytes) as u64))
+            .and_then(|used| used.checked_add((staged_len + boundary_bytes) as u64))
             .is_none_or(|used| used > self.capacity)
         {
             return Err(sql_err!(
@@ -1562,13 +1652,33 @@ impl Wal {
             offset += total;
         }
         assert_eq!(next_lsn + 1, final_lsn);
-        // The marker is appended only after every operation has been assigned
-        // its final LSN and checksum, so a torn tail can never look committed.
-        append_record(
-            &mut self.buffer,
-            final_lsn,
-            &WalOp::Commit { transaction_id },
-        )?;
+        if let Some(records) = captured_records.as_mut() {
+            records.clear();
+            let durable = self.buffer.readable();
+            let mut at = durable_mark;
+            while at < durable_mark + staged_len {
+                let payload_len =
+                    u32::from_le_bytes(durable[at + 4..at + 8].try_into().unwrap()) as usize;
+                let total = HEADER_LEN + payload_len;
+                let raw = &durable[at + 16..at + total];
+                let lsn = &durable[at + 8..at + 16];
+                if !records.append(lsn)
+                    || !records.append(&(raw.len() as u32).to_le_bytes())
+                    || !records.append(raw)
+                {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "prepared transaction exceeds wal_buffer_bytes ({})",
+                        records.capacity()
+                    ));
+                }
+                at += total;
+            }
+        }
+        // A transaction becomes replayable only when its typed terminal marker
+        // is present. Recovery retains prepare batches and applies commit
+        // batches; a torn prefix is neither.
+        append_record(&mut self.buffer, final_lsn, boundary)?;
         if staged_len > 0 && self.batch_first_lsn == 0 {
             self.batch_first_lsn = lsn_floor + 1;
             self.batch_start_offset = self.write_offset + durable_mark as u64;
@@ -1811,6 +1921,10 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetPolicy { .. } => KIND_SET_POLICY,
         WalOp::DropPolicy { .. } => KIND_DROP_POLICY,
         WalOp::Commit { .. } => KIND_COMMIT,
+        WalOp::PrepareTransaction { .. } => KIND_PREPARE_TRANSACTION,
+        WalOp::PreparedLocks { .. } => KIND_PREPARED_LOCKS,
+        WalOp::CommitPrepared { .. } => KIND_COMMIT_PREPARED,
+        WalOp::RollbackPrepared { .. } => KIND_ROLLBACK_PREPARED,
         WalOp::CreateReplicationSlot { .. } => KIND_CREATE_REPLICATION_SLOT,
         WalOp::DropReplicationSlot { .. } => KIND_DROP_REPLICATION_SLOT,
         WalOp::AdvanceReplicationSlot { .. } => KIND_ADVANCE_REPLICATION_SLOT,
@@ -2240,6 +2354,9 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
         } => 1 + schema.len() + 1 + table.len() + 1 + name.len(),
         WalOp::Commit { .. } => 4,
+        WalOp::PrepareTransaction { gid, .. } => 4 + 2 + 4 + 8 + 1 + gid.len(),
+        WalOp::PreparedLocks { encoded, .. } => 4 + 4 + encoded.len(),
+        WalOp::CommitPrepared { gid } | WalOp::RollbackPrepared { gid } => 1 + gid.len(),
         WalOp::CreateReplicationSlot { name, .. } => 1 + name.len() + 8 + 1,
         WalOp::AlterReplicationSlot { name, .. } => 1 + name.len() + 1,
         WalOp::DropReplicationSlot { name } => 1 + name.len(),
@@ -3600,6 +3717,29 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name) && name_bytes(buffer, new_name)
         }
         WalOp::Commit { transaction_id } => buffer.append(&transaction_id.to_le_bytes()),
+        WalOp::PrepareTransaction {
+            transaction_id,
+            owner,
+            database,
+            prepared_at,
+            gid,
+        } => {
+            buffer.append(&transaction_id.to_le_bytes())
+                && buffer.append(&owner.to_le_bytes())
+                && buffer.append(&database.to_le_bytes())
+                && buffer.append(&prepared_at.to_le_bytes())
+                && name_bytes(buffer, gid)
+        }
+        WalOp::PreparedLocks {
+            transaction_id,
+            encoded,
+        } => {
+            encoded.len() <= u32::MAX as usize
+                && buffer.append(&transaction_id.to_le_bytes())
+                && buffer.append(&(encoded.len() as u32).to_le_bytes())
+                && buffer.append(encoded)
+        }
+        WalOp::CommitPrepared { gid } | WalOp::RollbackPrepared { gid } => name_bytes(buffer, gid),
         WalOp::CreateReplicationSlot {
             name,
             restart_lsn,
@@ -6254,6 +6394,44 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_COMMIT => {
             let transaction_id = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
             (payload.len() == 4).then_some(WalOp::Commit { transaction_id })
+        }
+        KIND_PREPARE_TRANSACTION => {
+            let transaction_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let database = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let prepared_at = i64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let gid = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::PrepareTransaction {
+                transaction_id,
+                owner,
+                database,
+                prepared_at,
+                gid,
+            })
+        }
+        KIND_PREPARED_LOCKS => {
+            let transaction_id = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let length = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?) as usize;
+            at += 4;
+            let encoded = payload.get(at..at + length)?;
+            at += length;
+            (at == payload.len()).then_some(WalOp::PreparedLocks {
+                transaction_id,
+                encoded,
+            })
+        }
+        KIND_COMMIT_PREPARED => {
+            let gid = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::CommitPrepared { gid })
+        }
+        KIND_ROLLBACK_PREPARED => {
+            let gid = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RollbackPrepared { gid })
         }
         KIND_CREATE_REPLICATION_SLOT => {
             let name = take_name(&mut at)?;
@@ -9255,11 +9433,13 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(3, &WalOp::Commit { transaction_id: 1 })
+                .unwrap();
             wal.commit();
         }
         let mut replay_budget = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut replay_budget).unwrap();
-        let seen = collect_replay(&mut wal);
+        let seen = collect_replay_operations(&mut wal, 0);
         assert_eq!(seen.len(), 2, "{seen:?}");
         assert!(seen[0].contains("SetRoleSetting"), "{}", seen[0]);
         assert!(seen[1].contains("SetColumnAcl"), "{}", seen[1]);
@@ -9512,11 +9692,19 @@ mod tests {
     fn collect_replay_from(wal: &mut Wal, floor: u64) -> Vec<String> {
         let mut seen = Vec::new();
         wal.replay(floor, |lsn, record| {
-            seen.push(format!("{lsn}:{:?}", decode_record(record).unwrap()));
+            let operation = decode_record(record).unwrap();
+            seen.push(format!("{lsn}:{operation:?}"));
             Ok(())
         })
         .unwrap();
         seen
+    }
+
+    fn collect_replay_operations(wal: &mut Wal, floor: u64) -> Vec<String> {
+        collect_replay_from(wal, floor)
+            .into_iter()
+            .filter(|record| !record.contains(":Commit {"))
+            .collect()
     }
 
     #[test]
@@ -10201,11 +10389,13 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(25, &WalOp::Commit { transaction_id: 1 })
+                .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
-        let seen = collect_replay(&mut wal);
+        let seen = collect_replay_operations(&mut wal, 0);
         assert_eq!(seen.len(), 24);
         assert!(seen[0].starts_with("1:CreateTable"));
         // Constraints survive the encode/replay round-trip.
@@ -10295,16 +10485,18 @@ mod tests {
             "enum identity: {}",
             seen[23]
         );
-        assert_eq!(wal.last_lsn(), 24);
+        assert_eq!(wal.last_lsn(), 25);
         // Appending continues after the replayed tail.
         wal.append_committed(
-            25,
+            26,
             &WalOp::DropTable {
                 schema: "public",
                 name: "u",
             },
         )
         .unwrap();
+        wal.append_committed(27, &WalOp::Commit { transaction_id: 2 })
+            .unwrap();
         wal.commit();
     }
 
@@ -10328,18 +10520,24 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(2, &WalOp::Commit { transaction_id: 1 })
+                .unwrap();
             wal.commit();
         }
         let mut replay_budget = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut replay_budget).unwrap();
         let mut seen = false;
         wal.replay(0, |lsn, record| {
+            let operation = decode_record(record).unwrap();
+            if matches!(operation, WalOp::Commit { .. }) {
+                return Ok(());
+            }
             let WalOp::BeginTableRewrite {
                 previous_schema,
                 previous_name,
                 preserve_rows,
                 column_mapping,
-            } = decode_record(record).unwrap()
+            } = operation
             else {
                 panic!("expected table rewrite");
             };
@@ -10632,13 +10830,26 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_record_truncates_tail() {
+    fn corrupt_record_discards_its_transaction_without_hiding_a_prior_commit() {
         let dir = temp_dir("corrupt");
         let config = test_config(&dir);
         let mut budget = Budget::new(1 << 20);
         {
             let mut wal = Wal::open(&config, &mut budget).unwrap();
-            for lsn in 1..=3 {
+            wal.append_committed(
+                1,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "t",
+                    rowid: 1,
+                    old_row: None,
+                    command_id: 0,
+                },
+            )
+            .unwrap();
+            wal.append_committed(2, &WalOp::Commit { transaction_id: 1 })
+                .unwrap();
+            for lsn in 3..=5 {
                 wal.append_committed(
                     lsn,
                     &WalOp::Delete {
@@ -10651,9 +10862,11 @@ mod tests {
                 )
                 .unwrap();
             }
+            wal.append_committed(6, &WalOp::Commit { transaction_id: 2 })
+                .unwrap();
             wal.commit();
         }
-        // Flip one byte in the second record's payload.
+        // Flip one byte in the second transaction's second record.
         let path = format!("{dir}/journal.wal");
         let mut bytes = std::fs::read(&path).unwrap();
         let record_len = HEADER_LEN
@@ -10664,16 +10877,17 @@ mod tests {
                 old_row: None,
                 command_id: 0,
             });
-        bytes[record_len + HEADER_LEN] ^= 0xff;
+        let commit_len = HEADER_LEN + encoded_payload_len(&WalOp::Commit { transaction_id: 1 });
+        bytes[record_len + commit_len + record_len + HEADER_LEN] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
 
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
-        let seen = collect_replay(&mut wal);
+        let seen = collect_replay_operations(&mut wal, 0);
         assert_eq!(
             seen.len(),
             1,
-            "only the record before the corruption survives"
+            "the prior commit survives and the corrupt transaction is atomic"
         );
     }
 
@@ -10697,14 +10911,16 @@ mod tests {
                 )
                 .unwrap();
             }
+            wal.append_committed(6, &WalOp::Commit { transaction_id: 1 })
+                .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
-        let seen = collect_replay_from(&mut wal, 3);
+        let seen = collect_replay_operations(&mut wal, 3);
         assert_eq!(seen.len(), 2, "only records above the floor apply");
         assert!(seen[0].starts_with("4:"));
-        assert_eq!(wal.last_lsn(), 5, "scan still tracks the true tail");
+        assert_eq!(wal.last_lsn(), 6, "scan still tracks the true tail");
     }
 
     #[test]
@@ -10727,20 +10943,11 @@ mod tests {
                 )
                 .unwrap();
             }
+            wal.append_committed(11, &WalOp::Commit { transaction_id: 1 })
+                .unwrap();
             wal.commit();
-            // Checkpoint at lsn 10; journal restarts with two tail records.
+            // Checkpoint at lsn 11; journal restarts with two tail records.
             wal.reset_after_checkpoint();
-            wal.append_committed(
-                11,
-                &WalOp::Delete {
-                    schema: "public",
-                    table: "t",
-                    rowid: 11,
-                    old_row: None,
-                    command_id: 0,
-                },
-            )
-            .unwrap();
             wal.append_committed(
                 12,
                 &WalOp::Delete {
@@ -10752,16 +10959,29 @@ mod tests {
                 },
             )
             .unwrap();
+            wal.append_committed(
+                13,
+                &WalOp::Delete {
+                    schema: "public",
+                    table: "t",
+                    rowid: 13,
+                    old_row: None,
+                    command_id: 0,
+                },
+            )
+            .unwrap();
+            wal.append_committed(14, &WalOp::Commit { transaction_id: 2 })
+                .unwrap();
             wal.commit();
         }
         let mut budget2 = Budget::new(1 << 20);
         let mut wal = Wal::open(&config, &mut budget2).unwrap();
-        // The checkpoint says floor = 10; stale records 3..10 still sit in
+        // The checkpoint says floor = 11; stale records 4..11 still sit in
         // the file beyond the new tail but must not replay.
-        let seen = collect_replay_from(&mut wal, 10);
+        let seen = collect_replay_operations(&mut wal, 11);
         assert_eq!(seen.len(), 2);
-        assert!(seen[0].starts_with("11:"));
-        assert!(seen[1].starts_with("12:"));
+        assert!(seen[0].starts_with("12:"));
+        assert!(seen[1].starts_with("13:"));
     }
 
     #[test]

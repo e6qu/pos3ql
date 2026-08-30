@@ -4061,6 +4061,68 @@ def test_event_trigger_introspection_extended_wire_contract():
     s.close()
 
 
+def test_two_phase_transactions_extended_wire_contract():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+
+    def execute(text):
+        parse = frontend_message(b"P", b"\x00" + text.encode() + b"\x00\x00\x00")
+        bind = frontend_message(b"B", b"\x00\x00" + struct.pack("!hhh", 0, 0, 0))
+        run = frontend_message(b"E", b"\x00\x00\x00\x00\x00")
+        s.sendall(parse + bind + run + frontend_message(b"S"))
+        messages = []
+        while True:
+            item = read_message(s)
+            messages.append(item)
+            if item[0] == b"Z":
+                return messages
+
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_two_phase (id integer PRIMARY KEY, value text); "
+        "INSERT INTO wire_two_phase VALUES (1, 'before')",
+    )
+    begin = execute("BEGIN")
+    changed = execute("UPDATE wire_two_phase SET value = 'after' WHERE id = 1")
+    prepared = execute("PREPARE TRANSACTION 'wire-two-phase'")
+    check(
+        "two-phase wire: extended PREPARE detaches the transaction",
+        not any(kind == b"E" for messages in (setup, begin, changed, prepared) for kind, _ in messages)
+        and next((payload for kind, payload in prepared if kind == b"C"), None)
+        == b"PREPARE TRANSACTION\x00"
+        and prepared[-1] == (b"Z", b"I"),
+        setup + begin + changed + prepared,
+    )
+
+    catalog = extended_binary_result(s, "SELECT transaction FROM pg_prepared_xacts")
+    description = next((payload for kind, payload in catalog if kind == b"T"), None)
+    row = next((payload for kind, payload in catalog if kind == b"D"), None)
+    check(
+        "two-phase wire: pg_prepared_xacts exposes binary xid identity",
+        description is not None
+        and row_description_type_oids(description) == [28]
+        and row_description_formats(description) == [1]
+        and row is not None
+        and len(row) == 10
+        and row[:6] == b"\x00\x01\x00\x00\x00\x04",
+        catalog,
+    )
+    hidden = simple_query(s, "SELECT value FROM wire_two_phase WHERE id = 1")
+    committed = execute("COMMIT PREPARED 'wire-two-phase'")
+    visible = simple_query(s, "SELECT value FROM wire_two_phase WHERE id = 1")
+    check(
+        "two-phase wire: extended COMMIT PREPARED publishes retained work",
+        first_text_row(hidden) == "before"
+        and not any(kind == b"E" for kind, _ in committed)
+        and next((payload for kind, payload in committed if kind == b"C"), None)
+        == b"COMMIT PREPARED\x00"
+        and first_text_row(visible) == "after",
+        hidden + committed + visible,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

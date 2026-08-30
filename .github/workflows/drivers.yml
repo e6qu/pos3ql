@@ -37,6 +37,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Enable PostgreSQL prepared transactions
+        run: |
+          postgres_container=$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -n 1)
+          test -n "$postgres_container"
+          docker exec "$postgres_container" psql -U postgres -X -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET max_prepared_transactions = 8"
+          docker restart "$postgres_container"
+          for _ in $(seq 1 50); do
+            pg_isready -h 127.0.0.1 -p 5432 -U postgres >/dev/null 2>&1 && exit 0
+            sleep 0.1
+          done
+          exit 1
+
       - name: Verify runner PostgreSQL client
         run: |
           command -v psql

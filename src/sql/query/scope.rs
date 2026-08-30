@@ -441,6 +441,9 @@ impl<'d> QueryScope<'d> {
             && (tref.cte.is_some()
                 || tref.is_function_source()
                 || tref.subquery.is_some()
+                || storage
+                    .sequence_on_path(tref.schema, tref.table, txid)
+                    .is_some()
                 || matches!(
                     storage.resolve_relation(tref.schema, tref.table, txid),
                     Some(crate::storage::ResolvedRelation::Catalog)
@@ -463,6 +466,9 @@ impl<'d> QueryScope<'d> {
                 Some(crate::storage::ResolvedRelation::Catalog)
             ) {
                 return self.add_catalog(storage, tref, txid, arena, true);
+            }
+            if let Some(slot) = storage.sequence_on_path(tref.schema, tref.table, txid) {
+                return self.add_sequence(storage, tref, slot, txid, arena, true);
             }
             return self.add(storage, tref, txid, arena);
         };
@@ -614,6 +620,9 @@ impl<'d> QueryScope<'d> {
             && (tref.cte.is_some()
                 || tref.is_function_source()
                 || tref.subquery.is_some()
+                || storage
+                    .sequence_on_path(tref.schema, tref.table, txid)
+                    .is_some()
                 || matches!(
                     storage.resolve_relation(tref.schema, tref.table, txid),
                     Some(crate::storage::ResolvedRelation::Catalog)
@@ -636,6 +645,9 @@ impl<'d> QueryScope<'d> {
                 Some(crate::storage::ResolvedRelation::Catalog)
             ) {
                 return self.add_catalog(storage, tref, txid, arena, false);
+            }
+            if let Some(slot) = storage.sequence_on_path(tref.schema, tref.table, txid) {
+                return self.add_sequence(storage, tref, slot, txid, arena, false);
             }
             return self.add(storage, tref, txid, arena);
         };
@@ -727,6 +739,111 @@ impl<'d> QueryScope<'d> {
         };
         self.names[self.n] = exposed;
         self.defs[self.n] = Some(def_reference);
+        self.derived[self.n] = Some(rows);
+        self.slots[self.n] = usize::MAX;
+        self.n += 1;
+        Ok(())
+    }
+
+    /// Registers PostgreSQL's single-row sequence relation. Sequence values
+    /// remain storage-owned; the derived row is only a bounded query image.
+    fn add_sequence<'a>(
+        &mut self,
+        storage: &Storage,
+        tref: &'a TableRef<'a>,
+        slot: usize,
+        txid: u32,
+        arena: &'a Arena,
+        materialize: bool,
+    ) -> Result<(), SqlError>
+    where
+        'a: 'd,
+    {
+        let sequence = storage.sequence_for(slot, txid);
+        let exposed = tref.alias.unwrap_or(tref.table);
+        if self.names[..self.n].contains(&exposed) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_ALIAS,
+                "table name \"{}\" specified more than once",
+                exposed
+            ));
+        }
+        if let Some(aliases) = tref.col_alias
+            && aliases.len() > 3
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_COLUMN_REFERENCE,
+                "table \"{}\" has 3 columns available but {} columns specified",
+                exposed,
+                aliases.len()
+            ));
+        }
+        let default_names = ["last_value", "log_cnt", "is_called"];
+        let types = [ColType::Int8, ColType::Int8, ColType::Bool];
+        let mut columns = [ColumnMeta::EMPTY; MAX_COLUMNS];
+        for index in 0..3 {
+            columns[index] = ColumnMeta {
+                name: SqlName::parse(
+                    tref.col_alias
+                        .and_then(|aliases| aliases.get(index).copied())
+                        .unwrap_or(default_names[index]),
+                )?,
+                ctype: types[index],
+                ..ColumnMeta::EMPTY
+            };
+        }
+        let definition = arena
+            .alloc(TableDef {
+                schema: sequence.schema,
+                name: sequence.name,
+                columns,
+                n_columns: 3,
+                ..TableDef::empty()
+            })
+            .map_err(|_| arena_full())?;
+        let rows: &'a [&'a [u8]] = if materialize {
+            let role = storage.current_role_slot(txid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                )
+            })?;
+            storage.require_schema_usage_as(sequence.schema.as_str(), role, txid)?;
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Sequence,
+                slot: u16::try_from(slot).map_err(|_| {
+                    sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many sequences")
+                })?,
+            };
+            if !storage.has_object_privilege(
+                object,
+                role,
+                crate::storage::PrivilegeSet::SELECT,
+                txid,
+            ) {
+                return Err(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for sequence {}",
+                    sequence.name.as_str()
+                ));
+            }
+            let (last_value, is_called) = storage.sequence_value_for(slot, txid);
+            let encoded = crate::sql::exec::encode_projected_pub(
+                &[
+                    Datum::Int8(last_value),
+                    Datum::Int8(storage.sequence_log_count_for(slot, txid)),
+                    Datum::Bool(is_called),
+                ],
+                arena,
+            )?;
+            arena
+                .alloc_slice_with(1, |_| encoded)
+                .map_err(|_| arena_full())?
+        } else {
+            &[]
+        };
+        self.names[self.n] = exposed;
+        self.defs[self.n] = Some(&*definition);
         self.derived[self.n] = Some(rows);
         self.slots[self.n] = usize::MAX;
         self.n += 1;

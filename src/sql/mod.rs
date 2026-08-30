@@ -31,6 +31,7 @@ pub mod sequence;
 pub mod sha512;
 pub mod timezone;
 pub mod to_char;
+pub(crate) mod two_phase;
 pub mod txn;
 pub mod types;
 pub mod tzif;
@@ -190,6 +191,9 @@ pub struct Engine {
     /// statement. This is the `work_mem` analogue.
     work: Arena,
     next_txid: u32,
+    max_connections: u32,
+    max_prepared_transactions: usize,
+    prepared_transactions: two_phase::PreparedTransactions,
     /// LISTEN/NOTIFY registry and delivery outbox, shared across every
     /// connection (see [`notify`]).
     notify: notify::NotifyState,
@@ -299,6 +303,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Begin(_)
         | Stmt::Commit
         | Stmt::Rollback
+        | Stmt::PrepareTransaction(_)
         | Stmt::Savepoint(_)
         | Stmt::ReleaseSavepoint(_)
         | Stmt::RollbackToSavepoint(_)
@@ -435,7 +440,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DropTablespace { .. }
         | Stmt::CreateDatabase { .. }
         | Stmt::AlterDatabase { .. }
-        | Stmt::DropDatabase { .. } => true,
+        | Stmt::DropDatabase { .. }
+        | Stmt::CommitPrepared(_)
+        | Stmt::RollbackPrepared(_) => true,
     }
 }
 
@@ -1153,6 +1160,8 @@ fn top_level_only_command(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::Vacuum { .. } => Some("VACUUM"),
         Stmt::AlterSystem { .. } => Some("ALTER SYSTEM"),
         Stmt::Discard(ast::DiscardTarget::All) => Some("DISCARD ALL"),
+        Stmt::CommitPrepared(_) => Some("COMMIT PREPARED"),
+        Stmt::RollbackPrepared(_) => Some("ROLLBACK PREPARED"),
         Stmt::CreateDatabase { .. } => Some("CREATE DATABASE"),
         Stmt::DropDatabase { .. } => Some("DROP DATABASE"),
         Stmt::CreateTablespace { .. } => Some("CREATE TABLESPACE"),
@@ -2392,6 +2401,7 @@ impl Engine {
             + config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes)
             + config.max_connections as usize * config.wal_buffer_bytes
             + config.max_connections as usize * size_of::<(i32, u64)>()
+            + two_phase::PreparedTransactions::budget_bytes(config)
             + if config.object_store_on {
                 // The checkpointer's fixed parts plus the spilled-row reader's
                 // two scratch sets.
@@ -2424,7 +2434,20 @@ impl Engine {
             Some(c) => c.load_into(&mut storage)?,
             None => 0,
         };
+        let replay_floor = storage
+            .prepared_transaction_catalog()
+            .iter()
+            .map(|prepared| prepared.first_lsn.saturating_sub(1))
+            .min()
+            .unwrap_or(floor)
+            .min(floor);
+        let expected_prepared: Vec<crate::util::StackStr<199>> = storage
+            .prepared_transaction_catalog()
+            .iter()
+            .map(|prepared| prepared.gid)
+            .collect();
         let mut wal = Wal::open(config, budget)?;
+        let mut prepared_transactions = two_phase::PreparedTransactions::new(config, budget)?;
         // Recovery merges two partial sources by LSN and applies the merge in
         // order. Neither source alone spans the committed history past the
         // manifest floor: the journal may restart mid-history (a disk wipe
@@ -2436,36 +2459,43 @@ impl Engine {
         // copies of one record are the same bytes, so either wins.
         let mut recovered: std::collections::BTreeMap<u64, Vec<u8>> =
             std::collections::BTreeMap::new();
-        let mut journal_tip = floor;
-        wal.replay(floor, |lsn, record| {
+        let mut journal_tip = replay_floor;
+        wal.replay(replay_floor, |lsn, record| {
             journal_tip = journal_tip.max(lsn);
             recovered.insert(lsn, record.to_vec());
             Ok(())
         })?;
         // RPO=0: merge any commit batches in the bucket newer than what the
         // local journal (possibly empty after disk loss) already covered.
-        let mut segment_tip = floor;
+        let mut segment_tip = replay_floor;
         if let Some(c) = ckpt.as_mut() {
-            c.replay_commit_batches(floor, |lsn, record| {
+            c.replay_commit_batches(replay_floor, |lsn, record| {
                 segment_tip = segment_tip.max(lsn);
                 recovered.entry(lsn).or_insert_with(|| record.to_vec());
                 Ok(())
             })
             .map_err(EngineSetupError::Checkpoint)?;
         }
-        for (lsn, record) in &recovered {
-            let operator =
-                crate::wal::decode_record(record).ok_or(EngineSetupError::Storage(SqlError {
-                    sqlstate: SqlState::known(sqlstate::INTERNAL_ERROR),
-                    message: stack_format!(
-                        192,
-                        "corrupt uploaded WAL record at LSN {} (kind {})",
-                        lsn,
-                        record.first().copied().unwrap_or_default()
+        replay_transaction_batches(&mut storage, &mut prepared_transactions, &recovered, floor)?;
+        for expected in expected_prepared {
+            let gid = ast::PreparedTransactionId::parse(expected.as_str()).ok_or({
+                EngineSetupError::Checkpoint(crate::checkpoint::CheckpointSetupError::Corrupt(
+                    "manifest prepared transaction identifier is invalid",
+                ))
+            })?;
+            if prepared_transactions.find(gid).is_none() {
+                return Err(EngineSetupError::Checkpoint(
+                    crate::checkpoint::CheckpointSetupError::Corrupt(
+                        "manifest prepared transaction has no retained commit batch",
                     ),
-                }))?;
-            apply_wal_op(&mut storage, *lsn, operator)?;
+                ));
+            }
         }
+        let recovered_transaction_id = prepared_transactions
+            .entries()
+            .map(|(_, metadata)| metadata.transaction_id)
+            .max()
+            .unwrap_or(0);
         // WAL carries catalog identities as names where runtime slots are not
         // durable. Rebind each recovered database only after every replayed
         // definition exists.
@@ -2553,7 +2583,10 @@ impl Engine {
                     * config.table_rows,
             )?,
             work: Arena::new(budget, "work_arena", config.work_arena_bytes)?,
-            next_txid: 0,
+            next_txid: recovered_transaction_id,
+            max_connections: config.max_connections,
+            max_prepared_transactions: config.max_prepared_transactions,
+            prepared_transactions,
             notify: notify::NotifyState::new(
                 budget,
                 config.max_connections as usize * notify::CHANNELS_PER_CONN,
@@ -3525,9 +3558,19 @@ impl Engine {
         txn.failed = false;
     }
 
-    /// Commits: journals every touched row, fsyncs once, then promotes the
-    /// in-memory images. On failure the transaction rolls back entirely.
     pub fn commit_txn(&mut self, txn: &mut TxnState, guc: &GucState) -> Result<(), SqlError> {
+        self.finish_txn(txn, guc, None)
+    }
+
+    /// Journals every final transaction image and either commits it or leaves
+    /// its typed batch prepared. Only an ordinary commit promotes the
+    /// transaction-owned storage overlays here.
+    fn finish_txn(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+        prepared_slot: Option<usize>,
+    ) -> Result<(), SqlError> {
         // The next statement starts a fresh transaction clock.
         datetime::end_transaction();
         if !txn.is_active() {
@@ -3556,10 +3599,12 @@ impl Engine {
         // This transaction no longer needs its historical view. Release it
         // before promotion so only other live snapshots cause old row images
         // to be retained.
-        self.storage.release_snapshot(txn.txid);
-        self.storage.release_serializable(txn.txid);
-        self.storage.release_table_locks(txn.txid);
-        self.storage.release_row_locks(txn.txid);
+        if prepared_slot.is_none() {
+            self.storage.release_snapshot(txn.txid);
+            self.storage.release_serializable(txn.txid);
+            self.storage.release_table_locks(txn.txid);
+            self.storage.release_row_locks(txn.txid);
+        }
         for event_index in 0..txn.truncates().len() {
             let event = txn.truncates()[event_index];
             let transaction_id = txn.txid;
@@ -4220,18 +4265,33 @@ impl Engine {
         // A full preceding batch is published before adding this transaction;
         // therefore a single transaction is the largest unpublishable unit.
         let (_, staged_bytes) = self.wal.stage_stats(txn.txid);
+        let boundary_bytes =
+            prepared_slot.map_or_else(crate::wal::Wal::commit_boundary_bytes, |slot| {
+                crate::wal::Wal::prepare_boundary_bytes(
+                    self.prepared_transactions.slot(slot).metadata(),
+                )
+            });
         let next_batch_bytes = self
             .wal
             .pending_batch_bytes()
             .saturating_add(staged_bytes)
-            .saturating_add(crate::wal::HEADER_LEN as u64);
+            .saturating_add(boundary_bytes as u64);
         if next_batch_bytes > self.wal_seg_buf.capacity() as u64
             && let Err(error) = self.commit_wal()
         {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
-        let commit_lsn = match self.wal.commit_stage(txn.txid, self.storage.lsn()) {
+        let finish_result = match prepared_slot {
+            Some(slot) => {
+                let metadata = self.prepared_transactions.slot(slot).metadata();
+                let records = &mut self.prepared_transactions.slot_mut(slot).records;
+                self.wal
+                    .prepare_stage(metadata, self.storage.lsn(), records)
+            }
+            None => self.wal.commit_stage(txn.txid, self.storage.lsn()),
+        };
+        let commit_lsn = match finish_result {
             Ok(lsn) => lsn,
             Err(error) => {
                 self.rollback_txn(txn, guc);
@@ -4270,6 +4330,22 @@ impl Engine {
         // successful response until that barrier has published the immutable
         // batch to object storage.
         self.wal.commit();
+        if prepared_slot.is_some() {
+            guc.commit_transaction();
+            return Ok(());
+        }
+        self.promote_transaction_state(txn, commit_lsn, Some(guc))
+    }
+
+    /// Promotes an already-durable transaction's live overlays. Ordinary
+    /// COMMIT and COMMIT PREPARED share this transition rather than rebuilding
+    /// in-memory state from the journal.
+    fn promote_transaction_state(
+        &mut self,
+        txn: &mut TxnState,
+        commit_lsn: u64,
+        guc: Option<&GucState>,
+    ) -> Result<(), SqlError> {
         let mut altered_tables = [(usize::MAX, false); txn::MAX_TXN_DDL];
         let mut altered_count = 0usize;
         let mut index_tables = [usize::MAX; txn::MAX_TXN_DDL];
@@ -4691,7 +4767,9 @@ impl Engine {
         // a loud error reported to the client — like a post-commit upload
         // failure, the data is committed regardless — never a silent drop.
         let notify_result = self.flush_committed_notifications(txn);
-        guc.commit_transaction();
+        if let Some(guc) = guc {
+            guc.commit_transaction();
+        }
         txn.clear();
         notify_result.and(index_result)
     }
@@ -4711,6 +4789,248 @@ impl Engine {
             exec::TriggerQueueBoundary::Transaction,
         )?;
         self.commit_txn(txn, guc)
+    }
+
+    fn refresh_prepared_transaction_catalog(&mut self) {
+        self.storage.replace_prepared_transaction_catalog(
+            self.prepared_transactions.entries().map(|(_, metadata)| {
+                crate::storage::PreparedTransactionCatalogEntry {
+                    transaction_id: metadata.transaction_id,
+                    gid: crate::util::StackStr::from_str(metadata.gid.as_str()),
+                    prepared_at: metadata.prepared_at,
+                    owner: metadata.owner,
+                    database: metadata.database,
+                    first_lsn: metadata.first_lsn,
+                    prepared_lsn: metadata.prepared_lsn,
+                }
+            }),
+        );
+    }
+
+    fn prepare_transaction(
+        &mut self,
+        gid: ast::PreparedTransactionId,
+        txn: &mut TxnState,
+        guc: &GucState,
+        cursors: &mut cursor::CursorPool,
+        arena: &Arena,
+        responder: &mut Responder,
+    ) -> Result<(), SqlError> {
+        let fail =
+            |engine: &mut Self, txn: &mut TxnState, cursors: &mut cursor::CursorPool, error| {
+                if txn.is_explicit() {
+                    engine.rollback_txn(txn, guc);
+                    cursors.on_rollback();
+                }
+                error
+            };
+        if !txn.is_explicit() {
+            return Err(sql_err!(
+                sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                "PREPARE TRANSACTION can only be used in transaction blocks"
+            ));
+        }
+        if txn.failed {
+            return Err(fail(
+                self,
+                txn,
+                cursors,
+                sql_err!(
+                    sqlstate::IN_FAILED_SQL_TRANSACTION,
+                    "current transaction is aborted, commands ignored until end of transaction block"
+                ),
+            ));
+        }
+        if self.prepared_transactions.find(gid).is_some() {
+            return Err(fail(
+                self,
+                txn,
+                cursors,
+                sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "transaction identifier \"{}\" is already in use",
+                    gid.as_str()
+                ),
+            ));
+        }
+        if txn.has_session_notification_actions() {
+            return Err(fail(
+                self,
+                txn,
+                cursors,
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot PREPARE a transaction that has executed LISTEN, UNLISTEN, or NOTIFY"
+                ),
+            ));
+        }
+        if cursors.has_uncommitted_hold_cursor() {
+            return Err(fail(
+                self,
+                txn,
+                cursors,
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot PREPARE a transaction that has created a cursor WITH HOLD"
+                ),
+            ));
+        }
+        let current = eval::funcs::system::current_user_owned();
+        let owner = self
+            .storage
+            .find_role_visible(current.as_str(), txn.txid)
+            .expect("the current role is transaction-visible") as u16;
+        let metadata = two_phase::PreparedTransactionMetadata {
+            gid,
+            transaction_id: txn.txid,
+            owner,
+            database: self.storage.current_database_oid(),
+            prepared_at: datetime::now_micros(),
+            first_lsn: 0,
+            prepared_lsn: 0,
+        };
+        let Some(slot) = self.prepared_transactions.reserve(metadata) else {
+            return Err(fail(
+                self,
+                txn,
+                cursors,
+                sql_err!(
+                    sqlstate::OUT_OF_MEMORY,
+                    "maximum number of prepared transactions reached"
+                ),
+            ));
+        };
+        if let Err(error) = self.fire_constraint_trigger_boundary(
+            txn,
+            guc,
+            arena,
+            responder,
+            exec::TriggerQueueBoundary::Transaction,
+        ) {
+            self.prepared_transactions.release(slot);
+            return Err(fail(self, txn, cursors, error));
+        }
+        if let Err(error) = self.storage.encode_transaction_locks(
+            txn.txid,
+            &mut self.prepared_transactions.slot_mut(slot).locks,
+        ) {
+            self.prepared_transactions.release(slot);
+            return Err(fail(self, txn, cursors, error));
+        }
+        let lock_lsn = self.storage.lsn() + 1;
+        let lock_record = WalOp::PreparedLocks {
+            transaction_id: txn.txid,
+            encoded: self.prepared_transactions.slot(slot).locks.readable(),
+        };
+        if let Err(error) = self.wal.stage(txn.txid, lock_lsn, &lock_record) {
+            self.prepared_transactions.release(slot);
+            return Err(fail(self, txn, cursors, error));
+        }
+        self.storage.set_lsn(lock_lsn);
+        if let Err(error) = self.finish_txn(txn, guc, Some(slot)) {
+            self.prepared_transactions.release(slot);
+            return Err(error);
+        }
+        let prepared_lsn = self.storage.lsn();
+        let first_lsn = self
+            .prepared_transactions
+            .slot(slot)
+            .first_lsn()
+            .expect("a prepared transaction has a database-scope WAL record");
+        self.prepared_transactions
+            .set_lsn_range(slot, first_lsn, prepared_lsn);
+        core::mem::swap(
+            txn,
+            &mut self.prepared_transactions.slot_mut(slot).transaction,
+        );
+        txn.clear();
+        cursors.on_rollback();
+        Ok(())
+    }
+
+    fn resolve_prepared_transaction(
+        &mut self,
+        gid: ast::PreparedTransactionId,
+        commit: bool,
+        txn: &mut TxnState,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
+        let Some(slot) = self.prepared_transactions.find(gid) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "prepared transaction with identifier \"{}\" does not exist",
+                gid.as_str()
+            ));
+        };
+        let metadata = self.prepared_transactions.slot(slot).metadata();
+        let recovered = self.prepared_transactions.slot(slot).recovered;
+        if metadata.database != self.storage.current_database_oid() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "prepared transaction belongs to another database"
+            ));
+        }
+        let current = eval::funcs::system::current_user_owned();
+        let current_role = self
+            .storage
+            .find_role_visible(current.as_str(), txn.txid)
+            .expect("the current role is transaction-visible");
+        if current_role != usize::from(metadata.owner)
+            && !self
+                .storage
+                .role(current_role)
+                .attributes_to(txn.txid)
+                .superuser
+        {
+            return Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to finish prepared transaction"
+            ));
+        }
+
+        let lsn = self.storage.lsn() + 1;
+        let operation = if commit {
+            WalOp::CommitPrepared { gid: gid.as_str() }
+        } else {
+            WalOp::RollbackPrepared { gid: gid.as_str() }
+        };
+        self.wal.stage(txn.txid, lsn, &operation)?;
+        self.storage.set_lsn(lsn);
+        self.commit_txn(txn, guc)?;
+        let resolution_lsn = self.storage.lsn();
+
+        // The resolution record is durable before the detached transaction is
+        // released. Recovery therefore reaches the same outcome if the process
+        // stops anywhere in the in-memory promotion below.
+        core::mem::swap(
+            txn,
+            &mut self.prepared_transactions.slot_mut(slot).transaction,
+        );
+        let result = if commit && recovered {
+            self.rollback_transaction_state(txn);
+            self.prepared_transactions
+                .slot(slot)
+                .visit_records(|_, raw| {
+                    let operation = crate::wal::decode_record(raw).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "prepared transaction WAL is corrupt"
+                        )
+                    })?;
+                    apply_wal_op(&mut self.storage, resolution_lsn, operation)
+                })
+        } else if commit {
+            self.storage.release_snapshot(txn.txid);
+            self.storage.release_serializable(txn.txid);
+            self.storage.release_table_locks(txn.txid);
+            self.storage.release_row_locks(txn.txid);
+            self.promote_transaction_state(txn, resolution_lsn, None)
+        } else {
+            self.rollback_transaction_state(txn);
+            Ok(())
+        };
+        self.prepared_transactions.release(slot);
+        result
     }
 
     fn fire_constraint_trigger_boundary(
@@ -5064,11 +5384,8 @@ impl Engine {
 
     /// Discards every uncommitted change and journal byte of the
     /// transaction.
-    pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
-        // The next statement starts a fresh transaction clock.
-        datetime::end_transaction();
+    fn rollback_transaction_state(&mut self, txn: &mut TxnState) {
         if txn.txid == 0 {
-            guc.rollback_transaction();
             txn.clear();
             return;
         }
@@ -5096,8 +5413,19 @@ impl Engine {
             }
         }
         self.wal.discard_stage(txn.txid);
-        guc.rollback_transaction();
         txn.clear();
+    }
+
+    pub fn rollback_txn(&mut self, txn: &mut TxnState, guc: &GucState) {
+        // The next statement starts a fresh transaction clock.
+        datetime::end_transaction();
+        if txn.txid == 0 {
+            guc.rollback_transaction();
+            txn.clear();
+            return;
+        }
+        self.rollback_transaction_state(txn);
+        guc.rollback_transaction();
     }
 
     /// A deadlock victim releases pending versions and locks immediately,
@@ -5435,6 +5763,7 @@ impl Engine {
         if self.post_publish_cleanup.is_some() {
             self.finish_post_publish_cleanup()?;
         }
+        self.refresh_prepared_transaction_catalog();
         let Some(ckpt) = self.ckpt.as_mut() else {
             return Err(SqlError {
                 sqlstate: SqlState::known(sqlstate::FEATURE_NOT_SUPPORTED),
@@ -5480,7 +5809,14 @@ impl Engine {
                     .storage
                     .oldest_replication_restart_lsn()
                     .unwrap_or(lsn)
-                    .min(lsn);
+                    .min(lsn)
+                    .min(
+                        self.prepared_transactions
+                            .entries()
+                            .map(|(_, metadata)| metadata.first_lsn.saturating_sub(1))
+                            .min()
+                            .unwrap_or(lsn),
+                    );
                 ckpt.prune_commit_batches(retain_through)?;
             }
             // A sliced checkpoint can publish a snapshot while later
@@ -10112,6 +10448,7 @@ impl Engine {
         if reset_workspace {
             self.work.reset();
         }
+        self.refresh_prepared_transaction_catalog();
         // Drop any diagnostic detail a swallowed error left behind, and
         // install this session's effective search path for the statement:
         // every name resolution below reads it from storage.
@@ -10228,7 +10565,10 @@ impl Engine {
         if txn.failed
             && !matches!(
                 statement,
-                Stmt::Commit | Stmt::Rollback | Stmt::RollbackToSavepoint(_)
+                Stmt::Commit
+                    | Stmt::Rollback
+                    | Stmt::RollbackToSavepoint(_)
+                    | Stmt::PrepareTransaction(_)
             )
         {
             return Ok(Err(SqlError {
@@ -10281,6 +10621,9 @@ impl Engine {
             Stmt::Begin(_)
                 | Stmt::Commit
                 | Stmt::Rollback
+                | Stmt::PrepareTransaction(_)
+                | Stmt::CommitPrepared(_)
+                | Stmt::RollbackPrepared(_)
                 | Stmt::Savepoint(_)
                 | Stmt::ReleaseSavepoint(_)
                 | Stmt::RollbackToSavepoint(_)
@@ -11184,6 +11527,7 @@ impl Engine {
                     options,
                     set_schema: *set_schema,
                 },
+                guc.seq_session(),
                 responder,
             ),
             Stmt::DropSequence {
@@ -11997,6 +12341,35 @@ impl Engine {
                 // Later statements in this message get a fresh implicit txn.
                 // Freeze this statement's clock before anything anchors a
                 // transaction to it.
+                datetime::begin_statement();
+                self.ensure_txn(txn, TxnMode::Implicit, guc);
+                Ok(Ok(()))
+            }
+            Stmt::PrepareTransaction(gid) => {
+                if let Err(error) =
+                    self.prepare_transaction(*gid, txn, guc, cursors, arena, responder)
+                {
+                    return Ok(Err(error));
+                }
+                responder.command_complete("PREPARE TRANSACTION")?;
+                datetime::begin_statement();
+                self.ensure_txn(txn, TxnMode::Implicit, guc);
+                Ok(Ok(()))
+            }
+            Stmt::CommitPrepared(gid) => {
+                if let Err(error) = self.resolve_prepared_transaction(*gid, true, txn, guc) {
+                    return Ok(Err(error));
+                }
+                responder.command_complete("COMMIT PREPARED")?;
+                datetime::begin_statement();
+                self.ensure_txn(txn, TxnMode::Implicit, guc);
+                Ok(Ok(()))
+            }
+            Stmt::RollbackPrepared(gid) => {
+                if let Err(error) = self.resolve_prepared_transaction(*gid, false, txn, guc) {
+                    return Ok(Err(error));
+                }
+                responder.command_complete("ROLLBACK PREPARED")?;
                 datetime::begin_statement();
                 self.ensure_txn(txn, TxnMode::Implicit, guc);
                 Ok(Ok(()))
@@ -14180,6 +14553,12 @@ impl Engine {
                 "off"
             }));
         }
+        if name.eq_ignore_ascii_case("max_connections") {
+            return Some(stack_format!(256, "{}", self.max_connections));
+        }
+        if name.eq_ignore_ascii_case("max_prepared_transactions") {
+            return Some(stack_format!(256, "{}", self.max_prepared_transactions));
+        }
         fixed_setting(name).map(crate::util::StackStr::from_str)
     }
 }
@@ -14217,6 +14596,8 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "IntervalStyle",
     "is_superuser",
     "lock_timeout",
+    "max_connections",
+    "max_prepared_transactions",
     "row_security",
     "search_path",
     "server_encoding",
@@ -14445,6 +14826,340 @@ fn decode_wal_routine_signature(
     Ok((arguments, count))
 }
 
+fn replay_transaction_batches(
+    storage: &mut Storage,
+    prepared: &mut two_phase::PreparedTransactions,
+    recovered: &std::collections::BTreeMap<u64, Vec<u8>>,
+    apply_floor: u64,
+) -> Result<(), SqlError> {
+    let mut batch: Vec<(u64, &[u8])> = Vec::new();
+    for (lsn, record) in recovered {
+        let operator = crate::wal::decode_record(record).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "corrupt uploaded WAL record at LSN {} (kind {})",
+                lsn,
+                record.first().copied().unwrap_or_default()
+            )
+        })?;
+        let terminal = matches!(
+            operator,
+            WalOp::Commit { .. } | WalOp::PrepareTransaction { .. }
+        );
+        batch.push((*lsn, record));
+        if !terminal {
+            continue;
+        }
+        match operator {
+            WalOp::PrepareTransaction {
+                transaction_id,
+                owner,
+                database,
+                prepared_at,
+                gid,
+            } => {
+                let gid = ast::PreparedTransactionId::parse(gid).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "prepared transaction WAL has an invalid identifier"
+                    )
+                })?;
+                if prepared.find(gid).is_some() {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "recovered prepared transaction identifier \"{}\" is duplicated",
+                        gid.as_str()
+                    ));
+                }
+                let database = crate::storage::DatabaseOid::parse(database).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "prepared transaction WAL has an invalid database"
+                    )
+                })?;
+                let metadata = two_phase::PreparedTransactionMetadata {
+                    gid,
+                    transaction_id,
+                    owner,
+                    database,
+                    prepared_at,
+                    first_lsn: batch.first().map_or(*lsn, |(record_lsn, _)| *record_lsn),
+                    prepared_lsn: *lsn,
+                };
+                let slot = prepared.reserve(metadata).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::OUT_OF_MEMORY,
+                        "recovered prepared transactions exceed max_prepared_transactions ({})",
+                        prepared.capacity()
+                    )
+                })?;
+                prepared
+                    .slot_mut(slot)
+                    .transaction
+                    .restore_prepared_identity(transaction_id);
+                storage.select_database_for_recovery(database)?;
+                for (record_lsn, raw) in &batch[..batch.len() - 1] {
+                    prepared.slot_mut(slot).push_record(*record_lsn, raw)?;
+                }
+                for (_, raw) in &batch[..batch.len() - 1] {
+                    match crate::wal::decode_record(raw).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "prepared transaction WAL is corrupt"
+                        )
+                    })? {
+                        WalOp::CreateTable(definition) => {
+                            if storage
+                                .find_visible(
+                                    definition.schema.as_str(),
+                                    definition.name.as_str(),
+                                    transaction_id,
+                                )
+                                .is_none()
+                            {
+                                let table = storage.create_table_in(definition, transaction_id)?;
+                                prepared
+                                    .slot_mut(slot)
+                                    .transaction
+                                    .record_ddl(DdlUndo::Created(table as u32))?;
+                            }
+                        }
+                        WalOp::CreateSequence {
+                            schema,
+                            name,
+                            data_type,
+                            increment,
+                            min_value,
+                            max_value,
+                            start_value,
+                            cache,
+                            cycle,
+                            owner,
+                            generator_for,
+                        } => {
+                            let spec = crate::storage::SeqSpec {
+                                data_type: crate::storage::SeqType::from_u8(data_type),
+                                increment,
+                                min_value,
+                                max_value,
+                                start_value,
+                                cache,
+                                cycle,
+                            };
+                            if let Some(sequence) =
+                                storage.sequence_slot(schema, name, transaction_id)
+                            {
+                                let prior = storage.stage_sequence_alter(
+                                    sequence,
+                                    crate::storage::SequenceAlteration {
+                                        schema: crate::storage::SqlName::parse(schema)?,
+                                        spec,
+                                        owner,
+                                        generator_for,
+                                        restart: None,
+                                    },
+                                    transaction_id,
+                                )?;
+                                prepared.slot_mut(slot).transaction.record_ddl(
+                                    DdlUndo::SequenceAltered {
+                                        slot: sequence as u32,
+                                        prior,
+                                    },
+                                )?;
+                            } else {
+                                let sequence = storage.create_sequence(
+                                    crate::storage::SqlName::parse(schema)?,
+                                    crate::storage::SqlName::parse(name)?,
+                                    spec,
+                                    owner,
+                                    generator_for,
+                                    transaction_id,
+                                )?;
+                                prepared
+                                    .slot_mut(slot)
+                                    .transaction
+                                    .record_ddl(DdlUndo::SequenceCreated(sequence as u32))?;
+                            }
+                        }
+                        WalOp::PreparedLocks {
+                            transaction_id: lock_owner,
+                            encoded,
+                        } => {
+                            if lock_owner != transaction_id {
+                                return Err(sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "prepared lock WAL has the wrong transaction owner"
+                                ));
+                            }
+                            storage.restore_transaction_locks(transaction_id, encoded)?;
+                        }
+                        WalOp::Upsert {
+                            schema,
+                            table,
+                            rowid,
+                            row,
+                            command_id,
+                            ..
+                        } => {
+                            let Some(table_slot) =
+                                storage.find_visible(schema, table, transaction_id)
+                            else {
+                                continue;
+                            };
+                            let (location, bytes) = storage.heap.append(row.len())?;
+                            bytes.copy_from_slice(row);
+                            storage.observe_rowid(rowid);
+                            let prior = storage.write_pending(
+                                table_slot,
+                                rowid,
+                                transaction_id,
+                                command_id,
+                                Some(location),
+                            )?;
+                            prepared.slot_mut(slot).transaction.touch(
+                                table_slot as u32,
+                                rowid,
+                                prior,
+                            )?;
+                        }
+                        WalOp::Delete {
+                            schema,
+                            table,
+                            rowid,
+                            command_id,
+                            ..
+                        } => {
+                            let Some(table_slot) =
+                                storage.find_visible(schema, table, transaction_id)
+                            else {
+                                continue;
+                            };
+                            let prior = storage.write_pending(
+                                table_slot,
+                                rowid,
+                                transaction_id,
+                                command_id,
+                                None,
+                            )?;
+                            prepared.slot_mut(slot).transaction.touch(
+                                table_slot as u32,
+                                rowid,
+                                prior,
+                            )?;
+                        }
+                        WalOp::SequenceSet {
+                            schema,
+                            table,
+                            column,
+                            last,
+                        } => {
+                            if let Some(table_slot) = storage.find_table(schema, table)
+                                && usize::from(column) < crate::storage::MAX_COLUMNS
+                            {
+                                storage.table_mut(table_slot).serial_last[usize::from(column)] =
+                                    last;
+                            }
+                        }
+                        WalOp::SequenceAdvance {
+                            schema,
+                            name,
+                            last,
+                            is_called,
+                        } => {
+                            if let Some(sequence) =
+                                storage.sequence_slot(schema, name, transaction_id)
+                                && storage.sequence_slot(schema, name, 0).is_none()
+                            {
+                                storage.set_sequence_value(
+                                    sequence,
+                                    transaction_id,
+                                    last,
+                                    is_called,
+                                )?;
+                                storage.clear_sequence_value_dirty(sequence, transaction_id);
+                            } else {
+                                storage.apply_sequence_advance(schema, name, last, is_called);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                prepared.slot_mut(slot).recovered = true;
+                storage.set_lsn(*lsn);
+            }
+            WalOp::Commit { .. } => {
+                let mut resolution: Option<(bool, ast::PreparedTransactionId)> = None;
+                for (_, raw) in &batch[..batch.len() - 1] {
+                    match crate::wal::decode_record(raw).ok_or_else(|| {
+                        sql_err!(sqlstate::DATA_EXCEPTION, "transaction WAL is corrupt")
+                    })? {
+                        WalOp::CommitPrepared { gid } | WalOp::RollbackPrepared { gid } => {
+                            if resolution.is_some() {
+                                return Err(sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "one WAL transaction contains multiple prepared resolutions"
+                                ));
+                            }
+                            let commit = matches!(
+                                crate::wal::decode_record(raw),
+                                Some(WalOp::CommitPrepared { .. })
+                            );
+                            let gid = ast::PreparedTransactionId::parse(gid).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "prepared resolution WAL has an invalid identifier"
+                                )
+                            })?;
+                            resolution = Some((commit, gid));
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some((commit, gid)) = resolution {
+                    let slot = prepared.find(gid).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "prepared resolution targets unknown transaction \"{}\"",
+                            gid.as_str()
+                        )
+                    })?;
+                    if commit && *lsn > apply_floor {
+                        prepared.slot(slot).visit_records(|_, raw| {
+                            let operation = crate::wal::decode_record(raw).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "prepared transaction WAL is corrupt"
+                                )
+                            })?;
+                            apply_wal_op(storage, *lsn, operation)
+                        })?;
+                    }
+                    prepared.release(slot);
+                    storage.set_lsn(*lsn);
+                } else {
+                    if *lsn > apply_floor {
+                        for (record_lsn, raw) in &batch {
+                            let operation = crate::wal::decode_record(raw).ok_or_else(|| {
+                                sql_err!(sqlstate::DATA_EXCEPTION, "transaction WAL is corrupt")
+                            })?;
+                            apply_wal_op(storage, *record_lsn, operation)?;
+                        }
+                    }
+                }
+            }
+            _ => unreachable!("terminal marker was matched above"),
+        }
+        batch.clear();
+    }
+    if !batch.is_empty() {
+        return Err(sql_err!(
+            sqlstate::DATA_EXCEPTION,
+            "recovery input ends inside a transaction"
+        ));
+    }
+    Ok(())
+}
+
 fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), SqlError> {
     match operator {
         WalOp::DatabaseScope { oid } => {
@@ -14452,7 +15167,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL database scope"))?;
             storage.select_database(database)?;
         }
-        WalOp::Commit { .. } => {}
+        WalOp::Commit { .. }
+        | WalOp::PrepareTransaction { .. }
+        | WalOp::PreparedLocks { .. }
+        | WalOp::CommitPrepared { .. }
+        | WalOp::RollbackPrepared { .. } => {}
         WalOp::Truncate { .. } => {}
         WalOp::SetCast(definition) => {
             storage.create_cast_from_image(definition)?;

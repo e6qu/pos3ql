@@ -65,7 +65,7 @@ CLOSE	complete	39_cursors.sql
 CLUSTER	missing	-
 COMMENT	partial	59_comment.sql
 COMMIT	complete	05_transactions.sql
-COMMIT PREPARED	missing	-
+COMMIT PREPARED	complete	120_two_phase_transactions.sql
 COPY	complete	40_copy.sql
 CREATE ACCESS METHOD	missing	-
 CREATE AGGREGATE	complete	110_user_defined_aggregates.sql
@@ -171,7 +171,7 @@ MERGE	partial	58_merge.sql
 MOVE	complete	39_cursors.sql
 NOTIFY	complete	14_surface.sql
 PREPARE	complete	14_surface.sql
-PREPARE TRANSACTION	missing	-
+PREPARE TRANSACTION	complete	120_two_phase_transactions.sql
 REASSIGN OWNED	complete	83_roles_acl.sql
 REFRESH MATERIALIZED VIEW	complete	53_materialized_view.sql
 REINDEX	partial	92_reindex.sql and 107_index_lifecycle.sql
@@ -179,7 +179,7 @@ RELEASE SAVEPOINT	complete	05_transactions.sql
 RESET	complete	75_guc_mutation.sql
 REVOKE	partial	83_roles_acl.sql
 ROLLBACK	complete	05_transactions.sql
-ROLLBACK PREPARED	missing	-
+ROLLBACK PREPARED	complete	120_two_phase_transactions.sql
 ROLLBACK TO SAVEPOINT	complete	05_transactions.sql
 SAVEPOINT	complete	05_transactions.sql
 SECURITY LABEL	missing	-

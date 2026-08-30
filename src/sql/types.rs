@@ -24,6 +24,7 @@ pub mod oid {
     pub const PG_STATISTIC_ROW: i32 = 10029;
     pub const INT4: i32 = 23;
     pub const OID: i32 = 26;
+    pub const XID: i32 = 28;
     pub const OID_ARRAY: i32 = 1028;
     pub const TEXT: i32 = 25;
     pub const ACLITEM: i32 = 1033;
@@ -197,6 +198,9 @@ pub enum ColType {
     /// PostgreSQL object identity, retaining its catalog and wire metadata
     /// while sharing the engine's four-byte integer datum storage.
     Oid,
+    /// PostgreSQL transaction identity (`xid`, OID 28). Values retain unsigned
+    /// four-byte storage while the declared type carries the distinct wire OID.
+    Xid,
     /// `regtype`: a catalog type reference with OID storage and catalog-name
     /// text output, not ordinary text.
     Regtype,
@@ -352,7 +356,7 @@ impl BtreeOperatorClass {
             Macaddr8 => Self::Macaddr8,
             Name => Self::Name,
             Numeric => Self::Numeric,
-            Oid | Regtype | Regproc | Regprocedure | Regoper | Regoperator | Regclass
+            Oid | Xid | Regtype | Regproc | Regprocedure | Regoper | Regoperator | Regclass
             | Regnamespace | Regrole => Self::Oid,
             Record | Composite(_) => Self::Record,
             Text | Varchar => Self::Text,
@@ -595,6 +599,7 @@ impl ColType {
             "regrole" => Self::Regrole,
             "name" => Self::Name,
             "oid" => Self::Oid,
+            "xid" => Self::Xid,
             "varchar" | "character varying" => Self::Varchar,
             "char" | "character" | "bpchar" => Self::Bpchar,
             "date" => Self::Date,
@@ -635,6 +640,7 @@ impl ColType {
             Self::PgStatisticArray => oid::PG_STATISTIC_ARRAY,
             Self::Int4 => oid::INT4,
             Self::Oid => oid::OID,
+            Self::Xid => oid::XID,
             Self::Regtype => oid::REGTYPE,
             Self::Regproc => oid::REGPROC,
             Self::Regprocedure => oid::REGPROCEDURE,
@@ -696,6 +702,7 @@ impl ColType {
             oid::PG_STATISTIC_ARRAY => Some(Self::PgStatisticArray),
             oid::INT4 => Some(Self::Int4),
             oid::OID => Some(Self::Oid),
+            oid::XID => Some(Self::Xid),
             oid::REGPROC => Some(Self::Regproc),
             oid::REGPROCEDURE => Some(Self::Regprocedure),
             oid::REGOPER => Some(Self::Regoper),
@@ -804,6 +811,7 @@ impl ColType {
             | Self::PgStatisticArray => -1,
             Self::Int4
             | Self::Oid
+            | Self::Xid
             | Self::Regtype
             | Self::Regproc
             | Self::Regprocedure
@@ -851,7 +859,7 @@ impl ColType {
             | Self::PgDependencies
             | Self::PgMcvList
             | Self::PgStatisticArray => Self::Text,
-            Self::Oid => Self::Int4,
+            Self::Oid | Self::Xid => Self::Int4,
             Self::Regtype
             | Self::Regproc
             | Self::Regprocedure
@@ -881,6 +889,7 @@ impl ColType {
             Self::PgStatisticArray => "pg_statistic[]",
             Self::Int4 => "int4",
             Self::Oid => "oid",
+            Self::Xid => "xid",
             Self::Regtype => "regtype",
             Self::Regproc => "regproc",
             Self::Regprocedure => "regprocedure",
@@ -950,6 +959,7 @@ impl ColType {
             Self::PgStatisticArray => "pg_statistic[]",
             Self::Int4 => "integer",
             Self::Oid => "oid",
+            Self::Xid => "xid",
             Self::Regtype => "regtype",
             Self::Regproc => "regproc",
             Self::Regprocedure => "regprocedure",
@@ -1006,6 +1016,7 @@ impl ColType {
             Self::Bool => 1,
             Self::Int4 => 2,
             Self::Oid => 56,
+            Self::Xid => 76,
             Self::Regtype => 58,
             Self::Regproc => 59,
             Self::Regprocedure => 60,
@@ -1075,6 +1086,7 @@ impl ColType {
             74 => Self::Char,
             2 => Self::Int4,
             56 => Self::Oid,
+            76 => Self::Xid,
             58 => Self::Regtype,
             59 => Self::Regproc,
             60 => Self::Regprocedure,

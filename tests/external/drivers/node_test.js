@@ -74,6 +74,21 @@ async function main() {
     const n = await c.query('SELECT count(*)::int AS n FROM node_drv WHERE id=9');
     line('after rollback id=9 count=' + n.rows[0].n);
 
+    await c.query('DROP TABLE IF EXISTS node_two_phase');
+    await c.query('CREATE TABLE node_two_phase (id integer PRIMARY KEY, value text)');
+    await c.query("INSERT INTO node_two_phase VALUES (1, 'before')");
+    await c.query('BEGIN');
+    await c.query('UPDATE node_two_phase SET value = $1 WHERE id = $2', ['after', 1]);
+    await c.query("PREPARE TRANSACTION 'node-two-phase'");
+    const prepared = await c.query(
+      'SELECT gid, pg_typeof(transaction)::text AS type FROM pg_prepared_xacts');
+    line(`two-phase prepared ${prepared.rows[0].gid}|${prepared.rows[0].type}`);
+    const hidden = await c.query('SELECT value FROM node_two_phase WHERE id = 1');
+    line('two-phase hidden ' + hidden.rows[0].value);
+    await c.query("COMMIT PREPARED 'node-two-phase'");
+    const committed = await c.query('SELECT value FROM node_two_phase WHERE id = 1');
+    line('two-phase committed ' + committed.rows[0].value);
+
     // Catalog introspection (the `'tbl'::regclass` pattern).
     const cols = await c.query(
       "SELECT attname, format_type(atttypid, atttypmod) AS t, attnotnull " +

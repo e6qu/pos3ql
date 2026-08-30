@@ -47,6 +47,9 @@ pub struct Config {
     pub max_portals: usize,
     /// Rows one transaction may touch (per connection undo capacity).
     pub txn_rows: usize,
+    /// Cluster-wide PostgreSQL two-phase transaction slots. Zero disables
+    /// PREPARE TRANSACTION, matching PostgreSQL's startup-only setting.
+    pub max_prepared_transactions: usize,
     /// Bound-parameter bytes per portal.
     pub portal_bytes: usize,
     /// Buffered result bytes per portal (Execute max_rows paging).
@@ -184,6 +187,7 @@ impl Config {
             portal_bytes: 4 * KIB,
             portal_result_bytes: 64 * KIB,
             txn_rows: 8192,
+            max_prepared_transactions: 0,
             memtable_bytes: 64 * MIB,
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
@@ -337,6 +341,10 @@ impl Config {
                 }
                 "txn_rows" => {
                     config.txn_rows =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_prepared_transactions" => {
+                    config.max_prepared_transactions =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "memtable_bytes" => {
@@ -723,6 +731,7 @@ mod tests {
 # development overrides
 listen_addr = 0.0.0.0:5432
 max_connections = 128
+max_prepared_transactions = 11
 max_replication_slots = 12
 max_subscriptions = 7
 max_rules = 19
@@ -732,6 +741,7 @@ sql_arena_bytes = 4096
         let c = Config::parse(text).unwrap();
         assert_eq!(c.listen_addr, "0.0.0.0:5432");
         assert_eq!(c.max_connections, 128);
+        assert_eq!(c.max_prepared_transactions, 11);
         assert_eq!(c.max_replication_slots, 12);
         assert_eq!(c.max_subscriptions, 7);
         assert_eq!(c.max_rules, 19);

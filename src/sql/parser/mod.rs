@@ -935,10 +935,17 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident("commit") | Tok::Ident("end") => {
                 self.advance()?;
-                Ok(Stmt::Commit)
+                if self.eat_ident("prepared")? {
+                    Ok(Stmt::CommitPrepared(self.prepared_transaction_id()?))
+                } else {
+                    Ok(Stmt::Commit)
+                }
             }
             Tok::Ident("rollback") | Tok::Ident("abort") => {
                 self.advance()?;
+                if self.eat_ident("prepared")? {
+                    return Ok(Stmt::RollbackPrepared(self.prepared_transaction_id()?));
+                }
                 // ROLLBACK TO [SAVEPOINT] name rewinds to a savepoint; plain
                 // ROLLBACK aborts the whole transaction.
                 if self.eat_ident("to")? {
@@ -4848,6 +4855,9 @@ impl<'a> Parser<'a> {
 
     fn prepare(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("prepare")?;
+        if self.eat_ident("transaction")? {
+            return Ok(Stmt::PrepareTransaction(self.prepared_transaction_id()?));
+        }
         let name = self.any_ident("prepared statement name")?;
         // Declared parameter types, if any; they constrain EXECUTE arguments.
         let mut ptypes: [&'a str; MAX_LIST] = [""; MAX_LIST];
@@ -4876,6 +4886,15 @@ impl<'a> Parser<'a> {
             name,
             sql,
             param_types: self.arena_slice(&ptypes[..np])?,
+        })
+    }
+
+    fn prepared_transaction_id(&mut self) -> Result<PreparedTransactionId, ParseError> {
+        let value = self.str_literal("transaction identifier")?;
+        PreparedTransactionId::parse(value).ok_or(ParseError {
+            at: self.peek_at,
+            message: stack_format!(96, "transaction identifier \"{}\" is too long", value),
+            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
         })
     }
 

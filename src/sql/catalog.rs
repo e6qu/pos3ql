@@ -878,6 +878,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_enum"
                 | "pg_range"
                 | "pg_settings"
+                | "pg_prepared_xacts"
                 | "pg_proc"
                 | "pg_aggregate"
                 | "pg_operator"
@@ -1040,6 +1041,7 @@ pub fn synthesize<'a>(
         ),
         (false, "pg_partitioned_table") => pg_partitioned_table(storage, txid, arena),
         (false, "pg_settings") => pg_settings(arena),
+        (false, "pg_prepared_xacts") => pg_prepared_xacts(storage, txid, arena),
         (false, "pg_proc") => pg_proc(storage, txid, arena),
         (false, "pg_aggregate") => pg_aggregate(storage, txid, arena),
         (false, "pg_operator") => pg_operator(storage, txid, arena),
@@ -12554,6 +12556,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             | "transaction_timeout" => "0",
             "IntervalStyle" => "postgres",
             "is_superuser" => "on",
+            "max_connections" => "100",
+            "max_prepared_transactions" => "0",
             "search_path" => "\"$user\", public",
             "server_version" => crate::pg::REPORTED_SERVER_VERSION,
             "server_version_num" => crate::pg::REPORTED_SERVER_VERSION_NUM,
@@ -12583,7 +12587,10 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             "DateStyle" | "IntervalStyle" | "bytea_output" | "xmloption"
         ) {
             "enum"
-        } else if matches!(name, "extra_float_digits") {
+        } else if matches!(
+            name,
+            "extra_float_digits" | "max_connections" | "max_prepared_transactions"
+        ) {
             "integer"
         } else {
             "string"
@@ -12597,6 +12604,8 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
                 | "server_version_num"
         ) {
             "internal"
+        } else if matches!(name, "max_connections" | "max_prepared_transactions") {
+            "postmaster"
         } else {
             "user"
         };
@@ -12668,6 +12677,49 @@ fn pg_settings<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
         count += 1;
     }
     finish(definition, &output[..count], arena)
+}
+
+fn pg_prepared_xacts<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_prepared_xacts",
+        &[
+            ("transaction", ColType::Xid),
+            ("gid", ColType::Text),
+            ("prepared", ColType::Timestamptz),
+            ("owner", ColType::Name),
+            ("database", ColType::Name),
+        ],
+    );
+    let entries = storage.prepared_transaction_catalog();
+    let output = arena
+        .alloc_slice_with(entries.len(), |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (index, entry) in entries.iter().enumerate() {
+        let database = storage
+            .database_slot_by_oid(entry.database, txid)
+            .map(|slot| storage.database_definition(slot, txid).name);
+        output[index] = row(
+            &[
+                Datum::Oid(entry.transaction_id),
+                text(entry.gid.as_str(), arena)?,
+                Datum::Timestamptz(entry.prepared_at),
+                text(
+                    storage.role_name(usize::from(entry.owner), txid).as_str(),
+                    arena,
+                )?,
+                match database {
+                    Some(name) => text(name.as_str(), arena)?,
+                    None => Datum::Null,
+                },
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, output, arena)
 }
 
 fn pg_views<'a>(

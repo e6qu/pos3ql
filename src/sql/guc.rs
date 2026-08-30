@@ -7,7 +7,7 @@ use core::cell::{Cell, RefCell};
 use core::fmt::Write;
 
 use crate::sql_err;
-use crate::storage::MAX_SEQUENCES;
+use crate::storage::{MAX_SEQUENCES, SequenceCacheIdentity, SequenceDef};
 use crate::util::StackStr;
 
 use super::ast::{TransactionCharacteristics, TransactionIsolation};
@@ -337,6 +337,40 @@ pub struct SeqSession {
     currvals: [Cell<(u64, i64)>; MAX_SEQUENCES],
     /// `(defined, value)` for `lastval` — the last `nextval` of any sequence.
     lastval: Cell<(bool, i64)>,
+    caches: [Cell<SequenceCache>; MAX_SEQUENCES],
+}
+
+#[derive(Clone, Copy)]
+struct SequenceCache {
+    identity: Option<SequenceCacheIdentity>,
+    next: i64,
+    remaining: i64,
+    increment: i64,
+    min_value: i64,
+    max_value: i64,
+    cycle: bool,
+}
+
+impl SequenceCache {
+    const EMPTY: Self = Self {
+        identity: None,
+        next: 0,
+        remaining: 0,
+        increment: 1,
+        min_value: 0,
+        max_value: 0,
+        cycle: false,
+    };
+
+    fn advance(self, value: i64) -> i64 {
+        match value.checked_add(self.increment) {
+            Some(next) if self.increment > 0 && next <= self.max_value => next,
+            Some(next) if self.increment < 0 && next >= self.min_value => next,
+            _ if self.cycle && self.increment > 0 => self.min_value,
+            _ if self.cycle => self.max_value,
+            _ => value,
+        }
+    }
 }
 
 impl SeqSession {
@@ -344,7 +378,46 @@ impl SeqSession {
         SeqSession {
             currvals: [const { Cell::new((0u64, 0i64)) }; MAX_SEQUENCES],
             lastval: Cell::new((false, 0)),
+            caches: [const { Cell::new(SequenceCache::EMPTY) }; MAX_SEQUENCES],
         }
+    }
+
+    pub(crate) fn take_cached(&self, slot: usize, identity: SequenceCacheIdentity) -> Option<i64> {
+        let mut cache = self.caches[slot].get();
+        if cache.identity != Some(identity) || cache.remaining == 0 {
+            return None;
+        }
+        let value = cache.next;
+        cache.remaining -= 1;
+        if cache.remaining != 0 {
+            cache.next = cache.advance(value);
+        }
+        self.caches[slot].set(cache);
+        Some(value)
+    }
+
+    pub(crate) fn store_cache(
+        &self,
+        slot: usize,
+        first: i64,
+        reserved: i64,
+        definition: &SequenceDef,
+    ) {
+        let mut cache = SequenceCache {
+            identity: Some(definition.cache_identity()),
+            next: first,
+            remaining: reserved.saturating_sub(1),
+            increment: definition.increment,
+            min_value: definition.min_value,
+            max_value: definition.max_value,
+            cycle: definition.cycle,
+        };
+        cache.next = cache.advance(first);
+        self.caches[slot].set(cache);
+    }
+
+    pub(crate) fn invalidate_cache(&self, slot: usize) {
+        self.caches[slot].set(SequenceCache::EMPTY);
     }
 
     /// Records a `nextval`: defines both this sequence's `currval` and `lastval`.
@@ -357,6 +430,7 @@ impl SeqSession {
     /// does not let `setval` define `lastval`).
     pub fn record_setval(&self, slot: usize, created_at: u64, value: i64) {
         self.currvals[slot].set((created_at, value));
+        self.caches[slot].set(SequenceCache::EMPTY);
     }
 
     /// This sequence's `currval` in this session, if `nextval`/`setval` has
@@ -374,6 +448,9 @@ impl SeqSession {
     pub fn discard(&self) {
         for value in &self.currvals {
             value.set((0, 0));
+        }
+        for cache in &self.caches {
+            cache.set(SequenceCache::EMPTY);
         }
         self.lastval.set((false, 0));
     }
@@ -2312,6 +2389,7 @@ fn is_read_only(name: &str) -> bool {
         "integer_datetimes",
         "in_hot_standby",
         "max_connections",
+        "max_prepared_transactions",
     ];
     READ_ONLY.iter().any(|r| name.eq_ignore_ascii_case(r))
 }

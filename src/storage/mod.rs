@@ -6914,6 +6914,7 @@ impl SeqType {
 pub struct SequenceDef {
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
+    cache_generation: u64,
     pub schema: SqlName,
     pub name: SqlName,
     pub ownership: Ownership,
@@ -6938,6 +6939,7 @@ pub struct SequenceDef {
     /// `nextval` returns it unchanged (PostgreSQL's `setval(seq, start, false)`).
     pub last_value: Cell<i64>,
     pub is_called: Cell<bool>,
+    pub log_count: Cell<i64>,
     /// The value state changed since it was last journaled; `commit_txn` writes a
     /// `SequenceAdvance` and clears it, regardless of whether the surrounding
     /// transaction committed (advances are non-transactional).
@@ -6945,8 +6947,15 @@ pub struct SequenceDef {
     pub(crate) pending_definition: Option<PendingSequenceDefinition>,
     pending_last_value: Cell<i64>,
     pending_is_called: Cell<bool>,
+    pending_log_count: Cell<i64>,
     pending_dirty: Cell<bool>,
     ddl_state: CatalogDdlState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SequenceCacheIdentity {
+    created_at: u64,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6958,6 +6967,7 @@ pub(crate) struct PendingSequenceDefinition {
     pub generator_for: Option<SequenceOwner>,
     pub last_value: i64,
     pub is_called: bool,
+    pub log_count: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6965,11 +6975,13 @@ pub(crate) enum SequenceValueState {
     Committed {
         last_value: i64,
         is_called: bool,
+        log_count: i64,
         dirty: bool,
     },
     Pending {
         last_value: i64,
         is_called: bool,
+        log_count: i64,
         dirty: bool,
     },
 }
@@ -7027,6 +7039,13 @@ pub(crate) struct SequenceAlteration {
 }
 
 impl SequenceDef {
+    pub(crate) fn cache_identity(&self) -> SequenceCacheIdentity {
+        SequenceCacheIdentity {
+            created_at: self.created_at,
+            generation: self.cache_generation,
+        }
+    }
+
     pub(crate) fn visible_to(&self, txid: u32) -> bool {
         self.ddl_state.visible_to(txid)
     }
@@ -7047,67 +7066,81 @@ impl SequenceDef {
                     cycle: pending.spec.cycle,
                     owner: pending.owner,
                     generator_for: pending.generator_for,
+                    cache_generation: self.cache_generation.wrapping_add(1),
                     pending_definition: None,
                     ..self.clone()
                 },
             )
     }
 
-    /// Advances the generator and returns the next value, or the 2200H overflow
-    /// error when a non-cycling sequence runs off its bound. Mutates value state
-    /// through the `Cell` fields (a `&Storage` borrow is all the caller holds).
-    pub fn next_value(&self) -> Result<i64, SqlError> {
-        self.next_value_with(&self.last_value, &self.is_called, Some(&self.dirty))
-    }
-
-    fn next_value_with(
-        &self,
-        last_value: &Cell<i64>,
-        is_called: &Cell<bool>,
-        dirty: Option<&Cell<bool>>,
-    ) -> Result<i64, SqlError> {
-        if !is_called.get() {
-            // First call after CREATE/RESTART yields the start value unchanged.
-            is_called.set(true);
-            if let Some(dirty) = dirty {
-                dirty.set(true);
-            }
-            return Ok(last_value.get());
-        }
-        let current = last_value.get();
+    fn next_after(&self, current: i64) -> Result<i64, SqlError> {
         let next = current.checked_add(self.increment);
-        let value = if self.increment > 0 {
+        if self.increment > 0 {
             match next {
-                Some(n) if n <= self.max_value => n,
-                _ if self.cycle => self.min_value,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::SEQUENCE_GENERATOR_LIMIT_EXCEEDED,
-                        "nextval: reached maximum value of sequence \"{}\" ({})",
-                        self.name.as_str(),
-                        self.max_value
-                    ));
-                }
+                Some(value) if value <= self.max_value => Ok(value),
+                _ if self.cycle => Ok(self.min_value),
+                _ => Err(sql_err!(
+                    sqlstate::SEQUENCE_GENERATOR_LIMIT_EXCEEDED,
+                    "nextval: reached maximum value of sequence \"{}\" ({})",
+                    self.name.as_str(),
+                    self.max_value
+                )),
             }
         } else {
             match next {
-                Some(n) if n >= self.min_value => n,
-                _ if self.cycle => self.max_value,
-                _ => {
-                    return Err(sql_err!(
-                        sqlstate::SEQUENCE_GENERATOR_LIMIT_EXCEEDED,
-                        "nextval: reached minimum value of sequence \"{}\" ({})",
-                        self.name.as_str(),
-                        self.min_value
-                    ));
-                }
+                Some(value) if value >= self.min_value => Ok(value),
+                _ if self.cycle => Ok(self.max_value),
+                _ => Err(sql_err!(
+                    sqlstate::SEQUENCE_GENERATOR_LIMIT_EXCEEDED,
+                    "nextval: reached minimum value of sequence \"{}\" ({})",
+                    self.name.as_str(),
+                    self.min_value
+                )),
             }
+        }
+    }
+
+    fn reserve_values_with(
+        &self,
+        last_value: &Cell<i64>,
+        is_called: &Cell<bool>,
+        log_count: &Cell<i64>,
+        dirty: Option<&Cell<bool>>,
+        requested: i64,
+    ) -> Result<(i64, i64), SqlError> {
+        debug_assert!(requested > 0);
+        let first = if is_called.get() {
+            self.next_after(last_value.get())?
+        } else {
+            last_value.get()
         };
-        last_value.set(value);
+        let step = i128::from(self.increment);
+        let requested = i128::from(requested);
+        let available = if step > 0 {
+            (i128::from(self.max_value) - i128::from(first)) / step + 1
+        } else {
+            (i128::from(first) - i128::from(self.min_value)) / -step + 1
+        };
+        let reserved = requested.min(available);
+        let last = i128::from(first) + (reserved - 1) * step;
+        let reserved = i64::try_from(reserved).expect("requested cache count is i64");
+        last_value.set(i64::try_from(last).expect("sequence bounds constrain reserved value"));
+        is_called.set(true);
+        let previous_log_count = log_count.get();
+        log_count.set(if previous_log_count < reserved {
+            let trailing = if step > 0 {
+                (i128::from(self.max_value) - last) / step
+            } else {
+                (last - i128::from(self.min_value)) / -step
+            };
+            i64::try_from(trailing.min(32)).expect("prelogged sequence count is bounded")
+        } else {
+            previous_log_count - reserved
+        });
         if let Some(dirty) = dirty {
             dirty.set(true);
         }
-        Ok(value)
+        Ok((first, reserved))
     }
 
     /// Validates a `setval` target is within `[min, max]` (22003), without
@@ -7132,6 +7165,7 @@ impl SequenceDef {
         self.check_setval(value)?;
         self.last_value.set(value);
         self.is_called.set(is_called);
+        self.log_count.set(0);
         self.dirty.set(true);
         Ok(value)
     }
@@ -7142,11 +7176,13 @@ impl SequenceDef {
         is_called: bool,
         last_value: &Cell<i64>,
         called: &Cell<bool>,
+        log_count: &Cell<i64>,
         dirty: Option<&Cell<bool>>,
     ) -> Result<i64, SqlError> {
         self.check_setval(value)?;
         last_value.set(value);
         called.set(is_called);
+        log_count.set(0);
         if let Some(dirty) = dirty {
             dirty.set(true);
         }
@@ -9050,6 +9086,17 @@ struct ReplayTableRewrite {
     column_mapping: [u16; MAX_COLUMNS],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedTransactionCatalogEntry {
+    pub transaction_id: u32,
+    pub gid: StackStr<199>,
+    pub prepared_at: i64,
+    pub owner: u16,
+    pub database: DatabaseOid,
+    pub first_lsn: u64,
+    pub prepared_lsn: u64,
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -9098,6 +9145,7 @@ pub struct Storage {
     role_memberships: FixedVec<RoleMembership>,
     role_settings: FixedVec<RoleSetting>,
     system_settings: FixedVec<SystemSetting>,
+    prepared_transactions: FixedVec<PreparedTransactionCatalogEntry>,
     acl_entries: FixedVec<AclEntry>,
     column_acl_entries: FixedVec<ColumnAclEntry>,
     default_acl_entries: FixedVec<DefaultAclEntry>,
@@ -9821,6 +9869,7 @@ impl Storage {
             + MAX_ROLE_MEMBERSHIPS * size_of::<RoleMembership>()
             + MAX_ROLE_SETTINGS * size_of::<RoleSetting>()
             + MAX_SYSTEM_SETTINGS * size_of::<SystemSetting>()
+            + config.max_prepared_transactions * size_of::<PreparedTransactionCatalogEntry>()
             + MAX_ACL_ENTRIES * size_of::<AclEntry>()
             + MAX_COLUMN_ACL_ENTRIES * size_of::<ColumnAclEntry>()
             + MAX_DEFAULT_ACL_ENTRIES * size_of::<DefaultAclEntry>()
@@ -9831,13 +9880,17 @@ impl Storage {
             + MAX_DATABASES * size_of::<DatabaseDef>()
             + MAX_TABLESPACES * size_of::<TablespaceDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
-            + config.max_connections as usize * size_of::<(u32, u64)>()
-            + config.max_connections as usize * config.max_tables * size_of::<TableLock>()
+            + (config.max_connections as usize + config.max_prepared_transactions)
+                * size_of::<(u32, u64)>()
+            + (config.max_connections as usize + config.max_prepared_transactions)
+                * config.max_tables
+                * size_of::<TableLock>()
             + crate::sql::lock::LockManager::budget_bytes(
-                config.max_connections as usize * config.txn_rows,
+                (config.max_connections as usize + config.max_prepared_transactions)
+                    * config.txn_rows,
                 config.max_connections as usize,
             )
-            + config.max_connections as usize
+            + (config.max_connections as usize + config.max_prepared_transactions)
                 * config.max_tables
                 * size_of::<(u32, u32, u64, bool)>()
             + ValueIndexPool::budget_bytes(config.max_value_indexes, config.value_index_rows)
@@ -10131,6 +10184,7 @@ impl Storage {
                 .push(SequenceDef {
                     database: DatabaseOid::POSTGRES,
                     created_at: 0,
+                    cache_generation: 0,
                     schema: SqlName::EMPTY,
                     name: SqlName::EMPTY,
                     ownership: Ownership::BOOTSTRAP,
@@ -10145,10 +10199,12 @@ impl Storage {
                     generator_for: None,
                     last_value: Cell::new(1),
                     is_called: Cell::new(false),
+                    log_count: Cell::new(0),
                     dirty: Cell::new(false),
                     pending_definition: None,
                     pending_last_value: Cell::new(1),
                     pending_is_called: Cell::new(false),
+                    pending_log_count: Cell::new(0),
                     pending_dirty: Cell::new(false),
                     ddl_state: CatalogDdlState::Absent,
                 })
@@ -10272,6 +10328,11 @@ impl Storage {
                 .push(SystemSetting::EMPTY)
                 .expect("sized to MAX_SYSTEM_SETTINGS");
         }
+        let prepared_transactions = FixedVec::new(
+            budget,
+            "prepared_transaction_catalog",
+            config.max_prepared_transactions,
+        )?;
         let mut acl_entries = FixedVec::new(budget, "acl_entries", MAX_ACL_ENTRIES)?;
         for slot in 0..3 {
             acl_entries
@@ -10390,22 +10451,23 @@ impl Storage {
         }
         let value_indexes =
             ValueIndexPool::new(budget, config.max_value_indexes, config.value_index_rows)?;
-        let active_snapshots =
-            FixedVec::new(budget, "active_snapshots", config.max_connections as usize)?;
+        let transaction_capacity =
+            config.max_connections as usize + config.max_prepared_transactions;
+        let active_snapshots = FixedVec::new(budget, "active_snapshots", transaction_capacity)?;
         let table_locks = std::cell::RefCell::new(FixedVec::new(
             budget,
             "table_locks",
-            config.max_connections as usize * config.max_tables,
+            transaction_capacity * config.max_tables,
         )?);
         let row_locks = std::cell::RefCell::new(crate::sql::lock::LockManager::new(
             budget,
-            config.max_connections as usize * config.txn_rows,
+            transaction_capacity * config.txn_rows,
             config.max_connections as usize,
         )?);
         let serializable_snapshots = std::cell::RefCell::new(FixedVec::new(
             budget,
             "serializable_snapshots",
-            config.max_connections as usize * config.max_tables,
+            transaction_capacity * config.max_tables,
         )?);
         Ok(Self {
             heap,
@@ -10455,6 +10517,7 @@ impl Storage {
             role_memberships,
             role_settings,
             system_settings,
+            prepared_transactions,
             acl_entries,
             column_acl_entries,
             default_acl_entries,
@@ -10474,6 +10537,34 @@ impl Storage {
             spill: None,
             value_indexes: Some(value_indexes),
             collation: None,
+        })
+    }
+
+    pub(crate) fn replace_prepared_transaction_catalog(
+        &mut self,
+        entries: impl IntoIterator<Item = PreparedTransactionCatalogEntry>,
+    ) {
+        self.prepared_transactions.clear();
+        for entry in entries {
+            self.prepared_transactions
+                .push(entry)
+                .expect("prepared transaction catalog matches its configured capacity");
+        }
+    }
+
+    pub(crate) fn prepared_transaction_catalog(&self) -> &[PreparedTransactionCatalogEntry] {
+        &self.prepared_transactions
+    }
+
+    pub(crate) fn install_prepared_transaction_catalog_entry(
+        &mut self,
+        entry: PreparedTransactionCatalogEntry,
+    ) -> Result<(), SqlError> {
+        self.prepared_transactions.push(entry).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "prepared transaction manifest exceeds max_prepared_transactions"
+            )
         })
     }
 
@@ -22218,6 +22309,7 @@ impl Storage {
         self.sequences[new] = SequenceDef {
             database: self.current_database,
             created_at: self.catalog_seq,
+            cache_generation: 0,
             schema,
             name,
             ownership,
@@ -22232,10 +22324,12 @@ impl Storage {
             generator_for,
             last_value: Cell::new(spec.start_value),
             is_called: Cell::new(false),
+            log_count: Cell::new(0),
             dirty: Cell::new(false),
             pending_definition: None,
             pending_last_value: Cell::new(spec.start_value),
             pending_is_called: Cell::new(false),
+            pending_log_count: Cell::new(0),
             pending_dirty: Cell::new(false),
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
@@ -22275,6 +22369,11 @@ impl Storage {
                 } else {
                     pending.is_called
                 },
+                log_count: if pending.txid == txid {
+                    sequence.pending_log_count.get()
+                } else {
+                    pending.log_count
+                },
                 ..pending
             });
         let (last_value, is_called) = if sequence
@@ -22299,9 +22398,11 @@ impl Storage {
             generator_for: alteration.generator_for,
             last_value,
             is_called,
+            log_count: 0,
         });
         sequence.pending_last_value.set(last_value);
         sequence.pending_is_called.set(is_called);
+        sequence.pending_log_count.set(0);
         sequence.pending_dirty.set(alteration.restart.is_some());
         Ok(prior)
     }
@@ -22316,10 +22417,12 @@ impl Storage {
             let name = self.sequences[slot].name;
             let last_value = self.sequences[slot].pending_last_value.get();
             let is_called = self.sequences[slot].pending_is_called.get();
+            let log_count = self.sequences[slot].pending_log_count.get();
             let definition = self.sequences[slot].definition_for(txid);
             self.sequences[slot] = definition;
             self.sequences[slot].last_value.set(last_value);
             self.sequences[slot].is_called.set(is_called);
+            self.sequences[slot].log_count.set(log_count);
             self.sequences[slot].dirty.set(false);
             self.sequences[slot].pending_dirty.set(false);
             if old_schema != self.sequences[slot].schema {
@@ -22349,26 +22452,40 @@ impl Storage {
                 .pending_last_value
                 .set(prior.last_value);
             self.sequences[slot].pending_is_called.set(prior.is_called);
+            self.sequences[slot].pending_log_count.set(prior.log_count);
             self.sequences[slot].pending_dirty.set(false);
         } else {
             self.sequences[slot].pending_dirty.set(false);
         }
     }
 
-    pub(crate) fn next_sequence_value(&self, slot: usize, txid: u32) -> Result<i64, SqlError> {
+    pub(crate) fn reserve_sequence_values(
+        &self,
+        slot: usize,
+        txid: u32,
+        requested: i64,
+    ) -> Result<(i64, i64), SqlError> {
         let sequence = &self.sequences[slot];
         if sequence
             .pending_definition
             .is_some_and(|pending| pending.txid == txid)
         {
             let definition = sequence.definition_for(txid);
-            return definition.next_value_with(
+            return definition.reserve_values_with(
                 &sequence.pending_last_value,
                 &sequence.pending_is_called,
+                &sequence.pending_log_count,
                 Some(&sequence.pending_dirty),
+                requested,
             );
         }
-        sequence.next_value()
+        sequence.reserve_values_with(
+            &sequence.last_value,
+            &sequence.is_called,
+            &sequence.log_count,
+            Some(&sequence.dirty),
+            requested,
+        )
     }
 
     pub(crate) fn set_sequence_value(
@@ -22389,6 +22506,7 @@ impl Storage {
                 is_called,
                 &sequence.pending_last_value,
                 &sequence.pending_is_called,
+                &sequence.pending_log_count,
                 Some(&sequence.pending_dirty),
             );
         }
@@ -22416,6 +22534,17 @@ impl Storage {
             );
         }
         (sequence.last_value.get(), sequence.is_called.get())
+    }
+
+    pub(crate) fn sequence_log_count_for(&self, slot: usize, txid: u32) -> i64 {
+        let sequence = &self.sequences[slot];
+        if sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == txid)
+        {
+            return sequence.pending_log_count.get();
+        }
+        sequence.log_count.get()
     }
 
     pub(crate) fn sequence_value_dirty_for(&self, slot: usize, txid: u32) -> bool {
@@ -22455,20 +22584,24 @@ impl Storage {
             let prior = SequenceValueState::Pending {
                 last_value: sequence.pending_last_value.get(),
                 is_called: sequence.pending_is_called.get(),
+                log_count: sequence.pending_log_count.get(),
                 dirty: sequence.pending_dirty.get(),
             };
             sequence.pending_last_value.set(value);
             sequence.pending_is_called.set(false);
+            sequence.pending_log_count.set(0);
             sequence.pending_dirty.set(true);
             return prior;
         }
         let prior = SequenceValueState::Committed {
             last_value: sequence.last_value.get(),
             is_called: sequence.is_called.get(),
+            log_count: sequence.log_count.get(),
             dirty: sequence.dirty.get(),
         };
         sequence.last_value.set(value);
         sequence.is_called.set(false);
+        sequence.log_count.set(0);
         sequence.dirty.set(true);
         prior
     }
@@ -22479,19 +22612,23 @@ impl Storage {
             SequenceValueState::Committed {
                 last_value,
                 is_called,
+                log_count,
                 dirty,
             } => {
                 sequence.last_value.set(last_value);
                 sequence.is_called.set(is_called);
+                sequence.log_count.set(log_count);
                 sequence.dirty.set(dirty);
             }
             SequenceValueState::Pending {
                 last_value,
                 is_called,
+                log_count,
                 dirty,
             } => {
                 sequence.pending_last_value.set(last_value);
                 sequence.pending_is_called.set(is_called);
+                sequence.pending_log_count.set(log_count);
                 sequence.pending_dirty.set(dirty);
             }
         }
@@ -22555,6 +22692,7 @@ impl Storage {
         }) {
             self.sequences[i].last_value.set(last);
             self.sequences[i].is_called.set(is_called);
+            self.sequences[i].log_count.set(0);
             self.sequences[i].dirty.set(false);
         }
     }
@@ -29525,6 +29663,188 @@ impl Storage {
 
     pub(crate) fn lock_mark(&self) -> u64 {
         self.lock_sequence.get()
+    }
+
+    pub(crate) fn encode_transaction_locks(
+        &self,
+        txid: u32,
+        output: &mut FixedBuf,
+    ) -> Result<(), SqlError> {
+        fn append_lock(
+            output: &mut FixedBuf,
+            kind: u8,
+            mode: u8,
+            rowid: u64,
+            schema: &str,
+            table: &str,
+        ) -> Result<(), SqlError> {
+            if schema.len() > u8::MAX as usize
+                || table.len() > u8::MAX as usize
+                || !output.append(&[kind, mode])
+                || !output.append(&rowid.to_le_bytes())
+                || !output.append(&[schema.len() as u8])
+                || !output.append(schema.as_bytes())
+                || !output.append(&[table.len() as u8])
+                || !output.append(table.as_bytes())
+            {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "prepared transaction lock inventory exceeds wal_buffer_bytes"
+                ));
+            }
+            Ok(())
+        }
+
+        output.clear();
+        for lock in self
+            .table_locks
+            .borrow()
+            .iter()
+            .filter(|lock| lock.owner == txid)
+        {
+            let table = &self.tables[lock.table as usize];
+            if !table.live {
+                continue;
+            }
+            for (mode, acquired_at) in lock.modes.iter().enumerate() {
+                if *acquired_at != 0 {
+                    append_lock(
+                        output,
+                        0,
+                        mode as u8,
+                        0,
+                        table.def.schema.as_str(),
+                        table.def.name.as_str(),
+                    )?;
+                }
+            }
+        }
+        self.row_locks
+            .borrow()
+            .visit_owner(txid, |table_slot, rowid, strength| {
+                let table = &self.tables[table_slot];
+                if !table.live {
+                    return Ok(());
+                }
+                append_lock(
+                    output,
+                    1,
+                    strength as u8,
+                    rowid,
+                    table.def.schema.as_str(),
+                    table.def.name.as_str(),
+                )
+            })
+    }
+
+    pub(crate) fn restore_transaction_locks(
+        &self,
+        txid: u32,
+        encoded: &[u8],
+    ) -> Result<(), SqlError> {
+        let mut at = 0usize;
+        while at < encoded.len() {
+            let kind = *encoded.get(at).ok_or_else(|| {
+                sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is truncated")
+            })?;
+            let mode = *encoded.get(at + 1).ok_or_else(|| {
+                sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is truncated")
+            })?;
+            let rowid = u64::from_le_bytes(
+                encoded
+                    .get(at + 2..at + 10)
+                    .ok_or_else(|| {
+                        sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is truncated")
+                    })?
+                    .try_into()
+                    .unwrap(),
+            );
+            at += 10;
+            let schema_len = *encoded.get(at).ok_or_else(|| {
+                sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is truncated")
+            })? as usize;
+            at += 1;
+            let schema =
+                core::str::from_utf8(encoded.get(at..at + schema_len).ok_or_else(|| {
+                    sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is truncated")
+                })?)
+                .map_err(|_| {
+                    sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is not UTF-8")
+                })?;
+            at += schema_len;
+            let table_len = *encoded.get(at).ok_or_else(|| {
+                sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is truncated")
+            })? as usize;
+            at += 1;
+            let table = core::str::from_utf8(encoded.get(at..at + table_len).ok_or_else(|| {
+                sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is truncated")
+            })?)
+            .map_err(|_| sql_err!(sqlstate::DATA_EXCEPTION, "prepared lock WAL is not UTF-8"))?;
+            at += table_len;
+            let slot = self.find_visible(schema, table, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::DATA_EXCEPTION,
+                    "prepared lock WAL targets missing relation \"{}.{}\"",
+                    schema,
+                    table
+                )
+            })?;
+            match kind {
+                0 => {
+                    let table_mode = match mode {
+                        0 => crate::sql::ast::TableLockMode::AccessShare,
+                        1 => crate::sql::ast::TableLockMode::RowShare,
+                        2 => crate::sql::ast::TableLockMode::RowExclusive,
+                        3 => crate::sql::ast::TableLockMode::ShareUpdateExclusive,
+                        4 => crate::sql::ast::TableLockMode::Share,
+                        5 => crate::sql::ast::TableLockMode::ShareRowExclusive,
+                        6 => crate::sql::ast::TableLockMode::Exclusive,
+                        7 => crate::sql::ast::TableLockMode::AccessExclusive,
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "prepared lock WAL has an invalid table-lock mode"
+                            ));
+                        }
+                    };
+                    self.lock_table(txid, slot, table_mode, false)?;
+                }
+                1 => {
+                    let strength = match mode {
+                        0 => crate::sql::ast::LockStrength::Update,
+                        1 => crate::sql::ast::LockStrength::NoKeyUpdate,
+                        2 => crate::sql::ast::LockStrength::Share,
+                        3 => crate::sql::ast::LockStrength::KeyShare,
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "prepared lock WAL has an invalid row-lock mode"
+                            ));
+                        }
+                    };
+                    let decision = self.acquire_row_lock(
+                        slot,
+                        rowid,
+                        txid,
+                        strength,
+                        crate::sql::ast::LockWait::Wait,
+                    )?;
+                    if decision != crate::sql::lock::LockDecision::Acquired {
+                        return Err(sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "recovered prepared locks conflict"
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::DATA_EXCEPTION,
+                        "prepared lock WAL has an invalid lock kind"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn rollback_locks_to(&self, txid: u32, mark: u64) {

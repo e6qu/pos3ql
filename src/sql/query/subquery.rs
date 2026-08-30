@@ -1999,7 +1999,7 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         | ColType::PgDependencies
         | ColType::PgMcvList
         | ColType::PgStatisticArray => Datum::Text(""),
-        ColType::Oid => Datum::Oid(0),
+        ColType::Oid | ColType::Xid => Datum::Oid(0),
         ColType::Regtype => Datum::Regtype {
             referenced_oid: 0,
             name: "-",

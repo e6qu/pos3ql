@@ -9,7 +9,7 @@
 # Usage: tests/external/differential.sh [--keep]
 
 set -u
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../.." || exit
 EXT=tests/external
 ROOT_VENV=${POS3QL_VENV:-target/external-venv}
 EXTENSION_CONTROL_ROOT=${POS3QL_EXTENSION_CONTROL_PATH:-$PWD/$EXT/extensions}
@@ -137,7 +137,7 @@ if [[ "$REFERENCE_MODE" == local ]]; then
     exit 1
   fi
   SOCKDIR=$(mktemp -d /tmp/pos3ql-pgsock.XXXX)
-  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
+  "$PGBIN/pg_ctl" -D "$WORK/pgdata" -o "-p $PG_PORT -k $SOCKDIR -c listen_addresses=127.0.0.1 -c timezone=UTC -c max_prepared_transactions=8 -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
     -l "$WORK/pg.log" start >/dev/null || { bad "pg start"; exit 1; }
 fi
 
@@ -153,6 +153,7 @@ object_store = ${POS3QL_DIFF_OBJECT_STORE:-off}
 max_tables = 64
 table_rows = 8192
 max_value_indexes = 64
+max_prepared_transactions = 8
 memtable_bytes = ${POS3QL_DIFF_MEMTABLE:-256MiB}
 extension_control_path = ${EXTENSION_CONTROL_ROOT}
 ${POS3QL_EXTRA_CONF:-}
@@ -162,7 +163,7 @@ if [[ -n "$DIFF_OBJECT_PREFIX" ]]; then
 fi
 # A leftover server on our port would silently answer the readiness probe
 # below and the whole run would test a stale binary. Refuse to start.
-if nc -z 127.0.0.1 $P3_PORT 2>/dev/null; then
+if nc -z 127.0.0.1 "$P3_PORT" 2>/dev/null; then
   bad "port $P3_PORT is already in use (stale pos3ql from an earlier run?) — kill it first"
   exit 1
 fi
@@ -170,13 +171,13 @@ fi
 "${POS3QL_BIN:-./target/release/pos3ql}" --config "$WORK/p3.conf" > "$WORK/p3.log" 2>&1 &
 P3_PID=$!
 
-for i in {1..50}; do
-  "$PSQL" -h 127.0.0.1 -p $PG_PORT -U postgres -d "$REFERENCE_DATABASE" -X -q -c "SELECT 1" >/dev/null 2>&1 && break
+for _ in {1..50}; do
+  "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -d "$REFERENCE_DATABASE" -X -q -c "SELECT 1" >/dev/null 2>&1 && break
   sleep 0.1
 done
 P3_READY=0
-for i in {1..50}; do
-  if "$PSQL" -h 127.0.0.1 -p $P3_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1; then
+for _ in {1..50}; do
+  if "$PSQL" -h 127.0.0.1 -p "$P3_PORT" -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1; then
     P3_READY=1
     break
   fi
@@ -283,8 +284,8 @@ printf '%s\n' '=== corpus diffs (real PostgreSQL vs pos3ql) ==='
 reset_pair
 for f in $EXT/differential/*.sql; do
   name=$(basename "$f" .sql)
-  run_corpus $PG_PORT "$name.pg" "$f"
-  run_corpus $P3_PORT "$name.p3" "$f"
+  run_corpus "$PG_PORT" "$name.pg" "$f"
+  run_corpus "$P3_PORT" "$name.p3" "$f"
   if diff -u "$WORK/$name.pg" "$WORK/$name.p3" > "$WORK/$name.diff"; then
     ok "differential: $name"
   else
@@ -320,8 +321,8 @@ printf '%s\n' '' '=== exact-error corpora (message wording must match) ==='
 restart_pos3ql_clean
 for f in $EXT/differential_exact/*.sql; do
   name=$(basename "$f" .sql)
-  run_exact $PG_PORT "$name.pg" "$f"
-  run_exact $P3_PORT "$name.p3" "$f"
+  run_exact "$PG_PORT" "$name.pg" "$f"
+  run_exact "$P3_PORT" "$name.p3" "$f"
   if diff -u "$WORK/$name.pg" "$WORK/$name.p3" > "$WORK/$name.diff"; then
     ok "exact errors: $name"
   else
@@ -335,7 +336,7 @@ printf '%s\n' '' '=== binary COPY (wire bytes + cross-load) ==='
 restart_pos3ql_clean
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
   if "$ROOT_VENV/bin/python" "$EXT/copy_binary_diff.py" \
-       --pg $PG_PORT --p3 $P3_PORT > "$WORK/copy-binary.out" 2>&1; then
+       --pg "$PG_PORT" --p3 "$P3_PORT" > "$WORK/copy-binary.out" 2>&1; then
     ok "COPY BINARY differential"
   else
     bad "COPY BINARY differential"
@@ -350,7 +351,7 @@ printf '%s\n' '' '=== accepted-type fidelity matrix ==='
 restart_pos3ql_clean
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
   if "$ROOT_VENV/bin/python" "$EXT/type_fidelity_diff.py" \
-       --pg $PG_PORT --p3 $P3_PORT > "$WORK/type-fidelity.out" 2>&1; then
+       --pg "$PG_PORT" --p3 "$P3_PORT" > "$WORK/type-fidelity.out" 2>&1; then
     ok "accepted-type fidelity matrix ($(tail -1 "$WORK/type-fidelity.out"))"
   else
     bad "accepted-type fidelity matrix"
@@ -380,8 +381,8 @@ if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; th
   "${POS3QL_BIN:-./target/release/pos3ql}" --config "$SLT_CONF" > "$WORK/p3.log" 2>&1 &
   P3_PID=$!
   P3_READY=0
-  for i in {1..50}; do
-    if "$PSQL" -h 127.0.0.1 -p $P3_PORT -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1; then
+  for _ in {1..50}; do
+    if "$PSQL" -h 127.0.0.1 -p "$P3_PORT" -U postgres -X -q -c "SELECT 1" >/dev/null 2>&1; then
       P3_READY=1
       break
     fi
@@ -393,7 +394,7 @@ if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; th
     exit 1
   fi
   SLT_LIMIT=${POS3QL_SLT_LIMIT:-600}
-  if "$SLT_VENV/bin/python" "$EXT/slt_diff.py" --pg $PG_PORT --p3 $P3_PORT \
+  if "$SLT_VENV/bin/python" "$EXT/slt_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
        --limit "$SLT_LIMIT" \
        vendor/test/sqllogictest/test/*.test vendor/test/sqllogictest/test/evidence/*.test \
        "$EXT"/sqllogictest/*.test \
@@ -409,8 +410,8 @@ fi
 
 if (( FUZZ_COUNT > 0 )); then
   printf '%s\n' '' '=== generated SQL differential (PostgreSQL is the oracle) ==='
-  if "$SLT_VENV/bin/python" "$EXT/fuzz_diff.py" --pg $PG_PORT --p3 $P3_PORT \
-      --count $FUZZ_COUNT --seed $FUZZ_SEED --max-unsupported 0 > "$WORK/fuzz.out" 2>&1; then
+  if "$SLT_VENV/bin/python" "$EXT/fuzz_diff.py" --pg "$PG_PORT" --p3 "$P3_PORT" \
+      --count "$FUZZ_COUNT" --seed "$FUZZ_SEED" --max-unsupported 0 > "$WORK/fuzz.out" 2>&1; then
     ok "generated SQL differential ($(grep '^TOTAL' "$WORK/fuzz.out"))"
   else
     bad "generated SQL differential"

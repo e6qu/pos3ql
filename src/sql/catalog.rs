@@ -837,6 +837,7 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_tables"
                 | "pg_indexes"
                 | "pg_views"
+                | "pg_rules"
                 | "pg_matviews"
                 | "pg_sequences"
                 | "pg_sequence"
@@ -1251,6 +1252,7 @@ pub fn synthesize<'a>(
         (false, "pg_sequence") => pg_sequence(storage, txid, arena),
         (false, "pg_database") => pg_database(storage, txid, arena),
         (false, "pg_views") => pg_views(storage, txid, arena),
+        (false, "pg_rules") => pg_rules(storage, txid, arena),
         (true, "tables") => info_tables(storage, txid, arena),
         (true, "columns") => info_columns(storage, txid, arena),
         (true, "schemata") => info_schemata(storage, txid, arena),
@@ -1858,14 +1860,6 @@ pub(crate) fn sequence_state_by_oid(storage: &Storage, oid: i32) -> Option<(i64,
 const FIRST_VIEW_OID: i32 = 100_000;
 pub(crate) fn view_oid(slot: usize) -> i32 {
     FIRST_VIEW_OID + slot as i32
-}
-
-/// PostgreSQL gives each view's `_RETURN` rule a catalog identity distinct
-/// from the view relation. Keeping the mapping slot-based makes rule and
-/// dependency rows survive rename, checkpoint, recovery, and replacement.
-const FIRST_VIEW_REWRITE_OID: i32 = 110_000;
-pub(crate) fn view_rewrite_oid(slot: usize) -> i32 {
-    FIRST_VIEW_REWRITE_OID + slot as i32
 }
 
 pub(crate) fn domain_oid(slot: usize) -> i32 {
@@ -3908,15 +3902,95 @@ pub fn view_def_text<'a>(
             .map(Some)
             .map_err(|_| arena_full());
     }
-    for (slot, view) in storage.views_visible_to(txid) {
+    for (slot, _) in storage.views_visible_to(txid) {
         if view_oid(slot) == oid {
             return arena
-                .alloc_str_display(format_args!("{};", view.sql.as_str()))
+                .alloc_str_display(format_args!("{};", storage.view_sql(slot)))
                 .map(Some)
                 .map_err(|_| arena_full());
         }
     }
     Ok(None)
+}
+
+pub fn rule_def_text<'a>(
+    storage: &Storage,
+    txid: u32,
+    oid: i32,
+    arena: &'a Arena,
+) -> Result<Option<&'a str>, SqlError> {
+    use core::fmt::Write as _;
+    let Some((_, rule)) = storage
+        .rules_visible_to(txid)
+        .find(|(_, rule)| rule.oid() == oid)
+    else {
+        return Ok(None);
+    };
+    let definition = rule.definition_for(txid);
+    let (schema, relation) = match definition.target {
+        crate::storage::RuleTarget::Table(slot) => {
+            let table = storage.table_def(usize::from(slot), txid);
+            (table.schema, table.name)
+        }
+        crate::storage::RuleTarget::View(slot) => {
+            let view = storage.view(usize::from(slot));
+            (view.schema_for(txid), view.name)
+        }
+    };
+    let rule_name = super::eval::quote_ident_str(definition.name.as_str(), arena)?;
+    let schema = super::eval::quote_ident_str(schema.as_str(), arena)?;
+    let relation = super::eval::quote_ident_str(relation.as_str(), arena)?;
+    let mut out = StackStr::<{ crate::storage::RULE_SQL_MAX + 512 }>::new();
+    let _ = write!(
+        out,
+        "CREATE RULE {} AS ON {} TO {}.{}",
+        rule_name,
+        match definition.event {
+            crate::storage::RewriteEvent::Select => "SELECT",
+            crate::storage::RewriteEvent::Insert => "INSERT",
+            crate::storage::RewriteEvent::Update => "UPDATE",
+            crate::storage::RewriteEvent::Delete => "DELETE",
+        },
+        schema,
+        relation,
+    );
+    if let Some(condition) = definition.condition_sql() {
+        let _ = write!(out, " WHERE ({condition})");
+    }
+    let _ = write!(
+        out,
+        " DO {}",
+        if matches!(definition.mode, crate::storage::RewriteMode::Instead) {
+            "INSTEAD "
+        } else {
+            "ALSO "
+        }
+    );
+    if definition.action_count == 0 {
+        let _ = out.write_str("NOTHING;");
+    } else if definition.action_count == 1 {
+        let _ = write!(
+            out,
+            "{};",
+            definition.action_sql().next().expect("one action")
+        );
+    } else {
+        let _ = out.write_char('(');
+        for action in definition.action_sql() {
+            let _ = write!(out, "{action};");
+        }
+        let _ = out.write_str(");");
+    }
+    if out.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "formatted rewrite rule exceeds static output capacity"
+        ));
+    }
+    arena
+        .alloc_str(out.as_str())
+        .map(Some)
+        .map_err(|_| arena_full())
 }
 
 /// The bytes occupied by a relation's visible encoded row images. Plain views
@@ -4057,8 +4131,23 @@ fn pg_description<'a>(
                 };
                 (storage.event_trigger(slot).oid(), 3466)
             }
+            crate::storage::CommentClass::Rule => {
+                let rule = storage
+                    .rules_visible_to(txid)
+                    .map(|(_, rule)| rule)
+                    .find(|rule| {
+                        let definition = rule.definition_for(txid);
+                        definition.name.as_str() == name
+                            && definition.target.comment_subid() == subid
+                    });
+                let Some(rule) = rule else { continue };
+                (rule.oid(), PG_REWRITE_OID)
+            }
         };
-        let catalog_subid = if class == crate::storage::CommentClass::Trigger {
+        let catalog_subid = if matches!(
+            class,
+            crate::storage::CommentClass::Trigger | crate::storage::CommentClass::Rule
+        ) {
             0
         } else {
             subid as i32
@@ -4425,6 +4514,16 @@ pub fn comment_text_for<'a>(
                     && storage
                         .event_trigger_slot(name, txid)
                         .is_some_and(|slot| storage.event_trigger(slot).oid() == oid)
+            }
+            "pg_rewrite" => {
+                class == crate::storage::CommentClass::Rule
+                    && subid == 0
+                    && storage.rules_visible_to(txid).any(|(_, rule)| {
+                        let definition = rule.definition_for(txid);
+                        definition.name.as_str() == name
+                            && definition.target.comment_subid() == csub
+                            && rule.oid() == oid
+                    })
             }
             _ => {
                 class == crate::storage::CommentClass::Relation
@@ -5159,7 +5258,7 @@ pub(crate) fn describe_view<'a>(
     out: &mut [super::types::ColDesc<'a>],
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+    let path = storage.compute_path(storage.view_creation_path_for(view), user.as_str(), txid);
     let slot = storage
         .views_visible_to(txid)
         .find_map(|(slot, candidate)| {
@@ -5167,7 +5266,7 @@ pub(crate) fn describe_view<'a>(
         })
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "view does not exist"))?;
     super::query::describe_stored_query(
-        view.sql.as_str(),
+        storage.view_sql_for(view),
         storage,
         txid,
         path,
@@ -5184,11 +5283,10 @@ fn describe_stored_view<'a>(
     arena: &'a Arena,
     out: &mut [super::types::ColDesc<'a>],
 ) -> Result<usize, SqlError> {
-    let view = storage.view(slot);
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+    let path = storage.compute_path(storage.view_creation_path(slot), user.as_str(), txid);
     super::query::describe_stored_query(
-        view.sql.as_str(),
+        storage.view_sql(slot),
         storage,
         txid,
         path,
@@ -6606,6 +6704,7 @@ fn pg_class<'a>(
             || foreign_keys
                 .iter()
                 .any(|foreign_key| foreign_key.confrelid == toid);
+        let has_rules = storage.table_has_rules(slot, txid);
         let n_checks = table_def.n_checks as i32;
         let statistics = storage.table_statistics(slot, txid);
         let reltuples = if statistics.valid {
@@ -6660,7 +6759,7 @@ fn pg_class<'a>(
                 Datum::Int4(relation_owner),
                 Datum::Int4(n_checks), // relchecks
                 Datum::Bool(has_index),
-                Datum::Bool(false),        // relhasrules
+                Datum::Bool(has_rules),
                 Datum::Bool(has_triggers), // FK enforcement is trigger-backed in PostgreSQL
                 Datum::Bool(table_def.row_level_security.enabled),
                 Datum::Bool(table_def.row_level_security.forced),
@@ -7649,20 +7748,30 @@ fn pg_rewrite<'a>(
             ("is_instead", ColType::Bool),
         ],
     );
-    let count = storage.views_visible_to(txid).count();
+    let count = storage.rules_visible_to(txid).count();
     let out = arena
         .alloc_slice_with(count, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
-    for (index, (slot, _)) in storage.views_visible_to(txid).enumerate() {
+    for (index, (_, rule)) in storage.rules_visible_to(txid).enumerate() {
+        let definition = rule.definition_for(txid);
+        let relation_oid = match definition.target {
+            crate::storage::RuleTarget::Table(slot) => table_oid(storage, usize::from(slot)),
+            crate::storage::RuleTarget::View(slot) => view_oid(usize::from(slot)),
+        };
+        let event = [definition.event.catalog_code()];
+        let event = core::str::from_utf8(&event).expect("catalog event code is ASCII");
         out[index] = row(
             &[
                 Datum::Int4(2618),
-                Datum::Int4(view_rewrite_oid(slot)),
-                text("_RETURN", arena)?,
-                Datum::Int4(view_oid(slot)),
-                text("1", arena)?,
+                Datum::Int4(rule.oid()),
+                text(definition.name.as_str(), arena)?,
+                Datum::Int4(relation_oid),
+                text(event, arena)?,
                 text("O", arena)?,
-                Datum::Bool(true),
+                Datum::Bool(matches!(
+                    definition.mode,
+                    crate::storage::RewriteMode::Instead
+                )),
             ],
             arena,
         )?;
@@ -8349,14 +8458,8 @@ fn pg_depend<'a>(
         )),
     };
     for (view_slot, _) in storage.views_visible_to(txid) {
-        push(
-            2618,
-            view_rewrite_oid(view_slot),
-            PG_CLASS_OID,
-            view_oid(view_slot),
-            0,
-            "i",
-        )?;
+        let rewrite_oid = storage.rule(storage.view_return_rule(view_slot)).oid();
+        push(2618, rewrite_oid, PG_CLASS_OID, view_oid(view_slot), 0, "i")?;
         for dependency in storage.view_dependencies(view_slot).entries() {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
@@ -8364,7 +8467,7 @@ fn pg_depend<'a>(
             if dependency.referenced_columns == 0 {
                 push(
                     2618,
-                    view_rewrite_oid(view_slot),
+                    rewrite_oid,
                     referenced_class,
                     referenced_object,
                     0,
@@ -8375,7 +8478,46 @@ fn pg_depend<'a>(
                     if dependency.referenced_columns & (1u64 << column) != 0 {
                         push(
                             2618,
-                            view_rewrite_oid(view_slot),
+                            rewrite_oid,
+                            referenced_class,
+                            referenced_object,
+                            column as i32 + 1,
+                            "n",
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    for (_, rule) in storage.rules_visible_to(txid) {
+        let definition = rule.definition_for(txid);
+        if matches!(definition.event, crate::storage::RewriteEvent::Select) {
+            continue;
+        }
+        let relation_oid = match definition.target {
+            crate::storage::RuleTarget::Table(slot) => table_oid(storage, usize::from(slot)),
+            crate::storage::RuleTarget::View(slot) => view_oid(usize::from(slot)),
+        };
+        push(2618, rule.oid(), PG_CLASS_OID, relation_oid, 0, "i")?;
+        for dependency in definition.dependencies.entries() {
+            let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
+                continue;
+            };
+            if dependency.referenced_columns == 0 {
+                push(
+                    2618,
+                    rule.oid(),
+                    referenced_class,
+                    referenced_object,
+                    0,
+                    "n",
+                )?;
+            } else {
+                for column in 0..u64::BITS as usize {
+                    if dependency.referenced_columns & (1u64 << column) != 0 {
+                        push(
+                            2618,
+                            rule.oid(),
                             referenced_class,
                             referenced_object,
                             column as i32 + 1,
@@ -12560,13 +12702,58 @@ fn pg_views<'a>(
                     txid,
                     arena,
                 )?,
-                text(view.sql.as_str(), arena)?,
+                text(storage.view_sql(slot), arena)?,
             ],
             arena,
         )?;
         n += 1;
     }
     finish(def, &out[..n], arena)
+}
+
+fn pg_rules<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let def = def_of(
+        "pg_rules",
+        &[
+            ("schemaname", ColType::Name),
+            ("tablename", ColType::Name),
+            ("rulename", ColType::Name),
+            ("definition", ColType::Text),
+        ],
+    );
+    let count = storage.rules_visible_to(txid).count();
+    let rows = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (index, (_, rule)) in storage.rules_visible_to(txid).enumerate() {
+        let definition = rule.definition_for(txid);
+        let (schema, relation) = match definition.target {
+            crate::storage::RuleTarget::Table(slot) => {
+                let table = storage.table_def(usize::from(slot), txid);
+                (table.schema, table.name)
+            }
+            crate::storage::RuleTarget::View(slot) => {
+                let view = storage.view(usize::from(slot));
+                (view.schema_for(txid), view.name)
+            }
+        };
+        rows[index] = row(
+            &[
+                text(schema.as_str(), arena)?,
+                text(relation.as_str(), arena)?,
+                text(definition.name.as_str(), arena)?,
+                rule_def_text(storage, txid, rule.oid(), arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null),
+            ],
+            arena,
+        )?;
+    }
+    finish(def, rows, arena)
 }
 
 fn pg_matviews<'a>(
@@ -13109,7 +13296,7 @@ fn info_views<'a>(
                 text("postgres", arena)?,
                 text(view.schema.as_str(), arena)?,
                 text(view.name.as_str(), arena)?,
-                text(view.sql.as_str(), arena)?,
+                text(storage.view_sql_for(view), arena)?,
                 text("NONE", arena)?,
                 text(writable, arena)?,
                 text(writable, arena)?,

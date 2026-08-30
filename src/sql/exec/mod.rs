@@ -51,6 +51,29 @@ pub struct PhysicalRow {
 
 pub(crate) type DmlScratch = FixedVec<PhysicalRow>;
 
+/// The role whose privileges and row-security policies authorize a DML
+/// target. Rewrite actions use their owning relation's role without changing
+/// SQL-visible session identity.
+#[derive(Clone, Copy)]
+pub(crate) enum DmlAuthorization {
+    Invoker,
+    RuleOwner(u16),
+}
+
+impl DmlAuthorization {
+    fn role(self, storage: &Storage, txid: u32) -> Result<usize, SqlError> {
+        match self {
+            Self::Invoker => storage.current_role_slot(txid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "current role is not present in the role catalog"
+                )
+            }),
+            Self::RuleOwner(role) => Ok(usize::from(role)),
+        }
+    }
+}
+
 /// Wildcard expansion can double the select list.
 pub const MAX_PROJ: usize = MAX_COLUMNS * 2;
 
@@ -220,13 +243,13 @@ pub(crate) use ddl::check_referenced_columns;
 use ddl::{add_unique_key, attach_constraints, auto_key_name, build_column, build_def};
 
 pub(crate) mod constraints;
-pub(crate) use constraints::coerce_domain_value;
 use constraints::{
     MAX_FK_CASCADE_DEPTH, ParsedChecks, apply_fk_parent_actions, check_index_tuple_size,
-    enforce_row_constraints, parse_checks, parse_defaults, parse_generated, referenced_key_changed,
+    enforce_row_constraints, parse_checks, parse_generated, referenced_key_changed,
     table_is_referenced,
 };
 pub use constraints::{check_all_unique, check_unique, check_unique_indexes};
+pub(crate) use constraints::{coerce_domain_value, parse_defaults};
 
 #[derive(Clone, Copy)]
 struct OwnedSequencePlan {
@@ -2499,6 +2522,7 @@ pub fn drop_table(
                     views: dependent_views,
                     matviews: dependent_matviews,
                     routines: dependent_routines,
+                    rules: dependent_rules,
                 } = match closure {
                     Ok(closure) => closure,
                     Err(error) => return sql_fail(error),
@@ -2510,6 +2534,7 @@ pub fn drop_table(
                 let has_dependents = dependent_views.iter().any(|selected| *selected)
                     || dependent_matviews.iter().any(|selected| *selected)
                     || dependent_routines.iter().any(|selected| *selected)
+                    || dependent_rules.iter().any(|selected| *selected)
                     || policy_dependents_exist(
                         storage,
                         txn.txid,
@@ -2534,6 +2559,7 @@ pub fn drop_table(
                             views: &dependent_views,
                             matviews: &dependent_matviews,
                             routines: &dependent_routines,
+                            rules: &dependent_rules,
                             policy_root: Some(policy_root),
                         },
                         false,
@@ -2563,6 +2589,7 @@ pub fn drop_table(
                             views: &dependent_views,
                             matviews: &dependent_matviews,
                             routines: &dependent_routines,
+                            rules: &dependent_rules,
                             policy_root: Some(policy_root),
                         },
                         true,
@@ -2588,6 +2615,7 @@ pub fn drop_table(
                         &dependent_views,
                         &dependent_matviews,
                         &dependent_routines,
+                        &dependent_rules,
                     ) {
                         return sql_fail(error);
                     }
@@ -5779,6 +5807,7 @@ pub fn drop_owned(
         views: dependent_views,
         matviews: dependent_matviews,
         routines: dependent_routines,
+        rules: dependent_rules,
     } = match stored_query_dependent_closure(storage, txn.txid, root) {
         Ok(selection) => selection,
         Err(error) => return sql_fail(error),
@@ -5858,9 +5887,15 @@ pub fn drop_owned(
             routines[slot] |= dependent_routines[slot];
         }
     }
-    if let Err(error) =
-        drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines)
-    {
+    if let Err(error) = drop_selected_stored_queries(
+        storage,
+        wal,
+        txn,
+        &views,
+        &matviews,
+        &routines,
+        &dependent_rules,
+    ) {
         return sql_fail(error);
     }
 
@@ -7700,6 +7735,7 @@ pub fn drop_schema(
                 views: dependent_views,
                 matviews: dependent_matviews,
                 routines: dependent_routines,
+                rules: _dependent_rules,
             } = match closure {
                 Ok(closure) => closure,
                 Err(error) => return sql_fail(error),
@@ -7810,6 +7846,7 @@ pub fn drop_schema(
             views: dependent_views,
             matviews: dependent_matviews,
             routines: dependent_routines,
+            rules: _dependent_rules,
         } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
             in_listed(storage, dependency.schema.as_str())
         }) {
@@ -8487,6 +8524,7 @@ pub fn drop_schema(
                     &[false; MAX_DEPENDENT_STORED_QUERIES],
                     &[false; MAX_DEPENDENT_STORED_QUERIES],
                     &routines,
+                    &[false; MAX_DEPENDENT_STORED_QUERIES],
                 ) {
                     return sql_fail(error);
                 }
@@ -15373,6 +15411,7 @@ fn execute_trigger_block<'a>(
                         txn,
                         scratch,
                         &statement,
+                        DmlAuthorization::Invoker,
                         arena,
                         params,
                         seq_session,
@@ -15464,6 +15503,7 @@ fn execute_trigger_block<'a>(
                         txn,
                         scratch,
                         &statement,
+                        DmlAuthorization::Invoker,
                         arena,
                         params,
                         seq_session,
@@ -15560,6 +15600,7 @@ fn execute_trigger_block<'a>(
                         txn,
                         scratch,
                         &statement,
+                        DmlAuthorization::Invoker,
                         arena,
                         params,
                         seq_session,
@@ -19709,6 +19750,7 @@ pub fn drop_collation(
         views: dependent_views,
         matviews: dependent_matviews,
         routines: dependent_routines,
+        rules: dependent_rules,
     } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
         dependency.class == crate::storage::DependencyClass::Collation
             && dependency.slot as usize == slot
@@ -19723,6 +19765,7 @@ pub fn drop_collation(
     let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
         || dependent_matviews.iter().any(|selected| *selected)
         || dependent_routines.iter().any(|selected| *selected)
+        || dependent_rules.iter().any(|selected| *selected)
         || policy_dependents_exist(
             storage,
             txn.txid,
@@ -19747,6 +19790,7 @@ pub fn drop_collation(
                 views: &dependent_views,
                 matviews: &dependent_matviews,
                 routines: &dependent_routines,
+                rules: &dependent_rules,
                 policy_root: Some(policy_root),
             },
             false,
@@ -19916,6 +19960,7 @@ pub fn drop_collation(
                     views: &dependent_views,
                     matviews: &dependent_matviews,
                     routines: &dependent_routines,
+                    rules: &dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 true,
@@ -19941,6 +19986,7 @@ pub fn drop_collation(
                 &dependent_views,
                 &dependent_matviews,
                 &dependent_routines,
+                &dependent_rules,
             ) {
                 return sql_fail(error);
             }
@@ -20122,6 +20168,7 @@ fn cascade_operator_dependencies(
         views,
         matviews,
         routines,
+        rules,
     } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
         dependency.class == crate::storage::DependencyClass::Operator
             && matches!(
@@ -20137,7 +20184,7 @@ fn cascade_operator_dependencies(
         };
         drop_policy_dependents(storage, wal, txn, root, &views, &matviews, &routines)?;
     }
-    drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines)?;
+    drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines, &rules)?;
     loop {
         let dependent = storage
             .operator_classes_visible_to(txn.txid)
@@ -20392,6 +20439,7 @@ pub(crate) fn drop_operators(
             views: dependent_views,
             matviews: dependent_matviews,
             routines: dependent_routines,
+            rules: dependent_rules,
         } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
             dependency.class == crate::storage::DependencyClass::Operator
                 && matches!(
@@ -20410,6 +20458,7 @@ pub(crate) fn drop_operators(
         let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
             || dependent_matviews.iter().any(|selected| *selected)
             || dependent_routines.iter().any(|selected| *selected)
+            || dependent_rules.iter().any(|selected| *selected)
             || policy_dependents_exist(
                 storage,
                 txn.txid,
@@ -20437,6 +20486,7 @@ pub(crate) fn drop_operators(
                         views: &dependent_views,
                         matviews: &dependent_matviews,
                         routines: &dependent_routines,
+                        rules: &dependent_rules,
                         policy_root: Some(policy_root),
                     },
                     false,
@@ -20467,6 +20517,7 @@ pub(crate) fn drop_operators(
                     views: &dependent_views,
                     matviews: &dependent_matviews,
                     routines: &dependent_routines,
+                    rules: &dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 true,
@@ -24427,6 +24478,7 @@ pub fn drop_routine(
             views: dependent_views,
             matviews: dependent_matviews,
             routines: mut dependent_routines,
+            rules: dependent_rules,
         } = match stored_query_dependent_closure(storage, txn.txid, |dependency| {
             dependency.class == crate::storage::DependencyClass::Routine
                 && dependency.slot as usize == slot
@@ -24443,6 +24495,7 @@ pub fn drop_routine(
         let has_stored_dependents = dependent_views.iter().any(|selected| *selected)
             || dependent_matviews.iter().any(|selected| *selected)
             || dependent_routines.iter().any(|selected| *selected)
+            || dependent_rules.iter().any(|selected| *selected)
             || policy_dependents_exist(
                 storage,
                 txn.txid,
@@ -24471,6 +24524,7 @@ pub fn drop_routine(
                     views: &dependent_views,
                     matviews: &dependent_matviews,
                     routines: &dependent_routines,
+                    rules: &dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 false,
@@ -24500,6 +24554,7 @@ pub fn drop_routine(
                     views: &dependent_views,
                     matviews: &dependent_matviews,
                     routines: &dependent_routines,
+                    rules: &dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 true,
@@ -24529,6 +24584,7 @@ pub fn drop_routine(
                 &dependent_views,
                 &dependent_matviews,
                 &dependent_routines,
+                &dependent_rules,
             )
         {
             return sql_fail(error);
@@ -24863,6 +24919,723 @@ pub fn create_view(
     sql_ok()
 }
 
+fn rule_target(
+    storage: &Storage,
+    name: crate::sql::ast::QualName<'_>,
+    txid: u32,
+) -> Result<crate::storage::RuleTarget, SqlError> {
+    match storage.resolve_relation(name.schema, name.name, txid) {
+        Some(crate::storage::ResolvedRelation::Table(slot)) => u16::try_from(slot)
+            .map(crate::storage::RuleTarget::Table)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "relation slot is out of range"
+                )
+            }),
+        Some(crate::storage::ResolvedRelation::View(slot)) => u16::try_from(slot)
+            .map(crate::storage::RuleTarget::View)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "relation slot is out of range"
+                )
+            }),
+        Some(crate::storage::ResolvedRelation::Catalog) => Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied: system catalog rewrite rules are fixed"
+        )),
+        None => Err(sql_err!(
+            sqlstate::UNDEFINED_TABLE,
+            "relation \"{}\" does not exist",
+            name.name
+        )),
+    }
+}
+
+struct RuleConditionColumns<'a> {
+    names: [&'a str; crate::storage::MAX_COLUMNS],
+    metadata: [StaticTypeMeta; crate::storage::MAX_COLUMNS],
+    count: usize,
+    old: bool,
+    new: bool,
+}
+
+impl<'value> ColumnLookup<'value> for RuleConditionColumns<'_> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'value>, SqlError> {
+        self.col_type(qualifier, name)
+            .map(|_| Datum::Null)
+            .ok_or_else(|| {
+                if qualifier.is_some_and(|value| {
+                    !value.eq_ignore_ascii_case("old") && !value.eq_ignore_ascii_case("new")
+                }) {
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "missing FROM-clause entry for table \"{}\"",
+                        qualifier.unwrap_or("")
+                    )
+                } else {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    )
+                }
+            })
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        let available = match qualifier {
+            Some(value) if value.eq_ignore_ascii_case("old") => self.old,
+            Some(value) if value.eq_ignore_ascii_case("new") => self.new,
+            _ => false,
+        };
+        available
+            .then(|| {
+                self.names[..self.count]
+                    .iter()
+                    .position(|column| *column == name)
+            })
+            .flatten()
+            .map(|column| self.metadata[column].ctype)
+    }
+}
+
+impl ColTypeResolver for RuleConditionColumns<'_> {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        self.col_type(qualifier, name).ok_or_else(|| {
+            if qualifier.is_some_and(|value| {
+                !value.eq_ignore_ascii_case("old") && !value.eq_ignore_ascii_case("new")
+            }) {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    qualifier.unwrap_or("")
+                )
+            } else {
+                sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    name
+                )
+            }
+        })
+    }
+
+    fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
+        let available = match qualifier {
+            Some(value) if value.eq_ignore_ascii_case("old") => self.old,
+            Some(value) if value.eq_ignore_ascii_case("new") => self.new,
+            _ => false,
+        };
+        available
+            .then(|| {
+                self.names[..self.count]
+                    .iter()
+                    .position(|column| *column == name)
+            })
+            .flatten()
+            .map(|column| self.metadata[column])
+    }
+
+    fn is_whole_row(&self, name: &str) -> bool {
+        (name.eq_ignore_ascii_case("old") && self.old)
+            || (name.eq_ignore_ascii_case("new") && self.new)
+    }
+
+    fn whole_row_field(
+        &self,
+        name: &str,
+        index: usize,
+    ) -> Option<(crate::util::StackStr<64>, StaticTypeMeta)> {
+        if !self.is_whole_row(name) || index >= self.count {
+            return None;
+        }
+        Some((
+            crate::util::StackStr::from_str(self.names[index]),
+            self.metadata[index],
+        ))
+    }
+}
+
+fn stored_rule_definition(
+    storage: &Storage,
+    txn: &TxnState,
+    rule: &crate::sql::ast::CreateRule<'_>,
+    target: crate::storage::RuleTarget,
+    raw_path: &str,
+    arena: &Arena,
+) -> Result<crate::storage::RuleDefinition, SqlError> {
+    use core::fmt::Write;
+    let event = match rule.event {
+        crate::sql::ast::RuleEvent::Select => crate::storage::RewriteEvent::Select,
+        crate::sql::ast::RuleEvent::Update => crate::storage::RewriteEvent::Update,
+        crate::sql::ast::RuleEvent::Insert => crate::storage::RewriteEvent::Insert,
+        crate::sql::ast::RuleEvent::Delete => crate::storage::RewriteEvent::Delete,
+    };
+    let mode = match rule.mode {
+        crate::sql::ast::RuleMode::Also => crate::storage::RewriteMode::Also,
+        crate::sql::ast::RuleMode::Instead => crate::storage::RewriteMode::Instead,
+    };
+    let rule_owner = u16::try_from(storage.object_owner(target.access_object(), txn.txid))
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "rewrite-rule owner is out of range"
+            )
+        })?;
+    let mut condition_columns = RuleConditionColumns {
+        names: [""; crate::storage::MAX_COLUMNS],
+        metadata: [StaticTypeMeta {
+            ctype: ColType::Text,
+            type_oid: crate::sql::types::oid::TEXT,
+            type_mod: -1,
+            collation: crate::sql::ast::Collation::Default,
+        }; crate::storage::MAX_COLUMNS],
+        count: 0,
+        old: !matches!(event, crate::storage::RewriteEvent::Insert),
+        new: !matches!(event, crate::storage::RewriteEvent::Delete),
+    };
+    match target {
+        crate::storage::RuleTarget::Table(slot) => {
+            let definition = storage.table_def(usize::from(slot), txn.txid);
+            condition_columns.count = definition.n_columns;
+            for (index, column) in definition.columns().iter().enumerate() {
+                condition_columns.names[index] = column.name.as_str();
+                condition_columns.metadata[index] = StaticTypeMeta {
+                    ctype: column.ctype,
+                    type_oid: storage
+                        .routine_type_oid(column.ctype, column.user_type, txn.txid)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "rule target column has an unknown type"
+                            )
+                        })?,
+                    type_mod: column.type_mod,
+                    collation: column.collation,
+                };
+            }
+        }
+        crate::storage::RuleTarget::View(slot) => {
+            let mut descriptions = [ColDesc::new("", 0, 0); MAX_PROJ];
+            condition_columns.count = super::catalog::describe_view(
+                storage,
+                txn.txid,
+                storage.view(usize::from(slot)),
+                arena,
+                &mut descriptions,
+            )?;
+            for (index, description) in descriptions
+                .iter()
+                .enumerate()
+                .take(condition_columns.count)
+            {
+                condition_columns.names[index] = description.name;
+                let ctype = catalog_column_type(storage, txn.txid, description.type_oid)
+                    .map(|(ctype, _)| ctype)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "view column has an unknown type"
+                        )
+                    })?;
+                condition_columns.metadata[index] = StaticTypeMeta {
+                    ctype,
+                    type_oid: description.type_oid,
+                    type_mod: description.type_mod,
+                    collation: description.collation,
+                };
+            }
+        }
+    }
+    if matches!(event, crate::storage::RewriteEvent::Select) {
+        if !matches!(target, crate::storage::RuleTarget::View(_)) {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "ON SELECT rule target must be a view"
+            ));
+        }
+        if rule.name != "_return"
+            || !matches!(mode, crate::storage::RewriteMode::Instead)
+            || rule.condition.is_some()
+            || rule.actions.len() != 1
+            || !matches!(
+                rule.actions[0].statement,
+                crate::sql::ast::Stmt::Select(_) | crate::sql::ast::Stmt::SetQuery(_)
+            )
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "view rule must be named \"_RETURN\", be unconditional INSTEAD, and contain one SELECT action"
+            ));
+        }
+    } else if rule.name == "_return" {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "rule \"_RETURN\" must be an ON SELECT rule"
+        ));
+    }
+    if rule.condition.is_some()
+        && rule.actions.iter().any(|action| {
+            !matches!(
+                action.statement,
+                crate::sql::ast::Stmt::Select(_)
+                    | crate::sql::ast::Stmt::SetQuery(_)
+                    | crate::sql::ast::Stmt::Insert(_)
+                    | crate::sql::ast::Stmt::Update(_)
+                    | crate::sql::ast::Stmt::Delete(_)
+            )
+        })
+    {
+        return Err(sql_err!(
+            sqlstate::INVALID_OBJECT_DEFINITION,
+            "rules with WHERE conditions can only have SELECT, INSERT, UPDATE, or DELETE actions"
+        ));
+    }
+    let mut returning_action = None;
+    for (index, action) in rule.actions.iter().enumerate() {
+        if !super::query::statement_returns_rows(action.statement) {
+            continue;
+        }
+        if rule.condition.is_some() || !matches!(mode, crate::storage::RewriteMode::Instead) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "RETURNING lists are not supported in conditional or non-INSTEAD rules"
+            ));
+        }
+        if returning_action.replace(index as u8).is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot have multiple RETURNING lists in a rule"
+            ));
+        }
+    }
+    if returning_action.is_some()
+        && storage
+            .rules_for(target, event, txn.txid)
+            .any(|(_, existing)| {
+                let existing = existing.definition_for(txn.txid);
+                existing.returning_action.is_some()
+                    && !(rule.or_replace && existing.name.as_str() == rule.name)
+            })
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot have multiple RETURNING lists in rules for the same relation and event"
+        ));
+    }
+    if let Some(condition) = rule.condition {
+        if condition.contains_subquery() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use subquery in rule condition"
+            ));
+        }
+        if super::query::expr_has_aggregate(condition) {
+            return Err(sql_err!(
+                sqlstate::GROUPING_ERROR,
+                "aggregate functions are not allowed in rule conditions"
+            ));
+        }
+        let mut invalid = None;
+        condition.for_each_column_reference(&mut |qualifier, column| {
+            if invalid.is_some() {
+                return;
+            }
+            let Some(qualifier) = qualifier else {
+                invalid = Some(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "rule condition column \"{}\" must be qualified with OLD or NEW",
+                    column
+                ));
+                return;
+            };
+            let old = qualifier.eq_ignore_ascii_case("old");
+            let new = qualifier.eq_ignore_ascii_case("new");
+            if !old && !new {
+                invalid = Some(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "rule condition may only reference OLD or NEW"
+                ));
+            } else if old && matches!(event, crate::storage::RewriteEvent::Insert) {
+                invalid = Some(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "ON INSERT rule cannot reference OLD"
+                ));
+            } else if new && matches!(event, crate::storage::RewriteEvent::Delete) {
+                invalid = Some(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "ON DELETE rule cannot reference NEW"
+                ));
+            } else if condition_columns.names[..condition_columns.count]
+                .iter()
+                .all(|candidate| *candidate != column)
+            {
+                invalid = Some(sql_err!(
+                    sqlstate::UNDEFINED_COLUMN,
+                    "column \"{}\" does not exist",
+                    column
+                ));
+            }
+        });
+        if let Some(error) = invalid {
+            return Err(error);
+        }
+        let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+        let hooks = super::eval::EvalHooks {
+            catalog: Some(&catalog),
+            ..super::eval::NO_HOOKS
+        };
+        if super::eval::expression_type_identity(condition, &condition_columns, &hooks)?
+            .record_field_oid()
+            != ColType::Bool.oid()
+        {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "rule WHERE condition must be type boolean"
+            ));
+        }
+    }
+    let mut source = crate::util::StackStr::<{ crate::storage::RULE_SQL_MAX }>::new();
+    let condition = if let Some(sql) = rule.condition_sql {
+        let start = source.as_str().len();
+        let _ = source.write_str(sql);
+        let len = source.as_str().len().saturating_sub(start);
+        let _ = source.write_char('\n');
+        Some(crate::storage::RuleTextSpan {
+            start: start as u16,
+            len: len as u16,
+        })
+    } else {
+        None
+    };
+    let mut actions =
+        [crate::storage::RuleTextSpan { start: 0, len: 0 }; crate::storage::MAX_RULE_ACTIONS];
+    for (index, action) in rule.actions.iter().enumerate() {
+        let start = source.as_str().len();
+        let _ = source.write_str(action.sql);
+        let len = source.as_str().len().saturating_sub(start);
+        let _ = source.write_char('\n');
+        actions[index] = crate::storage::RuleTextSpan {
+            start: start as u16,
+            len: len as u16,
+        };
+    }
+    if source.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "rewrite rule definition exceeds {} bytes",
+            crate::storage::RULE_SQL_MAX
+        ));
+    }
+    let mut creation_path = crate::util::StackStr::<128>::new();
+    let _ = creation_path.write_str(raw_path);
+    if creation_path.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "search_path is too long to store with a rewrite rule"
+        ));
+    }
+    let path = storage.compute_path(
+        raw_path,
+        super::eval::funcs::system::session_user_owned().as_str(),
+        txn.txid,
+    );
+    let dependencies = super::query::stored_rule_dependencies(
+        rule.actions,
+        storage,
+        txn.txid,
+        path,
+        arena,
+        &condition_columns,
+    )?;
+    let transition_values = [&Expr::Null; crate::storage::MAX_COLUMNS];
+    for action in rule.actions {
+        super::query::expand_stored_rule_action_exec(
+            action.statement,
+            storage,
+            txn.txid,
+            path,
+            &dependencies,
+            arena,
+            crate::sql::eval::NO_PARAMS,
+            None,
+            rule_owner,
+            &condition_columns.names[..condition_columns.count],
+            &transition_values[..condition_columns.count],
+            &transition_values[..condition_columns.count],
+            condition_columns.old,
+            condition_columns.new,
+        )?;
+    }
+    Ok(crate::storage::RuleDefinition {
+        name: SqlName::parse(rule.name)?,
+        target,
+        event,
+        mode,
+        source,
+        condition,
+        actions,
+        action_count: rule.actions.len() as u8,
+        returning_action,
+        creation_path,
+        dependencies,
+    })
+}
+
+pub fn create_rule(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    rule: &crate::sql::ast::CreateRule<'_>,
+    raw_path: &str,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let target = match rule_target(storage, rule.table, txn.txid) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
+        return sql_fail(error);
+    }
+    let definition = match stored_rule_definition(storage, txn, rule, target, raw_path, arena) {
+        Ok(definition) => definition,
+        Err(error) => return sql_fail(error),
+    };
+    let existing = storage.rule_slot(target, rule.name, txn.txid);
+    let (slot, prior) = match storage.create_rule(definition, rule.or_replace, txn.txid) {
+        Ok(created) => created,
+        Err(error) => return sql_fail(error),
+    };
+    let prior_table_rule_txid = existing
+        .is_none()
+        .then(|| storage.begin_rule_history(target, txn.txid))
+        .flatten();
+    if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
+        if existing.is_some() {
+            storage.rollback_rule_alter(slot, prior);
+        } else {
+            storage.rollback_rule_create(slot, prior_table_rule_txid);
+        }
+        return sql_fail(error);
+    }
+    let undo = if existing.is_some() {
+        super::txn::DdlUndo::RuleAltered {
+            slot: slot as u32,
+            prior,
+        }
+    } else {
+        super::txn::DdlUndo::RuleCreated {
+            slot: slot as u32,
+            prior_table_rule_txid,
+        }
+    };
+    if let Err(error) = txn.record_ddl(undo) {
+        if existing.is_some() {
+            storage.rollback_rule_alter(slot, prior);
+        } else {
+            storage.rollback_rule_create(slot, prior_table_rule_txid);
+        }
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE RULE")?;
+    sql_ok()
+}
+
+pub fn alter_rule(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    table: crate::sql::ast::QualName<'_>,
+    new_name: &str,
+    responder: &mut Responder,
+) -> Outcome {
+    let target = match rule_target(storage, table, txn.txid) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
+        return sql_fail(error);
+    }
+    let Some(slot) = storage.rule_slot(target, name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "rule \"{}\" for relation \"{}\" does not exist",
+            name,
+            table.name
+        ));
+    };
+    let mut definition = storage.rule(slot).definition_for(txn.txid);
+    definition.name = match SqlName::parse(new_name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let prior = match storage.alter_rule(slot, definition, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
+        storage.rollback_rule_alter(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_rule_alter(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER RULE")?;
+    sql_ok()
+}
+
+pub fn drop_rule(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    rule: crate::sql::ast::DropRule<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let crate::sql::ast::DropRule {
+        name,
+        table,
+        if_exists,
+        cascade: _,
+    } = rule;
+    let target = match rule_target(storage, table, txn.txid) {
+        Ok(target) => target,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = storage.require_owner(target.access_object(), txn.txid, "relation") {
+        return sql_fail(error);
+    }
+    let Some(slot) = storage.rule_slot(target, name, txn.txid) else {
+        if if_exists {
+            responder.notice(
+                sqlstate::UNDEFINED_OBJECT,
+                stack_format!(
+                    128,
+                    "rule \"{}\" for relation \"{}\" does not exist, skipping",
+                    name,
+                    table.name
+                )
+                .as_str(),
+            )?;
+            responder.command_complete("DROP RULE")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "rule \"{}\" for relation \"{}\" does not exist",
+            name,
+            table.name
+        ));
+    };
+    if storage.rule(slot).definition_for(txn.txid).event == crate::storage::RewriteEvent::Select {
+        return sql_fail(sql_err!(
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "cannot drop rule _RETURN on view \"{}\"",
+            table.name
+        ));
+    }
+    storage.drop_rule(slot, txn.txid);
+    let (target_kind, schema, relation) = match target {
+        crate::storage::RuleTarget::Table(slot) => {
+            let definition = storage.table_def(usize::from(slot), txn.txid);
+            (
+                crate::wal::TriggerTargetKind::Table,
+                definition.schema,
+                definition.name,
+            )
+        }
+        crate::storage::RuleTarget::View(slot) => {
+            let definition = storage.view(usize::from(slot));
+            (
+                crate::wal::TriggerTargetKind::View,
+                definition.schema_for(txn.txid),
+                definition.name,
+            )
+        }
+    };
+    let lsn = storage.lsn() + 1;
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::DropRule {
+            target: target_kind,
+            table_schema: schema.as_str(),
+            table: relation.as_str(),
+            name,
+        },
+    ) {
+        storage.rollback_rule_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    storage.set_lsn(lsn);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleDropped(slot as u32)) {
+        storage.rollback_rule_drop(slot, txn.txid);
+        return sql_fail(error);
+    }
+    responder.command_complete("DROP RULE")?;
+    sql_ok()
+}
+
+fn stage_rule(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &TxnState,
+    slot: usize,
+    definition: crate::storage::RuleDefinition,
+) -> Result<(), SqlError> {
+    let (target, schema, relation) = match definition.target {
+        crate::storage::RuleTarget::Table(slot) => {
+            let table = storage.table_def(usize::from(slot), txn.txid);
+            (
+                crate::wal::TriggerTargetKind::Table,
+                table.schema,
+                table.name,
+            )
+        }
+        crate::storage::RuleTarget::View(slot) => {
+            let view = storage.view(usize::from(slot));
+            (
+                crate::wal::TriggerTargetKind::View,
+                view.schema_for(txn.txid),
+                view.name,
+            )
+        }
+    };
+    let lsn = storage.lsn() + 1;
+    wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetRule {
+            slot: slot as u16,
+            created_at: storage.rule(slot).created_at,
+            target,
+            table_schema: schema.as_str(),
+            table: relation.as_str(),
+            name: definition.name.as_str(),
+            event: definition.event,
+            mode: definition.mode,
+            source: definition.source.as_str(),
+            condition: definition.condition,
+            actions: definition.actions,
+            action_count: definition.action_count,
+            returning_action: definition.returning_action,
+            path: definition.creation_path.as_str(),
+            dependencies: crate::wal::WalStoredQueryDependencies::Captured(
+                &definition.dependencies,
+            ),
+        },
+    )?;
+    storage.set_lsn(lsn);
+    Ok(())
+}
+
 /// `COMMENT ON <object> IS { 'text' | NULL }`. Resolves and kind-checks the
 /// object, applies the comment as this transaction's uncommitted overlay, and
 /// journals it (promoted on commit, discarded on rollback — like other DDL).
@@ -24951,11 +25724,10 @@ pub fn comment(
                         relation.name
                     ));
                 };
-                let view = storage.view(slot).clone();
                 let user = super::eval::funcs::system::session_user_owned();
                 let view_path =
-                    storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
-                let view_sql = match arena.alloc_str(view.sql.as_str()) {
+                    storage.compute_path(storage.view_creation_path(slot), user.as_str(), txid);
+                let view_sql = match arena.alloc_str(storage.view_sql(slot)) {
                     Ok(sql) => sql,
                     Err(_) => return sql_fail(super::query::arena_full_pub()),
                 };
@@ -25173,6 +25945,33 @@ pub fn comment(
             };
             (
                 CommentClass::Trigger,
+                SqlName::EMPTY,
+                name,
+                target.comment_subid(),
+            )
+        }
+        CommentTarget::Rule(identity) => {
+            let target = match rule_target(storage, identity.table, txid) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = storage.require_owner(target.access_object(), txid, "relation") {
+                return sql_fail(error);
+            }
+            if storage.rule_slot(target, identity.name, txid).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "rule \"{}\" for relation \"{}\" does not exist",
+                    identity.name,
+                    identity.table.name
+                ));
+            }
+            let name = match SqlName::parse(identity.name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (
+                CommentClass::Rule,
                 SqlName::EMPTY,
                 name,
                 target.comment_subid(),
@@ -25935,6 +26734,7 @@ pub fn drop_materialized_view(
             views: dependent_views,
             matviews: dependent_matviews,
             routines: dependent_routines,
+            rules: dependent_rules,
         } = match closure {
             Ok(closure) => closure,
             Err(error) => return sql_fail(error),
@@ -25946,6 +26746,7 @@ pub fn drop_materialized_view(
         let has_dependents = dependent_views.iter().any(|selected| *selected)
             || dependent_matviews.iter().any(|selected| *selected)
             || dependent_routines.iter().any(|selected| *selected)
+            || dependent_rules.iter().any(|selected| *selected)
             || policy_dependents_exist(
                 storage,
                 txn.txid,
@@ -25980,6 +26781,7 @@ pub fn drop_materialized_view(
                 &dependent_views,
                 &dependent_matviews,
                 &dependent_routines,
+                &dependent_rules,
             ) {
                 return sql_fail(error);
             }
@@ -26518,6 +27320,7 @@ pub fn drop_sequence(
             views: dependent_views,
             matviews: dependent_matviews,
             routines: dependent_routines,
+            rules: dependent_rules,
         } = match closure {
             Ok(closure) => closure,
             Err(error) => return sql_fail(error),
@@ -26529,6 +27332,7 @@ pub fn drop_sequence(
         let has_dependents = dependent_views.iter().any(|selected| *selected)
             || dependent_matviews.iter().any(|selected| *selected)
             || dependent_routines.iter().any(|selected| *selected)
+            || dependent_rules.iter().any(|selected| *selected)
             || policy_dependents_exist(
                 storage,
                 txn.txid,
@@ -26553,6 +27357,7 @@ pub fn drop_sequence(
                     views: &dependent_views,
                     matviews: &dependent_matviews,
                     routines: &dependent_routines,
+                    rules: &dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 false,
@@ -26582,6 +27387,7 @@ pub fn drop_sequence(
                     views: &dependent_views,
                     matviews: &dependent_matviews,
                     routines: &dependent_routines,
+                    rules: &dependent_rules,
                     policy_root: Some(policy_root),
                 },
                 true,
@@ -26607,6 +27413,7 @@ pub fn drop_sequence(
                 &dependent_views,
                 &dependent_matviews,
                 &dependent_routines,
+                &dependent_rules,
             ) {
                 return sql_fail(error);
             }
@@ -27175,6 +27982,7 @@ fn drop_type_dependent_routines(
         views,
         matviews,
         routines: dependent_routines,
+        rules: dependent_rules,
     } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
         dependency.class == crate::storage::DependencyClass::Routine
             && selected
@@ -27201,7 +28009,15 @@ fn drop_type_dependent_routines(
     for slot in 0..storage.routine_count() {
         selected[slot] |= dependent_routines[slot];
     }
-    drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &selected)?;
+    drop_selected_stored_queries(
+        storage,
+        wal,
+        txn,
+        &views,
+        &matviews,
+        &selected,
+        &dependent_rules,
+    )?;
 
     loop {
         let dependency =
@@ -28535,6 +29351,7 @@ fn drop_composite_type(
         views: dependent_views,
         matviews: dependent_matviews,
         routines: dependent_routines,
+        rules: dependent_rules,
     } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
         dependency.class == crate::storage::DependencyClass::Composite
             && dependency.slot as usize == slot
@@ -28675,6 +29492,7 @@ fn drop_composite_type(
             &dependent_views,
             &dependent_matviews,
             &dependent_routines,
+            &dependent_rules,
         )?;
         drop_domain_selection(
             storage,
@@ -28993,6 +29811,7 @@ fn apply_type_drop_to_stored_queries(
         views,
         matviews,
         routines: dependent_routines,
+        rules: dependent_rules,
     } = stored_query_dependent_closure(storage, txn.txid, root)?;
     let has_policies = storage
         .policies_with_slots_visible_to(txn.txid)
@@ -29012,6 +29831,7 @@ fn apply_type_drop_to_stored_queries(
     if !views.iter().any(|selected| *selected)
         && !matviews.iter().any(|selected| *selected)
         && !dependent_routines.iter().any(|selected| *selected)
+        && !dependent_rules.iter().any(|selected| *selected)
         && !has_policies
     {
         return Ok(());
@@ -29042,7 +29862,15 @@ fn apply_type_drop_to_stored_queries(
             drop_policy_slot(storage, wal, txn, slot)?;
         }
     }
-    drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &dependent_routines)
+    drop_selected_stored_queries(
+        storage,
+        wal,
+        txn,
+        &views,
+        &matviews,
+        &dependent_routines,
+        &dependent_rules,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -29079,12 +29907,13 @@ fn policy_depends_on_type_selection(
     )
 }
 
-const MAX_DEPENDENT_STORED_QUERIES: usize = 64;
+const MAX_DEPENDENT_STORED_QUERIES: usize = 128;
 
 struct StoredDependencyClosure {
     views: [bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: [bool; MAX_DEPENDENT_STORED_QUERIES],
     routines: [bool; MAX_DEPENDENT_STORED_QUERIES],
+    rules: [bool; MAX_DEPENDENT_STORED_QUERIES],
 }
 
 fn stored_query_dependent_closure(
@@ -29097,6 +29926,11 @@ fn stored_query_dependent_closure(
         || storage.matview_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage.table_count() > MAX_DEPENDENT_STORED_QUERIES
         || storage.routine_count() > MAX_DEPENDENT_STORED_QUERIES
+        || storage
+            .rules_visible_to(txid)
+            .filter(|(_, rule)| !rule.definition_for(txid).is_view_return())
+            .count()
+            > MAX_DEPENDENT_STORED_QUERIES
     {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -29107,6 +29941,7 @@ fn stored_query_dependent_closure(
     let mut views = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut matviews = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut routines = [false; MAX_DEPENDENT_STORED_QUERIES];
+    let mut rules = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut matview_tables = [false; MAX_DEPENDENT_STORED_QUERIES];
     loop {
         let mut changed = false;
@@ -29166,6 +30001,35 @@ fn stored_query_dependent_closure(
                 changed = true;
             }
         }
+        for (slot, rule) in storage.rules_visible_to(txid) {
+            let definition = rule.definition_for(txid);
+            if definition.is_view_return() {
+                continue;
+            }
+            if slot >= rules.len() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "stored-query dependency closure exceeds {} rewrite-rule slots",
+                    MAX_DEPENDENT_STORED_QUERIES
+                ));
+            }
+            if rules[slot] {
+                continue;
+            }
+            let hit = definition.dependencies.entries().iter().any(|dependency| {
+                root(dependency)
+                    || (dependency.class == DependencyClass::View
+                        && views[dependency.slot as usize])
+                    || (dependency.class == DependencyClass::Table
+                        && matview_tables[dependency.slot as usize])
+                    || (dependency.class == DependencyClass::Routine
+                        && routines[dependency.slot as usize])
+            });
+            if hit {
+                rules[slot] = true;
+                changed = true;
+            }
+        }
         let mut slot = 0;
         while slot < storage.matview_count() {
             let matview = storage.matview(slot);
@@ -29210,6 +30074,7 @@ fn stored_query_dependent_closure(
         views,
         matviews,
         routines,
+        rules,
     })
 }
 
@@ -29408,12 +30273,14 @@ fn apply_column_drop_dependencies(
         views,
         matviews,
         routines: dependent_routines,
+        rules: dependent_rules,
     } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
         dependency_references_table_column(dependency, table, column)
     })?;
     let has_stored_dependents = views.iter().any(|selected| *selected)
         || matviews.iter().any(|selected| *selected)
-        || dependent_routines.iter().any(|selected| *selected);
+        || dependent_routines.iter().any(|selected| *selected)
+        || dependent_rules.iter().any(|selected| *selected);
     let policy_root = PolicyDependencySelection::TableColumn { table, column };
     let has_policy_dependents = policy_dependents_exist(
         storage,
@@ -29527,6 +30394,7 @@ fn apply_column_drop_dependencies(
             views: &views,
             matviews: &matviews,
             routines: &dependent_routines,
+            rules: &dependent_rules,
             policy_root: Some(policy_root),
         },
         cascade,
@@ -29553,7 +30421,15 @@ fn apply_column_drop_dependencies(
         &matviews,
         &dependent_routines,
     )?;
-    drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &dependent_routines)
+    drop_selected_stored_queries(
+        storage,
+        wal,
+        txn,
+        &views,
+        &matviews,
+        &dependent_routines,
+        &dependent_rules,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -29628,6 +30504,7 @@ struct StoredQuerySelection<'a> {
     views: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
     routines: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
+    rules: &'a [bool; MAX_DEPENDENT_STORED_QUERIES],
     policy_root: Option<PolicyDependencySelection>,
 }
 
@@ -29657,6 +30534,7 @@ fn report_stored_query_dependents(
     let views = selection.views;
     let matviews = selection.matviews;
     let routines = selection.routines;
+    let rules = selection.rules;
     let policy_selected = |policy: &crate::storage::PolicyDef| {
         selection.policy_root.is_some_and(|root| {
             policy_depends_on_dependency_drop(
@@ -29673,6 +30551,7 @@ fn report_stored_query_dependents(
     let count = views.iter().filter(|selected| **selected).count()
         + matviews.iter().filter(|selected| **selected).count()
         + routines.iter().filter(|selected| **selected).count()
+        + rules.iter().filter(|selected| **selected).count()
         + storage
             .policies_with_slots_visible_to(txid)
             .filter(|(_, policy)| policy_selected(policy))
@@ -29869,9 +30748,48 @@ fn report_stored_query_dependents(
             let _ = write!(out, "{}", suffix.as_str());
             Ok(())
         };
+    let describe_rule = |slot: usize, out: &mut crate::util::StackStr<192>| {
+        let definition = storage.rule(slot).definition_for(txid);
+        let (schema, relation) = match definition.target {
+            crate::storage::RuleTarget::Table(table) => {
+                let table = storage.table_def(usize::from(table), txid);
+                (table.schema, table.name)
+            }
+            crate::storage::RuleTarget::View(view) => {
+                let view = storage.view(usize::from(view));
+                (view.schema, view.name)
+            }
+        };
+        let _ = write!(out, "rule {} on ", definition.name.as_str());
+        write_name(out, &schema, &relation);
+    };
     let mut detail =
         crate::util::StackStr::<{ crate::sql::eval::MAX_DIAGNOSTIC_DETAIL_BYTES }>::new();
     let mut written = 0usize;
+    for (slot, selected) in rules.iter().copied().enumerate() {
+        if !selected {
+            continue;
+        }
+        let mut object = crate::util::StackStr::<192>::new();
+        describe_rule(slot, &mut object);
+        let _ = write!(
+            detail,
+            "{}{}{}",
+            if written == 0 { "" } else { "\n" },
+            if cascade { "drop cascades to " } else { "" },
+            object.as_str()
+        );
+        if !cascade {
+            let _ = write!(detail, " depends on {} ", root.kind);
+            if in_path(root.schema.as_str()) {
+                let _ = write!(detail, "{}", root.name.as_str());
+            } else {
+                let _ = write!(detail, "{}.{}", root.schema.as_str(), root.name.as_str());
+            }
+            let _ = write!(detail, "{}", root.suffix.as_str());
+        }
+        written += 1;
+    }
     for (_, policy) in storage
         .policies_with_slots_visible_to(txid)
         .filter(|(_, policy)| policy_selected(policy))
@@ -30156,7 +31074,44 @@ fn drop_selected_stored_queries(
     views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    rules: &[bool; MAX_DEPENDENT_STORED_QUERIES],
 ) -> Result<(), SqlError> {
+    for slot in (0..rules.len()).rev() {
+        if !rules[slot] || storage.rule_slot_visible_to(slot, txn.txid).is_none() {
+            continue;
+        }
+        let definition = storage.rule(slot).definition_for(txn.txid);
+        if definition.event == crate::storage::RewriteEvent::Select {
+            continue;
+        }
+        let (target, schema, relation) = match definition.target {
+            crate::storage::RuleTarget::Table(table) => {
+                let table = storage.table_def(usize::from(table), txn.txid);
+                (
+                    crate::wal::TriggerTargetKind::Table,
+                    table.schema,
+                    table.name,
+                )
+            }
+            crate::storage::RuleTarget::View(view) => {
+                let view = storage.view(usize::from(view));
+                (crate::wal::TriggerTargetKind::View, view.schema, view.name)
+            }
+        };
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::DropRule {
+                target,
+                table_schema: schema.as_str(),
+                table: relation.as_str(),
+                name: definition.name.as_str(),
+            },
+        )?;
+        storage.drop_rule(slot, txn.txid);
+        txn.record_ddl(super::txn::DdlUndo::RuleDropped(slot as u32))?;
+    }
     // Dependents are already closed transitively. Reverse slot order avoids
     // immediately reusing a just-freed low slot while this plan is executing.
     for slot in (0..storage.view_count()).rev() {
@@ -31449,11 +32404,14 @@ fn rewrite_composite_dependent_views(
         }
         let view = storage.view(view_slot).clone();
         let dependencies = *storage.view_dependencies(view_slot);
+        let view_sql =
+            StackStr::<{ crate::storage::VIEW_SQL_MAX }>::from_str(storage.view_sql(view_slot));
+        let creation_path = StackStr::<128>::from_str(storage.view_creation_path(view_slot));
         let user = super::eval::funcs::system::session_user_owned();
-        let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txn.txid);
+        let path = storage.compute_path(creation_path.as_str(), user.as_str(), txn.txid);
         let mut sites = [false; crate::storage::VIEW_SQL_MAX];
         let site_count = super::query::stored_query_composite_field_rename_sites(
-            view.sql.as_str(),
+            view_sql.as_str(),
             path,
             &dependencies,
             &super::query::StoredQueryCompositeFieldRename {
@@ -31466,13 +32424,13 @@ fn rewrite_composite_dependent_views(
             &mut sites,
         )?;
         let rewritten = rewrite_composite_field_site_flags(
-            view.sql.as_str(),
+            view_sql.as_str(),
             rename,
             &sites,
             site_count,
             arena,
         )?;
-        if rewritten == view.sql {
+        if rewritten == view_sql {
             continue;
         }
         let dependencies = super::query::stored_query_dependencies(
@@ -31487,7 +32445,7 @@ fn rewrite_composite_dependent_views(
             view.name,
             crate::storage::StoredQueryDefinition {
                 sql: rewritten,
-                creation_path: view.creation_path,
+                creation_path,
                 dependencies,
             },
             view.security,
@@ -31502,7 +32460,7 @@ fn rewrite_composite_dependent_views(
                 schema: view.schema.as_str(),
                 name: view.name.as_str(),
                 sql: rewritten.as_str(),
-                path: view.creation_path.as_str(),
+                path: creation_path.as_str(),
                 security_invoker: matches!(view.security, crate::storage::ViewSecurity::Invoker),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
             },
@@ -32441,6 +33399,7 @@ pub fn drop_view(
                 views: dependent_views,
                 matviews: dependent_matviews,
                 routines: dependent_routines,
+                rules: dependent_rules,
             } = match closure {
                 Ok(closure) => closure,
                 Err(error) => return sql_fail(error),
@@ -32452,6 +33411,7 @@ pub fn drop_view(
             let has_dependents = dependent_views.iter().any(|selected| *selected)
                 || dependent_matviews.iter().any(|selected| *selected)
                 || dependent_routines.iter().any(|selected| *selected)
+                || dependent_rules.iter().any(|selected| *selected)
                 || policy_dependents_exist(
                     storage,
                     txn.txid,
@@ -32487,6 +33447,7 @@ pub fn drop_view(
                     &dependent_views,
                     &dependent_matviews,
                     &dependent_routines,
+                    &dependent_rules,
                 ) {
                     return sql_fail(error);
                 }
@@ -40953,9 +41914,9 @@ pub(crate) fn view_trigger_definition(
     let view = storage.view(view_slot);
     let mut columns = [ColDesc::new("", 0, 0); MAX_COLUMNS];
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+    let path = storage.compute_path(storage.view_creation_path(view_slot), user.as_str(), txid);
     let n_columns = super::query::describe_stored_query(
-        view.sql.as_str(),
+        storage.view_sql(view_slot),
         storage,
         txid,
         path,
@@ -41064,6 +42025,7 @@ pub(crate) fn instead_of_view_dml<'a>(
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
     statement: &'a Stmt<'a>,
+    authorization: DmlAuthorization,
     view_slot: usize,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -41089,7 +42051,13 @@ pub(crate) fn instead_of_view_dml<'a>(
         TriggerEvents::DELETE => crate::storage::PrivilegeSet::DELETE,
         _ => unreachable!(),
     };
-    if let Err(error) = require_view_privilege(storage, view_slot, privilege, txn.txid) {
+    let authorization_role = match authorization.role(storage, txn.txid) {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) =
+        require_view_privilege_as(storage, view_slot, privilege, authorization_role, txn.txid)
+    {
         return sql_fail(error);
     }
     if !storage
@@ -41590,11 +42558,10 @@ fn materialize_view_rows<'a>(
     params: &[Datum<'a>],
     capacity: usize,
 ) -> Result<&'a [&'a [u8]], SqlError> {
-    let view = storage.view(view_slot);
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+    let path = storage.compute_path(storage.view_creation_path(view_slot), user.as_str(), txid);
     let source = arena
-        .alloc_str(view.sql.as_str())
+        .alloc_str(storage.view_sql(view_slot))
         .map_err(|_| super::query::arena_full_pub())?;
     let select = super::parser::parse_query(source, arena)?;
     let select = super::query::expand_stored_query(
@@ -41735,6 +42702,7 @@ pub(crate) fn insert<'a, 'scope, 'outer, 'snapshot>(
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
     statement: &Insert<'a>,
+    authorization: DmlAuthorization,
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
@@ -41755,6 +42723,10 @@ where
         Err(e) => return sql_fail(e),
     };
     let def = *storage.table_def(table_index, txn.txid);
+    let authorization_role = match authorization.role(storage, txn.txid) {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if statement.columns.is_empty() {
         for (i, target) in targets.iter_mut().enumerate().take(def.n_columns) {
@@ -41778,11 +42750,12 @@ where
     let insert_columns = targets[..n_targets]
         .iter()
         .fold(0u64, |mask, column| mask | (1u64 << column));
-    if let Err(error) = require_table_column_privilege(
+    if let Err(error) = require_table_column_privilege_as(
         storage,
         table_index,
         crate::storage::PrivilegeSet::INSERT,
         insert_columns,
+        authorization_role,
         txn.txid,
     ) {
         return sql_fail(error);
@@ -41820,11 +42793,12 @@ where
         None => None,
     };
     if let Some(updated_columns) = conflict_update_columns
-        && let Err(error) = require_table_column_privilege(
+        && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::UPDATE,
             updated_columns,
+            authorization_role,
             txn.txid,
         )
     {
@@ -41869,11 +42843,12 @@ where
         Err(error) => return sql_fail(error),
     };
     if conflict_read_columns != 0
-        && let Err(error) = require_table_column_privilege(
+        && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::SELECT,
             conflict_read_columns,
+            authorization_role,
             txn.txid,
         )
     {
@@ -41887,15 +42862,7 @@ where
     ) {
         return sql_fail(error);
     }
-    let current_role = match storage.current_role_slot(txn.txid) {
-        Some(role) => role,
-        None => {
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "current role is not present in the role catalog"
-            ));
-        }
-    };
+    let current_role = authorization_role;
     let insert_check = match super::query::plan_row_security(
         storage,
         table_index,
@@ -42763,6 +43730,7 @@ pub(crate) fn update<'a>(
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
     statement: &Update<'a>,
+    authorization: DmlAuthorization,
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
@@ -42777,6 +43745,10 @@ pub(crate) fn update<'a>(
         Err(e) => return sql_fail(e),
     };
     let def = *storage.table_def(table_index, txn.txid);
+    let authorization_role = match authorization.role(storage, txn.txid) {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
     let mut targets = [0usize; MAX_COLUMNS];
     let mut updated_columns = 0u64;
     for (i, (name, _)) in statement.assignments.iter().enumerate() {
@@ -42826,21 +43798,23 @@ pub(crate) fn update<'a>(
         Ok(reads) => reads,
         Err(error) => return sql_fail(error),
     };
-    if let Err(error) = require_table_column_privilege(
+    if let Err(error) = require_table_column_privilege_as(
         storage,
         table_index,
         crate::storage::PrivilegeSet::UPDATE,
         updated_columns,
+        authorization_role,
         txn.txid,
     ) {
         return sql_fail(error);
     }
     if reads_target != 0
-        && let Err(error) = require_table_column_privilege(
+        && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::SELECT,
             reads_target,
+            authorization_role,
             txn.txid,
         )
     {
@@ -42934,15 +43908,7 @@ pub(crate) fn update<'a>(
         project_sets: None,
         sequences: None,
     };
-    let current_role = match storage.current_role_slot(txn.txid) {
-        Some(role) => role,
-        None => {
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "current role is not present in the role catalog"
-            ));
-        }
-    };
+    let current_role = authorization_role;
     let update_security = match super::query::plan_row_security(
         storage,
         table_index,
@@ -43566,6 +44532,7 @@ pub(crate) fn delete<'a>(
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
     statement: &Delete<'a>,
+    authorization: DmlAuthorization,
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
@@ -43579,10 +44546,15 @@ pub(crate) fn delete<'a>(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
-    if let Err(error) = require_table_privilege(
+    let authorization_role = match authorization.role(storage, txn.txid) {
+        Ok(role) => role,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = require_table_privilege_as(
         storage,
         table_index,
         crate::storage::PrivilegeSet::DELETE,
+        authorization_role,
         txn.txid,
     ) {
         return sql_fail(error);
@@ -43622,11 +44594,12 @@ pub(crate) fn delete<'a>(
         Err(error) => return sql_fail(error),
     };
     if reads_target != 0
-        && let Err(error) = require_table_column_privilege(
+        && let Err(error) = require_table_column_privilege_as(
             storage,
             table_index,
             crate::storage::PrivilegeSet::SELECT,
             reads_target,
+            authorization_role,
             txn.txid,
         )
     {
@@ -43677,15 +44650,7 @@ pub(crate) fn delete<'a>(
         project_sets: None,
         sequences: None,
     };
-    let current_role = match storage.current_role_slot(txn.txid) {
-        Some(role) => role,
-        None => {
-            return sql_fail(sql_err!(
-                sqlstate::INSUFFICIENT_PRIVILEGE,
-                "current role is not present in the role catalog"
-            ));
-        }
-    };
+    let current_role = authorization_role;
     let delete_security = match super::query::plan_row_security(
         storage,
         table_index,
@@ -49054,6 +50019,235 @@ fn undefined_qual(name: &QualName) -> SqlError {
     }
 }
 
+pub(crate) fn require_rewrite_input_privileges(
+    storage: &Storage,
+    statement: &crate::sql::ast::Stmt<'_>,
+    authorization: DmlAuthorization,
+    txid: u32,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let role = authorization.role(storage, txid)?;
+    let (relation, privilege) = match statement {
+        crate::sql::ast::Stmt::Insert(insert) => {
+            (insert.table, crate::storage::PrivilegeSet::INSERT)
+        }
+        crate::sql::ast::Stmt::Update(update) => {
+            (update.table, crate::storage::PrivilegeSet::UPDATE)
+        }
+        crate::sql::ast::Stmt::Delete(delete) => {
+            (delete.table, crate::storage::PrivilegeSet::DELETE)
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "rewrite input is not data-modifying"
+            ));
+        }
+    };
+    let resolved = storage.resolve_relation(relation.schema, relation.name, txid);
+    let target_dependency = match resolved {
+        Some(crate::storage::ResolvedRelation::Table(table)) => {
+            Some((crate::storage::DependencyClass::Table, table))
+        }
+        Some(crate::storage::ResolvedRelation::View(view)) => {
+            Some((crate::storage::DependencyClass::View, view))
+        }
+        Some(crate::storage::ResolvedRelation::Catalog) | None => None,
+    };
+    let (read_dependencies, source_dependencies) =
+        super::query::dml_input_dependencies(statement, storage, txid, *storage.path(), arena)?;
+    for dependency in read_dependencies.entries() {
+        if !matches!(
+            dependency.class,
+            crate::storage::DependencyClass::Table | crate::storage::DependencyClass::View
+        ) {
+            continue;
+        }
+        let slot = usize::from(dependency.slot);
+        let target_only = target_dependency == Some((dependency.class, slot))
+            && dependency.referenced_columns == 0
+            && !source_dependencies.depends_on(dependency.class, slot);
+        if target_only {
+            continue;
+        }
+        match dependency.class {
+            crate::storage::DependencyClass::Table => require_table_read_privilege_as(
+                storage,
+                slot,
+                dependency.referenced_columns,
+                role,
+                txid,
+            )?,
+            crate::storage::DependencyClass::View => require_view_privilege_as(
+                storage,
+                slot,
+                crate::storage::PrivilegeSet::SELECT,
+                role,
+                txid,
+            )?,
+            _ => unreachable!(),
+        }
+    }
+    if let Some(crate::storage::ResolvedRelation::View(view)) = resolved {
+        return require_view_privilege_as(storage, view, privilege, role, txid);
+    }
+    match statement {
+        crate::sql::ast::Stmt::Insert(insert) => {
+            let table = resolve_dml_table(storage, &insert.table, txid)?;
+            let definition = storage.table_def(table, txid);
+            let mut insert_columns = 0u64;
+            if insert.columns.is_empty() {
+                insert_columns = all_columns_mask(definition);
+            } else {
+                for name in insert.columns {
+                    let column = definition.column_index(name).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            name,
+                            insert.table.name
+                        )
+                    })?;
+                    insert_columns |= 1u64 << column;
+                }
+            }
+            require_table_column_privilege_as(
+                storage,
+                table,
+                crate::storage::PrivilegeSet::INSERT,
+                insert_columns,
+                role,
+                txid,
+            )?;
+            let read_columns = returning_dml_target_columns(
+                insert.returning,
+                definition,
+                None,
+                storage,
+                txid,
+                arena,
+            )?;
+            if read_columns != 0 {
+                require_table_column_privilege_as(
+                    storage,
+                    table,
+                    crate::storage::PrivilegeSet::SELECT,
+                    read_columns,
+                    role,
+                    txid,
+                )?;
+            }
+        }
+        crate::sql::ast::Stmt::Update(update) => {
+            let table = resolve_dml_table(storage, &update.table, txid)?;
+            let definition = storage.table_def(table, txid);
+            let mut updated_columns = 0u64;
+            let mut read_columns = 0u64;
+            for (name, expression) in update.assignments {
+                let column = definition.column_index(name).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        update.table.name
+                    )
+                })?;
+                updated_columns |= 1u64 << column;
+                read_columns |= expression_dml_target_columns(
+                    expression,
+                    definition,
+                    update.alias,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
+            if let Some(expression) = update.where_clause {
+                read_columns |= expression_dml_target_columns(
+                    expression,
+                    definition,
+                    update.alias,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
+            read_columns |= returning_dml_target_columns(
+                update.returning,
+                definition,
+                update.alias,
+                storage,
+                txid,
+                arena,
+            )?;
+            require_table_column_privilege_as(
+                storage,
+                table,
+                crate::storage::PrivilegeSet::UPDATE,
+                updated_columns,
+                role,
+                txid,
+            )?;
+            if read_columns != 0 {
+                require_table_column_privilege_as(
+                    storage,
+                    table,
+                    crate::storage::PrivilegeSet::SELECT,
+                    read_columns,
+                    role,
+                    txid,
+                )?;
+            }
+        }
+        crate::sql::ast::Stmt::Delete(delete) => {
+            let table = resolve_dml_table(storage, &delete.table, txid)?;
+            let definition = storage.table_def(table, txid);
+            require_table_privilege_as(
+                storage,
+                table,
+                crate::storage::PrivilegeSet::DELETE,
+                role,
+                txid,
+            )?;
+            let mut read_columns = returning_dml_target_columns(
+                delete.returning,
+                definition,
+                delete.alias,
+                storage,
+                txid,
+                arena,
+            )?;
+            if let Some(expression) = delete.where_clause {
+                read_columns |= expression_dml_target_columns(
+                    expression,
+                    definition,
+                    delete.alias,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
+            if read_columns != 0 {
+                require_table_column_privilege_as(
+                    storage,
+                    table,
+                    crate::storage::PrivilegeSet::SELECT,
+                    read_columns,
+                    role,
+                    txid,
+                )?;
+            }
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "rewrite input is not data-modifying"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Resolves a DML/DDL target through the search path to a table slot.
 pub(crate) fn resolve_dml_table(
     storage: &Storage,
@@ -49072,13 +50266,23 @@ fn require_table_privilege(
     privilege: crate::storage::PrivilegeSet,
     txid: u32,
 ) -> Result<(), SqlError> {
-    storage.require_schema_usage(storage.table_def(table, txid).schema.as_str(), txid)?;
     let role = storage.current_role_slot(txid).ok_or_else(|| {
         sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "current role is not present in the role catalog"
         )
     })?;
+    require_table_privilege_as(storage, table, privilege, role, txid)
+}
+
+fn require_table_privilege_as(
+    storage: &Storage,
+    table: usize,
+    privilege: crate::storage::PrivilegeSet,
+    role: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    storage.require_schema_usage_as(storage.table_def(table, txid).schema.as_str(), role, txid)?;
     if storage.has_object_privilege(
         storage.table_access_object(table, txid),
         role,
@@ -49101,13 +50305,24 @@ fn require_table_column_privilege(
     columns: u64,
     txid: u32,
 ) -> Result<(), SqlError> {
-    storage.require_schema_usage(storage.table_def(table, txid).schema.as_str(), txid)?;
     let role = storage.current_role_slot(txid).ok_or_else(|| {
         sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "current role is not present in the role catalog"
         )
     })?;
+    require_table_column_privilege_as(storage, table, privilege, columns, role, txid)
+}
+
+fn require_table_column_privilege_as(
+    storage: &Storage,
+    table: usize,
+    privilege: crate::storage::PrivilegeSet,
+    columns: u64,
+    role: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    storage.require_schema_usage_as(storage.table_def(table, txid).schema.as_str(), role, txid)?;
     let object = storage.table_access_object(table, txid);
     if storage.has_object_privilege(object, role, privilege, txid) {
         return Ok(());
@@ -49130,20 +50345,80 @@ fn require_table_column_privilege(
     ))
 }
 
+fn require_table_read_privilege_as(
+    storage: &Storage,
+    table: usize,
+    columns: u64,
+    role: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    storage.require_schema_usage_as(storage.table_def(table, txid).schema.as_str(), role, txid)?;
+    let object = storage.table_access_object(table, txid);
+    if storage.has_object_privilege(object, role, crate::storage::PrivilegeSet::SELECT, txid) {
+        return Ok(());
+    }
+    let definition = storage.table_def(table, txid);
+    let allowed = if columns == 0 {
+        (0..definition.n_columns).any(|column| {
+            crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(|target| {
+                storage.has_column_privilege(
+                    target,
+                    role,
+                    crate::storage::PrivilegeSet::SELECT,
+                    txid,
+                )
+            })
+        })
+    } else {
+        (0..definition.n_columns)
+            .filter(|column| columns & (1u64 << column) != 0)
+            .all(|column| {
+                crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(
+                    |target| {
+                        storage.has_column_privilege(
+                            target,
+                            role,
+                            crate::storage::PrivilegeSet::SELECT,
+                            txid,
+                        )
+                    },
+                )
+            })
+    };
+    if allowed {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::INSUFFICIENT_PRIVILEGE,
+        "permission denied for table {}",
+        definition.name.as_str()
+    ))
+}
+
 fn require_view_privilege(
     storage: &Storage,
     view: usize,
     privilege: crate::storage::PrivilegeSet,
     txid: u32,
 ) -> Result<(), SqlError> {
-    let definition = storage.view(view);
-    storage.require_schema_usage(definition.schema.as_str(), txid)?;
     let role = storage.current_role_slot(txid).ok_or_else(|| {
         sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "current role is not present in the role catalog"
         )
     })?;
+    require_view_privilege_as(storage, view, privilege, role, txid)
+}
+
+fn require_view_privilege_as(
+    storage: &Storage,
+    view: usize,
+    privilege: crate::storage::PrivilegeSet,
+    role: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let definition = storage.view(view);
+    storage.require_schema_usage_as(definition.schema.as_str(), role, txid)?;
     let object = crate::storage::AccessObject {
         class: crate::storage::AccessClass::View,
         slot: view as u16,

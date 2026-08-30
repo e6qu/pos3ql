@@ -151,6 +151,8 @@ const KIND_SET_CONVERSION: u8 = 101;
 const KIND_DROP_CONVERSION: u8 = 102;
 const KIND_SET_EVENT_TRIGGER: u8 = 103;
 const KIND_DROP_EVENT_TRIGGER: u8 = 104;
+const KIND_SET_RULE: u8 = 105;
+const KIND_DROP_RULE: u8 = 106;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -158,7 +160,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DROP_EVENT_TRIGGER;
+const LAST_KIND: u8 = KIND_DROP_RULE;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -495,6 +497,29 @@ pub(crate) enum WalOp<'a> {
     },
     DropView {
         schema: &'a str,
+        name: &'a str,
+    },
+    SetRule {
+        slot: u16,
+        created_at: u64,
+        target: TriggerTargetKind,
+        table_schema: &'a str,
+        table: &'a str,
+        name: &'a str,
+        event: crate::storage::RewriteEvent,
+        mode: crate::storage::RewriteMode,
+        source: &'a str,
+        condition: Option<crate::storage::RuleTextSpan>,
+        actions: [crate::storage::RuleTextSpan; crate::storage::MAX_RULE_ACTIONS],
+        action_count: u8,
+        returning_action: Option<u8>,
+        path: &'a str,
+        dependencies: WalStoredQueryDependencies<'a>,
+    },
+    DropRule {
+        target: TriggerTargetKind,
+        table_schema: &'a str,
+        table: &'a str,
         name: &'a str,
     },
     CreatePublication {
@@ -1760,6 +1785,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Truncate { .. } => KIND_TRUNCATE,
         WalOp::CreateView { .. } => KIND_CREATE_VIEW,
         WalOp::DropView { .. } => KIND_DROP_VIEW,
+        WalOp::SetRule { .. } => KIND_SET_RULE,
+        WalOp::DropRule { .. } => KIND_DROP_RULE,
         WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION,
         WalOp::DropPublication { .. } => KIND_DROP_PUBLICATION,
         WalOp::AlterPublication { .. } => KIND_ALTER_PUBLICATION,
@@ -1986,6 +2013,41 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::SetRule {
+            table_schema,
+            table,
+            name,
+            source,
+            action_count,
+            path,
+            dependencies,
+            ..
+        } => {
+            2 + 8
+                + 1
+                + 1
+                + table_schema.len()
+                + 1
+                + table.len()
+                + 1
+                + name.len()
+                + 2
+                + 2
+                + source.len()
+                + 4
+                + 1
+                + usize::from(*action_count) * 4
+                + 1
+                + 2
+                + path.len()
+                + dependencies.encoded_len()
+        }
+        WalOp::DropRule {
+            table_schema,
+            table,
+            name,
+            ..
+        } => 1 + 1 + table_schema.len() + 1 + table.len() + 1 + name.len(),
         WalOp::CreatePublication {
             name,
             table_count,
@@ -3261,6 +3323,61 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && dependencies.append(buffer)
         }
         WalOp::DropView { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
+        WalOp::SetRule {
+            slot,
+            created_at,
+            target,
+            table_schema,
+            table,
+            name,
+            event,
+            mode,
+            source,
+            condition,
+            actions,
+            action_count,
+            returning_action,
+            path,
+            dependencies,
+        } => {
+            let condition = condition.unwrap_or(crate::storage::RuleTextSpan {
+                start: u16::MAX,
+                len: 0,
+            });
+            let mut ok = buffer.append(&slot.to_le_bytes())
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&[target.code()])
+                && name_bytes(buffer, table_schema)
+                && name_bytes(buffer, table)
+                && name_bytes(buffer, name)
+                && buffer.append(&[*event as u8, *mode as u8])
+                && source.len() <= u16::MAX as usize
+                && buffer.append(&(source.len() as u16).to_le_bytes())
+                && buffer.append(source.as_bytes())
+                && buffer.append(&condition.start.to_le_bytes())
+                && buffer.append(&condition.len.to_le_bytes())
+                && buffer.append(&[*action_count]);
+            for action in &actions[..usize::from(*action_count)] {
+                ok &= buffer.append(&action.start.to_le_bytes())
+                    && buffer.append(&action.len.to_le_bytes());
+            }
+            ok && buffer.append(&[returning_action.unwrap_or(u8::MAX)])
+                && path.len() <= u16::MAX as usize
+                && buffer.append(&(path.len() as u16).to_le_bytes())
+                && buffer.append(path.as_bytes())
+                && dependencies.append(buffer)
+        }
+        WalOp::DropRule {
+            target,
+            table_schema,
+            table,
+            name,
+        } => {
+            buffer.append(&[target.code()])
+                && name_bytes(buffer, table_schema)
+                && name_bytes(buffer, table)
+                && name_bytes(buffer, name)
+        }
         WalOp::CreatePublication {
             name,
             owner,
@@ -5497,6 +5614,115 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropView { schema, name })
+        }
+        KIND_SET_RULE => {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
+            at += 1;
+            let table_schema = take_name(&mut at)?;
+            let table = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let event = crate::storage::RewriteEvent::from_code(*payload.get(at)?)?;
+            at += 1;
+            let mode = crate::storage::RewriteMode::from_code(*payload.get(at)?)?;
+            at += 1;
+            let source_len = usize::from(u16::from_le_bytes(
+                payload.get(at..at + 2)?.try_into().ok()?,
+            ));
+            at += 2;
+            let source = core::str::from_utf8(payload.get(at..at + source_len)?).ok()?;
+            at += source_len;
+            let condition_start = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let condition_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let valid_span = |span: crate::storage::RuleTextSpan| {
+                let start = usize::from(span.start);
+                let end = start.checked_add(usize::from(span.len));
+                end.is_some_and(|end| {
+                    end <= source.len()
+                        && source.is_char_boundary(start)
+                        && source.is_char_boundary(end)
+                })
+            };
+            let condition = if condition_start == u16::MAX {
+                if condition_len != 0 {
+                    return None;
+                }
+                None
+            } else {
+                let span = crate::storage::RuleTextSpan {
+                    start: condition_start,
+                    len: condition_len,
+                };
+                valid_span(span).then_some(span)?.into()
+            };
+            let action_count = *payload.get(at)?;
+            at += 1;
+            if usize::from(action_count) > crate::storage::MAX_RULE_ACTIONS {
+                return None;
+            }
+            let mut actions = [crate::storage::RuleTextSpan { start: 0, len: 0 };
+                crate::storage::MAX_RULE_ACTIONS];
+            for action in &mut actions[..usize::from(action_count)] {
+                action.start = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+                action.len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+                if !valid_span(*action) {
+                    return None;
+                }
+            }
+            let returning_action = match *payload.get(at)? {
+                u8::MAX => None,
+                index if index < action_count => Some(index),
+                _ => return None,
+            };
+            at += 1;
+            let path_len = usize::from(u16::from_le_bytes(
+                payload.get(at..at + 2)?.try_into().ok()?,
+            ));
+            at += 2;
+            let path = core::str::from_utf8(payload.get(at..at + path_len)?).ok()?;
+            at += path_len;
+            let encoded = payload.get(at..)?;
+            if !validate_stored_query_dependencies(encoded) {
+                return None;
+            }
+            let dependencies = WalStoredQueryDependencies::Encoded(encoded);
+            Some(WalOp::SetRule {
+                slot,
+                created_at,
+                target,
+                table_schema,
+                table,
+                name,
+                event,
+                mode,
+                source,
+                condition,
+                actions,
+                action_count,
+                returning_action,
+                path,
+                dependencies,
+            })
+        }
+        KIND_DROP_RULE => {
+            let target = TriggerTargetKind::from_code(*payload.get(at)?)?;
+            at += 1;
+            let table_schema = take_name(&mut at)?;
+            let table = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropRule {
+                target,
+                table_schema,
+                table,
+                name,
+            })
         }
         KIND_CREATE_PUBLICATION => {
             let name = take_name(&mut at)?;

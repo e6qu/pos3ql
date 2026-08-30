@@ -336,6 +336,9 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DropTable(_)
         | Stmt::Truncate { .. }
         | Stmt::CreateView { .. }
+        | Stmt::CreateRule(_)
+        | Stmt::AlterRule { .. }
+        | Stmt::DropRule(_)
         | Stmt::CreateRoutine(_)
         | Stmt::CreateAggregate(_)
         | Stmt::CreateCast(_)
@@ -666,6 +669,9 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::AlterTable(_) => "ALTER TABLE",
         Stmt::CreateView { .. } => "CREATE VIEW",
         Stmt::DropView { .. } => "DROP VIEW",
+        Stmt::CreateRule(_) => "CREATE RULE",
+        Stmt::AlterRule { .. } => "ALTER RULE",
+        Stmt::DropRule(_) => "DROP RULE",
         Stmt::RefreshMaterializedView { .. } => "REFRESH MATERIALIZED VIEW",
         Stmt::DropMaterializedView { .. } => "DROP MATERIALIZED VIEW",
         Stmt::CreateTableAs { kind, .. } => match kind {
@@ -798,6 +804,7 @@ fn event_trigger_drop_command(statement: &Stmt<'_>) -> bool {
             statement,
             Stmt::DropTable(_)
                 | Stmt::DropView { .. }
+                | Stmt::DropRule(_)
                 | Stmt::DropMaterializedView { .. }
                 | Stmt::DropFunction { .. }
                 | Stmt::DropProcedure { .. }
@@ -1068,6 +1075,7 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
         "ALTER POLICY",
         "ALTER PROCEDURE",
         "ALTER PUBLICATION",
+        "ALTER RULE",
         "ALTER ROUTINE",
         "ALTER SEQUENCE",
         "ALTER STATISTICS",
@@ -1092,6 +1100,7 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
         "CREATE POLICY",
         "CREATE PROCEDURE",
         "CREATE PUBLICATION",
+        "CREATE RULE",
         "CREATE SCHEMA",
         "CREATE SEQUENCE",
         "CREATE STATISTICS",
@@ -1118,6 +1127,7 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
         "DROP POLICY",
         "DROP PROCEDURE",
         "DROP PUBLICATION",
+        "DROP RULE",
         "DROP ROUTINE",
         "DROP SCHEMA",
         "DROP SEQUENCE",
@@ -4328,6 +4338,13 @@ impl Engine {
                 DdlUndo::ViewSchemaChanged { slot, .. } => {
                     self.storage.commit_view_schema(*slot as usize, txn.txid)
                 }
+                DdlUndo::RuleCreated { slot, .. } => {
+                    self.storage.commit_rule_create(*slot as usize)
+                }
+                DdlUndo::RuleAltered { slot, .. } => {
+                    self.storage.commit_rule_alter(*slot as usize, txn.txid)
+                }
+                DdlUndo::RuleDropped(slot) => self.storage.commit_rule_drop(*slot as usize),
                 DdlUndo::RoutineCreated(slot) => {
                     self.storage.commit_routine_create(*slot as usize, txn.txid)
                 }
@@ -4745,6 +4762,16 @@ impl Engine {
                 self.storage.rollback_table_def(slot as usize, txid);
             }
             DdlUndo::ViewCreated(slot) => self.storage.rollback_view_create(slot as usize),
+            DdlUndo::RuleCreated {
+                slot,
+                prior_table_rule_txid,
+            } => self
+                .storage
+                .rollback_rule_create(slot as usize, prior_table_rule_txid),
+            DdlUndo::RuleAltered { slot, prior } => {
+                self.storage.rollback_rule_alter(slot as usize, prior)
+            }
+            DdlUndo::RuleDropped(slot) => self.storage.rollback_rule_drop(slot as usize, txid),
             DdlUndo::RoutineCreated(slot) => self.storage.rollback_routine_create(slot as usize),
             DdlUndo::RoutineDropped(slot) => {
                 self.storage.rollback_routine_drop(slot as usize, txid)
@@ -7152,11 +7179,13 @@ impl Engine {
                 &mut self.dml_scratch,
                 &self.work,
                 dml,
+                exec::DmlAuthorization::Invoker,
                 txn,
                 params,
                 guc,
                 responder,
                 Some(&mut sink),
+                self.current_conn_id,
             );
             match outcome {
                 Ok(Ok(())) => {}
@@ -7192,15 +7221,703 @@ impl Engine {
         ))
     }
 
-    /// Executes one INSERT/UPDATE/DELETE after any enclosing WITH clause has
-    /// been expanded. View rewriting lives here as well, so a data-modifying
-    /// CTE and a main DML statement have exactly the same target semantics.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn execute_data_modification<'a, 'capture>(
         storage: &mut Storage,
         scratch: &mut exec::DmlScratch,
         arena: &'a Arena,
         statement: &'a Stmt<'a>,
+        authorization: exec::DmlAuthorization,
+        txn: &mut TxnState,
+        params: &[Datum<'a>],
+        guc: &mut GucState,
+        responder: &mut Responder,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
+        connection_id: i32,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
+        let statement = match query::expand_dml_ctes(
+            statement,
+            &[],
+            storage,
+            txn.txid,
+            arena,
+            params,
+            &[],
+            Some(&sequence),
+        ) {
+            Ok(statement) => statement,
+            Err(error) => return Ok(Err(error)),
+        };
+        let (relation, event) = match statement {
+            Stmt::Insert(insert) => (insert.table, crate::storage::RewriteEvent::Insert),
+            Stmt::Update(update) => (update.table, crate::storage::RewriteEvent::Update),
+            Stmt::Delete(delete) => (delete.table, crate::storage::RewriteEvent::Delete),
+            _ => {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "rewrite input is not data-modifying"
+                )));
+            }
+        };
+        let outer_returns_rows = query::statement_returns_rows(statement);
+        let resolved = match storage.resolve_relation(relation.schema, relation.name, txn.txid) {
+            Some(resolved) => resolved,
+            None => {
+                return Self::execute_data_modification_unrewritten(
+                    storage,
+                    scratch,
+                    arena,
+                    statement,
+                    authorization,
+                    txn,
+                    params,
+                    guc,
+                    responder,
+                    capture,
+                );
+            }
+        };
+        let target = match resolved {
+            crate::storage::ResolvedRelation::Table(slot) => {
+                crate::storage::RuleTarget::Table(slot as u16)
+            }
+            crate::storage::ResolvedRelation::View(slot) => {
+                crate::storage::RuleTarget::View(slot as u16)
+            }
+            crate::storage::ResolvedRelation::Catalog => {
+                return Self::execute_data_modification_unrewritten(
+                    storage,
+                    scratch,
+                    arena,
+                    statement,
+                    authorization,
+                    txn,
+                    params,
+                    guc,
+                    responder,
+                    capture,
+                );
+            }
+        };
+        if matches!(
+            statement,
+            Stmt::Insert(Insert {
+                on_conflict: Some(_),
+                ..
+            })
+        ) {
+            let has_insert_or_update_rule = storage
+                .rules_for(target, crate::storage::RewriteEvent::Insert, txn.txid)
+                .next()
+                .is_some()
+                || storage
+                    .rules_for(target, crate::storage::RewriteEvent::Update, txn.txid)
+                    .next()
+                    .is_some();
+            if has_insert_or_update_rule {
+                return Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "INSERT with ON CONFLICT clause cannot be used with table that has INSERT or UPDATE rules"
+                )));
+            }
+        }
+        if storage.rules_for(target, event, txn.txid).next().is_none() {
+            return Self::execute_data_modification_unrewritten(
+                storage,
+                scratch,
+                arena,
+                statement,
+                authorization,
+                txn,
+                params,
+                guc,
+                responder,
+                capture,
+            );
+        }
+        let rule_owner = match u16::try_from(storage.object_owner(target.access_object(), txn.txid))
+        {
+            Ok(owner) => owner,
+            Err(_) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "rewrite-rule owner is out of range"
+                )));
+            }
+        };
+        let rule_authorization = exec::DmlAuthorization::RuleOwner(rule_owner);
+        if let Err(error) = exec::require_rewrite_input_privileges(
+            storage,
+            statement,
+            authorization,
+            txn.txid,
+            arena,
+        ) {
+            return Ok(Err(error));
+        }
+
+        let mut rule_defaults: exec::constraints::ParsedDefaults<'a> =
+            [None; crate::storage::MAX_COLUMNS];
+        let mut force_defaults = [false; crate::storage::MAX_COLUMNS];
+        let transition_collation = |collation| -> Result<_, SqlError> {
+            match collation {
+                ast::Collation::None | ast::Collation::Default => Ok(None),
+                ast::Collation::C | ast::Collation::Posix | ast::Collation::UcsBasic => {
+                    Ok(Some(ast::ParsedCollation::Builtin(collation)))
+                }
+                ast::Collation::Catalog(slot) => {
+                    let definition = storage
+                        .collation(usize::from(slot))
+                        .definition_for(txn.txid);
+                    let schema = arena
+                        .alloc_str(definition.schema.as_str())
+                        .map_err(|_| query::arena_full_pub())?;
+                    let name = arena
+                        .alloc_str(definition.name.as_str())
+                        .map_err(|_| query::arena_full_pub())?;
+                    let name = arena
+                        .alloc(ast::QualName {
+                            schema: Some(schema),
+                            name,
+                        })
+                        .map_err(|_| query::arena_full_pub())?;
+                    Ok(Some(ast::ParsedCollation::Named(&*name)))
+                }
+            }
+        };
+        let mut transition_types = [query::RuleTransitionType {
+            type_name: "text",
+            type_mod: -1,
+            collation: None,
+        }; crate::storage::MAX_COLUMNS];
+        let (columns, transition_types) = match target {
+            crate::storage::RuleTarget::Table(slot) => {
+                let definition = storage.table_def(usize::from(slot), txn.txid);
+                rule_defaults = match exec::parse_defaults(definition, arena) {
+                    Ok(defaults) => defaults,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if let Stmt::Insert(insert) = statement
+                    && insert.overriding == ast::Overriding::User
+                {
+                    for (index, column) in definition.columns().iter().enumerate() {
+                        force_defaults[index] = column.is_identity;
+                    }
+                }
+                let mut names = [""; crate::storage::MAX_COLUMNS];
+                for (index, column) in definition.columns().iter().enumerate() {
+                    names[index] = match arena.alloc_str(column.name.as_str()) {
+                        Ok(name) => name,
+                        Err(_) => return Ok(Err(query::arena_full_pub())),
+                    };
+                    let type_oid =
+                        match storage.routine_type_oid(column.ctype, column.user_type, txn.txid) {
+                            Some(type_oid) => type_oid,
+                            None => {
+                                return Ok(Err(sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "rule target column has an unknown type"
+                                )));
+                            }
+                        };
+                    let type_name =
+                        match catalog::user_type_name_text(storage, txn.txid, type_oid, arena) {
+                            Ok(Some(name)) => name,
+                            Ok(None) => column.ctype.name(),
+                            Err(error) => return Ok(Err(error)),
+                        };
+                    transition_types[index] = query::RuleTransitionType {
+                        type_name,
+                        type_mod: column.type_mod,
+                        collation: match transition_collation(column.collation) {
+                            Ok(collation) => collation,
+                            Err(error) => return Ok(Err(error)),
+                        },
+                    };
+                }
+                let columns = match arena.alloc_slice_copy(&names[..definition.n_columns]) {
+                    Ok(columns) => &*columns,
+                    Err(_) => return Ok(Err(query::arena_full_pub())),
+                };
+                let types = match arena.alloc_slice_copy(&transition_types[..definition.n_columns])
+                {
+                    Ok(types) => &*types,
+                    Err(_) => return Ok(Err(query::arena_full_pub())),
+                };
+                (columns, types)
+            }
+            crate::storage::RuleTarget::View(slot) => {
+                let mut descriptions = [ColDesc::new("", 0, 0); MAX_PROJ];
+                let count = match catalog::describe_view(
+                    storage,
+                    txn.txid,
+                    storage.view(usize::from(slot)),
+                    arena,
+                    &mut descriptions,
+                ) {
+                    Ok(count) => count,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let mut names = [""; crate::storage::MAX_COLUMNS];
+                for index in 0..count {
+                    names[index] = match arena.alloc_str(descriptions[index].name) {
+                        Ok(name) => name,
+                        Err(_) => return Ok(Err(query::arena_full_pub())),
+                    };
+                    let ctype = match exec::catalog_column_type(
+                        storage,
+                        txn.txid,
+                        descriptions[index].type_oid,
+                    ) {
+                        Some((ctype, _)) => ctype,
+                        None => {
+                            return Ok(Err(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "rule target column has an unknown type"
+                            )));
+                        }
+                    };
+                    let type_name = match catalog::user_type_name_text(
+                        storage,
+                        txn.txid,
+                        descriptions[index].type_oid,
+                        arena,
+                    ) {
+                        Ok(Some(name)) => name,
+                        Ok(None) => ctype.name(),
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    transition_types[index] = query::RuleTransitionType {
+                        type_name,
+                        type_mod: descriptions[index].type_mod,
+                        collation: match transition_collation(descriptions[index].collation) {
+                            Ok(collation) => collation,
+                            Err(error) => return Ok(Err(error)),
+                        },
+                    };
+                }
+                let columns = match arena.alloc_slice_copy(&names[..count]) {
+                    Ok(columns) => &*columns,
+                    Err(_) => return Ok(Err(query::arena_full_pub())),
+                };
+                let types = match arena.alloc_slice_copy(&transition_types[..count]) {
+                    Ok(types) => &*types,
+                    Err(_) => return Ok(Err(query::arena_full_pub())),
+                };
+                (columns, types)
+            }
+        };
+        let transition = match query::rule_transition_source(
+            statement,
+            columns,
+            transition_types,
+            &rule_defaults,
+            &force_defaults,
+            arena,
+        ) {
+            Ok(transition) => transition,
+            Err(error) => return Ok(Err(error)),
+        };
+        let original_transition =
+            match query::rule_original_transition(statement, columns, transition_types, arena) {
+                Ok(transition) => transition,
+                Err(error) => return Ok(Err(error)),
+            };
+        let suppress_original = storage.rules_for(target, event, txn.txid).any(|(_, rule)| {
+            let definition = rule.definition_for(txn.txid);
+            definition.mode == crate::storage::RewriteMode::Instead
+                && definition.condition.is_none()
+        });
+        if outer_returns_rows
+            && suppress_original
+            && !storage
+                .rules_for(target, event, txn.txid)
+                .any(|(_, rule)| rule.definition_for(txn.txid).returning_action.is_some())
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot perform a RETURNING query on relation \"{}\"",
+                relation.name
+            )));
+        }
+        let insert_event = event == crate::storage::RewriteEvent::Insert;
+        let mut original_filter: Option<&Expr<'a>> = None;
+        for (_, rule) in storage.rules_for(target, event, txn.txid) {
+            let definition = rule.definition_for(txn.txid);
+            if definition.mode != crate::storage::RewriteMode::Instead
+                || definition.condition.is_none()
+            {
+                continue;
+            }
+            let user = eval::funcs::system::session_user_owned();
+            let path =
+                storage.compute_path(definition.creation_path.as_str(), user.as_str(), txn.txid);
+            let sql = definition.condition_sql().expect("qualified rule");
+            let sql = match arena.alloc_str(sql) {
+                Ok(sql) => sql,
+                Err(_) => return Ok(Err(query::arena_full_pub())),
+            };
+            let parsed = match parser::parse_expr(sql, arena) {
+                Ok(parsed) => parsed,
+                Err(error) => return Ok(Err(error)),
+            };
+            let binding = if insert_event {
+                (transition.names, transition.old, transition.new)
+            } else {
+                (
+                    original_transition.names,
+                    original_transition.old,
+                    original_transition.new,
+                )
+            };
+            let condition = match query::expand_stored_rule_expression_exec(
+                parsed,
+                storage,
+                txn.txid,
+                path,
+                &definition.dependencies,
+                arena,
+                params,
+                Some(&sequence::SeqEval::new(
+                    storage,
+                    guc.seq_session(),
+                    txn.txid,
+                )),
+                rule_owner,
+                binding.0,
+                binding.1,
+                binding.2,
+                event != crate::storage::RewriteEvent::Insert,
+                event != crate::storage::RewriteEvent::Delete,
+            ) {
+                Ok(condition) => condition,
+                Err(error) => return Ok(Err(error)),
+            };
+            let exclusion = match arena.alloc(Expr::Unary {
+                operator: ast::UnaryOp::Not,
+                operand: condition,
+            }) {
+                Ok(exclusion) => &*exclusion,
+                Err(_) => return Ok(Err(query::arena_full_pub())),
+            };
+            original_filter = match query::and_where(original_filter, Some(exclusion), arena) {
+                Ok(filter) => filter,
+                Err(error) => return Ok(Err(error)),
+            };
+        }
+        let original_statement = if let Some(filter) = original_filter {
+            match query::restrict_rule_original(statement, transition, columns, filter, arena) {
+                Ok(statement) => statement,
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            statement
+        };
+        let mut capture = capture;
+        let mut original_rows = 0u64;
+        if insert_event && !suppress_original {
+            let outcome = Self::execute_data_modification_unrewritten(
+                storage,
+                scratch,
+                arena,
+                original_statement,
+                authorization,
+                txn,
+                params,
+                guc,
+                responder,
+                capture.take(),
+            )?;
+            if outcome.is_err() {
+                return Ok(outcome);
+            }
+            original_rows = responder.take_affected_rows().unwrap_or(0);
+        }
+
+        let mut last_name: Option<SqlName> = None;
+        let mut rewritten_rows = 0u64;
+        loop {
+            let selected = storage
+                .rules_for(target, event, txn.txid)
+                .filter(|(_, rule)| {
+                    last_name.is_none_or(|last| {
+                        rule.definition_for(txn.txid).name.as_str() > last.as_str()
+                    })
+                })
+                .min_by(|(_, left), (_, right)| {
+                    left.definition_for(txn.txid)
+                        .name
+                        .as_str()
+                        .cmp(right.definition_for(txn.txid).name.as_str())
+                });
+            let Some((_, rule)) = selected else { break };
+            let definition = rule.definition_for(txn.txid);
+            last_name = Some(definition.name);
+            if let Err(error) = txn.enter_rule(rule.oid(), relation.name) {
+                return Ok(Err(error));
+            }
+            let action_result = (|| -> Result<Result<u64, SqlError>, WireFull> {
+                let user = eval::funcs::system::session_user_owned();
+                let path = storage.compute_path(
+                    definition.creation_path.as_str(),
+                    user.as_str(),
+                    txn.txid,
+                );
+                let condition = match definition.condition_sql() {
+                    Some(sql) => {
+                        let sql = match arena.alloc_str(sql) {
+                            Ok(sql) => sql,
+                            Err(_) => return Ok(Err(query::arena_full_pub())),
+                        };
+                        let parsed = match parser::parse_expr(sql, arena) {
+                            Ok(parsed) => parsed,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        match query::expand_stored_rule_expression_exec(
+                            parsed,
+                            storage,
+                            txn.txid,
+                            path,
+                            &definition.dependencies,
+                            arena,
+                            params,
+                            Some(&sequence::SeqEval::new(
+                                storage,
+                                guc.seq_session(),
+                                txn.txid,
+                            )),
+                            rule_owner,
+                            transition.names,
+                            transition.old,
+                            transition.new,
+                            event != crate::storage::RewriteEvent::Insert,
+                            event != crate::storage::RewriteEvent::Delete,
+                        ) {
+                            Ok(condition) => Some(condition),
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    }
+                    None => None,
+                };
+                let mut affected = 0u64;
+                for (action_index, action_sql) in definition.action_sql().enumerate() {
+                    let action_sql = match arena.alloc_str(action_sql) {
+                        Ok(sql) => sql,
+                        Err(_) => return Ok(Err(query::arena_full_pub())),
+                    };
+                    let parsed = match parser::parse_stored_statement(action_sql, arena) {
+                        Ok(parsed) => parsed,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    let action = match query::expand_stored_rule_action_exec(
+                        parsed,
+                        storage,
+                        txn.txid,
+                        path,
+                        &definition.dependencies,
+                        arena,
+                        params,
+                        Some(&sequence::SeqEval::new(
+                            storage,
+                            guc.seq_session(),
+                            txn.txid,
+                        )),
+                        rule_owner,
+                        transition.names,
+                        transition.old,
+                        transition.new,
+                        event != crate::storage::RewriteEvent::Insert,
+                        event != crate::storage::RewriteEvent::Delete,
+                    ) {
+                        Ok(action) => action,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    let action = match query::attach_rule_source(
+                        action,
+                        transition.source,
+                        condition,
+                        arena,
+                    ) {
+                        Ok(action) => action,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    let use_returning = outer_returns_rows
+                        && definition.returning_action == Some(action_index as u8);
+                    let outcome = Self::execute_rule_action(
+                        storage,
+                        scratch,
+                        arena,
+                        action,
+                        rule_authorization,
+                        txn,
+                        params,
+                        guc,
+                        responder,
+                        if use_returning { capture.take() } else { None },
+                        use_returning,
+                        connection_id,
+                    )?;
+                    if let Err(error) = outcome {
+                        return Ok(Err(error));
+                    }
+                    affected = affected.saturating_add(responder.take_affected_rows().unwrap_or(0));
+                }
+                Ok(Ok(affected))
+            })();
+            txn.leave_rule();
+            match action_result? {
+                Ok(affected) => rewritten_rows = rewritten_rows.saturating_add(affected),
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+
+        if !insert_event && !suppress_original {
+            let outcome = Self::execute_data_modification_unrewritten(
+                storage,
+                scratch,
+                arena,
+                original_statement,
+                authorization,
+                txn,
+                params,
+                guc,
+                responder,
+                capture.take(),
+            )?;
+            if outcome.is_err() {
+                return Ok(outcome);
+            }
+            original_rows = responder.take_affected_rows().unwrap_or(0);
+        }
+        let affected = if suppress_original {
+            rewritten_rows
+        } else {
+            original_rows
+        };
+        responder.set_affected_rows(affected);
+        let tag = match statement {
+            Stmt::Insert(_) => stack_format!(48, "INSERT 0 {}", affected),
+            Stmt::Update(_) => stack_format!(48, "UPDATE {}", affected),
+            Stmt::Delete(_) => stack_format!(48, "DELETE {}", affected),
+            _ => unreachable!(),
+        };
+        responder.command_complete(tag.as_str())?;
+        Ok(Ok(()))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn execute_rule_action<'a, 'capture>(
+        storage: &mut Storage,
+        scratch: &mut exec::DmlScratch,
+        arena: &'a Arena,
+        action: &'a Stmt<'a>,
+        authorization: exec::DmlAuthorization,
+        txn: &mut TxnState,
+        params: &[Datum<'a>],
+        guc: &mut GucState,
+        responder: &mut Responder,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
+        returning: bool,
+        connection_id: i32,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        match action {
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) if returning => responder
+                .without_command_complete(|responder| {
+                    Self::execute_data_modification(
+                        storage,
+                        scratch,
+                        arena,
+                        action,
+                        authorization,
+                        txn,
+                        params,
+                        guc,
+                        responder,
+                        capture,
+                        connection_id,
+                    )
+                }),
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                responder.without_query_output(|responder| {
+                    Self::execute_data_modification(
+                        storage,
+                        scratch,
+                        arena,
+                        action,
+                        authorization,
+                        txn,
+                        params,
+                        guc,
+                        responder,
+                        None,
+                        connection_id,
+                    )
+                })
+            }
+            Stmt::Select(select) => responder.without_query_output(|responder| {
+                let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
+                if select.from.is_some() {
+                    query::select_query(
+                        storage,
+                        txn.txid,
+                        select,
+                        arena,
+                        params,
+                        Some(&sequence),
+                        responder,
+                    )
+                } else {
+                    query::constant_select(
+                        storage,
+                        txn.txid,
+                        select,
+                        arena,
+                        params,
+                        Some(&sequence),
+                        responder,
+                    )
+                }
+            }),
+            Stmt::SetQuery(query) => responder.without_query_output(|responder| {
+                let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
+                query::set_query(
+                    storage,
+                    txn.txid,
+                    query,
+                    arena,
+                    params,
+                    Some(&sequence),
+                    responder,
+                )
+            }),
+            Stmt::Notify { channel, payload } => {
+                let payload = match payload {
+                    Some(payload) => match notify::payload(payload) {
+                        Ok(payload) => payload,
+                        Err(error) => return Ok(Err(error)),
+                    },
+                    None => notify::Payload::new(),
+                };
+                Ok(txn.buffer_notify(connection_id, notify::channel(channel), payload.as_str()))
+            }
+            _ => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "rewrite-rule action is not executable"
+            ))),
+        }
+    }
+
+    /// Executes one INSERT/UPDATE/DELETE after any enclosing WITH clause has
+    /// been expanded. View rewriting lives here as well, so a data-modifying
+    /// CTE and a main DML statement have exactly the same target semantics.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn execute_data_modification_unrewritten<'a, 'capture>(
+        storage: &mut Storage,
+        scratch: &mut exec::DmlScratch,
+        arena: &'a Arena,
+        statement: &'a Stmt<'a>,
+        authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &mut GucState,
@@ -7237,7 +7954,16 @@ impl Engine {
         });
         let Some(view) = view else {
             return Self::execute_data_modification_inner(
-                storage, scratch, arena, statement, txn, params, guc, responder, capture,
+                storage,
+                scratch,
+                arena,
+                statement,
+                authorization,
+                txn,
+                params,
+                guc,
+                responder,
+                capture,
             );
         };
         let event = match statement {
@@ -7254,7 +7980,16 @@ impl Engine {
             })
         {
             return Self::execute_data_modification_inner(
-                storage, scratch, arena, statement, txn, params, guc, responder, capture,
+                storage,
+                scratch,
+                arena,
+                statement,
+                authorization,
+                txn,
+                params,
+                guc,
+                responder,
+                capture,
             );
         }
         if let Err(error) = exec::fire_view_statement_triggers(
@@ -7273,7 +8008,16 @@ impl Engine {
         let capturing = capture.is_some();
         let outcome = responder.without_command_complete(|responder| {
             Self::execute_data_modification_inner(
-                storage, scratch, arena, statement, txn, params, guc, responder, capture,
+                storage,
+                scratch,
+                arena,
+                statement,
+                authorization,
+                txn,
+                params,
+                guc,
+                responder,
+                capture,
             )
         })?;
         let affected = responder.take_affected_rows().unwrap_or(0);
@@ -7351,6 +8095,7 @@ impl Engine {
         scratch: &mut exec::DmlScratch,
         arena: &Arena,
         statement: &'a Stmt<'a>,
+        authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &mut GucState,
@@ -7373,6 +8118,7 @@ impl Engine {
                         txn,
                         scratch,
                         statement,
+                        authorization,
                         view,
                         arena,
                         params,
@@ -7424,6 +8170,7 @@ impl Engine {
                     txn,
                     scratch,
                     insert,
+                    authorization,
                     arena,
                     params,
                     guc.seq_session(),
@@ -7450,6 +8197,7 @@ impl Engine {
                         txn,
                         scratch,
                         statement,
+                        authorization,
                         view,
                         arena,
                         params,
@@ -7503,6 +8251,7 @@ impl Engine {
                     txn,
                     scratch,
                     update,
+                    authorization,
                     arena,
                     params,
                     guc.seq_session(),
@@ -7526,6 +8275,7 @@ impl Engine {
                         txn,
                         scratch,
                         statement,
+                        authorization,
                         view,
                         arena,
                         params,
@@ -7578,6 +8328,7 @@ impl Engine {
                     txn,
                     scratch,
                     delete,
+                    authorization,
                     arena,
                     params,
                     guc.seq_session(),
@@ -8464,11 +9215,13 @@ impl Engine {
                 &mut self.dml_scratch,
                 &self.work,
                 statement,
+                exec::DmlAuthorization::Invoker,
                 txn,
                 params,
                 guc,
                 responder,
                 None,
+                self.current_conn_id,
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
@@ -8529,11 +9282,13 @@ impl Engine {
                 &mut self.dml_scratch,
                 &self.work,
                 statement,
+                exec::DmlAuthorization::Invoker,
                 txn,
                 params,
                 guc,
                 responder,
                 capture,
+                self.current_conn_id,
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
@@ -9751,6 +10506,31 @@ impl Engine {
                 arena,
                 responder,
             ),
+            Stmt::CreateRule(rule) => exec::create_rule(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                rule,
+                guc.search_path().as_str(),
+                arena,
+                responder,
+            ),
+            Stmt::AlterRule {
+                name,
+                table,
+                new_name,
+            } => exec::alter_rule(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *table,
+                new_name,
+                responder,
+            ),
+            Stmt::DropRule(rule) => {
+                exec::drop_rule(&mut self.storage, &mut self.wal, txn, *rule, responder)
+            }
             Stmt::CreateRoutine(routine) => exec::create_routine(
                 &mut self.storage,
                 &mut self.wal,
@@ -10684,11 +11464,13 @@ impl Engine {
                 &mut self.dml_scratch,
                 &self.work,
                 statement,
+                exec::DmlAuthorization::Invoker,
                 txn,
                 params,
                 guc,
                 responder,
                 capture,
+                self.current_conn_id,
             ),
             Stmt::Merge(_) => Self::execute_merge(
                 &mut self.storage,
@@ -14313,6 +15095,97 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::DropView { schema, name } => {
             if let Some(slot) = storage.drop_view(schema, name, 0)? {
                 storage.commit_view_drop(slot);
+            }
+        }
+        WalOp::SetRule {
+            slot,
+            created_at,
+            target,
+            table_schema,
+            table,
+            name,
+            event,
+            mode,
+            source,
+            condition,
+            actions,
+            action_count,
+            returning_action,
+            path,
+            dependencies,
+        } => {
+            use core::fmt::Write as _;
+            let target = match target {
+                crate::wal::TriggerTargetKind::Table => storage
+                    .find_table(table_schema, table)
+                    .and_then(|slot| u16::try_from(slot).ok())
+                    .map(crate::storage::RuleTarget::Table),
+                crate::wal::TriggerTargetKind::View => storage
+                    .views_visible_to(0)
+                    .find(|(_, view)| {
+                        view.schema.as_str() == table_schema && view.name.as_str() == table
+                    })
+                    .and_then(|(slot, _)| u16::try_from(slot).ok())
+                    .map(crate::storage::RuleTarget::View),
+            }
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "journal rewrite-rule relation does not exist"
+                )
+            })?;
+            let mut stored_source =
+                crate::util::StackStr::<{ crate::storage::RULE_SQL_MAX }>::new();
+            let _ = stored_source.write_str(source);
+            let mut creation_path = crate::util::StackStr::<128>::new();
+            let _ = creation_path.write_str(path);
+            if stored_source.is_truncated() || creation_path.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "journal rewrite-rule definition exceeds configured bounds"
+                ));
+            }
+            let dependencies =
+                storage.rebind_stored_query_dependencies(dependencies.materialize()?, 0)?;
+            storage.replay_rule(
+                usize::from(slot),
+                created_at,
+                crate::storage::RuleDefinition {
+                    name: crate::storage::SqlName::parse(name)?,
+                    target,
+                    event,
+                    mode,
+                    source: stored_source,
+                    condition,
+                    actions,
+                    action_count,
+                    returning_action,
+                    creation_path,
+                    dependencies,
+                },
+            )?;
+        }
+        WalOp::DropRule {
+            target,
+            table_schema,
+            table,
+            name,
+        } => {
+            let target = match target {
+                crate::wal::TriggerTargetKind::Table => storage
+                    .find_table(table_schema, table)
+                    .and_then(|slot| u16::try_from(slot).ok())
+                    .map(crate::storage::RuleTarget::Table),
+                crate::wal::TriggerTargetKind::View => storage
+                    .views_visible_to(0)
+                    .find(|(_, view)| {
+                        view.schema.as_str() == table_schema && view.name.as_str() == table
+                    })
+                    .and_then(|(slot, _)| u16::try_from(slot).ok())
+                    .map(crate::storage::RuleTarget::View),
+            };
+            if let Some(target) = target {
+                storage.replay_drop_rule(target, name);
             }
         }
         WalOp::CreatePublication {

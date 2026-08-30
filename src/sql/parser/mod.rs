@@ -301,6 +301,44 @@ pub fn parse_query<'a>(
         })
 }
 
+/// Parses exactly one stored statement. Rewrite rules retain action text in
+/// the durable catalog and cross this boundary again only after recovery has
+/// validated the text and its captured dependencies.
+pub(crate) fn parse_stored_statement<'a>(
+    sql: &'a str,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, super::eval::SqlError> {
+    let mut parser = Parser::new(sql, arena).map_err(|error| super::parse_error_to_sql(&error))?;
+    let statement = parser
+        .next_stmt()
+        .map_err(|error| super::parse_error_to_sql(&error))?
+        .ok_or_else(|| {
+            crate::sql_err!(
+                super::eval::sqlstate::SYNTAX_ERROR,
+                "stored statement is empty"
+            )
+        })?;
+    if parser
+        .next_stmt()
+        .map_err(|error| super::parse_error_to_sql(&error))?
+        .is_some()
+    {
+        return Err(crate::sql_err!(
+            super::eval::sqlstate::SYNTAX_ERROR,
+            "stored action contains more than one statement"
+        ));
+    }
+    arena
+        .alloc(statement)
+        .map(|statement| &*statement)
+        .map_err(|_| {
+            crate::sql_err!(
+                super::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "stored statement exceeds the SQL arena"
+            )
+        })
+}
+
 /// Parses a single scalar expression (e.g. a stored CHECK predicate) into the
 /// arena. The whole input must be one expression.
 pub fn parse_expr<'a>(
@@ -4034,6 +4072,19 @@ impl<'a> Parser<'a> {
             self.expect_ident("privileges")?;
             return self.alter_default_privileges();
         }
+        if self.eat_ident("rule")? {
+            let name = self.col_ident("rule name")?;
+            self.expect_ident("on")?;
+            let table = self.qual_name("rule relation")?;
+            self.expect_ident("rename")?;
+            self.expect_ident("to")?;
+            let new_name = self.col_ident("new rule name")?;
+            return Ok(Stmt::AlterRule {
+                name,
+                table,
+                new_name,
+            });
+        }
         if self.eat_ident("role")? || self.eat_ident("user")? || self.eat_ident("group")? {
             return self.alter_role();
         }
@@ -5282,6 +5333,13 @@ impl<'a> Parser<'a> {
             CommentTarget::Trigger(crate::sql::ast::TriggerIdentity {
                 name,
                 table: self.qual_name("trigger table")?,
+            })
+        } else if self.eat_ident("rule")? {
+            let name = self.col_ident("rule name")?;
+            self.expect_ident("on")?;
+            CommentTarget::Rule(crate::sql::ast::TriggerIdentity {
+                name,
+                table: self.qual_name("rule relation")?,
             })
         } else if self.eat_ident("type")? {
             CommentTarget::Type {
@@ -7585,6 +7643,68 @@ mod tests {
         for sql in [
             "CREATE CONVERSION c FOR 'not-an-encoding' TO 'UTF8' FROM f",
             "CREATE COLLATION c (provider = pretend, locale = 'C')",
+        ] {
+            with_parser(sql, |parser| {
+                assert!(parser.next_stmt().is_err(), "accepted {sql}");
+            });
+        }
+    }
+
+    #[test]
+    fn rewrite_rules_parse_into_closed_event_mode_and_action_states() {
+        with_parser(
+            "CREATE RULE audit_update AS ON UPDATE TO app.accounts \
+               WHERE NEW.balance <> OLD.balance DO ALSO ( \
+                 INSERT INTO audit VALUES (OLD.id, NEW.balance); \
+                 NOTIFY account_changes, 'updated'; \
+               ); \
+             CREATE OR REPLACE RULE suppress_delete AS ON DELETE TO accounts \
+               DO INSTEAD NOTHING; \
+             ALTER RULE audit_update ON app.accounts RENAME TO audit_balance; \
+             DROP RULE IF EXISTS audit_balance ON app.accounts CASCADE",
+            |parser| {
+                let Stmt::CreateRule(created) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected CREATE RULE")
+                };
+                assert_eq!(created.event, RuleEvent::Update);
+                assert_eq!(created.mode, RuleMode::Also);
+                assert_eq!(created.condition_sql, Some("NEW.balance <> OLD.balance"));
+                assert_eq!(created.actions.len(), 2);
+                assert!(matches!(created.actions[0].statement, Stmt::Insert(_)));
+                assert!(matches!(created.actions[1].statement, Stmt::Notify { .. }));
+
+                let Stmt::CreateRule(replaced) = parser.next_stmt().unwrap().unwrap() else {
+                    panic!("expected CREATE OR REPLACE RULE")
+                };
+                assert!(replaced.or_replace);
+                assert_eq!(replaced.event, RuleEvent::Delete);
+                assert_eq!(replaced.mode, RuleMode::Instead);
+                assert!(replaced.actions.is_empty());
+
+                assert!(matches!(
+                    parser.next_stmt().unwrap().unwrap(),
+                    Stmt::AlterRule {
+                        name: "audit_update",
+                        new_name: "audit_balance",
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap().unwrap(),
+                    Stmt::DropRule(crate::sql::ast::DropRule {
+                        name: "audit_balance",
+                        if_exists: true,
+                        cascade: true,
+                        ..
+                    })
+                ));
+            },
+        );
+
+        for sql in [
+            "CREATE RULE bad AS ON TRUNCATE TO t DO NOTHING",
+            "CREATE RULE bad AS ON INSERT TO t DO VACUUM t",
+            "CREATE RULE bad AS ON INSERT TO t DO (INSERT INTO x VALUES (1) SELECT 1)",
         ] {
             with_parser(sql, |parser| {
                 assert!(parser.next_stmt().is_err(), "accepted {sql}");

@@ -3103,6 +3103,84 @@ def test_transition_tables_over_raw_simple_query():
     s.close()
 
 
+def test_rewrite_rule_extended_query_returning_and_catalog_lifecycle():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_rule_source (id integer); "
+        "CREATE TABLE wire_rule_sink (id integer); "
+        "CREATE RULE wire_rule_redirect AS ON INSERT TO wire_rule_source DO INSTEAD "
+        "INSERT INTO wire_rule_sink VALUES (NEW.id) RETURNING id",
+    )
+    check(
+        "rewrite rule wire: setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+
+    query = "INSERT INTO wire_rule_source VALUES ($1) RETURNING id"
+    parse = frontend_message(
+        b"P", b"wire_rule_statement\x00" + query.encode() + b"\x00" + struct.pack("!hi", 1, 23)
+    )
+    bind = frontend_message(
+        b"B",
+        b"wire_rule_portal\x00wire_rule_statement\x00"
+        + struct.pack("!hhh", 1, 0, 1)
+        + struct.pack("!i", 1)
+        + b"7"
+        + struct.pack("!h", 0),
+    )
+    describe = frontend_message(b"D", b"Pwire_rule_portal\x00")
+    execute = frontend_message(b"E", b"wire_rule_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    messages = []
+    while True:
+        item = read_message(s)
+        messages.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    row = next((payload for kind, payload in messages if kind == b"D"), None)
+    command = next((payload for kind, payload in messages if kind == b"C"), None)
+    check(
+        "rewrite rule wire: Describe preserves RETURNING integer identity",
+        description is not None
+        and row_description_type_oids(description) == [23]
+        and row_description_formats(description) == [0],
+        messages,
+    )
+    check(
+        "rewrite rule wire: Bind and Execute return the rewritten row and command count",
+        row is not None
+        and text_row_fields(row) == ["7"]
+        and command == b"INSERT 0 1\x00"
+        and not any(kind == b"E" for kind, _ in messages),
+        messages,
+    )
+    stored = simple_query(s, "SELECT id FROM wire_rule_sink")
+    check(
+        "rewrite rule wire: INSTEAD action is durable table state",
+        [text_row_fields(payload) for kind, payload in stored if kind == b"D"] == [["7"]],
+        stored,
+    )
+
+    lifecycle = simple_query(
+        s,
+        "ALTER RULE wire_rule_redirect ON wire_rule_source RENAME TO wire_rule_renamed; "
+        "DROP RULE wire_rule_renamed ON wire_rule_source; "
+        "SELECT count(*) FROM pg_rules WHERE tablename = 'wire_rule_source'",
+    )
+    check(
+        "rewrite rule wire: ALTER and DROP update the PostgreSQL catalog",
+        not any(kind == b"E" for kind, _ in lifecycle)
+        and first_text_row(lifecycle) == "0",
+        lifecycle,
+    )
+    s.close()
+
+
 def test_typed_trigger_query_program_over_raw_simple_query():
     s = connect()
     s.sendall(startup_payload(0))

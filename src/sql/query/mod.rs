@@ -58,12 +58,15 @@ pub use scope::{MAX_MERGED_COLUMNS, MergedColumn, QueryScope, ResolvedColumn};
 mod cte;
 mod dependencies;
 use cte::expand_set_tree_exec;
+pub(crate) use cte::{
+    RuleTransitionType, attach_rule_source, expand_set_tree, expand_stored_query,
+    expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
+    expand_stored_statement_exec, restrict_rule_original, rule_original_transition,
+    rule_transition_source,
+};
 pub use cte::{
     describe_set_query, expand_ctes, expand_ctes_exec, expand_ctes_under, expand_dml_ctes,
     rewrite_view_dml,
-};
-pub(crate) use cte::{
-    expand_set_tree, expand_stored_query, expand_stored_query_exec, expand_stored_statement_exec,
 };
 
 pub fn stored_query_dependencies(
@@ -84,6 +87,33 @@ pub(crate) fn stored_routine_dependencies(
     arena: &Arena,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
     dependencies::collect_routine_program(program, storage, txid, path, arena)
+}
+
+pub(crate) fn stored_rule_dependencies(
+    actions: &[crate::sql::ast::RuleAction<'_>],
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    arena: &Arena,
+    transition: &dyn crate::sql::exec::ColTypeResolver,
+) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
+    dependencies::collect_rule_actions(actions, storage, txid, path, arena, transition)
+}
+
+pub(crate) fn dml_input_dependencies(
+    statement: &crate::sql::ast::Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    arena: &Arena,
+) -> Result<
+    (
+        crate::storage::StoredQueryDependencies,
+        crate::storage::StoredQueryDependencies,
+    ),
+    SqlError,
+> {
+    dependencies::collect_dml_input(statement, storage, txid, path, arena)
 }
 
 pub(crate) struct StoredQueryCompositeFieldRename<'a> {
@@ -813,7 +843,7 @@ pub(crate) fn routine_forbidden_statement_error(statement: &str) -> SqlError {
     )
 }
 
-fn statement_returns_rows(statement: &Stmt<'_>) -> bool {
+pub(crate) fn statement_returns_rows(statement: &Stmt<'_>) -> bool {
     match statement {
         Stmt::Insert(insert) => !insert.returning.is_empty(),
         Stmt::Update(update) => !update.returning.is_empty(),
@@ -2534,6 +2564,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         super::catalog::view_def_text(self.storage, self.txid, oid, arena)
     }
 
+    fn rule_def<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        super::catalog::rule_def_text(self.storage, self.txid, oid, arena)
+    }
+
     fn relation_size(&self, oid: i32) -> Result<Option<i64>, SqlError> {
         super::catalog::relation_size(self.storage, self.txid, oid)
     }
@@ -3399,14 +3433,14 @@ pub fn resolve_view_for_dml<'a>(
         Some(crate::storage::ResolvedRelation::View(slot)) => slot,
         _ => return Ok(None),
     };
-    let view = storage.view(view_slot);
     // The body re-resolves under the view creator's search path.
     let user = crate::sql::eval::funcs::system::session_user_owned();
-    let view_path = storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+    let view_path =
+        storage.compute_path(storage.view_creation_path(view_slot), user.as_str(), txid);
     // Copy the definition into the arena so the parsed AST no longer borrows
     // storage (the caller then takes a mutable storage borrow to run the DML).
     let sql = arena
-        .alloc_str(view.sql.as_str())
+        .alloc_str(storage.view_sql(view_slot))
         .map_err(|_| arena_full())?;
     let name = name.name;
     let not_updatable = || {

@@ -83,6 +83,7 @@ pub const MAX_SAVEPOINTS: usize = 16;
 // Trigger routines recurse through the bounded statement executor. Keep the
 // SQL limit below the smallest supported thread stack's native-frame limit.
 pub const MAX_TRIGGER_NESTING: u16 = 16;
+pub const MAX_RULE_NESTING: usize = 16;
 pub const MAX_TRUNCATE_TABLES: usize = 16;
 pub const MAX_TRUNCATE_WAL_TABLE_BYTES: usize = MAX_TRUNCATE_TABLES * 128;
 
@@ -153,6 +154,8 @@ pub struct TxnState {
     /// Nested trigger-side SQL is bounded independently of row and arena
     /// capacity so a self-referential trigger cannot consume the call stack.
     trigger_depth: u16,
+    rule_stack: [i32; MAX_RULE_NESTING],
+    rule_depth: u8,
     /// Every row write, in order: (table slot, rowid, pending image before the
     /// write). Recorded per write (not per row) so `ROLLBACK TO SAVEPOINT` can
     /// reverse-replay to any earlier point.
@@ -216,6 +219,15 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingObjectSchema>,
     },
+    RuleCreated {
+        slot: u32,
+        prior_table_rule_txid: Option<u32>,
+    },
+    RuleAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingRuleDefinition>,
+    },
+    RuleDropped(u32),
     /// CREATE FUNCTION at this slot — undo by dropping its pending definition.
     RoutineCreated(u32),
     RoutineDropped(u32),
@@ -600,6 +612,8 @@ impl TxnState {
             snapshot_taken: false,
             command_id: 1,
             trigger_depth: 0,
+            rule_stack: [0; MAX_RULE_NESTING],
+            rule_depth: 0,
             touched: FixedVec::new(budget, "txn_touched", capacity)?,
             truncates: FixedVec::new(budget, "txn_truncates", MAX_TXN_DDL)?,
             truncate_wal_tables: FixedBuf::new(
@@ -732,6 +746,27 @@ impl TxnState {
             .trigger_depth
             .checked_sub(1)
             .expect("trigger depth is paired");
+    }
+
+    pub(crate) fn enter_rule(&mut self, oid: i32, relation: &str) -> Result<(), SqlError> {
+        let depth = usize::from(self.rule_depth);
+        if self.rule_stack[..depth].contains(&oid) || depth == MAX_RULE_NESTING {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "infinite recursion detected in rules for relation \"{}\"",
+                relation
+            ));
+        }
+        self.rule_stack[depth] = oid;
+        self.rule_depth += 1;
+        Ok(())
+    }
+
+    pub(crate) fn leave_rule(&mut self) {
+        self.rule_depth = self
+            .rule_depth
+            .checked_sub(1)
+            .expect("rewrite-rule nesting is paired");
     }
 
     pub fn set_characteristics(

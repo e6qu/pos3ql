@@ -7,6 +7,617 @@
 use super::*;
 
 #[test]
+fn rewrite_rule_lifecycle_catalogs_and_transactionality() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE rule_source(id integer); \
+         CREATE TABLE rule_audit(id integer); \
+         CREATE TABLE rule_rollback_target(id integer); \
+         CREATE TABLE rule_alter_target(id integer); \
+         CREATE RULE audit_insert AS ON INSERT TO rule_source \
+           DO ALSO INSERT INTO rule_audit VALUES (NEW.id); \
+         SELECT rulename, ev_type, is_instead FROM pg_rewrite \
+           WHERE rulename = 'audit_insert'; \
+         SELECT schemaname, tablename, rulename FROM pg_rules \
+           WHERE rulename = 'audit_insert'; \
+         SELECT relhasrules FROM pg_class WHERE relname = 'rule_source'; \
+         INSERT INTO rule_source VALUES (7), (9); \
+         SELECT id FROM rule_audit ORDER BY id",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "audit_insert|3|f",
+            "public|rule_source|audit_insert",
+            "t",
+            "7",
+            "9",
+        ]
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER RULE audit_insert ON rule_source RENAME TO rolled_back; ROLLBACK; \
+         SELECT rulename FROM pg_rules WHERE tablename = 'rule_source'; \
+         BEGIN; CREATE RULE rolled_back_create AS ON INSERT TO rule_rollback_target DO NOTHING; ROLLBACK; \
+         SELECT relhasrules FROM pg_class WHERE relname = 'rule_rollback_target'; \
+         BEGIN; \
+           CREATE RULE altered_table_rule AS ON INSERT TO rule_alter_target DO NOTHING; \
+           ALTER TABLE rule_alter_target ADD COLUMN value integer; \
+           DROP RULE altered_table_rule ON rule_alter_target; \
+         COMMIT; \
+         SELECT relhasrules FROM pg_class WHERE relname = 'rule_alter_target'; \
+         CREATE OR REPLACE RULE audit_insert AS ON INSERT TO rule_source DO INSTEAD NOTHING; \
+         SELECT is_instead, pg_get_ruledef(oid) LIKE '%INSTEAD NOTHING%' \
+           FROM pg_rewrite WHERE rulename = 'audit_insert'; \
+         DROP RULE audit_insert ON rule_source; \
+         SELECT relhasrules FROM pg_class WHERE relname = 'rule_source'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["audit_insert", "f", "t", "t|t", "t"]);
+}
+
+#[test]
+fn rewrite_rule_actions_are_set_oriented_ordered_and_qualified() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE rule_rows(id integer, value integer); \
+         CREATE TABLE rule_log(kind text, id integer, old_value integer, new_value integer); \
+         CREATE TABLE rule_images(id integer, value integer); \
+         CREATE RULE log_update AS ON UPDATE TO rule_rows \
+           WHERE NEW.value >= 20 \
+           DO ALSO INSERT INTO rule_log VALUES ('update', OLD.id, OLD.value, NEW.value); \
+         CREATE RULE keep_one AS ON DELETE TO rule_rows \
+           WHERE OLD.id = 1 \
+           DO INSTEAD INSERT INTO rule_log VALUES ('kept', OLD.id, OLD.value, NULL); \
+         CREATE RULE reject_negative AS ON INSERT TO rule_rows \
+           WHERE NEW.id < 0 DO INSTEAD NOTHING; \
+         CREATE RULE snapshot_update AS ON UPDATE TO rule_rows \
+           DO ALSO INSERT INTO rule_images SELECT OLD.*; \
+         INSERT INTO rule_rows VALUES (-1, 3), (1, 10), (2, 11); \
+         UPDATE rule_rows SET value = value + 10; \
+         DELETE FROM rule_rows; \
+         SELECT id, value FROM rule_rows ORDER BY id; \
+         SELECT kind, id, old_value, new_value FROM rule_log ORDER BY kind, id; \
+         SELECT id, value FROM rule_images ORDER BY id",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "1|20",
+            "kept|1|20|NULL",
+            "update|1|10|20",
+            "update|2|11|21",
+            "1|10",
+            "2|11",
+        ]
+    );
+}
+
+#[test]
+fn rewrite_rule_set_queries_notify_recursion_and_command_counts() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_as(
+        &mut engine,
+        &mut budget,
+        17,
+        "CREATE TABLE rule_set_source(id integer); \
+         CREATE SEQUENCE rule_set_sequence; \
+         CREATE RULE rule_set_action AS ON INSERT TO rule_set_source DO ALSO ( \
+           SELECT nextval('rule_set_sequence') WHERE NEW.id > 0 \
+           UNION ALL \
+           SELECT nextval('rule_set_sequence') WHERE NEW.id < 0; \
+           NOTIFY rule_set_changed, 'rewritten'; \
+         )",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let inserted = run_as(
+        &mut engine,
+        &mut budget,
+        17,
+        "INSERT INTO rule_set_source VALUES (1), (-1)",
+    );
+    let inserted = String::from_utf8_lossy(&inserted);
+    assert!(!inserted.contains("ERROR"), "{inserted}");
+    assert!(inserted.contains("INSERT 0 2"), "{inserted}");
+    let sequence = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT last_value FROM pg_sequences WHERE sequencename = 'rule_set_sequence'",
+    );
+    assert_eq!(
+        data_rows(&sequence),
+        ["2"],
+        "{}",
+        String::from_utf8_lossy(&sequence)
+    );
+    assert_eq!(engine.notifications().len(), 1);
+    assert_eq!(
+        engine.notifications()[0].channel.as_str(),
+        "rule_set_changed"
+    );
+    assert_eq!(engine.notifications()[0].payload.as_str(), "rewritten");
+    engine.clear_notifications();
+
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE recursive_rule_rows(id integer); \
+         CREATE RULE recurse_rows AS ON INSERT TO recursive_rule_rows DO ALSO \
+           INSERT INTO recursive_rule_rows VALUES (NEW.id)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let recursive = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO recursive_rule_rows VALUES (1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&recursive)
+            .contains("infinite recursion detected in rules for relation"),
+        "{}",
+        String::from_utf8_lossy(&recursive)
+    );
+}
+
+#[test]
+fn rewrite_rule_actions_use_the_relation_owner_security_context() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE rule_security_owner; \
+         CREATE ROLE rule_security_writer; \
+         GRANT CREATE ON SCHEMA public TO rule_security_owner; \
+         SET ROLE rule_security_owner; \
+         CREATE TABLE rule_security_source(id integer); \
+         CREATE TABLE rule_security_lookup(id integer); \
+         CREATE TABLE rule_security_sink(id integer); \
+         CREATE TABLE rule_security_trigger_log(id integer); \
+         INSERT INTO rule_security_lookup VALUES (7); \
+         ALTER TABLE rule_security_sink ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE rule_security_sink FORCE ROW LEVEL SECURITY; \
+         CREATE POLICY rule_owner_insert ON rule_security_sink \
+           FOR INSERT TO rule_security_owner WITH CHECK (true); \
+         CREATE FUNCTION log_rule_security_insert() RETURNS trigger \
+           LANGUAGE plpgsql SECURITY DEFINER AS \
+           'BEGIN INSERT INTO rule_security_trigger_log VALUES (NEW.id); RETURN NEW; END'; \
+         CREATE TRIGGER log_rule_security_insert \
+           AFTER INSERT ON rule_security_sink FOR EACH ROW \
+           EXECUTE FUNCTION log_rule_security_insert(); \
+         CREATE RULE redirect_secure_insert AS ON INSERT TO rule_security_source DO INSTEAD \
+           INSERT INTO rule_security_sink \
+             SELECT lookup.id FROM rule_security_lookup AS lookup \
+             WHERE lookup.id = NEW.id RETURNING id; \
+         GRANT INSERT ON rule_security_source TO rule_security_writer; \
+         GRANT SELECT(id) ON rule_security_source TO rule_security_writer; \
+         CREATE TABLE rule_security_denied(id integer); \
+         CREATE RULE redirect_denied AS ON INSERT TO rule_security_denied DO INSTEAD \
+           INSERT INTO rule_security_sink VALUES (NEW.id); \
+         CREATE TABLE rule_security_nothing(id integer); \
+         CREATE RULE discard_secure_insert AS ON INSERT TO rule_security_nothing \
+           DO INSTEAD NOTHING; \
+         GRANT INSERT ON rule_security_nothing TO rule_security_writer; \
+         RESET ROLE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rule_security_writer; \
+         INSERT INTO rule_security_source VALUES (7) RETURNING id; \
+         RESET ROLE; \
+         SELECT id FROM rule_security_sink; \
+         SELECT id FROM rule_security_trigger_log",
+    );
+    let inserted_text = String::from_utf8_lossy(&inserted);
+    assert!(!inserted_text.contains("ERROR"), "{inserted_text}");
+    assert_eq!(data_rows(&inserted), ["7", "7", "7"]);
+
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rule_security_writer; INSERT INTO rule_security_denied VALUES (8)",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied)
+            .contains("permission denied for table rule_security_denied"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+    let reset = run_with(&mut engine, &mut budget, "RESET ROLE");
+    assert!(!String::from_utf8_lossy(&reset).contains("ERROR"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM rule_security_sink WHERE id = 8"
+        )),
+        ["0"]
+    );
+
+    let denied_source = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rule_security_writer; \
+         INSERT INTO rule_security_nothing SELECT id FROM rule_security_lookup",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_source)
+            .contains("permission denied for table rule_security_lookup"),
+        "{}",
+        String::from_utf8_lossy(&denied_source)
+    );
+    let column_grant = run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT SELECT(id) ON rule_security_lookup TO rule_security_writer; \
+         SET ROLE rule_security_writer; \
+         INSERT INTO rule_security_nothing SELECT id FROM rule_security_lookup",
+    );
+    let column_grant_text = String::from_utf8_lossy(&column_grant);
+    assert!(!column_grant_text.contains("ERROR"), "{column_grant_text}");
+    assert!(
+        column_grant_text.contains("INSERT 0 0"),
+        "{column_grant_text}"
+    );
+}
+
+#[test]
+fn rewrite_rule_capacity_is_a_named_startup_bound() {
+    let mut config = test_config("rewrite-rule-capacity");
+    config.max_rules = 1;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE bounded_rules(id integer); \
+         CREATE RULE bounded_rule_one AS ON INSERT TO bounded_rules DO NOTHING; \
+         CREATE RULE bounded_rule_two AS ON UPDATE TO bounded_rules DO NOTHING",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("too many rewrite rules (limit 1)"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE rule_defaults(id integer DEFAULT 41, label text DEFAULT 'defaulted'); \
+         CREATE TABLE rule_default_log(id integer, label text); \
+         CREATE RULE log_defaults AS ON INSERT TO rule_defaults \
+           DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, NEW.label); \
+         INSERT INTO rule_defaults(label) VALUES (DEFAULT), ('given'); \
+         SELECT id, label FROM rule_default_log ORDER BY label; \
+         CREATE TABLE rule_redirect(id integer); \
+         CREATE TABLE rule_destination(id integer); \
+         CREATE RULE redirect_returning AS ON INSERT TO rule_redirect DO INSTEAD \
+           INSERT INTO rule_destination VALUES (NEW.id) RETURNING rule_destination.id; \
+         INSERT INTO rule_redirect VALUES (7), (9) RETURNING id; \
+         SELECT id FROM rule_destination ORDER BY id",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        ["41|defaulted", "41|given", "7", "9", "7", "9"]
+    );
+
+    for (sql, expected) in [
+        (
+            "CREATE RULE invalid_returning AS ON INSERT TO rule_defaults \
+             DO ALSO INSERT INTO rule_default_log VALUES (NEW.id, NEW.label) RETURNING id",
+            "conditional or non-INSTEAD",
+        ),
+        (
+            "CREATE RULE second_returning AS ON INSERT TO rule_redirect DO INSTEAD \
+             INSERT INTO rule_destination VALUES (NEW.id) RETURNING id",
+            "multiple RETURNING lists",
+        ),
+        (
+            "CREATE RULE update_guard AS ON UPDATE TO rule_defaults DO ALSO NOTHING; \
+             INSERT INTO rule_defaults VALUES (1, 'x') ON CONFLICT DO NOTHING",
+            "INSERT or UPDATE rules",
+        ),
+        (
+            "CREATE RULE non_boolean AS ON INSERT TO rule_defaults \
+             WHERE NEW.id DO NOTHING",
+            "must be type boolean",
+        ),
+        (
+            "CREATE RULE missing_column AS ON INSERT TO rule_defaults \
+             WHERE NEW.absent = 1 DO NOTHING",
+            "column \"absent\" does not exist",
+        ),
+        (
+            "CREATE RULE invalid_old AS ON INSERT TO rule_defaults \
+             DO ALSO INSERT INTO rule_default_log VALUES (OLD.id, NEW.label)",
+            "cannot reference OLD",
+        ),
+        (
+            "CREATE RULE conditional_notify AS ON INSERT TO rule_defaults \
+             WHERE NEW.id = 1 DO NOTIFY conditional_rule",
+            "can only have SELECT, INSERT, UPDATE, or DELETE actions",
+        ),
+    ] {
+        let rejected = run_with(&mut engine, &mut budget, sql);
+        assert!(
+            String::from_utf8_lossy(&rejected).contains(expected),
+            "{}",
+            String::from_utf8_lossy(&rejected)
+        );
+    }
+}
+
+#[test]
+fn rewrite_rule_comments_and_event_trigger_objects_are_first_class() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE rule_event_target(id integer); \
+         CREATE TABLE rule_event_sink(id integer); \
+         CREATE TABLE rule_ddl_log(tag text, kind text, identity text); \
+         CREATE FUNCTION capture_rule_ddl() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO rule_ddl_log \
+              SELECT command_tag, object_type, object_identity \
+              FROM pg_event_trigger_ddl_commands(); RETURN; END'; \
+         CREATE EVENT TRIGGER capture_rule_commands ON ddl_command_end \
+           WHEN TAG IN ('CREATE RULE', 'ALTER RULE', 'COMMENT') \
+           EXECUTE FUNCTION capture_rule_ddl()",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    for statement in [
+        "CREATE RULE event_rule AS ON INSERT TO rule_event_target \
+           DO ALSO INSERT INTO rule_event_sink VALUES (NEW.id)",
+        "COMMENT ON RULE event_rule ON rule_event_target IS 'durable rewrite contract'",
+        "ALTER RULE event_rule ON rule_event_target RENAME TO renamed_event_rule",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT rulename, obj_description(oid, 'pg_rewrite'), \
+                pg_get_ruledef(oid) LIKE '%renamed_event_rule%' \
+           FROM pg_rewrite WHERE rulename = 'renamed_event_rule'",
+    );
+    let catalog_text = String::from_utf8_lossy(&catalog);
+    assert!(!catalog_text.contains("ERROR"), "{catalog_text}");
+    let rows = data_rows(&catalog);
+    assert!(
+        rows.contains(&"renamed_event_rule|durable rewrite contract|t".to_string()),
+        "{catalog_text}"
+    );
+    let commands = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT tag, kind FROM rule_ddl_log ORDER BY tag",
+    );
+    let command_text = String::from_utf8_lossy(&commands);
+    assert!(!command_text.contains("ERROR"), "{command_text}");
+    let rows = data_rows(&commands);
+    assert!(rows.contains(&"ALTER RULE|rule".to_string()), "{text}");
+    assert!(rows.contains(&"COMMENT|rule".to_string()), "{text}");
+    assert!(rows.contains(&"CREATE RULE|rule".to_string()), "{text}");
+
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION capture_rule_drop() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO rule_ddl_log \
+              SELECT ''DROP RULE'', object_type, object_identity \
+              FROM pg_event_trigger_dropped_objects() WHERE object_type = ''rule''; \
+              RETURN; END'; \
+         CREATE EVENT TRIGGER capture_rule_drops ON sql_drop \
+           WHEN TAG IN ('DROP RULE') EXECUTE FUNCTION capture_rule_drop()",
+    );
+    assert!(
+        !String::from_utf8_lossy(&dropped).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP RULE renamed_event_rule ON rule_event_target; \
+         SELECT tag, kind FROM rule_ddl_log WHERE tag = 'DROP RULE'; \
+         SELECT count(*) FROM pg_description WHERE description = 'durable rewrite contract'",
+    );
+    let dropped_text = String::from_utf8_lossy(&dropped);
+    assert!(!dropped_text.contains("ERROR"), "{dropped_text}");
+    assert_eq!(data_rows(&dropped), ["DROP RULE|rule", "0"]);
+}
+
+#[test]
+fn rewrite_rule_transition_columns_preserve_catalog_type_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN rule_identity_domain AS integer CHECK (VALUE > 0); \
+         CREATE FUNCTION rule_identity(value integer) RETURNS text \
+           LANGUAGE sql AS 'SELECT ''base'''; \
+         CREATE FUNCTION rule_identity(value rule_identity_domain) RETURNS text \
+           LANGUAGE sql AS 'SELECT ''domain'''; \
+         SELECT rule_identity(value) \
+           FROM (SELECT 7::rule_identity_domain AS value) typed_input; \
+         CREATE TABLE rule_identity_source(id rule_identity_domain); \
+         CREATE TABLE rule_identity_log(value text); \
+         CREATE RULE capture_rule_identity AS ON INSERT TO rule_identity_source DO INSTEAD \
+           INSERT INTO rule_identity_log SELECT rule_identity(NEW.id); \
+         INSERT INTO rule_identity_source VALUES (7); \
+         SELECT value FROM rule_identity_log; \
+         SELECT count(*) FROM rule_identity_source",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["domain", "domain", "0"]);
+
+    let invalid = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO rule_identity_source VALUES (-1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&invalid)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM rule_identity_log",
+        )),
+        ["domain"]
+    );
+}
+
+#[test]
+fn rewrite_rules_survive_object_cold_checkpoint_recovery() {
+    let mut config = test_config("rewrite-rule-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("rewrite-rule-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_rule_source(id integer DEFAULT 12); \
+         CREATE TABLE durable_rule_sink(id integer); \
+         CREATE TABLE durable_rule_history(id integer); \
+         CREATE RULE durable_rule AS ON INSERT TO durable_rule_source DO INSTEAD \
+           INSERT INTO durable_rule_sink VALUES (NEW.id) RETURNING durable_rule_sink.id; \
+         COMMENT ON RULE durable_rule ON durable_rule_source IS 'object durable'; \
+         INSERT INTO durable_rule_source DEFAULT VALUES RETURNING id; \
+         CREATE RULE historical_rule AS ON INSERT TO durable_rule_history DO NOTHING; \
+         DROP RULE historical_rule ON durable_rule_history; \
+         SELECT relhasrules FROM pg_class WHERE relname = 'durable_rule_history'",
+    );
+    assert_eq!(
+        data_rows(&created),
+        ["12", "t"],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut wal_recovered_budget = Budget::new(1 << 29);
+    let mut wal_recovered = Engine::new(&config, &mut wal_recovered_budget).unwrap();
+    let wal_output = run_with(
+        &mut wal_recovered,
+        &mut wal_recovered_budget,
+        "INSERT INTO durable_rule_source VALUES (18) RETURNING id; \
+         SELECT id FROM durable_rule_sink ORDER BY id; \
+         SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite \
+           WHERE rulename = 'durable_rule'",
+    );
+    let wal_text = String::from_utf8_lossy(&wal_output);
+    assert!(!wal_text.contains("ERROR"), "{wal_text}");
+    assert_eq!(data_rows(&wal_output), ["18", "12", "18", "object durable"]);
+    assert!(wal_recovered.checkpoint().unwrap());
+    wal_recovered.commit_wal().unwrap();
+    drop(wal_recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "INSERT INTO durable_rule_source VALUES (24) RETURNING id; \
+         SELECT id FROM durable_rule_sink ORDER BY id; \
+         SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite \
+           WHERE rulename = 'durable_rule'; \
+         SELECT relhasrules FROM pg_class WHERE relname = 'durable_rule_history'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        ["24", "12", "18", "24", "object durable", "t"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn rewrite_rule_dependencies_obey_restrict_cascade_and_target_lifetime() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE rule_dependency_source(id integer); \
+         CREATE TABLE rule_dependency_sink(id integer); \
+         CREATE RULE dependency_rule AS ON INSERT TO rule_dependency_source \
+           DO ALSO INSERT INTO rule_dependency_sink VALUES (NEW.id)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+
+    let restricted = run_with(&mut engine, &mut budget, "DROP TABLE rule_dependency_sink");
+    let restricted = String::from_utf8_lossy(&restricted);
+    assert!(
+        restricted.contains("other objects depend on it") && restricted.contains("dependency_rule"),
+        "{restricted}"
+    );
+
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE rule_dependency_sink CASCADE; \
+         SELECT count(*) FROM pg_rules WHERE rulename = 'dependency_rule'; \
+         CREATE TABLE rule_dependency_sink_2(id integer); \
+         CREATE RULE target_lifetime_rule AS ON INSERT TO rule_dependency_source \
+           DO ALSO INSERT INTO rule_dependency_sink_2 VALUES (NEW.id); \
+         DROP TABLE rule_dependency_source CASCADE; \
+         SELECT count(*) FROM pg_rules WHERE rulename = 'target_lifetime_rule'",
+    );
+    let text = String::from_utf8_lossy(&cascaded);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&cascaded), ["0", "0"]);
+}
+
+#[test]
 fn event_trigger_lifecycle_firing_catalog_and_transactionality() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -2678,6 +3289,7 @@ fn test_config(name: &str) -> Config {
     config.memtable_bytes = 1 << 20;
     config.max_connections = 8;
     config.max_tables = 8;
+    config.max_rules = 32;
     config.table_rows = 1024;
     config.txn_rows = 2048;
     config.value_index_rows = 2048;
@@ -33359,6 +33971,9 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
              state template_app.state NOT NULL,
              label text COLLATE template_app.byte_order
          );
+         CREATE TABLE template_app.item_audit(id integer);
+         CREATE RULE audit_template_insert AS ON INSERT TO template_app.items DO ALSO
+           INSERT INTO template_app.item_audit VALUES (NEW.id);
          CREATE INDEX items_label_idx ON template_app.items(label);
          INSERT INTO template_app.items VALUES (1, 'ready', 'z');
          CREATE VIEW template_app.ready_items AS
@@ -33430,7 +34045,8 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          SELECT conname FROM pg_conversion WHERE conname = 'latin1_to_utf8';
          SELECT label FROM template_app.items ORDER BY label;
          SELECT convert_from(decode('e9', 'hex'), 'LATIN1');
-         INSERT INTO template_app.items VALUES (2, 'done', 'a');",
+         INSERT INTO template_app.items VALUES (2, 'done', 'a');
+         SELECT id FROM template_app.item_audit ORDER BY id;",
     );
     assert_eq!(
         data_rows(&output),
@@ -33446,6 +34062,8 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "latin1_to_utf8",
             "z",
             "é",
+            "1",
+            "2",
         ],
         "{}",
         String::from_utf8_lossy(&output)
@@ -33538,10 +34156,11 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
                     obj_description('template_app.items'::regclass, 'pg_class'),
                     (SELECT count(*) FROM pg_indexes
                       WHERE schemaname = 'template_app' AND tablename = 'items'
-                        AND indexname = 'items_pkey')
+                        AND indexname = 'items_pkey'),
+                    (SELECT count(*) FROM template_app.item_audit)
                FROM template_app.items"
         )),
-        ["1|8|copied template table|1"]
+        ["1|8|copied template table|1|1"]
     );
     engine.select_database(clone).unwrap();
     let output = run_with(
@@ -33601,7 +34220,8 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
            SELECT attcollation FROM pg_attribute
             WHERE attrelid = 'template_app.cloned_items'::regclass AND attname = 'label');
          SELECT conname FROM pg_conversion WHERE conname = 'latin1_to_utf8';
-         SELECT label FROM template_app.cloned_items ORDER BY label;",
+         SELECT label FROM template_app.cloned_items ORDER BY label;
+         SELECT id FROM template_app.item_audit ORDER BY id;",
     );
     assert_eq!(
         data_rows(&output),
@@ -33616,7 +34236,9 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "byte_order",
             "latin1_to_utf8",
             "a",
-            "z"
+            "z",
+            "1",
+            "2"
         ],
         "{}",
         String::from_utf8_lossy(&output)

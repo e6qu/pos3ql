@@ -484,6 +484,7 @@ pub(crate) fn dispatch<'a>(
             | "pg_get_function_sqlbody"
             | "pg_get_expr"
             | "pg_get_viewdef"
+            | "pg_get_ruledef"
             | "pg_table_size"
             | "pg_database_size"
             | "pg_tablespace_location"
@@ -1124,6 +1125,25 @@ pub(crate) fn dispatch<'a>(
                 };
                 Ok(cat
                     .view_def(oid, arena)?
+                    .map(Datum::Text)
+                    .unwrap_or(Datum::Null))
+            }
+            "pg_get_ruledef" => {
+                if !(1..=2).contains(&args.len()) {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function pg_get_ruledef(...) does not exist"
+                    ));
+                }
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                Ok(cat
+                    .rule_def(oid, arena)?
                     .map(Datum::Text)
                     .unwrap_or(Datum::Null))
             }

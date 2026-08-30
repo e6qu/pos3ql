@@ -80,6 +80,35 @@ pub(crate) struct StatementMark {
 }
 
 pub const MAX_SAVEPOINTS: usize = 16;
+pub const DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LargeObjectDescriptorMode {
+    pub readable: bool,
+    pub writable: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LargeObjectDescriptor {
+    pub oid: crate::storage::LargeObjectOid,
+    pub position: i64,
+    pub mode: LargeObjectDescriptorMode,
+    opened_savepoint_depth: u8,
+    active: bool,
+}
+
+impl LargeObjectDescriptor {
+    const EMPTY: Self = Self {
+        oid: crate::storage::LargeObjectOid::parse(1).expect("one is a valid OID"),
+        position: 0,
+        mode: LargeObjectDescriptorMode {
+            readable: false,
+            writable: false,
+        },
+        opened_savepoint_depth: 0,
+        active: false,
+    };
+}
 // Trigger routines recurse through the bounded statement executor. Keep the
 // SQL limit below the smallest supported thread stack's native-frame limit.
 pub const MAX_TRIGGER_NESTING: u16 = 16;
@@ -193,6 +222,7 @@ pub struct TxnState {
     deferred_triggers: FixedVec<DeferredTriggerEvent>,
     completed_deferred_triggers: FixedVec<usize>,
     deferred_trigger_bytes: FixedBuf,
+    large_object_descriptors: FixedVec<LargeObjectDescriptor>,
 }
 
 /// How to undo one DDL statement.
@@ -358,6 +388,8 @@ pub(crate) enum DdlUndo {
     SequenceCreated(u32),
     /// DROP SEQUENCE at this slot — undo by reviving it.
     SequenceDropped(u32),
+    LargeObjectCreated(u32),
+    LargeObjectDropped(u32),
     SequenceAltered {
         slot: u32,
         prior: Option<crate::storage::PendingSequenceDefinition>,
@@ -580,6 +612,13 @@ pub(crate) enum StatisticsUndo {
 
 impl TxnState {
     pub const fn budget_bytes(capacity: usize) -> usize {
+        Self::budget_bytes_with_large_objects(capacity, DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS)
+    }
+
+    pub const fn budget_bytes_with_large_objects(
+        capacity: usize,
+        descriptor_capacity: usize,
+    ) -> usize {
         capacity * core::mem::size_of::<(u32, u64, PriorPending)>()
             + MAX_TXN_DDL * core::mem::size_of::<TruncateEvent>()
             + MAX_TRUNCATE_WAL_TABLE_BYTES
@@ -601,9 +640,25 @@ impl TxnState {
             + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<DeferredTriggerEvent>()
             + MAX_DEFERRED_CONSTRAINTS * core::mem::size_of::<usize>()
             + DEFERRED_TRIGGER_BYTES
+            + descriptor_capacity * core::mem::size_of::<LargeObjectDescriptor>()
     }
 
     pub fn new(budget: &mut Budget, capacity: usize) -> Result<Self, BudgetError> {
+        Self::new_with_large_objects(budget, capacity, DEFAULT_MAX_LARGE_OBJECT_DESCRIPTORS)
+    }
+
+    pub fn new_with_large_objects(
+        budget: &mut Budget,
+        capacity: usize,
+        descriptor_capacity: usize,
+    ) -> Result<Self, BudgetError> {
+        let mut large_object_descriptors =
+            FixedVec::new(budget, "large_object_descriptors", descriptor_capacity)?;
+        for _ in 0..descriptor_capacity {
+            large_object_descriptors
+                .push(LargeObjectDescriptor::EMPTY)
+                .expect("sized to descriptor capacity");
+        }
         Ok(Self {
             mode: TxnMode::Idle,
             failed: false,
@@ -688,7 +743,85 @@ impl TxnState {
                 "txn_deferred_trigger_bytes",
                 DEFERRED_TRIGGER_BYTES,
             )?,
+            large_object_descriptors,
         })
+    }
+
+    pub(crate) fn open_large_object_descriptor(
+        &mut self,
+        oid: crate::storage::LargeObjectOid,
+        mode: LargeObjectDescriptorMode,
+    ) -> Result<i32, SqlError> {
+        let slot = self
+            .large_object_descriptors
+            .iter()
+            .position(|descriptor| !descriptor.active)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many open large objects (limit {})",
+                    self.large_object_descriptors.len()
+                )
+            })?;
+        self.large_object_descriptors[slot] = LargeObjectDescriptor {
+            oid,
+            position: 0,
+            mode,
+            opened_savepoint_depth: self.savepoints.len() as u8,
+            active: true,
+        };
+        Ok(slot as i32)
+    }
+
+    pub(crate) fn large_object_descriptor(
+        &self,
+        fd: i32,
+    ) -> Result<&LargeObjectDescriptor, SqlError> {
+        let descriptor = usize::try_from(fd)
+            .ok()
+            .and_then(|slot| self.large_object_descriptors.get(slot))
+            .filter(|descriptor| descriptor.active)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "invalid large-object descriptor: {}",
+                    fd
+                )
+            })?;
+        Ok(descriptor)
+    }
+
+    pub(crate) fn large_object_descriptor_mut(
+        &mut self,
+        fd: i32,
+    ) -> Result<&mut LargeObjectDescriptor, SqlError> {
+        let slot = usize::try_from(fd).ok().filter(|slot| {
+            self.large_object_descriptors
+                .get(*slot)
+                .is_some_and(|descriptor| descriptor.active)
+        });
+        slot.map(|slot| &mut self.large_object_descriptors[slot])
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "invalid large-object descriptor: {}",
+                    fd
+                )
+            })
+    }
+
+    pub(crate) fn close_large_object_descriptor(&mut self, fd: i32) -> Result<(), SqlError> {
+        self.large_object_descriptor_mut(fd)?.active = false;
+        Ok(())
+    }
+
+    pub(crate) fn rollback_large_object_descriptors_to(&mut self, savepoint_depth: usize) {
+        for descriptor in self.large_object_descriptors.iter_mut() {
+            if descriptor.active && usize::from(descriptor.opened_savepoint_depth) > savepoint_depth
+            {
+                descriptor.active = false;
+            }
+        }
     }
 
     pub fn is_active(&self) -> bool {
@@ -1671,6 +1804,11 @@ impl TxnState {
     /// Drops the savepoint at `index` and every one nested inside it (for
     /// `RELEASE SAVEPOINT`; the changes themselves are kept).
     pub fn release_savepoints_from(&mut self, index: usize) {
+        for descriptor in self.large_object_descriptors.iter_mut() {
+            if descriptor.active && usize::from(descriptor.opened_savepoint_depth) > index {
+                descriptor.opened_savepoint_depth = index as u8;
+            }
+        }
         while self.savepoints.len() > index {
             self.savepoints.pop();
         }
@@ -1679,6 +1817,7 @@ impl TxnState {
     /// Drops savepoints nested strictly inside `index`, keeping `index` itself (for
     /// `ROLLBACK TO SAVEPOINT`, which leaves the target reusable).
     pub fn rollback_savepoints_after(&mut self, index: usize) {
+        self.rollback_large_object_descriptors_to(index + 1);
         while self.savepoints.len() > index + 1 {
             self.savepoints.pop();
         }
@@ -1817,5 +1956,8 @@ impl TxnState {
         self.deferred_triggers.clear();
         self.completed_deferred_triggers.clear();
         self.deferred_trigger_bytes.clear();
+        for descriptor in self.large_object_descriptors.iter_mut() {
+            descriptor.active = false;
+        }
     }
 }

@@ -51,6 +51,8 @@ pub(crate) const PG_TS_PARSER_OID: i32 = 3601;
 pub(crate) const PG_TS_CONFIG_OID: i32 = 3602;
 pub(crate) const PG_TS_TEMPLATE_OID: i32 = 3764;
 pub(crate) const PG_REWRITE_OID: i32 = 2618;
+pub(crate) const PG_LARGEOBJECT_METADATA_OID: i32 = 2995;
+pub(crate) const PG_LARGEOBJECT_OID: i32 = 2613;
 pub(crate) const PG_TRIGGER_OID: i32 = 2620;
 pub(crate) const PG_TABLESPACE_OID: i32 = 1213;
 pub(crate) const PG_POLICY_OID: i32 = 3256;
@@ -70,6 +72,166 @@ struct IntrinsicRoutine {
 }
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
+    IntrinsicRoutine {
+        oid: 715,
+        name: "lo_create",
+        result_oid: 26,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 764,
+        name: "lo_import",
+        result_oid: 26,
+        argument_types: "25",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 765,
+        name: "lo_export",
+        result_oid: 23,
+        argument_types: "26 25",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 767,
+        name: "lo_import",
+        result_oid: 26,
+        argument_types: "25 26",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 952,
+        name: "lo_open",
+        result_oid: 23,
+        argument_types: "26 23",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 953,
+        name: "lo_close",
+        result_oid: 23,
+        argument_types: "23",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 954,
+        name: "loread",
+        result_oid: 17,
+        argument_types: "23 23",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 955,
+        name: "lowrite",
+        result_oid: 23,
+        argument_types: "23 17",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 956,
+        name: "lo_lseek",
+        result_oid: 23,
+        argument_types: "23 23 23",
+        argument_count: 3,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 957,
+        name: "lo_creat",
+        result_oid: 26,
+        argument_types: "23",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 958,
+        name: "lo_tell",
+        result_oid: 23,
+        argument_types: "23",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 964,
+        name: "lo_unlink",
+        result_oid: 23,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 1004,
+        name: "lo_truncate",
+        result_oid: 23,
+        argument_types: "23 23",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3170,
+        name: "lo_lseek64",
+        result_oid: 20,
+        argument_types: "23 20 23",
+        argument_count: 3,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3171,
+        name: "lo_tell64",
+        result_oid: 20,
+        argument_types: "23",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3172,
+        name: "lo_truncate64",
+        result_oid: 23,
+        argument_types: "23 20",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3457,
+        name: "lo_from_bytea",
+        result_oid: 26,
+        argument_types: "26 17",
+        argument_count: 2,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3458,
+        name: "lo_get",
+        result_oid: 17,
+        argument_types: "26",
+        argument_count: 1,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3459,
+        name: "lo_get",
+        result_oid: 17,
+        argument_types: "26 20 23",
+        argument_count: 3,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3460,
+        name: "lo_put",
+        result_oid: 2278,
+        argument_types: "26 20 17",
+        argument_count: 3,
+        volatility: "v",
+    },
     IntrinsicRoutine {
         oid: 1644,
         name: "RI_FKey_check_ins",
@@ -686,7 +848,8 @@ fn intrinsic_routine_is_strict(routine: IntrinsicRoutine) -> bool {
 
 fn intrinsic_routine_parallel(routine: IntrinsicRoutine) -> &'static str {
     match routine.oid {
-        1402 | 1403 | 2078 | 3086 => "u",
+        715 | 764 | 765 | 767 | 952 | 953 | 954 | 955 | 956 | 957 | 958 | 964 | 1004 | 3170
+        | 3171 | 3172 | 3457 | 3458 | 3459 | 3460 | 1402 | 1403 | 2078 | 3086 => "u",
         1641 | 3566 | 4568 => "r",
         _ => "s",
     }
@@ -827,6 +990,8 @@ const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_conversion", PG_CONVERSION_OID),
     ("pg_depend", 2608),
     ("pg_rewrite", 2618),
+    ("pg_largeobject", 2613),
+    ("pg_largeobject_metadata", 2995),
     ("pg_namespace", PG_NAMESPACE_OID),
     ("pg_opclass", PG_OPCLASS_OID),
     ("pg_operator", PG_OPERATOR_OID),
@@ -1114,20 +1279,7 @@ pub fn synthesize<'a>(
         (false, "pg_ts_dict") => pg_ts_dict(storage, txid, arena),
         (false, "pg_ts_config") => pg_ts_config(storage, txid, arena),
         (false, "pg_ts_config_map") => pg_ts_config_map(storage, txid, arena),
-        (false, "pg_init_privs") => finish(
-            def_of(
-                "pg_init_privs",
-                &[
-                    ("objoid", ColType::Int4),
-                    ("classoid", ColType::Int4),
-                    ("objsubid", ColType::Int4),
-                    ("privtype", ColType::Bpchar),
-                    ("initprivs", ColType::Array(super::types::ArrElem::AclItem)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_init_privs") => pg_init_privs(arena),
         (false, "pg_cast") => pg_cast(storage, txid, arena),
         (false, "pg_transform") => finish(
             def_of(
@@ -1200,30 +1352,8 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_largeobject_metadata") => finish(
-            def_of(
-                "pg_largeobject_metadata",
-                &[
-                    ("oid", ColType::Int4),
-                    ("lomowner", ColType::Int4),
-                    ("lomacl", ColType::Array(super::types::ArrElem::AclItem)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
-        (false, "pg_largeobject") => finish(
-            def_of(
-                "pg_largeobject",
-                &[
-                    ("loid", ColType::Int4),
-                    ("pageno", ColType::Int4),
-                    ("data", ColType::Bytea),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_largeobject_metadata") => pg_largeobject_metadata(storage, txid, arena),
+        (false, "pg_largeobject") => pg_largeobject(storage, txid, arena),
         (false, "pg_enum") => pg_enum(storage, txid, arena),
         (false, "pg_range") => finish(
             def_of(
@@ -1426,6 +1556,7 @@ fn acl<'a>(
         }
         crate::storage::AccessClass::Index => crate::storage::PrivilegeSet::NONE,
         crate::storage::AccessClass::Routine => crate::storage::PrivilegeSet::FUNCTION_ALL,
+        crate::storage::AccessClass::LargeObject => crate::storage::PrivilegeSet::LARGE_OBJECT_ALL,
         crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
         crate::storage::AccessClass::Tablespace => crate::storage::PrivilegeSet::CREATE,
         crate::storage::AccessClass::Database => crate::storage::PrivilegeSet::DATABASE_ALL,
@@ -1534,6 +1665,134 @@ fn acl<'a>(
         element: super::types::ArrElem::AclItem,
         raw: super::array::build(&values[..count], arena)?,
     })
+}
+
+fn builtin_acl<'a>(values: &[&str], arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let datums = arena
+        .alloc_slice_with(values.len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (datum, value) in datums.iter_mut().zip(values) {
+        *datum = text(value, arena)?;
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::AclItem,
+        raw: super::array::build(datums, arena)?,
+    })
+}
+
+fn pg_init_privs<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_init_privs",
+        &[
+            ("objoid", ColType::Int4),
+            ("classoid", ColType::Int4),
+            ("objsubid", ColType::Int4),
+            ("privtype", ColType::Bpchar),
+            ("initprivs", ColType::Array(super::types::ArrElem::AclItem)),
+        ],
+    );
+    let rows = arena
+        .alloc_slice_with(3, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (row_index, function_oid) in [764, 765, 767].into_iter().enumerate() {
+        rows[row_index] = row(
+            &[
+                Datum::Int4(function_oid),
+                Datum::Int4(PG_PROC_OID),
+                Datum::Int4(0),
+                Datum::Bpchar("i"),
+                builtin_acl(&["postgres=X/postgres"], arena)?,
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, rows, arena)
+}
+
+fn pg_largeobject_metadata<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_largeobject_metadata",
+        &[
+            ("oid", ColType::Oid),
+            ("lomowner", ColType::Oid),
+            ("lomacl", ColType::Array(super::types::ArrElem::AclItem)),
+        ],
+    );
+    let count = storage.large_objects_visible_to(txid).count();
+    let rows = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (index, (slot, object)) in storage.large_objects_visible_to(txid).enumerate() {
+        let access = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::LargeObject,
+            slot: slot as u16,
+        };
+        rows[index] = row(
+            &[
+                Datum::Oid(object.oid.get()),
+                Datum::Oid(Storage::role_oid(storage.object_owner(access, txid)) as u32),
+                acl(storage, access, txid, arena)?,
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, rows, arena)
+}
+
+fn pg_largeobject<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let role = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for table pg_largeobject"
+        )
+    })?;
+    if !storage.role(role).attributes_to(txid).superuser {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for table pg_largeobject"
+        ));
+    }
+    let definition = def_of(
+        "pg_largeobject",
+        &[
+            ("loid", ColType::Oid),
+            ("pageno", ColType::Int4),
+            ("data", ColType::Bytea),
+        ],
+    );
+    let mut count = 0usize;
+    super::large_object::for_each_page(storage, txid, &mut |_, _, _| {
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| catalog_capacity_exceeded("pg_largeobject"))?;
+        Ok(())
+    })?;
+    let rows = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut index = 0usize;
+    super::large_object::for_each_page(storage, txid, &mut |oid, page, data| {
+        let copied = arena.alloc_slice_copy(data).map_err(|_| arena_full())?;
+        rows[index] = row(
+            &[
+                Datum::Oid(oid.get()),
+                Datum::Int4(page as i32),
+                Datum::Bytea(copied),
+            ],
+            arena,
+        )?;
+        index += 1;
+        Ok(())
+    })?;
+    finish(definition, rows, arena)
 }
 
 fn column_acl<'a>(
@@ -4057,8 +4316,8 @@ fn pg_description<'a>(
     let def = def_of(
         "pg_description",
         &[
-            ("objoid", ColType::Int4),
-            ("classoid", ColType::Int4),
+            ("objoid", ColType::Oid),
+            ("classoid", ColType::Oid),
             ("objsubid", ColType::Int4),
             ("description", ColType::Text),
         ],
@@ -4121,6 +4380,18 @@ fn pg_description<'a>(
                 };
                 (storage.event_trigger(slot).oid(), 3466)
             }
+            crate::storage::CommentClass::LargeObject => {
+                let Ok(raw_oid) = name.parse::<u32>() else {
+                    continue;
+                };
+                let Some(oid) = crate::sql::ast::LargeObjectId::parse(raw_oid) else {
+                    continue;
+                };
+                if storage.large_object_slot(oid, txid).is_none() {
+                    continue;
+                }
+                (raw_oid as i32, PG_LARGEOBJECT_OID)
+            }
             crate::storage::CommentClass::Rule => {
                 let rule = storage
                     .rules_visible_to(txid)
@@ -4175,8 +4446,8 @@ fn pg_description<'a>(
         };
         out[n] = row(
             &[
-                Datum::Int4(objoid),
-                Datum::Int4(classoid),
+                Datum::Oid(objoid as u32),
+                Datum::Oid(classoid as u32),
                 Datum::Int4(catalog_subid),
                 text(description, arena)?,
             ],
@@ -4474,36 +4745,37 @@ pub fn comment_text_for<'a>(
     storage: &Storage,
     txid: u32,
     catalog_name: &str,
-    oid: i32,
+    oid: u32,
     subid: i32,
     arena: &'a Arena,
 ) -> Result<Option<&'a str>, SqlError> {
+    let signed_oid = i32::try_from(oid).ok();
     for (class, schema, name, csub, text) in storage.comments_visible(txid) {
         let hit = match catalog_name {
             "pg_namespace" => {
                 class == crate::storage::CommentClass::Schema
                     && subid == 0
-                    && namespace_oid(storage, name) == oid
+                    && Some(namespace_oid(storage, name)) == signed_oid
             }
             "pg_type" => {
                 class == crate::storage::CommentClass::Type
                     && subid == 0
-                    && type_oid_of(storage, schema, name, txid) == Some(oid)
+                    && type_oid_of(storage, schema, name, txid) == signed_oid
             }
             "pg_tablespace" => {
                 class == crate::storage::CommentClass::Tablespace
                     && subid == 0
                     && storage.tablespaces_visible_to(txid).any(|(_, tablespace)| {
                         tablespace.name_for(txid).as_str() == name
-                            && tablespace_oid(*tablespace) == oid
+                            && Some(tablespace_oid(*tablespace)) == signed_oid
                     })
             }
             "pg_database" => {
                 class == crate::storage::CommentClass::Database
                     && subid == 0
-                    && storage
-                        .database_slot(name, txid)
-                        .is_some_and(|slot| storage.database(slot).oid.get() == oid)
+                    && storage.database_slot(name, txid).is_some_and(|slot| {
+                        u32::try_from(storage.database(slot).oid.get()).ok() == Some(oid)
+                    })
             }
             "pg_trigger" => {
                 class == crate::storage::CommentClass::Trigger
@@ -4514,7 +4786,7 @@ pub fn comment_text_for<'a>(
                         .any(|trigger| {
                             trigger.name_to(txid).as_str() == name
                                 && trigger.target.comment_subid() == csub
-                                && crate::storage::trigger_oid(&trigger) == oid
+                                && Some(crate::storage::trigger_oid(&trigger)) == signed_oid
                         })
             }
             "pg_collation" => {
@@ -4522,21 +4794,26 @@ pub fn comment_text_for<'a>(
                     && subid == 0
                     && storage
                         .collation_slot(schema, name, txid)
-                        .is_some_and(|slot| storage.collation(slot).oid(slot) == oid)
+                        .is_some_and(|slot| Some(storage.collation(slot).oid(slot)) == signed_oid)
             }
             "pg_conversion" => {
                 class == crate::storage::CommentClass::Conversion
                     && subid == 0
                     && storage
                         .conversion_slot(schema, name, txid)
-                        .is_some_and(|slot| storage.conversion(slot).oid(slot) == oid)
+                        .is_some_and(|slot| Some(storage.conversion(slot).oid(slot)) == signed_oid)
             }
             "pg_event_trigger" => {
                 class == crate::storage::CommentClass::EventTrigger
                     && subid == 0
                     && storage
                         .event_trigger_slot(name, txid)
-                        .is_some_and(|slot| storage.event_trigger(slot).oid() == oid)
+                        .is_some_and(|slot| Some(storage.event_trigger(slot).oid()) == signed_oid)
+            }
+            "pg_largeobject" => {
+                class == crate::storage::CommentClass::LargeObject
+                    && subid == 0
+                    && name.parse::<u32>() == Ok(oid)
             }
             "pg_ts_parser" => {
                 class == crate::storage::CommentClass::TextSearchParser
@@ -4549,7 +4826,8 @@ pub fn comment_text_for<'a>(
                             txid,
                         )
                         .is_some_and(|slot| {
-                            storage.text_search_object(slot).definition_for(txid).oid() == oid
+                            Some(storage.text_search_object(slot).definition_for(txid).oid())
+                                == signed_oid
                         })
             }
             "pg_ts_template" => {
@@ -4563,7 +4841,8 @@ pub fn comment_text_for<'a>(
                             txid,
                         )
                         .is_some_and(|slot| {
-                            storage.text_search_object(slot).definition_for(txid).oid() == oid
+                            Some(storage.text_search_object(slot).definition_for(txid).oid())
+                                == signed_oid
                         })
             }
             "pg_ts_dict" => {
@@ -4577,7 +4856,8 @@ pub fn comment_text_for<'a>(
                             txid,
                         )
                         .is_some_and(|slot| {
-                            storage.text_search_object(slot).definition_for(txid).oid() == oid
+                            Some(storage.text_search_object(slot).definition_for(txid).oid())
+                                == signed_oid
                         })
             }
             "pg_ts_config" => {
@@ -4591,7 +4871,8 @@ pub fn comment_text_for<'a>(
                             txid,
                         )
                         .is_some_and(|slot| {
-                            storage.text_search_object(slot).definition_for(txid).oid() == oid
+                            Some(storage.text_search_object(slot).definition_for(txid).oid())
+                                == signed_oid
                         })
             }
             "pg_rewrite" => {
@@ -4601,13 +4882,13 @@ pub fn comment_text_for<'a>(
                         let definition = rule.definition_for(txid);
                         definition.name.as_str() == name
                             && definition.target.comment_subid() == csub
-                            && rule.oid() == oid
+                            && Some(rule.oid()) == signed_oid
                     })
             }
             _ => {
                 class == crate::storage::CommentClass::Relation
                     && csub as i32 == subid
-                    && relation_oid_of(storage, txid, schema, name) == Some(oid)
+                    && relation_oid_of(storage, txid, schema, name) == signed_oid
             }
         };
         if hit {
@@ -7211,6 +7492,106 @@ fn pg_class<'a>(
         )?;
         n += 1;
     }
+    for (oid, name, relation_type, relation_acl) in [
+        (
+            2613,
+            "pg_largeobject",
+            10025,
+            &["postgres=arwdDxtm/postgres"] as &[&str],
+        ),
+        (
+            PG_LARGEOBJECT_METADATA_OID,
+            "pg_largeobject_metadata",
+            10023,
+            &["postgres=arwdDxtm/postgres", "=r/postgres"] as &[&str],
+        ),
+    ] {
+        if n == out.len() {
+            return Err(catalog_capacity_exceeded("pg_class"));
+        }
+        out[n] = row(
+            &[
+                Datum::Int4(oid),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                text("r", arena)?,
+                Datum::Int4(3),
+                Datum::Float8(0.0),
+                Datum::Int4(0),
+                Datum::Int4(2),
+                Datum::Int4(10),
+                Datum::Int4(0),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                text("p", arena)?,
+                text("n", arena)?,
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(relation_type),
+                builtin_acl(relation_acl, arena)?,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(1),
+                Datum::Null,
+                Datum::Bool(true),
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    for (oid, name, attributes) in [
+        (2683, "pg_largeobject_loid_pn_index", 2),
+        (2996, "pg_largeobject_metadata_oid_index", 1),
+    ] {
+        if n == out.len() {
+            return Err(catalog_capacity_exceeded("pg_class"));
+        }
+        out[n] = row(
+            &[
+                Datum::Int4(oid),
+                text(name, arena)?,
+                Datum::Int4(PG_CATALOG_NS_OID),
+                text("i", arena)?,
+                Datum::Int4(attributes),
+                Datum::Float8(1.0),
+                Datum::Int4(2),
+                Datum::Int4(403),
+                Datum::Int4(10),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                text("p", arena)?,
+                text("n", arena)?,
+                Datum::Int4(PG_CLASS_OID),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Null,
+                Datum::Bool(true),
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
     finish(def, &out[..n], arena)
 }
 
@@ -8121,6 +8502,13 @@ fn extension_dependency_catalog_identity(
         AccessClass::Trigger => (2620, crate::storage::trigger_oid(storage.trigger(slot))),
         AccessClass::EventTrigger => (3466, storage.event_trigger(slot).oid()),
         AccessClass::Database => (1262, 5),
+        AccessClass::LargeObject => (
+            PG_LARGEOBJECT_OID,
+            storage
+                .large_objects_visible_to(txid)
+                .find_map(|(candidate, object)| (candidate == slot).then_some(object.oid.get()))?
+                as i32,
+        ),
     })
 }
 
@@ -8860,7 +9248,7 @@ fn pg_index<'a>(
         })
         .count();
     let out = arena
-        .alloc_slice_with(indexes.len() + toast_indexes, |_| &[] as &[Datum])
+        .alloc_slice_with(indexes.len() + toast_indexes + 2, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut n = 0;
     for info in indexes {
@@ -8951,6 +9339,50 @@ fn pg_index<'a>(
                     raw: super::array::build(&collations, arena)?,
                 },
                 oidvector(&operator_classes, arena)?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    for (index_oid, relation_oid, attributes, operator_classes) in [
+        (2683, 2613, &[0_u16, 1][..], &[1981_i32, 1978][..]),
+        (
+            2996,
+            PG_LARGEOBJECT_METADATA_OID,
+            &[0_u16][..],
+            &[1981_i32][..],
+        ),
+    ] {
+        let options = [Datum::Int4(0), Datum::Int4(0)];
+        let collations = [Datum::Int4(0), Datum::Int4(0)];
+        out[n] = row(
+            &[
+                Datum::Int4(index_oid),
+                Datum::Int4(relation_oid),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Int4(attributes.len() as i32),
+                Datum::Int4(attributes.len() as i32),
+                int2vector(attributes, arena)?,
+                Datum::Array {
+                    element: super::types::ArrElem::Int4,
+                    raw: super::array::build(&options[..attributes.len()], arena)?,
+                },
+                Datum::Null,
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Null,
+                Datum::Array {
+                    element: super::types::ArrElem::Int4,
+                    raw: super::array::build(&collations[..attributes.len()], arena)?,
+                },
+                oidvector(operator_classes, arena)?,
             ],
             arena,
         )?;
@@ -9460,6 +9892,102 @@ fn pg_attribute<'a>(
                     Datum::Int4(-1),
                     Datum::Bool(false),
                     Datum::Int4(attribute as i32 + 1),
+                    text("i", arena)?,
+                    Datum::Bool(true),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    for (relation, columns) in [
+        (
+            2613,
+            &[
+                ("loid", 26, true, 4, "p", "i"),
+                ("pageno", 23, true, 4, "p", "i"),
+                ("data", 17, true, -1, "x", "i"),
+            ][..],
+        ),
+        (
+            PG_LARGEOBJECT_METADATA_OID,
+            &[
+                ("oid", 26, true, 4, "p", "i"),
+                ("lomowner", 26, true, 4, "p", "i"),
+                ("lomacl", 1034, false, -1, "x", "d"),
+            ][..],
+        ),
+    ] {
+        for (attribute, (name, type_oid, not_null, type_len, storage_kind, alignment)) in
+            columns.iter().enumerate()
+        {
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_attribute"));
+            }
+            let number = attribute as i32 + 1;
+            out[n] = row(
+                &[
+                    Datum::Int4(relation),
+                    text(name, arena)?,
+                    Datum::Int4(*type_oid),
+                    Datum::Int4(number),
+                    Datum::Bool(*not_null),
+                    Datum::Int4(*type_len),
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Int4(0),
+                    text("", arena)?,
+                    text("", arena)?,
+                    text(storage_kind, arena)?,
+                    text("", arena)?,
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Int4(number),
+                    text(alignment, arena)?,
+                    Datum::Bool(true),
+                    Datum::Null,
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Null,
+                    Datum::Null,
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    for (relation, columns) in [
+        (2683, &[("loid", 26, 4), ("pageno", 23, 4)][..]),
+        (2996, &[("oid", 26, 4)][..]),
+    ] {
+        for (attribute, (name, type_oid, type_len)) in columns.iter().enumerate() {
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_attribute"));
+            }
+            let number = attribute as i32 + 1;
+            out[n] = row(
+                &[
+                    Datum::Int4(relation),
+                    text(name, arena)?,
+                    Datum::Int4(*type_oid),
+                    Datum::Int4(number),
+                    Datum::Bool(false),
+                    Datum::Int4(*type_len),
+                    Datum::Int4(-1),
+                    Datum::Bool(false),
+                    Datum::Int4(0),
+                    text("", arena)?,
+                    text("", arena)?,
+                    text("p", arena)?,
+                    text("", arena)?,
+                    Datum::Null,
+                    Datum::Bool(false),
+                    Datum::Int4(number),
                     text("i", arena)?,
                     Datum::Bool(true),
                     Datum::Null,
@@ -10472,7 +11000,11 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Bpchar(intrinsic_routine_parallel(*routine)),
                 Datum::Int4(10),
                 Datum::Bool(false),
-                Datum::Null,
+                if matches!(routine.oid, 764 | 765 | 767) {
+                    builtin_acl(&["postgres=X/postgres"], arena)?
+                } else {
+                    Datum::Null
+                },
                 Datum::Int4(12),
                 text(
                     if routine.oid == 89 {
@@ -12306,7 +12838,7 @@ fn pg_indexes<'a>(
     );
     let indices = collect_indexes(storage, txid, arena)?;
     let out = arena
-        .alloc_slice_with(indices.len(), |_| &[] as &[Datum])
+        .alloc_slice_with(indices.len() + 2, |_| &[] as &[Datum])
         .map_err(|_| arena_full())?;
     let mut n = 0;
     for info in indices {
@@ -12401,6 +12933,30 @@ fn pg_indexes<'a>(
                     alloc_rendered(&indexdef, "index definition is too long", arena)?,
                     arena,
                 )?,
+            ],
+            arena,
+        )?;
+        n += 1;
+    }
+    for (table_name, index_name, definition) in [
+        (
+            "pg_largeobject",
+            "pg_largeobject_loid_pn_index",
+            "CREATE UNIQUE INDEX pg_largeobject_loid_pn_index ON pg_catalog.pg_largeobject USING btree (loid, pageno)",
+        ),
+        (
+            "pg_largeobject_metadata",
+            "pg_largeobject_metadata_oid_index",
+            "CREATE UNIQUE INDEX pg_largeobject_metadata_oid_index ON pg_catalog.pg_largeobject_metadata USING btree (oid)",
+        ),
+    ] {
+        out[n] = row(
+            &[
+                text("pg_catalog", arena)?,
+                text(table_name, arena)?,
+                text(index_name, arena)?,
+                Datum::Null,
+                text(definition, arena)?,
             ],
             arena,
         )?;

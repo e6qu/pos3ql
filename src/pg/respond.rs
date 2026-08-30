@@ -448,6 +448,23 @@ impl<'b> Responder<'b> {
         MsgOut::begin(self.buffer, wire::MSG_NO_DATA).finish()
     }
 
+    pub(crate) fn function_call_response(
+        &mut self,
+        value: &Datum,
+        binary: bool,
+    ) -> Result<(), WireFull> {
+        let render = self.render_context();
+        self.with_retry(|buffer| {
+            let mut message = MsgOut::begin(buffer, wire::MSG_FUNCTION_CALL_RESPONSE);
+            if binary {
+                Self::encode_value_binary(&mut message, value);
+            } else {
+                Self::encode_value_text(&mut message, value, render);
+            }
+            message.finish()
+        })
+    }
+
     /// All parameters are described as text for now.
     pub fn parameter_description(&mut self, oids: &[i32]) -> Result<(), WireFull> {
         let mut m = MsgOut::begin(self.buffer, wire::MSG_PARAMETER_DESCRIPTION);

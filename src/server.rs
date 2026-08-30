@@ -786,8 +786,6 @@ impl Server {
         let _ = self.reactor.deregister(self.listener.as_raw_fd());
         for i in 0..self.slots.len() {
             if self.slots[i].conn.is_open() {
-                let slot = &mut self.slots[i];
-                self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
                 self.release(i);
             }
         }
@@ -887,12 +885,7 @@ impl Server {
             self.cancel(request);
         }
         match after {
-            After::Close => {
-                // A dropped connection releases its uncommitted work.
-                let slot = &mut self.slots[index];
-                self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
-                self.release(index)
-            }
+            After::Close => self.release(index),
             After::Continue => {
                 let slot = &mut self.slots[index];
                 let read_desired = slot.conn.wants_read();
@@ -1856,11 +1849,7 @@ impl Server {
                     retry_io_waiters,
                 ) {
                     After::Continue => self.sync_write_interest(index),
-                    After::Close => {
-                        let slot = &mut self.slots[index];
-                        self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
-                        self.release(index);
-                    }
+                    After::Close => self.release(index),
                 }
             }
             if self.engine.lock_generation() == generation {
@@ -1940,8 +1929,11 @@ impl Server {
     }
 
     fn release(&mut self, index: usize) {
-        // Drop the connection's LISTEN registrations so its channels free up and
-        // no stale entry can match a later connection that reuses the id.
+        // Every transport exit reaches this choke point. Roll back here so an
+        // I/O-interest failure, notification overflow, or replication close
+        // cannot strand transaction state or locks.
+        let slot = &mut self.slots[index];
+        self.engine.rollback_txn(&mut slot.conn.txn, &slot.conn.guc);
         self.slots[index].conn.stop_replication(&mut self.engine);
         self.engine.drop_connection(self.slots[index].conn.id());
         if let Some(role) = self.slots[index].conn.authenticated_role() {

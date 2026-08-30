@@ -4190,6 +4190,117 @@ def test_two_phase_transactions_extended_wire_contract():
     s.close()
 
 
+def test_large_object_fast_path_function_call_contract():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+
+    def call(function_oid, arguments):
+        payload = struct.pack("!ihhh", function_oid, 1, 1, len(arguments))
+        for argument in arguments:
+            payload += struct.pack("!i", len(argument)) + argument
+        payload += struct.pack("!h", 1)
+        s.sendall(frontend_message(b"F", payload))
+        response = read_message(s)
+        ready = read_message(s)
+        check(
+            f"large-object fast path: function {function_oid} ends its command cycle",
+            ready[0] == b"Z",
+            ready,
+        )
+        return response
+
+    oid = 93001
+    created = call(3457, [struct.pack("!I", oid), b"raw-fast-path"])
+    check(
+        "large-object fast path: lo_from_bytea returns binary OID",
+        created == (b"V", struct.pack("!iI", 4, oid)),
+        created,
+    )
+    fetched = call(3458, [struct.pack("!I", oid)])
+    check(
+        "large-object fast path: lo_get returns binary bytea",
+        fetched == (b"V", struct.pack("!i", 13) + b"raw-fast-path"),
+        fetched,
+    )
+    transaction = simple_query(s, "BEGIN")
+    check(
+        "large-object fast path: descriptor transaction begins",
+        transaction[-1] == (b"Z", b"T"),
+        transaction,
+    )
+    opened = call(952, [struct.pack("!I", oid), struct.pack("!i", 0x40000)])
+    descriptor = struct.unpack("!i", opened[1][4:])[0]
+    first = call(954, [struct.pack("!i", descriptor), struct.pack("!i", 8192)])
+    exhausted = call(954, [struct.pack("!i", descriptor), struct.pack("!i", 8192)])
+    closed = call(953, [struct.pack("!i", descriptor)])
+    check(
+        "large-object fast path: descriptor read reaches EOF and closes",
+        first == (b"V", struct.pack("!i", 13) + b"raw-fast-path")
+        and exhausted == (b"V", struct.pack("!i", 0))
+        and closed == (b"V", struct.pack("!ii", 4, 0)),
+        (opened, first, exhausted, closed),
+    )
+    committed = simple_query(s, "COMMIT")
+    check(
+        "large-object fast path: descriptor transaction commits",
+        committed[-1] == (b"Z", b"I"),
+        committed,
+    )
+    removed = simple_query(s, f"SELECT lo_unlink({oid}::oid)")
+    check(
+        "large-object fast path: implicit commits share SQL visibility",
+        first_text_row(removed) == "1",
+        removed,
+    )
+    s.close()
+
+
+def test_transport_eof_releases_transaction_locks():
+    setup = connect()
+    setup.sendall(startup_payload(0))
+    drain_startup(setup)
+    created = simple_query(setup, "CREATE TABLE wire_eof_lock (id integer)")
+    check(
+        "transport EOF: lock fixture is created",
+        not any(kind == b"E" for kind, _ in created),
+        created,
+    )
+    setup.close()
+
+    blocker = connect()
+    blocker.sendall(startup_payload(0))
+    drain_startup(blocker)
+    locked = simple_query(
+        blocker,
+        "BEGIN; LOCK TABLE wire_eof_lock IN ACCESS EXCLUSIVE MODE",
+    )
+    check(
+        "transport EOF: explicit transaction owns the table lock",
+        not any(kind == b"E" for kind, _ in locked) and locked[-1] == (b"Z", b"T"),
+        locked,
+    )
+    blocker.shutdown(socket.SHUT_WR)
+    while blocker.recv(8192):
+        pass
+    blocker.close()
+
+    observer = connect()
+    observer.sendall(startup_payload(0))
+    drain_startup(observer)
+    released = simple_query(
+        observer,
+        "BEGIN; LOCK TABLE wire_eof_lock IN ACCESS EXCLUSIVE MODE NOWAIT; "
+        "COMMIT; DROP TABLE wire_eof_lock",
+    )
+    check(
+        "transport EOF: server rollback releases every transaction lock",
+        not any(kind == b"E" for kind, _ in released) and released[-1] == (b"Z", b"I"),
+        released,
+    )
+    observer.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

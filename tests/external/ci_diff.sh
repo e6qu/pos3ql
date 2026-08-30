@@ -566,6 +566,9 @@ GRANT SELECT ON TABLE outbound_dump.items TO outbound_reader;
 GRANT UPDATE (note) ON TABLE outbound_dump.items TO outbound_reader;
 GRANT USAGE, SELECT ON SEQUENCE outbound_dump.manual_sequence TO outbound_reader;
 GRANT EXECUTE ON FUNCTION outbound_dump.dump_answer() TO outbound_reader;
+SELECT lo_from_bytea(94001::oid, decode('6f7574626f756e642d6c617267652d6f626a656374', 'hex'));
+GRANT SELECT ON LARGE OBJECT 94001 TO outbound_reader;
+COMMENT ON LARGE OBJECT 94001 IS 'dumped large object';
 SQL
 outbound_setup_status=$?
 pg_dump -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
@@ -754,12 +757,24 @@ else
     printf 'expected:\n%s\nobserved:\n%s\n' \
       "$expected_outbound_statistics" "$outbound_statistics"
   fi
+  outbound_large_object=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+    -X -At -F '|' -v ON_ERROR_STOP=1 -c "
+      SELECT encode(lo_get(94001::oid), 'hex'),
+             obj_description(94001, 'pg_largeobject'),
+             has_largeobject_privilege('outbound_reader', 94001, 'SELECT');
+    " 2>/dev/null)
+  if [[ "$outbound_large_object" == "6f7574626f756e642d6c617267652d6f626a656374|dumped large object|t" ]]; then
+    ok "pos3ql large objects survive pg_dump into PostgreSQL 18"
+  else
+    bad "pos3ql large-object pg_dump round-trip result"
+    printf 'observed:\n%s\n' "$outbound_large_object"
+  fi
 fi
 # The curated corpus later creates a public type with the same unqualified
 # name. Keep the PostgreSQL oracle as clean as the fresh pos3ql restart below,
 # so pg_type cardinality probes do not inherit this tooling fixture.
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
-  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader' \
+  -v ON_ERROR_STOP=1 -c 'SELECT lo_unlink(94001) WHERE EXISTS (SELECT 1 FROM pg_largeobject_metadata WHERE oid = 94001); DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader' \
   > "$WORK/outbound_cleanup.out" 2>&1 || {
     bad "clean outbound pg_dump fixture from PostgreSQL"
     tail -40 "$WORK/outbound_cleanup.out"

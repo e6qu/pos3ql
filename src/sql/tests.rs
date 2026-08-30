@@ -7,6 +7,332 @@
 use super::*;
 
 #[test]
+fn large_objects_are_sparse_transactional_and_match_postgresql_functions() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         SELECT lo_create(90001::oid); \
+         SELECT lo_put(90001::oid, 4098::bigint, decode('7879', 'hex')); \
+         SELECT octet_length(lo_get(90001::oid)), \
+                encode(lo_get(90001::oid, 4094::bigint, 6), 'hex'); \
+         SELECT lo_open(90001::oid, 131072); \
+         SELECT lo_lseek64(0, 7000::bigint, 0), lo_truncate64(0, 5000::bigint); \
+         SELECT octet_length(lo_get(90001::oid)), \
+                encode(lo_get(90001::oid, 4996::bigint, 4), 'hex'); \
+         SAVEPOINT changed; \
+         SELECT lo_lseek64(0, 0::bigint, 0), lowrite(0, decode('61', 'hex')); \
+         ROLLBACK TO changed; \
+         SELECT lo_tell64(0), encode(lo_get(90001::oid, 0::bigint, 1), 'hex'); \
+         COMMIT; \
+         SELECT encode(lo_get(90001::oid, 4094::bigint, 6), 'hex'); \
+         CREATE ROLE lo_reader; \
+         GRANT SELECT ON LARGE OBJECT 90001 TO lo_reader; \
+         COMMENT ON LARGE OBJECT 90001 IS 'sparse payload'; \
+         SELECT oid, lomacl IS NOT NULL, obj_description(oid, 'pg_largeobject') \
+           FROM pg_largeobject_metadata WHERE oid = 90001::oid; \
+         ALTER LARGE OBJECT 90001 OWNER TO lo_reader; \
+         SELECT m.oid, m.lomowner = r.oid \
+           FROM pg_largeobject_metadata m JOIN pg_roles r ON r.rolname = 'lo_reader' \
+          WHERE m.oid = 90001::oid; \
+         SELECT pageno, octet_length(data) FROM pg_largeobject \
+          WHERE loid = 90001::oid ORDER BY pageno; \
+         SELECT relname, relnatts, relhasindex FROM pg_class \
+          WHERE oid IN (2613, 2995) ORDER BY oid; \
+         SELECT relname, relnatts, relam FROM pg_class \
+          WHERE oid IN (2683, 2996) ORDER BY oid; \
+         SELECT indexrelid, indrelid, indisprimary, indisunique, \
+                indkey::text, indclass::text \
+           FROM pg_index WHERE indrelid IN (2613, 2995) ORDER BY indexrelid; \
+         SELECT attrelid, attname, atttypid, attnotnull FROM pg_attribute \
+          WHERE attrelid IN (2613, 2995) AND attnum > 0 ORDER BY attrelid, attnum; \
+         SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'pos3ql_internal' AND c.relname = 'large_object_pages'; \
+         SELECT lo_unlink(90001::oid); \
+         DROP ROLE lo_reader; \
+         SELECT lo_create(4294967295::oid); \
+         COMMENT ON LARGE OBJECT 4294967295 IS 'unsigned identity'; \
+         SELECT objoid, classoid, obj_description(objoid, 'pg_largeobject') \
+           FROM pg_description \
+          WHERE classoid = 2613::oid AND objoid = 4294967295::oid; \
+         SELECT lo_unlink(4294967295::oid)",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "90001",
+            "NULL",
+            "4100|000000007879",
+            "0",
+            "7000|0",
+            "5000|00000000",
+            "0|1",
+            "1|00",
+            "000000007879",
+            "90001|t|sparse payload",
+            "90001|t",
+            "2|904",
+            "pg_largeobject|3|t",
+            "pg_largeobject_metadata|3|t",
+            "pg_largeobject_loid_pn_index|2|403",
+            "pg_largeobject_metadata_oid_index|1|403",
+            "2683|2613|t|t|1 2|1981 1978",
+            "2996|2995|t|t|1|1981",
+            "2613|loid|26|t",
+            "2613|pageno|23|t",
+            "2613|data|17|t",
+            "2995|oid|26|t",
+            "2995|lomowner|26|t",
+            "2995|lomacl|1034|f",
+            "0",
+            "1",
+            "4294967295",
+            "4294967295|2613|unsigned identity",
+            "1",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+#[test]
+fn large_object_sql_functions_cover_descriptors_files_and_read_only_transactions() {
+    let directory = std::env::temp_dir().join(format!(
+        "pos3ql-large-object-functions-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("large-object test directory");
+    let import_path = directory.join("import.bin");
+    let export_path = directory.join("export.bin");
+    std::fs::write(&import_path, b"imported").expect("large-object import fixture");
+    let import_path = import_path.to_string_lossy();
+    let export_path = export_path.to_string_lossy();
+
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "SELECT lo_from_bytea(91001::oid, decode('616263646566', 'hex')); \
+             BEGIN; \
+             SELECT lo_creat(131072); \
+             SELECT lo_open(91001::oid, 131072); \
+             SELECT lowrite(0, decode('5859', 'hex')); \
+             SELECT lo_lseek(0, 0, 0), encode(loread(0, 6), 'hex'), lo_tell(0); \
+             SELECT lo_truncate(0, 3), lo_close(0); \
+             COMMIT; \
+             SELECT encode(lo_get(91001::oid), 'hex'); \
+             SELECT lo_import('{import_path}', 91002::oid); \
+             SELECT lo_export(91002::oid, '{export_path}'); \
+             SELECT encode(lo_get(lo_import('{import_path}')), 'hex')"
+        ),
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "91001",
+            "16384",
+            "0",
+            "2",
+            "0|585963646566|6",
+            "0|0",
+            "585963",
+            "91002",
+            "1",
+            "696d706f72746564",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+    assert_eq!(
+        std::fs::read(export_path.as_ref()).expect("large-object export"),
+        b"imported"
+    );
+
+    let readable = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "BEGIN READ ONLY; \
+             SELECT lo_export(91002::oid, '{export_path}'), encode(lo_get(91002::oid), 'hex'); \
+             COMMIT"
+        ),
+    );
+    assert_eq!(
+        data_rows(&readable),
+        ["1|696d706f72746564"],
+        "{}",
+        String::from_utf8_lossy(&readable)
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN READ ONLY; SELECT lo_put(91002::oid, 0::bigint, decode('00', 'hex'))",
+    );
+    let rejected = String::from_utf8_lossy(&rejected);
+    assert!(rejected.contains("25006"), "{rejected}");
+    assert!(
+        rejected.contains("cannot execute lo_put() in a read-only transaction"),
+        "{rejected}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn large_object_mutators_resume_across_data_modification_sources() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE large_object_dml (id integer PRIMARY KEY, object_oid oid); \
+         INSERT INTO large_object_dml VALUES \
+           (1, lo_from_bytea(93001::oid, decode('61', 'hex'))); \
+         WITH source(id) AS (VALUES (2)) \
+         INSERT INTO large_object_dml \
+           SELECT id, lo_from_bytea(93002::oid, decode('62', 'hex')) FROM source; \
+         MERGE INTO large_object_dml AS target \
+         USING (VALUES (1), (3)) AS source(id) ON target.id = source.id \
+         WHEN MATCHED THEN UPDATE SET object_oid = \
+           lo_from_bytea(93003::oid, decode('63', 'hex')) \
+         WHEN NOT MATCHED THEN INSERT VALUES \
+           (source.id, lo_from_bytea(93004::oid, decode('64', 'hex'))); \
+         SELECT id, encode(lo_get(object_oid), 'hex') \
+           FROM large_object_dml ORDER BY id; \
+         SELECT lo_unlink(93001::oid), lo_unlink(93002::oid), \
+                lo_unlink(93003::oid), lo_unlink(93004::oid)",
+        4 << 20,
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|63", "2|62", "3|64", "1|1|1|1"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn large_objects_survive_checkpoint_wal_and_prepared_transaction_recovery() {
+    let mut config = test_config("large-object-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.max_prepared_transactions = 1;
+    config.object_store_namespace = format!("large-object-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE large_object_oid_history (oid oid); \
+         INSERT INTO large_object_oid_history VALUES (lo_create(0)); \
+         SELECT lo_unlink(oid) FROM large_object_oid_history; \
+         CREATE ROLE large_object_owner; \
+         SELECT lo_from_bytea(91002::oid, decode('636865636b706f696e74', 'hex')); \
+         GRANT SELECT ON LARGE OBJECT 91002 TO PUBLIC; \
+         COMMENT ON LARGE OBJECT 91002 IS 'durable'; \
+         ALTER LARGE OBJECT 91002 OWNER TO large_object_owner",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT encode(lo_get(91002::oid), 'hex'), \
+                    obj_description(91002, 'pg_largeobject'), \
+                    lomacl IS NOT NULL \
+               FROM pg_largeobject_metadata WHERE oid = 91002::oid; \
+             INSERT INTO large_object_oid_history VALUES (lo_create(0)); \
+             SELECT count(*) = count(DISTINCT oid) FROM large_object_oid_history; \
+             SELECT lo_unlink((SELECT oid FROM large_object_oid_history \
+                                ORDER BY oid DESC LIMIT 1))"
+        )),
+        ["636865636b706f696e74|durable|t", "t", "1"]
+    );
+    let changed = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT lo_put(91002::oid, 10::bigint, decode('2d77616c', 'hex')); \
+         INSERT INTO large_object_oid_history VALUES (lo_create(0)); \
+         SELECT lo_unlink((SELECT oid FROM large_object_oid_history \
+                            ORDER BY oid DESC LIMIT 1))",
+    );
+    assert!(!String::from_utf8_lossy(&changed).contains("ERROR"));
+    drop(cold);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut replay_budget = Budget::new(1 << 29);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT encode(lo_get(91002::oid), 'hex'); \
+             INSERT INTO large_object_oid_history VALUES (lo_create(0)); \
+             SELECT count(*) = count(DISTINCT oid) FROM large_object_oid_history; \
+             SELECT lo_unlink((SELECT oid FROM large_object_oid_history \
+                                ORDER BY oid DESC LIMIT 1))"
+        )),
+        ["636865636b706f696e742d77616c", "t", "1"]
+    );
+    let prepared = run_with(
+        &mut replayed,
+        &mut replay_budget,
+        "BEGIN; \
+         SELECT lo_from_bytea(91003::oid, decode('7072657061726564', 'hex')); \
+         PREPARE TRANSACTION 'large_object_prepared'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&prepared).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&prepared)
+    );
+    drop(replayed);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut prepared_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut prepared_budget).unwrap();
+    let commit = run_with(
+        &mut recovered,
+        &mut prepared_budget,
+        "COMMIT PREPARED 'large_object_prepared'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&commit).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&commit)
+    );
+    let committed = run_with(
+        &mut recovered,
+        &mut prepared_budget,
+        "SELECT encode(lo_get(91003::oid), 'hex')",
+    );
+    assert_eq!(
+        data_rows(&committed),
+        ["7072657061726564"],
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn full_text_values_functions_operators_storage_and_generated_columns() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -4215,6 +4541,9 @@ fn test_config(name: &str) -> Config {
     config.memtable_bytes = 1 << 20;
     config.max_connections = 8;
     config.max_tables = 8;
+    config.max_large_objects = 64;
+    config.large_object_pages = 256;
+    config.max_large_object_descriptors = 16;
     config.max_rules = 32;
     config.table_rows = 1024;
     config.txn_rows = 2048;
@@ -9034,7 +9363,8 @@ fn logical_replication_omits_transactions_without_published_changes_on_sized_sta
         &mut engine,
         &mut budget,
         &mut transaction,
-        "INSERT INTO hidden_table VALUES (1)",
+        "INSERT INTO hidden_table VALUES (1); \
+         SELECT lo_from_bytea(91001::oid, decode('6c6f676963616c', 'hex'))",
     );
     let mut scratch =
         crate::mem::FixedBuf::new(&mut budget, "replication scratch", 1 << 16).unwrap();
@@ -12075,12 +12405,18 @@ fn catalog_index_relations_are_not_silently_capped() {
         data_rows(&run_with_arena_bytes(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM pg_index; \
-             SELECT count(*) FROM pg_class WHERE relkind = 'i'; \
-             SELECT count(*) FROM pg_indexes; \
+            "SELECT count(*) FROM pg_index catalog_index \
+              JOIN pg_class relation ON relation.oid = catalog_index.indexrelid \
+              JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+              WHERE namespace.nspname = 'public'; \
+             SELECT count(*) FROM pg_class relation \
+              JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+              WHERE relation.relkind = 'i' AND namespace.nspname = 'public'; \
+             SELECT count(*) FROM pg_indexes WHERE schemaname = 'public'; \
              SELECT count(*) FROM pg_attribute attribute \
               JOIN pg_class relation ON relation.oid = attribute.attrelid \
-              WHERE relation.relkind = 'i'",
+              JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace \
+              WHERE relation.relkind = 'i' AND namespace.nspname = 'public'",
             1 << 21,
         )),
         ["272", "272", "272", "272"]

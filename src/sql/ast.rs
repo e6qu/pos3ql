@@ -924,6 +924,10 @@ pub enum Stmt<'a> {
         role: &'a str,
         if_exists: bool,
     },
+    AlterLargeObjectOwner {
+        oid: LargeObjectId,
+        role: &'a str,
+    },
     /// CREATE ROLE / USER / GROUP. USER differs only in its default LOGIN
     /// attribute; GROUP is PostgreSQL's compatibility spelling for ROLE.
     CreateRole {
@@ -1850,6 +1854,20 @@ pub enum PrivilegeTarget<'a> {
         kind: RoutineTargetKind,
         identities: &'a [RoutineIdentity<'a>],
     },
+    LargeObjects(&'a [LargeObjectId]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LargeObjectId(u32);
+
+impl LargeObjectId {
+    pub const fn parse(value: u32) -> Option<Self> {
+        if value == 0 { None } else { Some(Self(value)) }
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2213,6 +2231,7 @@ pub enum CommentTarget<'a> {
     /// TABLESPACE name.
     Tablespace(&'a str),
     Database(&'a str),
+    LargeObject(LargeObjectId),
     Collation(QualName<'a>),
     Conversion(QualName<'a>),
     TextSearch {
@@ -4257,6 +4276,27 @@ fn is_volatile_function(name: &str) -> bool {
     NAMES
         .iter()
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        || matches!(
+            name,
+            "lo_create"
+                | "lo_import"
+                | "lo_export"
+                | "lo_open"
+                | "lo_close"
+                | "loread"
+                | "lowrite"
+                | "lo_lseek"
+                | "lo_creat"
+                | "lo_tell"
+                | "lo_unlink"
+                | "lo_truncate"
+                | "lo_lseek64"
+                | "lo_tell64"
+                | "lo_truncate64"
+                | "lo_from_bytea"
+                | "lo_get"
+                | "lo_put"
+        )
 }
 
 fn is_nonimmutable_function(name: &str) -> bool {

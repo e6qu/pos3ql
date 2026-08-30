@@ -333,6 +333,7 @@ enum ObjectRef {
     Publication(usize),
     Subscription(usize),
     Extension(usize),
+    LargeObject(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -873,6 +874,7 @@ fn utility_command_object_type(statement: &Stmt<'_>) -> Option<&'static str> {
                 crate::sql::ast::RoutineTargetKind::Aggregate => "AGGREGATE",
                 crate::sql::ast::RoutineTargetKind::Either => "ROUTINE",
             },
+            PrivilegeTarget::LargeObjects(_) => "LARGE OBJECT",
         })
     };
     Some(match statement {
@@ -910,6 +912,7 @@ fn access_reference(object: crate::storage::AccessObject) -> Option<ObjectRef> {
         AccessClass::Statistics => ObjectRef::Statistics(slot),
         AccessClass::Extension => ObjectRef::Extension(slot),
         AccessClass::Trigger => ObjectRef::Trigger(slot),
+        AccessClass::LargeObject => ObjectRef::LargeObject(slot),
         AccessClass::Tablespace | AccessClass::Database | AccessClass::EventTrigger => return None,
     })
 }
@@ -1105,6 +1108,19 @@ fn comment_reference(
         }
         CommentClass::Tablespace | CommentClass::Database | CommentClass::EventTrigger => {
             return Err(graph_full());
+        }
+        CommentClass::LargeObject => {
+            let oid = name
+                .as_str()
+                .parse::<u32>()
+                .ok()
+                .and_then(crate::sql::ast::LargeObjectId::parse)
+                .ok_or_else(graph_full)?;
+            EventObjectRef::Primary(ObjectRef::LargeObject(
+                storage
+                    .large_object_slot(oid, txid)
+                    .ok_or_else(graph_full)?,
+            ))
         }
     })
 }
@@ -1806,6 +1822,19 @@ fn primary_object(
                 None,
                 Some(extension.name.as_str()),
                 StackStr::from_str(identifier(extension.name.as_str()).as_str()),
+                false,
+            )
+        }
+        ObjectRef::LargeObject(slot) => {
+            let oid = storage.large_object(slot).oid.get();
+            let identity = StackStr::from_str(crate::stack_format!(16, "{}", oid).as_str());
+            base_object(
+                catalog::PG_LARGEOBJECT_OID,
+                oid as i32,
+                "large object",
+                None,
+                None,
+                identity,
                 false,
             )
         }

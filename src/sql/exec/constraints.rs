@@ -1097,7 +1097,7 @@ pub(crate) type ParsedDefaults<'a> = [Option<&'a Expr<'a>>; MAX_COLUMNS];
 /// Generated columns are excluded — they are computed from the row by
 /// [`parse_generated`], not defaulted.
 pub(crate) fn parse_defaults<'a>(
-    def: &'a TableDef,
+    def: &TableDef,
     arena: &'a Arena,
 ) -> Result<ParsedDefaults<'a>, SqlError> {
     let mut out: ParsedDefaults<'a> = [None; MAX_COLUMNS];
@@ -1106,7 +1106,10 @@ pub(crate) fn parse_defaults<'a>(
             continue;
         }
         if let Some(text) = c.default.expression() {
-            out[i] = Some(crate::sql::parser::parse_expr(text.as_str(), arena)?);
+            let text = arena
+                .alloc_str(text.as_str())
+                .map_err(|_| crate::sql::query::arena_full_pub())?;
+            out[i] = Some(crate::sql::parser::parse_expr(text, arena)?);
         }
     }
     Ok(out)

@@ -9,9 +9,9 @@
 use crate::mem::arena::Arena;
 use crate::sql::ast::{
     Collation, Cte, CteCycleMark, CteMaterialization, CteSearchOrder, Delete, Expr, FromClause,
-    Insert, Join, JoinKind, MaterializedCte, Merge, MergeAction, MergeWhen, OnConflict,
-    OnConflictTarget, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree, Stmt, TableRef,
-    Update,
+    GroupingSetQuantifier, Insert, Join, JoinKind, MaterializedCte, Merge, MergeAction, MergeWhen,
+    OnConflict, OnConflictTarget, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree, Stmt,
+    TableRef, Update,
 };
 use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
 use crate::sql::exec::MAX_PROJ;
@@ -20,7 +20,7 @@ use crate::sql_err;
 use crate::storage::Storage;
 
 use super::setops::{describe_set_body, external_set_body_into, materialize_set_body};
-use super::{MAX_JOIN_TABLES, arena_full, check_timeout};
+use super::{MAX_JOIN_TABLES, and_where, arena_full, check_timeout};
 
 /// Expands a statement's `WITH` list (and any view reference) for the
 /// describe path, which needs the shape but not the rows.
@@ -121,6 +121,7 @@ pub(crate) fn expand_stored_expression<'a>(
             dependencies: Some(dependencies),
             authorization_role: None,
             qualifier: None,
+            rule_transition: None,
             recursive_state: None,
             execution: None,
         },
@@ -173,6 +174,7 @@ fn expand_ctes_with_path<'a>(
             dependencies,
             authorization_role,
             qualifier: None,
+            rule_transition: None,
             recursive_state: None,
             execution: None,
         };
@@ -209,6 +211,7 @@ fn expand_ctes_with_path<'a>(
         dependencies,
         authorization_role,
         qualifier: None,
+        rule_transition: None,
         recursive_state: None,
         execution: None,
     };
@@ -272,6 +275,7 @@ pub(crate) fn bind_materialized_relations<'a>(
         dependencies: None,
         authorization_role: None,
         qualifier: None,
+        rule_transition: None,
         recursive_state: None,
         execution: None,
     };
@@ -323,12 +327,728 @@ pub(crate) fn expand_stored_statement_exec<'a>(
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
+    expand_stored_statement_with_transition(
+        statement,
+        storage,
+        txid,
+        path,
+        dependencies,
+        arena,
+        params,
+        sequences,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a stored rule action carries its catalog and transition-row binding"
+)]
+pub(crate) fn expand_stored_rule_action_exec<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: &crate::storage::StoredQueryDependencies,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
+    names: &'a [&'a str],
+    old: &'a [&'a Expr<'a>],
+    new: &'a [&'a Expr<'a>],
+    old_available: bool,
+    new_available: bool,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    expand_stored_statement_with_transition(
+        statement,
+        storage,
+        txid,
+        path,
+        dependencies,
+        arena,
+        params,
+        sequences,
+        Some(RuleTransition {
+            names,
+            old,
+            new,
+            old_available,
+            new_available,
+        }),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a stored rule condition carries its catalog and transition-row binding"
+)]
+pub(crate) fn expand_stored_rule_expression_exec<'a>(
+    expression: &'a Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: &crate::storage::StoredQueryDependencies,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
+    names: &'a [&'a str],
+    old: &'a [&'a Expr<'a>],
+    new: &'a [&'a Expr<'a>],
+    old_available: bool,
+    new_available: bool,
+) -> Result<&'a Expr<'a>, SqlError> {
+    with_exec_context(
+        &[],
+        &EMPTY_SELECT,
+        storage,
+        txid,
+        arena,
+        params,
+        &[],
+        &[],
+        &[],
+        &[],
+        sequences,
+        0,
+        Some(path),
+        Some(dependencies),
+        None,
+        |_| 0,
+        |context| {
+            subst_expr(
+                expression,
+                Subst {
+                    rule_transition: Some(RuleTransition {
+                        names,
+                        old,
+                        new,
+                        old_available,
+                        new_available,
+                    }),
+                    ..context
+                },
+                arena,
+            )
+        },
+    )
+}
+
+fn prepend_rule_source<'a>(
+    source: TableRef<'a>,
+    existing: Option<&FromClause<'a>>,
+    arena: &'a Arena,
+) -> Result<FromClause<'a>, SqlError> {
+    let Some(existing) = existing else {
+        return Ok(FromClause {
+            base: source,
+            joins: &[],
+        });
+    };
+    if existing.joins.len() + 1 >= super::MAX_JOIN_TABLES {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "rewrite action has too many joined relations"
+        ));
+    }
+    let joins = arena
+        .alloc_slice_with(existing.joins.len() + 1, |index| {
+            if index == 0 {
+                Join {
+                    table: existing.base,
+                    kind: JoinKind::Cross,
+                    on: None,
+                    using: None,
+                    natural: false,
+                }
+            } else {
+                existing.joins[index - 1]
+            }
+        })
+        .map_err(|_| arena_full())?;
+    Ok(FromClause {
+        base: source,
+        joins,
+    })
+}
+
+fn rule_select<'a>(
+    items: &'a [SelectItem<'a>],
+    from: Option<FromClause<'a>>,
+    where_clause: Option<&'a Expr<'a>>,
+) -> Select<'a> {
+    Select {
+        items,
+        distinct: false,
+        distinct_on: &[],
+        from,
+        where_clause,
+        group_by: &[],
+        grouping_set_quantifier: GroupingSetQuantifier::All,
+        grouping_sets: &[],
+        having: None,
+        order_by: &[],
+        limit: None,
+        offset: None,
+        with_ties: false,
+        with: &[],
+        set_body: None,
+        locking: &[],
+    }
+}
+
+fn rule_relation_ref<'a>(
+    name: crate::sql::ast::QualName<'a>,
+    alias: Option<&'a str>,
+) -> TableRef<'a> {
+    TableRef {
+        schema: name.schema,
+        table: name.name,
+        alias,
+        subquery: None,
+        func_args: None,
+        func_argument_names: &[],
+        func_variadic: false,
+        rows_from: None,
+        col_alias: None,
+        inheritance: crate::sql::ast::RelationInheritance::Descendants,
+        sample: None,
+        cte: None,
+        with_ordinality: false,
+        lateral: false,
+        authorization_role: None,
+    }
+}
+
+fn append_rule_input_from<'a>(
+    base: TableRef<'a>,
+    existing: Option<&FromClause<'a>>,
+    arena: &'a Arena,
+) -> Result<FromClause<'a>, SqlError> {
+    let Some(existing) = existing else {
+        return Ok(FromClause { base, joins: &[] });
+    };
+    let joins = arena
+        .alloc_slice_with(existing.joins.len() + 1, |index| {
+            if index == 0 {
+                Join {
+                    table: existing.base,
+                    kind: JoinKind::Cross,
+                    on: None,
+                    using: None,
+                    natural: false,
+                }
+            } else {
+                existing.joins[index - 1]
+            }
+        })
+        .map_err(|_| arena_full())?;
+    Ok(FromClause { base, joins })
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RuleTransitionSource<'a> {
+    pub source: TableRef<'a>,
+    pub names: &'a [&'a str],
+    pub old: &'a [&'a Expr<'a>],
+    pub new: &'a [&'a Expr<'a>],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RuleTransitionExpressions<'a> {
+    pub names: &'a [&'a str],
+    pub old: &'a [&'a Expr<'a>],
+    pub new: &'a [&'a Expr<'a>],
+}
+
+pub(crate) fn rule_original_transition<'a>(
+    statement: &'a Stmt<'a>,
+    columns: &'a [&'a str],
+    arena: &'a Arena,
+) -> Result<RuleTransitionExpressions<'a>, SqlError> {
+    let mut old = [&Expr::Null; crate::storage::MAX_COLUMNS];
+    let mut new = [&Expr::Null; crate::storage::MAX_COLUMNS];
+    match statement {
+        Stmt::Update(update) => {
+            let qualifier = update.alias.unwrap_or(update.table.name);
+            for (index, name) in columns.iter().copied().enumerate() {
+                old[index] = arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(qualifier),
+                        name,
+                    })
+                    .map(|expression| &*expression)
+                    .map_err(|_| arena_full())?;
+                new[index] = update
+                    .assignments
+                    .iter()
+                    .find_map(|(written, expression)| (*written == name).then_some(*expression))
+                    .unwrap_or(old[index]);
+            }
+        }
+        Stmt::Delete(delete) => {
+            let qualifier = delete.alias.unwrap_or(delete.table.name);
+            for (index, name) in columns.iter().copied().enumerate() {
+                old[index] = arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(qualifier),
+                        name,
+                    })
+                    .map(|expression| &*expression)
+                    .map_err(|_| arena_full())?;
+            }
+        }
+        Stmt::Insert(_) => {}
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "rewrite transition requires INSERT, UPDATE or DELETE"
+            ));
+        }
+    }
+    Ok(RuleTransitionExpressions {
+        names: columns,
+        old: arena
+            .alloc_slice_copy(&old[..columns.len()])
+            .map_err(|_| arena_full())?,
+        new: arena
+            .alloc_slice_copy(&new[..columns.len()])
+            .map_err(|_| arena_full())?,
+    })
+}
+
+pub(crate) fn restrict_rule_original<'a>(
+    statement: &'a Stmt<'a>,
+    transition: RuleTransitionSource<'a>,
+    columns: &'a [&'a str],
+    predicate: &'a Expr<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let rewritten = match statement {
+        Stmt::Update(update) => Stmt::Update(Update {
+            where_clause: and_where(update.where_clause, Some(predicate), arena)?,
+            ..*update
+        }),
+        Stmt::Delete(delete) => Stmt::Delete(Delete {
+            where_clause: and_where(delete.where_clause, Some(predicate), arena)?,
+            ..*delete
+        }),
+        Stmt::Insert(insert) => {
+            let items = arena
+                .alloc_slice_with(columns.len(), |index| SelectItem::Expr {
+                    expression: transition.new[index],
+                    alias: None,
+                })
+                .map_err(|_| arena_full())?;
+            let select = rule_select(
+                items,
+                Some(FromClause {
+                    base: transition.source,
+                    joins: &[],
+                }),
+                Some(predicate),
+            );
+            Stmt::Insert(Insert {
+                columns,
+                rows: &[],
+                select: Some(&*arena.alloc(select).map_err(|_| arena_full())?),
+                ..*insert
+            })
+        }
+        _ => unreachable!("rewrite original is DML"),
+    };
+    arena
+        .alloc(rewritten)
+        .map(|statement| &*statement)
+        .map_err(|_| arena_full())
+}
+
+/// Turns the original DML input into one derived relation. Rule actions scan
+/// that relation once, preserving statement-level behavior while OLD/NEW are
+/// ordinary typed column references rather than magic evaluator states.
+pub(crate) fn rule_transition_source<'a>(
+    statement: &'a Stmt<'a>,
+    columns: &'a [&'a str],
+    defaults: &[Option<&'a Expr<'a>>],
+    force_defaults: &[bool],
+    arena: &'a Arena,
+) -> Result<RuleTransitionSource<'a>, SqlError> {
+    if columns.len() > crate::storage::MAX_COLUMNS {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "rewrite relation is too wide"
+        ));
+    }
+    let source_alias = arena
+        .alloc_str("__pos3ql_rule_transition")
+        .map_err(|_| arena_full())?;
+    let mut old = [&Expr::Null; crate::storage::MAX_COLUMNS];
+    let mut new = [&Expr::Null; crate::storage::MAX_COLUMNS];
+    let mut items = [SelectItem::Wildcard; MAX_PROJ];
+    let mut item_count = 0usize;
+    let mut add_output = |prefix: &str,
+                          column: usize,
+                          expression: &'a Expr<'a>,
+                          destination: &mut [&'a Expr<'a>; crate::storage::MAX_COLUMNS]|
+     -> Result<(), SqlError> {
+        let alias = crate::stack_format!(63, "__pos3ql_{}_{}", prefix, column);
+        let alias = arena.alloc_str(alias.as_str()).map_err(|_| arena_full())?;
+        items[item_count] = SelectItem::Expr {
+            expression,
+            alias: Some(alias),
+        };
+        item_count += 1;
+        destination[column] = arena
+            .alloc(Expr::Column {
+                qualifier: Some(source_alias),
+                name: alias,
+            })
+            .map(|expression| &*expression)
+            .map_err(|_| arena_full())?;
+        Ok(())
+    };
+
+    let select = match statement {
+        Stmt::Update(update) => {
+            let target_qualifier = update.alias.unwrap_or(update.table.name);
+            let target = rule_relation_ref(update.table, update.alias);
+            let from = append_rule_input_from(target, update.from, arena)?;
+            for (column, name) in columns.iter().copied().enumerate() {
+                let old_expression = arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(target_qualifier),
+                        name,
+                    })
+                    .map(|expression| &*expression)
+                    .map_err(|_| arena_full())?;
+                add_output("old", column, old_expression, &mut old)?;
+                let new_expression = update
+                    .assignments
+                    .iter()
+                    .find_map(|(written, expression)| (*written == name).then_some(*expression))
+                    .unwrap_or(old_expression);
+                add_output("new", column, new_expression, &mut new)?;
+            }
+            rule_select(
+                arena
+                    .alloc_slice_copy(&items[..item_count])
+                    .map_err(|_| arena_full())?,
+                Some(from),
+                update.where_clause,
+            )
+        }
+        Stmt::Delete(delete) => {
+            let target_qualifier = delete.alias.unwrap_or(delete.table.name);
+            let target = rule_relation_ref(delete.table, delete.alias);
+            let from = append_rule_input_from(target, delete.using, arena)?;
+            for (column, name) in columns.iter().copied().enumerate() {
+                let old_expression = arena
+                    .alloc(Expr::Column {
+                        qualifier: Some(target_qualifier),
+                        name,
+                    })
+                    .map(|expression| &*expression)
+                    .map_err(|_| arena_full())?;
+                add_output("old", column, old_expression, &mut old)?;
+            }
+            rule_select(
+                arena
+                    .alloc_slice_copy(&items[..item_count])
+                    .map_err(|_| arena_full())?,
+                Some(from),
+                delete.where_clause,
+            )
+        }
+        Stmt::Insert(insert) => {
+            let input_columns = if insert.columns.is_empty() {
+                if insert.select.is_none() {
+                    let width = insert.rows.first().map_or(0, |row| row.len());
+                    columns.get(..width).ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "INSERT has more expressions than target columns"
+                        )
+                    })?
+                } else {
+                    columns
+                }
+            } else {
+                insert.columns
+            };
+            let input = if let Some(select) = insert.select {
+                select
+            } else {
+                let mut tree: Option<&SetTree<'a>> = None;
+                for row in insert.rows {
+                    let row_items = arena
+                        .alloc_slice_with(row.len(), |column| SelectItem::Expr {
+                            expression: if matches!(row[column], Expr::DefaultMarker)
+                                || input_columns
+                                    .get(column)
+                                    .and_then(|name| columns.iter().position(|item| item == name))
+                                    .is_some_and(|target| {
+                                        force_defaults.get(target).copied().unwrap_or(false)
+                                    }) {
+                                input_columns
+                                    .get(column)
+                                    .and_then(|name| columns.iter().position(|item| item == name))
+                                    .and_then(|target| defaults.get(target).copied().flatten())
+                                    .unwrap_or(&Expr::Null)
+                            } else {
+                                row[column]
+                            },
+                            alias: None,
+                        })
+                        .map_err(|_| arena_full())?;
+                    let leaf_select = arena
+                        .alloc(rule_select(row_items, None, None))
+                        .map_err(|_| arena_full())?;
+                    let leaf = arena
+                        .alloc(SetTree::Select(&*leaf_select))
+                        .map(|tree| &*tree)
+                        .map_err(|_| arena_full())?;
+                    tree = Some(match tree {
+                        None => leaf,
+                        Some(left) => arena
+                            .alloc(SetTree::Op {
+                                operator: SetOp::Union,
+                                all: true,
+                                left,
+                                right: leaf,
+                            })
+                            .map(|tree| &*tree)
+                            .map_err(|_| arena_full())?,
+                    });
+                }
+                arena
+                    .alloc(Select {
+                        set_body: tree,
+                        ..rule_select(&[], None, None)
+                    })
+                    .map(|select| &*select)
+                    .map_err(|_| arena_full())?
+            };
+            let input_alias = arena
+                .alloc_str("__pos3ql_rule_input")
+                .map_err(|_| arena_full())?;
+            let input_ref = TableRef {
+                schema: None,
+                table: "",
+                alias: Some(input_alias),
+                subquery: Some(input),
+                func_args: None,
+                func_argument_names: &[],
+                func_variadic: false,
+                rows_from: None,
+                col_alias: Some(input_columns),
+                inheritance: crate::sql::ast::RelationInheritance::Descendants,
+                sample: None,
+                cte: None,
+                with_ordinality: false,
+                lateral: false,
+                authorization_role: None,
+            };
+            for (column, name) in columns.iter().copied().enumerate() {
+                let expression = input_columns
+                    .iter()
+                    .position(|candidate| *candidate == name)
+                    .filter(|_| !force_defaults.get(column).copied().unwrap_or(false))
+                    .map(|_| {
+                        arena
+                            .alloc(Expr::Column {
+                                qualifier: Some(input_alias),
+                                name,
+                            })
+                            .map(|expression| &*expression)
+                            .map_err(|_| arena_full())
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| {
+                        defaults
+                            .get(column)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(&Expr::Null)
+                    });
+                add_output("new", column, expression, &mut new)?;
+            }
+            rule_select(
+                arena
+                    .alloc_slice_copy(&items[..item_count])
+                    .map_err(|_| arena_full())?,
+                Some(FromClause {
+                    base: input_ref,
+                    joins: &[],
+                }),
+                None,
+            )
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "rewrite transition source requires INSERT, UPDATE or DELETE"
+            ));
+        }
+    };
+    let source_select = arena.alloc(select).map_err(|_| arena_full())?;
+    let source = TableRef {
+        schema: None,
+        table: "",
+        alias: Some(source_alias),
+        subquery: Some(&*source_select),
+        func_args: None,
+        func_argument_names: &[],
+        func_variadic: false,
+        rows_from: None,
+        col_alias: None,
+        inheritance: crate::sql::ast::RelationInheritance::Descendants,
+        sample: None,
+        cte: None,
+        with_ordinality: false,
+        lateral: false,
+        authorization_role: None,
+    };
+    Ok(RuleTransitionSource {
+        source,
+        names: columns,
+        old: arena
+            .alloc_slice_copy(&old[..columns.len()])
+            .map_err(|_| arena_full())?,
+        new: arena
+            .alloc_slice_copy(&new[..columns.len()])
+            .map_err(|_| arena_full())?,
+    })
+}
+
+/// Attaches the original statement's transition-row source to one rebound
+/// action. OLD/NEW have already become columns of `source`; this step keeps
+/// the action set-oriented, so its statement triggers still fire once.
+pub(crate) fn attach_rule_source<'a>(
+    statement: &'a Stmt<'a>,
+    source: TableRef<'a>,
+    condition: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<&'a Stmt<'a>, SqlError> {
+    let rewritten = match statement {
+        Stmt::Select(select) => {
+            let from = prepend_rule_source(source, select.from.as_ref(), arena)?;
+            Stmt::Select(Select {
+                from: Some(from),
+                where_clause: and_where(condition, select.where_clause, arena)?,
+                ..*select
+            })
+        }
+        Stmt::Update(update) => {
+            let from = prepend_rule_source(source, update.from, arena)?;
+            Stmt::Update(Update {
+                from: Some(&*arena.alloc(from).map_err(|_| arena_full())?),
+                where_clause: and_where(condition, update.where_clause, arena)?,
+                ..*update
+            })
+        }
+        Stmt::Delete(delete) => {
+            let using = prepend_rule_source(source, delete.using, arena)?;
+            Stmt::Delete(Delete {
+                using: Some(&*arena.alloc(using).map_err(|_| arena_full())?),
+                where_clause: and_where(condition, delete.where_clause, arena)?,
+                ..*delete
+            })
+        }
+        Stmt::Insert(insert) => {
+            let select = if let Some(select) = insert.select {
+                let from = prepend_rule_source(source, select.from.as_ref(), arena)?;
+                Select {
+                    from: Some(from),
+                    where_clause: and_where(condition, select.where_clause, arena)?,
+                    ..*select
+                }
+            } else {
+                let mut leaves: [Option<&SetTree<'a>>; crate::sql::parser::MAX_LIST] =
+                    [None; crate::sql::parser::MAX_LIST];
+                for (index, row) in insert.rows.iter().enumerate() {
+                    let items = arena
+                        .alloc_slice_with(row.len(), |column| SelectItem::Expr {
+                            expression: row[column],
+                            alias: None,
+                        })
+                        .map_err(|_| arena_full())?;
+                    let select = arena
+                        .alloc(rule_select(
+                            items,
+                            Some(FromClause {
+                                base: source,
+                                joins: &[],
+                            }),
+                            condition,
+                        ))
+                        .map_err(|_| arena_full())?;
+                    leaves[index] = Some(
+                        arena
+                            .alloc(SetTree::Select(&*select))
+                            .map(|tree| &*tree)
+                            .map_err(|_| arena_full())?,
+                    );
+                }
+                let mut tree = leaves[0].ok_or_else(|| {
+                    sql_err!(sqlstate::SYNTAX_ERROR, "rewrite INSERT action has no row")
+                })?;
+                for leaf in &leaves[1..insert.rows.len()] {
+                    tree = arena
+                        .alloc(SetTree::Op {
+                            operator: SetOp::Union,
+                            all: true,
+                            left: tree,
+                            right: leaf.expect("populated rewrite action row"),
+                        })
+                        .map(|tree| &*tree)
+                        .map_err(|_| arena_full())?;
+                }
+                Select {
+                    set_body: Some(tree),
+                    ..rule_select(&[], None, None)
+                }
+            };
+            Stmt::Insert(Insert {
+                rows: &[],
+                select: Some(&*arena.alloc(select).map_err(|_| arena_full())?),
+                ..*insert
+            })
+        }
+        Stmt::Notify { .. } => *statement,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "rewrite-rule action is not executable"
+            ));
+        }
+    };
+    arena
+        .alloc(rewritten)
+        .map(|statement| &*statement)
+        .map_err(|_| arena_full())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored statements require their captured catalog and evaluation context"
+)]
+fn expand_stored_statement_with_transition<'a>(
+    statement: &'a Stmt<'a>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    dependencies: &crate::storage::StoredQueryDependencies,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    sequences: Option<&dyn SequenceAccess>,
+    transition: Option<RuleTransition<'a>>,
+) -> Result<&'a Stmt<'a>, SqlError> {
     let (with, body) = match statement {
         Stmt::With { ctes, statement } => (*ctes, *statement),
         _ => (&[][..], statement),
     };
     let placeholder = match body {
         Stmt::Insert(insert) => insert.select.unwrap_or(&EMPTY_SELECT),
+        Stmt::Select(select) => select,
         _ => &EMPTY_SELECT,
     };
     with_exec_context(
@@ -349,15 +1069,24 @@ pub(crate) fn expand_stored_statement_exec<'a>(
         None,
         |name| statement_references(body, name),
         |context| {
+            let context = Subst {
+                rule_transition: transition,
+                ..context
+            };
             let rebound = match body {
                 Stmt::Insert(insert) => Stmt::Insert(subst_insert(insert, context, arena)?),
                 Stmt::Update(update) => Stmt::Update(subst_update(update, context, arena)?),
                 Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
                 Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
+                Stmt::Select(select) => Stmt::Select(*subst_select(select, context, arena)?),
+                Stmt::Notify { channel, payload } => Stmt::Notify {
+                    channel,
+                    payload: *payload,
+                },
                 _ => {
                     return Err(sql_err!(
-                        sqlstate::INTERNAL_ERROR,
-                        "stored routine statement is not data-modifying"
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "stored statement kind is not executable in a rewrite rule"
                     ));
                 }
             };
@@ -469,6 +1198,7 @@ pub fn rewrite_view_dml<'a>(
             to: base_name,
             to_schema: base_schema,
         }),
+        rule_transition: None,
         recursive_state: None,
         execution: None,
     };
@@ -660,6 +1390,7 @@ fn with_exec_context<'a, 's, 'e, R>(
             dependencies,
             authorization_role,
             qualifier: None,
+            rule_transition: None,
             recursive_state: None,
             execution: Some(ExecutionSubst { params, sequences }),
         };
@@ -745,6 +1476,7 @@ fn with_exec_context<'a, 's, 'e, R>(
         dependencies,
         authorization_role,
         qualifier: None,
+        rule_transition: None,
         recursive_state: None,
         execution: Some(ExecutionSubst { params, sequences }),
     };
@@ -1037,6 +1769,7 @@ struct Subst<'c, 'a, 's, 'e> {
     /// DML on an auto-updatable view is executed against its base table.
     /// Qualified target references must follow that rewrite too.
     qualifier: Option<ViewQualifier<'a>>,
+    rule_transition: Option<RuleTransition<'a>>,
     recursive_state: Option<RecursiveStateSubst<'a>>,
     execution: Option<ExecutionSubst<'e, 'a>>,
 }
@@ -1052,6 +1785,15 @@ struct ViewQualifier<'a> {
     from: &'a str,
     to: &'a str,
     to_schema: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct RuleTransition<'a> {
+    names: &'a [&'a str],
+    old: &'a [&'a Expr<'a>],
+    new: &'a [&'a Expr<'a>],
+    old_available: bool,
+    new_available: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1975,6 +2717,7 @@ fn reject_recursive_name_collision<'a>(
             dependencies: None,
             authorization_role: None,
             qualifier: None,
+            rule_transition: None,
             recursive_state: None,
             execution: None,
         },
@@ -2221,6 +2964,7 @@ fn append_recursive_state<'a>(
             dependencies: None,
             authorization_role: None,
             qualifier: None,
+            rule_transition: None,
             recursive_state: Some(RecursiveStateSubst {
                 qualifier,
                 names: &decoration.column_names[decoration.visible..],
@@ -2744,6 +3488,7 @@ fn materialize_recursive<'a>(
             dependencies: None,
             authorization_role: None,
             qualifier: None,
+            rule_transition: None,
             recursive_state: None,
             execution: outer.execution,
         };
@@ -2881,6 +3626,7 @@ fn materialize_recursive<'a>(
         dependencies: None,
         authorization_role: None,
         qualifier: None,
+        rule_transition: None,
         recursive_state: None,
         execution: outer.execution,
     };
@@ -3159,11 +3905,38 @@ fn subst_select_items<'a>(
     arena: &'a Arena,
 ) -> Result<&'a [SelectItem<'a>], SqlError> {
     let mut items = [SelectItem::Wildcard; MAX_PROJ];
-    if source.len() > MAX_PROJ {
-        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "select list too wide"));
-    }
-    for (i, item) in source.iter().enumerate() {
-        items[i] = match item {
+    let mut count = 0usize;
+    for item in source {
+        if let SelectItem::TableWildcard(qualifier) = item
+            && let Some(transition) = context.rule_transition
+            && (qualifier.eq_ignore_ascii_case("old") || qualifier.eq_ignore_ascii_case("new"))
+        {
+            let old = qualifier.eq_ignore_ascii_case("old");
+            if (old && !transition.old_available) || (!old && !transition.new_available) {
+                return Err(sql_err!(
+                    sqlstate::INVALID_OBJECT_DEFINITION,
+                    "ON {} rule cannot reference {}",
+                    if old { "INSERT" } else { "DELETE" },
+                    if old { "OLD" } else { "NEW" }
+                ));
+            }
+            for (index, name) in transition.names.iter().copied().enumerate() {
+                let slot = items
+                    .get_mut(count)
+                    .ok_or_else(|| sql_err!(sqlstate::TOO_MANY_COLUMNS, "select list too wide"))?;
+                *slot = SelectItem::Expr {
+                    expression: if old {
+                        transition.old[index]
+                    } else {
+                        transition.new[index]
+                    },
+                    alias: Some(name),
+                };
+                count += 1;
+            }
+            continue;
+        }
+        let rewritten = match item {
             SelectItem::Wildcard => SelectItem::Wildcard,
             SelectItem::TableWildcard(qualifier) => {
                 SelectItem::TableWildcard(match context.qualifier {
@@ -3179,9 +3952,14 @@ fn subst_select_items<'a>(
                 alias: *alias,
             },
         };
+        let slot = items
+            .get_mut(count)
+            .ok_or_else(|| sql_err!(sqlstate::TOO_MANY_COLUMNS, "select list too wide"))?;
+        *slot = rewritten;
+        count += 1;
     }
     arena
-        .alloc_slice_copy(&items[..source.len()])
+        .alloc_slice_copy(&items[..count])
         .map(|items| &*items)
         .map_err(|_| arena_full())
 }
@@ -3670,13 +4448,14 @@ fn subst_tableref<'a>(
             crate::storage::ViewSecurity::Invoker => context.authorization_role,
         };
         let view_sql = arena
-            .alloc_str(view.sql.as_str())
+            .alloc_str(context.storage.view_sql(slot))
             .map_err(|_| arena_full())?;
         let user = crate::sql::eval::funcs::system::session_user_owned();
-        let view_path =
-            context
-                .storage
-                .compute_path(view.creation_path.as_str(), user.as_str(), context.txid);
+        let view_path = context.storage.compute_path(
+            context.storage.view_creation_path(slot),
+            user.as_str(),
+            context.txid,
+        );
         let vsel = crate::sql::parser::parse_view_select(view_sql, arena)?;
         // The view body has its own scope: no outer CTEs, deeper view depth,
         // and the creator's path for its own references.
@@ -3771,6 +4550,7 @@ fn subst_expr_slice<'a>(
     arena: &'a Arena,
 ) -> Result<&'a [&'a Expr<'a>], SqlError> {
     if context.qualifier.is_none()
+        && context.rule_transition.is_none()
         && context.recursive_state.is_none()
         && context.dependencies.is_none()
         && !xs.iter().any(|x| expr_has_subquery(x))
@@ -4037,6 +4817,7 @@ fn subst_expr<'a>(
     arena: &'a Arena,
 ) -> Result<&'a Expr<'a>, SqlError> {
     if context.qualifier.is_none()
+        && context.rule_transition.is_none()
         && context.recursive_state.is_none()
         && context.dependencies.is_none()
         && !expr_has_subquery(e)
@@ -4284,6 +5065,36 @@ fn subst_expr<'a>(
             all: *all,
         },
         Expr::Column { qualifier, name } => {
+            if let Some(transition) = context.rule_transition
+                && let Some(written) = qualifier
+                && (written.eq_ignore_ascii_case("old") || written.eq_ignore_ascii_case("new"))
+            {
+                let old = written.eq_ignore_ascii_case("old");
+                if (old && !transition.old_available) || (!old && !transition.new_available) {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_OBJECT_DEFINITION,
+                        "ON {} rule cannot reference {}",
+                        if old { "INSERT" } else { "DELETE" },
+                        if old { "OLD" } else { "NEW" }
+                    ));
+                }
+                let index = transition
+                    .names
+                    .iter()
+                    .position(|known| known == name)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" does not exist",
+                            name
+                        )
+                    })?;
+                return Ok(if old {
+                    transition.old[index]
+                } else {
+                    transition.new[index]
+                });
+            }
             if let Some(state) = context.recursive_state
                 && qualifier.is_none_or(|written| written == state.qualifier)
                 && let Some(index) = state.names.iter().position(|candidate| candidate == name)

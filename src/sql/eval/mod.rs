@@ -1104,6 +1104,9 @@ pub trait CatalogAccess {
     fn view_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
+    fn rule_def<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
     /// Bytes occupied by the relation's stored row images. Relations without
     /// physical row storage (plain views and catalog-only indexes) report zero.
     fn relation_size(&self, _oid: i32) -> Result<Option<i64>, SqlError> {

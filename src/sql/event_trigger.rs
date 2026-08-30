@@ -313,6 +313,7 @@ enum ObjectRef {
     Routine(usize),
     EventTrigger(usize),
     Trigger(usize),
+    Rule(usize),
     MaterializedView(usize),
     Sequence(usize),
     Domain(usize),
@@ -506,7 +507,7 @@ impl EventObjectRef {
                 .map_err(|_| graph_full())?;
                 let mut rule = base_object(
                     catalog::PG_REWRITE_OID,
-                    catalog::view_rewrite_oid(slot),
+                    storage.rule(storage.view_return_rule(slot)).oid(),
                     "rule",
                     None,
                     None,
@@ -767,6 +768,9 @@ fn mutation(undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         TriggerCreated(slot) => (ObjectRef::Trigger(slot as usize), Mutation::Create),
         TriggerDropped(slot) => (ObjectRef::Trigger(slot as usize), Mutation::Drop),
         TriggerAltered { slot, .. } => (ObjectRef::Trigger(slot as usize), Mutation::Alter),
+        RuleCreated { slot, .. } => (ObjectRef::Rule(slot as usize), Mutation::Create),
+        RuleDropped(slot) => (ObjectRef::Rule(slot as usize), Mutation::Drop),
+        RuleAltered { slot, .. } => (ObjectRef::Rule(slot as usize), Mutation::Alter),
         PolicyCreated(slot) => (ObjectRef::Policy(slot as usize), Mutation::Create),
         PolicyDropped(slot) => (ObjectRef::Policy(slot as usize), Mutation::Drop),
         PolicyAltered { slot, .. } => (ObjectRef::Policy(slot as usize), Mutation::Alter),
@@ -1053,6 +1057,24 @@ fn comment_reference(
             EventObjectRef::Primary(ObjectRef::Trigger(
                 storage
                     .trigger_slot_on(target, name.as_str(), txid)
+                    .ok_or_else(graph_full)?,
+            ))
+        }
+        CommentClass::Rule => {
+            let target = if subid & (1 << 31) == 0 {
+                crate::storage::RuleTarget::Table(
+                    u16::try_from(subid.checked_sub(1).ok_or_else(graph_full)?)
+                        .map_err(|_| graph_full())?,
+                )
+            } else {
+                crate::storage::RuleTarget::View(
+                    u16::try_from((subid & !(1 << 31)).checked_sub(1).ok_or_else(graph_full)?)
+                        .map_err(|_| graph_full())?,
+                )
+            };
+            EventObjectRef::Primary(ObjectRef::Rule(
+                storage
+                    .rule_slot(target, name.as_str(), txid)
                     .ok_or_else(graph_full)?,
             ))
         }
@@ -1553,6 +1575,42 @@ fn primary_object(
             object.address_name_count = 3;
             object
         }
+        ObjectRef::Rule(slot) => {
+            let rule = storage.rule(slot);
+            let definition = rule.definition_for(txid);
+            let (schema, relation) = match definition.target {
+                crate::storage::RuleTarget::Table(table) => {
+                    let table = storage.table_def(usize::from(table), txid);
+                    (table.schema, table.name)
+                }
+                crate::storage::RuleTarget::View(view) => {
+                    let view = storage.view(usize::from(view));
+                    (view.schema, view.name)
+                }
+            };
+            let mut identity = EventIdentity::new();
+            write!(
+                identity,
+                "{} on {}",
+                identifier(definition.name.as_str()).as_str(),
+                qualified(schema.as_str(), relation.as_str())?.as_str()
+            )
+            .map_err(|_| graph_full())?;
+            let mut object = base_object(
+                catalog::PG_REWRITE_OID,
+                rule.oid(),
+                "rule",
+                Some(schema.as_str()),
+                Some(definition.name.as_str()),
+                identity,
+                false,
+            );
+            object.address_names[0] = StackStr::from_str(schema.as_str());
+            object.address_names[1] = StackStr::from_str(relation.as_str());
+            object.address_names[2] = StackStr::from_str(definition.name.as_str());
+            object.address_name_count = 3;
+            object
+        }
         ObjectRef::Cast(slot) => {
             let cast = storage.cast(slot);
             let source = routine_result_name(cast.source)?;
@@ -1913,6 +1971,10 @@ fn is_original(
         (Stmt::DropTrigger { trigger, .. }, ObjectRef::Trigger(_)) => {
             trigger.name == object.object_name.as_ref().map_or("", |name| name.as_str())
                 && trigger.table.name == object.address_names[1].as_str()
+        }
+        (Stmt::DropRule(rule), ObjectRef::Rule(_)) => {
+            rule.name == object.object_name.as_ref().map_or("", |name| name.as_str())
+                && rule.table.name == object.address_names[1].as_str()
         }
         _ => false,
     })

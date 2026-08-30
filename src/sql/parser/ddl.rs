@@ -17,22 +17,47 @@ use crate::sql::ast::{
     AlterRoutineAction, AlterStatisticsAction, AlterTablespaceAction, AlterTriggerAction,
     AlterTypeAction, BtreeStrategy, CastContext, CastMethod, ConstraintMode, ConstraintTiming,
     ConstraintValidation, CreateCast, CreateDomain, CreateEventTrigger, CreateOperator,
-    CreateOperatorClass, CreateRoutine, CreateSchemaElement, CreateStatistics, CreateTrigger,
-    DomainCheck, EventTriggerEvent, ExclusionOperator, Expr, ExtensionMemberIdentity,
-    ExtensionRelationKind, IndexAccessMethod, IndexBuildMode, IndexStorageOptionNames,
-    IndexStorageOptions, IndexTargetScope, OperatorClassMember, OperatorFamilyMember,
-    OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands, PartitionBound,
-    PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression, PolicyIdentity,
-    PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget, RoleOptions,
-    RoutineArgument, RoutineArgumentMode, RoutineCreateKind, RoutineIdentity, RoutineParallel,
-    RoutineResultColumn, RoutineTargetKind, StatisticsExpression, StatisticsKey, StatisticsKeys,
-    StatisticsKinds, StatisticsName, StatisticsTarget, SubscriptionBehavior, SubscriptionConnect,
-    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
-    SubscriptionStreaming, SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions,
-    TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables,
-    ViewSecurity,
+    CreateOperatorClass, CreateRoutine, CreateRule, CreateSchemaElement, CreateStatistics,
+    CreateTrigger, DomainCheck, EventTriggerEvent, ExclusionOperator, Expr,
+    ExtensionMemberIdentity, ExtensionRelationKind, IndexAccessMethod, IndexBuildMode,
+    IndexStorageOptionNames, IndexStorageOptions, IndexTargetScope, OperatorClassMember,
+    OperatorFamilyMember, OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands,
+    PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression,
+    PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget,
+    RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineCreateKind, RoutineIdentity,
+    RoutineParallel, RoutineResultColumn, RoutineTargetKind, RuleAction, RuleEvent, RuleMode,
+    StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName,
+    StatisticsTarget, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
+    SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions, TriggerEvent,
+    TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables, ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
+
+fn rule_action_statement(statement: &Stmt<'_>) -> bool {
+    match statement {
+        Stmt::Select(_)
+        | Stmt::SetQuery(_)
+        | Stmt::Insert(_)
+        | Stmt::Update(_)
+        | Stmt::Delete(_)
+        | Stmt::Notify { .. } => true,
+        Stmt::With { statement, .. } => rule_action_statement(statement),
+        _ => false,
+    }
+}
+
+fn rule_action_name(statement: &Stmt<'_>) -> &'static str {
+    match statement {
+        Stmt::Select(_) | Stmt::SetQuery(_) => "SELECT",
+        Stmt::Insert(_) => "INSERT",
+        Stmt::Update(_) => "UPDATE",
+        Stmt::Delete(_) => "DELETE",
+        Stmt::Notify { .. } => "NOTIFY",
+        Stmt::With { statement, .. } => rule_action_name(statement),
+        _ => "utility",
+    }
+}
 use crate::stack_format;
 use crate::storage::MAX_INDEX_COLS;
 
@@ -875,6 +900,9 @@ impl<'a> Parser<'a> {
             false
         };
         if or_replace {
+            if self.eat_ident("rule")? {
+                return self.create_rule(true);
+            }
             if self.eat_ident("view")? {
                 return self.create_view(true);
             }
@@ -899,7 +927,7 @@ impl<'a> Parser<'a> {
                 return self.create_language(true, trusted);
             }
             return Err(self.unexpected(
-                "expected VIEW, FUNCTION, PROCEDURE, AGGREGATE, or TRIGGER after CREATE OR REPLACE",
+                "expected RULE, VIEW, FUNCTION, PROCEDURE, AGGREGATE, or TRIGGER after CREATE OR REPLACE",
             ));
         }
         if self.eat_ident("unique")? {
@@ -920,6 +948,9 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("view")? {
             return self.create_view(false);
+        }
+        if self.eat_ident("rule")? {
+            return self.create_rule(false);
         }
         if self.eat_ident("collation")? {
             return self.create_collation();
@@ -4560,6 +4591,98 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn create_rule(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("rule name")?;
+        self.expect_ident("as")?;
+        self.expect_ident("on")?;
+        let event = if self.eat_ident("select")? {
+            RuleEvent::Select
+        } else if self.eat_ident("insert")? {
+            RuleEvent::Insert
+        } else if self.eat_ident("update")? {
+            RuleEvent::Update
+        } else if self.eat_ident("delete")? {
+            RuleEvent::Delete
+        } else {
+            return Err(self.err_here("expected SELECT, INSERT, UPDATE, or DELETE rule event"));
+        };
+        self.expect_ident("to")?;
+        let table = self.qual_name("rule relation")?;
+        let (condition, condition_sql) = if self.eat_ident("where")? {
+            let start = self.peek_at;
+            let condition = self.expression(0)?;
+            let source = self.text[start..self.peek_at].trim();
+            (Some(condition), Some(source))
+        } else {
+            (None, None)
+        };
+        self.expect_ident("do")?;
+        let mode = if self.eat_ident("also")? {
+            RuleMode::Also
+        } else if self.eat_ident("instead")? {
+            RuleMode::Instead
+        } else {
+            RuleMode::Also
+        };
+        let mut actions = [RuleAction {
+            statement: &Stmt::Commit,
+            sql: "",
+        }; MAX_LIST];
+        let mut count = 0usize;
+        if !self.eat_ident("nothing")? {
+            let parenthesized = self.eat_op("(")?;
+            loop {
+                if count == actions.len() {
+                    return Err(self.limit("rule actions", actions.len()));
+                }
+                let start = self.peek_at;
+                let statement = self.statement()?;
+                if !rule_action_statement(&statement) {
+                    return Err(ParseError {
+                        at: start,
+                        message: stack_format!(
+                            96,
+                            "rules cannot contain {} commands",
+                            rule_action_name(&statement)
+                        ),
+                        sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                    });
+                }
+                let source = self.text[start..self.peek_at].trim();
+                let statement = self
+                    .arena
+                    .alloc(statement)
+                    .map(|statement| &*statement)
+                    .map_err(|_| self.err_here("rule action is too large"))?;
+                actions[count] = RuleAction {
+                    statement,
+                    sql: source,
+                };
+                count += 1;
+                if !parenthesized {
+                    break;
+                }
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(";")?;
+                if self.eat_op(")")? {
+                    break;
+                }
+            }
+        }
+        Ok(Stmt::CreateRule(CreateRule {
+            name,
+            or_replace,
+            event,
+            table,
+            condition,
+            condition_sql,
+            mode,
+            actions: self.arena_slice(&actions[..count])?,
+        }))
+    }
+
     fn create_publication(&mut self) -> Result<Stmt<'a>, ParseError> {
         let name = self.any_ident("publication name")?;
         let (all_tables, tables, schemas) = if self.eat_ident("for")? {
@@ -5098,6 +5221,29 @@ impl<'a> Parser<'a> {
     /// Dispatches DROP: `VIEW` or `TABLE` ("drop" consumed here).
     pub(super) fn drop_stmt(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("drop")?;
+        if self.eat_ident("rule")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.col_ident("rule name")?;
+            self.expect_ident("on")?;
+            let table = self.qual_name("rule relation")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropRule(crate::sql::ast::DropRule {
+                name,
+                table,
+                if_exists,
+                cascade,
+            }));
+        }
         if self.eat_ident("owned")? {
             self.expect_ident("by")?;
             let roles = self.role_name_list("role name")?;

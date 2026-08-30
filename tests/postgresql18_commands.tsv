@@ -39,7 +39,7 @@ ALTER PROCEDURE	partial	90_routine_lifecycle.sql
 ALTER PUBLICATION	partial	84_publication.sql
 ALTER ROLE	partial	83_roles_acl.sql
 ALTER ROUTINE	partial	90_routine_lifecycle.sql and aggregate extension dependencies in 111_extension_lifecycle.sql
-ALTER RULE	missing	-
+ALTER RULE	complete	tests/external/differential/122_rewrite_rules.sql
 ALTER SCHEMA	partial	37_schemas.sql
 ALTER SEQUENCE	partial	54_sequence.sql
 ALTER SERVER	missing	-
@@ -90,7 +90,7 @@ CREATE POLICY	complete	106_row_level_security.sql
 CREATE PROCEDURE	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql
 CREATE PUBLICATION	partial	84_publication.sql
 CREATE ROLE	partial	83_roles_acl.sql
-CREATE RULE	missing	-
+CREATE RULE	complete	tests/external/differential/122_rewrite_rules.sql
 CREATE SCHEMA	partial	37_schemas.sql
 CREATE SEQUENCE	complete	54_sequence.sql
 CREATE SERVER	missing	-
@@ -139,7 +139,7 @@ DROP PROCEDURE	partial	89_sql_procedures.sql
 DROP PUBLICATION	partial	84_publication.sql
 DROP ROLE	partial	83_roles_acl.sql
 DROP ROUTINE	partial	90_routine_lifecycle.sql
-DROP RULE	missing	-
+DROP RULE	complete	tests/external/differential/122_rewrite_rules.sql
 DROP SCHEMA	complete	37_schemas.sql
 DROP SEQUENCE	complete	54_sequence.sql
 DROP SERVER	missing	-

@@ -60,6 +60,9 @@ pub struct Config {
     pub wal_buffer_bytes: usize,
     /// Fixed number of table slots.
     pub max_tables: usize,
+    /// Fixed number of rewrite-rule slots, including one `_RETURN` rule per
+    /// ordinary view.
+    pub max_rules: usize,
     /// Colon-separated PostgreSQL extension roots; controls live below each
     /// root's `extension` directory. Empty selects only durable packages.
     pub extension_control_path: String,
@@ -185,6 +188,7 @@ impl Config {
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
             max_tables: 32,
+            max_rules: 128,
             extension_control_path: String::new(),
             max_extension_scripts: 128,
             extension_script_bytes: 4 * MIB,
@@ -348,6 +352,10 @@ impl Config {
                 }
                 "max_tables" => {
                     config.max_tables =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_rules" => {
+                    config.max_rules =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "extension_control_path" => config.extension_control_path = value.to_string(),
@@ -546,6 +554,12 @@ impl Config {
                 "collation_scratch_bytes must be greater than zero".to_string(),
             ));
         }
+        if config.max_rules == 0 {
+            return Err(ConfigError::at(
+                0,
+                "max_rules must be greater than zero".to_string(),
+            ));
+        }
         if config.max_extension_scripts == 0
             || config.max_extension_scripts > 256
             || config.extension_script_bytes == 0
@@ -711,6 +725,7 @@ listen_addr = 0.0.0.0:5432
 max_connections = 128
 max_replication_slots = 12
 max_subscriptions = 7
+max_rules = 19
 memtable_bytes = 16MiB   # small for tests
 sql_arena_bytes = 4096
 ";
@@ -719,6 +734,7 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_connections, 128);
         assert_eq!(c.max_replication_slots, 12);
         assert_eq!(c.max_subscriptions, 7);
+        assert_eq!(c.max_rules, 19);
         assert_eq!(c.memtable_bytes, 16 * MIB);
         assert_eq!(c.sql_arena_bytes, 4096);
         // Untouched keys keep defaults.
@@ -806,6 +822,7 @@ sql_arena_bytes = 4096
         );
         assert!(Config::parse("memtable_bytes = lots\n").is_err());
         assert!(Config::parse("max_connections = -1\n").is_err());
+        assert!(Config::parse("max_rules = 0\n").is_err());
         assert!(Config::parse("just some words\n").is_err());
         assert!(Config::parse("database_collation_locale = \n").is_err());
         assert!(Config::parse("collation_scratch_bytes = 0\n").is_err());

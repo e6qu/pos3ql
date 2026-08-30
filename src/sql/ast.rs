@@ -359,6 +359,15 @@ pub enum Stmt<'a> {
         security: ViewSecurity,
         sql: &'a str,
     },
+    /// A rewrite rule is parsed into its closed event/mode states and complete
+    /// action statements. Source slices are retained for durable catalog text.
+    CreateRule(CreateRule<'a>),
+    AlterRule {
+        name: &'a str,
+        table: QualName<'a>,
+        new_name: &'a str,
+    },
+    DropRule(DropRule<'a>),
     /// A SQL routine retains its parsed invocation contract and body spelling.
     /// The executor resolves every type before the definition reaches storage.
     CreateRoutine(CreateRoutine<'a>),
@@ -943,6 +952,67 @@ pub enum Stmt<'a> {
         roles: &'a [&'a str],
         cascade: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleEvent {
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl RuleEvent {
+    pub const fn catalog_code(self) -> u8 {
+        match self {
+            Self::Select => b'1',
+            Self::Update => b'2',
+            Self::Insert => b'3',
+            Self::Delete => b'4',
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Select => "SELECT",
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleMode {
+    Also,
+    Instead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuleAction<'a> {
+    pub statement: &'a Stmt<'a>,
+    pub sql: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreateRule<'a> {
+    pub name: &'a str,
+    pub or_replace: bool,
+    pub event: RuleEvent,
+    pub table: QualName<'a>,
+    pub condition: Option<&'a Expr<'a>>,
+    pub condition_sql: Option<&'a str>,
+    pub mode: RuleMode,
+    /// Empty is the typed representation of `DO ... NOTHING`.
+    pub actions: &'a [RuleAction<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropRule<'a> {
+    pub name: &'a str,
+    pub table: QualName<'a>,
+    pub if_exists: bool,
+    pub cascade: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2023,6 +2093,8 @@ pub enum CommentTarget<'a> {
     Extension(&'a str),
     /// TRIGGER name ON relation; trigger names are relation-local.
     Trigger(TriggerIdentity<'a>),
+    /// RULE name ON relation; rewrite-rule names are relation-local.
+    Rule(TriggerIdentity<'a>),
     /// TYPE name, or DOMAIN name when `domain_only` requires that kind.
     Type {
         name: &'a str,

@@ -1160,7 +1160,8 @@ impl Checkpointer {
                         return Err(CheckpointSetupError::Corrupt("too many columns"));
                     }
                     let has_toast = parse_bool_field(words.next(), "table toast relation")?;
-                    let name = rest_of(line, 4)?;
+                    let has_rules = parse_bool_field(words.next(), "table rewrite rules")?;
+                    let name = rest_of(line, 5)?;
                     let def = TableDef {
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
@@ -1168,6 +1169,7 @@ impl Checkpointer {
                         columns: [empty_column(); MAX_COLUMNS],
                         n_columns: n_cols,
                         has_toast,
+                        has_rules,
                         ..TableDef::empty()
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
@@ -2823,6 +2825,142 @@ impl Checkpointer {
                         .map_err(|error| {
                             CheckpointSetupError::ObjectStore(format!(
                                 "manifest event trigger rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
+                Some("rul") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let slot: usize = parse_field(words.next(), "rule slot")?;
+                    let created_at = parse_field(words.next(), "rule created_at")?;
+                    let target_kind: u8 = parse_field(words.next(), "rule target kind")?;
+                    let schema = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("rule schema missing"))?,
+                    )?;
+                    let relation = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("rule relation missing"))?,
+                    )?;
+                    let name = sql_name(&decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("rule name missing"))?,
+                    )?)?;
+                    let event = crate::storage::RewriteEvent::from_code(parse_field(
+                        words.next(),
+                        "rule event",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid rule event"))?;
+                    let mode = crate::storage::RewriteMode::from_code(parse_field(
+                        words.next(),
+                        "rule mode",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid rule mode"))?;
+                    let source =
+                        StackStr::<{ crate::storage::RULE_SQL_MAX }>::from_str(&decode_hex_name(
+                            words
+                                .next()
+                                .ok_or(CheckpointSetupError::Corrupt("rule source missing"))?,
+                        )?);
+                    if source.is_truncated() {
+                        return Err(CheckpointSetupError::Corrupt("rule source too long"));
+                    }
+                    let condition_start: u16 = parse_field(words.next(), "rule condition start")?;
+                    let condition_len: u16 = parse_field(words.next(), "rule condition length")?;
+                    let condition =
+                        (condition_start != u16::MAX).then_some(crate::storage::RuleTextSpan {
+                            start: condition_start,
+                            len: condition_len,
+                        });
+                    if condition_start == u16::MAX && condition_len != 0 {
+                        return Err(CheckpointSetupError::Corrupt("invalid rule condition span"));
+                    }
+                    let action_count: usize = parse_field(words.next(), "rule action count")?;
+                    if action_count > crate::storage::MAX_RULE_ACTIONS {
+                        return Err(CheckpointSetupError::Corrupt("too many rule actions"));
+                    }
+                    let mut actions = [crate::storage::RuleTextSpan { start: 0, len: 0 };
+                        crate::storage::MAX_RULE_ACTIONS];
+                    for action in &mut actions[..action_count] {
+                        action.start = parse_field(words.next(), "rule action start")?;
+                        action.len = parse_field(words.next(), "rule action length")?;
+                    }
+                    let returning_action: u16 = parse_field(words.next(), "rule returning action")?;
+                    let returning_action = match returning_action {
+                        u16::MAX => None,
+                        index if usize::from(index) < action_count => Some(index as u8),
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid rule returning action",
+                            ));
+                        }
+                    };
+                    let creation_path =
+                        StackStr::<128>::from_str(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("rule creation path missing"),
+                        )?)?);
+                    if creation_path.is_truncated() {
+                        return Err(CheckpointSetupError::Corrupt("rule creation path too long"));
+                    }
+                    let dependencies = parse_stored_query_dependencies(&mut words)?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing rule fields"));
+                    }
+                    let valid_span = |span: crate::storage::RuleTextSpan| {
+                        let start = usize::from(span.start);
+                        start.checked_add(usize::from(span.len)).is_some_and(|end| {
+                            end <= source.as_str().len()
+                                && source.as_str().is_char_boundary(start)
+                                && source.as_str().is_char_boundary(end)
+                        })
+                    };
+                    if condition.is_some_and(|span| !valid_span(span))
+                        || actions[..action_count]
+                            .iter()
+                            .any(|span| !valid_span(*span))
+                    {
+                        return Err(CheckpointSetupError::Corrupt("invalid rule text span"));
+                    }
+                    let target = match target_kind {
+                        0 => storage
+                            .find_table(&schema, &relation)
+                            .and_then(|slot| u16::try_from(slot).ok())
+                            .map(crate::storage::RuleTarget::Table),
+                        1 => storage
+                            .views_visible_to(0)
+                            .find(|(_, view)| {
+                                view.schema.as_str() == schema.as_str()
+                                    && view.name.as_str() == relation.as_str()
+                            })
+                            .and_then(|(slot, _)| u16::try_from(slot).ok())
+                            .map(crate::storage::RuleTarget::View),
+                        _ => None,
+                    }
+                    .ok_or(CheckpointSetupError::Corrupt("rule target missing"))?;
+                    storage
+                        .replay_rule(
+                            slot,
+                            created_at,
+                            crate::storage::RuleDefinition {
+                                name,
+                                target,
+                                event,
+                                mode,
+                                source,
+                                condition,
+                                actions,
+                                action_count: action_count as u8,
+                                returning_action,
+                                creation_path,
+                                dependencies,
+                            },
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest rewrite rule rejected: {}",
                                 error.message.as_str()
                             ))
                         })?;
@@ -5251,9 +5389,10 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "table {slot} {} {} {}",
+                    "table {slot} {} {} {} {}",
                     table.def.n_columns,
                     u8::from(table.def.has_toast),
+                    u8::from(table.def.has_rules),
                     table.def.name.as_str()
                 ),
             )?;
@@ -5735,7 +5874,7 @@ impl Checkpointer {
             write_database_context(&mut self.manifest_buf, &mut database_context, view.database)?;
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
-            for b in view.sql.as_str().as_bytes() {
+            for b in storage.view_sql(view_slot).as_bytes() {
                 let _ = write!(hex, "{b:02x}");
             }
             let mut hschema = StackStr::<130>::new();
@@ -5743,7 +5882,7 @@ impl Checkpointer {
                 let _ = write!(hschema, "{b:02x}");
             }
             let mut hpath = StackStr::<260>::new();
-            for b in view.creation_path.as_str().as_bytes() {
+            for b in storage.view_creation_path(view_slot).as_bytes() {
                 let _ = write!(hpath, "{b:02x}");
             }
             let mut hname = StackStr::<130>::new();
@@ -6354,6 +6493,53 @@ impl Checkpointer {
                     definition.enabled.code(),
                     ManifestName(owner.name.as_str()),
                     tags.as_str(),
+                ),
+            )?;
+        }
+        for (slot, rule) in storage.checkpoint_rules() {
+            write_database_context(&mut self.manifest_buf, &mut database_context, rule.database)?;
+            use core::fmt::Write as _;
+            let definition = rule.definition;
+            let (target, schema, relation) = match definition.target {
+                crate::storage::RuleTarget::Table(target) => {
+                    let table = storage.table_def(usize::from(target), 0);
+                    (0u8, table.schema, table.name)
+                }
+                crate::storage::RuleTarget::View(target) => {
+                    let view = storage.view(usize::from(target));
+                    (1u8, view.schema, view.name)
+                }
+            };
+            let condition = definition
+                .condition
+                .unwrap_or(crate::storage::RuleTextSpan {
+                    start: u16::MAX,
+                    len: 0,
+                });
+            let mut spans = StackStr::<512>::new();
+            let _ = write!(spans, "{}", definition.action_count);
+            for action in &definition.actions[..usize::from(definition.action_count)] {
+                let _ = write!(spans, " {} {}", action.start, action.len);
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "rul {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    slot,
+                    rule.created_at,
+                    target,
+                    ManifestName(schema.as_str()),
+                    ManifestName(relation.as_str()),
+                    ManifestName(definition.name.as_str()),
+                    definition.event as u8,
+                    definition.mode as u8,
+                    ManifestName(definition.source.as_str()),
+                    condition.start,
+                    condition.len,
+                    spans.as_str(),
+                    definition.returning_action.map_or(u16::MAX, u16::from),
+                    ManifestName(definition.creation_path.as_str()),
+                    ManifestDependencies(&definition.dependencies),
                 ),
             )?;
         }

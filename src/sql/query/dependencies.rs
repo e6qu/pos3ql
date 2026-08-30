@@ -106,6 +106,27 @@ pub(super) fn collect_routine_program(
     Ok(dependencies)
 }
 
+pub(super) fn collect_rule_actions(
+    actions: &[crate::sql::ast::RuleAction<'_>],
+    storage: &Storage,
+    txid: u32,
+    path: PathContext,
+    arena: &Arena,
+) -> Result<StoredQueryDependencies, SqlError> {
+    let mut dependencies = StoredQueryDependencies::EMPTY;
+    for action in actions {
+        collect_statement(
+            action.statement,
+            storage,
+            txid,
+            &path,
+            &mut dependencies,
+            arena,
+        )?;
+    }
+    Ok(dependencies)
+}
+
 fn collect_set_query(
     query: &SetQuery<'_>,
     storage: &Storage,
@@ -1507,15 +1528,14 @@ fn record_relation_column_references<'a>(
                 }
             }
             ResolvedRelation::View(slot) => {
-                let view = storage.view(slot);
                 let user = crate::sql::eval::funcs::system::session_user_owned();
                 let view_path =
-                    storage.compute_path(view.creation_path.as_str(), user.as_str(), txid);
+                    storage.compute_path(storage.view_creation_path(slot), user.as_str(), txid);
                 let mut described = [crate::sql::types::ColDesc::new("", 0, 0); MAX_COLUMNS];
                 source.class = DependencyClass::View;
                 source.slot = slot;
                 source.n_columns = super::describe_stored_query(
-                    view.sql.as_str(),
+                    storage.view_sql(slot),
                     storage,
                     txid,
                     view_path,

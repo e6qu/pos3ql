@@ -1511,6 +1511,280 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         self.storage.resolve_collation(schema, name, self.txid)
     }
 
+    fn resolve_text_search_configuration(&self, schema: Option<&str>, name: &str) -> Option<i32> {
+        let slot = self.storage.text_search_slot_on_path(
+            super::ast::TextSearchObjectKind::Configuration,
+            schema,
+            name,
+            self.txid,
+        )?;
+        Some(
+            self.storage
+                .text_search_object(slot)
+                .definition_for(self.txid)
+                .oid(),
+        )
+    }
+
+    fn rewrite_text_search_query<'a>(
+        &self,
+        source: &str,
+        query_sql: &str,
+        arena: &'a Arena,
+    ) -> Result<&'a str, SqlError> {
+        let query = super::parser::parse_query(query_sql, arena)?;
+        let query = RoutineQuery::Select(query);
+        let source = arena.alloc_str(source).map_err(|_| arena_full())?;
+        let mut rewritten = super::full_text::canonical_query(source, arena)?;
+        execute_routine_query(
+            &query,
+            self.storage,
+            self.txid,
+            arena,
+            &[],
+            false,
+            &mut |row| {
+                if row.len() != 2 {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "ts_rewrite query must return two tsquery columns"
+                    ));
+                }
+                let (Datum::TsQuery(target), Datum::TsQuery(replacement)) = (row[0], row[1]) else {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "ts_rewrite query must return two tsquery columns"
+                    ));
+                };
+                rewritten = super::full_text::rewrite_query(
+                    rewritten,
+                    target.as_str(),
+                    replacement.as_str(),
+                    arena,
+                )?;
+                Ok(())
+            },
+        )?;
+        Ok(rewritten)
+    }
+
+    fn text_search_configuration_name(&self, oid: i32) -> Option<crate::util::StackStr<128>> {
+        let slot = self.storage.text_search_slot_by_oid(
+            super::ast::TextSearchObjectKind::Configuration,
+            oid,
+            self.txid,
+        )?;
+        let definition = self
+            .storage
+            .text_search_object(slot)
+            .definition_for(self.txid);
+        let mut output = crate::util::StackStr::new();
+        if definition.schema().as_str() != "pg_catalog"
+            && !self.storage.schema_is_on_path(definition.schema())
+        {
+            use core::fmt::Write as _;
+            write!(output, "{}.", definition.schema().as_str()).ok()?;
+        }
+        use core::fmt::Write as _;
+        write!(output, "{}", definition.name().as_str()).ok()?;
+        (!output.is_truncated()).then_some(output)
+    }
+
+    fn resolve_text_search_dictionary(&self, schema: Option<&str>, name: &str) -> Option<i32> {
+        let slot = self.storage.text_search_slot_on_path(
+            super::ast::TextSearchObjectKind::Dictionary,
+            schema,
+            name,
+            self.txid,
+        )?;
+        Some(
+            self.storage
+                .text_search_object(slot)
+                .definition_for(self.txid)
+                .oid(),
+        )
+    }
+
+    fn text_search_dictionary_name(&self, oid: i32) -> Option<crate::util::StackStr<128>> {
+        let slot = self.storage.text_search_slot_by_oid(
+            super::ast::TextSearchObjectKind::Dictionary,
+            oid,
+            self.txid,
+        )?;
+        let definition = self
+            .storage
+            .text_search_object(slot)
+            .definition_for(self.txid);
+        let mut output = crate::util::StackStr::new();
+        if definition.schema().as_str() != "pg_catalog"
+            && !self.storage.schema_is_on_path(definition.schema())
+        {
+            use core::fmt::Write as _;
+            write!(output, "{}.", definition.schema().as_str()).ok()?;
+        }
+        use core::fmt::Write as _;
+        write!(output, "{}", definition.name().as_str()).ok()?;
+        (!output.is_truncated()).then_some(output)
+    }
+
+    fn lexize_text_search_dictionary<'a>(
+        &self,
+        dictionary_oid: i32,
+        token: &str,
+        arena: &'a Arena,
+    ) -> Result<super::full_text::TextSearchLexeme<'a>, SqlError> {
+        let slot = self
+            .storage
+            .text_search_slot_by_oid(
+                super::ast::TextSearchObjectKind::Dictionary,
+                dictionary_oid,
+                self.txid,
+            )
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "text search dictionary with OID {} does not exist",
+                    dictionary_oid
+                )
+            })?;
+        let super::super::storage::TextSearchDefinition::Dictionary { behavior, .. } = self
+            .storage
+            .text_search_object(slot)
+            .definition_for(self.txid)
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid text-search dictionary catalog entry"
+            ));
+        };
+        match behavior {
+            super::super::storage::TextSearchDictionaryBehavior::Simple { accept: false } => {
+                Ok(super::full_text::TextSearchLexeme::Unmapped)
+            }
+            super::super::storage::TextSearchDictionaryBehavior::Simple { accept: true } => Ok(
+                match super::full_text::normalize_token(
+                    token,
+                    super::full_text::TextSearchConfig::Simple,
+                    arena,
+                )? {
+                    Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
+                    None => super::full_text::TextSearchLexeme::StopWord,
+                },
+            ),
+            super::super::storage::TextSearchDictionaryBehavior::EnglishStem => Ok(
+                match super::full_text::normalize_token(
+                    token,
+                    super::full_text::TextSearchConfig::English,
+                    arena,
+                )? {
+                    Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
+                    None => super::full_text::TextSearchLexeme::StopWord,
+                },
+            ),
+        }
+    }
+
+    fn normalize_text_search_token<'a>(
+        &self,
+        configuration_oid: i32,
+        token_type: u8,
+        token: &str,
+        arena: &'a Arena,
+    ) -> Result<super::full_text::TextSearchLexeme<'a>, SqlError> {
+        let slot = self
+            .storage
+            .text_search_slot_by_oid(
+                super::ast::TextSearchObjectKind::Configuration,
+                configuration_oid,
+                self.txid,
+            )
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "text search configuration with OID {} does not exist",
+                    configuration_oid
+                )
+            })?;
+        let super::super::storage::TextSearchDefinition::Configuration { mappings, .. } = self
+            .storage
+            .text_search_object(slot)
+            .definition_for(self.txid)
+        else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid text-search configuration catalog entry"
+            ));
+        };
+        let token_index = usize::from(token_type.checked_sub(1).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid text-search parser token type"
+            )
+        })?);
+        if token_index >= super::super::storage::TEXT_SEARCH_TOKEN_TYPES {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "invalid text-search parser token type"
+            ));
+        }
+        for dictionary_oid in mappings.dictionaries[token_index]
+            .iter()
+            .take(usize::from(mappings.counts[token_index]))
+        {
+            let dictionary_slot = self
+                .storage
+                .text_search_slot_by_oid(
+                    super::ast::TextSearchObjectKind::Dictionary,
+                    *dictionary_oid,
+                    self.txid,
+                )
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "text-search configuration references a missing dictionary"
+                    )
+                })?;
+            let super::super::storage::TextSearchDefinition::Dictionary { behavior, .. } = self
+                .storage
+                .text_search_object(dictionary_slot)
+                .definition_for(self.txid)
+            else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "invalid text-search dictionary catalog entry"
+                ));
+            };
+            match behavior {
+                super::super::storage::TextSearchDictionaryBehavior::Simple { accept: false } => {}
+                super::super::storage::TextSearchDictionaryBehavior::Simple { accept: true } => {
+                    return Ok(
+                        match super::full_text::normalize_token(
+                            token,
+                            super::full_text::TextSearchConfig::Simple,
+                            arena,
+                        )? {
+                            Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
+                            None => super::full_text::TextSearchLexeme::StopWord,
+                        },
+                    );
+                }
+                super::super::storage::TextSearchDictionaryBehavior::EnglishStem => {
+                    return Ok(
+                        match super::full_text::normalize_token(
+                            token,
+                            super::full_text::TextSearchConfig::English,
+                            arena,
+                        )? {
+                            Some(lexeme) => super::full_text::TextSearchLexeme::Lexeme(lexeme),
+                            None => super::full_text::TextSearchLexeme::StopWord,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(super::full_text::TextSearchLexeme::Unmapped)
+    }
+
     fn has_operator_candidate(&self, name: &str) -> bool {
         self.storage
             .operators_visible_to(self.txid)

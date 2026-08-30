@@ -267,6 +267,12 @@ pub(crate) enum DdlUndo {
         prior: Option<crate::storage::PendingConversionDefinition>,
     },
     ConversionDropped(u32),
+    TextSearchCreated(u32),
+    TextSearchAltered {
+        slot: u32,
+        prior: Option<crate::storage::PendingTextSearchDefinition>,
+    },
+    TextSearchDropped(u32),
     EventTriggerCreated(u32),
     EventTriggerAltered {
         slot: u32,

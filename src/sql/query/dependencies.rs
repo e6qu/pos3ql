@@ -2059,6 +2059,11 @@ fn collect_expression<'a>(
     {
         collect_sequence(sequence_name, storage, txid, path, dependencies)?;
     }
+    if let Expr::Call { name, args, .. } = expression
+        && let Some(configuration_name) = text_search_config_literal(name, args)
+    {
+        collect_text_search_configuration(configuration_name, storage, txid, dependencies)?;
+    }
     let mut child = |expression| {
         collect_expression(
             expression,
@@ -2314,6 +2319,61 @@ fn regclass_literal<'a>(expression: &'a Expr<'a>) -> Option<&'a str> {
         Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => regclass_literal(operand),
         _ => None,
     }
+}
+
+fn text_search_config_literal<'a>(name: &str, args: &'a [&Expr<'a>]) -> Option<&'a str> {
+    let explicit = match name {
+        "to_tsvector"
+        | "to_tsquery"
+        | "plainto_tsquery"
+        | "phraseto_tsquery"
+        | "websearch_to_tsquery" => args.len() == 2,
+        "json_to_tsvector" | "jsonb_to_tsvector" => args.len() == 3,
+        "ts_headline" => matches!(args.len(), 3 | 4),
+        _ => false,
+    };
+    explicit
+        .then(|| args.first().copied())
+        .flatten()
+        .and_then(regclass_literal)
+}
+
+fn collect_text_search_configuration(
+    configuration_name: &str,
+    storage: &Storage,
+    txid: u32,
+    dependencies: &mut StoredQueryDependencies,
+) -> Result<(), SqlError> {
+    let (schema, name) = configuration_name
+        .rsplit_once('.')
+        .map_or((None, configuration_name), |(schema, name)| {
+            (Some(schema), name)
+        });
+    let slot = storage
+        .text_search_slot_on_path(
+            crate::sql::ast::TextSearchObjectKind::Configuration,
+            schema,
+            name,
+            txid,
+        )
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "text search configuration \"{}\" does not exist",
+                configuration_name
+            )
+        })?;
+    let definition = storage.text_search_object(slot).definition_for(txid);
+    dependencies.push(StoredQueryDependency {
+        class: DependencyClass::TextSearchConfiguration,
+        slot: slot as u16,
+        identity: StoredDependencyIdentity::Name,
+        referenced_columns: 0,
+        schema: definition.schema(),
+        name: definition.name(),
+        referenced_schema: SqlName::parse(schema.unwrap_or(""))?,
+        referenced_name: SqlName::parse(name)?,
+    })
 }
 
 fn collect_sequence(

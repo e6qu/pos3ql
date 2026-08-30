@@ -18,8 +18,9 @@ use crate::sql::ast::{
     AlterTypeAction, BtreeStrategy, CastContext, CastMethod, ConstraintMode, ConstraintTiming,
     ConstraintValidation, CreateCast, CreateDomain, CreateEventTrigger, CreateOperator,
     CreateOperatorClass, CreateRoutine, CreateRule, CreateSchemaElement, CreateStatistics,
-    CreateTrigger, DomainCheck, EventTriggerEvent, ExclusionOperator, Expr,
-    ExtensionMemberIdentity, ExtensionRelationKind, IndexAccessMethod, IndexBuildMode,
+    CreateTextSearchConfiguration, CreateTextSearchDictionary, CreateTextSearchParser,
+    CreateTextSearchTemplate, CreateTrigger, DomainCheck, EventTriggerEvent, ExclusionOperator,
+    Expr, ExtensionMemberIdentity, ExtensionRelationKind, IndexAccessMethod, IndexBuildMode,
     IndexStorageOptionNames, IndexStorageOptions, IndexTargetScope, OperatorClassMember,
     OperatorFamilyMember, OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands,
     PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression,
@@ -29,7 +30,8 @@ use crate::sql::ast::{
     StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName,
     StatisticsTarget, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
     SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
-    SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions, TriggerEvent,
+    SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions,
+    TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption, TriggerEvent,
     TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables, ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
@@ -889,6 +891,152 @@ impl<'a> Parser<'a> {
         }))
     }
 
+    pub(super) fn text_search_options(&mut self) -> Result<&'a [TextSearchOption<'a>], ParseError> {
+        let mut options = [TextSearchOption {
+            name: "",
+            value: "",
+        }; 32];
+        let mut count = 0usize;
+        loop {
+            if count == options.len() {
+                return Err(self.err_here("too many text search options"));
+            }
+            let name = self.col_ident("text search option name")?;
+            self.expect_op("=")?;
+            let value = self.database_option_value("text search option value is required")?;
+            if options[..count]
+                .iter()
+                .any(|option| option.name.eq_ignore_ascii_case(name))
+            {
+                return Err(self.err_here("duplicate text search option"));
+            }
+            options[count] = TextSearchOption { name, value };
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.arena_slice(&options[..count])
+    }
+
+    fn create_text_search(&mut self) -> Result<Stmt<'a>, ParseError> {
+        if self.eat_ident("parser")? {
+            let name = self.any_qual_name("text search parser name")?;
+            self.expect_op("(")?;
+            let mut start = None;
+            let mut gettoken = None;
+            let mut end = None;
+            let mut headline = None;
+            let mut lextypes = None;
+            loop {
+                let parameter = self.any_ident("text search parser parameter")?;
+                self.expect_op("=")?;
+                let routine = self.any_qual_name("text search parser routine")?;
+                let destination = if parameter.eq_ignore_ascii_case("start") {
+                    &mut start
+                } else if parameter.eq_ignore_ascii_case("gettoken") {
+                    &mut gettoken
+                } else if parameter.eq_ignore_ascii_case("end") {
+                    &mut end
+                } else if parameter.eq_ignore_ascii_case("headline") {
+                    &mut headline
+                } else if parameter.eq_ignore_ascii_case("lextypes") {
+                    &mut lextypes
+                } else {
+                    return Err(self.err_here("unrecognized text search parser parameter"));
+                };
+                if destination.replace(routine).is_some() {
+                    return Err(self.err_here("duplicate text search parser parameter"));
+                }
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            return Ok(Stmt::CreateTextSearchParser(CreateTextSearchParser {
+                name,
+                start: start.ok_or_else(|| self.err_here("START is required"))?,
+                gettoken: gettoken.ok_or_else(|| self.err_here("GETTOKEN is required"))?,
+                end: end.ok_or_else(|| self.err_here("END is required"))?,
+                headline,
+                lextypes: lextypes.ok_or_else(|| self.err_here("LEXTYPES is required"))?,
+            }));
+        }
+        if self.eat_ident("template")? {
+            let name = self.any_qual_name("text search template name")?;
+            self.expect_op("(")?;
+            let mut init = None;
+            let mut lexize = None;
+            loop {
+                let parameter = self.any_ident("text search template parameter")?;
+                self.expect_op("=")?;
+                let routine = self.any_qual_name("text search template routine")?;
+                if parameter.eq_ignore_ascii_case("init") {
+                    if init.replace(routine).is_some() {
+                        return Err(self.err_here("duplicate INIT parameter"));
+                    }
+                } else if parameter.eq_ignore_ascii_case("lexize") {
+                    if lexize.replace(routine).is_some() {
+                        return Err(self.err_here("duplicate LEXIZE parameter"));
+                    }
+                } else {
+                    return Err(self.err_here("unrecognized text search template parameter"));
+                }
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            return Ok(Stmt::CreateTextSearchTemplate(CreateTextSearchTemplate {
+                name,
+                init,
+                lexize: lexize.ok_or_else(|| self.err_here("LEXIZE is required"))?,
+            }));
+        }
+        if self.eat_ident("dictionary")? {
+            let name = self.any_qual_name("text search dictionary name")?;
+            self.expect_op("(")?;
+            self.expect_ident("template")?;
+            self.expect_op("=")?;
+            let template = self.any_qual_name("text search template name")?;
+            let options = if self.eat_op(",")? {
+                self.text_search_options()?
+            } else {
+                &[]
+            };
+            self.expect_op(")")?;
+            return Ok(Stmt::CreateTextSearchDictionary(
+                CreateTextSearchDictionary {
+                    name,
+                    template,
+                    options,
+                },
+            ));
+        }
+        if self.eat_ident("configuration")? {
+            let name = self.any_qual_name("text search configuration name")?;
+            self.expect_op("(")?;
+            let source = if self.eat_ident("parser")? {
+                self.expect_op("=")?;
+                TextSearchConfigurationSource::Parser(
+                    self.any_qual_name("text search parser name")?,
+                )
+            } else if self.eat_ident("copy")? {
+                self.expect_op("=")?;
+                TextSearchConfigurationSource::Copy(
+                    self.any_qual_name("text search configuration name")?,
+                )
+            } else {
+                return Err(self.err_here("expected PARSER or COPY"));
+            };
+            self.expect_op(")")?;
+            return Ok(Stmt::CreateTextSearchConfiguration(
+                CreateTextSearchConfiguration { name, source },
+            ));
+        }
+        Err(self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION"))
+    }
+
     /// Dispatches CREATE: `[OR REPLACE] VIEW`, `TABLE`, `INDEX` or `SCHEMA`
     /// ("create" consumed here).
     pub(super) fn create(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -954,6 +1102,10 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("collation")? {
             return self.create_collation();
+        }
+        if self.eat_ident("text")? {
+            self.expect_ident("search")?;
+            return self.create_text_search();
         }
         if self.eat_ident("conversion")? {
             return self.create_conversion(false);
@@ -5270,6 +5422,41 @@ impl<'a> Parser<'a> {
                 false
             };
             return Ok(Stmt::DropCollation {
+                name,
+                if_exists,
+                cascade,
+            });
+        }
+        if self.eat_ident("text")? {
+            self.expect_ident("search")?;
+            let kind = if self.eat_ident("parser")? {
+                TextSearchObjectKind::Parser
+            } else if self.eat_ident("template")? {
+                TextSearchObjectKind::Template
+            } else if self.eat_ident("dictionary")? {
+                TextSearchObjectKind::Dictionary
+            } else if self.eat_ident("configuration")? {
+                TextSearchObjectKind::Configuration
+            } else {
+                return Err(
+                    self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION")
+                );
+            };
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let name = self.any_qual_name(kind.noun())?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropTextSearch {
+                kind,
                 name,
                 if_exists,
                 cascade,

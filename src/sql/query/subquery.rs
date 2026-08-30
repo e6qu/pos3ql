@@ -2010,7 +2010,9 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         | ColType::Regoperator
         | ColType::Regclass
         | ColType::Regnamespace
-        | ColType::Regrole => Datum::RegObject {
+        | ColType::Regrole
+        | ColType::Regconfig
+        | ColType::Regdictionary => Datum::RegObject {
             type_oid: ct.oid(),
             referenced_oid: 0,
             name: "-",
@@ -2031,6 +2033,8 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
             text: "null",
             jsonb: true,
         },
+        ColType::TsVector => Datum::TsVector(crate::sql::full_text::restore_vector("")),
+        ColType::TsQuery => Datum::TsQuery(crate::sql::full_text::restore_query("")),
         ColType::Array(element) => Datum::Array {
             element,
             raw: crate::sql::array::EMPTY,

@@ -4911,6 +4911,85 @@ fn rewrite_stored_collation<'a>(
     ))
 }
 
+fn text_search_configuration_argument<'a>(
+    function: &str,
+    args: &'a [&'a Expr<'a>],
+) -> Option<&'a str> {
+    let explicit = match function {
+        "to_tsvector"
+        | "to_tsquery"
+        | "plainto_tsquery"
+        | "phraseto_tsquery"
+        | "websearch_to_tsquery" => args.len() == 2,
+        "json_to_tsvector" | "jsonb_to_tsvector" => args.len() == 3,
+        "ts_headline" => matches!(args.len(), 3 | 4),
+        _ => false,
+    };
+    fn literal<'a>(expression: &'a Expr<'a>) -> Option<&'a str> {
+        match expression {
+            Expr::Str(value) => Some(value),
+            Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => literal(operand),
+            _ => None,
+        }
+    }
+    explicit
+        .then(|| args.first().copied())
+        .flatten()
+        .and_then(literal)
+}
+
+fn rewrite_stored_text_search_arguments<'a>(
+    function: &str,
+    args: &'a [&'a Expr<'a>],
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    let Some(written) = text_search_configuration_argument(function, args) else {
+        return Ok(args);
+    };
+    let Some(dependencies) = context.dependencies else {
+        return Ok(args);
+    };
+    let (referenced_schema, referenced_name) = written.split_once('.').unwrap_or(("", written));
+    let Some(dependency) = dependencies.entries().iter().find(|dependency| {
+        dependency.class == crate::storage::DependencyClass::TextSearchConfiguration
+            && dependency.referenced_schema.as_str() == referenced_schema
+            && dependency.referenced_name.as_str() == referenced_name
+    }) else {
+        return Ok(args);
+    };
+    let definition = context
+        .storage
+        .text_search_objects_visible_to(context.txid)
+        .find_map(|(slot, definition)| (slot == dependency.slot as usize).then_some(definition))
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "stored text search configuration dependency \"{}\" does not exist",
+                written
+            )
+        })?;
+    let qualified = crate::stack_format!(
+        128,
+        "{}.{}",
+        definition.schema().as_str(),
+        definition.name().as_str()
+    );
+    if qualified.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "text search configuration name is too long"
+        ));
+    }
+    let rendered = arena
+        .alloc_str(qualified.as_str())
+        .map_err(|_| arena_full())?;
+    let first = arena.alloc(Expr::Str(rendered)).map_err(|_| arena_full())?;
+    let rewritten = arena.alloc_slice_copy(args).map_err(|_| arena_full())?;
+    rewritten[0] = first;
+    Ok(rewritten)
+}
+
 fn rewrite_stored_routine_name<'a>(
     name: &'a str,
     args: &[&Expr<'a>],
@@ -5090,9 +5169,11 @@ fn subst_expr<'a>(
                 None => None,
                 Some(f) => Some(subst_expr(f, context, arena)?),
             };
+            let args = subst_expr_slice(args, context, arena)?;
+            let args = rewrite_stored_text_search_arguments(name, args, context, arena)?;
             Expr::Call {
                 name,
-                args: subst_expr_slice(args, context, arena)?,
+                args,
                 argument_names,
                 variadic: *variadic,
                 star: *star,

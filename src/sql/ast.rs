@@ -540,6 +540,21 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
+    CreateTextSearchParser(CreateTextSearchParser<'a>),
+    CreateTextSearchTemplate(CreateTextSearchTemplate<'a>),
+    CreateTextSearchDictionary(CreateTextSearchDictionary<'a>),
+    CreateTextSearchConfiguration(CreateTextSearchConfiguration<'a>),
+    AlterTextSearch {
+        kind: TextSearchObjectKind,
+        name: QualName<'a>,
+        action: AlterTextSearchAction<'a>,
+    },
+    DropTextSearch {
+        kind: TextSearchObjectKind,
+        name: QualName<'a>,
+        if_exists: bool,
+        cascade: bool,
+    },
     /// CREATE PUBLICATION name FOR { ALL TABLES | TABLE table [(column [, ...])] [, ...] }
     /// [WITH (publish = 'insert, update, delete, truncate')].
     CreatePublication {
@@ -1096,6 +1111,94 @@ pub enum AlterConversionAction<'a> {
     Rename(&'a str),
     Owner(&'a str),
     SetSchema(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextSearchObjectKind {
+    Parser,
+    Template,
+    Dictionary,
+    Configuration,
+}
+
+impl TextSearchObjectKind {
+    pub const fn noun(self) -> &'static str {
+        match self {
+            Self::Parser => "text search parser",
+            Self::Template => "text search template",
+            Self::Dictionary => "text search dictionary",
+            Self::Configuration => "text search configuration",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTextSearchParser<'a> {
+    pub name: QualName<'a>,
+    pub start: QualName<'a>,
+    pub gettoken: QualName<'a>,
+    pub end: QualName<'a>,
+    pub headline: Option<QualName<'a>>,
+    pub lextypes: QualName<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTextSearchTemplate<'a> {
+    pub name: QualName<'a>,
+    pub init: Option<QualName<'a>>,
+    pub lexize: QualName<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextSearchOption<'a> {
+    pub name: &'a str,
+    pub value: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTextSearchDictionary<'a> {
+    pub name: QualName<'a>,
+    pub template: QualName<'a>,
+    pub options: &'a [TextSearchOption<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextSearchConfigurationSource<'a> {
+    Parser(QualName<'a>),
+    Copy(QualName<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTextSearchConfiguration<'a> {
+    pub name: QualName<'a>,
+    pub source: TextSearchConfigurationSource<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextSearchMappingAction<'a> {
+    Set {
+        replace_existing: bool,
+        token_types: &'a [&'a str],
+        dictionaries: &'a [QualName<'a>],
+    },
+    Replace {
+        token_types: Option<&'a [&'a str]>,
+        old: QualName<'a>,
+        new: QualName<'a>,
+    },
+    Drop {
+        if_exists: bool,
+        token_types: &'a [&'a str],
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterTextSearchAction<'a> {
+    Rename(&'a str),
+    Owner(&'a str),
+    SetSchema(&'a str),
+    DictionaryOptions(&'a [TextSearchOption<'a>]),
+    ConfigurationMapping(TextSearchMappingAction<'a>),
 }
 
 /// A parsed named-composite attribute. Keeping the field name and type spelling
@@ -2112,6 +2215,10 @@ pub enum CommentTarget<'a> {
     Database(&'a str),
     Collation(QualName<'a>),
     Conversion(QualName<'a>),
+    TextSearch {
+        kind: TextSearchObjectKind,
+        name: QualName<'a>,
+    },
     EventTrigger(&'a str),
     /// EXTENSION name.
     Extension(&'a str),
@@ -4734,6 +4841,8 @@ pub enum UnaryOp {
     SquareRoot,
     CubeRoot,
     AbsoluteValue,
+    /// `!! tsquery`, the text-search NOT operator.
+    TextSearchNot,
 }
 
 impl UnaryOp {
@@ -4764,6 +4873,10 @@ pub enum BinaryOp {
     And,
     Or,
     Concat,
+    /// `@@` and its PostgreSQL-compatible `@@@` alias.
+    TextSearchMatch,
+    /// `<->` between two tsquery values.
+    TextSearchPhrase,
     /// `json -> key/index` — returns json/jsonb.
     JsonGet,
     /// `json ->> key/index` — returns text.
@@ -4823,6 +4936,8 @@ impl BinaryOp {
             b">" => Self::Gt,
             b">=" => Self::GtEq,
             b"||" => Self::Concat,
+            b"@@" | b"@@@" => Self::TextSearchMatch,
+            b"<->" => Self::TextSearchPhrase,
             b"->" => Self::JsonGet,
             b"->>" => Self::JsonGetText,
             b"#>" => Self::JsonPath,
@@ -4863,6 +4978,8 @@ impl BinaryOp {
             Self::Gt => ">",
             Self::GtEq => ">=",
             Self::Concat => "||",
+            Self::TextSearchMatch => "@@",
+            Self::TextSearchPhrase => "<->",
             Self::JsonGet => "->",
             Self::JsonGetText => "->>",
             Self::JsonPath => "#>",
@@ -4898,11 +5015,13 @@ impl BinaryOp {
             Self::Eq | Self::NotEq | Self::Lt | Self::LtEq | Self::Gt | Self::GtEq => 4,
             // Containment/overlap/adjacency operators bind like comparisons.
             Self::Contains | Self::ContainedBy | Self::Overlaps => 4,
+            Self::TextSearchMatch => 4,
             Self::NotRightOf | Self::NotLeftOf | Self::Adjacent => 4,
             Self::NetContainedEq | Self::NetContainsEq => 4,
             Self::Like | Self::ILike => 4,
             Self::JsonExists | Self::JsonExistsAny | Self::JsonExistsAll => 4,
             Self::Concat => 5,
+            Self::TextSearchPhrase => 5,
             // Bitwise OR/XOR/AND and shifts sit between comparison and addition,
             // matching PostgreSQL (they are non-standard, mid-precedence).
             Self::BitOr | Self::BitXor => 5,

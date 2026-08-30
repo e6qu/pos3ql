@@ -662,6 +662,14 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[11]);
             hasher.write(text.as_bytes());
         }
+        Datum::TsVector(text) => {
+            hasher.write(&[37]);
+            hasher.write(text.as_bytes());
+        }
+        Datum::TsQuery(text) => {
+            hasher.write(&[38]);
+            crate::sql::full_text::emit_query_hash(text.as_str(), |bytes| hasher.write(bytes));
+        }
         // Subtle-canonical or non-comparable types: one constant per type. Every
         // value collides, so the caller verifies each candidate — correct, just
         // not accelerated for these column types.
@@ -719,6 +727,12 @@ pub(crate) fn compare_datums_as(
     let ord = match (l, r) {
         (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
         (Datum::Text(a), Datum::Text(b)) => a.cmp(b),
+        (Datum::TsVector(a), Datum::TsVector(b)) => {
+            crate::sql::full_text::compare_vector(a.as_str(), b.as_str())
+        }
+        (Datum::TsQuery(a), Datum::TsQuery(b)) => {
+            crate::sql::full_text::compare_query(a.as_str(), b.as_str())
+        }
         (Datum::Bpchar(a), Datum::Bpchar(b)) => {
             a.trim_end_matches(' ').cmp(b.trim_end_matches(' '))
         }
@@ -1594,6 +1608,11 @@ pub(crate) fn unary<'a>(
             ..n
         })),
         (UnaryOp::Not, Datum::Bool(b)) => Ok(Datum::Bool(!b)),
+        (UnaryOp::TextSearchNot, Datum::TsQuery(query)) => {
+            crate::sql::full_text::not_query(query.as_str(), arena)
+                .map(crate::sql::full_text::restore_query)
+                .map(Datum::TsQuery)
+        }
         (UnaryOp::BitNot, Datum::Int2(x)) => Ok(Datum::Int2(!x)),
         (UnaryOp::BitNot, Datum::Int4(x)) => Ok(Datum::Int4(!x)),
         (UnaryOp::BitNot, Datum::Int8(x)) => Ok(Datum::Int8(!x)),
@@ -1605,6 +1624,7 @@ pub(crate) fn unary<'a>(
             _ => Ok(Datum::Null),
         },
         (UnaryOp::BitNot, other) => Err(type_mismatch("~", &other)),
+        (UnaryOp::TextSearchNot, other) => Err(type_mismatch("!!", &other)),
         // The prefix arithmetic operators are evaluated through the functions
         // they compute, so a datum never reaches here wearing one.
         (UnaryOp::SquareRoot | UnaryOp::CubeRoot | UnaryOp::AbsoluteValue, _) => {
@@ -1892,6 +1912,16 @@ pub(crate) fn binary<'a>(
     match operator {
         And | Or => logic(operator, l, r),
         Concat => match (l, r) {
+            (Datum::TsVector(left), Datum::TsVector(right)) => {
+                crate::sql::full_text::concat_vectors(left.as_str(), right.as_str(), arena)
+                    .map(crate::sql::full_text::restore_vector)
+                    .map(Datum::TsVector)
+            }
+            (Datum::TsQuery(left), Datum::TsQuery(right)) => {
+                crate::sql::full_text::concat_queries(left.as_str(), right.as_str(), arena)
+                    .map(crate::sql::full_text::restore_query)
+                    .map(Datum::TsQuery)
+            }
             (Datum::Bit { .. }, _) | (_, Datum::Bit { .. }) => bit_concat(l, r, arena),
             // jsonb || jsonb: object merge (right wins), array concat, else
             // wrap-and-concat. (Plain json has no `||` operator in PostgreSQL,
@@ -1901,6 +1931,49 @@ pub(crate) fn binary<'a>(
                 jsonb_concat(l, r, arena)
             }
             _ => concat(l, r, l_unknown, r_unknown, arena),
+        },
+        TextSearchMatch => {
+            if l.is_null() || r.is_null() {
+                return Ok(Datum::Null);
+            }
+            let (vector, query) = match (l, r) {
+                (Datum::TsVector(vector), Datum::TsQuery(query))
+                | (Datum::TsQuery(query), Datum::TsVector(vector)) => {
+                    (vector.as_str(), query.as_str())
+                }
+                (Datum::Text(document), Datum::TsQuery(query))
+                | (Datum::TsQuery(query), Datum::Text(document)) => {
+                    let vector = crate::sql::full_text::to_tsvector(
+                        crate::sql::full_text::TextSearchConfig::English,
+                        document,
+                        arena,
+                    )?;
+                    (vector, query.as_str())
+                }
+                (left, right) => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "operator does not exist: {} @@ {}",
+                        type_name_of(&left),
+                        type_name_of(&right)
+                    ));
+                }
+            };
+            crate::sql::full_text::matches(vector, query, arena).map(Datum::Bool)
+        }
+        TextSearchPhrase => match (l, r) {
+            (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
+            (Datum::TsQuery(left), Datum::TsQuery(right)) => {
+                crate::sql::full_text::phrase_queries(left.as_str(), right.as_str(), arena)
+                    .map(crate::sql::full_text::restore_query)
+                    .map(Datum::TsQuery)
+            }
+            (left, right) => Err(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "operator does not exist: {} <-> {}",
+                type_name_of(&left),
+                type_name_of(&right)
+            )),
         },
         Eq | NotEq | Lt | LtEq | Gt | GtEq
             if matches!(l, Datum::Array { .. }) || matches!(r, Datum::Array { .. }) =>
@@ -1969,6 +2042,33 @@ pub(crate) fn binary<'a>(
             if matches!(l, Datum::Json { .. }) || matches!(r, Datum::Json { .. }) =>
         {
             jsonb_contains(operator, l, r, l_unknown, r_unknown, arena)
+        }
+        Overlaps if matches!(l, Datum::TsQuery(_)) || matches!(r, Datum::TsQuery(_)) => {
+            match (l, r) {
+                (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
+                (Datum::TsQuery(left), Datum::TsQuery(right)) => {
+                    crate::sql::full_text::and_queries(left.as_str(), right.as_str(), arena)
+                        .map(crate::sql::full_text::restore_query)
+                        .map(Datum::TsQuery)
+                }
+                _ => unreachable!("tsquery overlap guard"),
+            }
+        }
+        Contains | ContainedBy
+            if matches!(l, Datum::TsQuery(_)) || matches!(r, Datum::TsQuery(_)) =>
+        {
+            match (l, r) {
+                (Datum::Null, _) | (_, Datum::Null) => Ok(Datum::Null),
+                (Datum::TsQuery(left), Datum::TsQuery(right)) => {
+                    let contains = if operator == Contains {
+                        crate::sql::full_text::query_contains(left.as_str(), right.as_str(), arena)?
+                    } else {
+                        crate::sql::full_text::query_contains(right.as_str(), left.as_str(), arena)?
+                    };
+                    Ok(Datum::Bool(contains))
+                }
+                _ => unreachable!("tsquery containment guard"),
+            }
         }
         Contains | ContainedBy | Overlaps | NotLeftOf | NotRightOf | Adjacent => {
             range_op(operator, l, r, arena)
@@ -2055,6 +2155,12 @@ mod hash_tests {
         // A blank-padded char equals its stripped form and the same text.
         assert_eq!(h(Datum::Bpchar("a")), h(Datum::Bpchar("a   ")));
         assert_eq!(h(Datum::Text("a")), h(Datum::Bpchar("a  ")));
+        assert_eq!(
+            h(Datum::TsQuery(crate::sql::full_text::restore_query("'a'"))),
+            h(Datum::TsQuery(crate::sql::full_text::restore_query(
+                "'a':*AB"
+            ))),
+        );
         // Distinct values differ (not required for correctness, but the point
         // of the index is that the common types separate).
         assert_ne!(h(Datum::Int4(5)), h(Datum::Int4(6)));
@@ -2065,6 +2171,10 @@ mod hash_tests {
             (Datum::Float8(0.0), Datum::Float8(-0.0)),
             (Datum::Bpchar("a"), Datum::Bpchar("a  ")),
             (Datum::Text("a"), Datum::Bpchar("a ")),
+            (
+                Datum::TsQuery(crate::sql::full_text::restore_query("'a'")),
+                Datum::TsQuery(crate::sql::full_text::restore_query("'a':*AB")),
+            ),
         ] {
             assert!(compare_datums(&a, &b).unwrap().is_eq(), "{a:?} == {b:?}");
             assert_eq!(h(a), h(b));

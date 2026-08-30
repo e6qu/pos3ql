@@ -51,6 +51,8 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Json { text, .. }
             | Datum::Range { text, .. }
             | Datum::Multirange { text, .. } => 4 + text.len(),
+            Datum::TsVector(text) => 4 + text.len(),
+            Datum::TsQuery(text) => 4 + text.len(),
             // 4-byte payload length, 1 flag byte (varying), then the bit chars.
             Datum::Bit { bits, .. } => 5 + bits.len(),
             Datum::Array { raw, .. } => 5 + raw.len(),
@@ -154,6 +156,16 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
             Datum::Json { text, .. }
             | Datum::Range { text, .. }
             | Datum::Multirange { text, .. } => {
+                rest[..4].copy_from_slice(&(text.len() as u32).to_le_bytes());
+                rest[4..4 + text.len()].copy_from_slice(text.as_bytes());
+                take = 4 + text.len();
+            }
+            Datum::TsVector(text) => {
+                rest[..4].copy_from_slice(&(text.len() as u32).to_le_bytes());
+                rest[4..4 + text.len()].copy_from_slice(text.as_bytes());
+                take = 4 + text.len();
+            }
+            Datum::TsQuery(text) => {
                 rest[..4].copy_from_slice(&(text.len() as u32).to_le_bytes());
                 rest[4..4 + text.len()].copy_from_slice(text.as_bytes());
                 take = 4 + text.len();
@@ -310,6 +322,8 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Bpchar
         | ColType::Json
         | ColType::Jsonb
+        | ColType::TsVector
+        | ColType::TsQuery
         | ColType::Range(_)
         | ColType::Multirange(_)
         | ColType::Bytea => {
@@ -326,7 +340,9 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::Regoperator
         | ColType::Regclass
         | ColType::Regnamespace
-        | ColType::Regrole => {
+        | ColType::Regrole
+        | ColType::Regconfig
+        | ColType::Regdictionary => {
             let length = bytes.get(8..12).ok_or_else(corrupt)?;
             Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
@@ -463,7 +479,9 @@ pub(crate) fn decode<'a>(
             | ColType::Regoperator
             | ColType::Regclass
             | ColType::Regnamespace
-            | ColType::Regrole) => {
+            | ColType::Regrole
+            | ColType::Regconfig
+            | ColType::Regdictionary) => {
                 let type_oid = i32::from_le_bytes(
                     bytes
                         .get(at..at + 4)
@@ -578,6 +596,19 @@ pub(crate) fn decode<'a>(
                 out[i] = Datum::Json {
                     text: s,
                     jsonb: matches!(schema[i], ColType::Jsonb),
+                };
+            }
+            ColType::TsVector | ColType::TsQuery => {
+                let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                at += 4;
+                let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
+                at += len;
+                let text = core::str::from_utf8(raw).map_err(|_| corrupt())?;
+                out[i] = if matches!(schema[i], ColType::TsVector) {
+                    Datum::TsVector(crate::sql::full_text::restore_vector(text))
+                } else {
+                    Datum::TsQuery(crate::sql::full_text::restore_query(text))
                 };
             }
             ColType::Range(kind) => {

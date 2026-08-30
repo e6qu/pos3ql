@@ -188,6 +188,8 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Timetz(..) => 12,
         Datum::Interval(_) | Datum::Uuid(_) => 16,
         Datum::Text(text) | Datum::Bpchar(text) => text.len(),
+        Datum::TsVector(text) => crate::sql::full_text::emit_vector_binary(text.as_str(), |_| {}),
+        Datum::TsQuery(text) => crate::sql::full_text::emit_query_binary(text.as_str(), |_| {}),
         Datum::Bytea(bytes) => bytes.len(),
         Datum::Json { text, jsonb } => text.len().saturating_add(usize::from(*jsonb)),
         Datum::Range { text, .. } | Datum::Multirange { text, .. } => text.len(),
@@ -1121,6 +1123,20 @@ impl<'b> Responder<'b> {
                 Datum::Text(s) | Datum::Bpchar(s) => {
                     m.i32(s.len() as i32);
                     m.bytes(s.as_bytes());
+                }
+                Datum::TsVector(text) => {
+                    m.field(|m| {
+                        crate::sql::full_text::emit_vector_binary(text.as_str(), |bytes| {
+                            m.bytes(bytes);
+                        });
+                    });
+                }
+                Datum::TsQuery(text) => {
+                    m.field(|m| {
+                        crate::sql::full_text::emit_query_binary(text.as_str(), |bytes| {
+                            m.bytes(bytes);
+                        });
+                    });
                 }
                 Datum::Bytea(b) => {
                     m.i32(b.len() as i32);

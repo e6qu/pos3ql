@@ -3057,6 +3057,203 @@ impl Checkpointer {
                             ))
                         })?;
                 }
+                Some("tsobj") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let slot: usize = parse_field(words.next(), "text-search slot")?;
+                    let created_at = parse_field(words.next(), "text-search created_at")?;
+                    let kind = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("text-search kind missing"))?;
+                    let schema =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("text-search schema missing"),
+                        )?)?)?;
+                    let name =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("text-search name missing"),
+                        )?)?)?;
+                    let oid = parse_field(words.next(), "text-search OID")?;
+                    if oid <= 0 {
+                        return Err(CheckpointSetupError::Corrupt("invalid text-search OID"));
+                    }
+                    let behavior = |word: Option<&str>| -> Result<
+                        crate::storage::TextSearchDictionaryBehavior,
+                        CheckpointSetupError,
+                    > {
+                        Ok(
+                            match parse_field::<u8>(word, "text-search dictionary behavior")? {
+                                0 => crate::storage::TextSearchDictionaryBehavior::Simple {
+                                    accept: true,
+                                },
+                                1 => crate::storage::TextSearchDictionaryBehavior::Simple {
+                                    accept: false,
+                                },
+                                2 => crate::storage::TextSearchDictionaryBehavior::EnglishStem,
+                                _ => {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "invalid text-search dictionary behavior",
+                                    ));
+                                }
+                            },
+                        )
+                    };
+                    let definition = match kind {
+                        "p" => crate::storage::TextSearchDefinition::Parser {
+                            schema,
+                            name,
+                            oid,
+                            start: parse_field(words.next(), "text-search parser start")?,
+                            gettoken: parse_field(words.next(), "text-search parser token")?,
+                            end: parse_field(words.next(), "text-search parser end")?,
+                            headline: parse_field(words.next(), "text-search parser headline")?,
+                            lextypes: parse_field(words.next(), "text-search parser lextypes")?,
+                        },
+                        "t" => crate::storage::TextSearchDefinition::Template {
+                            schema,
+                            name,
+                            oid,
+                            init: parse_field(words.next(), "text-search template init")?,
+                            lexize: parse_field(words.next(), "text-search template lexize")?,
+                            behavior: behavior(words.next())?,
+                        },
+                        "d" => {
+                            let owner = parse_field(words.next(), "text-search dictionary owner")?;
+                            if storage.role_slot_by_oid(owner, 0).is_none() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "text-search dictionary owner missing",
+                                ));
+                            }
+                            let template =
+                                parse_field(words.next(), "text-search dictionary template")?;
+                            let decoded = decode_hex_name(words.next().ok_or(
+                                CheckpointSetupError::Corrupt(
+                                    "text-search dictionary options missing",
+                                ),
+                            )?)?;
+                            let options = StackStr::<512>::from_str(&decoded);
+                            if options.is_truncated() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "text-search dictionary options too long",
+                                ));
+                            }
+                            crate::storage::TextSearchDefinition::Dictionary {
+                                schema,
+                                name,
+                                oid,
+                                owner,
+                                template,
+                                options,
+                                behavior: behavior(words.next())?,
+                            }
+                        }
+                        "c" => {
+                            let owner =
+                                parse_field(words.next(), "text-search configuration owner")?;
+                            if storage.role_slot_by_oid(owner, 0).is_none() {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "text-search configuration owner missing",
+                                ));
+                            }
+                            let parser =
+                                parse_field(words.next(), "text-search configuration parser")?;
+                            let mut mappings = crate::storage::TextSearchMappings::EMPTY;
+                            for token in 0..crate::storage::TEXT_SEARCH_TOKEN_TYPES {
+                                let count: usize =
+                                    parse_field(words.next(), "text-search mapping count")?;
+                                if count > crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN {
+                                    return Err(CheckpointSetupError::Corrupt(
+                                        "too many text-search mapping dictionaries",
+                                    ));
+                                }
+                                mappings.counts[token] = count as u8;
+                                for dictionary in &mut mappings.dictionaries[token][..count] {
+                                    *dictionary = parse_field(
+                                        words.next(),
+                                        "text-search mapping dictionary",
+                                    )?;
+                                    if *dictionary <= 0 {
+                                        return Err(CheckpointSetupError::Corrupt(
+                                            "invalid text-search mapping dictionary",
+                                        ));
+                                    }
+                                }
+                            }
+                            crate::storage::TextSearchDefinition::Configuration {
+                                schema,
+                                name,
+                                oid,
+                                owner,
+                                parser,
+                                mappings,
+                            }
+                        }
+                        _ => return Err(CheckpointSetupError::Corrupt("invalid text-search kind")),
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt("trailing text-search fields"));
+                    }
+                    match definition {
+                        crate::storage::TextSearchDefinition::Dictionary { template, .. } => {
+                            if storage
+                                .text_search_slot_by_oid(
+                                    crate::sql::ast::TextSearchObjectKind::Template,
+                                    template,
+                                    0,
+                                )
+                                .is_none()
+                            {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "text-search dictionary template missing",
+                                ));
+                            }
+                        }
+                        crate::storage::TextSearchDefinition::Configuration {
+                            parser,
+                            mappings,
+                            ..
+                        } => {
+                            if storage
+                                .text_search_slot_by_oid(
+                                    crate::sql::ast::TextSearchObjectKind::Parser,
+                                    parser,
+                                    0,
+                                )
+                                .is_none()
+                            {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "text-search configuration parser missing",
+                                ));
+                            }
+                            for token in 0..crate::storage::TEXT_SEARCH_TOKEN_TYPES {
+                                for dictionary in &mappings.dictionaries[token]
+                                    [..usize::from(mappings.counts[token])]
+                                {
+                                    if storage
+                                        .text_search_slot_by_oid(
+                                            crate::sql::ast::TextSearchObjectKind::Dictionary,
+                                            *dictionary,
+                                            0,
+                                        )
+                                        .is_none()
+                                    {
+                                        return Err(CheckpointSetupError::Corrupt(
+                                            "text-search mapping dictionary missing",
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    storage
+                        .replay_text_search_object(slot, created_at, definition)
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest text-search object rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
                 Some("coll") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let slot = parse_field(words.next(), "collation slot")?;
@@ -6665,6 +6862,106 @@ impl Checkpointer {
                 ),
             )?;
         }
+        for (slot, object) in storage.checkpoint_text_search_objects() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                object.database,
+            )?;
+            let definition = object.definition;
+            match definition {
+                crate::storage::TextSearchDefinition::Parser {
+                    schema,
+                    name,
+                    oid,
+                    start,
+                    gettoken,
+                    end,
+                    headline,
+                    lextypes,
+                } => write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "tsobj {} {} p {} {} {} {} {} {} {} {}",
+                        slot,
+                        object.created_at,
+                        ManifestName(schema.as_str()),
+                        ManifestName(name.as_str()),
+                        oid,
+                        start,
+                        gettoken,
+                        end,
+                        headline,
+                        lextypes,
+                    ),
+                )?,
+                crate::storage::TextSearchDefinition::Template {
+                    schema,
+                    name,
+                    oid,
+                    init,
+                    lexize,
+                    behavior,
+                } => write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "tsobj {} {} t {} {} {} {} {} {}",
+                        slot,
+                        object.created_at,
+                        ManifestName(schema.as_str()),
+                        ManifestName(name.as_str()),
+                        oid,
+                        init,
+                        lexize,
+                        text_search_behavior_code(behavior),
+                    ),
+                )?,
+                crate::storage::TextSearchDefinition::Dictionary {
+                    schema,
+                    name,
+                    oid,
+                    owner,
+                    template,
+                    options,
+                    behavior,
+                } => write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "tsobj {} {} d {} {} {} {} {} {} {}",
+                        slot,
+                        object.created_at,
+                        ManifestName(schema.as_str()),
+                        ManifestName(name.as_str()),
+                        oid,
+                        owner,
+                        template,
+                        ManifestName(options.as_str()),
+                        text_search_behavior_code(behavior),
+                    ),
+                )?,
+                crate::storage::TextSearchDefinition::Configuration {
+                    schema,
+                    name,
+                    oid,
+                    owner,
+                    parser,
+                    mappings,
+                } => write_manifest(
+                    &mut self.manifest_buf,
+                    format_args!(
+                        "tsobj {} {} c {} {} {} {} {}{}",
+                        slot,
+                        object.created_at,
+                        ManifestName(schema.as_str()),
+                        ManifestName(name.as_str()),
+                        oid,
+                        owner,
+                        parser,
+                        ManifestTextSearchMappings(&mappings),
+                    ),
+                )?,
+            }
+        }
         for (slot, conversion) in storage.checkpoint_conversions() {
             write_database_context(
                 &mut self.manifest_buf,
@@ -9736,6 +10033,29 @@ fn load_matview(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
 struct ManifestDependencies<'a>(&'a crate::storage::StoredQueryDependencies);
 
 struct ManifestName<'a>(&'a str);
+
+fn text_search_behavior_code(behavior: crate::storage::TextSearchDictionaryBehavior) -> u8 {
+    match behavior {
+        crate::storage::TextSearchDictionaryBehavior::Simple { accept: true } => 0,
+        crate::storage::TextSearchDictionaryBehavior::Simple { accept: false } => 1,
+        crate::storage::TextSearchDictionaryBehavior::EnglishStem => 2,
+    }
+}
+
+struct ManifestTextSearchMappings<'a>(&'a crate::storage::TextSearchMappings);
+
+impl core::fmt::Display for ManifestTextSearchMappings<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for token in 0..crate::storage::TEXT_SEARCH_TOKEN_TYPES {
+            let count = usize::from(self.0.counts[token]);
+            write!(output, " {count}")?;
+            for dictionary in &self.0.dictionaries[token][..count] {
+                write!(output, " {dictionary}")?;
+            }
+        }
+        Ok(())
+    }
+}
 
 impl core::fmt::Display for ManifestName<'_> {
     fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

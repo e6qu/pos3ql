@@ -46,6 +46,10 @@ pub(crate) const PG_OPCLASS_OID: i32 = 2616;
 pub(crate) const PG_OPERATOR_OID: i32 = 2617;
 pub(crate) const PG_OPFAMILY_OID: i32 = 2753;
 pub(crate) const PG_COLLATION_OID: i32 = 3456;
+pub(crate) const PG_TS_DICT_OID: i32 = 3600;
+pub(crate) const PG_TS_PARSER_OID: i32 = 3601;
+pub(crate) const PG_TS_CONFIG_OID: i32 = 3602;
+pub(crate) const PG_TS_TEMPLATE_OID: i32 = 3764;
 pub(crate) const PG_REWRITE_OID: i32 = 2618;
 pub(crate) const PG_TRIGGER_OID: i32 = 2620;
 pub(crate) const PG_TABLESPACE_OID: i32 = 1213;
@@ -161,6 +165,62 @@ const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
         argument_types: "",
         argument_count: 0,
         volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 3717,
+        name: "prsd_start",
+        result_oid: 2281,
+        argument_types: "2281 23",
+        argument_count: 2,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3718,
+        name: "prsd_nexttoken",
+        result_oid: 2281,
+        argument_types: "2281 2281 2281",
+        argument_count: 3,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3719,
+        name: "prsd_end",
+        result_oid: 2278,
+        argument_types: "2281",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3720,
+        name: "prsd_headline",
+        result_oid: 2281,
+        argument_types: "2281 2281 3615",
+        argument_count: 3,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3721,
+        name: "prsd_lextype",
+        result_oid: 2281,
+        argument_types: "2281",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3725,
+        name: "dsimple_init",
+        result_oid: 2281,
+        argument_types: "2281",
+        argument_count: 1,
+        volatility: "i",
+    },
+    IntrinsicRoutine {
+        oid: 3726,
+        name: "dsimple_lexize",
+        result_oid: 2281,
+        argument_types: "2281 2281 2281 2281",
+        argument_count: 4,
+        volatility: "i",
     },
     IntrinsicRoutine {
         oid: 4568,
@@ -1049,83 +1109,11 @@ pub fn synthesize<'a>(
         (false, "pg_opfamily") => pg_opfamily(storage, txid, arena),
         (false, "pg_amop") => pg_amop(storage, txid, arena),
         (false, "pg_amproc") => pg_amproc(storage, txid, arena),
-        (false, "pg_ts_parser") => finish(
-            def_of(
-                "pg_ts_parser",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("prsname", ColType::Name),
-                    ("prsnamespace", ColType::Int4),
-                    ("prsstart", ColType::Int4),
-                    ("prstoken", ColType::Int4),
-                    ("prsend", ColType::Int4),
-                    ("prsheadline", ColType::Int4),
-                    ("prslextype", ColType::Int4),
-                ],
-            ),
-            &[],
-            arena,
-        ),
-        (false, "pg_ts_template") => finish(
-            def_of(
-                "pg_ts_template",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("tmplname", ColType::Name),
-                    ("tmplnamespace", ColType::Int4),
-                    ("tmplinit", ColType::Int4),
-                    ("tmpllexize", ColType::Int4),
-                ],
-            ),
-            &[],
-            arena,
-        ),
-        (false, "pg_ts_dict") => finish(
-            def_of(
-                "pg_ts_dict",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("dictname", ColType::Name),
-                    ("dictnamespace", ColType::Int4),
-                    ("dictowner", ColType::Int4),
-                    ("dicttemplate", ColType::Int4),
-                    ("dictinitoption", ColType::Text),
-                ],
-            ),
-            &[],
-            arena,
-        ),
-        (false, "pg_ts_config") => finish(
-            def_of(
-                "pg_ts_config",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("cfgname", ColType::Name),
-                    ("cfgnamespace", ColType::Int4),
-                    ("cfgowner", ColType::Int4),
-                    ("cfgparser", ColType::Int4),
-                ],
-            ),
-            &[],
-            arena,
-        ),
-        (false, "pg_ts_config_map") => finish(
-            def_of(
-                "pg_ts_config_map",
-                &[
-                    ("mapcfg", ColType::Int4),
-                    ("maptokentype", ColType::Int4),
-                    ("mapseqno", ColType::Int4),
-                    ("mapdict", ColType::Int4),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_ts_parser") => pg_ts_parser(storage, txid, arena),
+        (false, "pg_ts_template") => pg_ts_template(storage, txid, arena),
+        (false, "pg_ts_dict") => pg_ts_dict(storage, txid, arena),
+        (false, "pg_ts_config") => pg_ts_config(storage, txid, arena),
+        (false, "pg_ts_config_map") => pg_ts_config_map(storage, txid, arena),
         (false, "pg_init_privs") => finish(
             def_of(
                 "pg_init_privs",
@@ -4145,6 +4133,37 @@ fn pg_description<'a>(
                 let Some(rule) = rule else { continue };
                 (rule.oid(), PG_REWRITE_OID)
             }
+            crate::storage::CommentClass::TextSearchParser
+            | crate::storage::CommentClass::TextSearchTemplate
+            | crate::storage::CommentClass::TextSearchDictionary
+            | crate::storage::CommentClass::TextSearchConfiguration => {
+                let (kind, classoid) = match class {
+                    crate::storage::CommentClass::TextSearchParser => (
+                        crate::sql::ast::TextSearchObjectKind::Parser,
+                        PG_TS_PARSER_OID,
+                    ),
+                    crate::storage::CommentClass::TextSearchTemplate => (
+                        crate::sql::ast::TextSearchObjectKind::Template,
+                        PG_TS_TEMPLATE_OID,
+                    ),
+                    crate::storage::CommentClass::TextSearchDictionary => (
+                        crate::sql::ast::TextSearchObjectKind::Dictionary,
+                        PG_TS_DICT_OID,
+                    ),
+                    crate::storage::CommentClass::TextSearchConfiguration => (
+                        crate::sql::ast::TextSearchObjectKind::Configuration,
+                        PG_TS_CONFIG_OID,
+                    ),
+                    _ => unreachable!("text-search comment class guard"),
+                };
+                let Some(slot) = storage.text_search_slot(kind, schema, name, txid) else {
+                    continue;
+                };
+                (
+                    storage.text_search_object(slot).definition_for(txid).oid(),
+                    classoid,
+                )
+            }
         };
         let catalog_subid = if matches!(
             class,
@@ -4264,6 +4283,8 @@ pub fn builtin_type_identity(name: &str, allow_aliases: bool) -> Option<(&'stati
         "regtype" => Some(("regtype", oid::REGTYPE)),
         "regnamespace" => Some(("regnamespace", oid::REGNAMESPACE)),
         "regrole" => Some(("regrole", oid::REGROLE)),
+        "regconfig" => Some(("regconfig", oid::REGCONFIG)),
+        "regdictionary" => Some(("regdictionary", oid::REGDICTIONARY)),
         _ => None,
     };
     if catalog_only.is_some() {
@@ -4516,6 +4537,62 @@ pub fn comment_text_for<'a>(
                     && storage
                         .event_trigger_slot(name, txid)
                         .is_some_and(|slot| storage.event_trigger(slot).oid() == oid)
+            }
+            "pg_ts_parser" => {
+                class == crate::storage::CommentClass::TextSearchParser
+                    && subid == 0
+                    && storage
+                        .text_search_slot(
+                            crate::sql::ast::TextSearchObjectKind::Parser,
+                            schema,
+                            name,
+                            txid,
+                        )
+                        .is_some_and(|slot| {
+                            storage.text_search_object(slot).definition_for(txid).oid() == oid
+                        })
+            }
+            "pg_ts_template" => {
+                class == crate::storage::CommentClass::TextSearchTemplate
+                    && subid == 0
+                    && storage
+                        .text_search_slot(
+                            crate::sql::ast::TextSearchObjectKind::Template,
+                            schema,
+                            name,
+                            txid,
+                        )
+                        .is_some_and(|slot| {
+                            storage.text_search_object(slot).definition_for(txid).oid() == oid
+                        })
+            }
+            "pg_ts_dict" => {
+                class == crate::storage::CommentClass::TextSearchDictionary
+                    && subid == 0
+                    && storage
+                        .text_search_slot(
+                            crate::sql::ast::TextSearchObjectKind::Dictionary,
+                            schema,
+                            name,
+                            txid,
+                        )
+                        .is_some_and(|slot| {
+                            storage.text_search_object(slot).definition_for(txid).oid() == oid
+                        })
+            }
+            "pg_ts_config" => {
+                class == crate::storage::CommentClass::TextSearchConfiguration
+                    && subid == 0
+                    && storage
+                        .text_search_slot(
+                            crate::sql::ast::TextSearchObjectKind::Configuration,
+                            schema,
+                            name,
+                            txid,
+                        )
+                        .is_some_and(|slot| {
+                            storage.text_search_object(slot).definition_for(txid).oid() == oid
+                        })
             }
             "pg_rewrite" => {
                 class == crate::storage::CommentClass::Rule
@@ -8458,6 +8535,13 @@ fn pg_depend<'a>(
             PG_COLLATION_OID,
             crate::sql::ast::Collation::Catalog(dependency.slot as u8).oid(),
         )),
+        crate::storage::DependencyClass::TextSearchConfiguration => Some((
+            PG_TS_CONFIG_OID,
+            storage
+                .text_search_object(dependency.slot as usize)
+                .definition_for(txid)
+                .oid(),
+        )),
     };
     for (view_slot, _) in storage.views_visible_to(txid) {
         let rewrite_oid = storage.rule(storage.view_return_rule(view_slot)).oid();
@@ -9020,6 +9104,14 @@ fn catalog_column_type_mod(column: &ColumnMeta) -> i32 {
     }
 }
 
+fn type_storage(ctype: ColType) -> &'static str {
+    if matches!(ctype, ColType::TsQuery) || ctype.typlen() >= 0 {
+        "p"
+    } else {
+        "x"
+    }
+}
+
 fn pg_attribute<'a>(
     storage: &Storage,
     txid: u32,
@@ -9102,7 +9194,7 @@ fn pg_attribute<'a>(
                     text(if c.default.is_generated() { "s" } else { "" }, arena)?, // attgenerated
                     // Fixed-width values are plain; variable-width values use
                     // PostgreSQL's ordinary extended storage policy.
-                    text(if c.ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
+                    text(type_storage(c.ctype), arena)?,
                     text("", arena)?,   // attcompression: type default
                     Datum::Int4(-1),    // attstattarget: use server default
                     Datum::Bool(false), // attisdropped
@@ -9227,10 +9319,10 @@ fn pg_attribute<'a>(
                     text("", arena)?,
                     text("", arena)?,
                     text(
-                        if !field.dropped && field.ctype.typlen() < 0 {
-                            "x"
-                        } else {
+                        if field.dropped {
                             "p"
+                        } else {
+                            type_storage(field.ctype)
                         },
                         arena,
                     )?,
@@ -9314,7 +9406,7 @@ fn pg_attribute<'a>(
                         Datum::Int4(collation.oid()),
                         text("", arena)?,
                         text("", arena)?,
-                        text(if ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
+                        text(type_storage(ctype), arena)?,
                         text("", arena)?,
                         if expression.is_some() {
                             Datum::Int4(info.explicit_definition.map_or(-1, |definition| {
@@ -9363,7 +9455,7 @@ fn pg_attribute<'a>(
                     Datum::Int4(0),
                     text("", arena)?,
                     text("", arena)?,
-                    text(if ctype.typlen() < 0 { "x" } else { "p" }, arena)?,
+                    text(type_storage(ctype), arena)?,
                     text("", arena)?,
                     Datum::Int4(-1),
                     Datum::Bool(false),
@@ -10833,6 +10925,296 @@ fn pg_aggregate<'a>(
     finish(definition, &rows[..index], arena)
 }
 
+fn text_search_regproc<'a>(oid: i32, arena: &'a Arena) -> Result<Datum<'a>, SqlError> {
+    let name = match oid {
+        0 => "-",
+        3717 => "prsd_start",
+        3718 => "prsd_nexttoken",
+        3719 => "prsd_end",
+        3720 => "prsd_headline",
+        3721 => "prsd_lextype",
+        3725 => "dsimple_init",
+        3726 => "dsimple_lexize",
+        13_232 => "dsnowball_init",
+        13_233 => "dsnowball_lexize",
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "unknown text search support routine OID {}",
+                oid
+            ));
+        }
+    };
+    Ok(Datum::RegObject {
+        type_oid: super::types::oid::REGPROC,
+        referenced_oid: oid,
+        name: arena.alloc_str(name).map_err(|_| arena_full())?,
+    })
+}
+
+fn pg_ts_parser<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_ts_parser",
+        &[
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("prsname", ColType::Name),
+            ("prsnamespace", ColType::Oid),
+            ("prsstart", ColType::Regproc),
+            ("prstoken", ColType::Regproc),
+            ("prsend", ColType::Regproc),
+            ("prsheadline", ColType::Regproc),
+            ("prslextype", ColType::Regproc),
+        ],
+    );
+    let rows = arena
+        .alloc_slice_with(crate::storage::MAX_TEXT_SEARCH_OBJECTS, |_| {
+            &[] as &[Datum]
+        })
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for (_, object) in storage.text_search_objects_visible_to(txid) {
+        let crate::storage::TextSearchDefinition::Parser {
+            schema,
+            name,
+            oid,
+            start,
+            gettoken,
+            end,
+            headline,
+            lextypes,
+        } = object
+        else {
+            continue;
+        };
+        rows[count] = row(
+            &[
+                Datum::Oid(PG_TS_PARSER_OID as u32),
+                Datum::Oid(oid as u32),
+                text(name.as_str(), arena)?,
+                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                text_search_regproc(start, arena)?,
+                text_search_regproc(gettoken, arena)?,
+                text_search_regproc(end, arena)?,
+                text_search_regproc(headline, arena)?,
+                text_search_regproc(lextypes, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_ts_template<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_ts_template",
+        &[
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("tmplname", ColType::Name),
+            ("tmplnamespace", ColType::Oid),
+            ("tmplinit", ColType::Regproc),
+            ("tmpllexize", ColType::Regproc),
+        ],
+    );
+    let rows = arena
+        .alloc_slice_with(crate::storage::MAX_TEXT_SEARCH_OBJECTS, |_| {
+            &[] as &[Datum]
+        })
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for (_, object) in storage.text_search_objects_visible_to(txid) {
+        let crate::storage::TextSearchDefinition::Template {
+            schema,
+            name,
+            oid,
+            init,
+            lexize,
+            ..
+        } = object
+        else {
+            continue;
+        };
+        rows[count] = row(
+            &[
+                Datum::Oid(PG_TS_TEMPLATE_OID as u32),
+                Datum::Oid(oid as u32),
+                text(name.as_str(), arena)?,
+                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                text_search_regproc(init, arena)?,
+                text_search_regproc(lexize, arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_ts_dict<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_ts_dict",
+        &[
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("dictname", ColType::Name),
+            ("dictnamespace", ColType::Oid),
+            ("dictowner", ColType::Oid),
+            ("dicttemplate", ColType::Oid),
+            ("dictinitoption", ColType::Text),
+        ],
+    );
+    let rows = arena
+        .alloc_slice_with(crate::storage::MAX_TEXT_SEARCH_OBJECTS, |_| {
+            &[] as &[Datum]
+        })
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for (_, object) in storage.text_search_objects_visible_to(txid) {
+        let crate::storage::TextSearchDefinition::Dictionary {
+            schema,
+            name,
+            oid,
+            owner,
+            template,
+            options,
+            ..
+        } = object
+        else {
+            continue;
+        };
+        rows[count] = row(
+            &[
+                Datum::Oid(PG_TS_DICT_OID as u32),
+                Datum::Oid(oid as u32),
+                text(name.as_str(), arena)?,
+                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                Datum::Oid(owner as u32),
+                Datum::Oid(template as u32),
+                if options.is_empty() {
+                    Datum::Null
+                } else {
+                    text(options.as_str(), arena)?
+                },
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_ts_config<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_ts_config",
+        &[
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("cfgname", ColType::Name),
+            ("cfgnamespace", ColType::Oid),
+            ("cfgowner", ColType::Oid),
+            ("cfgparser", ColType::Oid),
+        ],
+    );
+    let rows = arena
+        .alloc_slice_with(crate::storage::MAX_TEXT_SEARCH_OBJECTS, |_| {
+            &[] as &[Datum]
+        })
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for (_, object) in storage.text_search_objects_visible_to(txid) {
+        let crate::storage::TextSearchDefinition::Configuration {
+            schema,
+            name,
+            oid,
+            owner,
+            parser,
+            ..
+        } = object
+        else {
+            continue;
+        };
+        rows[count] = row(
+            &[
+                Datum::Oid(PG_TS_CONFIG_OID as u32),
+                Datum::Oid(oid as u32),
+                text(name.as_str(), arena)?,
+                Datum::Oid(namespace_oid(storage, schema.as_str()) as u32),
+                Datum::Oid(owner as u32),
+                Datum::Oid(parser as u32),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn pg_ts_config_map<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_ts_config_map",
+        &[
+            ("mapcfg", ColType::Oid),
+            ("maptokentype", ColType::Int4),
+            ("mapseqno", ColType::Int4),
+            ("mapdict", ColType::Oid),
+        ],
+    );
+    let capacity = crate::storage::MAX_TEXT_SEARCH_OBJECTS
+        * crate::storage::TEXT_SEARCH_TOKEN_TYPES
+        * crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN;
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let mut count = 0;
+    for (_, object) in storage.text_search_objects_visible_to(txid) {
+        let crate::storage::TextSearchDefinition::Configuration { oid, mappings, .. } = object
+        else {
+            continue;
+        };
+        for token in 0..crate::storage::TEXT_SEARCH_TOKEN_TYPES {
+            for (sequence, dictionary) in mappings.dictionaries[token]
+                .iter()
+                .take(mappings.counts[token] as usize)
+                .enumerate()
+            {
+                rows[count] = row(
+                    &[
+                        Datum::Oid(oid as u32),
+                        Datum::Int4((token + 1) as i32),
+                        Datum::Int4((sequence + 1) as i32),
+                        Datum::Oid(*dictionary as u32),
+                    ],
+                    arena,
+                )?;
+                count += 1;
+            }
+        }
+    }
+    finish(definition, &rows[..count], arena)
+}
+
 fn pg_collation<'a>(
     storage: &Storage,
     txid: u32,
@@ -11059,6 +11441,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Regclass,
         ColType::Regnamespace,
         ColType::Regrole,
+        ColType::Regconfig,
+        ColType::Regdictionary,
         ColType::Int8,
         ColType::Float4,
         ColType::Float8,
@@ -11074,6 +11458,8 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Interval,
         ColType::Json,
         ColType::Jsonb,
+        ColType::TsVector,
+        ColType::TsQuery,
         ColType::Uuid,
         ColType::Bytea,
         ColType::Numeric,
@@ -11108,8 +11494,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         | ColType::Numeric => "N",
         ColType::Date | ColType::Time | ColType::Timestamp | ColType::Timestamptz => "D",
         ColType::Interval => "T",
-        ColType::Uuid => "U",
-        ColType::Bytea => "U",
+        ColType::Uuid | ColType::Bytea | ColType::TsVector | ColType::TsQuery => "U",
         ColType::PgNodeTree
         | ColType::PgNdistinct
         | ColType::PgDependencies
@@ -11151,7 +11536,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                 Datum::Int4(PG_TYPE_OID),
                 Datum::Int4(10),
                 Datum::Bool(true),
-                text(if t.typlen() < 0 { "x" } else { "p" }, arena)?,
+                text(type_storage(*t), arena)?,
                 Datum::Null,
             ],
             arena,
@@ -11424,7 +11809,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     txid,
                 )),
                 Datum::Bool(true),
-                text(if d.base.typlen() < 0 { "x" } else { "p" }, arena)?,
+                text(type_storage(d.base), arena)?,
                 Datum::Null,
             ],
             arena,

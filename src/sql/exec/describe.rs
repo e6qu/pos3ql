@@ -2572,6 +2572,7 @@ pub fn infer_type_res(
                 of(ColType::Float8)
             }
             crate::sql::ast::UnaryOp::AbsoluteValue => infer_type_res(operand, columns)?,
+            crate::sql::ast::UnaryOp::TextSearchNot => of(ColType::TsQuery),
         },
         Expr::Binary {
             operator,
@@ -2609,6 +2610,9 @@ pub fn infer_type_res(
                     of(ColType::Bool)
                 }
                 And | Or | Like | ILike => of(ColType::Bool),
+                TextSearchMatch => of(ColType::Bool),
+                TextSearchPhrase => of(ColType::TsQuery),
+                Overlaps if lo == oid::TSQUERY || ro == oid::TSQUERY => of(ColType::TsQuery),
                 Contains | ContainedBy | Overlaps | NotRightOf | NotLeftOf | Adjacent => {
                     of(ColType::Bool)
                 }
@@ -2657,7 +2661,11 @@ pub fn infer_type_res(
                 }
                 // Bit-string concatenation yields varbit; otherwise text.
                 Concat => {
-                    if lo == oid::JSONB || ro == oid::JSONB {
+                    if lo == oid::TSQUERY || ro == oid::TSQUERY {
+                        of(ColType::TsQuery)
+                    } else if lo == oid::TSVECTOR || ro == oid::TSVECTOR {
+                        of(ColType::TsVector)
+                    } else if lo == oid::JSONB || ro == oid::JSONB {
                         (oid::JSONB, -1)
                     } else if is_bit(lo) || is_bit(ro) {
                         (oid::VARBIT, -1)
@@ -2964,6 +2972,34 @@ pub fn infer_type_res(
             order_by,
             ..
         } => match *name {
+            "to_tsvector" | "json_to_tsvector" | "jsonb_to_tsvector" | "strip" | "setweight"
+            | "ts_delete" | "ts_filter" | "array_to_tsvector" => of(ColType::TsVector),
+            "to_tsquery"
+            | "plainto_tsquery"
+            | "phraseto_tsquery"
+            | "websearch_to_tsquery"
+            | "tsquery_phrase"
+            | "ts_rewrite" => of(ColType::TsQuery),
+            "numnode" => of(ColType::Int4),
+            "ts_rank" | "ts_rank_cd" => of(ColType::Float4),
+            "querytree" => of(ColType::Text),
+            "ts_headline" => {
+                let document = match args.len() {
+                    2 => 0,
+                    4 => 1,
+                    3 if infer_type_res(args[1], columns)?.0 == oid::TSQUERY => 0,
+                    3 => 1,
+                    _ => return Ok((oid::UNKNOWN, -2)),
+                };
+                match infer_type_res(args[document], columns)?.0 {
+                    oid::JSON => of(ColType::Json),
+                    oid::JSONB => of(ColType::Jsonb),
+                    _ => of(ColType::Text),
+                }
+            }
+            "tsvector_to_array" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
+            "ts_lexize" => of(ColType::Array(crate::sql::types::ArrElem::Text)),
+            "get_current_ts_config" => of(ColType::Regconfig),
             // Catalog-introspection helpers (for psql \d).
             "pg_get_userbyid"
             | "format_type"

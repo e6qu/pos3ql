@@ -79,7 +79,9 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         | ColType::Regoperator
         | ColType::Regclass
         | ColType::Regnamespace
-        | ColType::Regrole) => match v {
+        | ColType::Regrole
+        | ColType::Regconfig
+        | ColType::Regdictionary) => match v {
             Datum::RegObject {
                 type_oid,
                 referenced_oid,
@@ -372,6 +374,20 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 }
             }
             _ => return Err(cast_unsupported(&v, "jsonb")),
+        },
+        ColType::TsVector => match v {
+            Datum::TsVector(_) => v,
+            Datum::Text(text) => Datum::TsVector(crate::sql::full_text::restore_vector(
+                crate::sql::full_text::canonical_vector(text, arena)?,
+            )),
+            _ => return Err(cast_unsupported(&v, "tsvector")),
+        },
+        ColType::TsQuery => match v {
+            Datum::TsQuery(_) => v,
+            Datum::Text(text) => Datum::TsQuery(crate::sql::full_text::restore_query(
+                crate::sql::full_text::canonical_query(text, arena)?,
+            )),
+            _ => return Err(cast_unsupported(&v, "tsquery")),
         },
         ColType::Array(element) => match v {
             Datum::Array { element: e, .. } if e == element => v,

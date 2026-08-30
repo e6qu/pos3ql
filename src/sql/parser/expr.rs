@@ -1377,6 +1377,8 @@ impl<'a> Parser<'a> {
             "/" => BinaryOp::Div,
             "%" => BinaryOp::Mod,
             "||" => BinaryOp::Concat,
+            "@@" | "@@@" => BinaryOp::TextSearchMatch,
+            "<->" => BinaryOp::TextSearchPhrase,
             _ => return self.catalog_operator_expr(schema, operator, left, right),
         };
         self.arena_expr(Expr::Binary {
@@ -1949,6 +1951,8 @@ impl<'a> Parser<'a> {
             Tok::Op(">") => Some(BinaryOp::Gt),
             Tok::Op(">=") => Some(BinaryOp::GtEq),
             Tok::Op("||") => Some(BinaryOp::Concat),
+            Tok::Op("@@") | Tok::Op("@@@") => Some(BinaryOp::TextSearchMatch),
+            Tok::Op("<->") => Some(BinaryOp::TextSearchPhrase),
             Tok::Op("->") => Some(BinaryOp::JsonGet),
             Tok::Op("->>") => Some(BinaryOp::JsonGetText),
             Tok::Op("#>") => Some(BinaryOp::JsonPath),

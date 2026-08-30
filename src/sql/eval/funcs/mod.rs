@@ -12,6 +12,7 @@ pub(super) mod array;
 pub(crate) mod bytea;
 pub(super) mod conditional;
 pub(super) mod datetime;
+pub(super) mod full_text;
 pub(super) mod json;
 pub(super) mod math;
 pub(super) mod misc;

@@ -28,5 +28,12 @@ if grep -nE 'shards:.*(run:.*runtest:|runtest:.*run:)' .github/workflows/coverag
     failed=1
 fi
 
+# Shard names become tracefile names. Reject directory syntax at the workflow
+# boundary instead of relying on every consumer to sanitize it identically.
+if grep -nE 'shards:.*[/\\]' .github/workflows/coverage.yml; then
+    printf '%s\n' 'CI timeout guard: coverage shard names must not contain path separators' >&2
+    failed=1
+fi
+
 (( failed == 0 )) || exit 1
 printf 'CI timeout guard: every declared timeout is at most %s minutes\n' "$limit"

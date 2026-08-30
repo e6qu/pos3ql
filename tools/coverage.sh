@@ -14,7 +14,7 @@
 # Ways to run it (COVERAGE_SHARD):
 #   - unset — whole suite in one process, the floor enforced at the end. This
 #     is the local command.
-#   - lib:INDEX/COUNT / sql / run:<groups> — a coverage shard: its slice runs
+#   - lib:INDEX-of-COUNT / sql / run:<groups> — a coverage shard: its slice runs
 #     strictly against an instrumented binary, and the profile is written as an
 #     lcov tracefile. tools/coverage-merge.py unions the tracefiles and holds
 #     the floor over the merged whole.
@@ -129,11 +129,11 @@ case "$SHARD" in
     ;;
 lib:*)
     partition=${SHARD#lib:}
-    partition_index=${partition%/*}
-    partition_count=${partition#*/}
+    partition_index=${partition%%-of-*}
+    partition_count=${partition#*-of-}
     case "$partition_index:$partition_count" in
     *[!0-9:]* | :* | *: | *:*:*)
-        echo "FAIL: malformed lib partition '$partition' (expected INDEX/COUNT)"
+        echo "FAIL: malformed lib partition '$partition' (expected INDEX-of-COUNT)"
         exit 1
         ;;
     esac
@@ -277,7 +277,7 @@ run:*)
     write_lcov
     ;;
 *)
-    echo "FAIL: unknown COVERAGE_SHARD '$SHARD' (expected lib:INDEX/COUNT, sql, run:<groups> or runtest:<groups>)"
+    echo "FAIL: unknown COVERAGE_SHARD '$SHARD' (expected lib:INDEX-of-COUNT, sql, run:<groups> or runtest:<groups>)"
     exit 1
     ;;
 esac

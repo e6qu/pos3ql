@@ -184,6 +184,7 @@ pub mod sqlstate {
     pub const DATA_EXCEPTION: &str = "22000";
     pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
     pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
+    pub const ZERO_LENGTH_CHARACTER_STRING: &str = "2200F";
     pub const INVALID_DATETIME_FORMAT: &str = "22007";
     pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
     pub const SUBSTRING_ERROR: &str = "22011";
@@ -748,6 +749,57 @@ pub trait CatalogAccess {
     /// Resolves a transaction-visible collation name to its stable identity.
     fn resolve_collation(&self, _schema: Option<&str>, _name: &str) -> Option<Collation> {
         None
+    }
+    /// Resolves a transaction-visible text-search configuration to its stable
+    /// `regconfig` identity.
+    fn resolve_text_search_configuration(&self, _schema: Option<&str>, _name: &str) -> Option<i32> {
+        None
+    }
+    /// Returns the transaction-visible display name of a text-search
+    /// configuration identity.
+    fn text_search_configuration_name(&self, _oid: i32) -> Option<crate::util::StackStr<128>> {
+        None
+    }
+    fn resolve_text_search_dictionary(&self, _schema: Option<&str>, _name: &str) -> Option<i32> {
+        None
+    }
+    fn text_search_dictionary_name(&self, _oid: i32) -> Option<crate::util::StackStr<128>> {
+        None
+    }
+    fn lexize_text_search_dictionary<'a>(
+        &self,
+        _dictionary_oid: i32,
+        _token: &str,
+        _arena: &'a Arena,
+    ) -> Result<super::full_text::TextSearchLexeme<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "text-search catalog access is unavailable"
+        ))
+    }
+    fn rewrite_text_search_query<'a>(
+        &self,
+        _source: &str,
+        _query: &str,
+        _arena: &'a Arena,
+    ) -> Result<&'a str, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "text-search rewrite query execution is unavailable"
+        ))
+    }
+    /// Applies the parser token mapping and its ordered dictionary chain.
+    fn normalize_text_search_token<'a>(
+        &self,
+        _configuration_oid: i32,
+        _token_type: u8,
+        _token: &str,
+        _arena: &'a Arena,
+    ) -> Result<super::full_text::TextSearchLexeme<'a>, SqlError> {
+        Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "text-search catalog access is unavailable"
+        ))
     }
     /// Materializes a durable named-composite row value into its catalog field
     /// layout. The default is a loud capability error: raw composite text is
@@ -3442,6 +3494,12 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
+        && let Some(result) =
+            funcs::full_text::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
         && let Some(result) = funcs::regex::dispatch(name, args, star, arena, params, row, hooks)
     {
         return result;
@@ -3471,6 +3529,21 @@ fn call<'a>(
                 arguments[slot] = eval_full(argument, arena, params, row, hooks)?;
                 argument_type_oids[slot] = expression_type_identity(argument, row, hooks)?
                     .routine_argument_oid(&arguments[slot]);
+            }
+            if args.len() == 1
+                && let Some((schema, "!!")) = crate::sql::ast::catalog_operator_call(name)
+                && schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+                && argument_type_oids[0] == crate::sql::types::oid::TSQUERY
+            {
+                return match arguments[0] {
+                    Datum::Null => Ok(Datum::Null),
+                    Datum::TsQuery(query) => {
+                        crate::sql::full_text::not_query(query.as_str(), arena)
+                            .map(crate::sql::full_text::restore_query)
+                            .map(Datum::TsQuery)
+                    }
+                    _ => unreachable!("tsquery operator argument identity"),
+                };
             }
             if let Some(result) = catalog.call_routine(
                 name,
@@ -5632,6 +5705,30 @@ pub(crate) fn regobject_cast<'a>(
                                 name
                             )
                         })?,
+                    ColType::Regconfig | ColType::Regdictionary => {
+                        let (schema, unqualified) =
+                            name.rsplit_once('.')
+                                .map_or((None, name), |(schema, name)| {
+                                    (Some(schema.trim_matches('"')), name.trim_matches('"'))
+                                });
+                        let resolved = if target == ColType::Regconfig {
+                            catalog.resolve_text_search_configuration(schema, unqualified)
+                        } else {
+                            catalog.resolve_text_search_dictionary(schema, unqualified)
+                        };
+                        resolved.ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "text search {} \"{}\" does not exist",
+                                if target == ColType::Regconfig {
+                                    "configuration"
+                                } else {
+                                    "dictionary"
+                                },
+                                name
+                            )
+                        })?
+                    }
                     _ => {
                         return Err(sql_err!(
                             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -5665,6 +5762,28 @@ pub(crate) fn regobject_cast<'a>(
             .map(|catalog| catalog.operator_name(object_oid, target == ColType::Regoperator, arena))
             .transpose()?
             .flatten(),
+        ColType::Regconfig => (if let Some(catalog) = catalog {
+            catalog.text_search_configuration_name(object_oid)
+        } else {
+            match object_oid {
+                3748 => Some(crate::util::StackStr::from_str("simple")),
+                13_248 => Some(crate::util::StackStr::from_str("english")),
+                _ => None,
+            }
+        })
+        .map(|name| arena.alloc_str(name.as_str()).map_err(|_| arena_full()))
+        .transpose()?,
+        ColType::Regdictionary => (if let Some(catalog) = catalog {
+            catalog.text_search_dictionary_name(object_oid)
+        } else {
+            match object_oid {
+                3765 => Some(crate::util::StackStr::from_str("simple")),
+                13_247 => Some(crate::util::StackStr::from_str("english_stem")),
+                _ => None,
+            }
+        })
+        .map(|name| arena.alloc_str(name.as_str()).map_err(|_| arena_full()))
+        .transpose()?,
         _ => None,
     };
     let name = match name {
@@ -5730,6 +5849,8 @@ fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
         oid::REGTYPE => "regtype",
         oid::REGNAMESPACE => "regnamespace",
         oid::REGROLE => "regrole",
+        oid::REGCONFIG => "regconfig",
+        oid::REGDICTIONARY => "regdictionary",
         oid::ANYELEMENT => "anyelement",
         oid::ANYARRAY => "anyarray",
         oid::ANYNONARRAY => "anynonarray",
@@ -5807,6 +5928,8 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
         | "regnamespace"
         | "regoper"
         | "regoperator"
+        | "regconfig"
+        | "regdictionary"
         | "anyelement"
         | "anyarray"
         | "anynonarray"
@@ -5826,6 +5949,8 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
             "regnamespace" => "regnamespace",
             "regoper" => "regoper",
             "regoperator" => "regoperator",
+            "regconfig" => "regconfig",
+            "regdictionary" => "regdictionary",
             "anyelement" => "anyelement",
             "anyarray" => "anyarray",
             "anynonarray" => "anynonarray",
@@ -5857,6 +5982,8 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
         "regnamespace" => crate::sql::types::oid::REGNAMESPACE,
         "regoper" => crate::sql::types::oid::REGOPER,
         "regoperator" => crate::sql::types::oid::REGOPERATOR,
+        "regconfig" => crate::sql::types::oid::REGCONFIG,
+        "regdictionary" => crate::sql::types::oid::REGDICTIONARY,
         "anyelement" => crate::sql::types::oid::ANYELEMENT,
         "anyarray" => crate::sql::types::oid::ANYARRAY,
         "anynonarray" => crate::sql::types::oid::ANYNONARRAY,
@@ -5952,6 +6079,8 @@ fn type_name_of(d: &Datum) -> &'static str {
             crate::sql::types::oid::REGCLASS => "regclass",
             crate::sql::types::oid::REGNAMESPACE => "regnamespace",
             crate::sql::types::oid::REGROLE => "regrole",
+            crate::sql::types::oid::REGCONFIG => "regconfig",
+            crate::sql::types::oid::REGDICTIONARY => "regdictionary",
             _ => "regobject",
         },
         Datum::Date(_) => "date",
@@ -5962,6 +6091,8 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Interval(_) => "interval",
         Datum::Json { jsonb: false, .. } => "json",
         Datum::Json { jsonb: true, .. } => "jsonb",
+        Datum::TsVector(_) => "tsvector",
+        Datum::TsQuery(_) => "tsquery",
         Datum::Uuid(_) => "uuid",
         Datum::Bytea(_) => "bytea",
         Datum::Range { kind, .. } => kind.name(),

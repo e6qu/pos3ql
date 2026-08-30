@@ -496,6 +496,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn any_qual_name(&mut self, what: &str) -> Result<QualName<'a>, ParseError> {
+        let first = self.any_ident(what)?;
+        if self.eat_op(".")? {
+            Ok(QualName {
+                schema: Some(first),
+                name: self.any_ident(what)?,
+            })
+        } else {
+            Ok(QualName::bare(first))
+        }
+    }
+
     /// DECLARE name [BINARY] [INSENSITIVE|ASENSITIVE] [[NO] SCROLL] CURSOR
     /// [{WITH|WITHOUT} HOLD] FOR select ("declare" not yet consumed).
     fn declare_cursor(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -4114,6 +4126,10 @@ impl<'a> Parser<'a> {
             };
             return Ok(Stmt::AlterCollation { name, action });
         }
+        if self.eat_ident("text")? {
+            self.expect_ident("search")?;
+            return self.alter_text_search();
+        }
         if self.eat_ident("conversion")? {
             let name = self.qual_name("conversion name")?;
             let action = if self.eat_ident("rename")? {
@@ -4492,6 +4508,133 @@ impl<'a> Parser<'a> {
             only,
             actions: self.arena_slice(&buffer[..count])?,
         }))
+    }
+
+    fn text_search_token_types(&mut self) -> Result<&'a [&'a str], ParseError> {
+        let mut values = [""; 32];
+        let mut count = 0usize;
+        loop {
+            if count == values.len() {
+                return Err(self.err_here("too many text search token types"));
+            }
+            values[count] = self.col_ident("text search token type")?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.arena_slice(&values[..count])
+    }
+
+    fn text_search_dictionaries(&mut self) -> Result<&'a [QualName<'a>], ParseError> {
+        let mut values = [QualName {
+            schema: None,
+            name: "",
+        }; 32];
+        let mut count = 0usize;
+        loop {
+            if count == values.len() {
+                return Err(self.err_here("too many text search dictionaries"));
+            }
+            values[count] = self.any_qual_name("text search dictionary")?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.arena_slice(&values[..count])
+    }
+
+    fn alter_text_search(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let kind = if self.eat_ident("parser")? {
+            TextSearchObjectKind::Parser
+        } else if self.eat_ident("template")? {
+            TextSearchObjectKind::Template
+        } else if self.eat_ident("dictionary")? {
+            TextSearchObjectKind::Dictionary
+        } else if self.eat_ident("configuration")? {
+            TextSearchObjectKind::Configuration
+        } else {
+            return Err(self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION"));
+        };
+        let name = self.any_qual_name(kind.noun())?;
+        let action = if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterTextSearchAction::Rename(self.any_ident("new text search object name")?)
+        } else if self.eat_ident("owner")? {
+            if !matches!(
+                kind,
+                TextSearchObjectKind::Dictionary | TextSearchObjectKind::Configuration
+            ) {
+                return Err(self.err_here("this text search object has no owner"));
+            }
+            self.expect_ident("to")?;
+            AlterTextSearchAction::Owner(self.any_ident("role name")?)
+        } else if self.eat_ident("set")? {
+            self.expect_ident("schema")?;
+            AlterTextSearchAction::SetSchema(self.any_ident("schema name")?)
+        } else if kind == TextSearchObjectKind::Dictionary && self.eat_op("(")? {
+            let options = self.text_search_options()?;
+            self.expect_op(")")?;
+            AlterTextSearchAction::DictionaryOptions(options)
+        } else if kind == TextSearchObjectKind::Configuration {
+            let mapping = if self.eat_ident("add")? {
+                self.expect_ident("mapping")?;
+                self.expect_ident("for")?;
+                let token_types = self.text_search_token_types()?;
+                self.expect_ident("with")?;
+                TextSearchMappingAction::Set {
+                    replace_existing: false,
+                    token_types,
+                    dictionaries: self.text_search_dictionaries()?,
+                }
+            } else if self.eat_ident("alter")? {
+                self.expect_ident("mapping")?;
+                let token_types = if self.eat_ident("for")? {
+                    Some(self.text_search_token_types()?)
+                } else {
+                    None
+                };
+                if self.eat_ident("replace")? {
+                    let old = self.any_qual_name("old text search dictionary")?;
+                    self.expect_ident("with")?;
+                    TextSearchMappingAction::Replace {
+                        token_types,
+                        old,
+                        new: self.any_qual_name("new text search dictionary")?,
+                    }
+                } else {
+                    let Some(token_types) = token_types else {
+                        return Err(self.err_here("expected FOR or REPLACE"));
+                    };
+                    self.expect_ident("with")?;
+                    TextSearchMappingAction::Set {
+                        replace_existing: true,
+                        token_types,
+                        dictionaries: self.text_search_dictionaries()?,
+                    }
+                }
+            } else if self.eat_ident("drop")? {
+                self.expect_ident("mapping")?;
+                let if_exists = if self.eat_ident("if")? {
+                    self.expect_ident("exists")?;
+                    true
+                } else {
+                    false
+                };
+                self.expect_ident("for")?;
+                TextSearchMappingAction::Drop {
+                    if_exists,
+                    token_types: self.text_search_token_types()?,
+                }
+            } else {
+                return Err(self.err_here("expected a text search configuration alteration"));
+            };
+            AlterTextSearchAction::ConfigurationMapping(mapping)
+        } else {
+            return Err(self.err_here("expected a text search object alteration"));
+        };
+        Ok(Stmt::AlterTextSearch { kind, name, action })
     }
 
     fn alter_default_privileges(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -5341,6 +5484,25 @@ impl<'a> Parser<'a> {
             CommentTarget::Collation(self.qual_name("collation name")?)
         } else if self.eat_ident("conversion")? {
             CommentTarget::Conversion(self.qual_name("conversion name")?)
+        } else if self.eat_ident("text")? {
+            self.expect_ident("search")?;
+            let kind = if self.eat_ident("parser")? {
+                TextSearchObjectKind::Parser
+            } else if self.eat_ident("template")? {
+                TextSearchObjectKind::Template
+            } else if self.eat_ident("dictionary")? {
+                TextSearchObjectKind::Dictionary
+            } else if self.eat_ident("configuration")? {
+                TextSearchObjectKind::Configuration
+            } else {
+                return Err(
+                    self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION")
+                );
+            };
+            CommentTarget::TextSearch {
+                kind,
+                name: self.any_qual_name("text search object name")?,
+            }
         } else if self.eat_ident("event")? {
             self.expect_ident("trigger")?;
             CommentTarget::EventTrigger(self.col_ident("event trigger name")?)

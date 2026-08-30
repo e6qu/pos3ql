@@ -64,6 +64,20 @@ impl<const N: usize> StackStr<N> {
         self.len = 0;
         self.truncated = false;
     }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        assert!(len <= self.len && self.as_str().is_char_boundary(len));
+        self.len = len;
+        self.truncated = false;
+    }
 }
 
 impl<const N: usize> Default for StackStr<N> {

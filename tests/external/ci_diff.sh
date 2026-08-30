@@ -355,6 +355,31 @@ CREATE DEFAULT CONVERSION outbound_dump.latin1_to_utf8
   FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8;
 COMMENT ON COLLATION outbound_dump.byte_order IS 'dumped collation';
 COMMENT ON CONVERSION outbound_dump.latin1_to_utf8 IS 'dumped conversion';
+CREATE TEXT SEARCH PARSER outbound_dump.default_copy (
+  START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end,
+  HEADLINE = prsd_headline, LEXTYPES = prsd_lextype);
+CREATE TEXT SEARCH TEMPLATE outbound_dump.simple_copy (
+  INIT = dsimple_init, LEXIZE = dsimple_lexize);
+CREATE TEXT SEARCH DICTIONARY outbound_dump.search_words (
+  TEMPLATE = outbound_dump.simple_copy, ACCEPT = true);
+CREATE TEXT SEARCH CONFIGURATION outbound_dump.documents (
+  PARSER = outbound_dump.default_copy);
+ALTER TEXT SEARCH CONFIGURATION outbound_dump.documents ADD MAPPING
+  FOR asciiword, word, numword, uint WITH outbound_dump.search_words;
+COMMENT ON TEXT SEARCH CONFIGURATION outbound_dump.documents IS 'dumped search configuration';
+CREATE TABLE outbound_dump.search_documents (
+  id integer PRIMARY KEY,
+  body text NOT NULL,
+  terms tsvector GENERATED ALWAYS AS
+    (to_tsvector('outbound_dump.documents', body)) STORED,
+  query tsquery NOT NULL);
+INSERT INTO outbound_dump.search_documents(id, body, query) VALUES
+  (1, 'Cats 42', plainto_tsquery('outbound_dump.documents', 'cats 42')),
+  (2, 'Dogs 7', plainto_tsquery('outbound_dump.documents', 'dogs'));
+CREATE INDEX outbound_search_terms_idx ON outbound_dump.search_documents(terms);
+CREATE INDEX outbound_search_query_idx ON outbound_dump.search_documents(query);
+CREATE INDEX outbound_search_expression_idx ON outbound_dump.search_documents
+  ((to_tsvector('outbound_dump.documents', body)));
 CREATE DOMAIN outbound_dump.location_domain AS outbound_dump.location CHECK ((VALUE).x > 0);
 CREATE TABLE outbound_dump.items (
   id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -693,8 +718,20 @@ else
              obj_description(conversion.oid,'pg_conversion')
         FROM pg_collation AS c CROSS JOIN pg_conversion AS conversion
        WHERE c.collname='byte_order' AND conversion.conname='latin1_to_utf8';
+      SELECT id,terms,query,terms @@ query
+        FROM outbound_dump.search_documents ORDER BY id;
+      SELECT to_tsvector('outbound_dump.documents', 'Birds 9'),
+             ts_lexize('outbound_dump.search_words'::regdictionary, 'Birds');
+      SELECT obj_description(oid, 'pg_ts_config')
+        FROM pg_ts_config WHERE cfgname='documents';
+      SELECT count(*) FROM pg_ts_config_map AS mapping
+        JOIN pg_ts_config AS configuration ON configuration.oid=mapping.mapcfg
+       WHERE configuration.cfgname='documents';
+      SELECT indexname FROM pg_indexes
+       WHERE schemaname='outbound_dump' AND tablename='search_documents'
+       ORDER BY indexname;
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\n9|nine\nINSERT 0 1\n9|nine\noutbound_redirect|t|dumped rewrite rule\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1\nbyte_order|c|t|latin1_to_utf8|t\none\nthree\ntwo\nc3a9\ndumped collation|dumped conversion'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\n9|nine\nINSERT 0 1\n9|nine\noutbound_redirect|t|dumped rewrite rule\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1\nbyte_order|c|t|latin1_to_utf8|t\none\nthree\ntwo\nc3a9\ndumped collation|dumped conversion\n1|\'42\':2 \'cats\':1|\'cats\' & \'42\'|t\n2|\'7\':2 \'dogs\':1|\'dogs\'|t\n\'9\':2 \'birds\':1|{birds}\ndumped search configuration\n4\noutbound_search_expression_idx\noutbound_search_query_idx\noutbound_search_terms_idx\nsearch_documents_pkey'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

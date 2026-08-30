@@ -474,6 +474,7 @@ struct GucValues {
     application_name: StackStr<64>,
     search_path: StackStr<128>,
     default_tablespace: StackStr<64>,
+    default_text_search_config: StackStr<128>,
     client_min_messages: MessageLevel,
     extra_float_digits: StackStr<8>,
     lock_timeout: StackStr<24>,
@@ -506,6 +507,7 @@ impl GucValues {
             application_name: StackStr::new(),
             search_path: StackStr::new(),
             default_tablespace: StackStr::new(),
+            default_text_search_config: StackStr::new(),
             client_min_messages: MessageLevel::Notice,
             extra_float_digits: StackStr::new(),
             lock_timeout: StackStr::new(),
@@ -522,6 +524,7 @@ impl GucValues {
         let _ = write!(values.timezone, "UTC");
         let _ = write!(values.client_encoding, "UTF8");
         let _ = write!(values.search_path, "\"$user\", public");
+        let _ = write!(values.default_text_search_config, "pg_catalog.english");
         let _ = write!(values.extra_float_digits, "1");
         let _ = write!(values.lock_timeout, "0");
         let _ = write!(values.statement_timeout, "0");
@@ -554,7 +557,8 @@ const GUC_SYNCHRONIZE_SEQSCANS: u32 = 1 << 20;
 const GUC_IDLE_IN_TRANSACTION_SESSION_TIMEOUT: u32 = 1 << 21;
 const GUC_TRANSACTION_TIMEOUT: u32 = 1 << 22;
 const GUC_EVENT_TRIGGERS: u32 = 1 << 23;
-const GUC_ALL: u32 = (1 << 24) - 1;
+const GUC_DEFAULT_TEXT_SEARCH_CONFIG: u32 = 1 << 24;
+const GUC_ALL: u32 = (1 << 25) - 1;
 
 fn guc_bit(name: &str) -> u32 {
     if name.eq_ignore_ascii_case("datestyle") {
@@ -571,6 +575,8 @@ fn guc_bit(name: &str) -> u32 {
         GUC_SEARCH_PATH
     } else if name.eq_ignore_ascii_case("default_tablespace") {
         GUC_DEFAULT_TABLESPACE
+    } else if name.eq_ignore_ascii_case("default_text_search_config") {
+        GUC_DEFAULT_TEXT_SEARCH_CONFIG
     } else if name.eq_ignore_ascii_case("client_min_messages") {
         GUC_CLIENT_MIN_MESSAGES
     } else if name.eq_ignore_ascii_case("extra_float_digits") {
@@ -628,6 +634,7 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     copy!(GUC_APPLICATION_NAME, application_name);
     copy!(GUC_SEARCH_PATH, search_path);
     copy!(GUC_DEFAULT_TABLESPACE, default_tablespace);
+    copy!(GUC_DEFAULT_TEXT_SEARCH_CONFIG, default_text_search_config);
     copy!(GUC_CLIENT_MIN_MESSAGES, client_min_messages);
     copy!(GUC_EXTRA_FLOAT_DIGITS, extra_float_digits);
     copy!(GUC_LOCK_TIMEOUT, lock_timeout);
@@ -782,6 +789,7 @@ fn merge_session_changes(target: &mut GucValues, before: &GucValues, after: &Guc
     changed!(application_name);
     changed!(search_path);
     changed!(default_tablespace);
+    changed!(default_text_search_config);
     changed!(client_min_messages);
     changed!(extra_float_digits);
     changed!(lock_timeout);
@@ -839,6 +847,10 @@ impl GucState {
             Some(StackStr::from_str(values.search_path.as_str()))
         } else if name.eq_ignore_ascii_case("default_tablespace") {
             Some(StackStr::from_str(values.default_tablespace.as_str()))
+        } else if name.eq_ignore_ascii_case("default_text_search_config") {
+            Some(StackStr::from_str(
+                values.default_text_search_config.as_str(),
+            ))
         } else if name.eq_ignore_ascii_case("client_min_messages") {
             Some(StackStr::from_str(values.client_min_messages.as_str()))
         } else if name.eq_ignore_ascii_case("extra_float_digits") {
@@ -1605,6 +1617,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.search_path = defaults.search_path;
     } else if name.eq_ignore_ascii_case("default_tablespace") {
         values.default_tablespace = defaults.default_tablespace;
+    } else if name.eq_ignore_ascii_case("default_text_search_config") {
+        values.default_text_search_config = defaults.default_text_search_config;
     } else if name.eq_ignore_ascii_case("client_min_messages") {
         values.client_min_messages = defaults.client_min_messages;
     } else if name.eq_ignore_ascii_case("extra_float_digits") {
@@ -1736,6 +1750,15 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         return store(
             &mut values.default_tablespace,
             if is_default { "" } else { v },
+        );
+    }
+    if name.eq_ignore_ascii_case("default_text_search_config") {
+        if v.is_empty() {
+            return Err(unsupported_value("default_text_search_config", v));
+        }
+        return store(
+            &mut values.default_text_search_config,
+            if is_default { "pg_catalog.english" } else { v },
         );
     }
     if name.eq_ignore_ascii_case("default_table_access_method") {
@@ -1999,6 +2022,10 @@ impl GucState {
             Some(StackStr::from_str("content"))
         } else if name.eq_ignore_ascii_case("default_tablespace") {
             Some(StackStr::from_str(values.default_tablespace.as_str()))
+        } else if name.eq_ignore_ascii_case("default_text_search_config") {
+            Some(StackStr::from_str(
+                values.default_text_search_config.as_str(),
+            ))
         } else if name.eq_ignore_ascii_case("default_table_access_method") {
             Some(StackStr::from_str("heap"))
         } else if name.eq_ignore_ascii_case("intervalstyle") {

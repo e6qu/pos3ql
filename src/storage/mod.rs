@@ -374,6 +374,11 @@ pub enum OwnedDatum {
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
+    TextSearch {
+        query: bool,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     Numeric {
         sign: u8,
         weight: i16,
@@ -556,6 +561,22 @@ impl OwnedDatum {
             Datum::Interval(value) => Self::Interval(*value),
             Datum::Uuid(value) => Self::Uuid(*value),
             Datum::Json { text, jsonb } => Self::json(*jsonb, text)?,
+            Datum::TsVector(text) => {
+                let (len, bytes) = Self::bytes(text.as_bytes(), "text-search")?;
+                Self::TextSearch {
+                    query: false,
+                    len,
+                    bytes,
+                }
+            }
+            Datum::TsQuery(text) => {
+                let (len, bytes) = Self::bytes(text.as_bytes(), "text-search")?;
+                Self::TextSearch {
+                    query: true,
+                    len,
+                    bytes,
+                }
+            }
             Datum::Array { element, raw } => Self::array(*element, raw)?,
             Datum::Range { text, kind } => Self::range(*kind, false, text)?,
             Datum::Multirange { text, kind } => Self::range(*kind, true, text)?,
@@ -660,6 +681,15 @@ impl OwnedDatum {
             Self::Text { len, bytes } => Datum::Text(
                 core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
             ),
+            Self::TextSearch { query, len, bytes } => {
+                let text =
+                    core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8");
+                if *query {
+                    Datum::TsQuery(crate::sql::full_text::restore_query(text))
+                } else {
+                    Datum::TsVector(crate::sql::full_text::restore_vector(text))
+                }
+            }
             Self::Numeric {
                 sign,
                 weight,
@@ -2080,6 +2110,7 @@ pub(crate) const MAX_EXTENDED_STATISTICS_KEYS: usize = 8;
 pub(crate) const MAX_EXTENDED_STATISTICS_MCV: usize = 100;
 pub(crate) const MAX_COLLATIONS: usize = 128;
 pub(crate) const MAX_CONVERSIONS: usize = 128;
+pub(crate) const MAX_TEXT_SEARCH_OBJECTS: usize = MAX_DATABASES * 16;
 pub(crate) const MAX_EVENT_TRIGGERS: usize = 64;
 pub(crate) const MAX_EVENT_TRIGGER_TAGS: usize = 32;
 pub(crate) const EVENT_TRIGGER_TAG_MAX: usize = 64;
@@ -2308,6 +2339,240 @@ impl CollationDef {
 
     pub(crate) fn oid(self, slot: usize) -> i32 {
         crate::sql::ast::Collation::Catalog(slot as u8).oid()
+    }
+}
+
+pub(crate) const TEXT_SEARCH_TOKEN_TYPES: usize = 23;
+pub(crate) const TEXT_SEARCH_DICTIONARIES_PER_TOKEN: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextSearchDictionaryBehavior {
+    Simple { accept: bool },
+    EnglishStem,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextSearchMappings {
+    pub dictionaries: [[i32; TEXT_SEARCH_DICTIONARIES_PER_TOKEN]; TEXT_SEARCH_TOKEN_TYPES],
+    pub counts: [u8; TEXT_SEARCH_TOKEN_TYPES],
+}
+
+impl TextSearchMappings {
+    pub(crate) const EMPTY: Self = Self {
+        dictionaries: [[0; TEXT_SEARCH_DICTIONARIES_PER_TOKEN]; TEXT_SEARCH_TOKEN_TYPES],
+        counts: [0; TEXT_SEARCH_TOKEN_TYPES],
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextSearchDefinition {
+    Parser {
+        schema: SqlName,
+        name: SqlName,
+        oid: i32,
+        start: i32,
+        gettoken: i32,
+        end: i32,
+        headline: i32,
+        lextypes: i32,
+    },
+    Template {
+        schema: SqlName,
+        name: SqlName,
+        oid: i32,
+        init: i32,
+        lexize: i32,
+        behavior: TextSearchDictionaryBehavior,
+    },
+    Dictionary {
+        schema: SqlName,
+        name: SqlName,
+        oid: i32,
+        owner: i32,
+        template: i32,
+        options: StackStr<512>,
+        behavior: TextSearchDictionaryBehavior,
+    },
+    Configuration {
+        schema: SqlName,
+        name: SqlName,
+        oid: i32,
+        owner: i32,
+        parser: i32,
+        mappings: TextSearchMappings,
+    },
+}
+
+impl TextSearchDefinition {
+    pub(crate) const EMPTY: Self = Self::Parser {
+        schema: SqlName::EMPTY,
+        name: SqlName::EMPTY,
+        oid: 0,
+        start: 0,
+        gettoken: 0,
+        end: 0,
+        headline: 0,
+        lextypes: 0,
+    };
+
+    pub(crate) const fn kind(self) -> crate::sql::ast::TextSearchObjectKind {
+        match self {
+            Self::Parser { .. } => crate::sql::ast::TextSearchObjectKind::Parser,
+            Self::Template { .. } => crate::sql::ast::TextSearchObjectKind::Template,
+            Self::Dictionary { .. } => crate::sql::ast::TextSearchObjectKind::Dictionary,
+            Self::Configuration { .. } => crate::sql::ast::TextSearchObjectKind::Configuration,
+        }
+    }
+
+    fn executable_shape(self) -> bool {
+        match self {
+            Self::Parser {
+                start,
+                gettoken,
+                end,
+                headline,
+                lextypes,
+                ..
+            } => {
+                (start, gettoken, end, lextypes) == (3717, 3718, 3719, 3721)
+                    && matches!(headline, 0 | 3720)
+            }
+            Self::Template {
+                init,
+                lexize,
+                behavior,
+                ..
+            } => matches!(
+                (init, lexize, behavior),
+                (
+                    0 | 3725,
+                    3726,
+                    TextSearchDictionaryBehavior::Simple { accept: true }
+                ) | (13_232, 13_233, TextSearchDictionaryBehavior::EnglishStem)
+            ),
+            Self::Dictionary { .. } => true,
+            Self::Configuration { mappings, .. } => (0..TEXT_SEARCH_TOKEN_TYPES).all(|token| {
+                usize::from(mappings.counts[token]) <= TEXT_SEARCH_DICTIONARIES_PER_TOKEN
+                    && mappings.dictionaries[token][usize::from(mappings.counts[token])..]
+                        .iter()
+                        .all(|dictionary| *dictionary == 0)
+                    && mappings.dictionaries[token][..usize::from(mappings.counts[token])]
+                        .iter()
+                        .all(|dictionary| *dictionary > 0)
+            }),
+        }
+    }
+
+    pub(crate) const fn schema(self) -> SqlName {
+        match self {
+            Self::Parser { schema, .. }
+            | Self::Template { schema, .. }
+            | Self::Dictionary { schema, .. }
+            | Self::Configuration { schema, .. } => schema,
+        }
+    }
+
+    pub(crate) const fn name(self) -> SqlName {
+        match self {
+            Self::Parser { name, .. }
+            | Self::Template { name, .. }
+            | Self::Dictionary { name, .. }
+            | Self::Configuration { name, .. } => name,
+        }
+    }
+
+    pub(crate) const fn oid(self) -> i32 {
+        match self {
+            Self::Parser { oid, .. }
+            | Self::Template { oid, .. }
+            | Self::Dictionary { oid, .. }
+            | Self::Configuration { oid, .. } => oid,
+        }
+    }
+
+    pub(crate) const fn owner(self) -> Option<i32> {
+        match self {
+            Self::Dictionary { owner, .. } | Self::Configuration { owner, .. } => Some(owner),
+            Self::Parser { .. } | Self::Template { .. } => None,
+        }
+    }
+
+    pub(crate) fn rename(&mut self, schema: Option<SqlName>, name: Option<SqlName>) {
+        match self {
+            Self::Parser {
+                schema: s, name: n, ..
+            }
+            | Self::Template {
+                schema: s, name: n, ..
+            }
+            | Self::Dictionary {
+                schema: s, name: n, ..
+            }
+            | Self::Configuration {
+                schema: s, name: n, ..
+            } => {
+                if let Some(schema) = schema {
+                    *s = schema;
+                }
+                if let Some(name) = name {
+                    *n = name;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_oid(&mut self, value: i32) {
+        match self {
+            Self::Parser { oid, .. }
+            | Self::Template { oid, .. }
+            | Self::Dictionary { oid, .. }
+            | Self::Configuration { oid, .. } => *oid = value,
+        }
+    }
+
+    pub(crate) fn set_owner(&mut self, value: i32) -> bool {
+        match self {
+            Self::Dictionary { owner, .. } | Self::Configuration { owner, .. } => {
+                *owner = value;
+                true
+            }
+            Self::Parser { .. } | Self::Template { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingTextSearchDefinition {
+    pub txid: u32,
+    pub definition: TextSearchDefinition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TextSearchDef {
+    pub(crate) database: DatabaseOid,
+    pub created_at: u64,
+    pub definition: TextSearchDefinition,
+    pub pending: Option<PendingTextSearchDefinition>,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl TextSearchDef {
+    pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        definition: TextSearchDefinition::EMPTY,
+        pending: None,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
+
+    pub(crate) fn definition_for(self, txid: u32) -> TextSearchDefinition {
+        self.pending
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.definition, |pending| pending.definition)
     }
 }
 
@@ -2856,6 +3121,7 @@ pub enum DependencyClass {
     Routine = 7,
     Operator = 8,
     Collation = 9,
+    TextSearchConfiguration = 10,
 }
 
 impl DependencyClass {
@@ -2870,6 +3136,7 @@ impl DependencyClass {
             7 => Some(Self::Routine),
             8 => Some(Self::Operator),
             9 => Some(Self::Collation),
+            10 => Some(Self::TextSearchConfiguration),
             _ => None,
         }
     }
@@ -8834,6 +9101,10 @@ pub enum CommentClass {
     Conversion,
     EventTrigger,
     Rule,
+    TextSearchParser,
+    TextSearchTemplate,
+    TextSearchDictionary,
+    TextSearchConfiguration,
 }
 
 impl CommentClass {
@@ -8850,6 +9121,10 @@ impl CommentClass {
             CommentClass::Conversion => 8,
             CommentClass::EventTrigger => 9,
             CommentClass::Rule => 10,
+            CommentClass::TextSearchParser => 11,
+            CommentClass::TextSearchTemplate => 12,
+            CommentClass::TextSearchDictionary => 13,
+            CommentClass::TextSearchConfiguration => 14,
         }
     }
 
@@ -8866,8 +9141,23 @@ impl CommentClass {
             8 => CommentClass::Conversion,
             9 => CommentClass::EventTrigger,
             10 => CommentClass::Rule,
+            11 => CommentClass::TextSearchParser,
+            12 => CommentClass::TextSearchTemplate,
+            13 => CommentClass::TextSearchDictionary,
+            14 => CommentClass::TextSearchConfiguration,
             _ => return None,
         })
+    }
+}
+
+fn text_search_comment_class(kind: crate::sql::ast::TextSearchObjectKind) -> CommentClass {
+    match kind {
+        crate::sql::ast::TextSearchObjectKind::Parser => CommentClass::TextSearchParser,
+        crate::sql::ast::TextSearchObjectKind::Template => CommentClass::TextSearchTemplate,
+        crate::sql::ast::TextSearchObjectKind::Dictionary => CommentClass::TextSearchDictionary,
+        crate::sql::ast::TextSearchObjectKind::Configuration => {
+            CommentClass::TextSearchConfiguration
+        }
     }
 }
 
@@ -9111,6 +9401,7 @@ pub struct Storage {
     operator_classes: FixedVec<OperatorClassDef>,
     collations: FixedVec<CollationDef>,
     conversions: FixedVec<ConversionDef>,
+    text_search_objects: FixedVec<TextSearchDef>,
     event_triggers: FixedVec<EventTriggerDef>,
     routine_dependencies: FixedVec<StoredQueryDependencies>,
     pending_routine_dependencies: FixedVec<PendingRoutineDependencies>,
@@ -9647,6 +9938,12 @@ impl Storage {
                     }
                 },
                 DependencyClass::Collation => self.collation_slot(schema, name, txid),
+                DependencyClass::TextSearchConfiguration => self.text_search_slot(
+                    crate::sql::ast::TextSearchObjectKind::Configuration,
+                    schema,
+                    name,
+                    txid,
+                ),
             }
             .ok_or_else(|| {
                 sql_err!(
@@ -9848,6 +10145,7 @@ impl Storage {
             + config.max_rules * size_of::<RuleDef>()
             + MAX_COLLATIONS * size_of::<CollationDef>()
             + MAX_CONVERSIONS * size_of::<ConversionDef>()
+            + MAX_TEXT_SEARCH_OBJECTS * size_of::<TextSearchDef>()
             + MAX_EVENT_TRIGGERS * size_of::<EventTriggerDef>()
             + config.max_replication_slots * size_of::<ReplicationSlotDef>()
             + config.max_subscriptions * size_of::<SubscriptionDef>()
@@ -10015,6 +10313,102 @@ impl Storage {
             conversions
                 .push(ConversionDef::EMPTY)
                 .expect("sized to conversion capacity");
+        }
+        let mut text_search_objects =
+            FixedVec::new(budget, "text_search_objects", MAX_TEXT_SEARCH_OBJECTS)?;
+        for _ in 0..MAX_TEXT_SEARCH_OBJECTS {
+            text_search_objects
+                .push(TextSearchDef::EMPTY)
+                .expect("sized to text search capacity");
+        }
+        let pg_catalog = SqlName::parse("pg_catalog").expect("builtin schema fits");
+        let present = |definition| TextSearchDef {
+            database: DatabaseOid::POSTGRES,
+            created_at: 0,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        text_search_objects[0] = present(TextSearchDefinition::Parser {
+            schema: pg_catalog,
+            name: SqlName::parse("default").expect("builtin name fits"),
+            oid: 3722,
+            start: 3717,
+            gettoken: 3718,
+            end: 3719,
+            headline: 3720,
+            lextypes: 3721,
+        });
+        text_search_objects[1] = present(TextSearchDefinition::Template {
+            schema: pg_catalog,
+            name: SqlName::parse("simple").expect("builtin name fits"),
+            oid: 3727,
+            init: 3725,
+            lexize: 3726,
+            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
+        });
+        text_search_objects[2] = present(TextSearchDefinition::Template {
+            schema: pg_catalog,
+            name: SqlName::parse("snowball").expect("builtin name fits"),
+            oid: 13_234,
+            init: 13_232,
+            lexize: 13_233,
+            behavior: TextSearchDictionaryBehavior::EnglishStem,
+        });
+        text_search_objects[3] = present(TextSearchDefinition::Dictionary {
+            schema: pg_catalog,
+            name: SqlName::parse("simple").expect("builtin name fits"),
+            oid: 3765,
+            owner: 10,
+            template: 3727,
+            options: StackStr::new(),
+            behavior: TextSearchDictionaryBehavior::Simple { accept: true },
+        });
+        text_search_objects[4] = present(TextSearchDefinition::Dictionary {
+            schema: pg_catalog,
+            name: SqlName::parse("english_stem").expect("builtin name fits"),
+            oid: 13_247,
+            owner: 10,
+            template: 13_234,
+            options: StackStr::from_str("language = 'english', stopwords = 'english'"),
+            behavior: TextSearchDictionaryBehavior::EnglishStem,
+        });
+        let mut simple_mappings = TextSearchMappings::EMPTY;
+        for token in [
+            1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16, 17, 18, 19, 20, 21, 22,
+        ] {
+            simple_mappings.dictionaries[token - 1][0] = 3765;
+            simple_mappings.counts[token - 1] = 1;
+        }
+        text_search_objects[5] = present(TextSearchDefinition::Configuration {
+            schema: pg_catalog,
+            name: SqlName::parse("simple").expect("builtin name fits"),
+            oid: 3748,
+            owner: 10,
+            parser: 3722,
+            mappings: simple_mappings,
+        });
+        let mut english_mappings = simple_mappings;
+        for token in [1usize, 2, 10, 11, 16, 17] {
+            english_mappings.dictionaries[token - 1][0] = 13_247;
+        }
+        text_search_objects[6] = present(TextSearchDefinition::Configuration {
+            schema: pg_catalog,
+            name: SqlName::parse("english").expect("builtin name fits"),
+            oid: 13_248,
+            owner: 10,
+            parser: 3722,
+            mappings: english_mappings,
+        });
+        for (database, offset) in [
+            (DatabaseOid::TEMPLATE1, 7usize),
+            (DatabaseOid::TEMPLATE0, 14usize),
+        ] {
+            for builtin in 0..7 {
+                let mut definition = text_search_objects[builtin];
+                definition.database = database;
+                text_search_objects[offset + builtin] = definition;
+            }
         }
         let mut event_triggers = FixedVec::new(budget, "event_triggers", MAX_EVENT_TRIGGERS)?;
         for _ in 0..MAX_EVENT_TRIGGERS {
@@ -10483,6 +10877,7 @@ impl Storage {
             operator_classes,
             collations,
             conversions,
+            text_search_objects,
             event_triggers,
             routine_dependencies,
             pending_routine_dependencies,
@@ -11356,6 +11751,27 @@ impl Storage {
                 definition.ddl_state = CatalogDdlState::PendingCreate { txid };
                 self.collations[target_slot] = definition;
                 *target_mapping = target_slot as u8;
+            }
+            for source_slot in 0..self.text_search_objects.len() {
+                let mut definition = self.text_search_objects[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .text_search_objects
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "text-search catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.pending = None;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.text_search_objects[target_slot] = definition;
             }
             for source_slot in 0..self.conversions.len() {
                 let mut definition = self.conversions[source_slot];
@@ -12421,7 +12837,9 @@ impl Storage {
         clear_catalog!(casts);
         clear_catalog!(operators);
         clear_catalog!(collations);
+        clear_catalog!(text_search_objects);
         clear_catalog!(conversions);
+        clear_catalog!(event_triggers);
         clear_catalog!(operator_families);
         clear_catalog!(operator_classes);
         clear_catalog!(triggers);
@@ -12534,6 +12952,7 @@ impl Storage {
         commit_catalog!(casts);
         commit_catalog!(operators);
         commit_catalog!(collations);
+        commit_catalog!(text_search_objects);
         commit_catalog!(conversions);
         commit_catalog!(event_triggers);
         commit_catalog!(operator_families);
@@ -13207,6 +13626,15 @@ impl Storage {
 
     pub(crate) fn checkpoint_collations(&self) -> impl Iterator<Item = (usize, &CollationDef)> {
         self.collations
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_text_search_objects(
+        &self,
+    ) -> impl Iterator<Item = (usize, &TextSearchDef)> {
+        self.text_search_objects
             .iter()
             .enumerate()
             .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
@@ -15571,6 +15999,31 @@ impl Storage {
                 .expect("filtered pending comment identity");
             comment.schema = pending.schema;
             comment.name = pending.name;
+        }
+    }
+
+    fn replay_object_comment_identity(
+        &mut self,
+        class: CommentClass,
+        old_schema: SqlName,
+        old_name: SqlName,
+        new_schema: SqlName,
+        new_name: SqlName,
+    ) {
+        if old_schema == new_schema && old_name == new_name {
+            return;
+        }
+        let database = Some(self.current_database);
+        for comment in self.comments.iter_mut().filter(|comment| {
+            comment.used
+                && comment.database == database
+                && comment.class == class
+                && comment.schema == old_schema
+                && comment.name == old_name
+        }) {
+            comment.schema = new_schema;
+            comment.name = new_name;
+            comment.pending_identity = None;
         }
     }
 
@@ -30404,6 +30857,72 @@ impl Storage {
             .map(move |(slot, conversion)| (slot, conversion.definition_for(txid)))
     }
 
+    pub(crate) fn text_search_objects_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, TextSearchDefinition)> + '_ {
+        self.text_search_objects
+            .iter()
+            .enumerate()
+            .filter(move |(_, object)| {
+                object.database == self.current_database && object.visible_to(txid)
+            })
+            .map(move |(slot, object)| (slot, object.definition_for(txid)))
+    }
+
+    pub(crate) fn text_search_object(&self, slot: usize) -> TextSearchDef {
+        self.text_search_objects[slot]
+    }
+
+    pub(crate) fn text_search_slot(
+        &self,
+        kind: crate::sql::ast::TextSearchObjectKind,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        self.text_search_objects_visible_to(txid)
+            .find_map(|(slot, definition)| {
+                (definition.kind() == kind
+                    && definition.schema().as_str() == schema
+                    && definition.name().as_str() == name)
+                    .then_some(slot)
+            })
+    }
+
+    pub(crate) fn text_search_slot_on_path(
+        &self,
+        kind: crate::sql::ast::TextSearchObjectKind,
+        schema: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<usize> {
+        match schema {
+            Some(schema) => self.text_search_slot(kind, schema, name, txid),
+            None => self.path.entries().iter().find_map(|entry| match entry {
+                PathEntry::Schema(slot) => self.text_search_slot(
+                    kind,
+                    self.schemas[*slot as usize].name.as_str(),
+                    name,
+                    txid,
+                ),
+                PathEntry::Catalog => self.text_search_slot(kind, "pg_catalog", name, txid),
+            }),
+        }
+    }
+
+    pub(crate) fn text_search_slot_by_oid(
+        &self,
+        kind: crate::sql::ast::TextSearchObjectKind,
+        oid: i32,
+        txid: u32,
+    ) -> Option<usize> {
+        self.text_search_objects_visible_to(txid)
+            .find_map(|(slot, definition)| {
+                (definition.kind() == kind && definition.oid() == oid).then_some(slot)
+            })
+    }
+
     pub(crate) fn collation(&self, slot: usize) -> CollationDef {
         self.collations[slot]
     }
@@ -30604,6 +31123,272 @@ impl Storage {
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         Ok(slot)
+    }
+
+    pub(crate) fn create_text_search_object(
+        &mut self,
+        mut definition: TextSearchDefinition,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if !definition.executable_shape() {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "text-search definition is not executable"
+            ));
+        }
+        self.require_schema_create(definition.schema().as_str(), txid)?;
+        if self
+            .text_search_slot(
+                definition.kind(),
+                definition.schema().as_str(),
+                definition.name().as_str(),
+                txid,
+            )
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "{} \"{}\" already exists",
+                definition.kind().noun(),
+                definition.name().as_str()
+            ));
+        }
+        let slot = self
+            .text_search_objects
+            .iter()
+            .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many text search objects (limit {})",
+                    MAX_TEXT_SEARCH_OBJECTS
+                )
+            })?;
+        let base = match definition.kind() {
+            crate::sql::ast::TextSearchObjectKind::Parser => 310_000,
+            crate::sql::ast::TextSearchObjectKind::Template => 311_000,
+            crate::sql::ast::TextSearchObjectKind::Dictionary => 312_000,
+            crate::sql::ast::TextSearchObjectKind::Configuration => 313_000,
+        };
+        definition.set_oid(base + slot as i32);
+        self.catalog_seq = self.catalog_seq.saturating_add(1);
+        self.text_search_objects[slot] = TextSearchDef {
+            database: self.current_database,
+            created_at: self.catalog_seq,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn alter_text_search_object(
+        &mut self,
+        slot: usize,
+        definition: TextSearchDefinition,
+        txid: u32,
+    ) -> Result<Option<PendingTextSearchDefinition>, SqlError> {
+        if !definition.executable_shape() {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "text-search definition is not executable"
+            ));
+        }
+        let old = self.text_search_objects[slot].definition_for(txid);
+        if let Some(other) = self.text_search_slot(
+            definition.kind(),
+            definition.schema().as_str(),
+            definition.name().as_str(),
+            txid,
+        ) && other != slot
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "{} already exists",
+                definition.kind().noun()
+            ));
+        }
+        let prior = self.text_search_objects[slot].pending;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(sql_err!(
+                sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "{} is being altered by another transaction",
+                definition.kind().noun()
+            ));
+        }
+        self.text_search_objects[slot].pending =
+            Some(PendingTextSearchDefinition { txid, definition });
+        self.stage_object_comment_identity(
+            text_search_comment_class(old.kind()),
+            old.schema(),
+            old.name(),
+            definition.schema(),
+            definition.name(),
+            txid,
+        );
+        Ok(prior)
+    }
+
+    pub(crate) fn drop_text_search_object(&mut self, slot: usize, txid: u32) {
+        self.text_search_objects[slot].ddl_state =
+            self.text_search_objects[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_text_search_create(&mut self, slot: usize) {
+        self.text_search_objects[slot].ddl_state =
+            self.text_search_objects[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_text_search_create(&mut self, slot: usize) {
+        self.text_search_objects[slot].ddl_state =
+            self.text_search_objects[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_text_search_alter(&mut self, slot: usize, txid: u32) {
+        let old = self.text_search_objects[slot].definition;
+        let changed = self.text_search_objects[slot]
+            .pending
+            .filter(|pending| pending.txid == txid)
+            .map(|pending| pending.definition);
+        if let Some(pending) = self.text_search_objects[slot].pending
+            && pending.txid == txid
+        {
+            self.text_search_objects[slot].definition = pending.definition;
+            self.text_search_objects[slot].pending = None;
+            self.commit_object_comment_identity(
+                text_search_comment_class(old.kind()),
+                old.schema(),
+                old.name(),
+                txid,
+            );
+        }
+        if let Some(definition) = changed
+            && definition.kind() == crate::sql::ast::TextSearchObjectKind::Configuration
+        {
+            self.rename_stored_query_dependency(
+                DependencyClass::TextSearchConfiguration,
+                slot,
+                definition.schema(),
+                definition.name(),
+            );
+        }
+    }
+
+    pub(crate) fn rollback_text_search_alter(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingTextSearchDefinition>,
+    ) {
+        let txid = self.text_search_objects[slot]
+            .pending
+            .map_or(0, |pending| pending.txid);
+        self.text_search_objects[slot].pending = prior;
+        let committed = self.text_search_objects[slot].definition;
+        let visible = prior.map_or(committed, |pending| pending.definition);
+        self.stage_object_comment_identity(
+            text_search_comment_class(committed.kind()),
+            committed.schema(),
+            committed.name(),
+            visible.schema(),
+            visible.name(),
+            txid,
+        );
+    }
+
+    pub(crate) fn commit_text_search_drop(&mut self, slot: usize) {
+        let definition = self.text_search_objects[slot].definition;
+        self.drop_object_comments(
+            text_search_comment_class(definition.kind()),
+            definition.schema().as_str(),
+            definition.name().as_str(),
+        );
+        self.text_search_objects[slot].pending = None;
+        self.text_search_objects[slot].ddl_state =
+            self.text_search_objects[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_text_search_drop(&mut self, slot: usize, txid: u32) {
+        self.text_search_objects[slot].ddl_state =
+            self.text_search_objects[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn replay_text_search_object(
+        &mut self,
+        slot: usize,
+        created_at: u64,
+        definition: TextSearchDefinition,
+    ) -> Result<(), SqlError> {
+        if slot >= self.text_search_objects.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "journal text search object slot is out of range"
+            ));
+        }
+        if definition.oid() <= 0 || !definition.executable_shape() {
+            return Err(sql_err!(
+                sqlstate::INVALID_OBJECT_DEFINITION,
+                "journal text-search definition is invalid"
+            ));
+        }
+        if self
+            .text_search_objects
+            .iter()
+            .enumerate()
+            .any(|(other, candidate)| {
+                other != slot
+                    && candidate.database == self.current_database
+                    && candidate.ddl_state != CatalogDdlState::Absent
+                    && candidate.definition.kind() == definition.kind()
+                    && candidate.definition.schema() == definition.schema()
+                    && candidate.definition.name() == definition.name()
+            })
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "journal replays duplicate {} \"{}\"",
+                definition.kind().noun(),
+                definition.name().as_str()
+            ));
+        }
+        if self.text_search_objects[slot].ddl_state != CatalogDdlState::Absent {
+            let old = self.text_search_objects[slot].definition;
+            self.replay_object_comment_identity(
+                text_search_comment_class(old.kind()),
+                old.schema(),
+                old.name(),
+                definition.schema(),
+                definition.name(),
+            );
+            if definition.kind() == crate::sql::ast::TextSearchObjectKind::Configuration {
+                self.rename_stored_query_dependency(
+                    DependencyClass::TextSearchConfiguration,
+                    slot,
+                    definition.schema(),
+                    definition.name(),
+                );
+            }
+        }
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        self.text_search_objects[slot] = TextSearchDef {
+            database: self.current_database,
+            created_at,
+            definition,
+            pending: None,
+            ddl_state: CatalogDdlState::Present,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn replay_drop_text_search_object(
+        &mut self,
+        kind: crate::sql::ast::TextSearchObjectKind,
+        schema: &str,
+        name: &str,
+    ) {
+        if let Some(slot) = self.text_search_slot(kind, schema, name, 0) {
+            self.drop_object_comments(text_search_comment_class(kind), schema, name);
+            self.text_search_objects[slot] = TextSearchDef::EMPTY;
+        }
     }
 
     pub(crate) fn alter_collation(
@@ -30853,6 +31638,22 @@ impl Storage {
                 definition.name.as_str()
             ));
         }
+        if self.collations[slot].ddl_state != CatalogDdlState::Absent {
+            let old = self.collations[slot].definition;
+            self.replay_object_comment_identity(
+                CommentClass::Collation,
+                old.schema,
+                old.name,
+                definition.schema,
+                definition.name,
+            );
+            self.rename_stored_query_dependency(
+                DependencyClass::Collation,
+                slot,
+                definition.schema,
+                definition.name,
+            );
+        }
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.collations[slot] = CollationDef {
             database: self.current_database,
@@ -30900,6 +31701,16 @@ impl Storage {
                 "journal replays duplicate conversion \"{}\"",
                 definition.name.as_str()
             ));
+        }
+        if self.conversions[slot].ddl_state != CatalogDdlState::Absent {
+            let old = self.conversions[slot].definition;
+            self.replay_object_comment_identity(
+                CommentClass::Conversion,
+                old.schema,
+                old.name,
+                definition.schema,
+                definition.name,
+            );
         }
         self.catalog_seq = self.catalog_seq.max(created_at);
         self.conversions[slot] = ConversionDef {
@@ -32812,10 +33623,14 @@ mod tests {
             CommentClass::Conversion,
             CommentClass::EventTrigger,
             CommentClass::Rule,
+            CommentClass::TextSearchParser,
+            CommentClass::TextSearchTemplate,
+            CommentClass::TextSearchDictionary,
+            CommentClass::TextSearchConfiguration,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(11), None);
+        assert_eq!(CommentClass::from_u8(15), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 

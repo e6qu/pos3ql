@@ -7,6 +7,368 @@
 use super::*;
 
 #[test]
+fn full_text_values_functions_operators_storage_and_generated_columns() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT 'Fat foo foo:3B foo:2A'::tsvector, \
+                'fat'::tsquery && 'rat'::tsquery, \
+                'fat'::tsquery || 'rat'::tsquery, \
+                'fat'::tsquery <-> 'rat'::tsquery, \
+                !!'fat'::tsquery; \
+         SELECT to_tsvector('english', 'The Fat Rats'), \
+                plainto_tsquery('english', 'The Fat Rats'), \
+                phraseto_tsquery('english', 'The Fat Rats'), \
+                to_tsvector('english', 'The Fat Rats') @@ plainto_tsquery('english', 'fat rat'); \
+         SELECT websearch_to_tsquery('english', '\"fat rat\" -cat OR dog'), \
+                array_to_tsvector(ARRAY['rat', 'fat', 'rat']), \
+                tsvector_to_array('rat fat rat'::tsvector), \
+                length('fat:2,4 cat:3 rat:5A'::tsvector), \
+                tsquery_phrase('fat'::tsquery, 'rat'::tsquery, 7); \
+         SELECT ts_filter('a:1A,2B b:3C'::tsvector, ARRAY['A','C']::\"char\"[]), \
+                ts_rank('a:1,2,3'::tsvector, 'a'::tsquery), \
+                ts_rank(ARRAY[0.2,0.4,0.6,0.8]::real[], \
+                        'a:1A b:4B'::tsvector, 'a | b'::tsquery, 32); \
+         SELECT to_tsquery('english', 'The & Cats'), \
+                to_tsquery('english', 'Dogs | Cats:*AB'), \
+                to_tsquery('english', '!(Running <2> Mice)'), \
+                to_tsquery('simple', 'foo-bar'); \
+         SELECT ts_headline('english', 'The fat cats ran quickly.', 'cat'::tsquery), \
+                ts_headline('english', 'The fat cats.', 'cat'::tsquery, \
+                            'StartSel=<i>, StopSel=</i>'), \
+                ts_headline('simple', 'english', 'english'::tsquery); \
+         SELECT ts_headline('simple', \
+                  'one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty cats twentyone twentytwo twentythree twentyfour twentyfive twentysix twentyseven twentyeight twentynine thirty thirtyone thirtytwo thirtythree thirtyfour thirtyfive thirtysix thirtyseven thirtyeight thirtynine forty', \
+                  'cats'::tsquery), \
+                ts_headline('simple', \
+                  'one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty cats twentyone twentytwo twentythree twentyfour twentyfive twentysix twentyseven twentyeight twentynine thirty thirtyone thirtytwo thirtythree thirtyfour thirtyfive thirtysix thirtyseven thirtyeight thirtynine forty', \
+                  'cats'::tsquery, 'MaxWords=8, MinWords=4, ShortWord=0'), \
+                ts_headline('simple', \
+                  'one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty cats twentyone twentytwo twentythree twentyfour twentyfive twentysix twentyseven twentyeight twentynine thirty thirtyone thirtytwo thirtythree thirtyfour thirtyfive thirtysix thirtyseven thirtyeight thirtynine forty', \
+                  'cats'::tsquery, 'MaxWords=8, MinWords=4, MaxFragments=2, FragmentDelimiter=||'); \
+         CREATE TABLE search_documents( \
+             id integer PRIMARY KEY, \
+             body text NOT NULL, \
+             terms tsvector GENERATED ALWAYS AS (to_tsvector('english', body)) STORED, \
+             query tsquery \
+         ); \
+         INSERT INTO search_documents(id, body, query) VALUES \
+             (1, 'The Fat Rats', plainto_tsquery('english', 'fat rat')), \
+             (2, 'Slow Cats', plainto_tsquery('english', 'cat')); \
+         CREATE INDEX search_terms_idx ON search_documents(terms); \
+         CREATE INDEX search_query_idx ON search_documents(query); \
+         CREATE INDEX search_body_terms_idx ON search_documents \
+             ((to_tsvector('english', body))); \
+         SELECT id, terms, query, terms @@ query FROM search_documents ORDER BY id; \
+         SELECT indexname FROM pg_indexes WHERE tablename = 'search_documents' \
+             ORDER BY indexname",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "'Fat' 'foo':2A,3B|'fat' & 'rat'|'fat' | 'rat'|'fat' <-> 'rat'|!'fat'",
+            "'fat':2 'rat':3|'fat' & 'rat'|'fat' <-> 'rat'|t",
+            "'fat' <-> 'rat' & !'cat' | 'dog'|'fat' 'rat'|{fat,rat}|3|'fat' <7> 'rat'",
+            "'a':1A 'b':3C|0.082745634|0.29851586",
+            "'cat'|'dog' | 'cat':*AB|!( 'run' <2> 'mice' )|'foo-bar' <-> 'foo' <-> 'bar'",
+            "The fat <b>cats</b> ran quickly.|The fat <i>cats</i>.|<b>english</b>",
+            "<b>cats</b> twentyone twentytwo twentythree twentyfour twentyfive twentysix twentyseven twentyeight twentynine thirty thirtyone thirtytwo thirtythree thirtyfour|<b>cats</b> twentyone twentytwo twentythree|eighteen nineteen twenty <b>cats</b> twentyone twentytwo twentythree twentyfour",
+            "1|'fat':2 'rat':3|'fat' & 'rat'|t",
+            "2|'cat':2 'slow':1|'cat'|t",
+            "search_body_terms_idx",
+            "search_documents_pkey",
+            "search_query_idx",
+            "search_terms_idx",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn full_text_json_filters_and_session_configuration_match_postgresql() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT to_tsvector('simple', '{\"a\":\"cat dog\",\"b\":[\"rat\",\"mouse\"]}'::jsonb), \
+                jsonb_to_tsvector('simple', \
+                    '{\"a\":\"cat dog\",\"b\":42,\"c\":true}'::jsonb, '[\"all\"]'::jsonb), \
+                jsonb_to_tsvector('simple', \
+                    '{\"a\":\"cat dog\",\"b\":42,\"c\":true}'::jsonb, \
+                    '[\"key\",\"numeric\",\"boolean\"]'::jsonb); \
+         SELECT ts_headline('simple', \
+                  '{\"a\":\"cat dog\", \"n\": 1, \"x\":[\"rat cat\"]}'::json, \
+                  'cat'::tsquery), \
+                ts_headline('simple', \
+                  '{\"a\":\"cat dog\", \"n\": 1, \"x\":[\"rat cat\"]}'::jsonb, \
+                  'cat'::tsquery); \
+         SET default_text_search_config = 'pg_catalog.simple'; \
+         SELECT get_current_ts_config(), to_tsvector('The Cats'); \
+         RESET default_text_search_config; \
+         SELECT get_current_ts_config(), to_tsvector('The Cats')",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "'cat':1 'dog':2 'mouse':6 'rat':4|'42':8 'a':1 'b':6 'c':10 'cat':3 'dog':4 'true':12|'42':5 'a':1 'b':3 'c':7 'true':9",
+            "{\"a\":\"<b>cat</b> dog\",\"n\":1,\"x\":[\"rat <b>cat</b>\"]}|{\"a\": \"<b>cat</b> dog\", \"n\": 1, \"x\": [\"rat <b>cat</b>\"]}",
+            "simple|'cats':2 'the':1",
+            "english|'cat':2",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+#[test]
+fn full_text_query_rewrite_and_vector_unnest_are_typed() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ts_rewrite('a & (b | a:*A)'::tsquery, 'a'::tsquery, 'c'::tsquery), \
+                ts_rewrite('a & b'::tsquery, 'b'::tsquery, ''::tsquery); \
+         SELECT lexeme, positions, weights \
+           FROM unnest('a:1A,2 b:3C'::tsvector) ORDER BY lexeme; \
+         CREATE TABLE full_text_statistics(value tsvector); \
+         CREATE TABLE full_text_rewrites(target tsquery, substitute tsquery); \
+         INSERT INTO full_text_rewrites VALUES ('a', 'c'), ('b', 'd'); \
+         SELECT ts_rewrite('a & b'::tsquery, \
+           'SELECT target, substitute FROM full_text_rewrites ORDER BY target'); \
+         INSERT INTO full_text_statistics VALUES \
+           ('a:1A,2B b:3C'), ('a c'), ('d'); \
+         SELECT word, ndoc, nentry \
+           FROM ts_stat('SELECT value FROM full_text_statistics'); \
+         SELECT word, ndoc, nentry \
+           FROM ts_stat('SELECT value FROM full_text_statistics', 'A'); \
+         DROP TABLE full_text_statistics, full_text_rewrites",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "'c' & ( 'b' | 'c' )|'a'",
+            "a|{1,2}|{A,D}",
+            "b|{3}|{C}",
+            "'c' & 'd'",
+            "d|1|1",
+            "c|1|1",
+            "b|1|1",
+            "a|2|3",
+            "a|1|1",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output),
+    );
+}
+
+#[test]
+fn text_search_catalog_lifecycle_executes_and_remains_transactional() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA search_tools; \
+         CREATE TEXT SEARCH PARSER search_tools.default_copy ( \
+           START = prsd_start, GETTOKEN = prsd_nexttoken, END = prsd_end, \
+           HEADLINE = prsd_headline, LEXTYPES = prsd_lextype); \
+         CREATE TEXT SEARCH TEMPLATE search_tools.simple_copy ( \
+           INIT = dsimple_init, LEXIZE = dsimple_lexize); \
+         CREATE TEXT SEARCH DICTIONARY search_tools.words ( \
+           TEMPLATE = search_tools.simple_copy, ACCEPT = true); \
+         CREATE TEXT SEARCH CONFIGURATION search_tools.documents ( \
+           PARSER = search_tools.default_copy); \
+         ALTER TEXT SEARCH CONFIGURATION search_tools.documents \
+           ADD MAPPING FOR asciiword, word, numword, uint WITH search_tools.words; \
+         COMMENT ON TEXT SEARCH CONFIGURATION search_tools.documents IS 'document search'; \
+         CREATE VIEW search_tools.document_terms AS \
+           SELECT to_tsvector('search_tools.documents', 'Cats') AS terms; \
+         SELECT to_tsvector('search_tools.documents', 'Cats 42'), \
+                obj_description(c.oid, 'pg_ts_config'), \
+                ts_lexize('search_tools.words'::regdictionary, 'Cats') \
+           FROM pg_ts_config c WHERE c.cfgname = 'documents'",
+    );
+    assert!(
+        !message_types(&created).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert_eq!(
+        data_rows(&created),
+        ["'42':2 'cats':1|document search|{cats}"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT tokid, token FROM ts_parse('search_tools.default_copy', 'foo@example.com'); \
+             SELECT count(*), min(tokid), max(tokid) FROM ts_token_type('search_tools.default_copy'); \
+             SELECT alias, token, dictionary::text, lexemes::text \
+               FROM ts_debug('search_tools.documents', 'Cats 42') ORDER BY token",
+        )),
+        [
+            "4|foo@example.com",
+            "23|1|23",
+            "blank| |NULL|NULL",
+            "uint|42|search_tools.words|{42}",
+            "asciiword|Cats|search_tools.words|{cats}",
+        ],
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_ts_parser WHERE prsname='default_copy'; \
+             SELECT count(*) FROM pg_ts_template WHERE tmplname='simple_copy'; \
+             SELECT count(*) FROM pg_ts_dict WHERE dictname='words'; \
+             SELECT count(*) FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid=m.mapcfg \
+              WHERE c.cfgname='documents'; \
+             SELECT oid::regproc FROM pg_proc WHERE oid IN \
+              (3717,3718,3719,3720,3721,3725,3726) ORDER BY oid; \
+             SELECT typname, typcategory, typstorage FROM pg_type \
+              WHERE oid IN (3614,3615) ORDER BY oid",
+        )),
+        [
+            "1",
+            "1",
+            "1",
+            "4",
+            "prsd_start",
+            "prsd_nexttoken",
+            "prsd_end",
+            "prsd_headline",
+            "prsd_lextype",
+            "dsimple_init",
+            "dsimple_lexize",
+            "tsvector|U|x",
+            "tsquery|U|p",
+        ]
+    );
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER TEXT SEARCH DICTIONARY search_tools.words (ACCEPT = false); \
+         ALTER TEXT SEARCH CONFIGURATION search_tools.documents RENAME TO discarded; \
+         ROLLBACK; \
+         SELECT to_tsvector('search_tools.documents', 'Cats')",
+    );
+    assert_eq!(data_rows(&rolled_back), ["'cats':1"]);
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TEXT SEARCH DICTIONARY search_tools.words",
+    );
+    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TEXT SEARCH CONFIGURATION search_tools.documents RENAME TO documents_renamed; \
+         SELECT terms FROM search_tools.document_terms",
+    );
+    assert_eq!(data_rows(&renamed), ["'cats':1"]);
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TEXT SEARCH CONFIGURATION search_tools.documents_renamed",
+    );
+    assert!(String::from_utf8_lossy(&restricted).contains("2BP01"));
+    let cascaded = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TEXT SEARCH CONFIGURATION search_tools.documents_renamed CASCADE; \
+         SELECT count(*) FROM pg_views \
+          WHERE schemaname='search_tools' AND viewname='document_terms'",
+    );
+    assert_eq!(data_rows(&cascaded), ["0"]);
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SCHEMA search_tools CASCADE; \
+         SELECT count(*) FROM pg_ts_config WHERE cfgname='documents'",
+    );
+    assert_eq!(data_rows(&dropped), ["0"]);
+}
+
+#[test]
+fn text_search_catalog_survives_checkpoint_and_cold_object_recovery() {
+    let mut config = test_config("text-search-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("text-search-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TEXT SEARCH DICTIONARY durable_words (TEMPLATE = simple, ACCEPT = true); \
+             CREATE TEXT SEARCH CONFIGURATION durable_search (PARSER = default); \
+             ALTER TEXT SEARCH CONFIGURATION durable_search ADD MAPPING \
+               FOR asciiword, word, numword, uint WITH durable_words; \
+             COMMENT ON TEXT SEARCH DICTIONARY durable_words IS 'durable dictionary'; \
+             COMMENT ON TEXT SEARCH CONFIGURATION durable_search IS 'durable configuration'; \
+             CREATE TABLE durable_documents( \
+               body text, terms tsvector GENERATED ALWAYS AS \
+                 (to_tsvector('durable_search', body)) STORED); \
+             INSERT INTO durable_documents(body) VALUES ('Cold Cats 42')",
+        );
+        assert!(
+            !message_types(&output).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+        assert!(
+            !message_types(&checkpoint).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&checkpoint)
+        );
+        let renamed = run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TEXT SEARCH DICTIONARY durable_words RENAME TO durable_words_renamed; \
+             ALTER TEXT SEARCH CONFIGURATION durable_search RENAME TO durable_search_renamed",
+        );
+        assert!(
+            !message_types(&renamed).contains(&b'E'),
+            "{}",
+            String::from_utf8_lossy(&renamed)
+        );
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT terms, to_tsvector('durable_search_renamed', 'Warm Dogs 7') FROM durable_documents; \
+         SELECT obj_description(oid, 'pg_ts_dict') FROM pg_ts_dict WHERE dictname='durable_words_renamed'; \
+         SELECT obj_description(oid, 'pg_ts_config') FROM pg_ts_config WHERE cfgname='durable_search_renamed'; \
+         SELECT count(*) FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid=m.mapcfg \
+          WHERE c.cfgname='durable_search_renamed'",
+    );
+    assert!(
+        !message_types(&output).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "'42':3 'cats':2 'cold':1|'7':3 'dogs':2 'warm':1",
+            "durable dictionary",
+            "durable configuration",
+            "4",
+        ]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn prepared_transactions_commit_rollback_catalog_and_lock_contracts() {
     let mut config = test_config("prepared-transactions");
     config.max_prepared_transactions = 3;
@@ -34707,6 +35069,12 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
            (PROVIDER = libc, LOCALE = 'C', VERSION = '1');
          CREATE DEFAULT CONVERSION template_app.latin1_to_utf8
            FOR 'LATIN1' TO 'UTF8' FROM pg_catalog.iso8859_1_to_utf8;
+         CREATE TEXT SEARCH DICTIONARY template_app.words
+           (TEMPLATE = simple, ACCEPT = true);
+         CREATE TEXT SEARCH CONFIGURATION template_app.documents (PARSER = default);
+         ALTER TEXT SEARCH CONFIGURATION template_app.documents ADD MAPPING
+           FOR asciiword, word, numword, uint WITH template_app.words;
+         COMMENT ON TEXT SEARCH CONFIGURATION template_app.documents IS 'copied search configuration';
          CREATE TABLE template_app.items (
              id template_app.positive PRIMARY KEY,
              state template_app.state NOT NULL,
@@ -34720,6 +35088,8 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
          CREATE VIEW template_app.ready_items AS
            SELECT id, label COLLATE template_app.byte_order AS label
              FROM template_app.items WHERE state = 'ready';
+         CREATE VIEW template_app.search_terms AS
+           SELECT to_tsvector('template_app.documents', 'Cats') AS terms;
          CREATE SEQUENCE template_app.item_sequence;
          SELECT setval('template_app.item_sequence', 7, true);
          CREATE PUBLICATION template_changes FOR TABLE template_app.items;
@@ -34748,7 +35118,7 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT (SELECT count(*) FROM pg_class WHERE relname IN ('items', 'ready_items', 'item_sequence')),
+            "SELECT (SELECT count(*) FROM pg_class WHERE relname IN ('items', 'ready_items', 'search_terms', 'item_sequence')),
                     (SELECT count(*) FROM pg_type WHERE typname IN ('state', 'positive')),
                     (SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes')"
         )),
@@ -34777,13 +35147,17 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
         "SELECT current_database(), id, state FROM template_app.items;
          SELECT id FROM template_app.ready_items;
          SELECT nextval('template_app.item_sequence');
-         SELECT (SELECT count(*) FROM pg_class WHERE relname IN ('items', 'ready_items', 'item_sequence')),
+         SELECT (SELECT count(*) FROM pg_class WHERE relname IN ('items', 'ready_items', 'search_terms', 'item_sequence')),
                 (SELECT count(*) FROM pg_type WHERE typname IN ('state', 'positive'));
          SELECT count(*) FROM pg_publication WHERE pubname = 'template_changes';
          SELECT obj_description('template_app.items'::regclass, 'pg_class');
          SELECT has_table_privilege('template_reader', 'template_app.items', 'SELECT');
          SELECT collname FROM pg_collation WHERE collname = 'byte_order';
          SELECT conname FROM pg_conversion WHERE conname = 'latin1_to_utf8';
+         SELECT to_tsvector('template_app.documents', 'Cats');
+         SELECT obj_description(oid, 'pg_ts_config') FROM pg_ts_config
+          WHERE cfgname = 'documents';
+         SELECT terms FROM template_app.search_terms;
          SELECT label FROM template_app.items ORDER BY label;
          SELECT convert_from(decode('e9', 'hex'), 'LATIN1');
          INSERT INTO template_app.items VALUES (2, 'done', 'a');
@@ -34795,12 +35169,15 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "cloned_application|1|ready",
             "1",
             "8",
-            "3|2",
+            "4|2",
             "1",
             "copied template table",
             "t",
             "byte_order",
             "latin1_to_utf8",
+            "'cats':1",
+            "copied search configuration",
+            "'cats':1",
             "z",
             "é",
             "1",
@@ -34820,6 +35197,23 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             view.schema.as_str() == "template_app" && view.name.as_str() == "ready_items"
         })
         .map(|(slot, _)| slot)
+        .unwrap();
+    let cloned_search_view = engine
+        .storage
+        .views_visible_to(0)
+        .find(|(_, view)| {
+            view.schema.as_str() == "template_app" && view.name.as_str() == "search_terms"
+        })
+        .map(|(slot, _)| slot)
+        .unwrap();
+    let cloned_configuration = engine
+        .storage
+        .text_search_slot(
+            crate::sql::ast::TextSearchObjectKind::Configuration,
+            "template_app",
+            "documents",
+            0,
+        )
         .unwrap();
     let cloned_collation = engine
         .storage
@@ -34849,6 +35243,25 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             }),
         "template clone must rebind collation dependencies to cloned slots"
     );
+    assert!(
+        engine
+            .storage
+            .view_dependencies(cloned_search_view)
+            .entries()
+            .iter()
+            .any(|dependency| {
+                dependency.class == crate::storage::DependencyClass::TextSearchConfiguration
+                    && usize::from(dependency.slot) == cloned_configuration
+            }),
+        "template clone must rebind text-search configuration dependencies"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TEXT SEARCH CONFIGURATION template_app.documents RENAME TO documents_v2; \
+         SELECT terms FROM template_app.search_terms",
+    );
+    assert_eq!(data_rows(&output), ["'cats':1"]);
     let output = run_with(
         &mut engine,
         &mut budget,
@@ -34961,6 +35374,10 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
            SELECT attcollation FROM pg_attribute
             WHERE attrelid = 'template_app.cloned_items'::regclass AND attname = 'label');
          SELECT conname FROM pg_conversion WHERE conname = 'latin1_to_utf8';
+         SELECT to_tsvector('template_app.documents_v2', 'Cats');
+         SELECT obj_description(oid, 'pg_ts_config') FROM pg_ts_config
+          WHERE cfgname = 'documents_v2';
+         SELECT terms FROM template_app.search_terms;
          SELECT label FROM template_app.cloned_items ORDER BY label;
          SELECT id FROM template_app.item_audit ORDER BY id;",
     );
@@ -34976,6 +35393,9 @@ fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
             "copied template table",
             "byte_order",
             "latin1_to_utf8",
+            "'cats':1",
+            "copied search configuration",
+            "'cats':1",
             "a",
             "z",
             "1",

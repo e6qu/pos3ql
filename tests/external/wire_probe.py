@@ -1764,6 +1764,73 @@ def binary_multirange(ranges):
     )
 
 
+def binary_tsvector(entries):
+    body = struct.pack("!i", len(entries))
+    for lexeme, positions in entries:
+        body += lexeme.encode() + b"\x00" + struct.pack("!h", len(positions))
+        body += b"".join(struct.pack("!H", position) for position in positions)
+    return body
+
+
+def binary_tsquery_and(left, right):
+    lexeme = lambda value: b"\x01\x00\x00" + value.encode() + b"\x00"
+    return struct.pack("!i", 3) + b"\x02\x02" + lexeme(right) + lexeme(left)
+
+
+def test_full_text_binary_bind_result_and_malformed_input():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+
+    vector = binary_tsvector([("fat", [0xC002]), ("rat", [0x8003])])
+    query = binary_tsquery_and("fat", "rat")
+    bound = extended_binary_parameter(s, "SELECT $1::tsvector::text", 3614, vector)
+    check(
+        "full-text wire: binary tsvector Bind uses PostgreSQL receive format",
+        not any(kind == b"E" for kind, _ in bound)
+        and first_text_row(bound) == "'fat':2A 'rat':3B",
+        bound,
+    )
+    bound = extended_binary_parameter(s, "SELECT $1::tsquery::text", 3615, query)
+    check(
+        "full-text wire: binary tsquery Bind uses PostgreSQL receive format",
+        not any(kind == b"E" for kind, _ in bound)
+        and first_text_row(bound) == "'fat' & 'rat'",
+        bound,
+    )
+
+    messages = extended_binary_result(
+        s, "SELECT 'fat:2A rat:3B'::tsvector, 'fat & rat'::tsquery"
+    )
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    row = next((payload for kind, payload in messages if kind == b"D"), None)
+    expected = (
+        struct.pack("!h", 2)
+        + struct.pack("!i", len(vector))
+        + vector
+        + struct.pack("!i", len(query))
+        + query
+    )
+    check(
+        "full-text wire: binary Result exposes exact tsvector and tsquery formats",
+        description is not None
+        and row_description_type_oids(description) == [3614, 3615]
+        and row_description_formats(description) == [1, 1]
+        and row == expected,
+        messages,
+    )
+
+    malformed = extended_binary_parameter(
+        s, "SELECT $1::tsvector", 3614, struct.pack("!i", 1) + b"missing-nul"
+    )
+    check(
+        "full-text wire: malformed binary tsvector is rejected as a whole",
+        has_sqlstate(malformed, "22P03"),
+        malformed,
+    )
+    s.close()
+
+
 def extended_binary_parameter(s, text, oid, value):
     parse = frontend_message(
         b"P", b"\x00" + text.encode() + b"\x00" + struct.pack("!hi", 1, oid)

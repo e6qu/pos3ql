@@ -157,6 +157,8 @@ const KIND_PREPARE_TRANSACTION: u8 = 107;
 const KIND_COMMIT_PREPARED: u8 = 108;
 const KIND_ROLLBACK_PREPARED: u8 = 109;
 const KIND_PREPARED_LOCKS: u8 = 110;
+const KIND_SET_TEXT_SEARCH: u8 = 111;
+const KIND_DROP_TEXT_SEARCH: u8 = 112;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -164,7 +166,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_PREPARED_LOCKS;
+const LAST_KIND: u8 = KIND_DROP_TEXT_SEARCH;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -1002,6 +1004,16 @@ pub(crate) enum WalOp<'a> {
         definition: crate::storage::ConversionDefinition,
     },
     DropConversion {
+        schema: &'a str,
+        name: &'a str,
+    },
+    SetTextSearch {
+        slot: u8,
+        created_at: u64,
+        definition: crate::storage::TextSearchDefinition,
+    },
+    DropTextSearch {
+        kind: crate::sql::ast::TextSearchObjectKind,
         schema: &'a str,
         name: &'a str,
     },
@@ -1977,6 +1989,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DropCollation { .. } => KIND_DROP_COLLATION,
         WalOp::SetConversion { .. } => KIND_SET_CONVERSION,
         WalOp::DropConversion { .. } => KIND_DROP_CONVERSION,
+        WalOp::SetTextSearch { .. } => KIND_SET_TEXT_SEARCH,
+        WalOp::DropTextSearch { .. } => KIND_DROP_TEXT_SEARCH,
         WalOp::SetEventTrigger { .. } => KIND_SET_EVENT_TRIGGER,
         WalOp::DropEventTrigger { .. } => KIND_DROP_EVENT_TRIGGER,
         WalOp::DropRoutine { .. } => KIND_DROP_ROUTINE,
@@ -2009,6 +2023,25 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
     fn operator_signature_len(signature: crate::storage::OperatorSignature) -> usize {
         1 + signature.left.map_or(0, routine_result_len)
             + signature.right.map_or(0, routine_result_len)
+    }
+    fn text_search_definition_len(definition: crate::storage::TextSearchDefinition) -> usize {
+        let common =
+            1 + definition.schema().as_str().len() + 1 + definition.name().as_str().len() + 4;
+        common
+            + match definition {
+                crate::storage::TextSearchDefinition::Parser { .. } => 20,
+                crate::storage::TextSearchDefinition::Template { .. } => 10,
+                crate::storage::TextSearchDefinition::Dictionary { options, .. } => {
+                    8 + 1 + options.as_str().len() + 2
+                }
+                crate::storage::TextSearchDefinition::Configuration { mappings, .. } => {
+                    8 + mappings
+                        .counts
+                        .iter()
+                        .map(|count| 1 + usize::from(*count) * 4)
+                        .sum::<usize>()
+                }
+            }
     }
     match operation {
         WalOp::DatabaseScope { .. } => 4,
@@ -2813,6 +2846,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::SetConversion { definition, .. } => {
             1 + 8 + 1 + definition.schema.as_str().len() + 1 + definition.name.as_str().len() + 11
         }
+        WalOp::SetTextSearch { definition, .. } => {
+            1 + 8 + 1 + text_search_definition_len(*definition)
+        }
+        WalOp::DropTextSearch { schema, name, .. } => 1 + 1 + schema.len() + 1 + name.len(),
         WalOp::SetEventTrigger { definition, .. } => {
             1 + 8
                 + 1
@@ -3254,6 +3291,82 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         if let Some(right) = signature.right {
             ok &= append_routine_result(buffer, right);
         }
+        ok
+    }
+    fn append_text_search_definition(
+        buffer: &mut FixedBuf,
+        definition: crate::storage::TextSearchDefinition,
+    ) -> bool {
+        let name = |buffer: &mut FixedBuf, value: &str| {
+            value.len() <= u8::MAX as usize
+                && buffer.append(&[value.len() as u8])
+                && buffer.append(value.as_bytes())
+        };
+        let behavior = |value| match value {
+            crate::storage::TextSearchDictionaryBehavior::Simple { accept } => {
+                [0, u8::from(accept)]
+            }
+            crate::storage::TextSearchDictionaryBehavior::EnglishStem => [1, 0],
+        };
+        let mut ok = name(buffer, definition.schema().as_str())
+            && name(buffer, definition.name().as_str())
+            && buffer.append(&definition.oid().to_le_bytes());
+        ok &= match definition {
+            crate::storage::TextSearchDefinition::Parser {
+                start,
+                gettoken,
+                end,
+                headline,
+                lextypes,
+                ..
+            } => {
+                buffer.append(&start.to_le_bytes())
+                    && buffer.append(&gettoken.to_le_bytes())
+                    && buffer.append(&end.to_le_bytes())
+                    && buffer.append(&headline.to_le_bytes())
+                    && buffer.append(&lextypes.to_le_bytes())
+            }
+            crate::storage::TextSearchDefinition::Template {
+                init,
+                lexize,
+                behavior: executable,
+                ..
+            } => {
+                buffer.append(&init.to_le_bytes())
+                    && buffer.append(&lexize.to_le_bytes())
+                    && buffer.append(&behavior(executable))
+            }
+            crate::storage::TextSearchDefinition::Dictionary {
+                owner,
+                template,
+                options,
+                behavior: executable,
+                ..
+            } => {
+                buffer.append(&owner.to_le_bytes())
+                    && buffer.append(&template.to_le_bytes())
+                    && name(buffer, options.as_str())
+                    && buffer.append(&behavior(executable))
+            }
+            crate::storage::TextSearchDefinition::Configuration {
+                owner,
+                parser,
+                mappings,
+                ..
+            } => {
+                let mut encoded =
+                    buffer.append(&owner.to_le_bytes()) && buffer.append(&parser.to_le_bytes());
+                for token in 0..crate::storage::TEXT_SEARCH_TOKEN_TYPES {
+                    let count = mappings.counts[token];
+                    encoded &= count as usize <= crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN
+                        && buffer.append(&[count]);
+                    for dictionary in mappings.dictionaries[token].iter().take(count as usize) {
+                        encoded &= buffer.append(&dictionary.to_le_bytes());
+                    }
+                }
+                encoded
+            }
+        };
         ok
     }
     match operation {
@@ -4381,6 +4494,30 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ])
                 && buffer.append(&definition.procedure.to_le_bytes())
                 && buffer.append(&[u8::from(definition.default)])
+        }
+        WalOp::SetTextSearch {
+            slot,
+            created_at,
+            definition,
+        } => {
+            buffer.append(&[*slot])
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&[match definition.kind() {
+                    crate::sql::ast::TextSearchObjectKind::Parser => 0,
+                    crate::sql::ast::TextSearchObjectKind::Template => 1,
+                    crate::sql::ast::TextSearchObjectKind::Dictionary => 2,
+                    crate::sql::ast::TextSearchObjectKind::Configuration => 3,
+                }])
+                && append_text_search_definition(buffer, *definition)
+        }
+        WalOp::DropTextSearch { kind, schema, name } => {
+            buffer.append(&[match kind {
+                crate::sql::ast::TextSearchObjectKind::Parser => 0,
+                crate::sql::ast::TextSearchObjectKind::Template => 1,
+                crate::sql::ast::TextSearchObjectKind::Dictionary => 2,
+                crate::sql::ast::TextSearchObjectKind::Configuration => 3,
+            }]) && name_bytes(buffer, schema)
+                && name_bytes(buffer, name)
         }
         WalOp::SetEventTrigger {
             slot,
@@ -7628,6 +7765,117 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 },
             })
         }
+        KIND_SET_TEXT_SEARCH => {
+            let slot = *payload.get(at)?;
+            at += 1;
+            if usize::from(slot) >= crate::storage::MAX_TEXT_SEARCH_OBJECTS {
+                return None;
+            }
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let object_kind = *payload.get(at)?;
+            at += 1;
+            let schema = SqlName::parse(take_name(&mut at)?).ok()?;
+            let name = SqlName::parse(take_name(&mut at)?).ok()?;
+            let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+            at += 4;
+            let read_i32 = |at: &mut usize| {
+                let value = i32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+                *at += 4;
+                Some(value)
+            };
+            let read_behavior = |at: &mut usize| {
+                let behavior = match (*payload.get(*at)?, *payload.get(*at + 1)?) {
+                    (0, accept @ 0..=1) => crate::storage::TextSearchDictionaryBehavior::Simple {
+                        accept: accept != 0,
+                    },
+                    (1, 0) => crate::storage::TextSearchDictionaryBehavior::EnglishStem,
+                    _ => return None,
+                };
+                *at += 2;
+                Some(behavior)
+            };
+            let definition = match object_kind {
+                0 => crate::storage::TextSearchDefinition::Parser {
+                    schema,
+                    name,
+                    oid,
+                    start: read_i32(&mut at)?,
+                    gettoken: read_i32(&mut at)?,
+                    end: read_i32(&mut at)?,
+                    headline: read_i32(&mut at)?,
+                    lextypes: read_i32(&mut at)?,
+                },
+                1 => crate::storage::TextSearchDefinition::Template {
+                    schema,
+                    name,
+                    oid,
+                    init: read_i32(&mut at)?,
+                    lexize: read_i32(&mut at)?,
+                    behavior: read_behavior(&mut at)?,
+                },
+                2 => {
+                    let owner = read_i32(&mut at)?;
+                    let template = read_i32(&mut at)?;
+                    let options = StackStr::<512>::from_str(take_name(&mut at)?);
+                    if options.is_truncated() {
+                        return None;
+                    }
+                    crate::storage::TextSearchDefinition::Dictionary {
+                        schema,
+                        name,
+                        oid,
+                        owner,
+                        template,
+                        options,
+                        behavior: read_behavior(&mut at)?,
+                    }
+                }
+                3 => {
+                    let owner = read_i32(&mut at)?;
+                    let parser = read_i32(&mut at)?;
+                    let mut mappings = crate::storage::TextSearchMappings::EMPTY;
+                    for token in 0..crate::storage::TEXT_SEARCH_TOKEN_TYPES {
+                        let count = usize::from(*payload.get(at)?);
+                        at += 1;
+                        if count > crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN {
+                            return None;
+                        }
+                        mappings.counts[token] = count as u8;
+                        for dictionary in mappings.dictionaries[token].iter_mut().take(count) {
+                            *dictionary = read_i32(&mut at)?;
+                        }
+                    }
+                    crate::storage::TextSearchDefinition::Configuration {
+                        schema,
+                        name,
+                        oid,
+                        owner,
+                        parser,
+                        mappings,
+                    }
+                }
+                _ => return None,
+            };
+            (at == payload.len()).then_some(WalOp::SetTextSearch {
+                slot,
+                created_at,
+                definition,
+            })
+        }
+        KIND_DROP_TEXT_SEARCH => {
+            let kind = match *payload.get(at)? {
+                0 => crate::sql::ast::TextSearchObjectKind::Parser,
+                1 => crate::sql::ast::TextSearchObjectKind::Template,
+                2 => crate::sql::ast::TextSearchObjectKind::Dictionary,
+                3 => crate::sql::ast::TextSearchObjectKind::Configuration,
+                _ => return None,
+            };
+            at += 1;
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropTextSearch { kind, schema, name })
+        }
         KIND_SET_EVENT_TRIGGER => {
             let slot = *payload.get(at)?;
             at += 1;
@@ -8416,6 +8664,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Timetz(..)) => 12,
         Some(OwnedDatum::Interval(_)) | Some(OwnedDatum::Uuid(_)) => 16,
         Some(OwnedDatum::Text { len, .. }) => 1 + *len as usize,
+        Some(OwnedDatum::TextSearch { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Numeric { nbytes, .. }) => 6 + *nbytes as usize,
         Some(OwnedDatum::Inet(_)) | Some(OwnedDatum::Cidr(_)) => 18,
         Some(OwnedDatum::Macaddr(_)) => 6,
@@ -8542,6 +8791,13 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[1] = *len;
             out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             2 + *len as usize
+        }
+        Some(OwnedDatum::TextSearch { query, len, bytes }) => {
+            out[0] = 28;
+            out[1] = u8::from(*query);
+            out[2] = *len;
+            out[3..3 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            3 + *len as usize
         }
         Some(OwnedDatum::Numeric {
             sign,
@@ -8903,6 +9159,22 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             Some(OwnedDatum::RegObject {
                 type_oid,
                 referenced_oid,
+                len: len as u8,
+                bytes,
+            })
+        }
+        28 => {
+            let query = match *payload.get(*at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let len = *payload.get(*at + 1)? as usize;
+            *at += 2;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            core::str::from_utf8(&bytes[..len]).ok()?;
+            Some(OwnedDatum::TextSearch {
+                query,
                 len: len as u8,
                 bytes,
             })

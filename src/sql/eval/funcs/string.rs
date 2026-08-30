@@ -101,6 +101,10 @@ pub(crate) fn dispatch<'a>(
                     Datum::Bit { bits, .. } => Ok(Datum::Int4(bits.len() as i32)),
                     // length of a bytea is its number of bytes.
                     Datum::Bytea(b) => Ok(Datum::Int4(b.len() as i32)),
+                    Datum::TsVector(vector) if name == "length" => {
+                        crate::sql::full_text::vector_length(vector.as_str(), arena)
+                            .map(Datum::Int4)
+                    }
                     other => Err(type_mismatch("length", &other)),
                 }
             }

@@ -36,6 +36,7 @@ struct P<'a> {
     b: &'a [u8],
     at: usize,
     arena: &'a Arena,
+    preserve_object_order: bool,
 }
 
 fn bad() -> SqlError {
@@ -51,6 +52,7 @@ pub fn parse<'a>(input: &'a str, arena: &'a Arena) -> Result<Json<'a>, SqlError>
         b: input.as_bytes(),
         at: 0,
         arena,
+        preserve_object_order: false,
     };
     p.ws();
     let v = p.value(0)?;
@@ -59,6 +61,25 @@ pub fn parse<'a>(input: &'a str, arena: &'a Arena) -> Result<Json<'a>, SqlError>
         return Err(bad());
     }
     Ok(v)
+}
+
+/// Parses JSON without applying jsonb object sorting or duplicate-key
+/// collapse. Consumers whose PostgreSQL behavior depends on source order use
+/// this boundary; ordinary jsonb operations use [`parse`].
+pub fn parse_source_order<'a>(input: &'a str, arena: &'a Arena) -> Result<Json<'a>, SqlError> {
+    let mut p = P {
+        b: input.as_bytes(),
+        at: 0,
+        arena,
+        preserve_object_order: true,
+    };
+    p.ws();
+    let value = p.value(0)?;
+    p.ws();
+    if p.at != p.b.len() {
+        return Err(bad());
+    }
+    Ok(value)
 }
 
 /// Validates that `input` is well-formed JSON (for the `json` type, which is
@@ -145,6 +166,7 @@ pub fn object_members_source<'a>(
         b: input.as_bytes(),
         at: 0,
         arena,
+        preserve_object_order: true,
     };
     p.ws();
     if p.b.get(p.at) != Some(&b'{') {
@@ -211,6 +233,7 @@ pub fn array_elements_source<'a>(
         b: input.as_bytes(),
         at: 0,
         arena,
+        preserve_object_order: true,
     };
     p.ws();
     if p.b.get(p.at) != Some(&b'[') {
@@ -434,6 +457,13 @@ impl<'a> P<'a> {
                 }
                 _ => return Err(bad()),
             }
+        }
+        if self.preserve_object_order {
+            return Ok(Json::Object(
+                self.arena
+                    .alloc_slice_copy(&members[..n])
+                    .map_err(|_| bad())?,
+            ));
         }
         // Stable-sort by key, then drop earlier duplicates (last value wins).
         // jsonb orders object keys by length first, then bytewise — the same
@@ -1169,6 +1199,53 @@ pub fn write_json_raw_string(s: &str, out: &mut dyn core::fmt::Write) -> core::f
         }
     }
     out.write_str("\"")
+}
+
+pub(crate) fn map_string_values<'a>(
+    value: Json<'a>,
+    arena: &'a Arena,
+    transform: &mut impl FnMut(&'a str, &'a Arena) -> Result<&'a str, SqlError>,
+) -> Result<Json<'a>, SqlError> {
+    Ok(match value {
+        Json::Str(source) => {
+            let decoded = decode_string(source, arena)?;
+            let transformed = transform(decoded, arena)?;
+            let mut escaped = crate::util::StackStr::<65536>::new();
+            write_json_raw_string(transformed, &mut escaped).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "JSON headline string exceeds the fixed output buffer"
+                )
+            })?;
+            if escaped.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "JSON headline string exceeds the fixed output buffer"
+                ));
+            }
+            let body = &escaped.as_str()[1..escaped.len() - 1];
+            Json::Str(arena.alloc_str(body).map_err(|_| bad())?)
+        }
+        Json::Array(items) => {
+            let mapped = arena
+                .alloc_slice_with(items.len(), |_| Json::Null)
+                .map_err(|_| bad())?;
+            for (output, item) in mapped.iter_mut().zip(items) {
+                *output = map_string_values(*item, arena, transform)?;
+            }
+            Json::Array(mapped)
+        }
+        Json::Object(members) => {
+            let mapped = arena
+                .alloc_slice_with(members.len(), |_| ("", Json::Null))
+                .map_err(|_| bad())?;
+            for (output, (key, item)) in mapped.iter_mut().zip(members) {
+                *output = (*key, map_string_values(*item, arena, transform)?);
+            }
+            Json::Object(mapped)
+        }
+        scalar => scalar,
+    })
 }
 
 /// Escapes a display value directly into a JSON string literal. Unlike a

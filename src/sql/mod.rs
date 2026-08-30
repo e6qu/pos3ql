@@ -13,6 +13,7 @@ pub(crate) mod event_trigger;
 pub mod exec;
 mod explain;
 pub(crate) mod external;
+pub mod full_text;
 pub mod guc;
 pub mod json;
 pub mod lexer;
@@ -377,6 +378,12 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateConversion(_)
         | Stmt::AlterConversion { .. }
         | Stmt::DropConversion { .. }
+        | Stmt::CreateTextSearchParser(_)
+        | Stmt::CreateTextSearchTemplate(_)
+        | Stmt::CreateTextSearchDictionary(_)
+        | Stmt::CreateTextSearchConfiguration(_)
+        | Stmt::AlterTextSearch { .. }
+        | Stmt::DropTextSearch { .. }
         | Stmt::CreateEventTrigger(_)
         | Stmt::AlterEventTrigger { .. }
         | Stmt::DropEventTrigger { .. }
@@ -730,6 +737,22 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::CreateConversion(_) => "CREATE CONVERSION",
         Stmt::AlterConversion { .. } => "ALTER CONVERSION",
         Stmt::DropConversion { .. } => "DROP CONVERSION",
+        Stmt::CreateTextSearchParser(_) => "CREATE TEXT SEARCH PARSER",
+        Stmt::CreateTextSearchTemplate(_) => "CREATE TEXT SEARCH TEMPLATE",
+        Stmt::CreateTextSearchDictionary(_) => "CREATE TEXT SEARCH DICTIONARY",
+        Stmt::CreateTextSearchConfiguration(_) => "CREATE TEXT SEARCH CONFIGURATION",
+        Stmt::AlterTextSearch { kind, .. } => match kind {
+            ast::TextSearchObjectKind::Parser => "ALTER TEXT SEARCH PARSER",
+            ast::TextSearchObjectKind::Template => "ALTER TEXT SEARCH TEMPLATE",
+            ast::TextSearchObjectKind::Dictionary => "ALTER TEXT SEARCH DICTIONARY",
+            ast::TextSearchObjectKind::Configuration => "ALTER TEXT SEARCH CONFIGURATION",
+        },
+        Stmt::DropTextSearch { kind, .. } => match kind {
+            ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
+            ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
+            ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
+            ast::TextSearchObjectKind::Configuration => "DROP TEXT SEARCH CONFIGURATION",
+        },
         Stmt::CreatePublication { .. } => "CREATE PUBLICATION",
         Stmt::AlterPublication { .. } => "ALTER PUBLICATION",
         Stmt::DropPublication { .. } => "DROP PUBLICATION",
@@ -825,6 +848,7 @@ fn event_trigger_drop_command(statement: &Stmt<'_>) -> bool {
                 | Stmt::DropExtension { .. }
                 | Stmt::DropCollation { .. }
                 | Stmt::DropConversion { .. }
+                | Stmt::DropTextSearch { .. }
                 | Stmt::DropPublication { .. }
                 | Stmt::DropSubscription { .. }
                 | Stmt::DropTrigger { .. }
@@ -4451,6 +4475,15 @@ impl Engine {
                 DdlUndo::ConversionDropped(slot) => {
                     self.storage.commit_conversion_drop(*slot as usize)
                 }
+                DdlUndo::TextSearchCreated(slot) => {
+                    self.storage.commit_text_search_create(*slot as usize)
+                }
+                DdlUndo::TextSearchAltered { slot, .. } => self
+                    .storage
+                    .commit_text_search_alter(*slot as usize, txn.txid),
+                DdlUndo::TextSearchDropped(slot) => {
+                    self.storage.commit_text_search_drop(*slot as usize)
+                }
                 DdlUndo::EventTriggerCreated(slot) => {
                     self.storage.commit_event_trigger_create(*slot as usize)
                 }
@@ -5119,6 +5152,15 @@ impl Engine {
             }
             DdlUndo::ConversionDropped(slot) => {
                 self.storage.rollback_conversion_drop(slot as usize, txid)
+            }
+            DdlUndo::TextSearchCreated(slot) => {
+                self.storage.rollback_text_search_create(slot as usize)
+            }
+            DdlUndo::TextSearchAltered { slot, prior } => self
+                .storage
+                .rollback_text_search_alter(slot as usize, prior),
+            DdlUndo::TextSearchDropped(slot) => {
+                self.storage.rollback_text_search_drop(slot as usize, txid)
             }
             DdlUndo::EventTriggerCreated(slot) => {
                 self.storage.rollback_event_trigger_create(slot as usize)
@@ -11268,6 +11310,58 @@ impl Engine {
                 *cascade,
                 responder,
             ),
+            Stmt::CreateTextSearchParser(command) => exec::create_text_search_parser(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                responder,
+            ),
+            Stmt::CreateTextSearchTemplate(command) => exec::create_text_search_template(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                responder,
+            ),
+            Stmt::CreateTextSearchDictionary(command) => exec::create_text_search_dictionary(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                responder,
+            ),
+            Stmt::CreateTextSearchConfiguration(command) => exec::create_text_search_configuration(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                responder,
+            ),
+            Stmt::AlterTextSearch { kind, name, action } => exec::alter_text_search(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *kind,
+                name,
+                *action,
+                responder,
+            ),
+            Stmt::DropTextSearch {
+                kind,
+                name,
+                if_exists,
+                cascade,
+            } => exec::drop_text_search(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *kind,
+                name,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
             Stmt::CreateEventTrigger(command) => exec::create_event_trigger(
                 &mut self.storage,
                 &mut self.wal,
@@ -14590,6 +14684,7 @@ pub(crate) const SETTING_NAMES: &[&str] = &[
     "default_transaction_read_only",
     "default_table_access_method",
     "default_tablespace",
+    "default_text_search_config",
     "extra_float_digits",
     "idle_in_transaction_session_timeout",
     "integer_datetimes",
@@ -15228,6 +15323,16 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         } => storage.replay_conversion(usize::from(slot), created_at, definition)?,
         WalOp::DropConversion { schema, name } => {
             storage.replay_drop_conversion(schema, name);
+        }
+        WalOp::SetTextSearch {
+            slot,
+            created_at,
+            definition,
+        } => {
+            storage.replay_text_search_object(usize::from(slot), created_at, definition)?;
+        }
+        WalOp::DropTextSearch { kind, schema, name } => {
+            storage.replay_drop_text_search_object(kind, schema, name);
         }
         WalOp::SetEventTrigger {
             slot,

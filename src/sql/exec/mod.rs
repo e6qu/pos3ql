@@ -5350,6 +5350,10 @@ pub fn reassign_owned(
         .conversions_visible_to(txn.txid)
         .filter(|(_, definition)| source_owns_catalog(definition.owner))
         .count();
+    changes += storage
+        .text_search_objects_visible_to(txn.txid)
+        .filter(|(_, definition)| definition.owner().is_some_and(source_owns_catalog))
+        .count();
     if changes > super::txn::MAX_TXN_DDL.saturating_sub(txn.ddl().len()) {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -5478,6 +5482,28 @@ pub fn reassign_owned(
             prior,
         }) {
             storage.rollback_conversion_alter(slot, prior);
+            return sql_fail(error);
+        }
+    }
+    loop {
+        let found =
+            storage
+                .text_search_objects_visible_to(txn.txid)
+                .find_map(|(slot, definition)| {
+                    definition
+                        .owner()
+                        .is_some_and(source_owns_catalog)
+                        .then_some(slot)
+                });
+        let Some(slot) = found else { break };
+        let mut definition = storage.text_search_object(slot).definition_for(txn.txid);
+        if !definition.set_owner(target_oid) {
+            return sql_fail(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "owned text-search object has no owner"
+            ));
+        }
+        if let Err(error) = stage_text_search_alter(storage, wal, txn, slot, definition) {
             return sql_fail(error);
         }
     }
@@ -5715,6 +5741,7 @@ pub fn drop_owned(
     let mut operators = [false; MAX_DEPENDENT_STORED_QUERIES];
     let mut collations = [false; crate::storage::MAX_COLLATIONS];
     let mut conversions = [false; crate::storage::MAX_CONVERSIONS];
+    let mut text_search_objects = [false; crate::storage::MAX_TEXT_SEARCH_OBJECTS];
     let mut statistics =
         [false; MAX_DEPENDENT_STORED_QUERIES * crate::storage::MAX_EXTENDED_STATISTICS_PER_TABLE];
     let mut event_triggers = [false; crate::storage::MAX_EVENT_TRIGGERS];
@@ -5762,6 +5789,13 @@ pub fn drop_owned(
             .iter()
             .any(|role| Storage::role_oid(usize::from(*role)) == definition.owner);
     }
+    for (slot, definition) in storage.text_search_objects_visible_to(txn.txid) {
+        text_search_objects[slot] = definition.owner().is_some_and(|owner| {
+            owned_roles
+                .iter()
+                .any(|role| Storage::role_oid(usize::from(*role)) == owner)
+        });
+    }
 
     let root = |dependency: &crate::storage::StoredQueryDependency| match dependency.class {
         DependencyClass::Table => tables
@@ -5800,6 +5834,10 @@ pub fn drop_owned(
             .get(dependency.slot as usize)
             .copied()
             .unwrap_or(false),
+        DependencyClass::TextSearchConfiguration => text_search_objects
+            .get(dependency.slot as usize)
+            .copied()
+            .unwrap_or(false),
     };
     let StoredDependencyClosure {
         views: dependent_views,
@@ -5826,6 +5864,7 @@ pub fn drop_owned(
                     &composites,
                     &routines,
                     &operators,
+                    &text_search_objects,
                     &dependent_views,
                     &dependent_matviews,
                     &dependent_routines,
@@ -5868,6 +5907,7 @@ pub fn drop_owned(
                         &composites,
                         &routines,
                         &operators,
+                        &text_search_objects,
                         &dependent_views,
                         &dependent_matviews,
                         &dependent_routines,
@@ -6363,6 +6403,14 @@ pub fn drop_owned(
             Ok(Ok(())) => {}
             Ok(Err(error)) => return sql_fail(error),
             Err(error) => return Err(error),
+        }
+    }
+    for (slot, selected) in text_search_objects.iter().copied().enumerate().rev() {
+        if !selected || !storage.text_search_object(slot).visible_to(txn.txid) {
+            continue;
+        }
+        if let Err(error) = drop_text_search_slot(storage, wal, txn, slot, cascade) {
+            return sql_fail(error);
         }
     }
 
@@ -7350,6 +7398,7 @@ enum SchemaObject {
     Routine(usize),
     Collation(usize),
     Conversion(usize),
+    TextSearch(usize),
     Matview {
         table: usize,
         catalog: usize,
@@ -7458,14 +7507,14 @@ pub fn drop_schema(
             .iter()
             .any(|&slot| storage.schema_def(slot).name.as_str() == schema)
     };
-    let mut objects: [Option<SchemaObject>; 64] = [const { None }; 64];
+    let mut objects: [Option<SchemaObject>; 256] = [const { None }; 256];
     let mut n_objects = 0usize;
     let mut push = |o: SchemaObject, n_objects: &mut usize| -> Result<(), SqlError> {
         if *n_objects == objects.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "DROP SCHEMA sweeps up more than {} objects",
-                64
+                objects.len()
             ));
         }
         objects[*n_objects] = Some(o);
@@ -7513,6 +7562,13 @@ pub fn drop_schema(
     for (slot, definition) in storage.conversions_visible_to(txn.txid) {
         if in_listed(storage, definition.schema.as_str())
             && let Err(error) = push(SchemaObject::Conversion(slot), &mut n_objects)
+        {
+            return sql_fail(error);
+        }
+    }
+    for (slot, definition) in storage.text_search_objects_visible_to(txn.txid) {
+        if in_listed(storage, definition.schema().as_str())
+            && let Err(error) = push(SchemaObject::TextSearch(slot), &mut n_objects)
         {
             return sql_fail(error);
         }
@@ -7972,6 +8028,15 @@ pub fn drop_schema(
                     0,
                 )
             }
+            SchemaObject::TextSearch(slot) => {
+                let state = storage.text_search_object(*slot);
+                let definition = state.definition_for(txn.txid);
+                (
+                    schema_rank(storage, definition.schema().as_str()),
+                    state.created_at,
+                    0,
+                )
+            }
             SchemaObject::Matview { table, .. } => {
                 let table_state = storage.table(*table);
                 let def = storage.table_def(*table, txn.txid);
@@ -8134,6 +8199,11 @@ pub fn drop_schema(
                 let _ = write!(out, "conversion ");
                 write_rel(out, &definition.schema, &definition.name);
             }
+            SchemaObject::TextSearch(slot) => {
+                let definition = storage.text_search_object(*slot).definition_for(txn.txid);
+                let _ = write!(out, "{} ", definition.kind().noun());
+                write_rel(out, &definition.schema(), &definition.name());
+            }
             SchemaObject::Matview { table, .. } => {
                 let def = storage.table_def(*table, txn.txid);
                 let _ = write!(out, "materialized view ");
@@ -8216,6 +8286,10 @@ pub fn drop_schema(
                 SchemaObject::Conversion(slot) => {
                     storage.conversion(*slot).definition_for(txn.txid).schema
                 }
+                SchemaObject::TextSearch(slot) => storage
+                    .text_search_object(*slot)
+                    .definition_for(txn.txid)
+                    .schema(),
                 SchemaObject::Matview { table, .. } => storage.table_def(*table, txn.txid).schema,
                 SchemaObject::Sequence(sequence) => {
                     storage.sequence_for(*sequence, txn.txid).schema
@@ -8313,6 +8387,17 @@ pub fn drop_schema(
                         let collation = storage.collation(*root_slot).definition_for(txn.txid);
                         let _ = write!(dependency, "collation ");
                         write_rel(&mut dependency, &collation.schema, &collation.name);
+                    }
+                    crate::storage::DependencyClass::TextSearchConfiguration => {
+                        let configuration = storage
+                            .text_search_object(*root_slot)
+                            .definition_for(txn.txid);
+                        let _ = write!(dependency, "text search configuration ");
+                        write_rel(
+                            &mut dependency,
+                            &configuration.schema(),
+                            &configuration.name(),
+                        );
                     }
                 }
                 let _ = write!(
@@ -8590,6 +8675,13 @@ pub fn drop_schema(
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => return sql_fail(error),
                     Err(error) => return Err(error),
+                }
+            }
+            SchemaObject::TextSearch(slot) => {
+                if storage.text_search_object(*slot).visible_to(txn.txid)
+                    && let Err(error) = drop_text_search_slot(storage, wal, txn, *slot, true)
+                {
+                    return sql_fail(error);
                 }
             }
             SchemaObject::Matview { table, catalog } => {
@@ -19556,6 +19648,944 @@ pub fn create_conversion(
     sql_ok()
 }
 
+fn text_search_support_routine(name: QualName<'_>) -> Result<i32, SqlError> {
+    if name
+        .schema
+        .is_some_and(|schema| !schema.eq_ignore_ascii_case("pg_catalog"))
+    {
+        return Err(sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "text search support function {} does not exist",
+            name.name
+        ));
+    }
+    match name.name {
+        "prsd_start" => Ok(3717),
+        "prsd_nexttoken" => Ok(3718),
+        "prsd_end" => Ok(3719),
+        "prsd_headline" => Ok(3720),
+        "prsd_lextype" => Ok(3721),
+        "dsimple_init" => Ok(3725),
+        "dsimple_lexize" => Ok(3726),
+        "dsnowball_init" => Ok(13_232),
+        "dsnowball_lexize" => Ok(13_233),
+        _ => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "text search support routine {} is not executable",
+            name.name
+        )),
+    }
+}
+
+fn text_search_token_type(name: &str) -> Option<usize> {
+    Some(
+        match name {
+            "asciiword" => 1,
+            "word" => 2,
+            "numword" => 3,
+            "email" => 4,
+            "url" => 5,
+            "host" => 6,
+            "sfloat" => 7,
+            "version" => 8,
+            "hword_numpart" => 9,
+            "hword_part" => 10,
+            "hword_asciipart" => 11,
+            "blank" => 12,
+            "tag" => 13,
+            "protocol" => 14,
+            "numhword" => 15,
+            "asciihword" => 16,
+            "hword" => 17,
+            "url_path" => 18,
+            "file" => 19,
+            "float" => 20,
+            "int" => 21,
+            "uint" => 22,
+            "entity" => 23,
+            _ => return None,
+        } - 1,
+    )
+}
+
+fn text_search_schema_name(
+    storage: &Storage,
+    name: QualName<'_>,
+    txid: u32,
+) -> Result<(SqlName, SqlName), SqlError> {
+    Ok((
+        storage.creation_schema(name.schema, name.name, txid)?,
+        SqlName::parse(name.name)?,
+    ))
+}
+
+fn stage_text_search_create(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    definition: crate::storage::TextSearchDefinition,
+) -> Result<usize, SqlError> {
+    let slot = storage.create_text_search_object(definition, txn.txid)?;
+    let stored = storage.text_search_object(slot);
+    let definition = stored.definition_for(txn.txid);
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetTextSearch {
+            slot: slot as u8,
+            created_at: stored.created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_text_search_create(slot);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TextSearchCreated(slot as u32)) {
+        storage.rollback_text_search_create(slot);
+        return Err(error);
+    }
+    Ok(slot)
+}
+
+fn stage_text_search_alter(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    definition: crate::storage::TextSearchDefinition,
+) -> Result<(), SqlError> {
+    let prior = storage.alter_text_search_object(slot, definition, txn.txid)?;
+    let object = storage.text_search_object(slot);
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetTextSearch {
+            slot: slot as u8,
+            created_at: object.created_at,
+            definition,
+        },
+    ) {
+        storage.rollback_text_search_alter(slot, prior);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TextSearchAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_text_search_alter(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn stage_text_search_drop(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+) -> Result<(), SqlError> {
+    let definition = storage.text_search_object(slot).definition_for(txn.txid);
+    storage.drop_text_search_object(slot, txn.txid);
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::DropTextSearch {
+            kind: definition.kind(),
+            schema: definition.schema().as_str(),
+            name: definition.name().as_str(),
+        },
+    ) {
+        storage.rollback_text_search_drop(slot, txn.txid);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TextSearchDropped(slot as u32)) {
+        storage.rollback_text_search_drop(slot, txn.txid);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn text_search_superuser(storage: &Storage, txid: u32) -> Result<(), SqlError> {
+    let current = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role does not exist"
+        )
+    })?;
+    if storage.role(current).attributes_to(txid).superuser {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to create text search parsers or templates"
+        ))
+    }
+}
+
+pub fn create_text_search_parser(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &crate::sql::ast::CreateTextSearchParser<'_>,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    if let Err(error) = text_search_superuser(storage, txn.txid) {
+        return sql_fail(error);
+    }
+    let definition = (|| {
+        let (schema, name) = text_search_schema_name(storage, command.name, txn.txid)?;
+        let start = text_search_support_routine(command.start)?;
+        let gettoken = text_search_support_routine(command.gettoken)?;
+        let end = text_search_support_routine(command.end)?;
+        let headline = command
+            .headline
+            .map(text_search_support_routine)
+            .transpose()?
+            .unwrap_or(0);
+        let lextypes = text_search_support_routine(command.lextypes)?;
+        if (start, gettoken, end, lextypes) != (3717, 3718, 3719, 3721)
+            || !matches!(headline, 0 | 3720)
+        {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "only PostgreSQL's executable default parser support routines are available"
+            ));
+        }
+        Ok(crate::storage::TextSearchDefinition::Parser {
+            schema,
+            name,
+            oid: 0,
+            start,
+            gettoken,
+            end,
+            headline,
+            lextypes,
+        })
+    })();
+    if let Err(error) = definition
+        .and_then(|definition| stage_text_search_create(storage, wal, txn, definition).map(|_| ()))
+    {
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE TEXT SEARCH PARSER")?;
+    sql_ok()
+}
+
+pub fn create_text_search_template(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &crate::sql::ast::CreateTextSearchTemplate<'_>,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    if let Err(error) = text_search_superuser(storage, txn.txid) {
+        return sql_fail(error);
+    }
+    let definition = (|| {
+        let (schema, name) = text_search_schema_name(storage, command.name, txn.txid)?;
+        let init = command
+            .init
+            .map(text_search_support_routine)
+            .transpose()?
+            .unwrap_or(0);
+        let lexize = text_search_support_routine(command.lexize)?;
+        let behavior = match (init, lexize) {
+            (0 | 3725, 3726) => {
+                crate::storage::TextSearchDictionaryBehavior::Simple { accept: true }
+            }
+            (13_232, 13_233) => crate::storage::TextSearchDictionaryBehavior::EnglishStem,
+            _ => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "text search template support routine combination is not executable"
+                ));
+            }
+        };
+        Ok(crate::storage::TextSearchDefinition::Template {
+            schema,
+            name,
+            oid: 0,
+            init,
+            lexize,
+            behavior,
+        })
+    })();
+    if let Err(error) = definition
+        .and_then(|definition| stage_text_search_create(storage, wal, txn, definition).map(|_| ()))
+    {
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE TEXT SEARCH TEMPLATE")?;
+    sql_ok()
+}
+
+fn dictionary_definition(
+    template: crate::storage::TextSearchDefinition,
+    options: &[crate::sql::ast::TextSearchOption<'_>],
+) -> Result<(crate::storage::TextSearchDictionaryBehavior, StackStr<512>), SqlError> {
+    use core::fmt::Write as _;
+    let crate::storage::TextSearchDefinition::Template { behavior, .. } = template else {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "object is not a text search template"
+        ));
+    };
+    let mut rendered = StackStr::<512>::new();
+    let executable = match behavior {
+        crate::storage::TextSearchDictionaryBehavior::Simple { .. } => {
+            let mut accept = true;
+            for option in options {
+                if !option.name.eq_ignore_ascii_case("accept") {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "unrecognized simple dictionary parameter: {}",
+                        option.name
+                    ));
+                }
+                accept = match option.value {
+                    value if value.eq_ignore_ascii_case("true") => true,
+                    value if value.eq_ignore_ascii_case("false") => false,
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "invalid Accept value: {}",
+                            option.value
+                        ));
+                    }
+                };
+                let _ = write!(
+                    rendered,
+                    "accept = '{}'",
+                    if accept { "true" } else { "false" }
+                );
+            }
+            crate::storage::TextSearchDictionaryBehavior::Simple { accept }
+        }
+        crate::storage::TextSearchDictionaryBehavior::EnglishStem => {
+            let mut language = false;
+            let mut stopwords = false;
+            for option in options {
+                if option.name.eq_ignore_ascii_case("language") {
+                    if !option.value.eq_ignore_ascii_case("english") {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "only the English Snowball dictionary is executable"
+                        ));
+                    }
+                    language = true;
+                } else if option.name.eq_ignore_ascii_case("stopwords") {
+                    if !option.value.eq_ignore_ascii_case("english") {
+                        return Err(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "only PostgreSQL's English stopword file is available"
+                        ));
+                    }
+                    stopwords = true;
+                } else {
+                    return Err(sql_err!(
+                        sqlstate::INVALID_PARAMETER_VALUE,
+                        "unrecognized Snowball dictionary parameter: {}",
+                        option.name
+                    ));
+                }
+            }
+            if !language {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "missing Language parameter"
+                ));
+            }
+            let _ = rendered.write_str("language = 'english'");
+            if stopwords {
+                let _ = rendered.write_str(", stopwords = 'english'");
+            }
+            crate::storage::TextSearchDictionaryBehavior::EnglishStem
+        }
+    };
+    if rendered.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "text search dictionary options exceed the catalog limit"
+        ));
+    }
+    Ok((executable, rendered))
+}
+
+pub fn create_text_search_dictionary(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &crate::sql::ast::CreateTextSearchDictionary<'_>,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let definition = (|| {
+        let (schema, name) = text_search_schema_name(storage, command.name, txn.txid)?;
+        let template_slot = storage
+            .text_search_slot_on_path(
+                crate::sql::ast::TextSearchObjectKind::Template,
+                command.template.schema,
+                command.template.name,
+                txn.txid,
+            )
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "text search template \"{}\" does not exist",
+                    command.template.name
+                )
+            })?;
+        let template = storage
+            .text_search_object(template_slot)
+            .definition_for(txn.txid);
+        let (behavior, options) = dictionary_definition(template, command.options)?;
+        Ok(crate::storage::TextSearchDefinition::Dictionary {
+            schema,
+            name,
+            oid: 0,
+            owner: current_catalog_owner(storage, txn.txid)?,
+            template: template.oid(),
+            options,
+            behavior,
+        })
+    })();
+    if let Err(error) = definition
+        .and_then(|definition| stage_text_search_create(storage, wal, txn, definition).map(|_| ()))
+    {
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE TEXT SEARCH DICTIONARY")?;
+    sql_ok()
+}
+
+pub fn create_text_search_configuration(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &crate::sql::ast::CreateTextSearchConfiguration<'_>,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let definition = (|| {
+        let (schema, name) = text_search_schema_name(storage, command.name, txn.txid)?;
+        let owner = current_catalog_owner(storage, txn.txid)?;
+        let (parser, mappings) = match command.source {
+            crate::sql::ast::TextSearchConfigurationSource::Parser(parser) => {
+                let slot = storage
+                    .text_search_slot_on_path(
+                        crate::sql::ast::TextSearchObjectKind::Parser,
+                        parser.schema,
+                        parser.name,
+                        txn.txid,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "text search parser \"{}\" does not exist",
+                            parser.name
+                        )
+                    })?;
+                (
+                    storage
+                        .text_search_object(slot)
+                        .definition_for(txn.txid)
+                        .oid(),
+                    crate::storage::TextSearchMappings::EMPTY,
+                )
+            }
+            crate::sql::ast::TextSearchConfigurationSource::Copy(source) => {
+                let slot = storage
+                    .text_search_slot_on_path(
+                        crate::sql::ast::TextSearchObjectKind::Configuration,
+                        source.schema,
+                        source.name,
+                        txn.txid,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "text search configuration \"{}\" does not exist",
+                            source.name
+                        )
+                    })?;
+                let crate::storage::TextSearchDefinition::Configuration {
+                    parser, mappings, ..
+                } = storage.text_search_object(slot).definition_for(txn.txid)
+                else {
+                    unreachable!("configuration lookup invariant")
+                };
+                (parser, mappings)
+            }
+        };
+        Ok(crate::storage::TextSearchDefinition::Configuration {
+            schema,
+            name,
+            oid: 0,
+            owner,
+            parser,
+            mappings,
+        })
+    })();
+    if let Err(error) = definition
+        .and_then(|definition| stage_text_search_create(storage, wal, txn, definition).map(|_| ()))
+    {
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE TEXT SEARCH CONFIGURATION")?;
+    sql_ok()
+}
+
+fn resolve_text_search_dictionary(
+    storage: &Storage,
+    txid: u32,
+    name: QualName<'_>,
+) -> Result<i32, SqlError> {
+    let slot = storage
+        .text_search_slot_on_path(
+            crate::sql::ast::TextSearchObjectKind::Dictionary,
+            name.schema,
+            name.name,
+            txid,
+        )
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "text search dictionary \"{}\" does not exist",
+                name.name
+            )
+        })?;
+    Ok(storage.text_search_object(slot).definition_for(txid).oid())
+}
+
+pub fn alter_text_search(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    kind: crate::sql::ast::TextSearchObjectKind,
+    name: &QualName<'_>,
+    action: crate::sql::ast::AlterTextSearchAction<'_>,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let Some(slot) = storage.text_search_slot_on_path(kind, name.schema, name.name, txn.txid)
+    else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "{} \"{}\" does not exist",
+            kind.noun(),
+            name.name
+        ));
+    };
+    let mut definition = storage.text_search_object(slot).definition_for(txn.txid);
+    let authority = match definition.owner() {
+        Some(owner) => require_definition_owner(storage, txn.txid, owner, kind.noun()),
+        None => text_search_superuser(storage, txn.txid),
+    };
+    if let Err(error) = authority {
+        return sql_fail(error);
+    }
+    let alteration = (|| {
+        match action {
+            crate::sql::ast::AlterTextSearchAction::Rename(value) => {
+                definition.rename(None, Some(SqlName::parse(value)?));
+            }
+            crate::sql::ast::AlterTextSearchAction::Owner(value) => {
+                let owner = catalog_owner_slot(storage, txn.txid, value)?;
+                let owner_slot = storage.role_slot_by_oid(owner, txn.txid).ok_or_else(|| {
+                    sql_err!(sqlstate::UNDEFINED_OBJECT, "new owner role does not exist")
+                })?;
+                storage.require_schema_create_as(
+                    definition.schema().as_str(),
+                    owner_slot,
+                    txn.txid,
+                )?;
+                if !definition.set_owner(owner) {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "{} has no owner",
+                        kind.noun()
+                    ));
+                }
+            }
+            crate::sql::ast::AlterTextSearchAction::SetSchema(value) => {
+                storage.require_schema_create(value, txn.txid)?;
+                definition.rename(Some(SqlName::parse(value)?), None);
+            }
+            crate::sql::ast::AlterTextSearchAction::DictionaryOptions(options) => {
+                let crate::storage::TextSearchDefinition::Dictionary {
+                    behavior,
+                    options: stored_options,
+                    ..
+                } = &mut definition
+                else {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "object is not a dictionary"
+                    ));
+                };
+                use core::fmt::Write as _;
+                match behavior {
+                    crate::storage::TextSearchDictionaryBehavior::Simple { accept } => {
+                        for option in options {
+                            if !option.name.eq_ignore_ascii_case("accept") {
+                                return Err(sql_err!(
+                                    sqlstate::INVALID_PARAMETER_VALUE,
+                                    "unrecognized simple dictionary parameter: {}",
+                                    option.name
+                                ));
+                            }
+                            *accept = if option.value.eq_ignore_ascii_case("true") {
+                                true
+                            } else if option.value.eq_ignore_ascii_case("false") {
+                                false
+                            } else {
+                                return Err(sql_err!(
+                                    sqlstate::INVALID_PARAMETER_VALUE,
+                                    "invalid Accept value: {}",
+                                    option.value
+                                ));
+                            };
+                        }
+                        stored_options.clear();
+                        let _ = write!(
+                            stored_options,
+                            "accept = '{}'",
+                            if *accept { "true" } else { "false" }
+                        );
+                    }
+                    crate::storage::TextSearchDictionaryBehavior::EnglishStem => {
+                        for option in options {
+                            if !(option.name.eq_ignore_ascii_case("language")
+                                || option.name.eq_ignore_ascii_case("stopwords"))
+                                || !option.value.eq_ignore_ascii_case("english")
+                            {
+                                return Err(sql_err!(
+                                    sqlstate::FEATURE_NOT_SUPPORTED,
+                                    "only PostgreSQL's English Snowball dictionary is executable"
+                                ));
+                            }
+                        }
+                        *stored_options =
+                            StackStr::from_str("language = 'english', stopwords = 'english'");
+                    }
+                }
+            }
+            crate::sql::ast::AlterTextSearchAction::ConfigurationMapping(mapping) => {
+                let crate::storage::TextSearchDefinition::Configuration { mappings, .. } =
+                    &mut definition
+                else {
+                    return Err(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "object is not a configuration"
+                    ));
+                };
+                match mapping {
+                    crate::sql::ast::TextSearchMappingAction::Set {
+                        replace_existing,
+                        token_types,
+                        dictionaries,
+                    } => {
+                        let mut resolved =
+                            [0i32; crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN];
+                        if dictionaries.len() > resolved.len() {
+                            return Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "too many dictionaries in one text search mapping"
+                            ));
+                        }
+                        for (index, dictionary) in dictionaries.iter().enumerate() {
+                            resolved[index] =
+                                resolve_text_search_dictionary(storage, txn.txid, *dictionary)?;
+                        }
+                        for token_name in token_types {
+                            let token = text_search_token_type(token_name).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INVALID_PARAMETER_VALUE,
+                                    "token type \"{}\" does not exist",
+                                    token_name
+                                )
+                            })?;
+                            let exists = mappings.counts[token] != 0;
+                            if exists != replace_existing {
+                                return Err(sql_err!(
+                                    if exists {
+                                        sqlstate::DUPLICATE_OBJECT
+                                    } else {
+                                        sqlstate::UNDEFINED_OBJECT
+                                    },
+                                    "mapping for token type \"{}\" {}",
+                                    token_name,
+                                    if exists {
+                                        "already exists"
+                                    } else {
+                                        "does not exist"
+                                    }
+                                ));
+                            }
+                            mappings.dictionaries[token] = resolved;
+                            mappings.counts[token] = dictionaries.len() as u8;
+                        }
+                    }
+                    crate::sql::ast::TextSearchMappingAction::Replace {
+                        token_types,
+                        old,
+                        new,
+                    } => {
+                        let old = resolve_text_search_dictionary(storage, txn.txid, old)?;
+                        let new = resolve_text_search_dictionary(storage, txn.txid, new)?;
+                        let mut changed = false;
+                        for token in 0..crate::storage::TEXT_SEARCH_TOKEN_TYPES {
+                            if token_types.is_some_and(|types| {
+                                !types
+                                    .iter()
+                                    .any(|name| text_search_token_type(name) == Some(token))
+                            }) {
+                                continue;
+                            }
+                            for dictionary in mappings.dictionaries[token]
+                                .iter_mut()
+                                .take(mappings.counts[token] as usize)
+                            {
+                                if *dictionary == old {
+                                    *dictionary = new;
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if !changed {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "text search dictionary is not used in this configuration"
+                            ));
+                        }
+                    }
+                    crate::sql::ast::TextSearchMappingAction::Drop {
+                        if_exists,
+                        token_types,
+                    } => {
+                        for token_name in token_types {
+                            let token = text_search_token_type(token_name).ok_or_else(|| {
+                                sql_err!(
+                                    sqlstate::INVALID_PARAMETER_VALUE,
+                                    "token type \"{}\" does not exist",
+                                    token_name
+                                )
+                            })?;
+                            if mappings.counts[token] == 0 && !if_exists {
+                                return Err(sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "mapping for token type \"{}\" does not exist",
+                                    token_name
+                                ));
+                            }
+                            mappings.dictionaries[token] =
+                                [0; crate::storage::TEXT_SEARCH_DICTIONARIES_PER_TOKEN];
+                            mappings.counts[token] = 0;
+                        }
+                    }
+                }
+            }
+        }
+        stage_text_search_alter(storage, wal, txn, slot, definition)
+    })();
+    if let Err(error) = alteration {
+        return sql_fail(error);
+    }
+    responder.command_complete(match kind {
+        crate::sql::ast::TextSearchObjectKind::Parser => "ALTER TEXT SEARCH PARSER",
+        crate::sql::ast::TextSearchObjectKind::Template => "ALTER TEXT SEARCH TEMPLATE",
+        crate::sql::ast::TextSearchObjectKind::Dictionary => "ALTER TEXT SEARCH DICTIONARY",
+        crate::sql::ast::TextSearchObjectKind::Configuration => "ALTER TEXT SEARCH CONFIGURATION",
+    })?;
+    sql_ok()
+}
+
+fn drop_text_search_slot(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    cascade: bool,
+) -> Result<(), SqlError> {
+    let root = storage.text_search_object(slot).definition_for(txn.txid);
+    if root.kind() == crate::sql::ast::TextSearchObjectKind::Configuration {
+        let StoredDependencyClosure {
+            views,
+            matviews,
+            routines,
+            rules,
+        } = stored_query_dependent_closure(storage, txn.txid, |dependency| {
+            dependency.class == crate::storage::DependencyClass::TextSearchConfiguration
+                && dependency.slot as usize == slot
+        })?;
+        let policy_root = PolicyDependencySelection::Catalog {
+            class: crate::storage::DependencyClass::TextSearchConfiguration,
+            slot,
+        };
+        let has_stored_dependents = views.iter().any(|selected| *selected)
+            || matviews.iter().any(|selected| *selected)
+            || routines.iter().any(|selected| *selected)
+            || rules.iter().any(|selected| *selected)
+            || policy_dependents_exist(
+                storage,
+                txn.txid,
+                policy_root,
+                &views,
+                &matviews,
+                &routines,
+            );
+        if has_stored_dependents && !cascade {
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop text search configuration {}.{} because other objects depend on it",
+                root.schema().as_str(),
+                root.name().as_str()
+            ));
+        }
+        if has_stored_dependents {
+            drop_policy_dependents(storage, wal, txn, policy_root, &views, &matviews, &routines)?;
+            drop_selected_stored_queries(storage, wal, txn, &views, &matviews, &routines, &rules)?;
+        }
+    }
+    let mut dependent_slots = [usize::MAX; crate::storage::MAX_TEXT_SEARCH_OBJECTS];
+    let mut dependent_count = 0usize;
+    let mut mapped_configs = [usize::MAX; crate::storage::MAX_TEXT_SEARCH_OBJECTS];
+    let mut mapped_count = 0usize;
+    for (candidate_slot, candidate) in storage.text_search_objects_visible_to(txn.txid) {
+        if candidate_slot == slot {
+            continue;
+        }
+        let direct = match (root, candidate) {
+            (
+                crate::storage::TextSearchDefinition::Parser { oid, .. },
+                crate::storage::TextSearchDefinition::Configuration { parser, .. },
+            ) => parser == oid,
+            (
+                crate::storage::TextSearchDefinition::Template { oid, .. },
+                crate::storage::TextSearchDefinition::Dictionary { template, .. },
+            ) => template == oid,
+            _ => false,
+        };
+        if direct {
+            dependent_slots[dependent_count] = candidate_slot;
+            dependent_count += 1;
+        }
+        if let (
+            crate::storage::TextSearchDefinition::Dictionary { oid, .. },
+            crate::storage::TextSearchDefinition::Configuration { mappings, .. },
+        ) = (root, candidate)
+            && mappings
+                .dictionaries
+                .iter()
+                .enumerate()
+                .any(|(token, dictionaries)| {
+                    dictionaries[..mappings.counts[token] as usize].contains(&oid)
+                })
+        {
+            mapped_configs[mapped_count] = candidate_slot;
+            mapped_count += 1;
+        }
+    }
+    if (dependent_count != 0 || mapped_count != 0) && !cascade {
+        return Err(sql_err!(
+            sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+            "cannot drop {} {}.{} because other objects depend on it",
+            root.kind().noun(),
+            root.schema().as_str(),
+            root.name().as_str()
+        ));
+    }
+    for dependent in &dependent_slots[..dependent_count] {
+        drop_text_search_slot(storage, wal, txn, *dependent, true)?;
+    }
+    if let crate::storage::TextSearchDefinition::Dictionary { oid, .. } = root {
+        for config_slot in &mapped_configs[..mapped_count] {
+            let mut config = storage
+                .text_search_object(*config_slot)
+                .definition_for(txn.txid);
+            let crate::storage::TextSearchDefinition::Configuration { mappings, .. } = &mut config
+            else {
+                unreachable!("mapped configuration invariant")
+            };
+            for token in 0..crate::storage::TEXT_SEARCH_TOKEN_TYPES {
+                let count = mappings.counts[token] as usize;
+                let mut write = 0usize;
+                for read in 0..count {
+                    if mappings.dictionaries[token][read] != oid {
+                        mappings.dictionaries[token][write] = mappings.dictionaries[token][read];
+                        write += 1;
+                    }
+                }
+                mappings.dictionaries[token][write..].fill(0);
+                mappings.counts[token] = write as u8;
+            }
+            stage_text_search_alter(storage, wal, txn, *config_slot, config)?;
+        }
+    }
+    stage_text_search_drop(storage, wal, txn, slot)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn drop_text_search(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    kind: crate::sql::ast::TextSearchObjectKind,
+    name: &QualName<'_>,
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder<'_>,
+) -> Outcome {
+    let Some(slot) = storage.text_search_slot_on_path(kind, name.schema, name.name, txn.txid)
+    else {
+        if if_exists {
+            responder.notice(
+                sqlstate::UNDEFINED_OBJECT,
+                stack_format!(
+                    128,
+                    "{} \"{}\" does not exist, skipping",
+                    kind.noun(),
+                    name.name
+                )
+                .as_str(),
+            )?;
+            responder.command_complete(match kind {
+                crate::sql::ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
+                crate::sql::ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
+                crate::sql::ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
+                crate::sql::ast::TextSearchObjectKind::Configuration => {
+                    "DROP TEXT SEARCH CONFIGURATION"
+                }
+            })?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "{} \"{}\" does not exist",
+            kind.noun(),
+            name.name
+        ));
+    };
+    let definition = storage.text_search_object(slot).definition_for(txn.txid);
+    let authority = match definition.owner() {
+        Some(owner) => require_definition_owner(storage, txn.txid, owner, kind.noun()),
+        None => text_search_superuser(storage, txn.txid),
+    };
+    if let Err(error) = authority {
+        return sql_fail(error);
+    }
+    if let Err(error) = drop_text_search_slot(storage, wal, txn, slot, cascade) {
+        return sql_fail(error);
+    }
+    responder.command_complete(match kind {
+        crate::sql::ast::TextSearchObjectKind::Parser => "DROP TEXT SEARCH PARSER",
+        crate::sql::ast::TextSearchObjectKind::Template => "DROP TEXT SEARCH TEMPLATE",
+        crate::sql::ast::TextSearchObjectKind::Dictionary => "DROP TEXT SEARCH DICTIONARY",
+        crate::sql::ast::TextSearchObjectKind::Configuration => "DROP TEXT SEARCH CONFIGURATION",
+    })?;
+    sql_ok()
+}
+
 pub fn alter_collation(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -25877,6 +26907,40 @@ pub fn comment(
                 0u32,
             )
         }
+        CommentTarget::TextSearch {
+            kind,
+            name: object_name,
+        } => {
+            let Some(slot) =
+                storage.text_search_slot_on_path(kind, object_name.schema, object_name.name, txid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "{} \"{}\" does not exist",
+                    kind.noun(),
+                    object_name.name
+                ));
+            };
+            let definition = storage.text_search_object(slot).definition_for(txid);
+            let authority = match definition.owner() {
+                Some(owner) => require_definition_owner(storage, txid, owner, kind.noun()),
+                None => text_search_superuser(storage, txid),
+            };
+            if let Err(error) = authority {
+                return sql_fail(error);
+            }
+            let class = match kind {
+                crate::sql::ast::TextSearchObjectKind::Parser => CommentClass::TextSearchParser,
+                crate::sql::ast::TextSearchObjectKind::Template => CommentClass::TextSearchTemplate,
+                crate::sql::ast::TextSearchObjectKind::Dictionary => {
+                    CommentClass::TextSearchDictionary
+                }
+                crate::sql::ast::TextSearchObjectKind::Configuration => {
+                    CommentClass::TextSearchConfiguration
+                }
+            };
+            (class, definition.schema(), definition.name(), 0u32)
+        }
         CommentTarget::EventTrigger(event_trigger_name) => {
             let Some(slot) = storage.event_trigger_slot(event_trigger_name, txid) else {
                 return sql_fail(sql_err!(
@@ -30138,6 +31202,7 @@ fn policy_depends_on_owned_selection(
     composites: &[bool; crate::storage::MAX_COMPOSITES],
     routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     operators: &[bool; MAX_DEPENDENT_STORED_QUERIES],
+    text_search_objects: &[bool; crate::storage::MAX_TEXT_SEARCH_OBJECTS],
     dependent_views: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     dependent_matviews: &[bool; MAX_DEPENDENT_STORED_QUERIES],
     dependent_routines: &[bool; MAX_DEPENDENT_STORED_QUERIES],
@@ -30166,6 +31231,9 @@ fn policy_depends_on_owned_selection(
                 crate::storage::DependencyClass::Routine => routines.get(slot),
                 crate::storage::DependencyClass::Operator => operators.get(slot),
                 crate::storage::DependencyClass::Collation => None,
+                crate::storage::DependencyClass::TextSearchConfiguration => {
+                    text_search_objects.get(slot)
+                }
             }
             .copied()
             .unwrap_or(false)
@@ -38827,7 +39895,9 @@ fn decode_binary_field_with_context<'a>(
         | ColType::Regoperator
         | ColType::Regclass
         | ColType::Regnamespace
-        | ColType::Regrole) => {
+        | ColType::Regrole
+        | ColType::Regconfig
+        | ColType::Regdictionary) => {
             let bytes: [u8; 4] = bytes.try_into().map_err(|_| bad())?;
             let referenced_oid = i32::from_be_bytes(bytes);
             match context {
@@ -38893,6 +39963,14 @@ fn decode_binary_field_with_context<'a>(
         // invalid JSON datum.
         ColType::Json => crate::sql::eval::cast_to(via(oids::JSON)?, ColType::Json, arena),
         ColType::Jsonb => crate::sql::eval::cast_to(via(oids::JSONB)?, ColType::Jsonb, arena),
+        ColType::TsVector => crate::sql::full_text::decode_vector_binary(bytes, arena)
+            .map(crate::sql::full_text::restore_vector)
+            .map(Datum::TsVector)
+            .map_err(|_| bad()),
+        ColType::TsQuery => crate::sql::full_text::decode_query_binary(bytes, arena)
+            .map(crate::sql::full_text::restore_query)
+            .map(Datum::TsQuery)
+            .map_err(|_| bad()),
         ColType::Uuid => via(oids::UUID),
         ColType::Bytea => via(oids::BYTEA),
         ColType::Numeric => via(oids::NUMERIC),

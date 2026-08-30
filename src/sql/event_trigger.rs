@@ -327,6 +327,7 @@ enum ObjectRef {
     OperatorClass(usize),
     Collation(usize),
     Conversion(usize),
+    TextSearch(usize),
     Policy(usize),
     Statistics(usize),
     Publication(usize),
@@ -760,6 +761,9 @@ fn mutation(undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         ConversionCreated(slot) => (ObjectRef::Conversion(slot as usize), Mutation::Create),
         ConversionAltered { slot, .. } => (ObjectRef::Conversion(slot as usize), Mutation::Alter),
         ConversionDropped(slot) => (ObjectRef::Conversion(slot as usize), Mutation::Drop),
+        TextSearchCreated(slot) => (ObjectRef::TextSearch(slot as usize), Mutation::Create),
+        TextSearchAltered { slot, .. } => (ObjectRef::TextSearch(slot as usize), Mutation::Alter),
+        TextSearchDropped(slot) => (ObjectRef::TextSearch(slot as usize), Mutation::Drop),
         EventTriggerCreated(slot) => (ObjectRef::EventTrigger(slot as usize), Mutation::Create),
         EventTriggerDropped(slot) => (ObjectRef::EventTrigger(slot as usize), Mutation::Drop),
         EventTriggerAltered { slot, .. } => {
@@ -1042,6 +1046,27 @@ fn comment_reference(
                 .conversion_slot(schema.as_str(), name.as_str(), txid)
                 .ok_or_else(graph_full)?,
         )),
+        CommentClass::TextSearchParser
+        | CommentClass::TextSearchTemplate
+        | CommentClass::TextSearchDictionary
+        | CommentClass::TextSearchConfiguration => {
+            let kind = match class {
+                CommentClass::TextSearchParser => crate::sql::ast::TextSearchObjectKind::Parser,
+                CommentClass::TextSearchTemplate => crate::sql::ast::TextSearchObjectKind::Template,
+                CommentClass::TextSearchDictionary => {
+                    crate::sql::ast::TextSearchObjectKind::Dictionary
+                }
+                CommentClass::TextSearchConfiguration => {
+                    crate::sql::ast::TextSearchObjectKind::Configuration
+                }
+                _ => unreachable!("text-search comment class guard"),
+            };
+            EventObjectRef::Primary(ObjectRef::TextSearch(
+                storage
+                    .text_search_slot(kind, schema.as_str(), name.as_str(), txid)
+                    .ok_or_else(graph_full)?,
+            ))
+        }
         CommentClass::Trigger => {
             let target = if subid & (1 << 31) == 0 {
                 crate::storage::TriggerTarget::Table(
@@ -1681,6 +1706,32 @@ fn primary_object(
                 false,
             )
         }
+        ObjectRef::TextSearch(slot) => {
+            let definition = storage.text_search_object(slot).definition_for(txid);
+            let (classoid, object_type) = match definition.kind() {
+                crate::sql::ast::TextSearchObjectKind::Parser => {
+                    (catalog::PG_TS_PARSER_OID, "text search parser")
+                }
+                crate::sql::ast::TextSearchObjectKind::Template => {
+                    (catalog::PG_TS_TEMPLATE_OID, "text search template")
+                }
+                crate::sql::ast::TextSearchObjectKind::Dictionary => {
+                    (catalog::PG_TS_DICT_OID, "text search dictionary")
+                }
+                crate::sql::ast::TextSearchObjectKind::Configuration => {
+                    (catalog::PG_TS_CONFIG_OID, "text search configuration")
+                }
+            };
+            base_object(
+                classoid,
+                definition.oid(),
+                object_type,
+                Some(definition.schema().as_str()),
+                Some(definition.name().as_str()),
+                qualified(definition.schema().as_str(), definition.name().as_str())?,
+                false,
+            )
+        }
         ObjectRef::Policy(slot) => {
             let policy = storage.policy(slot);
             let table = storage.table_def(usize::from(policy.table), txid);
@@ -1951,6 +2002,9 @@ fn is_original(
             .any(|name| qualified_name_matches(*name, object)),
         (Stmt::DropCollation { name, .. }, ObjectRef::Collation(_))
         | (Stmt::DropConversion { name, .. }, ObjectRef::Conversion(_)) => {
+            qualified_name_matches(*name, object)
+        }
+        (Stmt::DropTextSearch { name, .. }, ObjectRef::TextSearch(_)) => {
             qualified_name_matches(*name, object)
         }
         (Stmt::DropPolicy { policy, .. }, ObjectRef::Policy(_)) => {

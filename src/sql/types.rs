@@ -42,6 +42,10 @@ pub mod oid {
     pub const INTERVAL: i32 = 1186;
     pub const JSON: i32 = 114;
     pub const JSONB: i32 = 3802;
+    pub const TSVECTOR: i32 = 3614;
+    pub const TSQUERY: i32 = 3615;
+    pub const TSVECTOR_ARRAY: i32 = 3643;
+    pub const TSQUERY_ARRAY: i32 = 3645;
     pub const UUID: i32 = 2950;
     pub const NUMERIC: i32 = 1700;
     /// Fixed-length bit string `bit(n)`.
@@ -98,6 +102,8 @@ pub mod oid {
     pub const REGTYPE: i32 = 2206;
     pub const REGNAMESPACE: i32 = 4089;
     pub const REGROLE: i32 = 4096;
+    pub const REGCONFIG: i32 = 3734;
+    pub const REGDICTIONARY: i32 = 3769;
     pub const REGPROC_ARRAY: i32 = 1008;
     pub const REGPROCEDURE_ARRAY: i32 = 2207;
     pub const REGOPER_ARRAY: i32 = 2208;
@@ -106,6 +112,8 @@ pub mod oid {
     pub const REGTYPE_ARRAY: i32 = 2211;
     pub const REGNAMESPACE_ARRAY: i32 = 4090;
     pub const REGROLE_ARRAY: i32 = 4097;
+    pub const REGCONFIG_ARRAY: i32 = 3735;
+    pub const REGDICTIONARY_ARRAY: i32 = 3770;
     /// Base OIDs for user-defined domains, enums, composites, and the array types PostgreSQL
     /// creates alongside each of them. Slots are catalog-local identities; the
     /// bands are deliberately disjoint from relation/composite OIDs.
@@ -214,6 +222,8 @@ pub enum ColType {
     Regclass,
     Regnamespace,
     Regrole,
+    Regconfig,
+    Regdictionary,
     Int8,
     /// `real`/`float4`. Its own [`Datum::Float4`] (f32); reports OID 700 and
     /// typlen 4. On disk it keeps the historical 8-byte float8 layout
@@ -248,6 +258,11 @@ pub enum ColType {
     Json,
     /// Binary/normalized JSON (canonicalized on input).
     Jsonb,
+    /// PostgreSQL full-text document vector. The datum contains canonical,
+    /// validated `tsvector` text; malformed search values never reach storage.
+    TsVector,
+    /// PostgreSQL full-text query tree in canonical text form.
+    TsQuery,
     /// An array of a scalar element type.
     Array(ArrElem),
     Uuid,
@@ -329,6 +344,8 @@ pub enum BtreeOperatorClass {
     Timetz,
     Uuid,
     Varbit,
+    TsQuery,
+    TsVector,
 }
 
 impl BtreeOperatorClass {
@@ -357,7 +374,7 @@ impl BtreeOperatorClass {
             Name => Self::Name,
             Numeric => Self::Numeric,
             Oid | Xid | Regtype | Regproc | Regprocedure | Regoper | Regoperator | Regclass
-            | Regnamespace | Regrole => Self::Oid,
+            | Regnamespace | Regrole | Regconfig | Regdictionary => Self::Oid,
             Record | Composite(_) => Self::Record,
             Text | Varchar => Self::Text,
             Char => return None,
@@ -365,10 +382,14 @@ impl BtreeOperatorClass {
             Timestamp => Self::Timestamp,
             Timestamptz => Self::Timestamptz,
             Timetz => Self::Timetz,
+            TsQuery => Self::TsQuery,
+            TsVector => Self::TsVector,
             Uuid => Self::Uuid,
             Bit { varying: true } => Self::Varbit,
             Void | Internal | PgDdlCommand | Int2Vector | OidVector | PgNodeTree | PgNdistinct
-            | PgDependencies | PgMcvList | PgStatisticArray | Json => return None,
+            | PgDependencies | PgMcvList | PgStatisticArray | Json => {
+                return None;
+            }
         })
     }
 
@@ -402,6 +423,8 @@ impl BtreeOperatorClass {
             "timestamp_ops" => Self::Timestamp,
             "timestamptz_ops" => Self::Timestamptz,
             "timetz_ops" => Self::Timetz,
+            "tsquery_ops" => Self::TsQuery,
+            "tsvector_ops" => Self::TsVector,
             "uuid_ops" => Self::Uuid,
             "varbit_ops" => Self::Varbit,
             _ => return None,
@@ -440,6 +463,8 @@ impl BtreeOperatorClass {
             28 => Self::Timetz,
             29 => Self::Uuid,
             30 => Self::Varbit,
+            31 => Self::TsQuery,
+            32 => Self::TsVector,
             _ => return None,
         })
     }
@@ -478,6 +503,8 @@ impl BtreeOperatorClass {
             Self::Timestamp => "timestamp_ops",
             Self::Timestamptz => "timestamptz_ops",
             Self::Timetz => "timetz_ops",
+            Self::TsQuery => "tsquery_ops",
+            Self::TsVector => "tsvector_ops",
             Self::Uuid => "uuid_ops",
             Self::Varbit => "varbit_ops",
         }
@@ -513,6 +540,8 @@ impl BtreeOperatorClass {
             Self::Timestamp => 3128,
             Self::Timestamptz => 3127,
             Self::Timetz => 10041,
+            Self::TsQuery => 10074,
+            Self::TsVector => 10071,
             Self::Uuid => 10065,
             Self::Varbit => 10043,
         }
@@ -562,6 +591,8 @@ impl ColType {
                 | Self::Regclass
                 | Self::Regnamespace
                 | Self::Regrole
+                | Self::Regconfig
+                | Self::Regdictionary
         )
     }
 
@@ -597,6 +628,8 @@ impl ColType {
             "regclass" => Self::Regclass,
             "regnamespace" => Self::Regnamespace,
             "regrole" => Self::Regrole,
+            "regconfig" => Self::Regconfig,
+            "regdictionary" => Self::Regdictionary,
             "name" => Self::Name,
             "oid" => Self::Oid,
             "xid" => Self::Xid,
@@ -610,6 +643,8 @@ impl ColType {
             "interval" => Self::Interval,
             "json" => Self::Json,
             "jsonb" => Self::Jsonb,
+            "tsvector" => Self::TsVector,
+            "tsquery" => Self::TsQuery,
             "uuid" => Self::Uuid,
             "bytea" => Self::Bytea,
             "numeric" | "decimal" | "dec" => Self::Numeric,
@@ -649,6 +684,8 @@ impl ColType {
             Self::Regclass => oid::REGCLASS,
             Self::Regnamespace => oid::REGNAMESPACE,
             Self::Regrole => oid::REGROLE,
+            Self::Regconfig => oid::REGCONFIG,
+            Self::Regdictionary => oid::REGDICTIONARY,
             Self::Int8 => oid::INT8,
             Self::Float4 => oid::FLOAT4,
             Self::Float8 => oid::FLOAT8,
@@ -665,6 +702,8 @@ impl ColType {
             Self::Interval => oid::INTERVAL,
             Self::Json => oid::JSON,
             Self::Jsonb => oid::JSONB,
+            Self::TsVector => oid::TSVECTOR,
+            Self::TsQuery => oid::TSQUERY,
             Self::Array(e) => e.array_oid(),
             Self::Uuid => oid::UUID,
             Self::Bytea => oid::BYTEA,
@@ -710,6 +749,8 @@ impl ColType {
             oid::REGCLASS => Some(Self::Regclass),
             oid::REGNAMESPACE => Some(Self::Regnamespace),
             oid::REGROLE => Some(Self::Regrole),
+            oid::REGCONFIG => Some(Self::Regconfig),
+            oid::REGDICTIONARY => Some(Self::Regdictionary),
             oid::REGTYPE => Some(Self::Regtype),
             oid::INT8 => Some(Self::Int8),
             oid::FLOAT4 => Some(Self::Float4),
@@ -727,6 +768,8 @@ impl ColType {
             oid::INTERVAL => Some(Self::Interval),
             oid::JSON => Some(Self::Json),
             oid::JSONB => Some(Self::Jsonb),
+            oid::TSVECTOR => Some(Self::TsVector),
+            oid::TSQUERY => Some(Self::TsQuery),
             oid::UUID => Some(Self::Uuid),
             oid::BYTEA => Some(Self::Bytea),
             oid::NUMERIC => Some(Self::Numeric),
@@ -820,6 +863,8 @@ impl ColType {
             | Self::Regclass
             | Self::Regnamespace
             | Self::Regrole
+            | Self::Regconfig
+            | Self::Regdictionary
             | Self::Date
             | Self::Float4 => 4,
             Self::Int8 | Self::Float8 | Self::Timestamp | Self::Timestamptz | Self::Time => 8,
@@ -835,7 +880,9 @@ impl ColType {
             | Self::Bytea
             | Self::Numeric
             | Self::Json
-            | Self::Jsonb => -1,
+            | Self::Jsonb
+            | Self::TsVector
+            | Self::TsQuery => -1,
             Self::Array(_) | Self::Range(_) | Self::Bit { .. } | Self::Multirange(_) => -1,
             Self::Inet | Self::Cidr => -1,
             Self::Record => -1,
@@ -867,7 +914,9 @@ impl ColType {
             | Self::Regoperator
             | Self::Regclass
             | Self::Regnamespace
-            | Self::Regrole => self,
+            | Self::Regrole
+            | Self::Regconfig
+            | Self::Regdictionary => self,
             other => other,
         }
     }
@@ -898,6 +947,8 @@ impl ColType {
             Self::Regclass => "regclass",
             Self::Regnamespace => "regnamespace",
             Self::Regrole => "regrole",
+            Self::Regconfig => "regconfig",
+            Self::Regdictionary => "regdictionary",
             Self::Int8 => "int8",
             Self::Float4 => "float4",
             Self::Float8 => "float8",
@@ -914,6 +965,8 @@ impl ColType {
             Self::Interval => "interval",
             Self::Json => "json",
             Self::Jsonb => "jsonb",
+            Self::TsVector => "tsvector",
+            Self::TsQuery => "tsquery",
             Self::Array(element) => element.array_name(),
             Self::Uuid => "uuid",
             Self::Bytea => "bytea",
@@ -968,6 +1021,8 @@ impl ColType {
             Self::Regclass => "regclass",
             Self::Regnamespace => "regnamespace",
             Self::Regrole => "regrole",
+            Self::Regconfig => "regconfig",
+            Self::Regdictionary => "regdictionary",
             Self::Int8 => "bigint",
             Self::Float4 => "real",
             Self::Float8 => "double precision",
@@ -984,6 +1039,8 @@ impl ColType {
             Self::Interval => "interval",
             Self::Json => "json",
             Self::Jsonb => "jsonb",
+            Self::TsVector => "tsvector",
+            Self::TsQuery => "tsquery",
             Self::Array(_) => "array",
             Self::Uuid => "uuid",
             Self::Bytea => "bytea",
@@ -1025,6 +1082,8 @@ impl ColType {
             Self::Regclass => 63,
             Self::Regnamespace => 64,
             Self::Regrole => 65,
+            Self::Regconfig => 28,
+            Self::Regdictionary => 29,
             Self::Int8 => 3,
             Self::Float8 => 4,
             Self::Text => 5,
@@ -1050,6 +1109,8 @@ impl ColType {
             Self::Interval => 17,
             Self::Json => 18,
             Self::Jsonb => 19,
+            Self::TsVector => 77,
+            Self::TsQuery => 78,
             Self::Range(k) => RANGE_CODE_BASE + k.code(),
             Self::Bit { varying: false } => 26,
             Self::Bit { varying: true } => 27,
@@ -1095,6 +1156,8 @@ impl ColType {
             63 => Self::Regclass,
             64 => Self::Regnamespace,
             65 => Self::Regrole,
+            28 => Self::Regconfig,
+            29 => Self::Regdictionary,
             3 => Self::Int8,
             4 => Self::Float8,
             5 => Self::Text,
@@ -1119,6 +1182,8 @@ impl ColType {
             17 => Self::Interval,
             18 => Self::Json,
             19 => Self::Jsonb,
+            77 => Self::TsVector,
+            78 => Self::TsQuery,
             26 => Self::Bit { varying: false },
             27 => Self::Bit { varying: true },
             42 => Self::Name,
@@ -1172,6 +1237,8 @@ pub enum ArrElem {
     Bytea,
     Json,
     Jsonb,
+    TsVector,
+    TsQuery,
     Varchar,
     Bpchar,
     Name,
@@ -1192,6 +1259,8 @@ pub enum ArrElem {
     Regclass,
     Regnamespace,
     Regrole,
+    Regconfig,
+    Regdictionary,
     /// Anonymous records are legal in transient arrays such as recursive CTE
     /// search paths, but remain invalid as stored table-column types.
     Record,
@@ -1220,14 +1289,14 @@ pub enum ArrElem {
 
 impl ArrElem {
     const ENUM_CODE_BASE: u8 = 32;
-    const DOMAIN_CODE_BASE: u8 = 64;
-    const COMPOSITE_CODE_BASE: u8 = 96;
+    const DOMAIN_CODE_BASE: u8 = 68;
+    const COMPOSITE_CODE_BASE: u8 = 100;
 
     /// Every catalog-defined built-in element type that pos3ql stores and
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 50] = [
+    pub const BUILTIN: [Self; 54] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
@@ -1249,6 +1318,8 @@ impl ArrElem {
         Self::Interval,
         Self::Json,
         Self::Jsonb,
+        Self::TsVector,
+        Self::TsQuery,
         Self::Uuid,
         Self::Bytea,
         Self::Numeric,
@@ -1266,6 +1337,8 @@ impl ArrElem {
         Self::Regclass,
         Self::Regnamespace,
         Self::Regrole,
+        Self::Regconfig,
+        Self::Regdictionary,
         Self::Range(RangeKind::Int4),
         Self::Range(RangeKind::Int8),
         Self::Range(RangeKind::Num),
@@ -1292,6 +1365,8 @@ impl ArrElem {
                 | Self::Regclass
                 | Self::Regnamespace
                 | Self::Regrole
+                | Self::Regconfig
+                | Self::Regdictionary
         )
     }
 
@@ -1319,6 +1394,8 @@ impl ArrElem {
             ArrElem::Bytea => "_bytea",
             ArrElem::Json => "_json",
             ArrElem::Jsonb => "_jsonb",
+            ArrElem::TsVector => "_tsvector",
+            ArrElem::TsQuery => "_tsquery",
             ArrElem::Varchar => "_varchar",
             ArrElem::Bpchar => "_bpchar",
             ArrElem::Name => "_name",
@@ -1336,6 +1413,8 @@ impl ArrElem {
             ArrElem::Regclass => "_regclass",
             ArrElem::Regnamespace => "_regnamespace",
             ArrElem::Regrole => "_regrole",
+            ArrElem::Regconfig => "_regconfig",
+            ArrElem::Regdictionary => "_regdictionary",
             ArrElem::Record => "_record",
             ArrElem::Range(kind) => match kind {
                 RangeKind::Int4 => "_int4range",
@@ -1385,6 +1464,8 @@ impl ArrElem {
             ArrElem::Bytea => "bytea[]",
             ArrElem::Json => "json[]",
             ArrElem::Jsonb => "jsonb[]",
+            ArrElem::TsVector => "tsvector[]",
+            ArrElem::TsQuery => "tsquery[]",
             ArrElem::Varchar => "character varying[]",
             ArrElem::Bpchar => "character[]",
             ArrElem::Name => "name[]",
@@ -1402,6 +1483,8 @@ impl ArrElem {
             ArrElem::Regclass => "regclass[]",
             ArrElem::Regnamespace => "regnamespace[]",
             ArrElem::Regrole => "regrole[]",
+            ArrElem::Regconfig => "regconfig[]",
+            ArrElem::Regdictionary => "regdictionary[]",
             ArrElem::Record => "record[]",
             ArrElem::Range(kind) => match kind {
                 RangeKind::Int4 => "int4range[]",
@@ -1457,6 +1540,8 @@ impl ArrElem {
             Datum::Bytea(_) => ArrElem::Bytea,
             Datum::Json { jsonb: false, .. } => ArrElem::Json,
             Datum::Json { jsonb: true, .. } => ArrElem::Jsonb,
+            Datum::TsVector(_) => ArrElem::TsVector,
+            Datum::TsQuery(_) => ArrElem::TsQuery,
             Datum::Inet(_) => ArrElem::Inet,
             Datum::Cidr(_) => ArrElem::Cidr,
             Datum::Macaddr(_) => ArrElem::Macaddr,
@@ -1472,6 +1557,8 @@ impl ArrElem {
                 oid::REGCLASS => ArrElem::Regclass,
                 oid::REGNAMESPACE => ArrElem::Regnamespace,
                 oid::REGROLE => ArrElem::Regrole,
+                oid::REGCONFIG => ArrElem::Regconfig,
+                oid::REGDICTIONARY => ArrElem::Regdictionary,
                 _ => return None,
             },
             Datum::Record(_) => ArrElem::Record,
@@ -1499,6 +1586,8 @@ impl ArrElem {
             ColType::Float4 => return Some(ArrElem::Float4),
             ColType::Bit { varying: false } => return Some(ArrElem::Bit),
             ColType::Bit { varying: true } => return Some(ArrElem::Varbit),
+            ColType::TsVector => return Some(ArrElem::TsVector),
+            ColType::TsQuery => return Some(ArrElem::TsQuery),
             ColType::Enum(slot) => return Some(ArrElem::Enum(slot)),
             ColType::Composite(slot) => return Some(ArrElem::Composite(slot)),
             ColType::Regtype => return Some(ArrElem::Regtype),
@@ -1509,6 +1598,8 @@ impl ArrElem {
             ColType::Regclass => return Some(ArrElem::Regclass),
             ColType::Regnamespace => return Some(ArrElem::Regnamespace),
             ColType::Regrole => return Some(ArrElem::Regrole),
+            ColType::Regconfig => return Some(ArrElem::Regconfig),
+            ColType::Regdictionary => return Some(ArrElem::Regdictionary),
             ColType::Record => return Some(ArrElem::Record),
             ColType::Range(kind) => return Some(ArrElem::Range(kind)),
             ColType::Multirange(kind) => return Some(ArrElem::Multirange(kind)),
@@ -1532,6 +1623,8 @@ impl ArrElem {
             ColType::Bytea => ArrElem::Bytea,
             ColType::Json => ArrElem::Json,
             ColType::Jsonb => ArrElem::Jsonb,
+            ColType::TsVector => ArrElem::TsVector,
+            ColType::TsQuery => ArrElem::TsQuery,
             ColType::Inet => ArrElem::Inet,
             ColType::Cidr => ArrElem::Cidr,
             ColType::Macaddr => ArrElem::Macaddr,
@@ -1563,6 +1656,8 @@ impl ArrElem {
             ArrElem::Bytea => ColType::Bytea,
             ArrElem::Json => ColType::Json,
             ArrElem::Jsonb => ColType::Jsonb,
+            ArrElem::TsVector => ColType::TsVector,
+            ArrElem::TsQuery => ColType::TsQuery,
             ArrElem::Varchar => ColType::Varchar,
             ArrElem::Bpchar => ColType::Bpchar,
             ArrElem::Name => ColType::Name,
@@ -1580,6 +1675,8 @@ impl ArrElem {
             ArrElem::Regclass => ColType::Regclass,
             ArrElem::Regnamespace => ColType::Regnamespace,
             ArrElem::Regrole => ColType::Regrole,
+            ArrElem::Regconfig => ColType::Regconfig,
+            ArrElem::Regdictionary => ColType::Regdictionary,
             ArrElem::Record => ColType::Record,
             ArrElem::Range(kind) => ColType::Range(kind),
             ArrElem::Multirange(kind) => ColType::Multirange(kind),
@@ -1625,6 +1722,8 @@ impl ArrElem {
             ArrElem::Bytea => 1001,
             ArrElem::Json => 199,
             ArrElem::Jsonb => 3807,
+            ArrElem::TsVector => oid::TSVECTOR_ARRAY,
+            ArrElem::TsQuery => oid::TSQUERY_ARRAY,
             ArrElem::Varchar => 1015,
             ArrElem::Bpchar => 1014,
             ArrElem::Name => 1003,
@@ -1642,6 +1741,8 @@ impl ArrElem {
             ArrElem::Regclass => oid::REGCLASS_ARRAY,
             ArrElem::Regnamespace => oid::REGNAMESPACE_ARRAY,
             ArrElem::Regrole => oid::REGROLE_ARRAY,
+            ArrElem::Regconfig => oid::REGCONFIG_ARRAY,
+            ArrElem::Regdictionary => oid::REGDICTIONARY_ARRAY,
             ArrElem::Record => oid::RECORD_ARRAY,
             ArrElem::Range(kind) => kind.array_oid(),
             ArrElem::Multirange(kind) => kind.multirange_array_oid(),
@@ -1685,6 +1786,8 @@ impl ArrElem {
             ArrElem::Bytea => 14,
             ArrElem::Json => 15,
             ArrElem::Jsonb => 16,
+            ArrElem::TsVector => 64,
+            ArrElem::TsQuery => 65,
             ArrElem::Varchar => 17,
             ArrElem::Bpchar => 18,
             ArrElem::Name => 19,
@@ -1703,6 +1806,8 @@ impl ArrElem {
             ArrElem::Regclass => 48,
             ArrElem::Regnamespace => 49,
             ArrElem::Regrole => 50,
+            ArrElem::Regconfig => 66,
+            ArrElem::Regdictionary => 67,
             ArrElem::Record => 128,
             ArrElem::Range(kind) => 51 + kind.code(),
             ArrElem::Multirange(kind) => 57 + kind.code(),
@@ -1734,6 +1839,8 @@ impl ArrElem {
             14 => ArrElem::Bytea,
             15 => ArrElem::Json,
             16 => ArrElem::Jsonb,
+            64 => ArrElem::TsVector,
+            65 => ArrElem::TsQuery,
             17 => ArrElem::Varchar,
             18 => ArrElem::Bpchar,
             19 => ArrElem::Name,
@@ -1752,6 +1859,8 @@ impl ArrElem {
             48 => ArrElem::Regclass,
             49 => ArrElem::Regnamespace,
             50 => ArrElem::Regrole,
+            66 => ArrElem::Regconfig,
+            67 => ArrElem::Regdictionary,
             128 => ArrElem::Record,
             51..=56 => ArrElem::Range(RangeKind::from_code(c - 51)?),
             57..=62 => ArrElem::Multirange(RangeKind::from_code(c - 57)?),
@@ -2325,6 +2434,12 @@ pub enum Datum<'a> {
         text: &'a str,
         jsonb: bool,
     },
+    /// Canonical `tsvector` text produced by the full-text parser. Keeping a
+    /// distinct datum prevents ordinary text from crossing search boundaries
+    /// without validation.
+    TsVector(super::full_text::TsVector<'a>),
+    /// Canonical `tsquery` text whose operator tree has already been parsed.
+    TsQuery(super::full_text::TsQuery<'a>),
     /// An array's element type and canonical shaped row encoding.
     Array {
         element: ArrElem,
@@ -2438,6 +2553,8 @@ impl<'a> Datum<'a> {
             Datum::Interval(_) => oid::INTERVAL,
             Datum::Json { jsonb: false, .. } => oid::JSON,
             Datum::Json { jsonb: true, .. } => oid::JSONB,
+            Datum::TsVector(_) => oid::TSVECTOR,
+            Datum::TsQuery(_) => oid::TSQUERY,
             Datum::Array { element, .. } => element.array_oid(),
             Datum::Int2Vector(_) => oid::INT2VECTOR,
             Datum::OidVector(_) => oid::OIDVECTOR,
@@ -2617,6 +2734,8 @@ impl fmt::Display for Datum<'_> {
                 f.write_str(super::datetime::format_interval_styled(*interval, style).as_str())
             }
             Datum::Json { text, .. } => f.write_str(text),
+            Datum::TsVector(text) => f.write_str(text.as_str()),
+            Datum::TsQuery(text) => f.write_str(text.as_str()),
             Datum::Range { text, .. } => f.write_str(text),
             Datum::Bit { bits, .. } => f.write_str(bits),
             Datum::Multirange { text, .. } => f.write_str(text),
@@ -3066,6 +3185,8 @@ mod tests {
             (ColType::Timestamp, BtreeOperatorClass::Timestamp),
             (ColType::Timestamptz, BtreeOperatorClass::Timestamptz),
             (ColType::Timetz, BtreeOperatorClass::Timetz),
+            (ColType::TsQuery, BtreeOperatorClass::TsQuery),
+            (ColType::TsVector, BtreeOperatorClass::TsVector),
             (ColType::Uuid, BtreeOperatorClass::Uuid),
             (ColType::Bit { varying: true }, BtreeOperatorClass::Varbit),
         ];

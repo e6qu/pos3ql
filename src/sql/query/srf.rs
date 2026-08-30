@@ -1010,6 +1010,45 @@ pub(crate) fn synth_derived_def<'a>(
     synth_derived_def_outer(storage, sub, exposed, col_alias, txid, arena, None)
 }
 
+fn preserve_projection_type_identities(
+    items: &[SelectItem<'_>],
+    scope: Option<&QueryScope<'_>>,
+    resolver: &dyn crate::sql::exec::ColTypeResolver,
+    descriptors: &[ColDesc<'_>],
+    type_oids: &mut [i32],
+) -> Result<(), SqlError> {
+    for (output, description) in type_oids.iter_mut().zip(descriptors) {
+        *output = description.type_oid;
+    }
+    let mut output = 0usize;
+    for item in items {
+        match item {
+            SelectItem::Wildcard => {
+                output += scope.map_or(0, QueryScope::star_columns);
+            }
+            SelectItem::TableWildcard(name) => {
+                output += match scope {
+                    Some(scope) => scope.qualified_star_columns(name)?,
+                    None => 0,
+                };
+            }
+            SelectItem::RecordStar(base) => {
+                output += scope.map_or(1, |scope| record_star_width(base, scope));
+            }
+            SelectItem::Expr { expression, .. } => {
+                let semantic = crate::sql::exec::infer_routine_argument_oid(expression, resolver)?;
+                if semantic != crate::sql::types::oid::UNKNOWN
+                    && let Some(type_oid) = type_oids.get_mut(output)
+                {
+                    *type_oid = semantic;
+                }
+                output += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// [`synth_derived_def`] with an optional outer scope, for a `LATERAL` body: a
 /// FROM-less lateral projection (`SELECT t.a * 2`) types its columns against the
 /// tables to the item's left. A lateral body with its own FROM is typed from
@@ -1025,9 +1064,16 @@ pub(crate) fn synth_derived_def_outer<'a>(
     outer: Option<&QueryScope<'a>>,
 ) -> Result<&'a TableDef, SqlError> {
     let mut descriptors = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let mut type_oids = [0_i32; MAX_PROJ];
     let mut output_collations = [crate::sql::ast::Collation::None; MAX_PROJ];
     let n_cols = match sub.set_body {
-        Some(tree) => describe_set_body(storage, tree, txid, &mut descriptors, arena)?,
+        Some(tree) => {
+            let count = describe_set_body(storage, tree, txid, &mut descriptors, arena)?;
+            for (output, description) in type_oids[..count].iter_mut().zip(&descriptors[..count]) {
+                *output = description.type_oid;
+            }
+            count
+        }
         None => match &sub.from {
             Some(f) => {
                 let ss = QueryScope::resolve_schema(storage, f, txid, arena)?;
@@ -1124,19 +1170,47 @@ pub(crate) fn synth_derived_def_outer<'a>(
                         }
                     }
                 }
+                preserve_projection_type_identities(
+                    sub.items,
+                    Some(&ss),
+                    &super::CatalogScopeCols {
+                        scope: &ss,
+                        outer_scope: outer,
+                        storage,
+                        txid,
+                    },
+                    &descriptors[..n],
+                    &mut type_oids[..n],
+                )?;
                 n
             }
             // A FROM-less lateral body types its projection against the outer
             // scope (`SELECT t.a * 2` sees the enclosing `t`).
-            None if outer.is_some() => describe_scope_items(
-                sub.items,
-                outer.expect("checked"),
-                None,
-                storage,
-                txid,
-                arena,
-                &mut descriptors,
-            )?,
+            None if outer.is_some() => {
+                let outer = outer.expect("checked");
+                let n = describe_scope_items(
+                    sub.items,
+                    outer,
+                    None,
+                    storage,
+                    txid,
+                    arena,
+                    &mut descriptors,
+                )?;
+                preserve_projection_type_identities(
+                    sub.items,
+                    Some(outer),
+                    &super::CatalogScopeCols {
+                        scope: outer,
+                        outer_scope: None,
+                        storage,
+                        txid,
+                    },
+                    &descriptors[..n],
+                    &mut type_oids[..n],
+                )?;
+                n
+            }
             None => {
                 let n = super::describe_catalog_items(
                     sub.items,
@@ -1165,6 +1239,18 @@ pub(crate) fn synth_derived_def_outer<'a>(
                         slot += 1;
                     }
                 }
+                preserve_projection_type_identities(
+                    sub.items,
+                    None,
+                    &crate::sql::exec::CatalogCols {
+                        definition: None,
+                        alias: None,
+                        storage,
+                        txid,
+                    },
+                    &descriptors[..n],
+                    &mut type_oids[..n],
+                )?;
                 n
             }
         },
@@ -1215,16 +1301,15 @@ pub(crate) fn synth_derived_def_outer<'a>(
     };
     let mut columns = [blank; MAX_COLUMNS];
     for i in 0..n_cols {
-        let (ctype, user_type) =
-            crate::sql::exec::catalog_column_type(storage, txid, descriptors[i].type_oid)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "derived table column \"{}\" type (oid {}) is not supported",
-                        descriptors[i].name,
-                        descriptors[i].type_oid
-                    )
-                })?;
+        let (ctype, user_type) = crate::sql::exec::catalog_column_type(storage, txid, type_oids[i])
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "derived table column \"{}\" type (oid {}) is not supported",
+                    descriptors[i].name,
+                    type_oids[i]
+                )
+            })?;
         columns[i] = ColumnMeta {
             name: SqlName::parse(descriptors[i].name)?,
             ctype,

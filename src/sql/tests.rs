@@ -105,6 +105,204 @@ fn rewrite_rule_actions_are_set_oriented_ordered_and_qualified() {
 }
 
 #[test]
+fn rewrite_rule_set_queries_notify_recursion_and_command_counts() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_as(
+        &mut engine,
+        &mut budget,
+        17,
+        "CREATE TABLE rule_set_source(id integer); \
+         CREATE SEQUENCE rule_set_sequence; \
+         CREATE RULE rule_set_action AS ON INSERT TO rule_set_source DO ALSO ( \
+           SELECT nextval('rule_set_sequence') WHERE NEW.id > 0 \
+           UNION ALL \
+           SELECT nextval('rule_set_sequence') WHERE NEW.id < 0; \
+           NOTIFY rule_set_changed, 'rewritten'; \
+         )",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let inserted = run_as(
+        &mut engine,
+        &mut budget,
+        17,
+        "INSERT INTO rule_set_source VALUES (1), (-1)",
+    );
+    let inserted = String::from_utf8_lossy(&inserted);
+    assert!(!inserted.contains("ERROR"), "{inserted}");
+    assert!(inserted.contains("INSERT 0 2"), "{inserted}");
+    let sequence = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT last_value FROM pg_sequences WHERE sequencename = 'rule_set_sequence'",
+    );
+    assert_eq!(
+        data_rows(&sequence),
+        ["2"],
+        "{}",
+        String::from_utf8_lossy(&sequence)
+    );
+    assert_eq!(engine.notifications().len(), 1);
+    assert_eq!(
+        engine.notifications()[0].channel.as_str(),
+        "rule_set_changed"
+    );
+    assert_eq!(engine.notifications()[0].payload.as_str(), "rewritten");
+    engine.clear_notifications();
+
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE recursive_rule_rows(id integer); \
+         CREATE RULE recurse_rows AS ON INSERT TO recursive_rule_rows DO ALSO \
+           INSERT INTO recursive_rule_rows VALUES (NEW.id)",
+    );
+    assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
+    let recursive = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO recursive_rule_rows VALUES (1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&recursive)
+            .contains("infinite recursion detected in rules for relation"),
+        "{}",
+        String::from_utf8_lossy(&recursive)
+    );
+}
+
+#[test]
+fn rewrite_rule_actions_use_the_relation_owner_security_context() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE rule_security_owner; \
+         CREATE ROLE rule_security_writer; \
+         GRANT CREATE ON SCHEMA public TO rule_security_owner; \
+         SET ROLE rule_security_owner; \
+         CREATE TABLE rule_security_source(id integer); \
+         CREATE TABLE rule_security_lookup(id integer); \
+         CREATE TABLE rule_security_sink(id integer); \
+         CREATE TABLE rule_security_trigger_log(id integer); \
+         INSERT INTO rule_security_lookup VALUES (7); \
+         ALTER TABLE rule_security_sink ENABLE ROW LEVEL SECURITY; \
+         ALTER TABLE rule_security_sink FORCE ROW LEVEL SECURITY; \
+         CREATE POLICY rule_owner_insert ON rule_security_sink \
+           FOR INSERT TO rule_security_owner WITH CHECK (true); \
+         CREATE FUNCTION log_rule_security_insert() RETURNS trigger \
+           LANGUAGE plpgsql SECURITY DEFINER AS \
+           'BEGIN INSERT INTO rule_security_trigger_log VALUES (NEW.id); RETURN NEW; END'; \
+         CREATE TRIGGER log_rule_security_insert \
+           AFTER INSERT ON rule_security_sink FOR EACH ROW \
+           EXECUTE FUNCTION log_rule_security_insert(); \
+         CREATE RULE redirect_secure_insert AS ON INSERT TO rule_security_source DO INSTEAD \
+           INSERT INTO rule_security_sink \
+             SELECT lookup.id FROM rule_security_lookup AS lookup \
+             WHERE lookup.id = NEW.id RETURNING id; \
+         GRANT INSERT ON rule_security_source TO rule_security_writer; \
+         GRANT SELECT(id) ON rule_security_source TO rule_security_writer; \
+         CREATE TABLE rule_security_denied(id integer); \
+         CREATE RULE redirect_denied AS ON INSERT TO rule_security_denied DO INSTEAD \
+           INSERT INTO rule_security_sink VALUES (NEW.id); \
+         CREATE TABLE rule_security_nothing(id integer); \
+         CREATE RULE discard_secure_insert AS ON INSERT TO rule_security_nothing \
+           DO INSTEAD NOTHING; \
+         GRANT INSERT ON rule_security_nothing TO rule_security_writer; \
+         RESET ROLE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let inserted = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rule_security_writer; \
+         INSERT INTO rule_security_source VALUES (7) RETURNING id; \
+         RESET ROLE; \
+         SELECT id FROM rule_security_sink; \
+         SELECT id FROM rule_security_trigger_log",
+    );
+    let inserted_text = String::from_utf8_lossy(&inserted);
+    assert!(!inserted_text.contains("ERROR"), "{inserted_text}");
+    assert_eq!(data_rows(&inserted), ["7", "7", "7"]);
+
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rule_security_writer; INSERT INTO rule_security_denied VALUES (8)",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied)
+            .contains("permission denied for table rule_security_denied"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+    let reset = run_with(&mut engine, &mut budget, "RESET ROLE");
+    assert!(!String::from_utf8_lossy(&reset).contains("ERROR"));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM rule_security_sink WHERE id = 8"
+        )),
+        ["0"]
+    );
+
+    let denied_source = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE rule_security_writer; \
+         INSERT INTO rule_security_nothing SELECT id FROM rule_security_lookup",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_source)
+            .contains("permission denied for table rule_security_lookup"),
+        "{}",
+        String::from_utf8_lossy(&denied_source)
+    );
+    let column_grant = run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT SELECT(id) ON rule_security_lookup TO rule_security_writer; \
+         SET ROLE rule_security_writer; \
+         INSERT INTO rule_security_nothing SELECT id FROM rule_security_lookup",
+    );
+    let column_grant_text = String::from_utf8_lossy(&column_grant);
+    assert!(!column_grant_text.contains("ERROR"), "{column_grant_text}");
+    assert!(
+        column_grant_text.contains("INSERT 0 0"),
+        "{column_grant_text}"
+    );
+}
+
+#[test]
+fn rewrite_rule_capacity_is_a_named_startup_bound() {
+    let mut config = test_config("rewrite-rule-capacity");
+    config.max_rules = 1;
+    let mut budget = Budget::new(1 << 28);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE bounded_rules(id integer); \
+         CREATE RULE bounded_rule_one AS ON INSERT TO bounded_rules DO NOTHING; \
+         CREATE RULE bounded_rule_two AS ON UPDATE TO bounded_rules DO NOTHING",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("too many rewrite rules (limit 1)"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn rewrite_rules_expand_defaults_returning_and_on_conflict_contracts() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -263,6 +461,51 @@ fn rewrite_rule_comments_and_event_trigger_objects_are_first_class() {
 }
 
 #[test]
+fn rewrite_rule_transition_columns_preserve_catalog_type_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE DOMAIN rule_identity_domain AS integer CHECK (VALUE > 0); \
+         CREATE FUNCTION rule_identity(value integer) RETURNS text \
+           LANGUAGE sql AS 'SELECT ''base'''; \
+         CREATE FUNCTION rule_identity(value rule_identity_domain) RETURNS text \
+           LANGUAGE sql AS 'SELECT ''domain'''; \
+         SELECT rule_identity(value) \
+           FROM (SELECT 7::rule_identity_domain AS value) typed_input; \
+         CREATE TABLE rule_identity_source(id rule_identity_domain); \
+         CREATE TABLE rule_identity_log(value text); \
+         CREATE RULE capture_rule_identity AS ON INSERT TO rule_identity_source DO INSTEAD \
+           INSERT INTO rule_identity_log SELECT rule_identity(NEW.id); \
+         INSERT INTO rule_identity_source VALUES (7); \
+         SELECT value FROM rule_identity_log; \
+         SELECT count(*) FROM rule_identity_source",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["domain", "domain", "0"]);
+
+    let invalid = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO rule_identity_source VALUES (-1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&invalid).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&invalid)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM rule_identity_log",
+        )),
+        ["domain"]
+    );
+}
+
+#[test]
 fn rewrite_rules_survive_object_cold_checkpoint_recovery() {
     let mut config = test_config("rewrite-rule-cold-recovery");
     config.object_store_on = true;
@@ -294,9 +537,26 @@ fn rewrite_rules_survive_object_cold_checkpoint_recovery() {
         "{}",
         String::from_utf8_lossy(&created)
     );
-    assert!(engine.checkpoint().unwrap());
     engine.commit_wal().unwrap();
     drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut wal_recovered_budget = Budget::new(1 << 29);
+    let mut wal_recovered = Engine::new(&config, &mut wal_recovered_budget).unwrap();
+    let wal_output = run_with(
+        &mut wal_recovered,
+        &mut wal_recovered_budget,
+        "INSERT INTO durable_rule_source VALUES (18) RETURNING id; \
+         SELECT id FROM durable_rule_sink ORDER BY id; \
+         SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite \
+           WHERE rulename = 'durable_rule'",
+    );
+    let wal_text = String::from_utf8_lossy(&wal_output);
+    assert!(!wal_text.contains("ERROR"), "{wal_text}");
+    assert_eq!(data_rows(&wal_output), ["18", "12", "18", "object durable"]);
+    assert!(wal_recovered.checkpoint().unwrap());
+    wal_recovered.commit_wal().unwrap();
+    drop(wal_recovered);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 
     let mut recovered_budget = Budget::new(1 << 29);
@@ -304,7 +564,7 @@ fn rewrite_rules_survive_object_cold_checkpoint_recovery() {
     let output = run_with(
         &mut recovered,
         &mut recovered_budget,
-        "INSERT INTO durable_rule_source VALUES (18) RETURNING id; \
+        "INSERT INTO durable_rule_source VALUES (24) RETURNING id; \
          SELECT id FROM durable_rule_sink ORDER BY id; \
          SELECT obj_description(oid, 'pg_rewrite') FROM pg_rewrite \
            WHERE rulename = 'durable_rule'; \
@@ -314,7 +574,7 @@ fn rewrite_rules_survive_object_cold_checkpoint_recovery() {
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(
         data_rows(&output),
-        ["18", "12", "18", "object durable", "t"]
+        ["24", "12", "18", "24", "object durable", "t"]
     );
     drop(recovered);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);

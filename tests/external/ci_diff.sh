@@ -426,6 +426,11 @@ CREATE FUNCTION outbound_dump.write_writable_view() RETURNS trigger LANGUAGE plp
 CREATE TRIGGER writable_view_write INSTEAD OF INSERT OR UPDATE OR DELETE
   ON outbound_dump.writable_view FOR EACH ROW
   EXECUTE FUNCTION outbound_dump.write_writable_view();
+CREATE TABLE outbound_dump.rule_source (id integer, body text);
+CREATE TABLE outbound_dump.rule_sink (id integer, body text);
+CREATE RULE outbound_redirect AS ON INSERT TO outbound_dump.rule_source DO INSTEAD
+  INSERT INTO outbound_dump.rule_sink VALUES (NEW.id, NEW.body) RETURNING id, body;
+COMMENT ON RULE outbound_redirect ON outbound_dump.rule_source IS 'dumped rewrite rule';
 CREATE TABLE outbound_dump.view_source (id integer PRIMARY KEY, value integer NOT NULL);
 INSERT INTO outbound_dump.view_source VALUES (2, 200), (3, 300);
 CREATE TABLE outbound_dump.tags (id integer PRIMARY KEY, label text UNIQUE NOT NULL);
@@ -583,6 +588,16 @@ else
       DELETE FROM outbound_dump.writable_view AS target USING outbound_dump.view_source AS source
         WHERE target.id = source.id AND source.id = 2 RETURNING target.id,target.value;
       SELECT id,value FROM outbound_dump.view_base ORDER BY id;
+      INSERT INTO outbound_dump.rule_source VALUES (9, 'nine') RETURNING id,body;
+      SELECT id,body FROM outbound_dump.rule_sink;
+      SELECT rules.rulename,rules.definition IS NOT NULL,
+             obj_description(rewrite.oid, 'pg_rewrite')
+        FROM pg_rules AS rules
+        JOIN pg_rewrite AS rewrite
+          ON rewrite.rulename = rules.rulename
+         AND rewrite.ev_class = 'outbound_dump.rule_source'::regclass
+       WHERE rules.schemaname = 'outbound_dump'
+         AND rules.tablename = 'rule_source';
       SELECT conname FROM pg_constraint
        WHERE conrelid = 'outbound_dump.items'::regclass AND contype = 'c';
       SELECT indexdef LIKE '%INCLUDE (mood)%' AND indexdef LIKE '%WHERE (note IS NOT NULL)%'
@@ -678,7 +693,7 @@ else
         FROM pg_collation AS c CROSS JOIN pg_conversion AS conversion
        WHERE c.collname='byte_order' AND conversion.conname='latin1_to_utf8';
     " 2>/dev/null)
-  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1\nbyte_order|c|t|latin1_to_utf8|t\none\nthree\ntwo\nc3a9\ndumped collation|dumped conversion'
+  expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\n9|nine\nINSERT 0 1\n9|nine\noutbound_redirect|t|dumped rewrite rule\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1\nbyte_order|c|t|latin1_to_utf8|t\none\nthree\ntwo\nc3a9\ndumped collation|dumped conversion'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

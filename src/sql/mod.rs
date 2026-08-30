@@ -7179,6 +7179,7 @@ impl Engine {
                 &mut self.dml_scratch,
                 &self.work,
                 dml,
+                exec::DmlAuthorization::Invoker,
                 txn,
                 params,
                 guc,
@@ -7226,6 +7227,7 @@ impl Engine {
         scratch: &mut exec::DmlScratch,
         arena: &'a Arena,
         statement: &'a Stmt<'a>,
+        authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &mut GucState,
@@ -7263,7 +7265,16 @@ impl Engine {
             Some(resolved) => resolved,
             None => {
                 return Self::execute_data_modification_unrewritten(
-                    storage, scratch, arena, statement, txn, params, guc, responder, capture,
+                    storage,
+                    scratch,
+                    arena,
+                    statement,
+                    authorization,
+                    txn,
+                    params,
+                    guc,
+                    responder,
+                    capture,
                 );
             }
         };
@@ -7276,7 +7287,16 @@ impl Engine {
             }
             crate::storage::ResolvedRelation::Catalog => {
                 return Self::execute_data_modification_unrewritten(
-                    storage, scratch, arena, statement, txn, params, guc, responder, capture,
+                    storage,
+                    scratch,
+                    arena,
+                    statement,
+                    authorization,
+                    txn,
+                    params,
+                    guc,
+                    responder,
+                    capture,
                 );
             }
         };
@@ -7304,14 +7324,74 @@ impl Engine {
         }
         if storage.rules_for(target, event, txn.txid).next().is_none() {
             return Self::execute_data_modification_unrewritten(
-                storage, scratch, arena, statement, txn, params, guc, responder, capture,
+                storage,
+                scratch,
+                arena,
+                statement,
+                authorization,
+                txn,
+                params,
+                guc,
+                responder,
+                capture,
             );
+        }
+        let rule_owner = match u16::try_from(storage.object_owner(target.access_object(), txn.txid))
+        {
+            Ok(owner) => owner,
+            Err(_) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "rewrite-rule owner is out of range"
+                )));
+            }
+        };
+        let rule_authorization = exec::DmlAuthorization::RuleOwner(rule_owner);
+        if let Err(error) = exec::require_rewrite_input_privileges(
+            storage,
+            statement,
+            authorization,
+            txn.txid,
+            arena,
+        ) {
+            return Ok(Err(error));
         }
 
         let mut rule_defaults: exec::constraints::ParsedDefaults<'a> =
             [None; crate::storage::MAX_COLUMNS];
         let mut force_defaults = [false; crate::storage::MAX_COLUMNS];
-        let columns = match target {
+        let transition_collation = |collation| -> Result<_, SqlError> {
+            match collation {
+                ast::Collation::None | ast::Collation::Default => Ok(None),
+                ast::Collation::C | ast::Collation::Posix | ast::Collation::UcsBasic => {
+                    Ok(Some(ast::ParsedCollation::Builtin(collation)))
+                }
+                ast::Collation::Catalog(slot) => {
+                    let definition = storage
+                        .collation(usize::from(slot))
+                        .definition_for(txn.txid);
+                    let schema = arena
+                        .alloc_str(definition.schema.as_str())
+                        .map_err(|_| query::arena_full_pub())?;
+                    let name = arena
+                        .alloc_str(definition.name.as_str())
+                        .map_err(|_| query::arena_full_pub())?;
+                    let name = arena
+                        .alloc(ast::QualName {
+                            schema: Some(schema),
+                            name,
+                        })
+                        .map_err(|_| query::arena_full_pub())?;
+                    Ok(Some(ast::ParsedCollation::Named(&*name)))
+                }
+            }
+        };
+        let mut transition_types = [query::RuleTransitionType {
+            type_name: "text",
+            type_mod: -1,
+            collation: None,
+        }; crate::storage::MAX_COLUMNS];
+        let (columns, transition_types) = match target {
             crate::storage::RuleTarget::Table(slot) => {
                 let definition = storage.table_def(usize::from(slot), txn.txid);
                 rule_defaults = match exec::parse_defaults(definition, arena) {
@@ -7331,11 +7411,41 @@ impl Engine {
                         Ok(name) => name,
                         Err(_) => return Ok(Err(query::arena_full_pub())),
                     };
+                    let type_oid =
+                        match storage.routine_type_oid(column.ctype, column.user_type, txn.txid) {
+                            Some(type_oid) => type_oid,
+                            None => {
+                                return Ok(Err(sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "rule target column has an unknown type"
+                                )));
+                            }
+                        };
+                    let type_name =
+                        match catalog::user_type_name_text(storage, txn.txid, type_oid, arena) {
+                            Ok(Some(name)) => name,
+                            Ok(None) => column.ctype.name(),
+                            Err(error) => return Ok(Err(error)),
+                        };
+                    transition_types[index] = query::RuleTransitionType {
+                        type_name,
+                        type_mod: column.type_mod,
+                        collation: match transition_collation(column.collation) {
+                            Ok(collation) => collation,
+                            Err(error) => return Ok(Err(error)),
+                        },
+                    };
                 }
-                match arena.alloc_slice_copy(&names[..definition.n_columns]) {
+                let columns = match arena.alloc_slice_copy(&names[..definition.n_columns]) {
                     Ok(columns) => &*columns,
                     Err(_) => return Ok(Err(query::arena_full_pub())),
-                }
+                };
+                let types = match arena.alloc_slice_copy(&transition_types[..definition.n_columns])
+                {
+                    Ok(types) => &*types,
+                    Err(_) => return Ok(Err(query::arena_full_pub())),
+                };
+                (columns, types)
             }
             crate::storage::RuleTarget::View(slot) => {
                 let mut descriptions = [ColDesc::new("", 0, 0); MAX_PROJ];
@@ -7355,16 +7465,53 @@ impl Engine {
                         Ok(name) => name,
                         Err(_) => return Ok(Err(query::arena_full_pub())),
                     };
+                    let ctype = match exec::catalog_column_type(
+                        storage,
+                        txn.txid,
+                        descriptions[index].type_oid,
+                    ) {
+                        Some((ctype, _)) => ctype,
+                        None => {
+                            return Ok(Err(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "rule target column has an unknown type"
+                            )));
+                        }
+                    };
+                    let type_name = match catalog::user_type_name_text(
+                        storage,
+                        txn.txid,
+                        descriptions[index].type_oid,
+                        arena,
+                    ) {
+                        Ok(Some(name)) => name,
+                        Ok(None) => ctype.name(),
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    transition_types[index] = query::RuleTransitionType {
+                        type_name,
+                        type_mod: descriptions[index].type_mod,
+                        collation: match transition_collation(descriptions[index].collation) {
+                            Ok(collation) => collation,
+                            Err(error) => return Ok(Err(error)),
+                        },
+                    };
                 }
-                match arena.alloc_slice_copy(&names[..count]) {
+                let columns = match arena.alloc_slice_copy(&names[..count]) {
                     Ok(columns) => &*columns,
                     Err(_) => return Ok(Err(query::arena_full_pub())),
-                }
+                };
+                let types = match arena.alloc_slice_copy(&transition_types[..count]) {
+                    Ok(types) => &*types,
+                    Err(_) => return Ok(Err(query::arena_full_pub())),
+                };
+                (columns, types)
             }
         };
         let transition = match query::rule_transition_source(
             statement,
             columns,
+            transition_types,
             &rule_defaults,
             &force_defaults,
             arena,
@@ -7372,10 +7519,11 @@ impl Engine {
             Ok(transition) => transition,
             Err(error) => return Ok(Err(error)),
         };
-        let original_transition = match query::rule_original_transition(statement, columns, arena) {
-            Ok(transition) => transition,
-            Err(error) => return Ok(Err(error)),
-        };
+        let original_transition =
+            match query::rule_original_transition(statement, columns, transition_types, arena) {
+                Ok(transition) => transition,
+                Err(error) => return Ok(Err(error)),
+            };
         let suppress_original = storage.rules_for(target, event, txn.txid).any(|(_, rule)| {
             let definition = rule.definition_for(txn.txid);
             definition.mode == crate::storage::RewriteMode::Instead
@@ -7436,6 +7584,7 @@ impl Engine {
                     guc.seq_session(),
                     txn.txid,
                 )),
+                rule_owner,
                 binding.0,
                 binding.1,
                 binding.2,
@@ -7473,6 +7622,7 @@ impl Engine {
                 scratch,
                 arena,
                 original_statement,
+                authorization,
                 txn,
                 params,
                 guc,
@@ -7537,6 +7687,7 @@ impl Engine {
                                 guc.seq_session(),
                                 txn.txid,
                             )),
+                            rule_owner,
                             transition.names,
                             transition.old,
                             transition.new,
@@ -7572,6 +7723,7 @@ impl Engine {
                             guc.seq_session(),
                             txn.txid,
                         )),
+                        rule_owner,
                         transition.names,
                         transition.old,
                         transition.new,
@@ -7597,6 +7749,7 @@ impl Engine {
                         scratch,
                         arena,
                         action,
+                        rule_authorization,
                         txn,
                         params,
                         guc,
@@ -7625,6 +7778,7 @@ impl Engine {
                 scratch,
                 arena,
                 original_statement,
+                authorization,
                 txn,
                 params,
                 guc,
@@ -7658,6 +7812,7 @@ impl Engine {
         scratch: &mut exec::DmlScratch,
         arena: &'a Arena,
         action: &'a Stmt<'a>,
+        authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &mut GucState,
@@ -7674,6 +7829,7 @@ impl Engine {
                         scratch,
                         arena,
                         action,
+                        authorization,
                         txn,
                         params,
                         guc,
@@ -7689,6 +7845,7 @@ impl Engine {
                         scratch,
                         arena,
                         action,
+                        authorization,
                         txn,
                         params,
                         guc,
@@ -7722,6 +7879,18 @@ impl Engine {
                     )
                 }
             }),
+            Stmt::SetQuery(query) => responder.without_query_output(|responder| {
+                let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
+                query::set_query(
+                    storage,
+                    txn.txid,
+                    query,
+                    arena,
+                    params,
+                    Some(&sequence),
+                    responder,
+                )
+            }),
             Stmt::Notify { channel, payload } => {
                 let payload = match payload {
                     Some(payload) => match notify::payload(payload) {
@@ -7748,6 +7917,7 @@ impl Engine {
         scratch: &mut exec::DmlScratch,
         arena: &'a Arena,
         statement: &'a Stmt<'a>,
+        authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &mut GucState,
@@ -7784,7 +7954,16 @@ impl Engine {
         });
         let Some(view) = view else {
             return Self::execute_data_modification_inner(
-                storage, scratch, arena, statement, txn, params, guc, responder, capture,
+                storage,
+                scratch,
+                arena,
+                statement,
+                authorization,
+                txn,
+                params,
+                guc,
+                responder,
+                capture,
             );
         };
         let event = match statement {
@@ -7801,7 +7980,16 @@ impl Engine {
             })
         {
             return Self::execute_data_modification_inner(
-                storage, scratch, arena, statement, txn, params, guc, responder, capture,
+                storage,
+                scratch,
+                arena,
+                statement,
+                authorization,
+                txn,
+                params,
+                guc,
+                responder,
+                capture,
             );
         }
         if let Err(error) = exec::fire_view_statement_triggers(
@@ -7820,7 +8008,16 @@ impl Engine {
         let capturing = capture.is_some();
         let outcome = responder.without_command_complete(|responder| {
             Self::execute_data_modification_inner(
-                storage, scratch, arena, statement, txn, params, guc, responder, capture,
+                storage,
+                scratch,
+                arena,
+                statement,
+                authorization,
+                txn,
+                params,
+                guc,
+                responder,
+                capture,
             )
         })?;
         let affected = responder.take_affected_rows().unwrap_or(0);
@@ -7898,6 +8095,7 @@ impl Engine {
         scratch: &mut exec::DmlScratch,
         arena: &Arena,
         statement: &'a Stmt<'a>,
+        authorization: exec::DmlAuthorization,
         txn: &mut TxnState,
         params: &[Datum<'a>],
         guc: &mut GucState,
@@ -7920,6 +8118,7 @@ impl Engine {
                         txn,
                         scratch,
                         statement,
+                        authorization,
                         view,
                         arena,
                         params,
@@ -7971,6 +8170,7 @@ impl Engine {
                     txn,
                     scratch,
                     insert,
+                    authorization,
                     arena,
                     params,
                     guc.seq_session(),
@@ -7997,6 +8197,7 @@ impl Engine {
                         txn,
                         scratch,
                         statement,
+                        authorization,
                         view,
                         arena,
                         params,
@@ -8050,6 +8251,7 @@ impl Engine {
                     txn,
                     scratch,
                     update,
+                    authorization,
                     arena,
                     params,
                     guc.seq_session(),
@@ -8073,6 +8275,7 @@ impl Engine {
                         txn,
                         scratch,
                         statement,
+                        authorization,
                         view,
                         arena,
                         params,
@@ -8125,6 +8328,7 @@ impl Engine {
                     txn,
                     scratch,
                     delete,
+                    authorization,
                     arena,
                     params,
                     guc.seq_session(),
@@ -9011,6 +9215,7 @@ impl Engine {
                 &mut self.dml_scratch,
                 &self.work,
                 statement,
+                exec::DmlAuthorization::Invoker,
                 txn,
                 params,
                 guc,
@@ -9077,6 +9282,7 @@ impl Engine {
                 &mut self.dml_scratch,
                 &self.work,
                 statement,
+                exec::DmlAuthorization::Invoker,
                 txn,
                 params,
                 guc,
@@ -11258,6 +11464,7 @@ impl Engine {
                 &mut self.dml_scratch,
                 &self.work,
                 statement,
+                exec::DmlAuthorization::Invoker,
                 txn,
                 params,
                 guc,

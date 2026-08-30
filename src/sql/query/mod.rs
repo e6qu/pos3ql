@@ -59,8 +59,8 @@ mod cte;
 mod dependencies;
 use cte::expand_set_tree_exec;
 pub(crate) use cte::{
-    attach_rule_source, expand_set_tree, expand_stored_query, expand_stored_query_exec,
-    expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
+    RuleTransitionType, attach_rule_source, expand_set_tree, expand_stored_query,
+    expand_stored_query_exec, expand_stored_rule_action_exec, expand_stored_rule_expression_exec,
     expand_stored_statement_exec, restrict_rule_original, rule_original_transition,
     rule_transition_source,
 };
@@ -95,8 +95,25 @@ pub(crate) fn stored_rule_dependencies(
     txid: u32,
     path: crate::storage::PathContext,
     arena: &Arena,
+    transition: &dyn crate::sql::exec::ColTypeResolver,
 ) -> Result<crate::storage::StoredQueryDependencies, SqlError> {
-    dependencies::collect_rule_actions(actions, storage, txid, path, arena)
+    dependencies::collect_rule_actions(actions, storage, txid, path, arena, transition)
+}
+
+pub(crate) fn dml_input_dependencies(
+    statement: &crate::sql::ast::Stmt<'_>,
+    storage: &Storage,
+    txid: u32,
+    path: crate::storage::PathContext,
+    arena: &Arena,
+) -> Result<
+    (
+        crate::storage::StoredQueryDependencies,
+        crate::storage::StoredQueryDependencies,
+    ),
+    SqlError,
+> {
+    dependencies::collect_dml_input(statement, storage, txid, path, arena)
 }
 
 pub(crate) struct StoredQueryCompositeFieldRename<'a> {

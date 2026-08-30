@@ -337,6 +337,7 @@ pub(crate) fn expand_stored_statement_exec<'a>(
         params,
         sequences,
         None,
+        None,
     )
 }
 
@@ -353,6 +354,7 @@ pub(crate) fn expand_stored_rule_action_exec<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
+    authorization_role: u16,
     names: &'a [&'a str],
     old: &'a [&'a Expr<'a>],
     new: &'a [&'a Expr<'a>],
@@ -368,6 +370,7 @@ pub(crate) fn expand_stored_rule_action_exec<'a>(
         arena,
         params,
         sequences,
+        Some(authorization_role),
         Some(RuleTransition {
             names,
             old,
@@ -391,6 +394,7 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
+    authorization_role: u16,
     names: &'a [&'a str],
     old: &'a [&'a Expr<'a>],
     new: &'a [&'a Expr<'a>],
@@ -412,7 +416,7 @@ pub(crate) fn expand_stored_rule_expression_exec<'a>(
         0,
         Some(path),
         Some(dependencies),
-        None,
+        Some(authorization_role),
         |_| 0,
         |context| {
             subst_expr(
@@ -560,11 +564,50 @@ pub(crate) struct RuleTransitionExpressions<'a> {
     pub new: &'a [&'a Expr<'a>],
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RuleTransitionType<'a> {
+    pub type_name: &'a str,
+    pub type_mod: i32,
+    pub collation: Option<crate::sql::ast::ParsedCollation<'a>>,
+}
+
+fn coerce_rule_transition<'a>(
+    expression: &'a Expr<'a>,
+    target: RuleTransitionType<'a>,
+    arena: &'a Arena,
+) -> Result<&'a Expr<'a>, SqlError> {
+    let cast = arena
+        .alloc(Expr::Cast {
+            operand: expression,
+            type_name: target.type_name,
+            type_mod: target.type_mod,
+        })
+        .map(|expression| &*expression)
+        .map_err(|_| arena_full())?;
+    match target.collation {
+        Some(collation) => arena
+            .alloc(Expr::Collate {
+                operand: cast,
+                collation,
+            })
+            .map(|expression| &*expression)
+            .map_err(|_| arena_full()),
+        None => Ok(cast),
+    }
+}
+
 pub(crate) fn rule_original_transition<'a>(
     statement: &'a Stmt<'a>,
     columns: &'a [&'a str],
+    types: &'a [RuleTransitionType<'a>],
     arena: &'a Arena,
 ) -> Result<RuleTransitionExpressions<'a>, SqlError> {
+    if types.len() != columns.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "rewrite transition type shape does not match its columns"
+        ));
+    }
     let mut old = [&Expr::Null; crate::storage::MAX_COLUMNS];
     let mut new = [&Expr::Null; crate::storage::MAX_COLUMNS];
     match statement {
@@ -583,6 +626,7 @@ pub(crate) fn rule_original_transition<'a>(
                     .iter()
                     .find_map(|(written, expression)| (*written == name).then_some(*expression))
                     .unwrap_or(old[index]);
+                new[index] = coerce_rule_transition(new[index], types[index], arena)?;
             }
         }
         Stmt::Delete(delete) => {
@@ -668,6 +712,7 @@ pub(crate) fn restrict_rule_original<'a>(
 pub(crate) fn rule_transition_source<'a>(
     statement: &'a Stmt<'a>,
     columns: &'a [&'a str],
+    types: &'a [RuleTransitionType<'a>],
     defaults: &[Option<&'a Expr<'a>>],
     force_defaults: &[bool],
     arena: &'a Arena,
@@ -676,6 +721,12 @@ pub(crate) fn rule_transition_source<'a>(
         return Err(sql_err!(
             sqlstate::TOO_MANY_COLUMNS,
             "rewrite relation is too wide"
+        ));
+    }
+    if types.len() != columns.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "rewrite transition type shape does not match its columns"
         ));
     }
     let source_alias = arena
@@ -726,7 +777,12 @@ pub(crate) fn rule_transition_source<'a>(
                     .iter()
                     .find_map(|(written, expression)| (*written == name).then_some(*expression))
                     .unwrap_or(old_expression);
-                add_output("new", column, new_expression, &mut new)?;
+                add_output(
+                    "new",
+                    column,
+                    coerce_rule_transition(new_expression, types[column], arena)?,
+                    &mut new,
+                )?;
             }
             rule_select(
                 arena
@@ -869,7 +925,12 @@ pub(crate) fn rule_transition_source<'a>(
                             .flatten()
                             .unwrap_or(&Expr::Null)
                     });
-                add_output("new", column, expression, &mut new)?;
+                add_output(
+                    "new",
+                    column,
+                    coerce_rule_transition(expression, types[column], arena)?,
+                    &mut new,
+                )?;
             }
             rule_select(
                 arena
@@ -937,6 +998,10 @@ pub(crate) fn attach_rule_source<'a>(
                 ..*select
             })
         }
+        Stmt::SetQuery(query) => Stmt::SetQuery(SetQuery {
+            body: attach_rule_source_to_set_tree(query.body, source, condition, arena)?,
+            ..*query
+        }),
         Stmt::Update(update) => {
             let from = prepend_rule_source(source, update.from, arena)?;
             Stmt::Update(Update {
@@ -1027,6 +1092,42 @@ pub(crate) fn attach_rule_source<'a>(
         .map_err(|_| arena_full())
 }
 
+fn attach_rule_source_to_set_tree<'a>(
+    tree: &'a SetTree<'a>,
+    source: TableRef<'a>,
+    condition: Option<&'a Expr<'a>>,
+    arena: &'a Arena,
+) -> Result<&'a SetTree<'a>, SqlError> {
+    let rewritten = match tree {
+        SetTree::Select(select) => {
+            let from = prepend_rule_source(source, select.from.as_ref(), arena)?;
+            let select = arena
+                .alloc(Select {
+                    from: Some(from),
+                    where_clause: and_where(condition, select.where_clause, arena)?,
+                    ..**select
+                })
+                .map_err(|_| arena_full())?;
+            SetTree::Select(&*select)
+        }
+        SetTree::Op {
+            operator,
+            all,
+            left,
+            right,
+        } => SetTree::Op {
+            operator: *operator,
+            all: *all,
+            left: attach_rule_source_to_set_tree(left, source, condition, arena)?,
+            right: attach_rule_source_to_set_tree(right, source, condition, arena)?,
+        },
+    };
+    arena
+        .alloc(rewritten)
+        .map(|tree| &*tree)
+        .map_err(|_| arena_full())
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "stored statements require their captured catalog and evaluation context"
@@ -1040,11 +1141,16 @@ fn expand_stored_statement_with_transition<'a>(
     arena: &'a Arena,
     params: &[Datum<'a>],
     sequences: Option<&dyn SequenceAccess>,
+    authorization_role: Option<u16>,
     transition: Option<RuleTransition<'a>>,
 ) -> Result<&'a Stmt<'a>, SqlError> {
-    let (with, body) = match statement {
+    let (outer_with, body) = match statement {
         Stmt::With { ctes, statement } => (*ctes, *statement),
         _ => (&[][..], statement),
+    };
+    let with = match body {
+        Stmt::SetQuery(query) if outer_with.is_empty() => query.with,
+        _ => outer_with,
     };
     let placeholder = match body {
         Stmt::Insert(insert) => insert.select.unwrap_or(&EMPTY_SELECT),
@@ -1066,7 +1172,7 @@ fn expand_stored_statement_with_transition<'a>(
         0,
         Some(path),
         Some(dependencies),
-        None,
+        authorization_role,
         |name| statement_references(body, name),
         |context| {
             let context = Subst {
@@ -1079,6 +1185,9 @@ fn expand_stored_statement_with_transition<'a>(
                 Stmt::Delete(delete) => Stmt::Delete(subst_delete(delete, context, arena)?),
                 Stmt::Merge(merge) => Stmt::Merge(subst_merge(merge, context, arena)?),
                 Stmt::Select(select) => Stmt::Select(*subst_select(select, context, arena)?),
+                Stmt::SetQuery(query) => {
+                    Stmt::SetQuery(*subst_set_query_body(query, context, arena)?)
+                }
                 Stmt::Notify { channel, payload } => Stmt::Notify {
                     channel,
                     payload: *payload,
@@ -1093,6 +1202,25 @@ fn expand_stored_statement_with_transition<'a>(
             Ok(&*arena.alloc(rebound).map_err(|_| arena_full())?)
         },
     )
+}
+
+fn subst_set_query_body<'a>(
+    query: &'a SetQuery<'a>,
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a SetQuery<'a>, SqlError> {
+    let query = SetQuery {
+        with: &[],
+        body: subst_set_tree(query.body, context, arena)?,
+        order_by: subst_order_by(query.order_by, context, arena)?,
+        limit: opt_subst(query.limit, context, arena)?,
+        offset: opt_subst(query.offset, context, arena)?,
+        ..*query
+    };
+    arena
+        .alloc(query)
+        .map(|query| &*query)
+        .map_err(|_| arena_full())
 }
 
 /// Binds executor-owned relations into a data-modifying statement. Unlike a
@@ -3849,26 +3977,7 @@ fn subst_select_body<'a>(
     let grouping_sets = arena
         .alloc_slice_copy(s.grouping_sets)
         .map_err(|_| arena_full())?;
-    let mut order = [OrderBy {
-        expression: &Expr::Null,
-        descending: false,
-        nulls_first: false,
-    }; crate::sql::parser::MAX_LIST];
-    if s.order_by.len() > crate::sql::parser::MAX_LIST {
-        return Err(sql_err!(
-            sqlstate::TOO_MANY_ARGUMENTS,
-            "ORDER BY list too long"
-        ));
-    }
-    for (i, ob) in s.order_by.iter().enumerate() {
-        order[i] = OrderBy {
-            expression: subst_expr(ob.expression, context, arena)?,
-            ..*ob
-        };
-    }
-    let order_by = arena
-        .alloc_slice_copy(&order[..s.order_by.len()])
-        .map_err(|_| arena_full())?;
+    let order_by = subst_order_by(s.order_by, context, arena)?;
     let set_body = match s.set_body {
         Some(tree) => Some(subst_set_tree(tree, context, arena)?),
         None => None,
@@ -3892,6 +4001,34 @@ fn subst_select_body<'a>(
         locking: s.locking,
     };
     Ok(&*arena.alloc(new).map_err(|_| arena_full())?)
+}
+
+fn subst_order_by<'a>(
+    source: &'a [OrderBy<'a>],
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a [OrderBy<'a>], SqlError> {
+    let mut order = [OrderBy {
+        expression: &Expr::Null,
+        descending: false,
+        nulls_first: false,
+    }; crate::sql::parser::MAX_LIST];
+    if source.len() > order.len() {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_ARGUMENTS,
+            "ORDER BY list too long"
+        ));
+    }
+    for (index, item) in source.iter().enumerate() {
+        order[index] = OrderBy {
+            expression: subst_expr(item.expression, context, arena)?,
+            ..*item
+        };
+    }
+    arena
+        .alloc_slice_copy(&order[..source.len()])
+        .map(|order| &*order)
+        .map_err(|_| arena_full())
 }
 
 fn from_shadows_qualifier(from: &FromClause<'_>, qualifier: &str) -> bool {

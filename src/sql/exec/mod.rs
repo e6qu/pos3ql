@@ -434,6 +434,27 @@ fn create_table_kind(
     } else {
         "CREATE TABLE"
     };
+    match statement.membership {
+        crate::sql::ast::TableMembership::None => {}
+        crate::sql::ast::TableMembership::Inherits(_) => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "table inheritance requires object-native inherited-relation scans and dependencies"
+            ));
+        }
+        crate::sql::ast::TableMembership::OfType(_) => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "typed tables require durable row-type membership"
+            ));
+        }
+    }
+    if !statement.storage_options.is_empty() {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "table storage options require an object-native row layout implementation"
+        ));
+    }
     if statement.persistence != crate::sql::ast::RelationPersistence::Permanent {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -49553,7 +49574,24 @@ fn alter_partition_attachment(
     };
     let (child_name, parsed_bound) = match action {
         AlterAction::AttachPartition { child, bound } => (child, Some(bound)),
-        AlterAction::DetachPartition { child } => (child, None),
+        AlterAction::DetachPartition { child, mode } => {
+            match mode {
+                crate::sql::ast::PartitionDetachMode::Immediate => {}
+                crate::sql::ast::PartitionDetachMode::Concurrent => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "concurrent partition detach requires an object-native concurrent DDL protocol"
+                    ));
+                }
+                crate::sql::ast::PartitionDetachMode::Finalize => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "partition detach finalization requires an object-native concurrent DDL protocol"
+                    ));
+                }
+            }
+            (child, None)
+        }
         _ => unreachable!("partition attachment action was classified by the caller"),
     };
     let Some(crate::storage::ResolvedRelation::Table(child)) =
@@ -50514,6 +50552,18 @@ fn alter_table_inner(
                         "unlogged tables are incompatible with object-native durable storage"
                     ));
                 }
+            }
+            AlterAction::SetStorageOptions(_) | AlterAction::ResetStorageOptions(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "table storage options require an object-native row layout implementation"
+                ));
+            }
+            AlterAction::SetInheritance { .. } => {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "table inheritance requires object-native inherited-relation scans and dependencies"
+                ));
             }
             AlterAction::SetStorage { .. } | AlterAction::SetCompression { .. } => {
                 return sql_fail(sql_err!(

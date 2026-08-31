@@ -3579,6 +3579,44 @@ def test_partitioned_tables_over_raw_wire():
     s.close()
 
 
+def test_table_lifecycle_boundaries_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_lifecycle_parent (id integer) PARTITION BY RANGE (id); "
+        "CREATE TABLE wire_lifecycle_child PARTITION OF wire_lifecycle_parent FOR VALUES FROM (0) TO (10); "
+        "CREATE TYPE wire_lifecycle_row AS (id integer); "
+        "CREATE TABLE wire_lifecycle_plain (id integer)",
+    )
+    checks = [
+        simple_query(s, "CREATE TABLE wire_lifecycle_storage (id integer) WITH (fillfactor = 80)"),
+        simple_query(s, "CREATE TABLE wire_lifecycle_inherited (id integer) INHERITS (wire_lifecycle_plain)"),
+        simple_query(s, "CREATE TABLE wire_lifecycle_typed OF wire_lifecycle_row"),
+        simple_query(s, "ALTER TABLE wire_lifecycle_plain SET (fillfactor = 80)"),
+        simple_query(s, "ALTER TABLE wire_lifecycle_plain INHERIT wire_lifecycle_parent"),
+        simple_query(s, "ALTER TABLE wire_lifecycle_parent DETACH PARTITION wire_lifecycle_child CONCURRENTLY"),
+    ]
+    check(
+        "raw wire: unimplemented table lifecycle forms return typed feature errors",
+        not any(kind == b"E" for kind, _ in setup)
+        and all(has_sqlstate(messages, "0A000") for messages in checks),
+        setup + [message for messages in checks for message in messages],
+    )
+    cleanup = simple_query(
+        s,
+        "DROP TABLE wire_lifecycle_child, wire_lifecycle_parent, wire_lifecycle_plain; "
+        "DROP TYPE wire_lifecycle_row",
+    )
+    check(
+        "raw wire: table lifecycle boundary fixtures clean up",
+        not any(kind == b"E" for kind, _ in cleanup),
+        cleanup,
+    )
+    s.close()
+
+
 def test_deferred_constraint_commit_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

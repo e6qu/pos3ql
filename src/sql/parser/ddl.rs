@@ -28,12 +28,13 @@ use crate::sql::ast::{
     OperatorFamilyMember, OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands,
     PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression,
     PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget,
-    RelationPersistence, RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineCreateKind,
-    RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind, RuleAction,
-    RuleEvent, RuleMode, StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds,
-    StatisticsName, StatisticsTarget, SubscriptionBehavior, SubscriptionConnect,
-    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
-    SubscriptionStreaming, SubscriptionSynchronousCommit, TableAccessMethod, TablespaceOptionNames,
+    RelationPersistence, RelationStorageOptionNames, RelationStorageOptions, RoleOptions,
+    RoutineArgument, RoutineArgumentMode, RoutineCreateKind, RoutineIdentity, RoutineParallel,
+    RoutineResultColumn, RoutineTargetKind, RuleAction, RuleEvent, RuleMode, StatisticsExpression,
+    StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget,
+    SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin,
+    SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
+    SubscriptionSynchronousCommit, TableAccessMethod, TableMembership, TablespaceOptionNames,
     TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption,
     TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables,
     ViewSecurity,
@@ -4685,9 +4686,11 @@ impl<'a> Parser<'a> {
                 constraints: &[],
                 likes: &[],
                 partition: PartitionClause::None,
+                membership: TableMembership::None,
                 persistence: RelationPersistence::Permanent,
                 access_method: TableAccessMethod::Heap,
                 tablespace: None,
+                storage_options: RelationStorageOptions::DEFAULT,
                 if_not_exists: false,
             });
         let mut elements: [&'a CreateSchemaElement<'a>; 16] = [&EMPTY_SCHEMA_ELEMENT; 16];
@@ -5033,6 +5036,74 @@ impl<'a> Parser<'a> {
             };
             if core::mem::replace(flag, true) {
                 return Err(self.err_here("index storage parameter specified more than once"));
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(names)
+    }
+
+    pub(super) fn relation_storage_options(
+        &mut self,
+    ) -> Result<RelationStorageOptions, ParseError> {
+        let mut options = RelationStorageOptions::DEFAULT;
+        if self.peeked == Tok::Op(")") {
+            return Ok(options);
+        }
+        loop {
+            let option = self.any_ident("table storage parameter")?;
+            self.expect_op("=")?;
+            if option.eq_ignore_ascii_case("fillfactor") {
+                if options.fillfactor.is_some() {
+                    return Err(self.err_here("parameter \"fillfactor\" specified more than once"));
+                }
+                let Tok::Num(raw) = self.peeked else {
+                    return Err(self.unexpected("fillfactor must be an integer"));
+                };
+                let value = raw
+                    .parse::<u8>()
+                    .map_err(|_| self.unexpected("fillfactor is out of range"))?;
+                self.advance()?;
+                if !(10..=100).contains(&value) {
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(96, "fillfactor must be between 10 and 100"),
+                        sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                    });
+                }
+                options.fillfactor = Some(value);
+            } else {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok(options)
+    }
+
+    pub(super) fn relation_storage_option_names(
+        &mut self,
+    ) -> Result<RelationStorageOptionNames, ParseError> {
+        let mut names = RelationStorageOptionNames::EMPTY;
+        loop {
+            let option = self.any_ident("table storage parameter")?;
+            let flag = if option.eq_ignore_ascii_case("fillfactor") {
+                &mut names.fillfactor
+            } else {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "unrecognized parameter \"{}\"", option),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            };
+            if core::mem::replace(flag, true) {
+                return Err(self.err_here("table storage parameter specified more than once"));
             }
             if !self.eat_op(",")? {
                 break;
@@ -6806,6 +6877,11 @@ impl<'a> Parser<'a> {
             false
         };
         let name = self.qual_name("table name")?;
+        let mut membership = if self.eat_ident("of")? {
+            TableMembership::OfType(self.qual_name("row type name")?)
+        } else {
+            TableMembership::None
+        };
         // A partition is a table whose column layout is inherited from its
         // parent; unlike ordinary CREATE TABLE it has no column list here.
         if self.eat_ident("partition")? {
@@ -6842,9 +6918,11 @@ impl<'a> Parser<'a> {
                     bound,
                     subpartition,
                 },
+                membership: TableMembership::None,
                 persistence,
                 access_method,
                 tablespace,
+                storage_options: RelationStorageOptions::DEFAULT,
                 if_not_exists,
             };
             if foreign {
@@ -6874,6 +6952,45 @@ impl<'a> Parser<'a> {
                 if_not_exists,
                 crate::sql::ast::CreateTableAsKind::Table,
             );
+        }
+        if matches!(membership, TableMembership::OfType(_)) && self.peeked != Tok::Op("(") {
+            if foreign {
+                return Err(self.err_here("CREATE FOREIGN TABLE OF is not supported by PostgreSQL"));
+            }
+            let mut access_method = TableAccessMethod::Heap;
+            let mut tablespace = None;
+            let mut storage_options = RelationStorageOptions::DEFAULT;
+            loop {
+                if self.eat_ident("with")? {
+                    self.expect_op("(")?;
+                    storage_options = self.relation_storage_options()?;
+                    self.expect_op(")")?;
+                } else if self.eat_ident("using")? {
+                    let method = self.any_ident("table access method")?;
+                    access_method = if method.eq_ignore_ascii_case("heap") {
+                        TableAccessMethod::Heap
+                    } else {
+                        TableAccessMethod::Named(method)
+                    };
+                } else if self.eat_ident("tablespace")? {
+                    tablespace = Some(self.col_ident("tablespace name")?);
+                } else {
+                    break;
+                }
+            }
+            return Ok(Stmt::CreateTable(CreateTable {
+                name,
+                columns: &[],
+                constraints: &[],
+                likes: &[],
+                partition: PartitionClause::None,
+                membership,
+                persistence,
+                access_method,
+                tablespace,
+                storage_options,
+                if_not_exists,
+            }));
         }
         self.expect_op("(")?;
         // A `(` is either column definitions or — for `CREATE TABLE ... AS` — a
@@ -7146,21 +7263,46 @@ impl<'a> Parser<'a> {
         } else {
             PartitionClause::None
         };
-        let access_method = if self.eat_ident("using")? {
-            let method = self.any_ident("table access method")?;
-            if method.eq_ignore_ascii_case("heap") {
-                TableAccessMethod::Heap
+        let mut access_method = TableAccessMethod::Heap;
+        let mut tablespace = None;
+        let mut storage_options = RelationStorageOptions::DEFAULT;
+        loop {
+            if self.eat_ident("with")? {
+                self.expect_op("(")?;
+                storage_options = self.relation_storage_options()?;
+                self.expect_op(")")?;
+            } else if self.eat_ident("using")? {
+                let method = self.any_ident("table access method")?;
+                access_method = if method.eq_ignore_ascii_case("heap") {
+                    TableAccessMethod::Heap
+                } else {
+                    TableAccessMethod::Named(method)
+                };
+            } else if self.eat_ident("tablespace")? {
+                tablespace = Some(self.col_ident("tablespace name")?);
+            } else if self.eat_ident("inherits")? {
+                if !matches!(membership, TableMembership::None) {
+                    return Err(self.err_here("a typed table cannot also specify INHERITS"));
+                }
+                self.expect_op("(")?;
+                let mut parents = [QualName::bare(""); MAX_LIST];
+                let mut n_parents = 0usize;
+                loop {
+                    if n_parents == parents.len() {
+                        return Err(self.limit("inheritance parent", parents.len()));
+                    }
+                    parents[n_parents] = self.qual_name("parent relation name")?;
+                    n_parents += 1;
+                    if !self.eat_op(",")? {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+                membership = TableMembership::Inherits(self.arena_slice(&parents[..n_parents])?);
             } else {
-                TableAccessMethod::Named(method)
+                break;
             }
-        } else {
-            TableAccessMethod::Heap
-        };
-        let tablespace = if self.eat_ident("tablespace")? {
-            Some(self.col_ident("tablespace name")?)
-        } else {
-            None
-        };
+        }
         let columns = self.arena_slice(&columns[..n])?;
         let constraints = self.arena_slice(&cons[..n_cons])?;
         let likes = self.arena_slice(&likes[..n_likes])?;
@@ -7170,9 +7312,11 @@ impl<'a> Parser<'a> {
             constraints,
             likes,
             partition,
+            membership,
             persistence,
             access_method,
             tablespace,
+            storage_options,
             if_not_exists,
         };
         if foreign {

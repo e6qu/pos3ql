@@ -2916,6 +2916,10 @@ pub struct CreateTable<'a> {
     /// The table's partitioning role.  This is structured at parse time so
     /// execution never needs to reinterpret a SQL fragment as a bound.
     pub partition: PartitionClause<'a>,
+    /// PostgreSQL table inheritance or typed-table membership. The executor
+    /// rejects these closed states until it can preserve their scan and
+    /// dependency semantics through durable storage.
+    pub membership: TableMembership<'a>,
     /// Relation persistence requested by the client. Only permanent tables
     /// can enter object-native durable storage.
     pub persistence: RelationPersistence,
@@ -2923,7 +2927,39 @@ pub struct CreateTable<'a> {
     pub access_method: TableAccessMethod<'a>,
     /// An explicit relation tablespace. `None` selects the database default.
     pub tablespace: Option<&'a str>,
+    /// Heap storage options. They are parsed as a closed state rather than
+    /// accepted as inert catalog text.
+    pub storage_options: RelationStorageOptions,
     pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TableMembership<'a> {
+    None,
+    Inherits(&'a [QualName<'a>]),
+    OfType(QualName<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelationStorageOptions {
+    pub fillfactor: Option<u8>,
+}
+
+impl RelationStorageOptions {
+    pub const DEFAULT: Self = Self { fillfactor: None };
+
+    pub const fn is_empty(self) -> bool {
+        self.fillfactor.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelationStorageOptionNames {
+    pub fillfactor: bool,
+}
+
+impl RelationStorageOptionNames {
+    pub const EMPTY: Self = Self { fillfactor: false };
 }
 
 /// Parsed access-method spelling; only an executable variant can reach a
@@ -4032,6 +4068,12 @@ pub enum AlterAction<'a> {
     },
     SetRowLevelSecurity(RowLevelSecurityAlteration),
     SetPersistence(RelationPersistence),
+    SetStorageOptions(RelationStorageOptions),
+    ResetStorageOptions(RelationStorageOptionNames),
+    SetInheritance {
+        parent: QualName<'a>,
+        inherit: bool,
+    },
     /// ALTER TABLE ... SET TABLESPACE name.
     SetTablespace(&'a str),
     /// ALTER TABLE ... SET ACCESS METHOD heap.
@@ -4045,7 +4087,15 @@ pub enum AlterAction<'a> {
     },
     DetachPartition {
         child: QualName<'a>,
+        mode: PartitionDetachMode,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionDetachMode {
+    Immediate,
+    Concurrent,
+    Finalize,
 }
 
 /// The closed SQL forms of `ALTER TABLE ... REPLICA IDENTITY`. An index target

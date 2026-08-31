@@ -36692,6 +36692,47 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
 }
 
 #[test]
+fn unimplemented_table_lifecycle_forms_are_typed_and_loud() {
+    let (mut engine, mut budget) = test_engine();
+    for statement in [
+        "CREATE TABLE table_storage_option_rows (id integer) WITH (fillfactor = 80)",
+        "CREATE TABLE inheritance_parent_rows (id integer); \
+         CREATE TABLE inheritance_child_rows (id integer) INHERITS (inheritance_parent_rows)",
+        "CREATE TYPE typed_table_row AS (id integer); \
+         CREATE TABLE typed_table_rows OF typed_table_row",
+        "CREATE TABLE alter_inheritance_rows (id integer); \
+         ALTER TABLE alter_inheritance_rows INHERIT inheritance_parent_rows",
+        "CREATE TABLE alter_storage_option_rows (id integer); \
+         ALTER TABLE alter_storage_option_rows SET (fillfactor = 80)",
+        "CREATE TABLE reset_storage_option_rows (id integer); \
+         ALTER TABLE reset_storage_option_rows RESET (fillfactor)",
+        "CREATE TABLE detach_parent_rows (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE detach_child_rows PARTITION OF detach_parent_rows FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE detach_parent_rows DETACH PARTITION detach_child_rows CONCURRENTLY",
+        "CREATE TABLE finalize_parent_rows (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE finalize_child_rows PARTITION OF finalize_parent_rows FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE finalize_parent_rows DETACH PARTITION finalize_child_rows FINALIZE",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("0A000"),
+            "{statement} must fail as a typed architecture boundary: {text}"
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_class \
+              WHERE relname IN ('table_storage_option_rows', 'inheritance_child_rows', 'typed_table_rows')",
+        )),
+        ["0"],
+        "rejected metadata must not leave inert durable relations behind"
+    );
+}
+
+#[test]
 fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery() {
     let mut config = test_config("table-definition-metadata-recovery");
     config.object_store_on = true;

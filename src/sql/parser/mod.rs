@@ -87,7 +87,10 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::SetIdentityMode { .. }
         | AlterAction::SetGeneratedExpression { .. }
         | AlterAction::AlterIdentitySequence { .. } => 4,
-        AlterAction::SetForeignOptions(_) | AlterAction::SetColumnForeignOptions { .. } => 4,
+        AlterAction::SetForeignOptions(_)
+        | AlterAction::SetColumnForeignOptions { .. }
+        | AlterAction::SetStorageOptions(_)
+        | AlterAction::ResetStorageOptions(_) => 4,
         // Standalone forms; never appear in a multi-action list.
         AlterAction::RenameTable(_)
         | AlterAction::RenameColumn { .. }
@@ -95,6 +98,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::SetTriggerEnabled { .. }
         | AlterAction::SetRowLevelSecurity(_)
         | AlterAction::SetPersistence(_)
+        | AlterAction::SetInheritance { .. }
         | AlterAction::SetTablespace(_)
         | AlterAction::SetAccessMethod(_)
         | AlterAction::SetReplicaIdentity(_)
@@ -4558,6 +4562,10 @@ impl<'a> Parser<'a> {
                 AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Unlogged)
             } else if self.eat_ident("tablespace")? {
                 AlterAction::SetTablespace(self.col_ident("tablespace name")?)
+            } else if self.eat_op("(")? {
+                let options = self.relation_storage_options()?;
+                self.expect_op(")")?;
+                AlterAction::SetStorageOptions(options)
             } else {
                 self.expect_ident("access")?;
                 self.expect_ident("method")?;
@@ -4620,19 +4628,25 @@ impl<'a> Parser<'a> {
             ));
         }
         if self.eat_ident("no")? {
-            self.expect_ident("force")?;
-            self.expect_ident("row")?;
-            self.expect_ident("level")?;
-            self.expect_ident("security")?;
+            let action = if self.eat_ident("inherit")? {
+                AlterAction::SetInheritance {
+                    parent: self.qual_name("parent relation name")?,
+                    inherit: false,
+                }
+            } else {
+                self.expect_ident("force")?;
+                self.expect_ident("row")?;
+                self.expect_ident("level")?;
+                self.expect_ident("security")?;
+                AlterAction::SetRowLevelSecurity(RowLevelSecurityAlteration::NoForce)
+            };
             return Ok(Self::alter_table_statement(
                 foreign,
                 AlterTable {
                     table,
                     if_exists,
                     only,
-                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                        RowLevelSecurityAlteration::NoForce,
-                    )])?,
+                    actions: self.arena_slice(&[action])?,
                 },
             ));
         }
@@ -5004,10 +5018,25 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("detach")? {
             self.expect_ident("partition")?;
             let child = self.qual_name("partition name")?;
-            if self.eat_ident("concurrently")? || self.eat_ident("finalize")? {
-                return Err(self.err_here("concurrent partition detach is not supported"));
-            }
-            Ok(AlterAction::DetachPartition { child })
+            let mode = if self.eat_ident("concurrently")? {
+                crate::sql::ast::PartitionDetachMode::Concurrent
+            } else if self.eat_ident("finalize")? {
+                crate::sql::ast::PartitionDetachMode::Finalize
+            } else {
+                crate::sql::ast::PartitionDetachMode::Immediate
+            };
+            Ok(AlterAction::DetachPartition { child, mode })
+        } else if self.eat_ident("inherit")? {
+            Ok(AlterAction::SetInheritance {
+                parent: self.qual_name("parent relation name")?,
+                inherit: true,
+            })
+        } else if self.eat_ident("no")? {
+            self.expect_ident("inherit")?;
+            Ok(AlterAction::SetInheritance {
+                parent: self.qual_name("parent relation name")?,
+                inherit: false,
+            })
         } else if self.eat_ident("replica")? {
             self.expect_ident("identity")?;
             let target = if self.eat_ident("default")? {
@@ -5035,20 +5064,27 @@ impl<'a> Parser<'a> {
                 Ok(AlterAction::SetTablespace(
                     self.col_ident("tablespace name")?,
                 ))
+            } else if self.eat_op("(")? {
+                let options = self.relation_storage_options()?;
+                self.expect_op(")")?;
+                Ok(AlterAction::SetStorageOptions(options))
             } else {
                 self.expect_ident("access")?;
                 self.expect_ident("method")?;
                 let method = self.any_ident("table access method")?;
-                if method.eq_ignore_ascii_case("heap") {
-                    Ok(AlterAction::SetAccessMethod(
-                        crate::sql::ast::TableAccessMethod::Heap,
-                    ))
-                } else {
-                    Ok(AlterAction::SetAccessMethod(
-                        crate::sql::ast::TableAccessMethod::Named(method),
-                    ))
-                }
+                Ok(AlterAction::SetAccessMethod(
+                    if method.eq_ignore_ascii_case("heap") {
+                        crate::sql::ast::TableAccessMethod::Heap
+                    } else {
+                        crate::sql::ast::TableAccessMethod::Named(method)
+                    },
+                ))
             }
+        } else if self.eat_ident("reset")? {
+            self.expect_op("(")?;
+            let names = self.relation_storage_option_names()?;
+            self.expect_op(")")?;
+            Ok(AlterAction::ResetStorageOptions(names))
         } else if self.eat_ident("add")? {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
             if self.eat_ident("constraint")? {
@@ -7154,6 +7190,59 @@ mod tests {
                         bound: PartitionBound::Default,
                         ..
                     }
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn table_lifecycle_boundaries_are_closed_parse_states() {
+        with_parser(
+            "CREATE TABLE inherited_child (id integer) WITH (fillfactor = 80) INHERITS (parent_one, parent_two); \
+             CREATE TABLE typed_child OF public.row_type; \
+             ALTER TABLE inherited_child SET (fillfactor = 70); \
+             ALTER TABLE inherited_child RESET (fillfactor); \
+             ALTER TABLE partitioned_parent DETACH PARTITION partitioned_child CONCURRENTLY; \
+             ALTER TABLE partitioned_parent DETACH PARTITION partitioned_child FINALIZE",
+            |parser| {
+                let Some(Stmt::CreateTable(inherited)) = parser.next_stmt().unwrap() else {
+                    panic!("inheritance definition did not parse")
+                };
+                assert_eq!(inherited.storage_options.fillfactor, Some(80));
+                assert!(matches!(
+                    inherited.membership,
+                    crate::sql::ast::TableMembership::Inherits(parents)
+                        if parents == [QualName::bare("parent_one"), QualName::bare("parent_two")]
+                ));
+                let Some(Stmt::CreateTable(typed)) = parser.next_stmt().unwrap() else {
+                    panic!("typed table definition did not parse")
+                };
+                assert!(matches!(
+                    typed.membership,
+                    crate::sql::ast::TableMembership::OfType(QualName {
+                        schema: Some("public"),
+                        name: "row_type"
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterTable(AlterTable { actions, .. }))
+                        if matches!(actions, [AlterAction::SetStorageOptions(options)] if options.fillfactor == Some(70))
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterTable(AlterTable { actions, .. }))
+                        if matches!(actions, [AlterAction::ResetStorageOptions(names)] if names.fillfactor)
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterTable(AlterTable { actions, .. }))
+                        if matches!(actions, [AlterAction::DetachPartition { mode: crate::sql::ast::PartitionDetachMode::Concurrent, .. }])
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterTable(AlterTable { actions, .. }))
+                        if matches!(actions, [AlterAction::DetachPartition { mode: crate::sql::ast::PartitionDetachMode::Finalize, .. }])
                 ));
             },
         );

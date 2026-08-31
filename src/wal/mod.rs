@@ -161,6 +161,10 @@ const KIND_SET_TEXT_SEARCH: u8 = 111;
 const KIND_DROP_TEXT_SEARCH: u8 = 112;
 const KIND_CREATE_LARGE_OBJECT: u8 = 113;
 const KIND_DROP_LARGE_OBJECT: u8 = 114;
+const KIND_SET_FOREIGN_DATA_WRAPPER: u8 = 115;
+const KIND_SET_FOREIGN_SERVER: u8 = 116;
+const KIND_SET_USER_MAPPING: u8 = 117;
+const KIND_SET_FOREIGN_TABLE: u8 = 118;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -168,7 +172,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DROP_LARGE_OBJECT;
+const LAST_KIND: u8 = KIND_SET_FOREIGN_TABLE;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -459,6 +463,28 @@ pub(crate) enum WalOp<'a> {
     },
     DropLargeObject {
         oid: u32,
+    },
+    SetForeignDataWrapper {
+        slot: u16,
+        created_at: u64,
+        owner: u16,
+        definition: Option<crate::storage::foreign::ForeignDataWrapperDefinition>,
+    },
+    SetForeignServer {
+        slot: u16,
+        created_at: u64,
+        owner: u16,
+        definition: Option<crate::storage::foreign::ForeignServerDefinition>,
+    },
+    SetUserMapping {
+        slot: u16,
+        created_at: u64,
+        definition: Option<crate::storage::foreign::UserMappingDefinition>,
+    },
+    SetForeignTable {
+        slot: u16,
+        created_at: u64,
+        definition: Option<crate::storage::foreign::ForeignTableDefinition>,
     },
     CreateTable(TableDef),
     /// Begins ALTER TABLE's in-place definition/row rewrite. The immediately
@@ -1917,6 +1943,10 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::DatabaseScope { .. } => KIND_DATABASE_SCOPE,
         WalOp::CreateLargeObject { .. } => KIND_CREATE_LARGE_OBJECT,
         WalOp::DropLargeObject { .. } => KIND_DROP_LARGE_OBJECT,
+        WalOp::SetForeignDataWrapper { .. } => KIND_SET_FOREIGN_DATA_WRAPPER,
+        WalOp::SetForeignServer { .. } => KIND_SET_FOREIGN_SERVER,
+        WalOp::SetUserMapping { .. } => KIND_SET_USER_MAPPING,
+        WalOp::SetForeignTable { .. } => KIND_SET_FOREIGN_TABLE,
         WalOp::CreateTable(_) => KIND_CREATE,
         WalOp::DropTable { .. } => KIND_DROP,
         WalOp::Upsert { .. } => KIND_UPSERT,
@@ -2032,6 +2062,18 @@ fn op_kind(operation: &WalOp) -> u8 {
 }
 
 fn encoded_payload_len(operation: &WalOp) -> usize {
+    fn foreign_options_len(options: crate::storage::foreign::ForeignOptions) -> usize {
+        1 + options
+            .entries()
+            .iter()
+            .map(|option| 1 + option.name.as_str().len() + 2 + option.value.as_str().len())
+            .sum::<usize>()
+    }
+    fn optional_foreign_value_len(
+        value: Option<crate::util::StackStr<{ crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX }>>,
+    ) -> usize {
+        1 + value.map_or(0, |value| 2 + value.as_str().len())
+    }
     fn routine_result_len(result: crate::storage::RoutineResult) -> usize {
         2 + result.user_type.map_or(0, |identity| {
             1 + identity.schema.as_str().len() + 1 + identity.name.as_str().len()
@@ -2064,8 +2106,44 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::DatabaseScope { .. } => 4,
         WalOp::CreateLargeObject { .. } => 13,
         WalOp::DropLargeObject { .. } => 4,
+        WalOp::SetForeignDataWrapper { definition, .. } => {
+            13 + definition.map_or(0, |definition| {
+                1 + definition.name.as_str().len() + 2 + foreign_options_len(definition.options)
+            })
+        }
+        WalOp::SetForeignServer { definition, .. } => {
+            13 + definition.map_or(0, |definition| {
+                1 + definition.name.as_str().len()
+                    + 2
+                    + optional_foreign_value_len(definition.server_type)
+                    + optional_foreign_value_len(definition.version)
+                    + foreign_options_len(definition.options)
+            })
+        }
+        WalOp::SetUserMapping { definition, .. } => {
+            11 + definition.map_or(0, |definition| {
+                2 + 3 + foreign_options_len(definition.options)
+            })
+        }
+        WalOp::SetForeignTable { definition, .. } => {
+            11 + definition.map_or(0, |definition| {
+                4 + foreign_options_len(definition.options)
+                    + 1
+                    + definition.column_options.entries().len() * 3
+                    + definition
+                        .column_options
+                        .entries()
+                        .iter()
+                        .map(|column| {
+                            1 + column.option.name.as_str().len()
+                                + 2
+                                + column.option.value.as_str().len()
+                        })
+                        .sum::<usize>()
+            })
+        }
         WalOp::CreateTable(def) => {
-            let mut n = 1 + def.name.as_str().len() + 2 + 1;
+            let mut n = 1 + def.name.as_str().len() + 2 + 2;
             for c in def.columns() {
                 let default_value = c.default.constant().copied();
                 n += 1 + c.name.as_str().len() + 3 + 4 + encoded_default_len(&default_value);
@@ -3388,6 +3466,38 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         };
         ok
     }
+    fn append_foreign_options(
+        buffer: &mut FixedBuf,
+        options: crate::storage::foreign::ForeignOptions,
+    ) -> bool {
+        let mut ok = buffer.append(&[options.entries().len() as u8]);
+        for option in options.entries() {
+            let name = option.name.as_str();
+            let value = option.value.as_str();
+            ok &= name.len() <= u8::MAX as usize
+                && value.len() <= u16::MAX as usize
+                && buffer.append(&[name.len() as u8])
+                && buffer.append(name.as_bytes())
+                && buffer.append(&(value.len() as u16).to_le_bytes())
+                && buffer.append(value.as_bytes());
+        }
+        ok
+    }
+    fn append_optional_foreign_value<const N: usize>(
+        buffer: &mut FixedBuf,
+        value: Option<crate::util::StackStr<N>>,
+    ) -> bool {
+        match value {
+            None => buffer.append(&[0]),
+            Some(value) => {
+                let value = value.as_str();
+                buffer.append(&[1])
+                    && value.len() <= u16::MAX as usize
+                    && buffer.append(&(value.len() as u16).to_le_bytes())
+                    && buffer.append(value.as_bytes())
+            }
+        }
+    }
     match operation {
         WalOp::DatabaseScope { oid } => buffer.append(&oid.to_le_bytes()),
         WalOp::CreateLargeObject {
@@ -3400,10 +3510,105 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&[u8::from(*allocated)])
         }
         WalOp::DropLargeObject { oid } => buffer.append(&oid.to_le_bytes()),
+        WalOp::SetForeignDataWrapper {
+            slot,
+            created_at,
+            owner,
+            definition,
+        } => {
+            let mut ok = buffer.append(&slot.to_le_bytes())
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&owner.to_le_bytes())
+                && buffer.append(&[u8::from(definition.is_some())]);
+            if let Some(definition) = definition {
+                ok &= name_bytes(buffer, definition.name.as_str())
+                    && buffer.append(&[
+                        match definition.handler {
+                            crate::storage::foreign::ForeignDataHandler::None => 0,
+                            crate::storage::foreign::ForeignDataHandler::Postgres => 1,
+                        },
+                        match definition.validator {
+                            crate::storage::foreign::ForeignDataValidator::None => 0,
+                            crate::storage::foreign::ForeignDataValidator::Postgres => 1,
+                        },
+                    ])
+                    && append_foreign_options(buffer, definition.options);
+            }
+            ok
+        }
+        WalOp::SetForeignServer {
+            slot,
+            created_at,
+            owner,
+            definition,
+        } => {
+            let mut ok = buffer.append(&slot.to_le_bytes())
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&owner.to_le_bytes())
+                && buffer.append(&[u8::from(definition.is_some())]);
+            if let Some(definition) = definition {
+                ok &= name_bytes(buffer, definition.name.as_str())
+                    && buffer.append(&definition.wrapper.to_le_bytes())
+                    && append_optional_foreign_value(buffer, definition.server_type)
+                    && append_optional_foreign_value(buffer, definition.version)
+                    && append_foreign_options(buffer, definition.options);
+            }
+            ok
+        }
+        WalOp::SetUserMapping {
+            slot,
+            created_at,
+            definition,
+        } => {
+            let mut ok = buffer.append(&slot.to_le_bytes())
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&[u8::from(definition.is_some())]);
+            if let Some(definition) = definition {
+                let (kind, role) = match definition.user {
+                    crate::storage::foreign::ForeignMappingUser::Public => (0, u16::MAX),
+                    crate::storage::foreign::ForeignMappingUser::Role(role) => (1, role),
+                };
+                ok &= buffer.append(&definition.server.to_le_bytes())
+                    && buffer.append(&[kind])
+                    && buffer.append(&role.to_le_bytes())
+                    && append_foreign_options(buffer, definition.options);
+            }
+            ok
+        }
+        WalOp::SetForeignTable {
+            slot,
+            created_at,
+            definition,
+        } => {
+            let mut ok = buffer.append(&slot.to_le_bytes())
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&[u8::from(definition.is_some())]);
+            if let Some(definition) = definition {
+                ok &= buffer.append(&definition.table.to_le_bytes())
+                    && buffer.append(&definition.server.to_le_bytes())
+                    && append_foreign_options(buffer, definition.options)
+                    && buffer.append(&[definition.column_options.entries().len() as u8]);
+                for column in definition.column_options.entries() {
+                    ok &= buffer.append(&column.column.to_le_bytes());
+                    let mut one = crate::storage::foreign::ForeignOptions::EMPTY;
+                    ok &= one
+                        .restore_option(column.option.name.as_str(), column.option.value.as_str())
+                        .is_ok()
+                        && append_foreign_options(buffer, one);
+                }
+            }
+            ok
+        }
         WalOp::CreateTable(def) => {
             let mut ok = name_bytes(buffer, def.name.as_str());
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
-            ok &= buffer.append(&[u8::from(def.has_toast)]);
+            ok &= buffer.append(&[
+                u8::from(def.has_toast),
+                match def.kind {
+                    crate::storage::TableKind::Local => 0,
+                    crate::storage::TableKind::Foreign => 1,
+                },
+            ]);
             for c in def.columns() {
                 ok &= name_bytes(buffer, c.name.as_str());
                 // Bit 7 (the last free per-column flag bit) marks a domain-typed
@@ -5491,6 +5696,52 @@ fn decode_operator_signature(
     Some(crate::storage::OperatorSignature { left, right })
 }
 
+fn decode_foreign_options(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<crate::storage::foreign::ForeignOptions> {
+    let count = *payload.get(*at)? as usize;
+    *at += 1;
+    if count > crate::storage::foreign::MAX_FOREIGN_OPTIONS {
+        return None;
+    }
+    let mut options = crate::storage::foreign::ForeignOptions::EMPTY;
+    for _ in 0..count {
+        let name_len = *payload.get(*at)? as usize;
+        *at += 1;
+        let name = core::str::from_utf8(payload.get(*at..*at + name_len)?).ok()?;
+        *at += name_len;
+        let value_len = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?) as usize;
+        *at += 2;
+        let value = core::str::from_utf8(payload.get(*at..*at + value_len)?).ok()?;
+        *at += value_len;
+        options.restore_option(name, value).ok()?;
+    }
+    Some(options)
+}
+
+fn decode_optional_foreign_value(
+    payload: &[u8],
+    at: &mut usize,
+) -> Option<Option<StackStr<{ crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX }>>> {
+    match *payload.get(*at)? {
+        0 => {
+            *at += 1;
+            Some(None)
+        }
+        1 => {
+            *at += 1;
+            let len = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?) as usize;
+            *at += 2;
+            let value = core::str::from_utf8(payload.get(*at..*at + len)?).ok()?;
+            *at += len;
+            let value = StackStr::from_str(value);
+            (!value.is_truncated()).then_some(Some(value))
+        }
+        _ => None,
+    }
+}
+
 fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
     let mut at = 0usize;
     let take_name = |at: &mut usize| -> Option<&str> {
@@ -5526,6 +5777,168 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at = 4;
             (oid != 0 && at == payload.len()).then_some(WalOp::DropLargeObject { oid })
         }
+        KIND_SET_FOREIGN_DATA_WRAPPER => {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let definition = match *payload.get(at)? {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    at += 1;
+                    let name = SqlName::parse(take_name(&mut at)?).ok()?;
+                    let handler = match *payload.get(at)? {
+                        0 => crate::storage::foreign::ForeignDataHandler::None,
+                        1 => crate::storage::foreign::ForeignDataHandler::Postgres,
+                        _ => return None,
+                    };
+                    at += 1;
+                    let validator = match *payload.get(at)? {
+                        0 => crate::storage::foreign::ForeignDataValidator::None,
+                        1 => crate::storage::foreign::ForeignDataValidator::Postgres,
+                        _ => return None,
+                    };
+                    at += 1;
+                    Some(crate::storage::foreign::ForeignDataWrapperDefinition {
+                        name,
+                        handler,
+                        validator,
+                        options: decode_foreign_options(payload, &mut at)?,
+                    })
+                }
+                _ => return None,
+            };
+            (at == payload.len()).then_some(WalOp::SetForeignDataWrapper {
+                slot,
+                created_at,
+                owner,
+                definition,
+            })
+        }
+        KIND_SET_FOREIGN_SERVER => {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let definition = match *payload.get(at)? {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    at += 1;
+                    let name = SqlName::parse(take_name(&mut at)?).ok()?;
+                    let wrapper = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                    Some(crate::storage::foreign::ForeignServerDefinition {
+                        name,
+                        wrapper,
+                        server_type: decode_optional_foreign_value(payload, &mut at)?,
+                        version: decode_optional_foreign_value(payload, &mut at)?,
+                        options: decode_foreign_options(payload, &mut at)?,
+                    })
+                }
+                _ => return None,
+            };
+            (at == payload.len()).then_some(WalOp::SetForeignServer {
+                slot,
+                created_at,
+                owner,
+                definition,
+            })
+        }
+        KIND_SET_USER_MAPPING => {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let definition = match *payload.get(at)? {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    at += 1;
+                    let server = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                    let user = match *payload.get(at)? {
+                        0 => crate::storage::foreign::ForeignMappingUser::Public,
+                        1 => {
+                            let role =
+                                u16::from_le_bytes(payload.get(at + 1..at + 3)?.try_into().ok()?);
+                            crate::storage::foreign::ForeignMappingUser::Role(role)
+                        }
+                        _ => return None,
+                    };
+                    at += 3;
+                    Some(crate::storage::foreign::UserMappingDefinition {
+                        server,
+                        user,
+                        options: decode_foreign_options(payload, &mut at)?,
+                    })
+                }
+                _ => return None,
+            };
+            (at == payload.len()).then_some(WalOp::SetUserMapping {
+                slot,
+                created_at,
+                definition,
+            })
+        }
+        KIND_SET_FOREIGN_TABLE => {
+            let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let definition = match *payload.get(at)? {
+                0 => {
+                    at += 1;
+                    None
+                }
+                1 => {
+                    at += 1;
+                    let table = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                    let server = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                    let options = decode_foreign_options(payload, &mut at)?;
+                    let count = *payload.get(at)? as usize;
+                    at += 1;
+                    if count > crate::storage::foreign::MAX_FOREIGN_COLUMN_OPTIONS {
+                        return None;
+                    }
+                    let mut column_options = crate::storage::foreign::ForeignColumnOptions::EMPTY;
+                    for _ in 0..count {
+                        let column = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                        at += 2;
+                        let one = decode_foreign_options(payload, &mut at)?;
+                        if one.entries().len() != 1 {
+                            return None;
+                        }
+                        column_options.append(column, one).ok()?;
+                    }
+                    Some(crate::storage::foreign::ForeignTableDefinition {
+                        table,
+                        server,
+                        options,
+                        column_options,
+                    })
+                }
+                _ => return None,
+            };
+            (at == payload.len()).then_some(WalOp::SetForeignTable {
+                slot,
+                created_at,
+                definition,
+            })
+        }
         KIND_CREATE => {
             let name = take_name(&mut at)?;
             let n_cols = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
@@ -5534,6 +5947,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 return None;
             }
             let has_toast = *payload.get(at)? != 0;
+            at += 1;
+            let kind = match *payload.get(at)? {
+                0 => crate::storage::TableKind::Local,
+                1 => crate::storage::TableKind::Foreign,
+                _ => return None,
+            };
             at += 1;
             let mut def = TableDef {
                 name: SqlName::parse(name).ok()?,
@@ -5554,6 +5973,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 }; MAX_COLUMNS],
                 n_columns: n_cols,
                 has_toast,
+                kind,
                 ..TableDef::empty()
             };
             for i in 0..n_cols {

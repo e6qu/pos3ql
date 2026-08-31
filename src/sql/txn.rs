@@ -356,6 +356,51 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingPublicationName>,
     },
+    ForeignDataWrapperCreated(u32),
+    ForeignDataWrapperAltered {
+        slot: u32,
+        prior: Option<
+            crate::storage::foreign::PendingForeignDefinition<
+                crate::storage::foreign::ForeignDataWrapperDefinition,
+            >,
+        >,
+    },
+    ForeignDataWrapperDropped(u32),
+    ForeignServerCreated(u32),
+    ForeignServerAltered {
+        slot: u32,
+        prior: Option<
+            crate::storage::foreign::PendingForeignDefinition<
+                crate::storage::foreign::ForeignServerDefinition,
+            >,
+        >,
+    },
+    ForeignServerDropped(u32),
+    UserMappingCreated(u32),
+    UserMappingAltered {
+        slot: u32,
+        prior: Option<
+            crate::storage::foreign::PendingForeignDefinition<
+                crate::storage::foreign::UserMappingDefinition,
+            >,
+        >,
+    },
+    UserMappingDropped(u32),
+    ForeignTableCreated(u32),
+    ForeignTableAltered {
+        slot: u32,
+        prior: Option<
+            crate::storage::foreign::PendingForeignDefinition<
+                crate::storage::foreign::ForeignTableDefinition,
+            >,
+        >,
+    },
+    ForeignTableDropped(u32),
+    ForeignOwnerChanged {
+        class: crate::storage::foreign::ForeignObjectClass,
+        slot: u32,
+        prior: Option<crate::storage::PendingOwnership>,
+    },
     SubscriptionCreated(u32),
     SubscriptionDropped(u32),
     SubscriptionEnabled {

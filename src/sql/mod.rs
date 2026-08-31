@@ -13,6 +13,7 @@ pub(crate) mod event_trigger;
 pub mod exec;
 mod explain;
 pub(crate) mod external;
+pub(crate) mod foreign;
 pub mod full_text;
 pub mod guc;
 pub mod json;
@@ -101,6 +102,7 @@ pub enum EngineSetupError {
     /// A storage operation during recovery failed loudly — e.g. the recovered
     /// data exceeds the configured value-index capacity.
     Storage(SqlError),
+    ForeignTransport(String),
 }
 
 impl From<SqlError> for EngineSetupError {
@@ -116,6 +118,7 @@ impl std::fmt::Display for EngineSetupError {
             Self::Wal(e) => write!(f, "{e}"),
             Self::Checkpoint(e) => write!(f, "{e}"),
             Self::Storage(e) => write!(f, "{}", e.message.as_str()),
+            Self::ForeignTransport(e) => write!(f, "{e}"),
         }
     }
 }
@@ -379,6 +382,19 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateConversion(_)
         | Stmt::AlterConversion { .. }
         | Stmt::DropConversion { .. }
+        | Stmt::CreateForeignDataWrapper(_)
+        | Stmt::AlterForeignDataWrapper { .. }
+        | Stmt::DropForeignDataWrapper { .. }
+        | Stmt::CreateForeignServer(_)
+        | Stmt::AlterForeignServer { .. }
+        | Stmt::DropForeignServer { .. }
+        | Stmt::CreateUserMapping(_)
+        | Stmt::AlterUserMapping(_)
+        | Stmt::DropUserMapping(_)
+        | Stmt::CreateForeignTable(_)
+        | Stmt::AlterForeignTable(_)
+        | Stmt::DropForeignTable(_)
+        | Stmt::ImportForeignSchema(_)
         | Stmt::CreateTextSearchParser(_)
         | Stmt::CreateTextSearchTemplate(_)
         | Stmt::CreateTextSearchDictionary(_)
@@ -739,6 +755,19 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::CreateConversion(_) => "CREATE CONVERSION",
         Stmt::AlterConversion { .. } => "ALTER CONVERSION",
         Stmt::DropConversion { .. } => "DROP CONVERSION",
+        Stmt::CreateForeignDataWrapper(_) => "CREATE FOREIGN DATA WRAPPER",
+        Stmt::AlterForeignDataWrapper { .. } => "ALTER FOREIGN DATA WRAPPER",
+        Stmt::DropForeignDataWrapper { .. } => "DROP FOREIGN DATA WRAPPER",
+        Stmt::CreateForeignServer(_) => "CREATE SERVER",
+        Stmt::AlterForeignServer { .. } => "ALTER SERVER",
+        Stmt::DropForeignServer { .. } => "DROP SERVER",
+        Stmt::CreateUserMapping(_) => "CREATE USER MAPPING",
+        Stmt::AlterUserMapping(_) => "ALTER USER MAPPING",
+        Stmt::DropUserMapping(_) => "DROP USER MAPPING",
+        Stmt::CreateForeignTable(_) => "CREATE FOREIGN TABLE",
+        Stmt::AlterForeignTable(_) => "ALTER FOREIGN TABLE",
+        Stmt::DropForeignTable(_) => "DROP FOREIGN TABLE",
+        Stmt::ImportForeignSchema(_) => "IMPORT FOREIGN SCHEMA",
         Stmt::CreateTextSearchParser(_) => "CREATE TEXT SEARCH PARSER",
         Stmt::CreateTextSearchTemplate(_) => "CREATE TEXT SEARCH TEMPLATE",
         Stmt::CreateTextSearchDictionary(_) => "CREATE TEXT SEARCH DICTIONARY",
@@ -800,6 +829,7 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
             ast::AlterOwnerKind::Type => "ALTER TYPE",
             ast::AlterOwnerKind::Domain => "ALTER DOMAIN",
             ast::AlterOwnerKind::Table => "ALTER TABLE",
+            ast::AlterOwnerKind::ForeignTable => "ALTER FOREIGN TABLE",
             ast::AlterOwnerKind::View => "ALTER VIEW",
             ast::AlterOwnerKind::MaterializedView => "ALTER MATERIALIZED VIEW",
             ast::AlterOwnerKind::Sequence => "ALTER SEQUENCE",
@@ -2429,6 +2459,11 @@ impl Engine {
             + config.max_connections as usize * config.wal_buffer_bytes
             + config.max_connections as usize * size_of::<(i32, u64)>()
             + two_phase::PreparedTransactions::budget_bytes(config)
+            + crate::pg::replication_client::ReplicationClient::budget_bytes(
+                1,
+                config.foreign_receive_bytes,
+                config.foreign_send_bytes,
+            )
             + if config.object_store_on {
                 // The checkpointer's fixed parts plus the spilled-row reader's
                 // two scratch sets.
@@ -2584,6 +2619,18 @@ impl Engine {
                 active_system_setting_count += 1;
             }
         }
+        let foreign_tls =
+            crate::object_store::tls::build_client_config(&config.foreign_tls_ca_file)
+                .map_err(EngineSetupError::ForeignTransport)?;
+        let foreign_client = crate::pg::replication_client::ReplicationClient::new_unbound(
+            budget,
+            1,
+            config.foreign_receive_bytes,
+            config.foreign_send_bytes,
+            Some(&foreign_tls),
+        )
+        .map_err(|error| EngineSetupError::ForeignTransport(error.to_string()))?;
+        storage.install_foreign_client(foreign_client);
         // The upload buffer must hold at least one full WAL batch.
         let upload_buf = config.wal_upload_buffer_bytes.max(config.wal_buffer_bytes);
         Ok(Self {
@@ -4057,6 +4104,93 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        let foreign_target = |undo: DdlUndo| match undo {
+            DdlUndo::ForeignDataWrapperCreated(slot)
+            | DdlUndo::ForeignDataWrapperAltered { slot, .. }
+            | DdlUndo::ForeignDataWrapperDropped(slot) => {
+                Some((crate::storage::foreign::ForeignObjectClass::Wrapper, slot))
+            }
+            DdlUndo::ForeignServerCreated(slot)
+            | DdlUndo::ForeignServerAltered { slot, .. }
+            | DdlUndo::ForeignServerDropped(slot) => {
+                Some((crate::storage::foreign::ForeignObjectClass::Server, slot))
+            }
+            DdlUndo::UserMappingCreated(slot)
+            | DdlUndo::UserMappingAltered { slot, .. }
+            | DdlUndo::UserMappingDropped(slot) => {
+                Some((crate::storage::foreign::ForeignObjectClass::Mapping, slot))
+            }
+            DdlUndo::ForeignTableCreated(slot)
+            | DdlUndo::ForeignTableAltered { slot, .. }
+            | DdlUndo::ForeignTableDropped(slot) => {
+                Some((crate::storage::foreign::ForeignObjectClass::Table, slot))
+            }
+            DdlUndo::ForeignOwnerChanged { class, slot, .. } => Some((class, slot)),
+            _ => None,
+        };
+        for (position, undo) in txn.ddl().iter().copied().enumerate() {
+            let Some((class, slot)) = foreign_target(undo) else {
+                continue;
+            };
+            if txn.ddl()[position + 1..]
+                .iter()
+                .copied()
+                .filter_map(foreign_target)
+                .any(|later| later == (class, slot))
+            {
+                continue;
+            }
+            let operation = match class {
+                crate::storage::foreign::ForeignObjectClass::Wrapper => {
+                    let entry = self.storage.foreign_wrapper_entry(slot as usize);
+                    WalOp::SetForeignDataWrapper {
+                        slot: slot as u16,
+                        created_at: entry.created_at,
+                        owner: entry.ownership.owner_to(txn.txid),
+                        definition: entry
+                            .visible_to(txn.txid)
+                            .then(|| entry.definition_for(txn.txid)),
+                    }
+                }
+                crate::storage::foreign::ForeignObjectClass::Server => {
+                    let entry = self.storage.foreign_server_entry(slot as usize);
+                    WalOp::SetForeignServer {
+                        slot: slot as u16,
+                        created_at: entry.created_at,
+                        owner: entry.ownership.owner_to(txn.txid),
+                        definition: entry
+                            .visible_to(txn.txid)
+                            .then(|| entry.definition_for(txn.txid)),
+                    }
+                }
+                crate::storage::foreign::ForeignObjectClass::Mapping => {
+                    let entry = self.storage.foreign_mapping_entry(slot as usize);
+                    WalOp::SetUserMapping {
+                        slot: slot as u16,
+                        created_at: entry.created_at,
+                        definition: entry
+                            .visible_to(txn.txid)
+                            .then(|| entry.definition_for(txn.txid)),
+                    }
+                }
+                crate::storage::foreign::ForeignObjectClass::Table => {
+                    let entry = self.storage.foreign_table_entry(slot as usize);
+                    WalOp::SetForeignTable {
+                        slot: slot as u16,
+                        created_at: entry.created_at,
+                        definition: entry
+                            .visible_to(txn.txid)
+                            .then(|| entry.definition_for(txn.txid)),
+                    }
+                }
+            };
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(txn.txid, lsn, &operation) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
         for undo in txn.ddl() {
             let operation = match *undo {
                 DdlUndo::LargeObjectCreated(slot) => {
@@ -4645,6 +4779,73 @@ impl Engine {
                 DdlUndo::PublicationRenamed { slot, .. } => self
                     .storage
                     .commit_publication_rename(*slot as usize, txn.txid),
+                DdlUndo::ForeignDataWrapperCreated(slot) => {
+                    self.storage.foreign_catalog_commit_create(
+                        crate::storage::foreign::ForeignObjectClass::Wrapper,
+                        *slot as usize,
+                    )
+                }
+                DdlUndo::ForeignDataWrapperAltered { slot, .. } => {
+                    self.storage.foreign_catalog_commit_alter(
+                        crate::storage::foreign::ForeignObjectClass::Wrapper,
+                        *slot as usize,
+                        txn.txid,
+                    )
+                }
+                DdlUndo::ForeignDataWrapperDropped(slot) => {
+                    self.storage.foreign_catalog_commit_drop(
+                        crate::storage::foreign::ForeignObjectClass::Wrapper,
+                        *slot as usize,
+                    )
+                }
+                DdlUndo::ForeignServerCreated(slot) => self.storage.foreign_catalog_commit_create(
+                    crate::storage::foreign::ForeignObjectClass::Server,
+                    *slot as usize,
+                ),
+                DdlUndo::ForeignServerAltered { slot, .. } => {
+                    self.storage.foreign_catalog_commit_alter(
+                        crate::storage::foreign::ForeignObjectClass::Server,
+                        *slot as usize,
+                        txn.txid,
+                    )
+                }
+                DdlUndo::ForeignServerDropped(slot) => self.storage.foreign_catalog_commit_drop(
+                    crate::storage::foreign::ForeignObjectClass::Server,
+                    *slot as usize,
+                ),
+                DdlUndo::UserMappingCreated(slot) => self.storage.foreign_catalog_commit_create(
+                    crate::storage::foreign::ForeignObjectClass::Mapping,
+                    *slot as usize,
+                ),
+                DdlUndo::UserMappingAltered { slot, .. } => {
+                    self.storage.foreign_catalog_commit_alter(
+                        crate::storage::foreign::ForeignObjectClass::Mapping,
+                        *slot as usize,
+                        txn.txid,
+                    )
+                }
+                DdlUndo::UserMappingDropped(slot) => self.storage.foreign_catalog_commit_drop(
+                    crate::storage::foreign::ForeignObjectClass::Mapping,
+                    *slot as usize,
+                ),
+                DdlUndo::ForeignTableCreated(slot) => self.storage.foreign_catalog_commit_create(
+                    crate::storage::foreign::ForeignObjectClass::Table,
+                    *slot as usize,
+                ),
+                DdlUndo::ForeignTableAltered { slot, .. } => {
+                    self.storage.foreign_catalog_commit_alter(
+                        crate::storage::foreign::ForeignObjectClass::Table,
+                        *slot as usize,
+                        txn.txid,
+                    )
+                }
+                DdlUndo::ForeignTableDropped(slot) => self.storage.foreign_catalog_commit_drop(
+                    crate::storage::foreign::ForeignObjectClass::Table,
+                    *slot as usize,
+                ),
+                DdlUndo::ForeignOwnerChanged { class, slot, .. } => self
+                    .storage
+                    .commit_foreign_catalog_owner(*class, *slot as usize, txn.txid),
                 DdlUndo::SubscriptionCreated(slot) => {
                     self.storage.commit_subscription_create(*slot as usize)
                 }
@@ -5344,6 +5545,59 @@ impl Engine {
             DdlUndo::PublicationRenamed { slot, prior } => self
                 .storage
                 .rollback_publication_rename(slot as usize, prior),
+            DdlUndo::ForeignDataWrapperCreated(slot) => {
+                self.storage.foreign_catalog_rollback_create(
+                    crate::storage::foreign::ForeignObjectClass::Wrapper,
+                    slot as usize,
+                )
+            }
+            DdlUndo::ForeignDataWrapperAltered { slot, prior } => self
+                .storage
+                .rollback_foreign_wrapper_alter(slot as usize, prior),
+            DdlUndo::ForeignDataWrapperDropped(slot) => self.storage.foreign_catalog_rollback_drop(
+                crate::storage::foreign::ForeignObjectClass::Wrapper,
+                slot as usize,
+                txid,
+            ),
+            DdlUndo::ForeignServerCreated(slot) => self.storage.foreign_catalog_rollback_create(
+                crate::storage::foreign::ForeignObjectClass::Server,
+                slot as usize,
+            ),
+            DdlUndo::ForeignServerAltered { slot, prior } => self
+                .storage
+                .rollback_foreign_server_alter(slot as usize, prior),
+            DdlUndo::ForeignServerDropped(slot) => self.storage.foreign_catalog_rollback_drop(
+                crate::storage::foreign::ForeignObjectClass::Server,
+                slot as usize,
+                txid,
+            ),
+            DdlUndo::UserMappingCreated(slot) => self.storage.foreign_catalog_rollback_create(
+                crate::storage::foreign::ForeignObjectClass::Mapping,
+                slot as usize,
+            ),
+            DdlUndo::UserMappingAltered { slot, prior } => self
+                .storage
+                .rollback_foreign_mapping_alter(slot as usize, prior),
+            DdlUndo::UserMappingDropped(slot) => self.storage.foreign_catalog_rollback_drop(
+                crate::storage::foreign::ForeignObjectClass::Mapping,
+                slot as usize,
+                txid,
+            ),
+            DdlUndo::ForeignTableCreated(slot) => self.storage.foreign_catalog_rollback_create(
+                crate::storage::foreign::ForeignObjectClass::Table,
+                slot as usize,
+            ),
+            DdlUndo::ForeignTableAltered { slot, prior } => self
+                .storage
+                .rollback_foreign_table_alter(slot as usize, prior),
+            DdlUndo::ForeignTableDropped(slot) => self.storage.foreign_catalog_rollback_drop(
+                crate::storage::foreign::ForeignObjectClass::Table,
+                slot as usize,
+                txid,
+            ),
+            DdlUndo::ForeignOwnerChanged { class, slot, prior } => self
+                .storage
+                .rollback_foreign_catalog_owner(class, slot as usize, prior),
             DdlUndo::SubscriptionCreated(slot) => {
                 self.storage.rollback_subscription_create(slot as usize)
             }
@@ -11582,6 +11836,102 @@ impl Engine {
                 *cascade,
                 responder,
             ),
+            Stmt::CreateForeignDataWrapper(command) => exec::create_foreign_data_wrapper(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                responder,
+            ),
+            Stmt::CreateForeignServer(command) => exec::create_foreign_server(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                responder,
+            ),
+            Stmt::CreateUserMapping(command) => {
+                exec::create_user_mapping(&mut self.storage, &mut self.wal, txn, command, responder)
+            }
+            Stmt::CreateForeignTable(command) => exec::create_foreign_table(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                arena,
+                responder,
+            ),
+            Stmt::AlterForeignDataWrapper { name, action } => exec::alter_foreign_data_wrapper(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *action,
+                responder,
+            ),
+            Stmt::DropForeignDataWrapper {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_foreign_data_wrapper(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
+            Stmt::AlterForeignServer { name, action } => exec::alter_foreign_server(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *action,
+                responder,
+            ),
+            Stmt::DropForeignServer {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_foreign_server(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
+            Stmt::AlterUserMapping(command) => {
+                exec::alter_user_mapping(&mut self.storage, &mut self.wal, txn, command, responder)
+            }
+            Stmt::DropUserMapping(command) => {
+                exec::drop_user_mapping(&mut self.storage, &mut self.wal, txn, command, responder)
+            }
+            Stmt::DropForeignTable(command) => {
+                exec::drop_foreign_table(&mut self.storage, &mut self.wal, txn, command, responder)
+            }
+            Stmt::ImportForeignSchema(command) => exec::import_foreign_schema(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                arena,
+                responder,
+            ),
+            Stmt::AlterForeignTable(command) => exec::alter_foreign_table(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                command,
+                exec::ForeignTableAlterRuntime {
+                    scratch: &mut self.dml_scratch,
+                    arena,
+                    sequence: guc.seq_session(),
+                },
+                responder,
+            ),
             Stmt::CreateTextSearchParser(command) => exec::create_text_search_parser(
                 &mut self.storage,
                 &mut self.wal,
@@ -14286,7 +14636,9 @@ impl Engine {
             crate::storage::AccessClass::Tablespace
             | crate::storage::AccessClass::Extension
             | crate::storage::AccessClass::Database
-            | crate::storage::AccessClass::LargeObject => {
+            | crate::storage::AccessClass::LargeObject
+            | crate::storage::AccessClass::ForeignDataWrapper
+            | crate::storage::AccessClass::ForeignServer => {
                 return Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "unsupported extension member class"
@@ -15567,6 +15919,28 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             })?;
             storage.commit_large_object_drop(slot);
         }
+        WalOp::SetForeignDataWrapper {
+            slot,
+            created_at,
+            owner,
+            definition,
+        } => storage.replay_set_foreign_wrapper(slot as usize, created_at, owner, definition)?,
+        WalOp::SetForeignServer {
+            slot,
+            created_at,
+            owner,
+            definition,
+        } => storage.replay_set_foreign_server(slot as usize, created_at, owner, definition)?,
+        WalOp::SetUserMapping {
+            slot,
+            created_at,
+            definition,
+        } => storage.replay_set_foreign_user_mapping(slot as usize, created_at, definition)?,
+        WalOp::SetForeignTable {
+            slot,
+            created_at,
+            definition,
+        } => storage.replay_set_foreign_table(slot as usize, created_at, definition)?,
         WalOp::Commit { .. }
         | WalOp::PrepareTransaction { .. }
         | WalOp::PreparedLocks { .. }

@@ -12,15 +12,18 @@ use super::{
 use crate::sql::ast::{
     AggregateArgument, AggregateArguments, AggregateDefinition, AggregateFinal,
     AggregateFinalModify, AggregateIdentity, AggregateMoving, AggregatePartial, AlterDomainAction,
-    AlterEventTriggerAction, AlterExtensionAction, AlterIndexAction, AlterOperatorAction,
-    AlterOperatorClassAction, AlterOperatorFamilyAction, AlterPublicationAction,
-    AlterRoutineAction, AlterStatisticsAction, AlterTablespaceAction, AlterTriggerAction,
-    AlterTypeAction, BtreeStrategy, CastContext, CastMethod, ConstraintMode, ConstraintTiming,
-    ConstraintValidation, CreateCast, CreateDomain, CreateEventTrigger, CreateOperator,
-    CreateOperatorClass, CreateRoutine, CreateRule, CreateSchemaElement, CreateStatistics,
-    CreateTextSearchConfiguration, CreateTextSearchDictionary, CreateTextSearchParser,
-    CreateTextSearchTemplate, CreateTrigger, DomainCheck, EventTriggerEvent, ExclusionOperator,
-    Expr, ExtensionMemberIdentity, ExtensionRelationKind, IndexAccessMethod, IndexBuildMode,
+    AlterEventTriggerAction, AlterExtensionAction, AlterForeignDataWrapperAction,
+    AlterForeignServerAction, AlterIndexAction, AlterOperatorAction, AlterOperatorClassAction,
+    AlterOperatorFamilyAction, AlterPublicationAction, AlterRoutineAction, AlterStatisticsAction,
+    AlterTablespaceAction, AlterTriggerAction, AlterTypeAction, BtreeStrategy, CastContext,
+    CastMethod, ConstraintMode, ConstraintTiming, ConstraintValidation, CreateCast, CreateDomain,
+    CreateEventTrigger, CreateForeignDataWrapper, CreateForeignServer, CreateForeignTable,
+    CreateOperator, CreateOperatorClass, CreateRoutine, CreateRule, CreateSchemaElement,
+    CreateStatistics, CreateTextSearchConfiguration, CreateTextSearchDictionary,
+    CreateTextSearchParser, CreateTextSearchTemplate, CreateTrigger, DomainCheck,
+    EventTriggerEvent, ExclusionOperator, Expr, ExtensionMemberIdentity, ExtensionRelationKind,
+    ForeignDataHandler, ForeignDataValidator, ForeignOption, ForeignOptionAction,
+    ForeignSchemaSelection, ForeignUser, ImportForeignSchema, IndexAccessMethod, IndexBuildMode,
     IndexStorageOptionNames, IndexStorageOptions, IndexTargetScope, OperatorClassMember,
     OperatorFamilyMember, OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands,
     PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression,
@@ -1037,6 +1040,318 @@ impl<'a> Parser<'a> {
         Err(self.err_here("expected PARSER, TEMPLATE, DICTIONARY, or CONFIGURATION"))
     }
 
+    pub(super) fn foreign_options(&mut self) -> Result<&'a [ForeignOption<'a>], ParseError> {
+        self.expect_op("(")?;
+        let mut options = [ForeignOption {
+            name: "",
+            value: "",
+        }; MAX_LIST];
+        let mut count = 0usize;
+        if self.eat_op(")")? {
+            return Ok(&[]);
+        }
+        loop {
+            if count == options.len() {
+                return Err(self.limit("foreign options", options.len()));
+            }
+            let name = self.any_ident("foreign option name")?;
+            if options[..count].iter().any(|option| option.name == name) {
+                return Err(self.err_here("foreign option specified more than once"));
+            }
+            options[count] = ForeignOption {
+                name,
+                value: self.str_literal("foreign option value")?,
+            };
+            count += 1;
+            if self.eat_op(")")? {
+                break;
+            }
+            self.expect_op(",")?;
+        }
+        self.arena_slice(&options[..count])
+    }
+
+    pub(super) fn alter_foreign_options(
+        &mut self,
+    ) -> Result<&'a [ForeignOptionAction<'a>], ParseError> {
+        self.expect_op("(")?;
+        let mut options = [ForeignOptionAction::Drop(""); MAX_LIST];
+        let mut names = [""; MAX_LIST];
+        let mut count = 0usize;
+        if self.eat_op(")")? {
+            return Ok(&[]);
+        }
+        loop {
+            if count == options.len() {
+                return Err(self.limit("foreign option alterations", options.len()));
+            }
+            let operation = if self.eat_ident("set")? {
+                1u8
+            } else if self.eat_ident("drop")? {
+                2u8
+            } else {
+                let _ = self.eat_ident("add")?;
+                0u8
+            };
+            let name = self.any_ident("foreign option name")?;
+            if names[..count].contains(&name) {
+                return Err(self.err_here("foreign option specified more than once"));
+            }
+            names[count] = name;
+            options[count] = if operation == 2 {
+                ForeignOptionAction::Drop(name)
+            } else {
+                let option = ForeignOption {
+                    name,
+                    value: self.str_literal("foreign option value")?,
+                };
+                if operation == 1 {
+                    ForeignOptionAction::Set(option)
+                } else {
+                    ForeignOptionAction::Add(option)
+                }
+            };
+            count += 1;
+            if self.eat_op(")")? {
+                break;
+            }
+            self.expect_op(",")?;
+        }
+        self.arena_slice(&options[..count])
+    }
+
+    fn foreign_user(&mut self) -> Result<ForeignUser<'a>, ParseError> {
+        if self.eat_ident("current_role")? {
+            Ok(ForeignUser::CurrentRole)
+        } else if self.eat_ident("current_user")? {
+            Ok(ForeignUser::CurrentUser)
+        } else if self.eat_ident("user")? {
+            Ok(ForeignUser::User)
+        } else if self.eat_ident("public")? {
+            Ok(ForeignUser::Public)
+        } else {
+            Ok(ForeignUser::Named(self.col_ident("user mapping role")?))
+        }
+    }
+
+    fn create_foreign_data_wrapper(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("foreign-data wrapper name")?;
+        let handler = if self.eat_ident("handler")? {
+            ForeignDataHandler::Function(self.qual_name("foreign-data wrapper handler")?)
+        } else if self.eat_ident("no")? {
+            self.expect_ident("handler")?;
+            ForeignDataHandler::None
+        } else {
+            ForeignDataHandler::None
+        };
+        let validator = if self.eat_ident("validator")? {
+            ForeignDataValidator::Function(self.qual_name("foreign-data wrapper validator")?)
+        } else if self.eat_ident("no")? {
+            self.expect_ident("validator")?;
+            ForeignDataValidator::None
+        } else {
+            ForeignDataValidator::None
+        };
+        let options = if self.eat_ident("options")? {
+            self.foreign_options()?
+        } else {
+            &[]
+        };
+        Ok(Stmt::CreateForeignDataWrapper(CreateForeignDataWrapper {
+            name,
+            handler,
+            validator,
+            options,
+        }))
+    }
+
+    fn create_foreign_server(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_not_exists = if self.eat_ident("if")? {
+            self.expect_ident("not")?;
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.col_ident("foreign server name")?;
+        let server_type = if self.eat_ident("type")? {
+            Some(self.str_literal("foreign server type")?)
+        } else {
+            None
+        };
+        let version = if self.eat_ident("version")? {
+            Some(self.str_literal("foreign server version")?)
+        } else {
+            None
+        };
+        self.expect_ident("foreign")?;
+        self.expect_ident("data")?;
+        self.expect_ident("wrapper")?;
+        let wrapper = self.col_ident("foreign-data wrapper name")?;
+        let options = if self.eat_ident("options")? {
+            self.foreign_options()?
+        } else {
+            &[]
+        };
+        Ok(Stmt::CreateForeignServer(CreateForeignServer {
+            name,
+            if_not_exists,
+            server_type,
+            version,
+            wrapper,
+            options,
+        }))
+    }
+
+    fn create_user_mapping(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_not_exists = if self.eat_ident("if")? {
+            self.expect_ident("not")?;
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        self.expect_ident("for")?;
+        let user = self.foreign_user()?;
+        self.expect_ident("server")?;
+        let server = self.col_ident("foreign server name")?;
+        let options = if self.eat_ident("options")? {
+            self.foreign_options()?
+        } else {
+            &[]
+        };
+        Ok(Stmt::CreateUserMapping(
+            crate::sql::ast::CreateUserMapping {
+                user,
+                server,
+                if_not_exists,
+                options,
+            },
+        ))
+    }
+
+    pub(super) fn alter_foreign_data_wrapper(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("foreign-data wrapper name")?;
+        let action = if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterForeignDataWrapperAction::Owner(self.any_ident("role name")?)
+        } else if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterForeignDataWrapperAction::Rename(self.col_ident("new foreign-data wrapper name")?)
+        } else {
+            let handler = if self.eat_ident("handler")? {
+                Some(ForeignDataHandler::Function(
+                    self.qual_name("foreign-data wrapper handler")?,
+                ))
+            } else if self.eat_ident("no")? {
+                self.expect_ident("handler")?;
+                Some(ForeignDataHandler::None)
+            } else {
+                None
+            };
+            let validator = if self.eat_ident("validator")? {
+                Some(ForeignDataValidator::Function(
+                    self.qual_name("foreign-data wrapper validator")?,
+                ))
+            } else if self.eat_ident("no")? {
+                self.expect_ident("validator")?;
+                Some(ForeignDataValidator::None)
+            } else {
+                None
+            };
+            let options = if self.eat_ident("options")? {
+                self.alter_foreign_options()?
+            } else {
+                &[]
+            };
+            if handler.is_none() && validator.is_none() && options.is_empty() {
+                return Err(self.err_here("expected a foreign-data wrapper alteration"));
+            }
+            AlterForeignDataWrapperAction::Definition {
+                handler,
+                validator,
+                options,
+            }
+        };
+        Ok(Stmt::AlterForeignDataWrapper { name, action })
+    }
+
+    pub(super) fn alter_foreign_server(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("foreign server name")?;
+        let action = if self.eat_ident("owner")? {
+            self.expect_ident("to")?;
+            AlterForeignServerAction::Owner(self.any_ident("role name")?)
+        } else if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            AlterForeignServerAction::Rename(self.col_ident("new foreign server name")?)
+        } else {
+            let version = if self.eat_ident("version")? {
+                if self.eat_ident("null")? {
+                    Some(None)
+                } else {
+                    Some(Some(self.str_literal("foreign server version")?))
+                }
+            } else {
+                None
+            };
+            let options = if self.eat_ident("options")? {
+                self.alter_foreign_options()?
+            } else {
+                &[]
+            };
+            if version.is_none() && options.is_empty() {
+                return Err(self.err_here("expected a foreign server alteration"));
+            }
+            AlterForeignServerAction::Definition { version, options }
+        };
+        Ok(Stmt::AlterForeignServer { name, action })
+    }
+
+    pub(super) fn alter_user_mapping(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("for")?;
+        let user = self.foreign_user()?;
+        self.expect_ident("server")?;
+        let server = self.col_ident("foreign server name")?;
+        self.expect_ident("options")?;
+        Ok(Stmt::AlterUserMapping(crate::sql::ast::AlterUserMapping {
+            user,
+            server,
+            options: self.alter_foreign_options()?,
+        }))
+    }
+
+    pub(super) fn import_foreign_schema(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("import")?;
+        self.expect_ident("foreign")?;
+        self.expect_ident("schema")?;
+        let remote_schema = self.col_ident("remote schema name")?;
+        let selection = if self.eat_ident("limit")? {
+            self.expect_ident("to")?;
+            ForeignSchemaSelection::LimitTo(self.column_name_list()?)
+        } else if self.eat_ident("except")? {
+            ForeignSchemaSelection::Except(self.column_name_list()?)
+        } else {
+            ForeignSchemaSelection::All
+        };
+        self.expect_ident("from")?;
+        self.expect_ident("server")?;
+        let server = self.col_ident("foreign server name")?;
+        self.expect_ident("into")?;
+        let local_schema = self.col_ident("local schema name")?;
+        let options = if self.eat_ident("options")? {
+            self.foreign_options()?
+        } else {
+            &[]
+        };
+        Ok(Stmt::ImportForeignSchema(ImportForeignSchema {
+            remote_schema,
+            selection,
+            server,
+            local_schema,
+            options,
+        }))
+    }
+
     /// Dispatches CREATE: `[OR REPLACE] VIEW`, `TABLE`, `INDEX` or `SCHEMA`
     /// ("create" consumed here).
     pub(super) fn create(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -1109,6 +1424,22 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("conversion")? {
             return self.create_conversion(false);
+        }
+        if self.eat_ident("foreign")? {
+            if self.eat_ident("data")? {
+                self.expect_ident("wrapper")?;
+                return self.create_foreign_data_wrapper();
+            }
+            return self.create_table(true);
+        }
+        if self.eat_ident("server")? {
+            return self.create_foreign_server();
+        }
+        if self.eat_ident("user")? {
+            if self.eat_ident("mapping")? {
+                return self.create_user_mapping();
+            }
+            return self.create_role(true);
         }
         if self.eat_ident("function")? {
             return self.create_routine(false, true);
@@ -1185,13 +1516,10 @@ impl<'a> Parser<'a> {
         if self.eat_ident("role")? {
             return self.create_role(false);
         }
-        if self.eat_ident("user")? {
-            return self.create_role(true);
-        }
         if self.eat_ident("group")? {
             return self.create_role(false);
         }
-        self.create_table()
+        self.create_table(false)
     }
 
     fn access_method(&mut self) -> Result<IndexAccessMethod, ParseError> {
@@ -5373,6 +5701,90 @@ impl<'a> Parser<'a> {
     /// Dispatches DROP: `VIEW` or `TABLE` ("drop" consumed here).
     pub(super) fn drop_stmt(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("drop")?;
+        if self.eat_ident("foreign")? {
+            if self.eat_ident("data")? {
+                self.expect_ident("wrapper")?;
+                let (names, if_exists) = self.drop_bare_targets("foreign-data wrapper name")?;
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
+                return Ok(Stmt::DropForeignDataWrapper {
+                    names,
+                    if_exists,
+                    cascade,
+                });
+            }
+            self.expect_ident("table")?;
+            let (names, if_exists) = self.drop_targets("foreign table name")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropForeignTable(DropTable {
+                names,
+                if_exists,
+                cascade,
+            }));
+        }
+        if self.eat_ident("server")? {
+            let (names, if_exists) = self.drop_bare_targets("foreign server name")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropForeignServer {
+                names,
+                if_exists,
+                cascade,
+            });
+        }
+        if self.eat_ident("user")? {
+            if self.eat_ident("mapping")? {
+                let if_exists = if self.eat_ident("if")? {
+                    self.expect_ident("exists")?;
+                    true
+                } else {
+                    false
+                };
+                self.expect_ident("for")?;
+                let user = self.foreign_user()?;
+                self.expect_ident("server")?;
+                return Ok(Stmt::DropUserMapping(crate::sql::ast::DropUserMapping {
+                    user,
+                    server: self.col_ident("foreign server name")?,
+                    if_exists,
+                }));
+            }
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = [""; 16];
+            let mut count = 0usize;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("roles", names.len()));
+                }
+                names[count] = self.any_ident("role name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            return Ok(Stmt::DropRole {
+                names: self.arena_slice(&names[..count])?,
+                if_exists,
+            });
+        }
         if self.eat_ident("rule")? {
             let if_exists = if self.eat_ident("if")? {
                 self.expect_ident("exists")?;
@@ -5814,7 +6226,7 @@ impl<'a> Parser<'a> {
         if self.eat_ident("type")? {
             return self.drop_type();
         }
-        if self.eat_ident("role")? || self.eat_ident("user")? || self.eat_ident("group")? {
+        if self.eat_ident("role")? || self.eat_ident("group")? {
             let if_exists = if self.eat_ident("if")? {
                 self.expect_ident("exists")?;
                 true
@@ -6344,7 +6756,32 @@ impl<'a> Parser<'a> {
         Ok((self.arena_slice(&names[..n])?, if_exists))
     }
 
-    fn create_table(&mut self) -> Result<Stmt<'a>, ParseError> {
+    fn drop_bare_targets(
+        &mut self,
+        what: &'static str,
+    ) -> Result<(&'a [&'a str], bool), ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let mut names = [""; MAX_LIST];
+        let mut count = 0usize;
+        loop {
+            if count == names.len() {
+                return Err(self.limit(what, names.len()));
+            }
+            names[count] = self.col_ident(what)?;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        Ok((self.arena_slice(&names[..count])?, if_exists))
+    }
+
+    fn create_table(&mut self, foreign: bool) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("table")?;
         let if_not_exists = if self.eat_ident("if")? {
             self.expect_ident("not")?;
@@ -6365,7 +6802,7 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            return Ok(Stmt::CreateTable(CreateTable {
+            let relation = CreateTable {
                 name,
                 columns: &[],
                 constraints: &[],
@@ -6376,10 +6813,28 @@ impl<'a> Parser<'a> {
                     subpartition,
                 },
                 if_not_exists,
-            }));
+            };
+            if foreign {
+                self.expect_ident("server")?;
+                let server = self.col_ident("foreign server name")?;
+                let options = if self.eat_ident("options")? {
+                    self.foreign_options()?
+                } else {
+                    &[]
+                };
+                return Ok(Stmt::CreateForeignTable(CreateForeignTable {
+                    relation,
+                    server,
+                    options,
+                }));
+            }
+            return Ok(Stmt::CreateTable(relation));
         }
         // `CREATE TABLE name AS <query>` — no explicit column list.
         if self.eat_ident("as")? {
+            if foreign {
+                return Err(self.err_here("CREATE FOREIGN TABLE AS is not supported by PostgreSQL"));
+            }
             return self.create_table_as(
                 name,
                 &[],
@@ -6411,6 +6866,11 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_op(")")?;
                 self.expect_ident("as")?;
+                if foreign {
+                    return Err(
+                        self.err_here("CREATE FOREIGN TABLE AS is not supported by PostgreSQL")
+                    );
+                }
                 let cols = self.arena_slice(&list[..m])?;
                 return self.create_table_as(
                     name,
@@ -6427,6 +6887,7 @@ impl<'a> Parser<'a> {
             type_name: "",
             type_mod: -1,
             collation: crate::sql::ast::ParsedCollation::DEFAULT,
+            foreign_options: &[],
             not_null: false,
             unique: false,
             primary: false,
@@ -6509,6 +6970,11 @@ impl<'a> Parser<'a> {
             };
             let warnings_before = self.n_warnings;
             let (type_name, type_mod) = self.type_name_mod()?;
+            let foreign_options = if foreign && self.eat_ident("options")? {
+                self.foreign_options()?
+            } else {
+                &[]
+            };
             let collation = if self.eat_ident("collate")? {
                 self.collation_name()?
             } else {
@@ -6618,6 +7084,7 @@ impl<'a> Parser<'a> {
                 type_name,
                 type_mod,
                 collation,
+                foreign_options,
                 not_null,
                 unique,
                 primary,
@@ -6633,6 +7100,11 @@ impl<'a> Parser<'a> {
         }
         self.expect_op(")")?;
         let partition = if self.eat_ident("partition")? {
+            if foreign {
+                return Err(
+                    self.err_here("CREATE FOREIGN TABLE does not support a PARTITION BY clause")
+                );
+            }
             let by = self.partition_by_clause()?;
             PartitionClause::By {
                 strategy: by.strategy,
@@ -6644,14 +7116,30 @@ impl<'a> Parser<'a> {
         let columns = self.arena_slice(&columns[..n])?;
         let constraints = self.arena_slice(&cons[..n_cons])?;
         let likes = self.arena_slice(&likes[..n_likes])?;
-        Ok(Stmt::CreateTable(CreateTable {
+        let relation = CreateTable {
             name,
             columns,
             constraints,
             likes,
             partition,
             if_not_exists,
-        }))
+        };
+        if foreign {
+            self.expect_ident("server")?;
+            let server = self.col_ident("foreign server name")?;
+            let options = if self.eat_ident("options")? {
+                self.foreign_options()?
+            } else {
+                &[]
+            };
+            Ok(Stmt::CreateForeignTable(CreateForeignTable {
+                relation,
+                server,
+                options,
+            }))
+        } else {
+            Ok(Stmt::CreateTable(relation))
+        }
     }
 
     pub(super) fn partition_bound(&mut self) -> Result<PartitionBound<'a>, ParseError> {

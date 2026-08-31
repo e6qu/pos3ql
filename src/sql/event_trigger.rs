@@ -866,6 +866,8 @@ fn utility_command_object_type(statement: &Stmt<'_>) -> Option<&'static str> {
                 PrivilegeObjectKind::Schema => "SCHEMA",
                 PrivilegeObjectKind::Type => "TYPE",
                 PrivilegeObjectKind::AllFunctionsInSchema => "FUNCTION",
+                PrivilegeObjectKind::ForeignDataWrapper => "FOREIGN DATA WRAPPER",
+                PrivilegeObjectKind::ForeignServer => "FOREIGN SERVER",
                 PrivilegeObjectKind::Tablespace | PrivilegeObjectKind::Database => return None,
             },
             PrivilegeTarget::Routines { kind, .. } => match kind {
@@ -913,7 +915,11 @@ fn access_reference(object: crate::storage::AccessObject) -> Option<ObjectRef> {
         AccessClass::Extension => ObjectRef::Extension(slot),
         AccessClass::Trigger => ObjectRef::Trigger(slot),
         AccessClass::LargeObject => ObjectRef::LargeObject(slot),
-        AccessClass::Tablespace | AccessClass::Database | AccessClass::EventTrigger => return None,
+        AccessClass::Tablespace
+        | AccessClass::Database
+        | AccessClass::EventTrigger
+        | AccessClass::ForeignDataWrapper
+        | AccessClass::ForeignServer => return None,
     })
 }
 

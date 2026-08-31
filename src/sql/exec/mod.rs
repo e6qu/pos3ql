@@ -39491,6 +39491,188 @@ pub fn reindex(
     sql_ok()
 }
 
+/// Records the btree CLUSTER choice in the same typed index definition that
+/// owns tablespace, build state, WAL, checkpoints, and rollback. Physical
+/// block placement is cache-local in the object-native store, so its durable
+/// counterpart is PostgreSQL's catalog-visible selected ordering.
+pub fn cluster(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    target: crate::sql::ast::ClusterTarget<'_>,
+    verbose: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    let mut tables = [usize::MAX; crate::storage::MAX_SCHEMAS * crate::storage::MAX_COLUMNS];
+    let mut indexes = [usize::MAX; crate::storage::MAX_SCHEMAS * crate::storage::MAX_COLUMNS];
+    let mut count = 0usize;
+    match target {
+        crate::sql::ast::ClusterTarget::All => {
+            for index_slot in 0..storage.index_count() {
+                let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
+                    continue;
+                };
+                if !index.mutable_for(txn.txid).clustered {
+                    continue;
+                }
+                let Some(table) = storage.index_table_slot_to(index_slot, txn.txid) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "clustered index \"{}\" has no table",
+                        index.name_for(txn.txid).as_str()
+                    ));
+                };
+                if count == tables.len() {
+                    return sql_fail(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many clustered relations"
+                    ));
+                }
+                tables[count] = table;
+                indexes[count] = index_slot;
+                count += 1;
+            }
+        }
+        crate::sql::ast::ClusterTarget::Table { table, index } => {
+            let table_slot = match resolve_dml_table(storage, &table, txn.txid) {
+                Ok(slot) => slot,
+                Err(error) => return sql_fail(error),
+            };
+            let definition = storage.table_def(table_slot, txn.txid);
+            let index_slot = match index {
+                Some(index_name) => {
+                    let schema = index_name.schema.unwrap_or(definition.schema.as_str());
+                    let Some(slot) = storage.index_slot(schema, index_name.name, txn.txid) else {
+                        return sql_fail(sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "index \"{}\" does not exist",
+                            index_name.name
+                        ));
+                    };
+                    slot
+                }
+                None => {
+                    let selected = (0..storage.index_count()).find(|slot| {
+                        storage.index_table_slot_to(*slot, txn.txid) == Some(table_slot)
+                            && storage
+                                .index_visible_to(*slot, txn.txid)
+                                .is_some_and(|index| index.mutable_for(txn.txid).clustered)
+                    });
+                    let Some(slot) = selected else {
+                        return sql_fail(sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "there is no previously clustered index for table \"{}\"",
+                            definition.name.as_str()
+                        ));
+                    };
+                    slot
+                }
+            };
+            tables[0] = table_slot;
+            indexes[0] = index_slot;
+            count = 1;
+        }
+    }
+    for position in 0..count {
+        let table = tables[position];
+        let selected = indexes[position];
+        let definition = storage.table_def(table, txn.txid);
+        if definition.kind != crate::storage::TableKind::Local {
+            return sql_fail(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not a table",
+                definition.name.as_str()
+            ));
+        }
+        if definition.partition.scheme.is_some() {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot cluster partitioned table \"{}\"",
+                definition.name.as_str()
+            ));
+        }
+        if storage.index_table_slot_to(selected, txn.txid) != Some(table) {
+            let index = storage
+                .index_visible_to(selected, txn.txid)
+                .expect("resolved CLUSTER index is visible");
+            return sql_fail(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "index \"{}\" is not an index for table \"{}\"",
+                index.name_for(txn.txid).as_str(),
+                definition.name.as_str()
+            ));
+        }
+        let selected_definition = storage
+            .index_visible_to(selected, txn.txid)
+            .expect("resolved CLUSTER index is visible")
+            .mutable_for(txn.txid);
+        if !matches!(
+            selected_definition.kind,
+            crate::storage::IndexKind::Ordinary
+        ) {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot cluster on partitioned index"
+            ));
+        }
+        if let Err(error) = require_table_privilege(
+            storage,
+            table,
+            crate::storage::PrivilegeSet::MAINTAIN,
+            txn.txid,
+        ) {
+            return sql_fail(error);
+        }
+        if let Err(error) = storage.lock_table(
+            txn.txid,
+            table,
+            crate::sql::ast::TableLockMode::AccessExclusive,
+            false,
+        ) {
+            return sql_fail(error);
+        }
+        // Clear the prior choice before setting the new one so the storage
+        // boundary can enforce the one-clustered-index invariant even inside
+        // this transaction.
+        for index_slot in 0..storage.index_count() {
+            if storage.index_table_slot_to(index_slot, txn.txid) != Some(table) {
+                continue;
+            }
+            let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
+                continue;
+            };
+            let mut mutable = index.mutable_for(txn.txid);
+            if index_slot == selected || !mutable.clustered {
+                continue;
+            }
+            mutable.clustered = false;
+            if let Err(error) = stage_index_definition(storage, wal, txn, index_slot, mutable) {
+                return sql_fail(error);
+            }
+        }
+        let selected_index = storage
+            .index_visible_to(selected, txn.txid)
+            .expect("resolved CLUSTER index remains visible");
+        let mut selected_mutable = selected_index.mutable_for(txn.txid);
+        if !selected_mutable.clustered {
+            selected_mutable.clustered = true;
+            if let Err(error) =
+                stage_index_definition(storage, wal, txn, selected, selected_mutable)
+            {
+                return sql_fail(error);
+            }
+        }
+        if let Err(error) = storage.refresh_enforcers(table) {
+            return sql_fail(error);
+        }
+    }
+    if verbose {
+        responder.notice(sqlstate::SUCCESSFUL_COMPLETION, "clustering completed")?;
+    }
+    responder.command_complete("CLUSTER")?;
+    sql_ok()
+}
+
 /// COPY's per-statement setup: the resolved table and target columns, in
 /// COPY's column order. Held by the connection across CopyData messages.
 #[derive(Clone, Copy)]

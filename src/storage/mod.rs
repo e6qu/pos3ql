@@ -7803,6 +7803,9 @@ pub struct IndexMutableDefinition {
     pub statistics: [i16; MAX_INDEX_COLS],
     pub parent: Option<u16>,
     pub kind: IndexKind,
+    /// PostgreSQL's `pg_index.indisclustered`: at most one ordinary index on
+    /// a relation is the selected CLUSTER ordering.
+    pub clustered: bool,
 }
 
 impl IndexMutableDefinition {
@@ -7812,6 +7815,7 @@ impl IndexMutableDefinition {
         statistics: [-1; MAX_INDEX_COLS],
         parent: None,
         kind: IndexKind::Ordinary,
+        clustered: false,
     };
 }
 
@@ -30037,6 +30041,26 @@ impl Storage {
     pub fn create_index(&mut self, mut def: IndexDef, txid: u32) -> Result<usize, SqlError> {
         def.database = self.current_database;
         self.require_schema_create(def.schema.as_str(), txid)?;
+        if def.mutable.clustered && !matches!(def.mutable.kind, IndexKind::Ordinary) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                "partitioned index cannot be selected for clustering"
+            ));
+        }
+        if def.mutable.clustered
+            && self.indexes.iter().any(|index| {
+                index.database == self.current_database
+                    && index.visible_to(txid)
+                    && index.schema == def.schema
+                    && index.table == def.table
+                    && index.mutable_for(txid).clustered
+            })
+        {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                "relation already has a clustered index"
+            ));
+        }
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
             (index.database == self.current_database
                 && index.schema.as_str() == def.schema.as_str()
@@ -30092,6 +30116,12 @@ impl Storage {
         definition: IndexMutableDefinition,
         txid: u32,
     ) -> Result<Option<PendingIndexDefinition>, SqlError> {
+        if definition.clustered && !matches!(definition.kind, IndexKind::Ordinary) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                "partitioned index cannot be selected for clustering"
+            ));
+        }
         let pending = self.indexes[slot].pending_definition;
         if let Some(pending) = pending
             && pending.txid != txid
@@ -30101,6 +30131,22 @@ impl Storage {
                 pending.txid,
                 self.indexes[slot].name.as_str(),
             ));
+        }
+        if definition.clustered {
+            let index = self.indexes[slot];
+            if self.indexes.iter().enumerate().any(|(other_slot, other)| {
+                other_slot != slot
+                    && other.database == self.current_database
+                    && other.visible_to(txid)
+                    && other.schema == index.schema
+                    && other.table == index.table
+                    && other.mutable_for(txid).clustered
+            }) {
+                return Err(sql_err!(
+                    crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                    "relation already has a clustered index"
+                ));
+            }
         }
         let index = &mut self.indexes[slot];
         let prior = index.pending_definition;

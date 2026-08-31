@@ -9629,7 +9629,10 @@ fn pg_index<'a>(
                 Datum::Int4(info.table_oid),
                 Datum::Bool(info.is_primary),
                 Datum::Bool(info.is_unique),
-                Datum::Bool(false), // indisclustered
+                Datum::Bool(
+                    info.explicit_definition
+                        .is_some_and(|definition| definition.clustered),
+                ),
                 Datum::Bool(false), // indischeckxmin
                 Datum::Bool(
                     info.explicit_definition

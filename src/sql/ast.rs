@@ -214,6 +214,21 @@ pub struct MaintenanceTarget<'a> {
     pub columns: &'a [&'a str],
 }
 
+/// The VACUUM modes this object-native engine can execute. Other PostgreSQL
+/// options are rejected at parsing rather than accepted without an effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumOptions {
+    pub full: bool,
+    pub analyze: bool,
+}
+
+impl VacuumOptions {
+    pub const DEFAULT: Self = Self {
+        full: false,
+        analyze: false,
+    };
+}
+
 /// EXPLAIN's output representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExplainFormat {
@@ -795,6 +810,13 @@ pub enum Stmt<'a> {
         name: Option<QualName<'a>>,
         options: ReindexOptions<'a>,
     },
+    /// CLUSTER either reuses every relation's recorded clustering index or
+    /// selects one index for a single table. `All` cannot accidentally carry
+    /// a stray relation or index name.
+    Cluster {
+        target: ClusterTarget<'a>,
+        verbose: bool,
+    },
     /// SET [LOCAL] name {=|TO} value. `value` is the raw source text of the
     /// value (quotes included); the session GUC store validates and applies it.
     Set {
@@ -922,7 +944,7 @@ pub enum Stmt<'a> {
     /// checkpoint/compaction and optionally refreshes exact live statistics.
     Vacuum {
         targets: &'a [MaintenanceTarget<'a>],
-        analyze: bool,
+        options: VacuumOptions,
     },
     /// ANALYZE [options] [table [(columns)] [, ...]] — validates the requested
     /// relations and walks the exact live row state used by the planner.
@@ -2324,6 +2346,15 @@ pub struct ReindexOptions<'a> {
     pub build: IndexBuildMode,
     pub tablespace: Option<&'a str>,
     pub verbose: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterTarget<'a> {
+    All,
+    Table {
+        table: QualName<'a>,
+        index: Option<QualName<'a>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

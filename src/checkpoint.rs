@@ -5033,6 +5033,16 @@ impl Checkpointer {
                         2 => crate::storage::IndexKind::Partitioned { valid: true },
                         _ => return Err(CheckpointSetupError::Corrupt("bad index kind")),
                     };
+                    let clustered = match parse_field(words.next(), "idx clustered")? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(CheckpointSetupError::Corrupt("bad index clustered")),
+                    };
+                    if clustered && !matches!(kind, crate::storage::IndexKind::Ordinary) {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "partitioned index cannot be clustered",
+                        ));
+                    }
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
@@ -5078,6 +5088,7 @@ impl Checkpointer {
                                     statistics,
                                     parent: (parent != u16::MAX).then_some(parent),
                                     kind,
+                                    clustered,
                                 },
                                 pending_definition: None,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
@@ -8119,7 +8130,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {}",
+                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {}",
                     index.created_at,
                     u8::from(index.unique),
                     index.n_cols,
@@ -8146,6 +8157,7 @@ impl Checkpointer {
                     statistics.as_str(),
                     mutable.parent.unwrap_or(u16::MAX),
                     kind,
+                    u8::from(mutable.clustered),
                 ),
             )?;
         }

@@ -62,7 +62,7 @@ BEGIN	complete	05_transactions.sql
 CALL	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql (lone top-level PL/pgSQL transaction control, typed outputs, SQL procedures, and explicit rejection of post-boundary suspension)
 CHECKPOINT	complete	40_copy.sql
 CLOSE	complete	39_cursors.sql
-CLUSTER	missing	-
+CLUSTER	complete	tests/external/differential/124_cluster.sql and object-cold recovery
 COMMENT	partial	59_comment.sql
 COMMIT	complete	05_transactions.sql
 COMMIT PREPARED	complete	120_two_phase_transactions.sql

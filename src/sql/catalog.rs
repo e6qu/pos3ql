@@ -3089,7 +3089,7 @@ pub fn relname_text<'a>(
         }
         if view_oid(slot) == oid {
             let bytes = arena
-                .alloc_slice_copy(view.name.as_str().as_bytes())
+                .alloc_slice_copy(view.name_for(txid).as_str().as_bytes())
                 .map_err(|_| arena_full())?;
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
@@ -3132,8 +3132,9 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
     (0..storage.view_count())
         .find(|&slot| {
             storage.view_slot_visible_to(slot, txid)
-                && storage.view(slot).name.as_str() == relation
-                && schema.is_none_or(|schema| storage.view(slot).schema.as_str() == schema)
+                && storage.view(slot).name_for(txid).as_str() == relation
+                && schema
+                    .is_none_or(|schema| storage.view(slot).schema_for(txid).as_str() == schema)
         })
         .map(view_oid)
 }
@@ -4908,8 +4909,8 @@ fn relation_oid_of(storage: &Storage, txid: u32, schema: &str, name: &str) -> Op
     for slot in 0..storage.view_count() {
         let view = storage.view(slot);
         if storage.view_slot_visible_to(slot, txid)
-            && view.schema.as_str() == schema
-            && view.name.as_str() == name
+            && view.schema_for(txid).as_str() == schema
+            && view.name_for(txid).as_str() == name
         {
             return Some(view_oid(slot));
         }
@@ -7826,7 +7827,10 @@ fn pg_class<'a>(
         }
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
         let n_columns = describe_view(storage, txid, view, arena, &mut columns)?;
-        let reloptions = if matches!(view.security, crate::storage::ViewSecurity::Invoker) {
+        let reloptions = if matches!(
+            view.security_for(txid),
+            crate::storage::ViewSecurity::Invoker
+        ) {
             let values = [text("security_invoker=true", arena)?];
             Datum::Array {
                 element: super::types::ArrElem::Text,
@@ -7838,8 +7842,8 @@ fn pg_class<'a>(
         out[n] = row(
             &[
                 Datum::Int4(view_oid(slot)),
-                text(view.name.as_str(), arena)?,
-                Datum::Int4(namespace_oid(storage, view.schema.as_str())),
+                text(view.name_for(txid).as_str(), arena)?,
+                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str())),
                 text("v", arena)?,
                 Datum::Int4(n_columns as i32),
                 Datum::Float8(0.0),
@@ -13101,10 +13105,10 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         out[n] = row(
             &[
                 Datum::Int4(FIRST_VIEW_COMPOSITE_TYPE_OID + slot as i32),
-                text(view.name.as_str(), arena)?,
+                text(view.name_for(txid).as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, view.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str())),
                 text("c", arena)?,
                 text("C", arena)?,
                 Datum::Int4(0),
@@ -13136,14 +13140,14 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         if n == out.len() {
             return Err(catalog_capacity_exceeded("pg_type"));
         }
-        let array_name = stack_format!(128, "_{}", view.name.as_str());
+        let array_name = stack_format!(128, "_{}", view.name_for(txid).as_str());
         out[n] = row(
             &[
                 Datum::Int4(FIRST_VIEW_COMPOSITE_ARRAY_TYPE_OID + slot as i32),
                 text(array_name.as_str(), arena)?,
                 Datum::Int4(-1),
                 Datum::Int4(0),
-                Datum::Int4(namespace_oid(storage, view.schema.as_str())),
+                Datum::Int4(namespace_oid(storage, view.schema_for(txid).as_str())),
                 text("b", arena)?,
                 text("A", arena)?,
                 Datum::Int4(0),
@@ -14114,8 +14118,8 @@ fn pg_views<'a>(
         }
         out[n] = row(
             &[
-                text(view.schema.as_str(), arena)?,
-                text(view.name.as_str(), arena)?,
+                text(view.schema_for(txid).as_str(), arena)?,
+                text(view.name_for(txid).as_str(), arena)?,
                 owner_name(
                     storage,
                     crate::storage::AccessClass::View,
@@ -14909,13 +14913,13 @@ fn info_tables<'a>(
                 text("postgres", arena)?,
                 text(
                     arena
-                        .alloc_str(view.schema.as_str())
+                        .alloc_str(view.schema_for(txid).as_str())
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
                 text(
                     arena
-                        .alloc_str(view.name.as_str())
+                        .alloc_str(view.name_for(txid).as_str())
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
@@ -15213,8 +15217,8 @@ fn info_views<'a>(
     for (index, (_, view)) in storage.views_visible_to(txid).enumerate() {
         let is_updatable = super::query::view_is_auto_updatable(
             storage,
-            view.schema.as_str(),
-            view.name.as_str(),
+            view.schema_for(txid).as_str(),
+            view.name_for(txid).as_str(),
             txid,
             arena,
         )?;
@@ -15222,8 +15226,8 @@ fn info_views<'a>(
         out[index] = row(
             &[
                 text("postgres", arena)?,
-                text(view.schema.as_str(), arena)?,
-                text(view.name.as_str(), arena)?,
+                text(view.schema_for(txid).as_str(), arena)?,
+                text(view.name_for(txid).as_str(), arena)?,
                 text(storage.view_sql_for(view), arena)?,
                 text("NONE", arena)?,
                 text(writable, arena)?,
@@ -15273,18 +15277,18 @@ fn info_view_table_usage<'a>(
     let mut index = 0usize;
     for (view_slot, view) in storage.views_visible_to(txid) {
         for dependency in storage.view_dependencies(view_slot).entries() {
-            let (schema, name) = match dependency.class {
+            let (schema, name): (SqlName, SqlName) = match dependency.class {
                 crate::storage::DependencyClass::Table => {
                     let slot = dependency.slot as usize;
                     if !storage.table_slot_visible_to(slot, txid) {
                         return Err(sql_err!(
                             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                             "view \"{}\" has a stale table dependency",
-                            view.name.as_str()
+                            view.name_for(txid).as_str()
                         ));
                     }
                     let table = storage.table_def(slot, txid);
-                    (table.schema.as_str(), table.name.as_str())
+                    (table.schema, table.name)
                 }
                 crate::storage::DependencyClass::View => {
                     let slot = dependency.slot as usize;
@@ -15293,21 +15297,21 @@ fn info_view_table_usage<'a>(
                         return Err(sql_err!(
                             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                             "view \"{}\" has a stale view dependency",
-                            view.name.as_str()
+                            view.name_for(txid).as_str()
                         ));
                     }
-                    (source.schema.as_str(), source.name.as_str())
+                    (source.schema_for(txid), source.name_for(txid))
                 }
                 _ => continue,
             };
             out[index] = row(
                 &[
                     text("postgres", arena)?,
-                    text(view.schema.as_str(), arena)?,
-                    text(view.name.as_str(), arena)?,
+                    text(view.schema_for(txid).as_str(), arena)?,
+                    text(view.name_for(txid).as_str(), arena)?,
                     text("postgres", arena)?,
-                    text(schema, arena)?,
-                    text(name, arena)?,
+                    text(schema.as_str(), arena)?,
+                    text(name.as_str(), arena)?,
                 ],
                 arena,
             )?;
@@ -15344,7 +15348,7 @@ fn info_view_column_usage<'a>(
                     return Err(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                         "view \"{}\" has a stale table dependency",
-                        view.name.as_str()
+                        view.name_for(txid).as_str()
                     ));
                 }
                 let columns = storage.table_def(table_slot, txid).columns().len();
@@ -15357,7 +15361,7 @@ fn info_view_column_usage<'a>(
                     return Err(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                         "view \"{}\" has a stale column dependency",
-                        view.name.as_str()
+                        view.name_for(txid).as_str()
                     ));
                 }
                 count = count
@@ -15371,7 +15375,7 @@ fn info_view_column_usage<'a>(
                     return Err(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                         "view \"{}\" has a stale view dependency",
-                        view.name.as_str()
+                        view.name_for(txid).as_str()
                     ));
                 }
                 let mut columns =
@@ -15387,7 +15391,7 @@ fn info_view_column_usage<'a>(
                     return Err(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                         "view \"{}\" has a stale column dependency",
-                        view.name.as_str()
+                        view.name_for(txid).as_str()
                     ));
                 }
                 count = count
@@ -15412,8 +15416,8 @@ fn info_view_column_usage<'a>(
                             out[index] = row(
                                 &[
                                     text("postgres", arena)?,
-                                    text(view.schema.as_str(), arena)?,
-                                    text(view.name.as_str(), arena)?,
+                                    text(view.schema_for(txid).as_str(), arena)?,
+                                    text(view.name_for(txid).as_str(), arena)?,
                                     text("postgres", arena)?,
                                     text(table.schema.as_str(), arena)?,
                                     text(table.name.as_str(), arena)?,
@@ -15437,11 +15441,11 @@ fn info_view_column_usage<'a>(
                             out[index] = row(
                                 &[
                                     text("postgres", arena)?,
-                                    text(view.schema.as_str(), arena)?,
-                                    text(view.name.as_str(), arena)?,
+                                    text(view.schema_for(txid).as_str(), arena)?,
+                                    text(view.name_for(txid).as_str(), arena)?,
                                     text("postgres", arena)?,
-                                    text(source.schema.as_str(), arena)?,
-                                    text(source.name.as_str(), arena)?,
+                                    text(source.schema_for(txid).as_str(), arena)?,
+                                    text(source.name_for(txid).as_str(), arena)?,
                                     text(descriptor.name, arena)?,
                                 ],
                                 arena,
@@ -15601,8 +15605,8 @@ fn info_columns<'a>(
                 storage,
                 txid,
                 InformationSchemaColumnSource {
-                    schema: view.schema.as_str(),
-                    table: view.name.as_str(),
+                    schema: view.schema_for(txid).as_str(),
+                    table: view.name_for(txid).as_str(),
                     name: column.name,
                     position: index + 1,
                     column: &column_meta,
@@ -17020,8 +17024,8 @@ fn info_column_privileges<'a>(
                 class: crate::storage::AccessClass::View,
                 slot: slot as u16,
             },
-            view.schema.as_str(),
-            view.name.as_str(),
+            view.schema_for(txid).as_str(),
+            view.name_for(txid).as_str(),
             &columns[..description_count],
         )?;
     }
@@ -17530,8 +17534,8 @@ fn info_column_type_usage<'a>(
                 statistics_target: -1,
             };
             append(
-                view.schema.as_str(),
-                view.name.as_str(),
+                view.schema_for(txid).as_str(),
+                view.name_for(txid).as_str(),
                 column.name,
                 &metadata,
             )?;

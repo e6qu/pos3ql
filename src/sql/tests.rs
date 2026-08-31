@@ -6105,6 +6105,298 @@ fn row_level_security_composes_and_survives_recovery() {
 }
 
 #[test]
+fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
+    let config = test_config("alter-view-security-invoker");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE view_owner;
+         CREATE ROLE view_reader;
+         GRANT CREATE ON SCHEMA public TO view_owner;
+         SET ROLE view_owner;
+         CREATE TABLE view_secret (value integer);
+         INSERT INTO view_secret VALUES (7);
+         CREATE VIEW view_gateway AS SELECT value FROM view_secret;
+         RESET ROLE;
+         GRANT SELECT ON view_gateway TO view_reader;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let default_barrier = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE view_owner;
+         ALTER VIEW view_gateway SET (security_barrier = false);
+         ALTER VIEW view_gateway RESET (security_barrier);
+         RESET ROLE;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&default_barrier).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&default_barrier)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SET ROLE view_reader; SELECT value FROM view_gateway; RESET ROLE",
+        )),
+        ["7"]
+    );
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE view_reader; ALTER VIEW view_gateway SET (security_invoker = true)",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied).contains("must be owner"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; SET ROLE view_owner;
+         BEGIN;
+         ALTER VIEW view_gateway SET (security_invoker = true);
+         SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
+         ROLLBACK;
+         RESET ROLE;
+         SET ROLE view_reader;
+         SELECT value FROM view_gateway;",
+    );
+    assert_eq!(data_rows(&changed), ["{security_invoker=true}", "7"]);
+    let committed = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE; SET ROLE view_owner;
+         ALTER VIEW view_gateway SET (security_invoker = true)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&committed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&committed)
+    );
+    let denied_after_commit = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE;
+         SET ROLE view_reader;
+         SELECT value FROM view_gateway;",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied_after_commit)
+            .contains("permission denied for table view_secret"),
+        "{}",
+        String::from_utf8_lossy(&denied_after_commit)
+    );
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_state = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT reloptions FROM pg_class WHERE relname = 'view_gateway'",
+    );
+    assert_eq!(data_rows(&recovered_state), ["{security_invoker=true}"]);
+    let recovered_denied = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SET ROLE view_reader; SELECT value FROM view_gateway",
+    );
+    assert!(
+        String::from_utf8_lossy(&recovered_denied)
+            .contains("permission denied for table view_secret"),
+        "{}",
+        String::from_utf8_lossy(&recovered_denied)
+    );
+    let reset = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "RESET ROLE; SET ROLE view_owner;
+         ALTER VIEW view_gateway RESET (security_invoker);
+         RESET ROLE;
+         SET ROLE view_reader;
+         SELECT value FROM view_gateway;",
+    );
+    assert_eq!(data_rows(&reset), ["7"]);
+}
+
+#[test]
+fn alter_view_set_schema_preserves_identity_dependencies_and_comments() {
+    let config = test_config("alter-view-set-schema");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA view_source;
+         CREATE SCHEMA view_target;
+         CREATE TABLE view_source.rows (value integer);
+         INSERT INTO view_source.rows VALUES (7);
+         CREATE VIEW view_source.gateway AS SELECT value FROM view_source.rows;
+         COMMENT ON VIEW view_source.gateway IS 'moved view';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER VIEW view_source.gateway SET SCHEMA view_target;
+         SELECT value FROM view_target.gateway;
+         ROLLBACK;",
+    );
+    assert_eq!(
+        data_rows(&rollback),
+        ["7"],
+        "{}",
+        String::from_utf8_lossy(&rollback)
+    );
+    let after_rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT value FROM view_source.gateway",
+    );
+    assert_eq!(
+        data_rows(&after_rollback),
+        ["7"],
+        "{}",
+        String::from_utf8_lossy(&after_rollback)
+    );
+    let moved = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER VIEW view_source.gateway SET SCHEMA view_target;
+         SELECT table_schema, table_name FROM information_schema.views
+          WHERE table_schema = 'view_target' AND table_name = 'gateway';
+         SELECT obj_description('view_target.gateway'::regclass);",
+    );
+    assert_eq!(
+        data_rows(&moved),
+        ["view_target|gateway", "moved view"],
+        "{}",
+        String::from_utf8_lossy(&moved)
+    );
+    let collision = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW view_source.gateway AS SELECT 1;
+         ALTER VIEW view_target.gateway SET SCHEMA view_source",
+    );
+    assert!(
+        String::from_utf8_lossy(&collision).contains("42P07"),
+        "{}",
+        String::from_utf8_lossy(&collision)
+    );
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let after_recovery = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT value FROM view_target.gateway;
+         SELECT table_schema FROM information_schema.views
+          WHERE table_schema = 'view_target' AND table_name = 'gateway';
+         SELECT obj_description('view_target.gateway'::regclass);",
+    );
+    assert_eq!(
+        data_rows(&after_recovery),
+        ["7", "view_target", "moved view"],
+        "{}",
+        String::from_utf8_lossy(&after_recovery)
+    );
+}
+
+#[test]
+fn alter_view_rename_preserves_oid_comments_and_recovery() {
+    let config = test_config("alter-view-rename");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE rename_view_source (value integer);
+         INSERT INTO rename_view_source VALUES (9);
+         CREATE VIEW rename_view_old AS SELECT value FROM rename_view_source;
+         COMMENT ON VIEW rename_view_old IS 'renamed view';",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let old_oid = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid FROM pg_class WHERE relname = 'rename_view_old'",
+    ))[0]
+        .to_owned();
+    let rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER VIEW rename_view_old RENAME TO rename_view_new;
+         SELECT value FROM rename_view_new;
+         SELECT obj_description('rename_view_new'::regclass);
+         SELECT relname FROM pg_class WHERE relname = 'rename_view_new';
+         SELECT table_name FROM information_schema.views WHERE table_name = 'rename_view_new';
+         ROLLBACK;",
+    );
+    assert_eq!(
+        data_rows(&rollback),
+        ["9", "renamed view", "rename_view_new", "rename_view_new"],
+        "{}",
+        String::from_utf8_lossy(&rollback)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM rename_view_old",
+        )),
+        ["9"]
+    );
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER VIEW rename_view_old RENAME TO rename_view_new;
+         SELECT oid, relname FROM pg_class WHERE relname = 'rename_view_new';
+         SELECT obj_description('rename_view_new'::regclass);",
+    );
+    let renamed_rows = data_rows(&renamed);
+    assert_eq!(
+        renamed_rows.len(),
+        2,
+        "{}",
+        String::from_utf8_lossy(&renamed)
+    );
+    assert_eq!(renamed_rows[0], format!("{old_oid}|rename_view_new"));
+    assert_eq!(renamed_rows[1], "renamed view");
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let after_recovery = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT value FROM rename_view_new;
+         SELECT obj_description('rename_view_new'::regclass);",
+    );
+    assert_eq!(data_rows(&after_recovery), ["9", "renamed view"]);
+}
+
+#[test]
 fn policy_column_dependencies_restrict_cascade_rollback_and_recover() {
     let config = test_config("policy-column-dependencies");
     let mut budget = Budget::new(1 << 29);

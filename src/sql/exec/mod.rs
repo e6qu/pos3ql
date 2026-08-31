@@ -27825,6 +27825,260 @@ pub fn create_view(
     sql_ok()
 }
 
+/// Applies the view options whose behavior is already modeled by the stored
+/// query execution boundary.  Every other PostgreSQL spelling reaches a
+/// closed AST variant and fails before it can create catalog state that the
+/// engine cannot enforce.
+pub fn alter_view(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: QualName<'_>,
+    if_exists: bool,
+    action: crate::sql::ast::AlterViewAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::sql::ast::{AlterViewAction, ViewOption, ViewOptionName};
+    let Some(slot) = storage
+        .resolve_relation(name.schema, name.name, txn.txid)
+        .and_then(|relation| match relation {
+            crate::storage::ResolvedRelation::View(slot) => Some(slot),
+            _ => None,
+        })
+    else {
+        if if_exists
+            && storage
+                .resolve_relation(name.schema, name.name, txn.txid)
+                .is_none()
+        {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(160, "view \"{}\" does not exist, skipping", name.name).as_str(),
+            )?;
+            responder.command_complete("ALTER VIEW")?;
+            return sql_ok();
+        }
+        return sql_fail(
+            match storage.resolve_relation(name.schema, name.name, txn.txid) {
+                Some(_) => sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a view",
+                    name.name
+                ),
+                None => undefined_qual(&name),
+            },
+        );
+    };
+    if let Err(error) = storage.require_owner(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::View,
+            slot: slot as u16,
+        },
+        txn.txid,
+        "view",
+    ) {
+        return sql_fail(error);
+    }
+    if let crate::sql::ast::AlterViewAction::SetSchema(new_schema) = action {
+        if new_schema == storage.view(slot).schema_for(txn.txid).as_str() {
+            responder.command_complete("ALTER VIEW")?;
+            return sql_ok();
+        }
+        if storage.find_schema_visible(new_schema, txn.txid).is_none() {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_SCHEMA_NAME,
+                "schema \"{}\" does not exist",
+                new_schema
+            ));
+        }
+        if let Err(error) = storage.require_schema_create(new_schema, txn.txid) {
+            return sql_fail(error);
+        }
+        let (schema, view_name) = {
+            let view = storage.view(slot);
+            (view.schema_for(txn.txid), view.name)
+        };
+        if storage.relation_name_taken(new_schema, view_name.as_str(), txn.txid) {
+            return sql_fail(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists in schema \"{}\"",
+                view_name.as_str(),
+                new_schema
+            ));
+        }
+        let target = match SqlName::parse(new_schema) {
+            Ok(target) => target,
+            Err(error) => return sql_fail(error),
+        };
+        let prior = match storage.stage_view_schema(slot, target, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::SetViewSchema {
+                schema: schema.as_str(),
+                name: view_name.as_str(),
+                new_schema,
+            },
+        ) {
+            storage.rollback_view_schema(slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewSchemaChanged {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_view_schema(slot, prior);
+            return sql_fail(error);
+        }
+        responder.command_complete("ALTER VIEW")?;
+        return sql_ok();
+    }
+    let mut security = storage.view(slot).security_for(txn.txid);
+    match action {
+        AlterViewAction::SetOptions(options) => {
+            for option in options {
+                match option {
+                    ViewOption::SecurityInvoker(enabled) => {
+                        security = if *enabled {
+                            crate::storage::ViewSecurity::Invoker
+                        } else {
+                            crate::storage::ViewSecurity::Definer
+                        };
+                    }
+                    ViewOption::SecurityBarrier(true) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "security_barrier requires a predicate-ordering boundary"
+                        ));
+                    }
+                    ViewOption::SecurityBarrier(false) => {}
+                    ViewOption::CheckOption(_) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "view check_option requires automatically updatable view enforcement"
+                        ));
+                    }
+                }
+            }
+        }
+        AlterViewAction::ResetOptions(options) => {
+            for option in options {
+                match option {
+                    ViewOptionName::SecurityInvoker => {
+                        security = crate::storage::ViewSecurity::Definer;
+                    }
+                    ViewOptionName::SecurityBarrier => {}
+                    ViewOptionName::CheckOption => {
+                        return sql_fail(sql_err!(
+                            sqlstate::FEATURE_NOT_SUPPORTED,
+                            "view check_option requires automatically updatable view enforcement"
+                        ));
+                    }
+                }
+            }
+        }
+        AlterViewAction::SetDefault { .. } | AlterViewAction::DropDefault { .. } => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "view column defaults require automatically updatable view enforcement"
+            ));
+        }
+        AlterViewAction::RenameColumn { .. } => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "view column renames require a durable output-column identity"
+            ));
+        }
+        AlterViewAction::RenameTo(new_name) => {
+            let (schema, current_name) = {
+                let view = storage.view(slot);
+                (view.schema_for(txn.txid), view.name_for(txn.txid))
+            };
+            if new_name == current_name.as_str() {
+                responder.command_complete("ALTER VIEW")?;
+                return sql_ok();
+            }
+            if storage.relation_name_taken(schema.as_str(), new_name, txn.txid) {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
+                    new_name
+                ));
+            }
+            let target = match SqlName::parse(new_name) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            };
+            let prior = match storage.stage_view_rename(slot, target, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::RenameView {
+                    schema: schema.as_str(),
+                    name: current_name.as_str(),
+                    new_name,
+                },
+            ) {
+                storage.rollback_view_rename(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewRenamed {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_view_rename(slot, prior);
+                return sql_fail(error);
+            }
+            responder.command_complete("ALTER VIEW")?;
+            return sql_ok();
+        }
+        AlterViewAction::SetSchema(_) => unreachable!("handled before option staging"),
+    }
+    let current = storage.view(slot).security_for(txn.txid);
+    if security == current {
+        responder.command_complete("ALTER VIEW")?;
+        return sql_ok();
+    }
+    let (schema, view_name) = {
+        let view = storage.view(slot);
+        (view.schema, view.name)
+    };
+    let prior = match storage.stage_view_security(slot, security, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetViewSecurity {
+            schema: schema.as_str(),
+            name: view_name.as_str(),
+            security_invoker: matches!(security, crate::storage::ViewSecurity::Invoker),
+        },
+    ) {
+        storage.rollback_view_security(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewSecurityChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_view_security(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER VIEW")?;
+    sql_ok()
+}
+
 fn rule_target(
     storage: &Storage,
     name: crate::sql::ast::QualName<'_>,
@@ -35419,7 +35673,7 @@ fn rewrite_composite_dependent_views(
                 creation_path,
                 dependencies,
             },
-            view.security,
+            view.security_for(txn.txid),
             true,
             txn.txid,
         )?;
@@ -35432,7 +35686,10 @@ fn rewrite_composite_dependent_views(
                 name: view.name.as_str(),
                 sql: rewritten.as_str(),
                 path: creation_path.as_str(),
-                security_invoker: matches!(view.security, crate::storage::ViewSecurity::Invoker),
+                security_invoker: matches!(
+                    view.security_for(txn.txid),
+                    crate::storage::ViewSecurity::Invoker
+                ),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
             },
         ) {

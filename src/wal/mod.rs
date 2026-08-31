@@ -165,6 +165,8 @@ const KIND_SET_FOREIGN_DATA_WRAPPER: u8 = 115;
 const KIND_SET_FOREIGN_SERVER: u8 = 116;
 const KIND_SET_USER_MAPPING: u8 = 117;
 const KIND_SET_FOREIGN_TABLE: u8 = 118;
+const KIND_SET_VIEW_SECURITY: u8 = 119;
+const KIND_RENAME_VIEW: u8 = 120;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -172,7 +174,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_SET_FOREIGN_TABLE;
+const LAST_KIND: u8 = KIND_RENAME_VIEW;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
@@ -545,6 +547,16 @@ pub(crate) enum WalOp<'a> {
     DropView {
         schema: &'a str,
         name: &'a str,
+    },
+    SetViewSecurity {
+        schema: &'a str,
+        name: &'a str,
+        security_invoker: bool,
+    },
+    RenameView {
+        schema: &'a str,
+        name: &'a str,
+        new_name: &'a str,
     },
     SetRule {
         slot: u16,
@@ -1954,6 +1966,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Truncate { .. } => KIND_TRUNCATE,
         WalOp::CreateView { .. } => KIND_CREATE_VIEW,
         WalOp::DropView { .. } => KIND_DROP_VIEW,
+        WalOp::SetViewSecurity { .. } => KIND_SET_VIEW_SECURITY,
+        WalOp::RenameView { .. } => KIND_RENAME_VIEW,
         WalOp::SetRule { .. } => KIND_SET_RULE,
         WalOp::DropRule { .. } => KIND_DROP_RULE,
         WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION,
@@ -2258,6 +2272,12 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
+        WalOp::SetViewSecurity { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 1,
+        WalOp::RenameView {
+            schema,
+            name,
+            new_name,
+        } => 1 + name.len() + 1 + schema.len() + 1 + new_name.len(),
         WalOp::SetRule {
             table_schema,
             table,
@@ -3798,6 +3818,20 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && dependencies.append(buffer)
         }
         WalOp::DropView { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
+        WalOp::SetViewSecurity {
+            schema,
+            name,
+            security_invoker,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && buffer.append(&[u8::from(*security_invoker)])
+        }
+        WalOp::RenameView {
+            schema,
+            name,
+            new_name,
+        } => name_bytes(buffer, name) && name_bytes(buffer, schema) && name_bytes(buffer, new_name),
         WalOp::SetRule {
             slot,
             created_at,
@@ -6400,6 +6434,31 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropView { schema, name })
+        }
+        KIND_SET_VIEW_SECURITY => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let security_invoker = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            (at == payload.len()).then_some(WalOp::SetViewSecurity {
+                schema,
+                name,
+                security_invoker,
+            })
+        }
+        KIND_RENAME_VIEW => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RenameView {
+                schema,
+                name,
+                new_name,
+            })
         }
         KIND_SET_RULE => {
             let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);

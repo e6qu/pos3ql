@@ -4501,14 +4501,7 @@ impl<'a> Parser<'a> {
             return self.alter_owner(AlterOwnerKind::MaterializedView, name, if_exists);
         }
         if self.eat_ident("view")? {
-            let if_exists = if self.eat_ident("if")? {
-                self.expect_ident("exists")?;
-                true
-            } else {
-                false
-            };
-            let name = self.qual_name("view name")?;
-            return self.alter_owner(AlterOwnerKind::View, name, if_exists);
+            return self.alter_view();
         }
         if self.eat_ident("sequence")? {
             return self.alter_sequence();
@@ -4529,6 +4522,143 @@ impl<'a> Parser<'a> {
         } else {
             Stmt::AlterTable(statement)
         }
+    }
+
+    /// `ALTER VIEW` has a deliberately smaller grammar than `ALTER TABLE`.
+    /// Keeping it separate prevents table-only mutation states from reaching a
+    /// stored query merely because PostgreSQL permits a few historical
+    /// `ALTER TABLE view` spellings.
+    fn alter_view(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.qual_name("view name")?;
+        if self.peeked == Tok::Ident("owner") {
+            return self.alter_owner(AlterOwnerKind::View, name, if_exists);
+        }
+        let action = if self.eat_ident("alter")? {
+            let _ = self.eat_ident("column")?;
+            let column = self.col_ident("view column name")?;
+            if self.eat_ident("set")? {
+                self.expect_ident("default")?;
+                let start = self.peek_at;
+                let _ = self.expression(0)?;
+                let expression = self.text[start..self.peek_at].trim();
+                crate::sql::ast::AlterViewAction::SetDefault { column, expression }
+            } else {
+                self.expect_ident("drop")?;
+                self.expect_ident("default")?;
+                crate::sql::ast::AlterViewAction::DropDefault { column }
+            }
+        } else if self.eat_ident("rename")? {
+            if self.eat_ident("to")? {
+                crate::sql::ast::AlterViewAction::RenameTo(self.col_ident("new view name")?)
+            } else {
+                let _ = self.eat_ident("column")?;
+                let from = self.col_ident("view column name")?;
+                self.expect_ident("to")?;
+                let to = self.col_ident("new view column name")?;
+                crate::sql::ast::AlterViewAction::RenameColumn { from, to }
+            }
+        } else if self.eat_ident("set")? {
+            if self.eat_ident("schema")? {
+                crate::sql::ast::AlterViewAction::SetSchema(self.col_ident("schema name")?)
+            } else {
+                self.expect_op("(")?;
+                crate::sql::ast::AlterViewAction::SetOptions(self.view_options()?)
+            }
+        } else {
+            self.expect_ident("reset")?;
+            self.expect_op("(")?;
+            crate::sql::ast::AlterViewAction::ResetOptions(self.view_option_names()?)
+        };
+        Ok(Stmt::AlterView {
+            name,
+            if_exists,
+            action,
+        })
+    }
+
+    fn view_options(&mut self) -> Result<&'a [crate::sql::ast::ViewOption], ParseError> {
+        use crate::sql::ast::{ViewCheckOption, ViewOption};
+        let mut options = [ViewOption::SecurityInvoker(false); 3];
+        let mut count = 0usize;
+        let mut seen = [false; 3];
+        loop {
+            if count == options.len() {
+                return Err(self.limit("view options", options.len()));
+            }
+            let option = self.any_ident("view option name")?;
+            let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
+                (
+                    0,
+                    ViewOption::SecurityInvoker(self.subscription_bool_option(option)?),
+                )
+            } else if option.eq_ignore_ascii_case("security_barrier") {
+                (
+                    1,
+                    ViewOption::SecurityBarrier(self.subscription_bool_option(option)?),
+                )
+            } else if option.eq_ignore_ascii_case("check_option") {
+                self.expect_op("=")?;
+                let value = self.any_ident("check_option value")?;
+                let value = if value.eq_ignore_ascii_case("local") {
+                    ViewCheckOption::Local
+                } else if value.eq_ignore_ascii_case("cascaded") {
+                    ViewCheckOption::Cascaded
+                } else {
+                    return Err(self.err_here("check_option must be local or cascaded"));
+                };
+                (2, ViewOption::CheckOption(value))
+            } else {
+                return Err(self.err_here("unrecognized view option"));
+            };
+            if core::mem::replace(&mut seen[index], true) {
+                return Err(self.err_here("view option specified more than once"));
+            }
+            options[count] = parsed;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        self.arena_slice(&options[..count])
+    }
+
+    fn view_option_names(&mut self) -> Result<&'a [crate::sql::ast::ViewOptionName], ParseError> {
+        use crate::sql::ast::ViewOptionName;
+        let mut names = [ViewOptionName::SecurityInvoker; 3];
+        let mut count = 0usize;
+        let mut seen = [false; 3];
+        loop {
+            if count == names.len() {
+                return Err(self.limit("view options", names.len()));
+            }
+            let option = self.any_ident("view option name")?;
+            let (index, parsed) = if option.eq_ignore_ascii_case("security_invoker") {
+                (0, ViewOptionName::SecurityInvoker)
+            } else if option.eq_ignore_ascii_case("security_barrier") {
+                (1, ViewOptionName::SecurityBarrier)
+            } else if option.eq_ignore_ascii_case("check_option") {
+                (2, ViewOptionName::CheckOption)
+            } else {
+                return Err(self.err_here("unrecognized view option"));
+            };
+            if core::mem::replace(&mut seen[index], true) {
+                return Err(self.err_here("view option specified more than once"));
+            }
+            names[count] = parsed;
+            count += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        self.arena_slice(&names[..count])
     }
 
     fn alter_table_relation(&mut self, foreign: bool) -> Result<Stmt<'a>, ParseError> {

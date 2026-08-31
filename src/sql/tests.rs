@@ -36327,6 +36327,28 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+    for statement in [
+        "CREATE UNLOGGED TABLE unlogged_object_native_rows (id integer)",
+        "CREATE TEMP TABLE temporary_object_native_rows (id integer)",
+        "ALTER TABLE table_definition_rows SET UNLOGGED",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains("0A000"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows SET LOGGED",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
 }
 
 #[test]

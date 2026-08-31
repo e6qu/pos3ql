@@ -2916,6 +2916,9 @@ pub struct CreateTable<'a> {
     /// The table's partitioning role.  This is structured at parse time so
     /// execution never needs to reinterpret a SQL fragment as a bound.
     pub partition: PartitionClause<'a>,
+    /// Relation persistence requested by the client. Only permanent tables
+    /// can enter object-native durable storage.
+    pub persistence: RelationPersistence,
     /// The PostgreSQL table access method, resolved before storage mutation.
     pub access_method: TableAccessMethod<'a>,
     /// An explicit relation tablespace. `None` selects the database default.
@@ -2932,6 +2935,15 @@ pub enum TableAccessMethod<'a> {
     /// deferred to execution. It cannot reach storage unless it resolves to
     /// one of the executable variants above.
     Named(&'a str),
+}
+
+/// PostgreSQL's table-persistence grammar, parsed before execution decides
+/// whether the object-native durability contract can realize it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationPersistence {
+    Permanent,
+    Unlogged,
+    Temporary,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3981,6 +3993,7 @@ pub enum AlterAction<'a> {
         enabled: TriggerEnableMode,
     },
     SetRowLevelSecurity(RowLevelSecurityAlteration),
+    SetPersistence(RelationPersistence),
     /// ALTER TABLE ... SET TABLESPACE name.
     SetTablespace(&'a str),
     /// ALTER TABLE ... SET ACCESS METHOD heap.

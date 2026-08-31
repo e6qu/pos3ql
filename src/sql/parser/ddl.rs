@@ -28,14 +28,15 @@ use crate::sql::ast::{
     OperatorFamilyMember, OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands,
     PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression,
     PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget,
-    RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineCreateKind, RoutineIdentity,
-    RoutineParallel, RoutineResultColumn, RoutineTargetKind, RuleAction, RuleEvent, RuleMode,
-    StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName,
-    StatisticsTarget, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
-    SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
-    SubscriptionSynchronousCommit, TableAccessMethod, TablespaceOptionNames, TablespaceOptions,
-    TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption, TriggerEvent,
-    TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables, ViewSecurity,
+    RelationPersistence, RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineCreateKind,
+    RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind, RuleAction,
+    RuleEvent, RuleMode, StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds,
+    StatisticsName, StatisticsTarget, SubscriptionBehavior, SubscriptionConnect,
+    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
+    SubscriptionStreaming, SubscriptionSynchronousCommit, TableAccessMethod, TablespaceOptionNames,
+    TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption,
+    TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables,
+    ViewSecurity,
 };
 use crate::sql::eval::sqlstate;
 
@@ -1430,7 +1431,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("wrapper")?;
                 return self.create_foreign_data_wrapper();
             }
-            return self.create_table(true);
+            return self.create_table(true, RelationPersistence::Permanent);
         }
         if self.eat_ident("server")? {
             return self.create_foreign_server();
@@ -1519,7 +1520,14 @@ impl<'a> Parser<'a> {
         if self.eat_ident("group")? {
             return self.create_role(false);
         }
-        self.create_table(false)
+        let persistence = if self.eat_ident("unlogged")? {
+            RelationPersistence::Unlogged
+        } else if self.eat_ident("temporary")? || self.eat_ident("temp")? {
+            RelationPersistence::Temporary
+        } else {
+            RelationPersistence::Permanent
+        };
+        self.create_table(false, persistence)
     }
 
     fn access_method(&mut self) -> Result<IndexAccessMethod, ParseError> {
@@ -4677,6 +4685,7 @@ impl<'a> Parser<'a> {
                 constraints: &[],
                 likes: &[],
                 partition: PartitionClause::None,
+                persistence: RelationPersistence::Permanent,
                 access_method: TableAccessMethod::Heap,
                 tablespace: None,
                 if_not_exists: false,
@@ -6783,7 +6792,11 @@ impl<'a> Parser<'a> {
         Ok((self.arena_slice(&names[..count])?, if_exists))
     }
 
-    fn create_table(&mut self, foreign: bool) -> Result<Stmt<'a>, ParseError> {
+    fn create_table(
+        &mut self,
+        foreign: bool,
+        persistence: RelationPersistence,
+    ) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("table")?;
         let if_not_exists = if self.eat_ident("if")? {
             self.expect_ident("not")?;
@@ -6829,6 +6842,7 @@ impl<'a> Parser<'a> {
                     bound,
                     subpartition,
                 },
+                persistence,
                 access_method,
                 tablespace,
                 if_not_exists,
@@ -7156,6 +7170,7 @@ impl<'a> Parser<'a> {
             constraints,
             likes,
             partition,
+            persistence,
             access_method,
             tablespace,
             if_not_exists,

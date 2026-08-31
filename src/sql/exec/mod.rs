@@ -392,6 +392,17 @@ fn create_table_kind(
     } else {
         "CREATE TABLE"
     };
+    if statement.persistence != crate::sql::ast::RelationPersistence::Permanent {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} tables are incompatible with object-native durable storage",
+            match statement.persistence {
+                crate::sql::ast::RelationPersistence::Permanent => unreachable!(),
+                crate::sql::ast::RelationPersistence::Unlogged => "unlogged",
+                crate::sql::ast::RelationPersistence::Temporary => "temporary",
+            }
+        ));
+    }
     let mut def = match build_partitioned_table_def(storage, statement, txn.txid, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
@@ -50237,6 +50248,14 @@ fn alter_table_inner(
             }
             AlterAction::SetRowLevelSecurity(_) => {
                 unreachable!("row-level security is a standalone action")
+            }
+            AlterAction::SetPersistence(persistence) => {
+                if *persistence != crate::sql::ast::RelationPersistence::Permanent {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "unlogged tables are incompatible with object-native durable storage"
+                    ));
+                }
             }
             AlterAction::SetTablespace(name) => {
                 new_def.tablespace =

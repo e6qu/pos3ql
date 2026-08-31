@@ -89,6 +89,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::RenameConstraint { .. }
         | AlterAction::SetTriggerEnabled { .. }
         | AlterAction::SetRowLevelSecurity(_)
+        | AlterAction::SetPersistence(_)
         | AlterAction::SetTablespace(_)
         | AlterAction::SetAccessMethod(_)
         | AlterAction::SetReplicaIdentity(_)
@@ -4546,6 +4547,10 @@ impl<'a> Parser<'a> {
         if self.eat_ident("set")? {
             let action = if self.eat_ident("schema")? {
                 AlterAction::SetSchema(self.col_ident("schema name")?)
+            } else if self.eat_ident("logged")? {
+                AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent)
+            } else if self.eat_ident("unlogged")? {
+                AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Unlogged)
             } else if self.eat_ident("tablespace")? {
                 AlterAction::SetTablespace(self.col_ident("tablespace name")?)
             } else {
@@ -5013,7 +5018,15 @@ impl<'a> Parser<'a> {
             };
             Ok(AlterAction::SetReplicaIdentity(target))
         } else if self.eat_ident("set")? {
-            if self.eat_ident("tablespace")? {
+            if self.eat_ident("logged")? {
+                Ok(AlterAction::SetPersistence(
+                    crate::sql::ast::RelationPersistence::Permanent,
+                ))
+            } else if self.eat_ident("unlogged")? {
+                Ok(AlterAction::SetPersistence(
+                    crate::sql::ast::RelationPersistence::Unlogged,
+                ))
+            } else if self.eat_ident("tablespace")? {
                 Ok(AlterAction::SetTablespace(
                     self.col_ident("tablespace name")?,
                 ))

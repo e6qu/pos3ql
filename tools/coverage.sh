@@ -14,11 +14,10 @@
 # Ways to run it (COVERAGE_SHARD):
 #   - unset — whole suite in one process, the floor enforced at the end. This
 #     is the local command.
-#   - lib / sql / run:<groups> — a coverage shard: its slice runs strictly (a failure
-#     fails the shard) against an instrumented binary, and the profile is
-#     written as an lcov tracefile to COVERAGE_LCOV instead of being compared to
-#     the floor (one shard's number is meaningless alone). tools/coverage-
-#     merge.py unions the tracefiles and holds the floor over the merged whole.
+#   - lib:INDEX-of-COUNT / sql / run:<groups> — a coverage shard: its slice runs
+#     strictly against an instrumented binary, and the profile is written as an
+#     lcov tracefile. tools/coverage-merge.py unions the tracefiles and holds
+#     the floor over the merged whole.
 #   - runtest:<groups> — a correctness-only shard: it runs run.sh groups
 #     strictly but produces no coverage, so it builds an *uninstrumented*
 #     binary (much faster) and writes no tracefile. This is for crash torture,
@@ -98,7 +97,7 @@ command -v cargo-llvm-cov >/dev/null 2>&1 || {
 }
 # Coverage-producing shards need a tracefile to merge.
 case "$SHARD" in
-lib | sql | run:*)
+lib:* | sql | run:*)
     if [ -z "$LCOV_OUT" ]; then
         echo "FAIL: COVERAGE_SHARD=$SHARD is set but COVERAGE_LCOV is not; a"
         echo "      shard's floor-less percentage would vanish without a"
@@ -119,11 +118,59 @@ find target -name '*.profraw' -delete 2>/dev/null || true
 # The in-process tests have their own trace shard so their growing runtime
 # cannot consume the differential shard's server-build budget.
 case "$SHARD" in
-"" | lib)
+"")
     echo "=== in-process tests ==="
     if ! cargo test --lib --release > "$TMP/lib.log" 2>&1; then
         tail -80 "$TMP/lib.log"
         echo "FAIL: in-process tests did not pass; coverage cannot be reported"
+        exit 1
+    fi
+    grep -E '^test result' "$TMP/lib.log" | tail -1
+    ;;
+lib:*)
+    partition=${SHARD#lib:}
+    partition_index=${partition%%-of-*}
+    partition_count=${partition#*-of-}
+    case "$partition_index:$partition_count" in
+    *[!0-9:]* | :* | *: | *:*:*)
+        echo "FAIL: malformed lib partition '$partition' (expected INDEX-of-COUNT)"
+        exit 1
+        ;;
+    esac
+    if [ "$partition_count" -lt 2 ] || [ "$partition_index" -ge "$partition_count" ]; then
+        echo "FAIL: invalid lib partition '$partition' (COUNT >= 2 and INDEX < COUNT required)"
+        exit 1
+    fi
+
+    echo "=== in-process tests, partition $partition ==="
+    if ! cargo test --lib --release -- --list > "$TMP/lib.list" 2>&1; then
+        tail -80 "$TMP/lib.list"
+        echo "FAIL: in-process tests could not be enumerated"
+        exit 1
+    fi
+    set -- --exact
+    ordinal=0
+    selected=0
+    while IFS= read -r line; do
+        case "$line" in
+        *': test')
+            test_name=${line%: test}
+            if [ $((ordinal % partition_count)) -eq "$partition_index" ]; then
+                selected=$((selected + 1))
+            else
+                set -- "$@" --skip "$test_name"
+            fi
+            ordinal=$((ordinal + 1))
+            ;;
+        esac
+    done < "$TMP/lib.list"
+    if [ "$selected" -eq 0 ] || [ "$ordinal" -eq "$selected" ]; then
+        echo "FAIL: lib partition $partition selected $selected of $ordinal tests"
+        exit 1
+    fi
+    if ! cargo test --lib --release -- "$@" > "$TMP/lib.log" 2>&1; then
+        tail -80 "$TMP/lib.log"
+        echo "FAIL: in-process test partition $partition did not pass"
         exit 1
     fi
     grep -E '^test result' "$TMP/lib.log" | tail -1
@@ -133,12 +180,14 @@ esac
 # add server profiles on top.
 LIB_PROFILES=$(find target -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')
 
-if [ "$SHARD" = "lib" ]; then
+case "$SHARD" in
+lib:*)
     echo "=== lcov tracefile ==="
     cargo llvm-cov report --release --lcov --output-path "$LCOV_OUT"
     echo "wrote $LCOV_OUT"
     exit 0
-fi
+    ;;
+esac
 
 echo "=== building the instrumented server ==="
 # Cargo does not always re-fingerprint on RUSTC_WRAPPER alone, so an existing
@@ -228,7 +277,7 @@ run:*)
     write_lcov
     ;;
 *)
-    echo "FAIL: unknown COVERAGE_SHARD '$SHARD' (expected lib, sql, run:<groups> or runtest:<groups>)"
+    echo "FAIL: unknown COVERAGE_SHARD '$SHARD' (expected lib:INDEX-of-COUNT, sql, run:<groups> or runtest:<groups>)"
     exit 1
     ;;
 esac

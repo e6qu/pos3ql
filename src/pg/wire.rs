@@ -43,6 +43,7 @@ pub const MSG_PORTAL_SUSPENDED: u8 = b's';
 pub const MSG_COPY_IN_RESPONSE: u8 = b'G';
 pub const MSG_COPY_OUT_RESPONSE: u8 = b'H';
 pub const MSG_COPY_BOTH_RESPONSE: u8 = b'W';
+pub const MSG_FUNCTION_CALL_RESPONSE: u8 = b'V';
 
 // Frontend message type bytes.
 pub const FMSG_QUERY: u8 = b'Q';
@@ -58,6 +59,7 @@ pub const FMSG_CLOSE: u8 = b'C';
 pub const FMSG_SYNC: u8 = b'S';
 pub const FMSG_FLUSH: u8 = b'H';
 pub const FMSG_PASSWORD: u8 = b'p';
+pub const FMSG_FUNCTION_CALL: u8 = b'F';
 
 /// The send buffer cannot hold the message being built. The connection
 /// must flush (or fail the statement) and retry.

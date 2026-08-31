@@ -107,7 +107,7 @@ pub fn describe_items<'q>(
         fn comment<'a>(
             &self,
             catalog_name: &str,
-            oid: i32,
+            oid: u32,
             subid: i32,
             arena: &'a crate::mem::arena::Arena,
         ) -> Result<Option<&'a str>, SqlError> {
@@ -2497,6 +2497,11 @@ pub fn infer_type_res(
     let of = |t: ColType| (t.oid(), t.typlen());
     if let Some(result) = routine_result_metadata(expression, columns) {
         return Ok((result.type_oid, result.ctype.typlen()));
+    }
+    if let Expr::Call { name, args, .. } = expression
+        && let Some(result) = crate::sql::large_object::result_type(name, args.len())
+    {
+        return Ok(result);
     }
     Ok(match expression {
         Expr::RecursiveState { ctype, .. } => of(*ctype),

@@ -159,6 +159,8 @@ const KIND_ROLLBACK_PREPARED: u8 = 109;
 const KIND_PREPARED_LOCKS: u8 = 110;
 const KIND_SET_TEXT_SEARCH: u8 = 111;
 const KIND_DROP_TEXT_SEARCH: u8 = 112;
+const KIND_CREATE_LARGE_OBJECT: u8 = 113;
+const KIND_DROP_LARGE_OBJECT: u8 = 114;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -166,9 +168,14 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_DROP_TEXT_SEARCH;
+const LAST_KIND: u8 = KIND_DROP_LARGE_OBJECT;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
+
+fn access_class_has_oid(class: u8) -> bool {
+    class == crate::storage::AccessClass::Routine as u8
+        || class == crate::storage::AccessClass::LargeObject as u8
+}
 
 /// A domain's direct enum/composite base uses its durable catalog slot during
 /// replay. Names are catalog projections and can change after an older domain
@@ -444,6 +451,14 @@ pub(crate) enum WalOp<'a> {
     /// Database identity for following records in a staged transaction.
     DatabaseScope {
         oid: i32,
+    },
+    CreateLargeObject {
+        oid: u32,
+        created_at: u64,
+        allocated: bool,
+    },
+    DropLargeObject {
+        oid: u32,
     },
     CreateTable(TableDef),
     /// Begins ALTER TABLE's in-place definition/row rewrite. The immediately
@@ -1900,6 +1915,8 @@ fn die(msg: &str) -> ! {
 fn op_kind(operation: &WalOp) -> u8 {
     match operation {
         WalOp::DatabaseScope { .. } => KIND_DATABASE_SCOPE,
+        WalOp::CreateLargeObject { .. } => KIND_CREATE_LARGE_OBJECT,
+        WalOp::DropLargeObject { .. } => KIND_DROP_LARGE_OBJECT,
         WalOp::CreateTable(_) => KIND_CREATE,
         WalOp::DropTable { .. } => KIND_DROP,
         WalOp::Upsert { .. } => KIND_UPSERT,
@@ -2045,6 +2062,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
     }
     match operation {
         WalOp::DatabaseScope { .. } => 4,
+        WalOp::CreateLargeObject { .. } => 13,
+        WalOp::DropLargeObject { .. } => 4,
         WalOp::CreateTable(def) => {
             let mut n = 1 + def.name.as_str().len() + 2 + 1;
             for c in def.columns() {
@@ -3009,7 +3028,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             owner,
             ..
         } => {
-            1 + usize::from(*class == crate::storage::AccessClass::Routine as u8) * 4
+            1 + usize::from(access_class_has_oid(*class)) * 4
                 + 1
                 + schema.len()
                 + 1
@@ -3025,7 +3044,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             grantor,
             ..
         } => {
-            1 + usize::from(*class == crate::storage::AccessClass::Routine as u8) * 4
+            1 + usize::from(access_class_has_oid(*class)) * 4
                 + 1
                 + schema.len()
                 + 1
@@ -3371,6 +3390,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
     }
     match operation {
         WalOp::DatabaseScope { oid } => buffer.append(&oid.to_le_bytes()),
+        WalOp::CreateLargeObject {
+            oid,
+            created_at,
+            allocated,
+        } => {
+            buffer.append(&oid.to_le_bytes())
+                && buffer.append(&created_at.to_le_bytes())
+                && buffer.append(&[u8::from(*allocated)])
+        }
+        WalOp::DropLargeObject { oid } => buffer.append(&oid.to_le_bytes()),
         WalOp::CreateTable(def) => {
             let mut ok = name_bytes(buffer, def.name.as_str());
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
@@ -4757,8 +4786,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             owner,
         } => {
             buffer.append(&[*class])
-                && (*class != crate::storage::AccessClass::Routine as u8
-                    || buffer.append(&object_oid.to_le_bytes()))
+                && (!access_class_has_oid(*class) || buffer.append(&object_oid.to_le_bytes()))
                 && name_bytes(buffer, schema)
                 && name_bytes(buffer, name)
                 && name_bytes(buffer, owner)
@@ -4774,8 +4802,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             grant_options,
         } => {
             buffer.append(&[*class])
-                && (*class != crate::storage::AccessClass::Routine as u8
-                    || buffer.append(&object_oid.to_le_bytes()))
+                && (!access_class_has_oid(*class) || buffer.append(&object_oid.to_le_bytes()))
                 && name_bytes(buffer, schema)
                 && name_bytes(buffer, name)
                 && name_bytes(buffer, grantee)
@@ -5478,6 +5505,26 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let oid = i32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
             at = 4;
             (at == payload.len()).then_some(WalOp::DatabaseScope { oid })
+        }
+        KIND_CREATE_LARGE_OBJECT => {
+            let oid = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+            let created_at = u64::from_le_bytes(payload.get(4..12)?.try_into().ok()?);
+            let allocated = match *payload.get(12)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at = 13;
+            (oid != 0 && at == payload.len()).then_some(WalOp::CreateLargeObject {
+                oid,
+                created_at,
+                allocated,
+            })
+        }
+        KIND_DROP_LARGE_OBJECT => {
+            let oid = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?);
+            at = 4;
+            (oid != 0 && at == payload.len()).then_some(WalOp::DropLargeObject { oid })
         }
         KIND_CREATE => {
             let name = take_name(&mut at)?;
@@ -8523,7 +8570,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let class = *payload.get(at)?;
             at += 1;
             crate::storage::AccessClass::from_u8(class)?;
-            let object_oid = if class == crate::storage::AccessClass::Routine as u8 {
+            let object_oid = if access_class_has_oid(class) {
                 let object_oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
                 at += 4;
                 object_oid
@@ -8545,7 +8592,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let class = *payload.get(at)?;
             at += 1;
             let class = crate::storage::AccessClass::from_u8(class)?;
-            let object_oid = if class == crate::storage::AccessClass::Routine {
+            let object_oid = if access_class_has_oid(class as u8) {
                 let object_oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
                 at += 4;
                 object_oid
@@ -9672,6 +9719,55 @@ mod tests {
             }
         ));
         assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_none());
+    }
+
+    #[test]
+    fn large_object_codec_keeps_unsigned_identity_and_catalog_order() {
+        let mut budget = Budget::new(2048);
+        let mut buffer = FixedBuf::new(&mut budget, "large-object WAL", 2048).unwrap();
+        append_record(
+            &mut buffer,
+            9,
+            &WalOp::CreateLargeObject {
+                oid: u32::MAX,
+                created_at: 73,
+                allocated: true,
+            },
+        )
+        .unwrap();
+        let WalOp::CreateLargeObject {
+            oid,
+            created_at,
+            allocated,
+        } = decode_record(&buffer.readable()[16..]).unwrap()
+        else {
+            panic!("expected large-object creation WAL operation");
+        };
+        assert_eq!((oid, created_at), (u32::MAX, 73));
+        assert!(allocated);
+
+        buffer.clear();
+        append_record(
+            &mut buffer,
+            10,
+            &WalOp::SetObjectAcl {
+                class: crate::storage::AccessClass::LargeObject as u8,
+                object_oid: -1,
+                schema: "",
+                name: "4294967295",
+                grantee: "PUBLIC",
+                grantor: "postgres",
+                privileges: crate::storage::PrivilegeSet::SELECT,
+                grant_options: crate::storage::PrivilegeSet::NONE,
+            },
+        )
+        .unwrap();
+        let WalOp::SetObjectAcl { object_oid, .. } =
+            decode_record(&buffer.readable()[16..]).unwrap()
+        else {
+            panic!("expected large-object ACL WAL operation");
+        };
+        assert_eq!(object_oid as u32, u32::MAX);
     }
 
     #[test]

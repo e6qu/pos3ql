@@ -450,6 +450,7 @@ pub fn check_timeout() -> Result<(), SqlError> {
 #[derive(Clone, Copy)]
 pub(crate) struct PendingRoutineInvocation<'a> {
     pub slot: usize,
+    pub intrinsic_oid: Option<i32>,
     pub arguments: &'a [u8],
     pub argument_count: usize,
 }
@@ -548,11 +549,11 @@ impl<'a> RoutineInvocationState<'a> {
         self.pending.set(None);
     }
 
-    fn cursor(&self) -> usize {
+    pub(crate) fn cursor(&self) -> usize {
         self.next.get()
     }
 
-    fn restore_cursor(&self, cursor: usize) {
+    pub(crate) fn restore_cursor(&self, cursor: usize) {
         self.next.set(cursor);
     }
 
@@ -584,12 +585,51 @@ impl<'a> RoutineInvocationState<'a> {
         }
         self.pending.set(Some(PendingRoutineInvocation {
             slot,
+            intrinsic_oid: None,
             arguments: super::exec::encode_projected_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
         Err(sql_err!(
             sqlstate::INTERNAL_ROUTINE_INVOCATION,
             "mutable SQL routine invocation is pending"
+        ))
+    }
+
+    pub(crate) fn resolve_intrinsic<'query>(
+        &self,
+        oid: i32,
+        arguments: &[Datum],
+        statement_arena: &'a Arena,
+        query_arena: &'query Arena,
+    ) -> Result<Datum<'query>, SqlError> {
+        let ordinal = self.next.get();
+        if ordinal == MAX_ROUTINE_INVOCATIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "SQL statement exceeds {} mutable routine invocations",
+                MAX_ROUTINE_INVOCATIONS
+            ));
+        }
+        self.next.set(ordinal + 1);
+        if ordinal < self.completed.get() {
+            let RoutineInvocationResult::Scalar(value) = self.results[ordinal].get() else {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "intrinsic invocation changed result shape"
+                ));
+            };
+            let encoded = super::exec::encode_projected_pub(&[value], query_arena)?;
+            return Ok(super::exec::decode_projected_pub(encoded, 0));
+        }
+        self.pending.set(Some(PendingRoutineInvocation {
+            slot: 0,
+            intrinsic_oid: Some(oid),
+            arguments: super::exec::encode_projected_pub(arguments, statement_arena)?,
+            argument_count: arguments.len(),
+        }));
+        Err(sql_err!(
+            sqlstate::INTERNAL_ROUTINE_INVOCATION,
+            "mutable intrinsic invocation is pending"
         ))
     }
 
@@ -637,6 +677,7 @@ impl<'a> RoutineInvocationState<'a> {
         }
         self.pending.set(Some(PendingRoutineInvocation {
             slot,
+            intrinsic_oid: None,
             arguments: super::exec::encode_projected_pub(arguments, statement_arena)?,
             argument_count: arguments.len(),
         }));
@@ -2823,7 +2864,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
     fn comment<'a>(
         &self,
         catalog_name: &str,
-        oid: i32,
+        oid: u32,
         subid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {

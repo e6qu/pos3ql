@@ -58,6 +58,41 @@ impl CatalogOid {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ObjectOid(u32);
+
+impl ObjectOid {
+    fn parse(value: Datum<'_>) -> Result<Option<Self>, SqlError> {
+        match value {
+            Datum::Null => Ok(None),
+            Datum::Oid(oid) => Ok(Some(Self(oid))),
+            Datum::Int4(oid) => u32::try_from(oid)
+                .map(Self)
+                .map(Some)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
+            Datum::Int8(oid) => u32::try_from(oid)
+                .map(Self)
+                .map(Some)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
+            Datum::RegObject { referenced_oid, .. } => u32::try_from(referenced_oid)
+                .map(Self)
+                .map(Some)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID out of range")),
+            Datum::Text(raw) => raw.parse::<u32>().map(Self).map(Some).map_err(|_| {
+                sql_err!(
+                    sqlstate::INVALID_TEXT_REPRESENTATION,
+                    "invalid input syntax for type oid: \"{}\"",
+                    raw
+                )
+            }),
+            _ => Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "object identity must be oid"
+            )),
+        }
+    }
+}
+
 /// PostgreSQL's closed one-byte object-class protocol for `acldefault`.
 #[derive(Clone, Copy)]
 enum AclDefaultObject {
@@ -1038,7 +1073,7 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                let oid = match ObjectOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
@@ -1064,7 +1099,7 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                let oid = match ObjectOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };
@@ -1083,7 +1118,7 @@ pub(crate) fn dispatch<'a>(
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
-                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                let oid = match ObjectOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
                     Some(oid) => oid.0,
                     None => return Ok(Datum::Null),
                 };

@@ -63,6 +63,12 @@ pub struct Config {
     pub wal_buffer_bytes: usize,
     /// Fixed number of table slots.
     pub max_tables: usize,
+    /// Fixed number of large-object identities in the cluster catalog.
+    pub max_large_objects: usize,
+    /// Sparse 2 KiB large-object pages that may be resident in the page map.
+    pub large_object_pages: usize,
+    /// Transaction-scoped large-object descriptors per connection.
+    pub max_large_object_descriptors: usize,
     /// Fixed number of rewrite-rule slots, including one `_RETURN` rule per
     /// ordinary view.
     pub max_rules: usize,
@@ -192,6 +198,9 @@ impl Config {
             wal_bytes: 256 * MIB,
             wal_buffer_bytes: MIB,
             max_tables: 32,
+            max_large_objects: 1024,
+            large_object_pages: 8192,
+            max_large_object_descriptors: 64,
             max_rules: 128,
             extension_control_path: String::new(),
             max_extension_scripts: 128,
@@ -360,6 +369,18 @@ impl Config {
                 }
                 "max_tables" => {
                     config.max_tables =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_large_objects" => {
+                    config.max_large_objects =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "large_object_pages" => {
+                    config.large_object_pages =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_large_object_descriptors" => {
+                    config.max_large_object_descriptors =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
                 "max_rules" => {
@@ -568,6 +589,15 @@ impl Config {
                 "max_rules must be greater than zero".to_string(),
             ));
         }
+        if config.max_large_objects == 0
+            || config.large_object_pages == 0
+            || config.max_large_object_descriptors == 0
+        {
+            return Err(ConfigError::at(
+                0,
+                "large-object capacities must be greater than zero".to_string(),
+            ));
+        }
         if config.max_extension_scripts == 0
             || config.max_extension_scripts > 256
             || config.extension_script_bytes == 0
@@ -603,7 +633,10 @@ impl Config {
             + self.max_portals * (self.portal_bytes + self.portal_result_bytes)
             + self.max_tables * core::mem::size_of::<crate::storage::SqlName>()
             + crate::sql::cursor::CursorPool::budget_bytes(self)
-            + crate::sql::txn::TxnState::budget_bytes(self.txn_rows);
+            + crate::sql::txn::TxnState::budget_bytes_with_large_objects(
+                self.txn_rows,
+                self.max_large_object_descriptors,
+            );
         MemoryPlan {
             memtable: self.memtable_bytes,
             tables: tables_bytes,

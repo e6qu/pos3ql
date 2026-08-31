@@ -27,7 +27,7 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v3";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v4";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -382,7 +382,7 @@ impl Checkpointer {
         // pinned. Free one of those lists before servicing ordinary merge
         // candidates, or a smaller unrelated table can starve the publication.
         let must_free_full_list = storage.has_active_snapshots()
-            && (0..storage.table_count()).any(|slot| {
+            && (0..storage.physical_table_count()).any(|slot| {
                 storage.table(slot).live
                     && storage.table(slot).dirty
                     && self
@@ -390,7 +390,7 @@ impl Checkpointer {
                         .get(slot)
                         .is_some_and(|list| list.n == crate::storage::MAX_SPILL_SSTS)
             });
-        for slot in 0..storage.table_count().min(MAX_CKPT_TABLES) {
+        for slot in 0..storage.physical_table_count().min(MAX_CKPT_TABLES) {
             if !storage.table(slot).live {
                 continue;
             }
@@ -1098,6 +1098,7 @@ impl Checkpointer {
         }
         let mut lsn = 0u64;
         let mut next_rowid = 1u64;
+        let mut saw_large_object_allocator = false;
         // manifest table index → live slot index
         let mut slot_of: Vec<Option<usize>> = Vec::new();
         // (mindex, def, cols_seen, per-column sequence positions)
@@ -1137,6 +1138,35 @@ impl Checkpointer {
                 }
                 Some("next_rowid") => {
                     next_rowid = parse_field(words.next(), "next_rowid")?;
+                }
+                Some("next_lo_oid") => {
+                    if saw_large_object_allocator {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "duplicate large-object allocator",
+                        ));
+                    }
+                    let value = words.next().ok_or(CheckpointSetupError::Corrupt(
+                        "large-object allocator missing",
+                    ))?;
+                    let oid = if value == "-" {
+                        None
+                    } else {
+                        Some(
+                            crate::sql::ast::LargeObjectId::parse(value.parse::<u32>().map_err(
+                                |_| CheckpointSetupError::Corrupt("invalid large-object allocator"),
+                            )?)
+                            .ok_or(CheckpointSetupError::Corrupt(
+                                "invalid large-object allocator",
+                            ))?,
+                        )
+                    };
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing large-object allocator fields",
+                        ));
+                    }
+                    storage.restore_next_large_object_oid(oid);
+                    saw_large_object_allocator = true;
                 }
                 Some("dbctx") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -1597,6 +1627,26 @@ impl Checkpointer {
                             ))
                         })?;
                     }
+                }
+                Some("lob") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let oid = parse_field::<u32>(words.next(), "large-object OID")?;
+                    let created_at = parse_field::<u64>(words.next(), "large-object creation")?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing large-object fields",
+                        ));
+                    }
+                    let oid = crate::sql::ast::LargeObjectId::parse(oid)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid large-object OID"))?;
+                    storage
+                        .restore_large_object(oid, created_at, false)
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest large object rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
                 }
                 Some("rol") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -4817,6 +4867,11 @@ impl Checkpointer {
         if !saw_end {
             return Err(CheckpointSetupError::Corrupt("manifest truncated (no end)"));
         }
+        if !saw_large_object_allocator {
+            return Err(CheckpointSetupError::Corrupt(
+                "manifest lacks large-object allocator",
+            ));
+        }
 
         // Block SSTs load in list order. Versioned reads choose the greatest
         // admissible commit LSN across every member.
@@ -5103,7 +5158,7 @@ impl Checkpointer {
         }
         let pinned_full_list = storage.has_active_snapshots()
             && self.merge_done.is_none()
-            && (0..storage.table_count()).any(|slot| {
+            && (0..storage.physical_table_count()).any(|slot| {
                 storage.table(slot).live
                     && storage.table(slot).dirty
                     && self
@@ -5148,7 +5203,7 @@ impl Checkpointer {
             self.pending_installs.clear();
             self.pending_value_installs.clear();
         }
-        for slot in 0..storage.table_count().min(MAX_CKPT_TABLES) {
+        for slot in 0..storage.physical_table_count().min(MAX_CKPT_TABLES) {
             if !self.needs_slice(storage, slot) {
                 continue;
             }
@@ -5188,6 +5243,13 @@ impl Checkpointer {
             &mut self.manifest_buf,
             format_args!("next_rowid {}", storage.peek_next_rowid()),
         )?;
+        match storage.next_large_object_oid() {
+            Some(oid) => write_manifest(
+                &mut self.manifest_buf,
+                format_args!("next_lo_oid {}", oid.get()),
+            )?,
+            None => write_manifest(&mut self.manifest_buf, "next_lo_oid -")?,
+        }
         write_manifest(
             &mut self.manifest_buf,
             format_args!("writer {:016x}", self.writer_id),
@@ -5477,6 +5539,17 @@ impl Checkpointer {
             }
             write_manifest(&mut self.manifest_buf, format_args!("nsp {}", hex.as_str()))?;
         }
+        for (_, object) in storage.checkpoint_large_objects() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                object.database,
+            )?;
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!("lob {} {}", object.oid.get(), object.created_at),
+            )?;
+        }
         // Domains: `dom3 <base-code> <base-typmod> <not-null> <n-checks>
         // <hex-schema> <hex-name> <hex-base-domain> <hex-base-domain-schema>
         // <hex-base-type> <hex-base-type-schema> <hex-default>
@@ -5638,7 +5711,7 @@ impl Checkpointer {
             }
             write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
         }
-        for slot in 0..storage.table_count() {
+        for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
             if !table.live {
                 // A dropped table's recorded list must not linger into the
@@ -7873,6 +7946,12 @@ impl Checkpointer {
                 write_owner(crate::storage::Storage::routine_access_object(slot))?;
             }
         }
+        for (slot, _) in storage.checkpoint_large_objects() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::LargeObject,
+                slot: slot as u16,
+            })?;
+        }
         for (_, acl) in storage.checkpoint_acls() {
             if !storage.access_object_is_live_in_catalog(acl.object) {
                 continue;
@@ -8459,7 +8538,7 @@ impl Checkpointer {
                 self.roster_scratch.push(BlockId(id));
             }
         }
-        for slot in 0..storage.table_count() {
+        for slot in 0..storage.physical_table_count() {
             for binding in 0..storage.value_binding_count(slot) {
                 let Some(handle) = storage.value_binding_handle(slot, binding) else {
                     continue;
@@ -9089,12 +9168,38 @@ fn finish_pending(
                 "manifest column count mismatch",
             ));
         }
-        let slot = storage.create_table(definition).map_err(|error| {
-            CheckpointSetupError::ObjectStore(format!(
-                "manifest table rejected: {}",
-                error.message.as_str()
-            ))
-        })?;
+        let slot =
+            if storage
+                .is_large_object_page_relation(definition.schema.as_str(), definition.name.as_str())
+            {
+                let slot = storage.large_object_page_table();
+                let expected = &storage.table(slot).def;
+                if manifest_index != slot
+                    || definition.schema != expected.schema
+                    || definition.name != expected.name
+                    || definition.n_columns != expected.n_columns
+                    || definition.has_toast != expected.has_toast
+                    || definition.columns().iter().zip(expected.columns()).any(
+                        |(actual, expected)| {
+                            actual.name != expected.name
+                                || actual.ctype != expected.ctype
+                                || actual.not_null != expected.not_null
+                        },
+                    )
+                {
+                    return Err(CheckpointSetupError::Corrupt(
+                        "large-object page relation definition mismatch",
+                    ));
+                }
+                slot
+            } else {
+                storage.create_table(definition).map_err(|error| {
+                    CheckpointSetupError::ObjectStore(format!(
+                        "manifest table rejected: {}",
+                        error.message.as_str()
+                    ))
+                })?
+            };
         storage.table_mut(slot).serial_last = serials;
         if slot_of.len() <= manifest_index {
             slot_of.resize(manifest_index + 1, None);

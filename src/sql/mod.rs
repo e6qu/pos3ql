@@ -16,6 +16,7 @@ pub(crate) mod external;
 pub mod full_text;
 pub mod guc;
 pub mod json;
+pub(crate) mod large_object;
 pub mod lexer;
 pub(crate) mod lock;
 pub mod md5;
@@ -429,6 +430,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Notify { .. }
         | Stmt::Comment { .. }
         | Stmt::AlterOwner { .. }
+        | Stmt::AlterLargeObjectOwner { .. }
         | Stmt::CreateRole { .. }
         | Stmt::AlterRole { .. }
         | Stmt::AlterRoleRename { .. }
@@ -803,6 +805,7 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
             ast::AlterOwnerKind::Sequence => "ALTER SEQUENCE",
             ast::AlterOwnerKind::Statistics => "ALTER STATISTICS",
         },
+        Stmt::AlterLargeObjectOwner { .. } => "ALTER LARGE OBJECT",
         Stmt::GrantPrivileges { target, .. } if privilege_target_is_database_local(*target) => {
             "GRANT"
         }
@@ -3136,51 +3139,60 @@ impl Engine {
                         old_row,
                         ..
                     } => {
-                        let table_slot = storage.find_table(schema, table).ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::UNDEFINED_TABLE,
-                                "replication WAL refers to unknown table \"{}\"",
-                                table
-                            )
-                        })?;
-                        let definition = storage.table_def(table_slot, 0);
-                        let mut types = [ColType::Bool; crate::storage::MAX_COLUMNS];
-                        let count = definition.schema(&mut types);
-                        let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
-                        crate::storage::rowenc::decode(row, &types[..count], &mut values)?;
-                        if is_update {
-                            let old = old_row.ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::PROTOCOL_VIOLATION,
-                                    "update WAL record lacks replica identity"
-                                )
-                            })?;
-                            let mut old_values = [Datum::Null; crate::storage::MAX_COLUMNS];
-                            crate::storage::rowenc::decode(old, &types[..count], &mut old_values)?;
-                            publication_row_matches(
-                                storage,
-                                publication_names,
-                                table_slot,
-                                PublicationOperation::Update,
-                                &values[..count],
-                                filter_arena,
-                            )? || publication_row_matches(
-                                storage,
-                                publication_names,
-                                table_slot,
-                                PublicationOperation::Update,
-                                &old_values[..count],
-                                filter_arena,
-                            )?
+                        if storage.is_large_object_page_relation(schema, table) {
+                            false
                         } else {
-                            publication_row_matches(
-                                storage,
-                                publication_names,
-                                table_slot,
-                                PublicationOperation::Insert,
-                                &values[..count],
-                                filter_arena,
-                            )?
+                            let table_slot =
+                                storage.find_table(schema, table).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_TABLE,
+                                        "replication WAL refers to unknown table \"{}\"",
+                                        table
+                                    )
+                                })?;
+                            let definition = storage.table_def(table_slot, 0);
+                            let mut types = [ColType::Bool; crate::storage::MAX_COLUMNS];
+                            let count = definition.schema(&mut types);
+                            let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                            crate::storage::rowenc::decode(row, &types[..count], &mut values)?;
+                            if is_update {
+                                let old = old_row.ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROTOCOL_VIOLATION,
+                                        "update WAL record lacks replica identity"
+                                    )
+                                })?;
+                                let mut old_values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                                crate::storage::rowenc::decode(
+                                    old,
+                                    &types[..count],
+                                    &mut old_values,
+                                )?;
+                                publication_row_matches(
+                                    storage,
+                                    publication_names,
+                                    table_slot,
+                                    PublicationOperation::Update,
+                                    &values[..count],
+                                    filter_arena,
+                                )? || publication_row_matches(
+                                    storage,
+                                    publication_names,
+                                    table_slot,
+                                    PublicationOperation::Update,
+                                    &old_values[..count],
+                                    filter_arena,
+                                )?
+                            } else {
+                                publication_row_matches(
+                                    storage,
+                                    publication_names,
+                                    table_slot,
+                                    PublicationOperation::Insert,
+                                    &values[..count],
+                                    filter_arena,
+                                )?
+                            }
                         }
                     }
                     WalOp::Delete {
@@ -3190,41 +3202,46 @@ impl Engine {
                         command_id,
                         ..
                     } => {
-                        let table_slot = storage.find_table(schema, table).ok_or_else(|| {
-                            sql_err!(
-                                sqlstate::UNDEFINED_TABLE,
-                                "replication WAL refers to unknown table \"{}\"",
-                                table
-                            )
-                        })?;
-                        let suppressed_by_truncate =
-                            truncates[..truncate_count].iter().any(|truncate| {
-                                truncate.command_id >= command_id
-                                    && truncate.table_slots[..truncate.table_count]
-                                        .contains(&(table_slot as u16))
-                            });
-                        if suppressed_by_truncate {
+                        if storage.is_large_object_page_relation(schema, table) {
                             false
                         } else {
-                            let old = old_row.ok_or_else(|| {
-                                sql_err!(
-                                    sqlstate::PROTOCOL_VIOLATION,
-                                    "delete WAL record lacks replica identity"
-                                )
-                            })?;
-                            let definition = storage.table_def(table_slot, 0);
-                            let mut types = [ColType::Bool; crate::storage::MAX_COLUMNS];
-                            let count = definition.schema(&mut types);
-                            let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
-                            crate::storage::rowenc::decode(old, &types[..count], &mut values)?;
-                            publication_row_matches(
-                                storage,
-                                publication_names,
-                                table_slot,
-                                PublicationOperation::Delete,
-                                &values[..count],
-                                filter_arena,
-                            )?
+                            let table_slot =
+                                storage.find_table(schema, table).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::UNDEFINED_TABLE,
+                                        "replication WAL refers to unknown table \"{}\"",
+                                        table
+                                    )
+                                })?;
+                            let suppressed_by_truncate =
+                                truncates[..truncate_count].iter().any(|truncate| {
+                                    truncate.command_id >= command_id
+                                        && truncate.table_slots[..truncate.table_count]
+                                            .contains(&(table_slot as u16))
+                                });
+                            if suppressed_by_truncate {
+                                false
+                            } else {
+                                let old = old_row.ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROTOCOL_VIOLATION,
+                                        "delete WAL record lacks replica identity"
+                                    )
+                                })?;
+                                let definition = storage.table_def(table_slot, 0);
+                                let mut types = [ColType::Bool; crate::storage::MAX_COLUMNS];
+                                let count = definition.schema(&mut types);
+                                let mut values = [Datum::Null; crate::storage::MAX_COLUMNS];
+                                crate::storage::rowenc::decode(old, &types[..count], &mut values)?;
+                                publication_row_matches(
+                                    storage,
+                                    publication_names,
+                                    table_slot,
+                                    PublicationOperation::Delete,
+                                    &values[..count],
+                                    filter_arena,
+                                )?
+                            }
                         }
                     }
                     _ => false,
@@ -3268,6 +3285,10 @@ impl Engine {
                         command_id,
                         ..
                     } => {
+                        if storage.is_large_object_page_relation(schema, table) {
+                            at += total;
+                            continue;
+                        }
                         emit_pending_truncates(
                             storage,
                             publication_names,
@@ -3439,6 +3460,10 @@ impl Engine {
                         command_id,
                         ..
                     } => {
+                        if storage.is_large_object_page_relation(schema, table) {
+                            at += total;
+                            continue;
+                        }
                         let Some(table_slot) = storage.find_table(schema, table) else {
                             return Err(sql_err!(
                                 sqlstate::UNDEFINED_TABLE,
@@ -3580,6 +3605,32 @@ impl Engine {
         let (isolation, read_only, deferrable) = guc.transaction_defaults();
         txn.set_characteristics(isolation, read_only, deferrable);
         txn.failed = false;
+    }
+
+    fn begin_command_snapshot(
+        &mut self,
+        txn: &mut TxnState,
+        takes_snapshot: bool,
+    ) -> Result<(), SqlError> {
+        txn.begin_command();
+        self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
+        let snapshot = if takes_snapshot {
+            let snapshot = txn.statement_snapshot(self.storage.lsn());
+            if matches!(
+                txn.isolation,
+                TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
+            ) {
+                self.storage.register_snapshot(txn.txid, snapshot)?;
+            }
+            if txn.isolation == TransactionIsolation::Serializable {
+                self.storage.begin_serializable(txn.txid)?;
+            }
+            snapshot
+        } else {
+            self.storage.lsn()
+        };
+        self.storage.set_commit_snapshot(snapshot);
+        Ok(())
     }
 
     pub fn commit_txn(&mut self, txn: &mut TxnState, guc: &GucState) -> Result<(), SqlError> {
@@ -4006,6 +4057,28 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        for undo in txn.ddl() {
+            let operation = match *undo {
+                DdlUndo::LargeObjectCreated(slot) => {
+                    let object = self.storage.large_object(slot as usize);
+                    WalOp::CreateLargeObject {
+                        oid: object.oid.get(),
+                        created_at: object.created_at,
+                        allocated: object.allocated,
+                    }
+                }
+                DdlUndo::LargeObjectDropped(slot) => WalOp::DropLargeObject {
+                    oid: self.storage.large_object(slot as usize).oid.get(),
+                },
+                _ => continue,
+            };
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(txn.txid, lsn, &operation) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
         // Ownership and ACLs are absolute catalog images. They are staged at
         // commit from the transaction-visible overlays, so repeated GRANT,
         // REVOKE, ALTER OWNER, and savepoint rollback publish exactly one
@@ -4056,6 +4129,10 @@ impl Engine {
                     class: crate::storage::AccessClass::Extension,
                     slot: slot as u16,
                 }),
+                DdlUndo::LargeObjectCreated(slot) => Some(crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::LargeObject,
+                    slot: slot as u16,
+                }),
                 DdlUndo::ObjectOwnerChanged { object, .. } => Some(object),
                 _ => None,
             };
@@ -4085,10 +4162,14 @@ impl Engine {
                 lsn,
                 &WalOp::SetObjectOwner {
                     class: object.class as u8,
-                    object_oid: if object.class == crate::storage::AccessClass::Routine {
-                        crate::storage::routine_oid(self.storage.routine(object.slot as usize))
-                    } else {
-                        0
+                    object_oid: match object.class {
+                        crate::storage::AccessClass::Routine => {
+                            crate::storage::routine_oid(self.storage.routine(object.slot as usize))
+                        }
+                        crate::storage::AccessClass::LargeObject => {
+                            self.storage.large_object(object.slot as usize).oid.get() as i32
+                        }
+                        _ => 0,
                     },
                     schema: schema.as_str(),
                     name: name.as_str(),
@@ -4144,10 +4225,14 @@ impl Engine {
                 lsn,
                 &WalOp::SetObjectAcl {
                     class: object.class as u8,
-                    object_oid: if object.class == crate::storage::AccessClass::Routine {
-                        crate::storage::routine_oid(self.storage.routine(object.slot as usize))
-                    } else {
-                        0
+                    object_oid: match object.class {
+                        crate::storage::AccessClass::Routine => {
+                            crate::storage::routine_oid(self.storage.routine(object.slot as usize))
+                        }
+                        crate::storage::AccessClass::LargeObject => {
+                            self.storage.large_object(object.slot as usize).oid.get() as i32
+                        }
+                        _ => 0,
                     },
                     schema: schema.as_str(),
                     name: name.as_str(),
@@ -4606,6 +4691,19 @@ impl Engine {
                     );
                 }
                 DdlUndo::SequenceDropped(slot) => self.storage.commit_sequence_drop(*slot as usize),
+                DdlUndo::LargeObjectCreated(slot) => {
+                    self.storage.commit_large_object_create(*slot as usize);
+                    self.storage.commit_object_owner(
+                        crate::storage::AccessObject {
+                            class: crate::storage::AccessClass::LargeObject,
+                            slot: *slot as u16,
+                        },
+                        txn.txid,
+                    );
+                }
+                DdlUndo::LargeObjectDropped(slot) => {
+                    self.storage.commit_large_object_drop(*slot as usize)
+                }
                 DdlUndo::SequenceAltered { slot, .. } => {
                     self.storage.commit_sequence_alter(*slot as usize, txn.txid)
                 }
@@ -5282,6 +5380,12 @@ impl Engine {
             }
             DdlUndo::SequenceAltered { slot, prior } => {
                 self.storage.rollback_sequence_alter(slot as usize, prior);
+            }
+            DdlUndo::LargeObjectCreated(slot) => {
+                self.storage.rollback_large_object_create(slot as usize)
+            }
+            DdlUndo::LargeObjectDropped(slot) => {
+                self.storage.rollback_large_object_drop(slot as usize, txid)
             }
             DdlUndo::DomainCreated(slot) => self.storage.rollback_domain_create(slot as usize),
             DdlUndo::DomainDropped(slot) => {
@@ -6547,6 +6651,80 @@ impl Engine {
                 Ok(ExtendedExecutionStatus::Complete(false))
             }
         }
+    }
+
+    pub(crate) fn large_object_fast_path_signature(
+        function_oid: i32,
+    ) -> Option<(&'static [i32], i32)> {
+        large_object::fast_path_signature(function_oid)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_large_object_fast_path(
+        &mut self,
+        function_oid: i32,
+        arguments: &[Datum],
+        binary_result: bool,
+        arena: &Arena,
+        txn: &mut TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+        conn_id: i32,
+    ) -> Result<bool, WireFull> {
+        self.current_conn_id = conn_id;
+        datetime::begin_statement();
+        self.ensure_txn(txn, TxnMode::Implicit, guc);
+        if txn.failed {
+            responder.error(
+                sqlstate::IN_FAILED_SQL_TRANSACTION,
+                "current transaction is aborted, commands ignored until end of transaction block",
+            )?;
+            responder.ready_for_query(txn.status_byte())?;
+            return Ok(false);
+        }
+        if let Err(error) = self.begin_command_snapshot(txn, true) {
+            if txn.is_explicit() {
+                txn.failed = true;
+            } else {
+                self.rollback_txn(txn, guc);
+            }
+            responder.error(error.sqlstate, error.message.as_str())?;
+            responder.ready_for_query(txn.status_byte())?;
+            return Ok(false);
+        }
+        let mark = txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+        let result = if arguments.iter().any(Datum::is_null) {
+            Ok(Datum::Null)
+        } else {
+            large_object::execute(function_oid, arguments, &mut self.storage, txn, arena)
+        };
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                if txn.owns_statement_mark(mark) {
+                    self.rollback_waiting_statement(txn, mark);
+                }
+                if txn.is_explicit() {
+                    txn.failed = true;
+                } else {
+                    self.rollback_txn(txn, guc);
+                }
+                responder.error(error.sqlstate, error.message.as_str())?;
+                responder.ready_for_query(txn.status_byte())?;
+                return Ok(false);
+            }
+        };
+        txn.compact_completed_constraints();
+        if txn.mode == TxnMode::Implicit
+            && let Err(error) = self.commit_txn(txn, guc)
+        {
+            responder.error(error.sqlstate, error.message.as_str())?;
+            responder.ready_for_query(txn.status_byte())?;
+            return Ok(false);
+        }
+        responder.function_call_response(&value, binary_result)?;
+        responder.ready_for_query(txn.status_byte())?;
+        Ok(true)
     }
 
     /// Infers each `$n` parameter's type OID from how it is used, as
@@ -8781,6 +8959,95 @@ impl Engine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute_modification_resumable(
+        &mut self,
+        statement: &Stmt<'_>,
+        arena: &Arena,
+        params: &[Datum],
+        txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &mut GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let invocations = query::RoutineInvocationState::new();
+        loop {
+            self.work.reset();
+            invocations.begin_attempt();
+            let attempt_arena_mark = arena.mark();
+            let output_mark = responder.buffer.mark();
+            let statement_mark =
+                txn.statement_mark(self.wal.stage_mark(txn.txid), self.storage.lock_mark());
+            let outcome = {
+                let _scope = query::enter_routine_invocation_scope(Some(
+                    query::RoutineInvocationContext::new(&invocations, arena),
+                ));
+                match statement {
+                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                        Self::execute_data_modification(
+                            &mut self.storage,
+                            &mut self.dml_scratch,
+                            &self.work,
+                            statement,
+                            exec::DmlAuthorization::Invoker,
+                            txn,
+                            params,
+                            guc,
+                            responder,
+                            None,
+                            self.current_conn_id,
+                        )?
+                    }
+                    Stmt::Merge(_) => Self::execute_merge(
+                        &mut self.storage,
+                        &mut self.dml_scratch,
+                        arena,
+                        statement,
+                        txn,
+                        params,
+                        guc,
+                        responder,
+                    )?,
+                    Stmt::With { ctes, statement } => self.execute_with_data_modification(
+                        ctes, statement, arena, params, txn, guc, responder, None,
+                    )?,
+                    _ => unreachable!("resumable modification has a mutation statement"),
+                }
+            };
+            let Err(error) = outcome else {
+                return Ok(outcome);
+            };
+            if error.sqlstate != sqlstate::INTERNAL_ROUTINE_INVOCATION {
+                return Ok(Err(error));
+            }
+            self.rollback_waiting_statement(txn, statement_mark);
+            responder.buffer.truncate_to(output_mark);
+            // The failed attempt has emitted or encoded every value it owns.
+            // Keep prior invocation results below the mark and reclaim only
+            // the materialization that will be rebuilt on the next attempt.
+            unsafe { arena.rewind_to(attempt_arena_mark) };
+            let Some(pending) = invocations.take_pending() else {
+                return Ok(Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "data modification yielded without a pending routine invocation"
+                )));
+            };
+            if let Err(error) = self.complete_pending_routine(
+                pending,
+                &invocations,
+                arena,
+                txn,
+                sqlprep,
+                cursors,
+                guc,
+                responder,
+            )? {
+                return Ok(Err(error));
+            }
+        }
+    }
+
     /// Runs a suspended mutable function and records its typed result in the
     /// statement-owned invocation log before the enclosing expression restarts.
     #[allow(clippy::too_many_arguments)]
@@ -8795,6 +9062,27 @@ impl Engine {
         guc: &mut GucState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Some(oid) = pending.intrinsic_oid {
+            let mut arguments = [Datum::Null; crate::sql::parser::MAX_LIST];
+            for (index, argument) in arguments[..pending.argument_count].iter_mut().enumerate() {
+                *argument = match exec::decode_projected_col_record(pending.arguments, index, arena)
+                {
+                    Ok(value) => value,
+                    Err(error) => return Ok(Err(error)),
+                };
+            }
+            let value = match large_object::execute(
+                oid,
+                &arguments[..pending.argument_count],
+                &mut self.storage,
+                txn,
+                arena,
+            ) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            return Ok(invocations.complete(value));
+        }
         if self
             .storage
             .routine_for(pending.slot, txn.txid)
@@ -10652,12 +10940,9 @@ impl Engine {
                 "statement is waiting for a schema lock"
             )));
         }
-        // A new command: advance the command-id (so this statement's writes are
-        // tagged with it) and reset reads to full own-write visibility. A
-        // data-modifying WITH statement lowers the read snapshot itself; the
-        // reset here guarantees it never leaks into the next statement.
-        txn.begin_command();
-        self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
+        // A data-modifying WITH statement lowers the command snapshot itself;
+        // the shared command boundary guarantees it never leaks into the next
+        // SQL or fast-path statement.
         let takes_snapshot = !matches!(
             statement,
             Stmt::Begin(_)
@@ -10678,25 +10963,9 @@ impl Engine {
                 | Stmt::Show(_)
                 | Stmt::ShowAll
         );
-        let commit_snapshot = if takes_snapshot {
-            let snapshot = txn.statement_snapshot(self.storage.lsn());
-            if matches!(
-                txn.isolation,
-                TransactionIsolation::RepeatableRead | TransactionIsolation::Serializable
-            ) && let Err(error) = self.storage.register_snapshot(txn.txid, snapshot)
-            {
-                return Ok(Err(error));
-            }
-            if txn.isolation == TransactionIsolation::Serializable
-                && let Err(error) = self.storage.begin_serializable(txn.txid)
-            {
-                return Ok(Err(error));
-            }
-            snapshot
-        } else {
-            self.storage.lsn()
-        };
-        self.storage.set_commit_snapshot(commit_snapshot);
+        if let Err(error) = self.begin_command_snapshot(txn, takes_snapshot) {
+            return Ok(Err(error));
+        }
         let event_tag = event_trigger_tag(statement);
         if let Some(tag) = event_tag
             && let Err(error) = self.fire_event_triggers(
@@ -10848,6 +11117,9 @@ impl Engine {
                 };
                 explain::emit_plan(&plan, *options, actual, responder)
             }
+            Stmt::With { .. } if reset_workspace => self.execute_modification_resumable(
+                statement, arena, params, txn, sqlprep, cursors, guc, responder,
+            ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
                 ctes, statement, arena, params, txn, guc, responder, capture,
             ),
@@ -11897,6 +12169,14 @@ impl Engine {
                     responder,
                 )
             }
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_)
+                if reset_workspace =>
+            {
+                debug_assert!(capture.is_none());
+                self.execute_modification_resumable(
+                    statement, arena, params, txn, sqlprep, cursors, guc, responder,
+                )
+            }
             Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => Self::execute_data_modification(
                 &mut self.storage,
                 &mut self.dml_scratch,
@@ -12055,6 +12335,9 @@ impl Engine {
                 *if_exists,
                 responder,
             ),
+            Stmt::AlterLargeObjectOwner { oid, role } => {
+                exec::alter_large_object_owner(&mut self.storage, txn, *oid, role, responder)
+            }
             Stmt::CreateRole {
                 name,
                 options,
@@ -12492,7 +12775,7 @@ impl Engine {
                         "LOCK TABLE can only be used in transaction blocks"
                     )));
                 }
-                let mut slots = [usize::MAX; 32];
+                let mut slots = [usize::MAX; parser::MAX_LOCK_TABLES];
                 for (index, table) in tables.iter().enumerate() {
                     slots[index] = match exec::resolve_dml_table(&self.storage, table, txn.txid) {
                         Ok(slot) => slot,
@@ -14002,7 +14285,8 @@ impl Engine {
             }
             crate::storage::AccessClass::Tablespace
             | crate::storage::AccessClass::Extension
-            | crate::storage::AccessClass::Database => {
+            | crate::storage::AccessClass::Database
+            | crate::storage::AccessClass::LargeObject => {
                 return Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "unsupported extension member class"
@@ -15262,6 +15546,27 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL database scope"))?;
             storage.select_database(database)?;
         }
+        WalOp::CreateLargeObject {
+            oid,
+            created_at,
+            allocated,
+        } => {
+            let oid = ast::LargeObjectId::parse(oid)
+                .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt large-object OID"))?;
+            storage.restore_large_object(oid, created_at, allocated)?;
+        }
+        WalOp::DropLargeObject { oid } => {
+            let oid = ast::LargeObjectId::parse(oid)
+                .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "corrupt large-object OID"))?;
+            let slot = storage.drop_large_object(oid, 0)?.ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal drops unknown large object {}",
+                    oid.get()
+                )
+            })?;
+            storage.commit_large_object_drop(slot);
+        }
         WalOp::Commit { .. }
         | WalOp::PrepareTransaction { .. }
         | WalOp::PreparedLocks { .. }
@@ -15718,7 +16023,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             column,
             last,
         } => {
-            let Some(index) = storage.find_table(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table) else {
                 return Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
                     message: stack_format!(
@@ -15738,7 +16043,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             table,
             statistics,
         } => {
-            let Some(index) = storage.find_table(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table) else {
                 return Err(sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "journal analyzes unknown table \"{}\"",
@@ -15847,7 +16152,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             row,
             ..
         } => {
-            let Some(index) = storage.find_table(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table) else {
                 return Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
                     message: stack_format!(192, "journal writes to unknown table \"{}\"", table),
@@ -15871,7 +16176,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             rowid,
             ..
         } => {
-            let Some(index) = storage.find_table(schema, table) else {
+            let Some(index) = storage.wal_table_slot(schema, table) else {
                 return Err(SqlError {
                     sqlstate: SqlState::known(sqlstate::UNDEFINED_TABLE),
                     message: stack_format!(192, "journal deletes from unknown table \"{}\"", table),

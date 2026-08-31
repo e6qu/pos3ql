@@ -21,6 +21,10 @@ pub(crate) const SIMILAR_TO: &str = "similar to";
 pub(crate) const OVERLAPS_PERIODS: &str = "overlaps periods";
 
 pub const MAX_LIST: usize = 64;
+/// A single `LOCK TABLE` may name every relation in the largest bounded
+/// catalog operation. This is separate from ordinary SQL lists because
+/// pg_dump locks its complete table set in one statement.
+pub const MAX_LOCK_TABLES: usize = crate::storage::MAX_PUBLICATION_TABLES;
 
 pub const MAX_CTES: usize = 16;
 /// Maximum number of `FOR UPDATE`/`FOR SHARE`/… clauses on one query.
@@ -508,6 +512,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn large_object_id(&mut self) -> Result<crate::sql::ast::LargeObjectId, ParseError> {
+        let Tok::Num(text) = self.peeked else {
+            return Err(self.unexpected("large-object OID must be an unsigned integer"));
+        };
+        let value = text
+            .parse::<u32>()
+            .ok()
+            .and_then(crate::sql::ast::LargeObjectId::parse)
+            .ok_or_else(|| self.unexpected("large-object OID must be between 1 and 4294967295"))?;
+        self.advance()?;
+        Ok(value)
+    }
+
     /// DECLARE name [BINARY] [INSENSITIVE|ASENSITIVE] [[NO] SCROLL] CURSOR
     /// [{WITH|WITHOUT} HOLD] FOR select ("declare" not yet consumed).
     fn declare_cursor(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -667,7 +684,7 @@ impl<'a> Parser<'a> {
     fn lock_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.advance()?; // lock
         let _ = self.eat_ident("table")?;
-        let mut names = [QualName::bare(""); 32];
+        let mut names = [QualName::bare(""); MAX_LOCK_TABLES];
         let mut count = 0usize;
         loop {
             let _ = self.eat_ident("only")?;
@@ -3606,6 +3623,24 @@ impl<'a> Parser<'a> {
 
     fn privilege_target(&mut self) -> Result<crate::sql::ast::PrivilegeTarget<'a>, ParseError> {
         use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget, RoutineTargetKind};
+        if self.eat_ident("large")? {
+            self.expect_ident("object")?;
+            let mut objects = [crate::sql::ast::LargeObjectId::parse(1).unwrap(); MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == objects.len() {
+                    return Err(self.limit("large-object privilege targets", objects.len()));
+                }
+                objects[count] = self.large_object_id()?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            return Ok(PrivilegeTarget::LargeObjects(
+                self.arena_slice(&objects[..count])?,
+            ));
+        }
         let kind = if self.eat_ident("all")? {
             if self.eat_ident("tables")? {
                 self.expect_ident("in")?;
@@ -4062,6 +4097,16 @@ impl<'a> Parser<'a> {
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
         use crate::sql::ast::AlterOwnerKind;
+        if self.eat_ident("large")? {
+            self.expect_ident("object")?;
+            let oid = self.large_object_id()?;
+            self.expect_ident("owner")?;
+            self.expect_ident("to")?;
+            return Ok(Stmt::AlterLargeObjectOwner {
+                oid,
+                role: self.any_ident("role name")?,
+            });
+        }
         if self.eat_ident("system")? {
             if self.eat_ident("set")? {
                 let name = self.any_ident("configuration parameter")?;
@@ -5480,6 +5525,9 @@ impl<'a> Parser<'a> {
             CommentTarget::Tablespace(self.col_ident("tablespace name")?)
         } else if self.eat_ident("database")? {
             CommentTarget::Database(self.col_ident("database name")?)
+        } else if self.eat_ident("large")? {
+            self.expect_ident("object")?;
+            CommentTarget::LargeObject(self.large_object_id()?)
         } else if self.eat_ident("collation")? {
             CommentTarget::Collation(self.qual_name("collation name")?)
         } else if self.eat_ident("conversion")? {
@@ -6525,6 +6573,25 @@ mod tests {
             };
             assert_eq!(alias, Some("half"));
             assert!(p.next_stmt().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn pg_dump_can_lock_a_complete_bounded_catalog() {
+        let mut sql = String::from("LOCK TABLE ");
+        for index in 0..MAX_LIST {
+            if index != 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("dump_relation_{index}"));
+        }
+        sql.push_str(" IN ACCESS SHARE MODE");
+        with_parser(&sql, |parser| {
+            let Stmt::LockTable { tables, mode, .. } = parser.next_stmt().unwrap().unwrap() else {
+                panic!("expected LOCK TABLE")
+            };
+            assert_eq!(tables.len(), MAX_LIST);
+            assert_eq!(mode, TableLockMode::AccessShare);
         });
     }
 

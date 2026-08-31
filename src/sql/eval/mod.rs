@@ -1144,7 +1144,7 @@ pub trait CatalogAccess {
     fn comment<'a>(
         &self,
         catalog_name: &str,
-        oid: i32,
+        oid: u32,
         subid: i32,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError>;
@@ -3453,6 +3453,12 @@ fn call<'a>(
             Ok(())
         }
     };
+    if argument_names.is_empty()
+        && let Some(result) =
+            super::large_object::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
     if argument_names.is_empty()
         && let Some(result) = funcs::bytea::dispatch(name, args, star, arena, params, row, hooks)
     {

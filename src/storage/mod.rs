@@ -99,6 +99,13 @@ pub(crate) const MAX_SUBSCRIPTION_PUBLICATIONS: usize = 16;
 pub(crate) const SUBSCRIPTION_CONNINFO_BYTES: usize = 512;
 pub(crate) const MAX_TRIGGER_ARGUMENTS: usize = 16;
 pub(crate) const TRIGGER_ARGUMENT_BYTES: usize = u8::MAX as usize;
+pub(crate) const LARGE_OBJECT_BLOCK_SIZE: usize = 2_048;
+pub(crate) const INTERNAL_LARGE_OBJECT_SCHEMA: &str = "pos3ql_internal";
+pub(crate) const INTERNAL_LARGE_OBJECT_TABLE: &str = "large_object_pages";
+
+const fn table_slot_capacity(config: &Config) -> usize {
+    config.max_tables + 1
+}
 
 /// A bounded trigger invocation argument vector.  SQL parses the literals once
 /// before catalog mutation; WAL and checkpoints carry the same typed state.
@@ -8545,6 +8552,36 @@ pub(crate) enum AccessClass {
     Trigger = 13,
     Database = 14,
     EventTrigger = 15,
+    LargeObject = 16,
+}
+
+/// A PostgreSQL large-object identity. Zero is reserved by the OID allocator
+/// and is rejected at the SQL and wire parse boundaries.
+pub(crate) type LargeObjectOid = crate::sql::ast::LargeObjectId;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LargeObjectDef {
+    pub database: DatabaseOid,
+    pub oid: LargeObjectOid,
+    pub ownership: Ownership,
+    pub created_at: u64,
+    pub allocated: bool,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl LargeObjectDef {
+    const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        oid: LargeObjectOid::parse(1).expect("one is a large-object identity"),
+        ownership: Ownership::BOOTSTRAP,
+        created_at: 0,
+        allocated: false,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn visible_to(self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
 }
 
 /// Object classes addressable by ALTER DEFAULT PRIVILEGES.
@@ -8608,6 +8645,7 @@ impl AccessClass {
             13 => Self::Trigger,
             14 => Self::Database,
             15 => Self::EventTrigger,
+            16 => Self::LargeObject,
             _ => return None,
         })
     }
@@ -8639,6 +8677,7 @@ impl PrivilegeSet {
     pub(crate) const MAINTAIN: Self = Self(1 << 10);
     pub(crate) const CONNECT: Self = Self(1 << 11);
     pub(crate) const TEMPORARY: Self = Self(1 << 12);
+    pub(crate) const LARGE_OBJECT_ALL: Self = Self(Self::SELECT.0 | Self::UPDATE.0);
 
     pub(crate) const TABLE_ALL: Self = Self(
         Self::SELECT.0
@@ -8687,6 +8726,7 @@ pub(crate) const fn all_object_privileges(class: AccessClass) -> PrivilegeSet {
         AccessClass::Schema => PrivilegeSet::SCHEMA_ALL,
         AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => PrivilegeSet::TYPE_ALL,
         AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
+        AccessClass::LargeObject => PrivilegeSet::LARGE_OBJECT_ALL,
         AccessClass::Tablespace => PrivilegeSet::CREATE,
         AccessClass::Database => PrivilegeSet::DATABASE_ALL,
         AccessClass::Index
@@ -9105,6 +9145,7 @@ pub enum CommentClass {
     TextSearchTemplate,
     TextSearchDictionary,
     TextSearchConfiguration,
+    LargeObject,
 }
 
 impl CommentClass {
@@ -9125,6 +9166,7 @@ impl CommentClass {
             CommentClass::TextSearchTemplate => 12,
             CommentClass::TextSearchDictionary => 13,
             CommentClass::TextSearchConfiguration => 14,
+            CommentClass::LargeObject => 15,
         }
     }
 
@@ -9145,6 +9187,7 @@ impl CommentClass {
             12 => CommentClass::TextSearchTemplate,
             13 => CommentClass::TextSearchDictionary,
             14 => CommentClass::TextSearchConfiguration,
+            15 => CommentClass::LargeObject,
             _ => return None,
         })
     }
@@ -9390,6 +9433,9 @@ pub(crate) struct PreparedTransactionCatalogEntry {
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
+    large_objects: FixedVec<LargeObjectDef>,
+    next_large_object_oid: Option<LargeObjectOid>,
+    large_object_page_table: u32,
     pending_table_defs: FixedVec<PendingTableDefSlot>,
     pending_table_statistics: FixedVec<PendingTableStatisticsSlot>,
     views: FixedVec<ViewDef>,
@@ -10123,7 +10169,7 @@ impl Storage {
     /// Bytes drawn beyond the row heap itself, for the memory plan.
     pub fn extra_budget_bytes(config: &Config) -> usize {
         2 * config.collation_scratch_bytes
-            + config.max_tables
+            + table_slot_capacity(config)
                 * (size_of::<Table>()
                     + FixedMap::<u64, RowState>::budget_bytes(config.table_rows)
                     + size_of::<ViewDef>()
@@ -10142,6 +10188,8 @@ impl Storage {
                     + size_of::<MatviewDef>()
                     + size_of::<StoredQueryDependencies>()
                     + size_of::<IndexDef>())
+            + FixedMap::<u64, RowState>::budget_bytes(config.large_object_pages)
+                .saturating_sub(FixedMap::<u64, RowState>::budget_bytes(config.table_rows))
             + config.max_rules * size_of::<RuleDef>()
             + MAX_COLLATIONS * size_of::<CollationDef>()
             + MAX_CONVERSIONS * size_of::<ConversionDef>()
@@ -10152,8 +10200,13 @@ impl Storage {
             + config.max_subscriptions
                 * config.subscription_relation_capacity
                 * size_of::<SubscriptionRelation>()
-            + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableDefSlot>()
-            + config.max_tables * MAX_PENDING_TABLE_DEFS * size_of::<PendingTableStatisticsSlot>()
+            + table_slot_capacity(config)
+                * MAX_PENDING_TABLE_DEFS
+                * size_of::<PendingTableDefSlot>()
+            + table_slot_capacity(config)
+                * MAX_PENDING_TABLE_DEFS
+                * size_of::<PendingTableStatisticsSlot>()
+            + config.max_large_objects * size_of::<LargeObjectDef>()
             + pending_extended_statistics_capacity(config)
                 * size_of::<PendingExtendedStatisticsDataSlot>()
             + MAX_SCHEMAS * size_of::<SchemaDef>()
@@ -10181,7 +10234,7 @@ impl Storage {
             + (config.max_connections as usize + config.max_prepared_transactions)
                 * size_of::<(u32, u64)>()
             + (config.max_connections as usize + config.max_prepared_transactions)
-                * config.max_tables
+                * table_slot_capacity(config)
                 * size_of::<TableLock>()
             + crate::sql::lock::LockManager::budget_bytes(
                 (config.max_connections as usize + config.max_prepared_transactions)
@@ -10189,25 +10242,26 @@ impl Storage {
                 config.max_connections as usize,
             )
             + (config.max_connections as usize + config.max_prepared_transactions)
-                * config.max_tables
+                * table_slot_capacity(config)
                 * size_of::<(u32, u32, u64, bool)>()
             + ValueIndexPool::budget_bytes(config.max_value_indexes, config.value_index_rows)
     }
 
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, BudgetError> {
         let heap = RowHeap::new(budget, config.memtable_bytes)?;
-        let mut tables = FixedVec::new(budget, "tables", config.max_tables)?;
+        let table_capacity = table_slot_capacity(config);
+        let mut tables = FixedVec::new(budget, "tables", table_capacity)?;
         let pending_table_defs = FixedVec::new(
             budget,
             "pending_table_defs",
-            config.max_tables * MAX_PENDING_TABLE_DEFS,
+            table_capacity * MAX_PENDING_TABLE_DEFS,
         )?;
         let pending_table_statistics = FixedVec::new(
             budget,
             "pending_table_statistics",
-            config.max_tables * MAX_PENDING_TABLE_DEFS,
+            table_capacity * MAX_PENDING_TABLE_DEFS,
         )?;
-        for _ in 0..config.max_tables {
+        for slot in 0..table_capacity {
             tables
                 .push(Table {
                     database: DatabaseOid::POSTGRES,
@@ -10235,7 +10289,15 @@ impl Storage {
                     pending_def_slots: [u32::MAX; MAX_PENDING_TABLE_DEFS],
                     n_pending_defs: 0,
                     pending_def_txid: None,
-                    rows: FixedMap::new(budget, "table_rows", config.table_rows)?,
+                    rows: FixedMap::new(
+                        budget,
+                        "table_rows",
+                        if slot == config.max_tables {
+                            config.large_object_pages
+                        } else {
+                            config.table_rows
+                        },
+                    )?,
                     created_at: 0,
                     live: false,
                     pending_ddl: None,
@@ -10259,6 +10321,38 @@ impl Storage {
                     n_enforcers: 0,
                 })
                 .expect("sized to max_tables");
+        }
+        let large_object_page_table = config.max_tables as u32;
+        {
+            let table = &mut tables[large_object_page_table as usize];
+            let mut definition = TableDef::empty();
+            definition.schema =
+                SqlName::parse(INTERNAL_LARGE_OBJECT_SCHEMA).expect("internal schema name fits");
+            definition.name =
+                SqlName::parse(INTERNAL_LARGE_OBJECT_TABLE).expect("internal relation name fits");
+            for (column, name, ctype) in [
+                (0, "database", ColType::Oid),
+                (1, "loid", ColType::Oid),
+                (2, "pageno", ColType::Int4),
+                (3, "data", ColType::Bytea),
+            ] {
+                definition.columns[column] = ColumnMeta {
+                    name: SqlName::parse(name).expect("internal column name fits"),
+                    ctype,
+                    not_null: NotNullOrigin::Local,
+                    ..ColumnMeta::EMPTY
+                };
+            }
+            definition.n_columns = 4;
+            definition.has_toast = true;
+            table.def = definition;
+            table.live = true;
+        }
+        let mut large_objects = FixedVec::new(budget, "large_objects", config.max_large_objects)?;
+        for _ in 0..config.max_large_objects {
+            large_objects
+                .push(LargeObjectDef::EMPTY)
+                .expect("sized to max_large_objects");
         }
         let mut views = FixedVec::new(budget, "views", config.max_tables)?;
         for _ in 0..config.max_tables {
@@ -10851,7 +10945,7 @@ impl Storage {
         let table_locks = std::cell::RefCell::new(FixedVec::new(
             budget,
             "table_locks",
-            transaction_capacity * config.max_tables,
+            transaction_capacity * table_capacity,
         )?);
         let row_locks = std::cell::RefCell::new(crate::sql::lock::LockManager::new(
             budget,
@@ -10861,11 +10955,14 @@ impl Storage {
         let serializable_snapshots = std::cell::RefCell::new(FixedVec::new(
             budget,
             "serializable_snapshots",
-            transaction_capacity * config.max_tables,
+            transaction_capacity * table_capacity,
         )?);
         Ok(Self {
             heap,
             tables,
+            large_objects,
+            next_large_object_oid: LargeObjectOid::parse(16_384),
+            large_object_page_table,
             pending_table_defs,
             pending_table_statistics,
             views,
@@ -12741,6 +12838,9 @@ impl Storage {
                 AccessClass::EventTrigger => {
                     self.event_triggers[usize::from(entry.object.slot)].database
                 }
+                AccessClass::LargeObject => {
+                    self.large_objects[usize::from(entry.object.slot)].database
+                }
                 AccessClass::Tablespace | AccessClass::Database => continue,
             };
             if object_database == database {
@@ -13157,6 +13257,7 @@ impl Storage {
             },
             AccessClass::EventTrigger => &self.event_triggers[slot].definition.ownership,
             AccessClass::Database => &self.databases[slot].ownership,
+            AccessClass::LargeObject => &self.large_objects[slot].ownership,
         }
     }
 
@@ -13181,6 +13282,7 @@ impl Storage {
             }
             AccessClass::EventTrigger => &mut self.event_triggers[slot].definition.ownership,
             AccessClass::Database => &mut self.databases[slot].ownership,
+            AccessClass::LargeObject => &mut self.large_objects[slot].ownership,
         }
     }
 
@@ -13205,6 +13307,211 @@ impl Storage {
     pub(crate) fn current_role_slot(&self, txid: u32) -> Option<usize> {
         let role = crate::sql::eval::funcs::system::current_user_owned();
         self.find_role_visible(role.as_str(), txid)
+    }
+
+    pub(crate) fn large_object_slot(&self, oid: LargeObjectOid, txid: u32) -> Option<usize> {
+        self.large_objects.iter().position(|object| {
+            object.database == self.current_database && object.oid == oid && object.visible_to(txid)
+        })
+    }
+
+    pub(crate) fn large_objects_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, LargeObjectDef)> + '_ {
+        self.large_objects
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(move |(_, object)| {
+                object.database == self.current_database && object.visible_to(txid)
+            })
+    }
+
+    pub(crate) fn checkpoint_large_objects(
+        &self,
+    ) -> impl Iterator<Item = (usize, LargeObjectDef)> + '_ {
+        self.large_objects
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, object)| object.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn large_object(&self, slot: usize) -> LargeObjectDef {
+        self.large_objects[slot]
+    }
+
+    pub(crate) fn create_large_object(
+        &mut self,
+        requested: Option<LargeObjectOid>,
+        txid: u32,
+    ) -> Result<(usize, LargeObjectOid), SqlError> {
+        let (oid, allocated) = match requested {
+            Some(oid) => {
+                if self.large_object_slot(oid, txid).is_some() {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "large object {} already exists",
+                        oid.get()
+                    ));
+                }
+                (oid, false)
+            }
+            None => {
+                let mut candidate = self.next_large_object_oid.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "no large-object OIDs remain"
+                    )
+                })?;
+                loop {
+                    self.next_large_object_oid = candidate
+                        .get()
+                        .checked_add(1)
+                        .and_then(LargeObjectOid::parse);
+                    if !self.large_objects.iter().any(|object| {
+                        object.database == self.current_database
+                            && object.ddl_state != CatalogDdlState::Absent
+                            && object.oid == candidate
+                    }) {
+                        break (candidate, true);
+                    }
+                    candidate = self.next_large_object_oid.ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "no large-object OIDs remain"
+                        )
+                    })?;
+                }
+            }
+        };
+        if let Some(owner) = self.large_objects.iter().find_map(|object| {
+            (object.database == self.current_database && object.oid == oid)
+                .then_some(object.ddl_state.pending_txid()?)
+                .filter(|owner| *owner != txid)
+        }) {
+            return Err(self.catalog_ddl_wait_error(txid, owner, "large object"));
+        }
+        let slot = self
+            .large_objects
+            .iter()
+            .position(|object| object.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many large objects (limit {})",
+                    self.large_objects.len()
+                )
+            })?;
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::LargeObject,
+            slot: slot as u16,
+        });
+        self.catalog_seq += 1;
+        self.large_objects[slot] = LargeObjectDef {
+            database: self.current_database,
+            oid,
+            ownership: self.initial_ownership(txid),
+            created_at: self.catalog_seq,
+            allocated,
+            ddl_state: if txid == 0 {
+                CatalogDdlState::Present
+            } else {
+                CatalogDdlState::PendingCreate { txid }
+            },
+        };
+        Ok((slot, oid))
+    }
+
+    pub(crate) fn drop_large_object(
+        &mut self,
+        oid: LargeObjectOid,
+        txid: u32,
+    ) -> Result<Option<usize>, SqlError> {
+        let Some(slot) = self.large_object_slot(oid, txid) else {
+            return Ok(None);
+        };
+        self.large_objects[slot].ddl_state = self.large_objects[slot].ddl_state.drop_by(txid);
+        Ok(Some(slot))
+    }
+
+    pub(crate) fn commit_large_object_create(&mut self, slot: usize) {
+        self.large_objects[slot].ddl_state = self.large_objects[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_large_object_create(&mut self, slot: usize) {
+        self.large_objects[slot].ddl_state = self.large_objects[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_large_object_drop(&mut self, slot: usize) {
+        let oid = self.large_objects[slot].oid;
+        self.drop_object_comments(
+            CommentClass::LargeObject,
+            "",
+            crate::stack_format!(16, "{}", oid.get()).as_str(),
+        );
+        self.clear_object_acl_entries(AccessObject {
+            class: AccessClass::LargeObject,
+            slot: slot as u16,
+        });
+        self.large_objects[slot].ddl_state = self.large_objects[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_large_object_drop(&mut self, slot: usize, txid: u32) {
+        self.large_objects[slot].ddl_state = self.large_objects[slot].ddl_state.rollback_drop(txid);
+    }
+
+    pub(crate) fn large_object_page_table(&self) -> usize {
+        self.large_object_page_table as usize
+    }
+
+    pub(crate) fn next_large_object_oid(&self) -> Option<LargeObjectOid> {
+        self.next_large_object_oid
+    }
+
+    pub(crate) fn restore_next_large_object_oid(&mut self, oid: Option<LargeObjectOid>) {
+        self.next_large_object_oid = oid;
+    }
+
+    pub(crate) fn is_large_object_page_relation(&self, schema: &str, name: &str) -> bool {
+        schema == INTERNAL_LARGE_OBJECT_SCHEMA && name == INTERNAL_LARGE_OBJECT_TABLE
+    }
+
+    pub(crate) fn wal_table_slot(&self, schema: &str, name: &str) -> Option<usize> {
+        if self.is_large_object_page_relation(schema, name) {
+            Some(self.large_object_page_table())
+        } else {
+            self.find_table(schema, name)
+        }
+    }
+
+    pub(crate) fn physical_table_count(&self) -> usize {
+        self.tables.len()
+    }
+
+    pub(crate) fn restore_large_object(
+        &mut self,
+        oid: LargeObjectOid,
+        created_at: u64,
+        allocated: bool,
+    ) -> Result<usize, SqlError> {
+        let (slot, _) = self.create_large_object(Some(oid), 0)?;
+        self.large_objects[slot].created_at = created_at;
+        self.large_objects[slot].allocated = allocated;
+        if allocated {
+            let next = oid.get().checked_add(1).and_then(LargeObjectOid::parse);
+            self.next_large_object_oid = match (self.next_large_object_oid, next) {
+                (None, _) | (_, None) => None,
+                (Some(current), Some(next)) => Some(if current.get() < next.get() {
+                    next
+                } else {
+                    current
+                }),
+            };
+        }
+        self.catalog_seq = self.catalog_seq.max(created_at);
+        Ok(slot)
     }
 
     pub(crate) fn table_access_object(&self, slot: usize, txid: u32) -> AccessObject {
@@ -13264,6 +13571,12 @@ impl Storage {
                 .is_empty()
                 .then(|| self.database_slot(name, txid))
                 .flatten(),
+            AccessClass::LargeObject => schema
+                .is_empty()
+                .then(|| name.parse::<u32>().ok())
+                .flatten()
+                .and_then(LargeObjectOid::parse)
+                .and_then(|oid| self.large_object_slot(oid, txid)),
         }?;
         u16::try_from(slot)
             .ok()
@@ -13348,6 +13661,13 @@ impl Storage {
                 SqlName::EMPTY,
                 self.databases[slot].definition_for(txid).name,
             ),
+            AccessClass::LargeObject => {
+                let name = crate::stack_format!(16, "{}", self.large_objects[slot].oid.get());
+                (
+                    SqlName::EMPTY,
+                    SqlName::parse(name.as_str()).expect("large-object OID fits a SQL name"),
+                )
+            }
         }
     }
 
@@ -13376,6 +13696,9 @@ impl Storage {
                 self.event_triggers[slot].ddl_state == CatalogDdlState::Present
             }
             AccessClass::Database => self.databases[slot].ddl_state == CatalogDdlState::Present,
+            AccessClass::LargeObject => {
+                self.large_objects[slot].ddl_state == CatalogDdlState::Present
+            }
         }
     }
 
@@ -13401,6 +13724,7 @@ impl Storage {
             AccessClass::Trigger => self.triggers[slot].visible_to(txid),
             AccessClass::EventTrigger => self.event_triggers[slot].visible_to(txid),
             AccessClass::Database => self.databases[slot].visible_to(txid),
+            AccessClass::LargeObject => self.large_objects[slot].visible_to(txid),
         }
     }
 
@@ -13426,6 +13750,7 @@ impl Storage {
             AccessClass::Extension => Some(self.extensions[slot].database),
             AccessClass::Trigger => Some(self.triggers[slot].database),
             AccessClass::EventTrigger => Some(self.event_triggers[slot].database),
+            AccessClass::LargeObject => Some(self.large_objects[slot].database),
             AccessClass::Tablespace | AccessClass::Database => None,
         }
     }
@@ -13525,6 +13850,14 @@ impl Storage {
                 let created_at = self.event_triggers[source_slot].created_at;
                 self.event_triggers.iter().position(|candidate| {
                     candidate.database == target_database && candidate.created_at == created_at
+                })?
+            }
+            AccessClass::LargeObject => {
+                let oid = self.large_objects[source_slot].oid;
+                self.large_objects.iter().position(|candidate| {
+                    candidate.database == target_database
+                        && candidate.ddl_state != CatalogDdlState::Absent
+                        && candidate.oid == oid
                 })?
             }
             AccessClass::Database | AccessClass::Tablespace => return None,
@@ -13799,6 +14132,7 @@ impl Storage {
             AccessClass::Trigger => self.triggers.len(),
             AccessClass::EventTrigger => self.event_triggers.len(),
             AccessClass::Database => self.databases.len(),
+            AccessClass::LargeObject => self.large_objects.len(),
         }
     }
 
@@ -18930,7 +19264,7 @@ impl Storage {
     }
 
     pub fn table_count(&self) -> usize {
-        self.tables.len()
+        self.large_object_page_table as usize
     }
 
     /// Resolves a logical insert target to its owning leaf.  One typed catalog
@@ -20265,7 +20599,7 @@ impl Storage {
     /// Committed-catalog lookup (ignores uncommitted DDL): used by journal
     /// replay and any context that operates on the durable image.
     pub fn find_table(&self, schema: &str, name: &str) -> Option<usize> {
-        self.tables.iter().position(|t| {
+        self.tables.iter().take(self.table_count()).position(|t| {
             t.database == self.current_database
                 && t.live
                 && t.def.schema.as_str() == schema
@@ -20277,12 +20611,16 @@ impl Storage {
     /// and every committed table, but not another transaction's uncommitted
     /// DDL.
     pub fn find_visible(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
-        self.tables.iter().enumerate().position(|(index, table)| {
-            table.database == self.current_database
-                && table.visible_to(txid)
-                && self.table_def(index, txid).schema.as_str() == schema
-                && self.table_def(index, txid).name.as_str() == name
-        })
+        self.tables
+            .iter()
+            .take(self.table_count())
+            .enumerate()
+            .position(|(index, table)| {
+                table.database == self.current_database
+                    && table.visible_to(txid)
+                    && self.table_def(index, txid).schema.as_str() == schema
+                    && self.table_def(index, txid).name.as_str() == name
+            })
     }
 
     pub fn table(&self, index: usize) -> &Table {
@@ -33627,10 +33965,11 @@ mod tests {
             CommentClass::TextSearchTemplate,
             CommentClass::TextSearchDictionary,
             CommentClass::TextSearchConfiguration,
+            CommentClass::LargeObject,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(15), None);
+        assert_eq!(CommentClass::from_u8(16), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 

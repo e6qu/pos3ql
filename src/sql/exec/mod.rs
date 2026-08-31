@@ -3373,6 +3373,73 @@ pub fn alter_owner(
     sql_ok()
 }
 
+pub fn alter_large_object_owner(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    oid: crate::sql::ast::LargeObjectId,
+    role: &str,
+    responder: &mut Responder,
+) -> Outcome {
+    use crate::storage::{AccessClass, AccessObject};
+    let Some(slot) = storage.large_object_slot(oid, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "large object {} does not exist",
+            oid.get()
+        ));
+    };
+    let object = AccessObject {
+        class: AccessClass::LargeObject,
+        slot: slot as u16,
+    };
+    let role = resolve_role_name(role);
+    let Some(new_owner) = storage.find_role_visible(role.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            role.as_str()
+        ));
+    };
+    let current = super::eval::funcs::system::current_user_owned();
+    let Some(current_role) = storage.find_role_visible(current.as_str(), txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "role \"{}\" does not exist",
+            current.as_str()
+        ));
+    };
+    let superuser = storage.role(current_role).attributes_to(txn.txid).superuser;
+    if !superuser && storage.object_owner(object, txn.txid) != current_role {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be owner of large object {}",
+            oid.get()
+        ));
+    }
+    if !superuser
+        && current_role != new_owner
+        && !storage.role_can_set(current_role, new_owner, txn.txid)
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be able to SET ROLE \"{}\"",
+            role.as_str()
+        ));
+    }
+    let old_owner = storage.object_owner(object, txn.txid) as u16;
+    let prior = storage.set_object_owner(object, new_owner, txn.txid);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged { object, prior }) {
+        storage.restore_object_owner(object, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = rewrite_object_acl_owner(storage, txn, object, old_owner, new_owner as u16)
+    {
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER LARGE OBJECT")?;
+    sql_ok()
+}
+
 fn resolve_role_name(written: &str) -> crate::util::StackStr<64> {
     match written {
         "current_role" | "current_user" => super::eval::funcs::system::current_user_owned(),
@@ -4836,6 +4903,7 @@ fn privilege_mask(
         AccessClass::Domain | AccessClass::Enum => PrivilegeSet::TYPE_ALL,
         AccessClass::Index => PrivilegeSet::NONE,
         AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
+        AccessClass::LargeObject => PrivilegeSet::LARGE_OBJECT_ALL,
         AccessClass::Composite => PrivilegeSet::TYPE_ALL,
         AccessClass::Tablespace => PrivilegeSet::CREATE,
         AccessClass::Database => PrivilegeSet::DATABASE_ALL,
@@ -4900,6 +4968,7 @@ fn privilege_object_noun(class: crate::storage::AccessClass) -> &'static str {
         AccessClass::Schema => "schema",
         AccessClass::Sequence => "sequence",
         AccessClass::Routine => "function",
+        AccessClass::LargeObject => "large object",
         AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => "type",
         AccessClass::Tablespace => "tablespace",
         _ => "relation",
@@ -5146,7 +5215,10 @@ fn apply_default_privileges_to_new_object(
         AccessClass::Tablespace => return Ok(()),
         AccessClass::Database => return Ok(()),
         AccessClass::Statistics => return Ok(()),
-        AccessClass::Extension | AccessClass::Trigger | AccessClass::EventTrigger => return Ok(()),
+        AccessClass::Extension
+        | AccessClass::Trigger
+        | AccessClass::EventTrigger
+        | AccessClass::LargeObject => return Ok(()),
     };
     let owner = storage.object_owner(object, txn.txid) as u16;
     let schema = if object.class == AccessClass::Schema {
@@ -6488,6 +6560,25 @@ fn resolve_privilege_objects(
     use crate::storage::{AccessClass, AccessObject};
     let mut count = 0usize;
     match target {
+        PrivilegeTarget::LargeObjects(oids) => {
+            for oid in oids {
+                let Some(slot) = storage.large_object_slot(*oid, txid) else {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "large object {} does not exist",
+                        oid.get()
+                    ));
+                };
+                add_privilege_object(
+                    objects,
+                    &mut count,
+                    AccessObject {
+                        class: AccessClass::LargeObject,
+                        slot: slot as u16,
+                    },
+                )?;
+            }
+        }
         PrivilegeTarget::Routines { kind, identities } => {
             for identity in identities {
                 let schema = identity.name.schema.unwrap_or("public");
@@ -26861,6 +26952,28 @@ pub fn comment(
             };
             (CommentClass::Database, SqlName::EMPTY, stored, 0u32)
         }
+        CommentTarget::LargeObject(oid) => {
+            let Some(slot) = storage.large_object_slot(oid, txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "large object {} does not exist",
+                    oid.get()
+                ));
+            };
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::LargeObject,
+                slot: slot as u16,
+            };
+            if let Err(error) = storage.require_owner(object, txid, "large object") {
+                return sql_fail(error);
+            }
+            let rendered = stack_format!(16, "{}", oid.get());
+            let stored = match SqlName::parse(rendered.as_str()) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (CommentClass::LargeObject, SqlName::EMPTY, stored, 0u32)
+        }
         CommentTarget::Collation(collation_name) => {
             let Some(slot) =
                 storage.collation_slot_on_path(collation_name.schema, collation_name.name, txid)
@@ -44079,6 +44192,8 @@ where
                     None => sel,
                 };
                 let mut count = 0usize;
+                let invocation_cursor = super::query::active_routine_invocations()
+                    .map(|(invocations, _)| invocations.cursor());
                 {
                     let dry = crate::sql::sequence::SeqEval::dry(storage, seq_session, txn.txid);
                     if let Err(e) = super::query::select_into_rows_recycling(
@@ -44096,6 +44211,11 @@ where
                     ) {
                         return sql_fail(e);
                     }
+                }
+                if let Some((invocations, _)) = super::query::active_routine_invocations()
+                    && let Some(cursor) = invocation_cursor
+                {
+                    invocations.restore_cursor(cursor);
                 }
                 let empty: &[u8] = &[];
                 let rows: &mut [&[u8]] = match arena.alloc_slice_with(count, |_| empty) {

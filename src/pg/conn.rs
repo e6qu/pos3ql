@@ -375,7 +375,11 @@ impl Conn {
             recv: FixedBuf::new(budget, "conn_recv", config.conn_recv_buffer_bytes)?,
             send: FixedBuf::new(budget, "conn_send", config.conn_send_buffer_bytes)?,
             arena: Arena::new(budget, "conn_sql_arena", config.sql_arena_bytes)?,
-            txn: TxnState::new(budget, config.txn_rows)?,
+            txn: TxnState::new_with_large_objects(
+                budget,
+                config.txn_rows,
+                config.max_large_object_descriptors,
+            )?,
             sqlprep: SqlPreparedPool::new(config, budget)?,
             cursors: crate::sql::cursor::CursorPool::new(config, budget)?,
             guc: GucState::new(),
@@ -1392,6 +1396,7 @@ impl Conn {
             wire::FMSG_DESCRIBE => self.handle_describe(engine, total),
             wire::FMSG_EXECUTE => self.handle_execute(engine, total),
             wire::FMSG_CLOSE => self.handle_close(total),
+            wire::FMSG_FUNCTION_CALL => self.handle_function_call(engine, total),
             _ => {
                 let mut responder = Responder::new(&mut self.send);
                 let _ = responder.error(
@@ -1405,6 +1410,160 @@ impl Conn {
             self.recv.consume(total);
         }
         step
+    }
+
+    fn handle_function_call(&mut self, engine: &mut Engine, total: usize) -> Step {
+        const MAX_FAST_PATH_ARGUMENTS: usize = 3;
+        self.arena.reset();
+        let payload = &self.recv.readable()[5..total];
+        let mut input = MsgIn::new(payload);
+        let Ok(function_oid) = input.i32() else {
+            return self.protocol_error("malformed FunctionCall message");
+        };
+        let Some((argument_oids, _result_oid)) =
+            Engine::large_object_fast_path_signature(function_oid)
+        else {
+            let message = stack_format!(96, "function with OID {} does not exist", function_oid);
+            return self.function_call_error(
+                engine,
+                sqlstate::UNDEFINED_FUNCTION,
+                message.as_str(),
+            );
+        };
+        let Ok(format_count) = input.i16() else {
+            return self.protocol_error("malformed FunctionCall format list");
+        };
+        if format_count < 0 || format_count as usize > MAX_FAST_PATH_ARGUMENTS {
+            return self.protocol_error("invalid FunctionCall format count");
+        }
+        let mut formats = [0i16; MAX_FAST_PATH_ARGUMENTS];
+        for format in &mut formats[..format_count as usize] {
+            let Ok(value) = input.i16() else {
+                return self.protocol_error("malformed FunctionCall format list");
+            };
+            if !matches!(value, 0 | 1) {
+                return self.protocol_error("invalid FunctionCall format code");
+            }
+            *format = value;
+        }
+        let Ok(argument_count) = input.i16() else {
+            return self.protocol_error("malformed FunctionCall argument list");
+        };
+        if argument_count < 0
+            || argument_count as usize != argument_oids.len()
+            || argument_count as usize > MAX_FAST_PATH_ARGUMENTS
+            || !matches!(format_count as usize, 0 | 1)
+                && format_count as usize != argument_oids.len()
+        {
+            return self.protocol_error("FunctionCall argument count does not match the function");
+        }
+        let mut spans = [(0usize, None); MAX_FAST_PATH_ARGUMENTS];
+        for span in &mut spans[..argument_count as usize] {
+            let Ok(length) = input.i32() else {
+                return self.protocol_error("malformed FunctionCall argument");
+            };
+            if length == -1 {
+                span.1 = None;
+                continue;
+            }
+            let Ok(length) = usize::try_from(length) else {
+                return self.protocol_error("invalid FunctionCall argument length");
+            };
+            let start = payload.len() - input.remaining();
+            if input.take(length).is_err() {
+                return self.protocol_error("malformed FunctionCall argument");
+            }
+            *span = (start, Some(length));
+        }
+        let Ok(result_format) = input.i16() else {
+            return self.protocol_error("malformed FunctionCall result format");
+        };
+        if !input.done() || !matches!(result_format, 0 | 1) {
+            return self.protocol_error("invalid FunctionCall result format");
+        }
+        let mut arguments = [Datum::Null; MAX_FAST_PATH_ARGUMENTS];
+        for index in 0..argument_oids.len() {
+            let Some(length) = spans[index].1 else {
+                continue;
+            };
+            let bytes = &payload[spans[index].0..spans[index].0 + length];
+            let format = match format_count {
+                0 => 0,
+                1 => formats[0],
+                _ => formats[index],
+            };
+            let decoded = if format == 1 {
+                engine.decode_binary_parameter(
+                    argument_oids[index],
+                    bytes,
+                    &self.arena,
+                    self.txn.txid,
+                )
+            } else {
+                engine.decode_text_parameter(
+                    argument_oids[index],
+                    bytes,
+                    &self.arena,
+                    self.txn.txid,
+                )
+            };
+            match decoded {
+                Ok(value) => arguments[index] = value,
+                Err(error) => {
+                    return self.function_call_error(
+                        engine,
+                        error.sqlstate,
+                        error.message.as_str(),
+                    );
+                }
+            }
+        }
+        let result = {
+            let mut responder = Responder::new(&mut self.send);
+            engine.execute_large_object_fast_path(
+                function_oid,
+                &arguments[..argument_oids.len()],
+                result_format == 1,
+                &self.arena,
+                &mut self.txn,
+                &self.guc,
+                &mut responder,
+                self.id,
+            )
+        };
+        match result {
+            Ok(_) => Step::Continue,
+            Err(WireFull) => Step::Close,
+        }
+    }
+
+    fn function_call_error(
+        &mut self,
+        engine: &mut Engine,
+        state: impl AsRef<str>,
+        message: &str,
+    ) -> Step {
+        if self.txn.is_explicit() {
+            self.txn.failed = true;
+        } else {
+            engine.rollback_txn(&mut self.txn, &self.guc);
+        }
+        let mut responder = Responder::new(&mut self.send);
+        if responder
+            .error(state.as_ref(), message)
+            .and_then(|()| responder.ready_for_query(self.txn.status_byte()))
+            .is_ok()
+        {
+            Step::Continue
+        } else {
+            Step::Close
+        }
+    }
+
+    fn protocol_error(&mut self, message: &str) -> Step {
+        let mut responder = Responder::new(&mut self.send);
+        let _ = responder.error(sqlstate::PROTOCOL_VIOLATION, message);
+        Step::Close
     }
 
     /// Frontend traffic while a COPY FROM STDIN is in flight. CopyData
@@ -4389,6 +4548,127 @@ fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, messa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn function_call(function: i32, arguments: &[&[u8]], binary_result: bool) -> Vec<u8> {
+        let payload_len = 4
+            + 2
+            + 2
+            + 2
+            + arguments
+                .iter()
+                .map(|argument| 4 + argument.len())
+                .sum::<usize>()
+            + 2;
+        let mut message = Vec::with_capacity(payload_len + 5);
+        message.push(wire::FMSG_FUNCTION_CALL);
+        message.extend_from_slice(&((payload_len + 4) as i32).to_be_bytes());
+        message.extend_from_slice(&function.to_be_bytes());
+        message.extend_from_slice(&1i16.to_be_bytes());
+        message.extend_from_slice(&1i16.to_be_bytes());
+        message.extend_from_slice(&(arguments.len() as i16).to_be_bytes());
+        for argument in arguments {
+            message.extend_from_slice(&(argument.len() as i32).to_be_bytes());
+            message.extend_from_slice(argument);
+        }
+        message.extend_from_slice(&i16::from(binary_result).to_be_bytes());
+        message
+    }
+
+    #[test]
+    fn fast_path_large_objects_use_postgresql_function_call_frames() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("pos3ql-fast-path-{}-{suffix}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        config.object_store_namespace =
+            format!("fast-path-large-object-{}-{suffix}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        config.max_tables = 8;
+        config.table_rows = 256;
+        config.large_object_pages = 64;
+        config.wal_bytes = 1 << 20;
+        config.wal_buffer_bytes = 1 << 16;
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).expect("engine");
+        let mut connection = Conn::new(&config, &mut budget).expect("connection");
+        connection.phase = Phase::Ready;
+
+        let mut query = vec![wire::FMSG_QUERY];
+        query.extend_from_slice(&13i32.to_be_bytes());
+        query.extend_from_slice(b"SELECT 1\0");
+        connection.recv.append(&query);
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let requested = 98_765u32.to_be_bytes();
+        connection
+            .recv
+            .append(&function_call(3457, &[&requested, b"fast-path"], true));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert_eq!(
+            connection.send.readable(),
+            &[
+                wire::MSG_FUNCTION_CALL_RESPONSE,
+                0,
+                0,
+                0,
+                12,
+                0,
+                0,
+                0,
+                4,
+                0,
+                1,
+                0x81,
+                0xcd,
+                wire::MSG_READY_FOR_QUERY,
+                0,
+                0,
+                0,
+                5,
+                b'I',
+            ]
+        );
+
+        assert!(engine.checkpoint().expect("large-object checkpoint"));
+
+        connection.send.clear();
+        connection
+            .recv
+            .append(&function_call(3458, &[&requested], true));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        let response = connection.send.readable();
+        assert_eq!(response[0], wire::MSG_FUNCTION_CALL_RESPONSE);
+        assert_eq!(&response[9..18], b"fast-path");
+        assert_eq!(
+            &response[18..],
+            &[wire::MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I']
+        );
+
+        drop(connection);
+        drop(engine);
+        crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn startup_event_trigger_escape_hatch_is_superuser_only() {

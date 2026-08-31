@@ -18,10 +18,18 @@ INSERT INTO attached_index_constraint VALUES (1, 1);
 INSERT INTO attached_index_constraint VALUES (1, 2);
 DROP INDEX attached_index_constraint_pkey;
 
+ALTER TABLE attached_index_constraint
+  RENAME CONSTRAINT attached_index_constraint_code_idx
+  TO attached_index_constraint_code_key;
 ALTER INDEX attached_index_constraint_pkey
   RENAME TO attached_index_constraint_primary;
 SELECT relname
 FROM pg_class
-WHERE relname IN ('attached_index_constraint_pkey', 'attached_index_constraint_primary');
+WHERE relname IN ('attached_index_constraint_pkey', 'attached_index_constraint_primary',
+                  'attached_index_constraint_code_idx', 'attached_index_constraint_code_key')
+ORDER BY relname;
 ALTER TABLE attached_index_constraint DROP CONSTRAINT attached_index_constraint_primary;
-SELECT count(*) FROM pg_class WHERE relname = 'attached_index_constraint_primary';
+ALTER TABLE attached_index_constraint DROP CONSTRAINT attached_index_constraint_code_key;
+SELECT count(*)
+FROM pg_class
+WHERE relname IN ('attached_index_constraint_primary', 'attached_index_constraint_code_key');

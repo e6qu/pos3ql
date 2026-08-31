@@ -16930,8 +16930,11 @@ fn unique_and_primary_key_constraints_attach_existing_indexes_durably() {
         &mut engine,
         &mut budget,
         &mut txn,
-        "ALTER INDEX attached_keys_primary RENAME TO attached_keys_pkey; \
-         ALTER TABLE attached_keys DROP CONSTRAINT attached_keys_pkey",
+        "ALTER TABLE attached_keys RENAME CONSTRAINT attached_keys_code_idx \
+           TO attached_keys_code_key; \
+         ALTER INDEX attached_keys_primary RENAME TO attached_keys_pkey; \
+         ALTER TABLE attached_keys DROP CONSTRAINT attached_keys_pkey; \
+         ALTER TABLE attached_keys DROP CONSTRAINT attached_keys_code_key",
     );
     assert_eq!(
         data_rows(&run_with_txn_bytes(
@@ -16939,7 +16942,8 @@ fn unique_and_primary_key_constraints_attach_existing_indexes_durably() {
             &mut budget,
             &mut txn,
             "SELECT relname FROM pg_class WHERE relname IN \
-               ('attached_keys_primary', 'attached_keys_pkey')",
+               ('attached_keys_primary', 'attached_keys_pkey', \
+                'attached_keys_code_idx', 'attached_keys_code_key')",
         )),
         Vec::<String>::new()
     );

@@ -2916,7 +2916,22 @@ pub struct CreateTable<'a> {
     /// The table's partitioning role.  This is structured at parse time so
     /// execution never needs to reinterpret a SQL fragment as a bound.
     pub partition: PartitionClause<'a>,
+    /// The PostgreSQL table access method, resolved before storage mutation.
+    pub access_method: TableAccessMethod<'a>,
+    /// An explicit relation tablespace. `None` selects the database default.
+    pub tablespace: Option<&'a str>,
     pub if_not_exists: bool,
+}
+
+/// Parsed access-method spelling; only an executable variant can reach a
+/// durable relation definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAccessMethod<'a> {
+    Heap,
+    /// A syntactically valid access-method name whose catalog resolution is
+    /// deferred to execution. It cannot reach storage unless it resolves to
+    /// one of the executable variants above.
+    Named(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3925,6 +3940,12 @@ pub enum AlterAction<'a> {
     DropNotNull {
         column: &'a str,
     },
+    /// ALTER [COLUMN] col SET STATISTICS target. `-1` is PostgreSQL's
+    /// `DEFAULT` target and remains a valid stored value.
+    SetStatistics {
+        column: &'a str,
+        target: i16,
+    },
     /// ALTER [COLUMN] col [SET DATA] TYPE newtype [USING expr]. Without `using`
     /// the stored value is cast through the assignment cast; with it, `using`
     /// is evaluated per row (the old columns in scope) and cast to the type.
@@ -3960,6 +3981,10 @@ pub enum AlterAction<'a> {
         enabled: TriggerEnableMode,
     },
     SetRowLevelSecurity(RowLevelSecurityAlteration),
+    /// ALTER TABLE ... SET TABLESPACE name.
+    SetTablespace(&'a str),
+    /// ALTER TABLE ... SET ACCESS METHOD heap.
+    SetAccessMethod(TableAccessMethod<'a>),
     /// ALTER TABLE ... REPLICA IDENTITY controls the old tuple emitted for
     /// logical UPDATE and DELETE messages.
     SetReplicaIdentity(ReplicaIdentityTarget<'a>),

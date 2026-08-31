@@ -33,7 +33,7 @@ use crate::sql::ast::{
     StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName,
     StatisticsTarget, SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions,
     SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
-    SubscriptionSynchronousCommit, TablespaceOptionNames, TablespaceOptions,
+    SubscriptionSynchronousCommit, TableAccessMethod, TablespaceOptionNames, TablespaceOptions,
     TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption, TriggerEvent,
     TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables, ViewSecurity,
 };
@@ -4514,7 +4514,7 @@ impl<'a> Parser<'a> {
 
     /// A signed integer literal for a sequence option. Parses through `i128` so
     /// `MINVALUE -9223372036854775808` (i64::MIN) is representable.
-    fn seq_int(&mut self) -> Result<i64, ParseError> {
+    pub(super) fn seq_int(&mut self) -> Result<i64, ParseError> {
         let negative = self.eat_op("-")?;
         if !negative {
             let _ = self.eat_op("+")?;
@@ -4677,6 +4677,8 @@ impl<'a> Parser<'a> {
                 constraints: &[],
                 likes: &[],
                 partition: PartitionClause::None,
+                access_method: TableAccessMethod::Heap,
+                tablespace: None,
                 if_not_exists: false,
             });
         let mut elements: [&'a CreateSchemaElement<'a>; 16] = [&EMPTY_SCHEMA_ELEMENT; 16];
@@ -6802,6 +6804,21 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            let access_method = if self.eat_ident("using")? {
+                let method = self.any_ident("table access method")?;
+                if method.eq_ignore_ascii_case("heap") {
+                    TableAccessMethod::Heap
+                } else {
+                    TableAccessMethod::Named(method)
+                }
+            } else {
+                TableAccessMethod::Heap
+            };
+            let tablespace = if self.eat_ident("tablespace")? {
+                Some(self.col_ident("tablespace name")?)
+            } else {
+                None
+            };
             let relation = CreateTable {
                 name,
                 columns: &[],
@@ -6812,6 +6829,8 @@ impl<'a> Parser<'a> {
                     bound,
                     subpartition,
                 },
+                access_method,
+                tablespace,
                 if_not_exists,
             };
             if foreign {
@@ -7113,6 +7132,21 @@ impl<'a> Parser<'a> {
         } else {
             PartitionClause::None
         };
+        let access_method = if self.eat_ident("using")? {
+            let method = self.any_ident("table access method")?;
+            if method.eq_ignore_ascii_case("heap") {
+                TableAccessMethod::Heap
+            } else {
+                TableAccessMethod::Named(method)
+            }
+        } else {
+            TableAccessMethod::Heap
+        };
+        let tablespace = if self.eat_ident("tablespace")? {
+            Some(self.col_ident("tablespace name")?)
+        } else {
+            None
+        };
         let columns = self.arena_slice(&columns[..n])?;
         let constraints = self.arena_slice(&cons[..n_cons])?;
         let likes = self.arena_slice(&likes[..n_likes])?;
@@ -7122,6 +7156,8 @@ impl<'a> Parser<'a> {
             constraints,
             likes,
             partition,
+            access_method,
+            tablespace,
             if_not_exists,
         };
         if foreign {

@@ -406,6 +406,20 @@ fn create_table_kind(
     } else {
         crate::storage::TableKind::Local
     };
+    def.access_method = match statement.access_method {
+        crate::sql::ast::TableAccessMethod::Heap => crate::storage::TableAccessMethod::Heap,
+        crate::sql::ast::TableAccessMethod::Named(name) => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "access method \"{}\" does not exist",
+                name
+            ));
+        }
+    };
+    def.tablespace = match resolve_relation_tablespace(storage, statement.tablespace, txn.txid) {
+        Ok(tablespace) => tablespace,
+        Err(error) => return sql_fail(error),
+    };
     // A copied constraint lands before the explicitly written ones, so a
     // duplicate primary key is caught with PostgreSQL's own message.
     if let Err(e) = copy_like_constraints(storage, &mut def, statement, txn.txid) {
@@ -29072,6 +29086,7 @@ pub fn create_table_as(
             identity_always: false,
             auto_increment_step: 1,
             user_type,
+            statistics_target: -1,
         };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
@@ -35934,6 +35949,7 @@ fn verify_composite_attribute_type(
                             identity_always: false,
                             auto_increment_step: 1,
                             user_type: change.replacement.user_type,
+                            statistics_target: -1,
                         };
                         let converted = coerce(
                             field.value,
@@ -37501,7 +37517,7 @@ pub fn create_index(
         },
         None => None,
     };
-    let tablespace = match resolve_index_tablespace(storage, command.tablespace, txn.txid) {
+    let tablespace = match resolve_relation_tablespace(storage, command.tablespace, txn.txid) {
         Ok(tablespace) => tablespace,
         Err(error) => return sql_fail(error),
     };
@@ -38038,7 +38054,7 @@ pub fn alter_index(
                 .expect("resolved index is visible")
                 .mutable_for(txn.txid);
             definition.tablespace =
-                match resolve_index_tablespace(storage, Some(tablespace), txn.txid) {
+                match resolve_relation_tablespace(storage, Some(tablespace), txn.txid) {
                     Ok(tablespace) => tablespace,
                     Err(error) => return sql_fail(error),
                 };
@@ -38231,7 +38247,7 @@ pub fn alter_indexes_tablespace(
             ));
         }
     };
-    let target_slot = match resolve_index_tablespace(storage, Some(command.target), txn.txid) {
+    let target_slot = match resolve_relation_tablespace(storage, Some(command.target), txn.txid) {
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
     };
@@ -38280,7 +38296,7 @@ fn stored_tablespace_options(
     }
 }
 
-fn resolve_index_tablespace(
+fn resolve_relation_tablespace(
     storage: &Storage,
     name: Option<&str>,
     txid: u32,
@@ -39500,7 +39516,7 @@ pub fn reindex(
     }
     if let Some(tablespace) = options.tablespace {
         let selected_tablespace =
-            match resolve_index_tablespace(storage, Some(tablespace), txn.txid) {
+            match resolve_relation_tablespace(storage, Some(tablespace), txn.txid) {
                 Ok(tablespace) => tablespace,
                 Err(error) => return sql_fail(error),
             };
@@ -45054,6 +45070,7 @@ pub(crate) fn view_trigger_definition(
             identity_always: false,
             auto_increment_step: 1,
             user_type,
+            statistics_target: -1,
         };
     }
     Ok(definition)
@@ -50221,6 +50238,27 @@ fn alter_table_inner(
             AlterAction::SetRowLevelSecurity(_) => {
                 unreachable!("row-level security is a standalone action")
             }
+            AlterAction::SetTablespace(name) => {
+                new_def.tablespace =
+                    match resolve_relation_tablespace(storage, Some(name), txn.txid) {
+                        Ok(tablespace) => tablespace,
+                        Err(error) => return sql_fail(error),
+                    };
+            }
+            AlterAction::SetAccessMethod(method) => {
+                new_def.access_method = match method {
+                    crate::sql::ast::TableAccessMethod::Heap => {
+                        crate::storage::TableAccessMethod::Heap
+                    }
+                    crate::sql::ast::TableAccessMethod::Named(name) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "access method \"{}\" does not exist",
+                            name
+                        ));
+                    }
+                };
+            }
             AlterAction::SetReplicaIdentity(target) => {
                 let (mode, selected) = match resolve_replica_identity_target(
                     storage,
@@ -50587,6 +50625,12 @@ fn alter_table_inner(
                     ));
                 }
                 new_def.columns[i].not_null = new_def.columns[i].not_null.drop_local();
+            }
+            AlterAction::SetStatistics { column, target } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                new_def.columns[i].statistics_target = *target;
             }
             AlterAction::AlterColumnType {
                 column,
@@ -52704,6 +52748,7 @@ fn coerce_composite_value_inner<'a>(
             identity_always: false,
             auto_increment_step: 1,
             user_type: field.user_type,
+            statistics_target: -1,
         };
         out.name = arena.alloc_str(field.name.as_str()).map_err(|_| {
             sql_err!(

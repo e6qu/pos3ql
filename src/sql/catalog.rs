@@ -5913,6 +5913,7 @@ fn materialize_def(specification: SynthDef<'_>) -> TableDef {
             identity_always: false,
             auto_increment_step: 1,
             user_type: None,
+            statistics_target: -1,
         }; MAX_COLUMNS],
         n_columns: specification.columns.len(),
         ..TableDef::empty()
@@ -7471,7 +7472,9 @@ fn pg_class<'a>(
                 Datum::Int4(table_def.n_columns as i32),
                 Datum::Float8(reltuples),
                 Datum::Int4(relpages),
-                Datum::Int4(0), // relam
+                Datum::Int4(match table_def.access_method {
+                    crate::storage::TableAccessMethod::Heap => 2,
+                }),
                 Datum::Int4(relation_owner),
                 Datum::Int4(n_checks), // relchecks
                 Datum::Bool(has_index),
@@ -7480,7 +7483,7 @@ fn pg_class<'a>(
                 Datum::Bool(table_def.row_level_security.enabled),
                 Datum::Bool(table_def.row_level_security.forced),
                 Datum::Bool(table_def.partition.is_attached()),
-                Datum::Int4(0), // reltablespace
+                Datum::Int4(catalog_tablespace_oid(storage, table_def.tablespace, txid)),
                 Datum::Int4(0), // reloftype
                 Datum::Int4(if table_def.has_toast {
                     toast_relation_oid(slot)
@@ -10009,8 +10012,8 @@ fn pg_attribute<'a>(
                     // Fixed-width values are plain; variable-width values use
                     // PostgreSQL's ordinary extended storage policy.
                     text(type_storage(c.ctype), arena)?,
-                    text("", arena)?,   // attcompression: type default
-                    Datum::Int4(-1),    // attstattarget: use server default
+                    text("", arena)?, // attcompression: type default
+                    Datum::Int4(i32::from(c.statistics_target)),
                     Datum::Bool(false), // attisdropped
                     Datum::Int4(i as i32 + 1),
                     text("i", arena)?,
@@ -10102,6 +10105,7 @@ fn pg_attribute<'a>(
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type: field.user_type,
+                statistics_target: -1,
             };
             out[n] = row(
                 &[
@@ -15559,6 +15563,7 @@ fn info_columns<'a>(
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type,
+                statistics_target: -1,
             };
             out[n] = info_column_row(
                 storage,
@@ -16975,6 +16980,7 @@ fn info_column_privileges<'a>(
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type,
+                statistics_target: -1,
             };
         }
         append_relation(
@@ -17489,6 +17495,7 @@ fn info_column_type_usage<'a>(
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type,
+                statistics_target: -1,
             };
             append(
                 view.schema.as_str(),

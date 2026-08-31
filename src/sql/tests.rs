@@ -36210,6 +36210,178 @@ fn default_index_tablespace_remains_implicit_in_pg_class() {
 }
 
 #[test]
+fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLESPACE table_definition_space LOCATION '/object/table-definition'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE table_definition_rows (id integer) USING heap TABLESPACE table_definition_space",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "
+         SELECT c.relam, s.spcname FROM pg_class c JOIN pg_tablespace s ON s.oid = c.reltablespace \
+          WHERE c.relname = 'table_definition_rows'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(data_rows(&output), ["2|table_definition_space"], "{text}");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows SET ACCESS METHOD heap",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows ALTER COLUMN id SET STATISTICS 77",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attstattarget FROM pg_attribute \
+              WHERE attrelid = 'table_definition_rows'::regclass AND attname = 'id'",
+        )),
+        ["77"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows SET TABLESPACE pg_default",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT relam, reltablespace FROM pg_class WHERE relname = 'table_definition_rows'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(data_rows(&output), ["2|0"], "{text}");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLESPACE table_definition_space",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows SET TABLESPACE no_such_tablespace",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("42704"),
+        "missing tablespaces must fail at the typed relation boundary: {text}"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE unknown_access_method_rows (id integer) USING unknown_am",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("42704"),
+        "unknown access methods must not be accepted as inert metadata: {text}"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows SET ACCESS METHOD unknown_am",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42704"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery() {
+    let mut config = test_config("table-definition-metadata-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("table-definition-metadata-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for statement in [
+        "CREATE TABLESPACE table_definition_recovery_space LOCATION '/object/table-definition-recovery'",
+        "CREATE TABLE table_definition_recovery_rows (id integer) USING heap TABLESPACE table_definition_recovery_space",
+        "ALTER TABLE table_definition_recovery_rows ALTER COLUMN id SET STATISTICS 91",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT c.relam, s.spcname FROM pg_class c JOIN pg_tablespace s \
+               ON s.oid = c.reltablespace WHERE c.relname = 'table_definition_recovery_rows'",
+        )),
+        ["2|table_definition_recovery_space"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT attstattarget FROM pg_attribute \
+              WHERE attrelid = 'table_definition_recovery_rows'::regclass AND attname = 'id'",
+        )),
+        ["91"]
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn database_template_catalogs_diverge_and_survive_object_cold_recovery() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

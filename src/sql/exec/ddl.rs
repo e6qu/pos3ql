@@ -99,6 +99,7 @@ fn empty_meta() -> ColumnMeta {
         identity_always: false,
         auto_increment_step: 1,
         user_type: None,
+        statistics_target: -1,
     }
 }
 
@@ -314,6 +315,7 @@ pub(super) fn build_column(
         identity_always,
         auto_increment_step,
         user_type,
+        statistics_target: -1,
     })
 }
 

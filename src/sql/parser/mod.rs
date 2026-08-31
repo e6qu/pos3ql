@@ -79,6 +79,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::DropDefault { .. }
         | AlterAction::SetNotNull { .. }
         | AlterAction::DropNotNull { .. }
+        | AlterAction::SetStatistics { .. }
         | AlterAction::AddIdentity { .. }
         | AlterAction::DropIdentity { .. } => 4,
         AlterAction::SetForeignOptions(_) | AlterAction::SetColumnForeignOptions { .. } => 4,
@@ -88,6 +89,8 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::RenameConstraint { .. }
         | AlterAction::SetTriggerEnabled { .. }
         | AlterAction::SetRowLevelSecurity(_)
+        | AlterAction::SetTablespace(_)
+        | AlterAction::SetAccessMethod(_)
         | AlterAction::SetReplicaIdentity(_)
         | AlterAction::AttachPartition { .. }
         | AlterAction::DetachPartition { .. }
@@ -4541,8 +4544,20 @@ impl<'a> Parser<'a> {
         // combine them with a comma-separated subcommand list, so they parse to
         // a single-element list on their own.
         if self.eat_ident("set")? {
-            self.expect_ident("schema")?;
-            let action = AlterAction::SetSchema(self.col_ident("schema name")?);
+            let action = if self.eat_ident("schema")? {
+                AlterAction::SetSchema(self.col_ident("schema name")?)
+            } else if self.eat_ident("tablespace")? {
+                AlterAction::SetTablespace(self.col_ident("tablespace name")?)
+            } else {
+                self.expect_ident("access")?;
+                self.expect_ident("method")?;
+                let method = self.any_ident("table access method")?;
+                AlterAction::SetAccessMethod(if method.eq_ignore_ascii_case("heap") {
+                    crate::sql::ast::TableAccessMethod::Heap
+                } else {
+                    crate::sql::ast::TableAccessMethod::Named(method)
+                })
+            };
             return Ok(Self::alter_table_statement(
                 foreign,
                 AlterTable {
@@ -4997,6 +5012,25 @@ impl<'a> Parser<'a> {
                 crate::sql::ast::ReplicaIdentityTarget::Index(self.qual_name("index name")?)
             };
             Ok(AlterAction::SetReplicaIdentity(target))
+        } else if self.eat_ident("set")? {
+            if self.eat_ident("tablespace")? {
+                Ok(AlterAction::SetTablespace(
+                    self.col_ident("tablespace name")?,
+                ))
+            } else {
+                self.expect_ident("access")?;
+                self.expect_ident("method")?;
+                let method = self.any_ident("table access method")?;
+                if method.eq_ignore_ascii_case("heap") {
+                    Ok(AlterAction::SetAccessMethod(
+                        crate::sql::ast::TableAccessMethod::Heap,
+                    ))
+                } else {
+                    Ok(AlterAction::SetAccessMethod(
+                        crate::sql::ast::TableAccessMethod::Named(method),
+                    ))
+                }
+            }
         } else if self.eat_ident("add")? {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
             if self.eat_ident("constraint")? {
@@ -5197,6 +5231,16 @@ impl<'a> Parser<'a> {
                         value,
                         value_text,
                     })
+                } else if self.eat_ident("statistics")? {
+                    let target = if self.eat_ident("default")? {
+                        -1
+                    } else {
+                        i16::try_from(self.seq_int()?)
+                            .ok()
+                            .filter(|target| (-1..=10_000).contains(target))
+                            .ok_or_else(|| self.err_here("statistics target is out of range"))?
+                    };
+                    Ok(AlterAction::SetStatistics { column, target })
                 } else {
                     self.expect_ident("not")?;
                     self.expect_ident("null")?;

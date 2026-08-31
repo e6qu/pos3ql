@@ -81,6 +81,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::DropNotNull { .. }
         | AlterAction::AddIdentity { .. }
         | AlterAction::DropIdentity { .. } => 4,
+        AlterAction::SetForeignOptions(_) | AlterAction::SetColumnForeignOptions { .. } => 4,
         // Standalone forms; never appear in a multi-action list.
         AlterAction::RenameTable(_)
         | AlterAction::RenameColumn { .. }
@@ -1268,6 +1269,7 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::RefreshMaterializedView { name })
             }
             Tok::Ident("alter") => self.alter_table(),
+            Tok::Ident("import") => self.import_foreign_schema(),
             Tok::Ident("grant") => self.grant_statement(),
             Tok::Ident("revoke") => self.revoke_statement(),
             Tok::Ident("reassign") => {
@@ -3675,6 +3677,14 @@ impl<'a> Parser<'a> {
             PrivilegeObjectKind::Database
         } else if self.eat_ident("type")? || self.eat_ident("domain")? {
             PrivilegeObjectKind::Type
+        } else if self.eat_ident("foreign")? {
+            if self.eat_ident("data")? {
+                self.expect_ident("wrapper")?;
+                PrivilegeObjectKind::ForeignDataWrapper
+            } else {
+                self.expect_ident("server")?;
+                PrivilegeObjectKind::ForeignServer
+            }
         } else {
             // TABLE is PostgreSQL's default object kind.
             PrivilegeObjectKind::Table
@@ -3690,6 +3700,8 @@ impl<'a> Parser<'a> {
                 PrivilegeObjectKind::Schema
                     | PrivilegeObjectKind::Tablespace
                     | PrivilegeObjectKind::Database
+                    | PrivilegeObjectKind::ForeignDataWrapper
+                    | PrivilegeObjectKind::ForeignServer
                     | PrivilegeObjectKind::AllTablesInSchema
                     | PrivilegeObjectKind::AllSequencesInSchema
                     | PrivilegeObjectKind::AllFunctionsInSchema
@@ -4149,7 +4161,24 @@ impl<'a> Parser<'a> {
                 new_name,
             });
         }
-        if self.eat_ident("role")? || self.eat_ident("user")? || self.eat_ident("group")? {
+        if self.eat_ident("foreign")? {
+            if self.eat_ident("data")? {
+                self.expect_ident("wrapper")?;
+                return self.alter_foreign_data_wrapper();
+            }
+            self.expect_ident("table")?;
+            return self.alter_table_relation(true);
+        }
+        if self.eat_ident("server")? {
+            return self.alter_foreign_server();
+        }
+        if self.eat_ident("user")? {
+            if self.eat_ident("mapping")? {
+                return self.alter_user_mapping();
+            }
+            return self.alter_role();
+        }
+        if self.eat_ident("role")? || self.eat_ident("group")? {
             return self.alter_role();
         }
         if self.eat_ident("collation")? {
@@ -4384,6 +4413,18 @@ impl<'a> Parser<'a> {
             return self.alter_type();
         }
         self.expect_ident("table")?;
+        self.alter_table_relation(false)
+    }
+
+    fn alter_table_statement(foreign: bool, statement: AlterTable<'a>) -> Stmt<'a> {
+        if foreign {
+            Stmt::AlterForeignTable(statement)
+        } else {
+            Stmt::AlterTable(statement)
+        }
+    }
+
+    fn alter_table_relation(&mut self, foreign: bool) -> Result<Stmt<'a>, ParseError> {
         let if_exists = if self.eat_ident("if")? {
             self.expect_ident("exists")?;
             true
@@ -4393,7 +4434,15 @@ impl<'a> Parser<'a> {
         let only = self.eat_ident("only")?;
         let table = self.qual_name("table name")?;
         if self.peeked == Tok::Ident("owner") {
-            return self.alter_owner(AlterOwnerKind::Table, table, if_exists);
+            return self.alter_owner(
+                if foreign {
+                    AlterOwnerKind::ForeignTable
+                } else {
+                    AlterOwnerKind::Table
+                },
+                table,
+                if_exists,
+            );
         }
         // RENAME … and SET SCHEMA are standalone forms: PostgreSQL does not
         // combine them with a comma-separated subcommand list, so they parse to
@@ -4401,12 +4450,15 @@ impl<'a> Parser<'a> {
         if self.eat_ident("set")? {
             self.expect_ident("schema")?;
             let action = AlterAction::SetSchema(self.col_ident("schema name")?);
-            return Ok(Stmt::AlterTable(AlterTable {
-                table,
-                if_exists,
-                only,
-                actions: self.arena_slice(&[action])?,
-            }));
+            return Ok(Self::alter_table_statement(
+                foreign,
+                AlterTable {
+                    table,
+                    if_exists,
+                    only,
+                    actions: self.arena_slice(&[action])?,
+                },
+            ));
         }
         if self.eat_ident("rename")? {
             let action = if self.eat_ident("to")? {
@@ -4423,52 +4475,64 @@ impl<'a> Parser<'a> {
                 let to = self.col_ident("new column name")?;
                 AlterAction::RenameColumn { from, to }
             };
-            return Ok(Stmt::AlterTable(AlterTable {
-                table,
-                if_exists,
-                only,
-                actions: self.arena_slice(&[action])?,
-            }));
+            return Ok(Self::alter_table_statement(
+                foreign,
+                AlterTable {
+                    table,
+                    if_exists,
+                    only,
+                    actions: self.arena_slice(&[action])?,
+                },
+            ));
         }
         if self.eat_ident("force")? {
             self.expect_ident("row")?;
             self.expect_ident("level")?;
             self.expect_ident("security")?;
-            return Ok(Stmt::AlterTable(AlterTable {
-                table,
-                if_exists,
-                only,
-                actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                    RowLevelSecurityAlteration::Force,
-                )])?,
-            }));
+            return Ok(Self::alter_table_statement(
+                foreign,
+                AlterTable {
+                    table,
+                    if_exists,
+                    only,
+                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
+                        RowLevelSecurityAlteration::Force,
+                    )])?,
+                },
+            ));
         }
         if self.eat_ident("no")? {
             self.expect_ident("force")?;
             self.expect_ident("row")?;
             self.expect_ident("level")?;
             self.expect_ident("security")?;
-            return Ok(Stmt::AlterTable(AlterTable {
-                table,
-                if_exists,
-                only,
-                actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                    RowLevelSecurityAlteration::NoForce,
-                )])?,
-            }));
+            return Ok(Self::alter_table_statement(
+                foreign,
+                AlterTable {
+                    table,
+                    if_exists,
+                    only,
+                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
+                        RowLevelSecurityAlteration::NoForce,
+                    )])?,
+                },
+            ));
         }
         let trigger_mode = if self.eat_ident("enable")? {
             if self.eat_ident("row")? {
                 self.expect_ident("level")?;
                 self.expect_ident("security")?;
-                return Ok(Stmt::AlterTable(AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                        RowLevelSecurityAlteration::Enable,
-                    )])?,
-                }));
+                return Ok(Self::alter_table_statement(
+                    foreign,
+                    AlterTable {
+                        table,
+                        if_exists,
+                        only,
+                        actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
+                            RowLevelSecurityAlteration::Enable,
+                        )])?,
+                    },
+                ));
             }
             if self.eat_ident("replica")? {
                 Some(crate::sql::ast::TriggerEnableMode::Replica)
@@ -4481,14 +4545,17 @@ impl<'a> Parser<'a> {
             if self.eat_ident("row")? {
                 self.expect_ident("level")?;
                 self.expect_ident("security")?;
-                return Ok(Stmt::AlterTable(AlterTable {
-                    table,
-                    if_exists,
-                    only,
-                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                        RowLevelSecurityAlteration::Disable,
-                    )])?,
-                }));
+                return Ok(Self::alter_table_statement(
+                    foreign,
+                    AlterTable {
+                        table,
+                        if_exists,
+                        only,
+                        actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
+                            RowLevelSecurityAlteration::Disable,
+                        )])?,
+                    },
+                ));
             }
             Some(crate::sql::ast::TriggerEnableMode::Disabled)
         } else {
@@ -4516,12 +4583,15 @@ impl<'a> Parser<'a> {
                 _ => crate::sql::ast::TriggerEnableTarget::Name(self.col_ident("trigger name")?),
             };
             let action = AlterAction::SetTriggerEnabled { target, enabled };
-            return Ok(Stmt::AlterTable(AlterTable {
-                table,
-                if_exists,
-                only,
-                actions: self.arena_slice(&[action])?,
-            }));
+            return Ok(Self::alter_table_statement(
+                foreign,
+                AlterTable {
+                    table,
+                    if_exists,
+                    only,
+                    actions: self.arena_slice(&[action])?,
+                },
+            ));
         }
         // Otherwise a comma-separated list of ADD / DROP / ALTER subcommands.
         let mut buffer = [AlterAction::DropDefault { column: "" }; MAX_ALTER_ACTIONS];
@@ -4530,7 +4600,7 @@ impl<'a> Parser<'a> {
             if count == MAX_ALTER_ACTIONS {
                 return Err(self.err_here("too many actions in one ALTER TABLE"));
             }
-            buffer[count] = self.alter_table_cmd()?;
+            buffer[count] = self.alter_table_cmd(foreign)?;
             count += 1;
             if !self.eat_op(",")? {
                 break;
@@ -4547,12 +4617,15 @@ impl<'a> Parser<'a> {
                 j -= 1;
             }
         }
-        Ok(Stmt::AlterTable(AlterTable {
-            table,
-            if_exists,
-            only,
-            actions: self.arena_slice(&buffer[..count])?,
-        }))
+        Ok(Self::alter_table_statement(
+            foreign,
+            AlterTable {
+                table,
+                if_exists,
+                only,
+                actions: self.arena_slice(&buffer[..count])?,
+            },
+        ))
     }
 
     fn text_search_token_types(&mut self) -> Result<&'a [&'a str], ParseError> {
@@ -4800,8 +4873,12 @@ impl<'a> Parser<'a> {
 
     /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable
     /// forms; RENAME and SET SCHEMA are handled by the caller).
-    fn alter_table_cmd(&mut self) -> Result<AlterAction<'a>, ParseError> {
-        if self.eat_ident("attach")? {
+    fn alter_table_cmd(&mut self, foreign: bool) -> Result<AlterAction<'a>, ParseError> {
+        if foreign && self.eat_ident("options")? {
+            Ok(AlterAction::SetForeignOptions(
+                self.alter_foreign_options()?,
+            ))
+        } else if self.eat_ident("attach")? {
             self.expect_ident("partition")?;
             let child = self.qual_name("partition name")?;
             let bound = self.partition_bound()?;
@@ -4835,6 +4912,11 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("column")?;
             let name = self.col_ident("column name")?;
             let (type_name, type_mod) = self.type_name_mod()?;
+            let foreign_options = if foreign && self.eat_ident("options")? {
+                self.foreign_options()?
+            } else {
+                &[]
+            };
             let collation = if self.eat_ident("collate")? {
                 self.collation_name()?
             } else {
@@ -4872,6 +4954,7 @@ impl<'a> Parser<'a> {
                 type_name,
                 type_mod,
                 collation,
+                foreign_options,
                 not_null,
                 unique,
                 primary: false,
@@ -4983,6 +5066,12 @@ impl<'a> Parser<'a> {
             // | DROP NOT NULL }.
             let _ = self.eat_ident("column")?;
             let column = self.col_ident("column name")?;
+            if foreign && self.eat_ident("options")? {
+                return Ok(AlterAction::SetColumnForeignOptions {
+                    column,
+                    options: self.alter_foreign_options()?,
+                });
+            }
             // `TYPE t` and `SET DATA TYPE t` are the same column-type change;
             // `SET DEFAULT`/`SET NOT NULL` and `DROP DEFAULT`/`DROP NOT NULL`
             // are the other four ALTER COLUMN forms.
@@ -6574,6 +6663,101 @@ mod tests {
             assert_eq!(alias, Some("half"));
             assert!(p.next_stmt().unwrap().is_none());
         });
+    }
+
+    #[test]
+    fn foreign_data_ddl_is_typed_without_runtime_allocation() {
+        with_parser(
+            "CREATE FOREIGN DATA WRAPPER fdw HANDLER postgres_fdw_handler \
+                 VALIDATOR postgres_fdw_validator OPTIONS (extensions 'hstore'); \
+             CREATE SERVER upstream TYPE 'postgresql' VERSION '18' \
+                 FOREIGN DATA WRAPPER fdw OPTIONS (host 'db'); \
+             CREATE USER MAPPING FOR CURRENT_USER SERVER upstream OPTIONS (user 'remote'); \
+             CREATE FOREIGN TABLE remote_items \
+                 (id integer OPTIONS (column_name 'remote_id')) \
+                 SERVER upstream OPTIONS (schema_name 'public'); \
+             ALTER FOREIGN DATA WRAPPER fdw OPTIONS (SET extensions 'citext'); \
+             ALTER SERVER upstream VERSION NULL OPTIONS (ADD dbname 'postgres'); \
+             ALTER USER MAPPING FOR CURRENT_USER SERVER upstream OPTIONS (SET user 'changed'); \
+             ALTER FOREIGN TABLE remote_items OPTIONS (SET schema_name 'changed'), \
+                 ALTER COLUMN id OPTIONS (SET column_name 'id2'); \
+             IMPORT FOREIGN SCHEMA public EXCEPT (skip_me) \
+                 FROM SERVER upstream INTO public OPTIONS (import_default 'true'); \
+             DROP FOREIGN TABLE remote_items; \
+             DROP USER MAPPING FOR CURRENT_USER SERVER upstream; \
+             DROP SERVER upstream; \
+             DROP FOREIGN DATA WRAPPER fdw",
+            |parser| {
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::CreateForeignDataWrapper(_))
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::CreateForeignServer(_))
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::CreateUserMapping(_))
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::CreateForeignTable(_))
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterForeignDataWrapper { .. })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterForeignServer { .. })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterUserMapping(_))
+                ));
+                let Some(Stmt::AlterForeignTable(alter)) = parser.next_stmt().unwrap() else {
+                    panic!("expected typed ALTER FOREIGN TABLE")
+                };
+                assert!(
+                    alter
+                        .actions
+                        .iter()
+                        .any(|action| matches!(action, AlterAction::SetForeignOptions(_)))
+                );
+                assert!(alter.actions.iter().any(|action| matches!(
+                    action,
+                    AlterAction::SetColumnForeignOptions { column: "id", .. }
+                )));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::ImportForeignSchema(_))
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::DropForeignTable(_))
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::DropUserMapping(_))
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::DropForeignServer { .. })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::DropForeignDataWrapper { .. })
+                ));
+                assert!(parser.next_stmt().unwrap().is_none());
+            },
+        );
+        with_parser(
+            "ALTER FOREIGN TABLE remote_items SERVER upstream",
+            |parser| {
+                assert!(parser.next_stmt().is_err());
+            },
+        );
     }
 
     #[test]

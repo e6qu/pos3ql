@@ -34,6 +34,12 @@ impl<const N: usize> fmt::Debug for StackStr<N> {
     }
 }
 
+impl<const N: usize> fmt::Display for StackStr<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl<const N: usize> StackStr<N> {
     pub const fn new() -> Self {
         Self {

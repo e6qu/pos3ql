@@ -470,6 +470,22 @@ impl<'d> QueryScope<'d> {
             if let Some(slot) = storage.sequence_on_path(tref.schema, tref.table, txid) {
                 return self.add_sequence(storage, tref, slot, txid, arena, true);
             }
+            if let Some(crate::storage::ResolvedRelation::Table(slot)) =
+                storage.resolve_relation(tref.schema, tref.table, txid)
+                && storage.table_def(slot, txid).kind == crate::storage::TableKind::Foreign
+            {
+                if tref.sample.is_some() {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "TABLESAMPLE is not supported for foreign tables"
+                    ));
+                }
+                let rows = crate::sql::foreign::materialize(storage, slot, txid, arena)?;
+                let source = self.n;
+                self.add(storage, tref, txid, arena)?;
+                self.derived[source] = Some(rows);
+                return Ok(());
+            }
             return self.add(storage, tref, txid, arena);
         };
         let exposed = tref.alias.expect("parser requires a derived-table alias");

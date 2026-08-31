@@ -242,6 +242,176 @@ exec(compile(src, "driver_test.py", "exec"))
 EOF
 then ok "psycopg driver"; else bad "psycopg driver"; cat "$WORK/driver.out"; fi
 
+# --- postgres_fdw scan/import, typed values, driver Bind, and restart -------
+restart_p3_fresh || exit 1
+echo "=== PostgreSQL foreign-data vertical slice ==="
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 -q -c 'CREATE EXTENSION IF NOT EXISTS postgres_fdw' \
+  > "$WORK/foreign_extension.out" 2>&1
+cat > "$WORK/foreign_catalog.sql" <<'SQL'
+SET client_min_messages = warning;
+CREATE FOREIGN DATA WRAPPER pos3ql_catalog_fdw
+  HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator;
+CREATE SERVER pos3ql_catalog_a TYPE 'postgresql' VERSION '18'
+  FOREIGN DATA WRAPPER pos3ql_catalog_fdw OPTIONS (host '127.0.0.1', port '5432');
+CREATE SERVER pos3ql_catalog_b FOREIGN DATA WRAPPER pos3ql_catalog_fdw
+  OPTIONS (host '127.0.0.2');
+CREATE USER MAPPING FOR CURRENT_USER SERVER pos3ql_catalog_a OPTIONS (user 'before');
+CREATE USER MAPPING FOR CURRENT_USER SERVER pos3ql_catalog_b OPTIONS (user 'second');
+CREATE FOREIGN TABLE pos3ql_catalog_foreign (
+  id integer OPTIONS (column_name 'remote_id'), label text
+) SERVER pos3ql_catalog_a OPTIONS (schema_name 'public', table_name 'source');
+BEGIN;
+SAVEPOINT before_foreign_change;
+ALTER FOREIGN DATA WRAPPER pos3ql_catalog_fdw NO HANDLER;
+ALTER SERVER pos3ql_catalog_a VERSION 'changed';
+ALTER USER MAPPING FOR CURRENT_USER SERVER pos3ql_catalog_a OPTIONS (SET user 'after');
+ALTER FOREIGN TABLE pos3ql_catalog_foreign OPTIONS (SET table_name 'changed');
+ROLLBACK TO SAVEPOINT before_foreign_change;
+COMMIT;
+SELECT w.fdwname, w.fdwhandler <> 0, s.srvname, s.srvversion,
+       u.umoptions::text, f.ftoptions::text, a.attfdwoptions::text
+  FROM pg_foreign_data_wrapper w
+  JOIN pg_foreign_server s ON s.srvfdw = w.oid
+  JOIN pg_user_mapping u ON u.umserver = s.oid
+  JOIN pg_foreign_table f ON f.ftserver = s.oid
+  JOIN pg_attribute a ON a.attrelid = f.ftrelid AND a.attname = 'id'
+ WHERE w.fdwname = 'pos3ql_catalog_fdw';
+ALTER SERVER pos3ql_catalog_a RENAME TO pos3ql_catalog_a_renamed;
+ALTER FOREIGN DATA WRAPPER pos3ql_catalog_fdw RENAME TO pos3ql_catalog_fdw_renamed;
+SELECT w.fdwname, s.srvname
+  FROM pg_foreign_table f JOIN pg_foreign_server s ON s.oid = f.ftserver
+  JOIN pg_foreign_data_wrapper w ON w.oid = s.srvfdw;
+DROP SERVER pos3ql_catalog_a_renamed CASCADE;
+DROP FOREIGN DATA WRAPPER pos3ql_catalog_fdw_renamed CASCADE;
+SELECT count(*) FROM pg_foreign_data_wrapper WHERE fdwname LIKE 'pos3ql_catalog_%';
+SQL
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -Atq \
+  -v ON_ERROR_STOP=1 -f "$WORK/foreign_catalog.sql" \
+  > "$WORK/foreign_catalog_reference.out" 2>&1
+foreign_catalog_reference_status=$?
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -Atq \
+  -v ON_ERROR_STOP=1 -f "$WORK/foreign_catalog.sql" \
+  > "$WORK/foreign_catalog_pos3ql.out" 2>&1
+foreign_catalog_pos3ql_status=$?
+if [[ $foreign_catalog_reference_status -eq 0 && $foreign_catalog_pos3ql_status -eq 0 ]] \
+  && cmp -s "$WORK/foreign_catalog_reference.out" "$WORK/foreign_catalog_pos3ql.out"; then
+  ok "foreign-data DDL, catalogs, savepoints and dependency cascades match PostgreSQL"
+else
+  bad "foreign-data catalog lifecycle"
+  diff -u "$WORK/foreign_catalog_reference.out" "$WORK/foreign_catalog_pos3ql.out" || true
+fi
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 > "$WORK/foreign_reference.out" 2>&1 <<'SQL'
+DROP TABLE IF EXISTS public.pos3ql_fdw_source CASCADE;
+DROP TYPE IF EXISTS public.pos3ql_fdw_pair CASCADE;
+CREATE TYPE public.pos3ql_fdw_pair AS (code integer, label text);
+CREATE TABLE public.pos3ql_fdw_source (
+  id integer,
+  scores integer[],
+  pair public.pos3ql_fdw_pair,
+  note text
+);
+INSERT INTO public.pos3ql_fdw_source VALUES
+  (2, ARRAY[3,4], ROW(20,'two')::public.pos3ql_fdw_pair, 'second'),
+  (1, ARRAY[1,2], ROW(10,'one')::public.pos3ql_fdw_pair, 'first'),
+  (3, ARRAY[5,NULL], ROW(30,NULL)::public.pos3ql_fdw_pair, NULL);
+SQL
+foreign_reference_status=$?
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 > "$WORK/foreign_pos3ql.out" 2>&1 <<SQL
+CREATE TYPE public.pos3ql_fdw_pair AS (code integer, label text);
+CREATE FOREIGN DATA WRAPPER postgres_fdw
+  HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator;
+CREATE SERVER reference_server FOREIGN DATA WRAPPER postgres_fdw
+  OPTIONS (host '$PGHOST', port '$PGPORT', dbname 'postgres', sslmode 'disable');
+CREATE USER MAPPING FOR CURRENT_USER SERVER reference_server OPTIONS (user '$PGUSER');
+IMPORT FOREIGN SCHEMA public LIMIT TO (pos3ql_fdw_source)
+  FROM SERVER reference_server INTO public;
+SQL
+foreign_pos3ql_status=$?
+foreign_reference=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+  -X -At -F '|' -v ON_ERROR_STOP=1 \
+  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id" 2>/dev/null)
+foreign_pos3ql=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -At -F '|' -v ON_ERROR_STOP=1 \
+  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id" 2>/dev/null)
+if [[ $foreign_reference_status -eq 0 && $foreign_pos3ql_status -eq 0 \
+      && "$foreign_pos3ql" == "$foreign_reference" ]]; then
+  ok "foreign schema import and typed scan match PostgreSQL"
+else
+  bad "foreign schema import and typed scan"
+  cat "$WORK/foreign_reference.out" "$WORK/foreign_pos3ql.out"
+  printf 'reference:\n%s\npos3ql:\n%s\n' "$foreign_reference" "$foreign_pos3ql"
+fi
+if P3_PORT="$P3_PORT" "$PY" - <<'PY' > "$WORK/foreign_driver.out" 2>&1
+import os
+import psycopg
+
+with psycopg.connect(host="127.0.0.1", port=int(os.environ["P3_PORT"]),
+                     user="postgres", dbname="postgres") as connection:
+    with connection.cursor(binary=True) as cursor:
+        cursor.execute(
+            "SELECT id,scores FROM pos3ql_fdw_source WHERE id >= %s ORDER BY id",
+            (2,),
+        )
+        assert cursor.fetchall() == [(2, [3, 4]), (3, [5, None])]
+PY
+then
+  ok "foreign scan accepts extended-protocol Bind and binary Result"
+else
+  bad "foreign scan driver behavior"
+  cat "$WORK/foreign_driver.out"
+fi
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 > "$WORK/foreign_privilege_setup.out" 2>&1 <<SQL
+CREATE ROLE pos3ql_fdw_reader;
+CREATE ROLE pos3ql_fdw_observer;
+GRANT USAGE ON FOREIGN SERVER reference_server TO pos3ql_fdw_reader, pos3ql_fdw_observer;
+CREATE USER MAPPING FOR pos3ql_fdw_reader SERVER reference_server OPTIONS (user '$PGUSER');
+GRANT SELECT (id) ON pos3ql_fdw_source TO pos3ql_fdw_reader;
+SQL
+foreign_privilege_setup_status=$?
+foreign_allowed=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -Atq -v ON_ERROR_STOP=1 \
+  -c 'SET ROLE pos3ql_fdw_reader; SELECT id FROM pos3ql_fdw_source ORDER BY id' 2>/dev/null)
+if psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 \
+  -c 'SET ROLE pos3ql_fdw_reader; SELECT note FROM pos3ql_fdw_source' \
+  > "$WORK/foreign_privilege_denied.out" 2>&1; then
+  foreign_denied_status=0
+else
+  foreign_denied_status=$?
+fi
+foreign_hidden=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -Atq -v ON_ERROR_STOP=1 \
+  -c 'SET ROLE pos3ql_fdw_observer; SELECT bool_and(umoptions IS NULL) FROM pg_user_mapping' \
+  2>/dev/null)
+if [[ $foreign_privilege_setup_status -eq 0 && "$foreign_allowed" == $'1\n2\n3' \
+      && $foreign_denied_status -ne 0 && "$foreign_hidden" == t ]]; then
+  ok "foreign scans enforce column demand and hide other mappings"
+else
+  bad "foreign scan and mapping privilege behavior"
+  cat "$WORK/foreign_privilege_setup.out" "$WORK/foreign_privilege_denied.out"
+  printf 'allowed:\n%s\nhidden:\n%s\n' "$foreign_allowed" "$foreign_hidden"
+fi
+restart_p3 || exit 1
+foreign_recovered=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -At -F '|' -v ON_ERROR_STOP=1 \
+  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id" 2>/dev/null)
+if [[ "$foreign_recovered" == "$foreign_reference" ]]; then
+  ok "foreign metadata and typed scans survive WAL restart"
+else
+  bad "foreign metadata restart recovery"
+  printf 'reference:\n%s\nrecovered:\n%s\n' "$foreign_reference" "$foreign_recovered"
+fi
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 -c 'DROP TABLE public.pos3ql_fdw_source; DROP TYPE public.pos3ql_fdw_pair' \
+  > "$WORK/foreign_cleanup.out" 2>&1 || {
+    bad "clean foreign-data PostgreSQL fixture"
+    cat "$WORK/foreign_cleanup.out"
+  }
+
 # --- PostgreSQL 18.4 pg_dump plain-format restore --------------------------
 restart_p3_fresh || exit 1
 echo "=== PostgreSQL 18.4 plain dump restore ==="

@@ -59,6 +59,7 @@ pub mod oid {
     pub const EVENT_TRIGGER: i32 = 3838;
     /// PostgreSQL's opaque server-state pseudo-type.
     pub const INTERNAL: i32 = 2281;
+    pub const FDW_HANDLER: i32 = 3115;
     pub const ANYELEMENT: i32 = 2283;
     pub const ANYNONARRAY: i32 = 2776;
     pub const ANYENUM: i32 = 3500;

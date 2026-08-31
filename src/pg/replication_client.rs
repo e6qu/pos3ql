@@ -1,4 +1,4 @@
-//! Typed PostgreSQL v3 client framing for one logical-replication session.
+//! Typed PostgreSQL v3 client framing for bounded outbound connections.
 //!
 //! It owns one non-blocking socket, but constructs only complete frontend
 //! states and parses only complete backend states.  Fixed buffers and typed
@@ -30,6 +30,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SslMode {
     Disable,
+    Prefer,
     Require,
 }
 
@@ -89,6 +90,7 @@ impl ConnectionInfo {
         let application_name = application_name.map(bounded).transpose()?;
         let ssl_mode = match ssl_mode.ok_or(ConnectionInfoError::Missing("sslmode"))? {
             "disable" => SslMode::Disable,
+            "prefer" => SslMode::Prefer,
             "require" => SslMode::Require,
             _ => return Err(ConnectionInfoError::UnsupportedSslMode),
         };
@@ -136,6 +138,32 @@ impl ConnectionInfo {
 
     pub fn ssl_mode(&self) -> SslMode {
         self.ssl_mode
+    }
+
+    pub(crate) fn for_foreign(
+        host: &str,
+        port: u16,
+        user: &str,
+        database: &str,
+        password: Option<&str>,
+        application_name: &str,
+        ssl_mode: SslMode,
+    ) -> Result<Self, ConnectionInfoError> {
+        if host.parse::<IpAddr>().is_err() {
+            return Err(ConnectionInfoError::NonNumericHost);
+        }
+        if port == 0 {
+            return Err(ConnectionInfoError::InvalidPort);
+        }
+        Ok(Self {
+            host: bounded(host)?,
+            port,
+            user: bounded(user)?,
+            database: bounded(database)?,
+            password: password.map(bounded).transpose()?,
+            application_name: Some(bounded(application_name)?),
+            ssl_mode,
+        })
     }
 
     fn socket_addr(&self) -> SocketAddr {
@@ -296,19 +324,16 @@ impl core::fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Budget(error) => write!(formatter, "{error}"),
-            Self::Io(error) => write!(formatter, "replication transport: {error}"),
-            Self::Protocol(error) => write!(formatter, "replication protocol: {error:?}"),
-            Self::WireFull => write!(formatter, "replication send buffer is full"),
+            Self::Io(error) => write!(formatter, "PostgreSQL transport: {error}"),
+            Self::Protocol(error) => write!(formatter, "PostgreSQL protocol: {error:?}"),
+            Self::WireFull => write!(formatter, "PostgreSQL send buffer is full"),
             Self::MissingApplicationName => {
-                write!(
-                    formatter,
-                    "subscription connection requires application_name"
-                )
+                write!(formatter, "PostgreSQL connection requires application_name")
             }
             Self::UnsupportedTls => {
-                write!(formatter, "subscription TLS transport is not configured")
+                write!(formatter, "PostgreSQL TLS transport is not configured")
             }
-            Self::Authentication => write!(formatter, "publisher authentication cannot proceed"),
+            Self::Authentication => write!(formatter, "PostgreSQL authentication cannot proceed"),
             Self::Publisher(error) => {
                 write!(
                     formatter,
@@ -511,7 +536,7 @@ impl ReplicationClient {
             behavior,
             manage_slot_behavior,
         } = setup;
-        if endpoint.ssl_mode() == SslMode::Require && self.tls.is_none() {
+        if endpoint.ssl_mode() != SslMode::Disable && self.tls.is_none() {
             return Err(ClientError::UnsupportedTls);
         }
         if endpoint.application_name().is_none() {
@@ -601,7 +626,7 @@ impl ReplicationClient {
         if self.state != ClientState::Idle || self.stream.is_some() {
             return Err(ClientError::Protocol(FrameError::Malformed));
         }
-        if endpoint.ssl_mode() == SslMode::Require && self.tls.is_none() {
+        if endpoint.ssl_mode() != SslMode::Disable && self.tls.is_none() {
             return Err(ClientError::UnsupportedTls);
         }
         if endpoint.application_name().is_none() {
@@ -715,7 +740,7 @@ impl ReplicationClient {
                 }
                 return Err(connection.into());
             }
-            if self.endpoint.expect("bound replication worker").ssl_mode() == SslMode::Require {
+            if self.endpoint.expect("bound replication worker").ssl_mode() != SslMode::Disable {
                 if !self.send.append(&8_i32.to_be_bytes())
                     || !self.send.append(&80_877_103_i32.to_be_bytes())
                 {
@@ -778,6 +803,12 @@ impl ReplicationClient {
                 return Ok(());
             };
             self.receive.consume(1);
+            if response == b'N'
+                && self.endpoint.expect("bound replication worker").ssl_mode() == SslMode::Prefer
+            {
+                self.queue_startup()?;
+                return Ok(());
+            }
             if response != b'S' {
                 return Err(ClientError::UnsupportedTls);
             }

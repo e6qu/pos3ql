@@ -7,6 +7,472 @@
 use super::*;
 
 #[test]
+fn foreign_data_catalogs_are_typed_transactional_and_visible() {
+    let (mut engine, mut budget) = test_engine();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FOREIGN DATA WRAPPER postgres_fdw \
+             HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         CREATE SERVER upstream TYPE 'postgresql' VERSION '18' \
+             FOREIGN DATA WRAPPER postgres_fdw \
+             OPTIONS (host '127.0.0.1', port '5432', dbname 'postgres'); \
+         CREATE USER MAPPING FOR CURRENT_USER SERVER upstream \
+             OPTIONS (user 'postgres', password 'secret'); \
+         CREATE FOREIGN TABLE remote_items (\
+             id integer OPTIONS (column_name 'remote_id'), label text\
+         ) SERVER upstream OPTIONS (schema_name 'public', table_name 'items'); \
+         SELECT fdwname, fdwowner <> 0, fdwhandler::regproc, fdwvalidator::regproc, \
+                fdwoptions IS NULL \
+           FROM pg_foreign_data_wrapper; \
+         SELECT srvname, srvtype, srvversion, srvoptions::text \
+           FROM pg_foreign_server; \
+         SELECT umuser <> 0, umoptions::text FROM pg_user_mapping; \
+         SELECT ftserver <> 0, ftoptions::text FROM pg_foreign_table",
+    );
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         ALTER SERVER upstream OPTIONS (SET port '6432', ADD application_name 'pos3ql'); \
+         ALTER FOREIGN TABLE remote_items OPTIONS (SET table_name 'changed'); \
+         ROLLBACK; \
+         SELECT srvversion, srvoptions::text FROM pg_foreign_server; \
+         SELECT ftoptions::text FROM pg_foreign_table",
+    );
+    assert_eq!(
+        data_rows(&created)
+            .into_iter()
+            .chain(data_rows(&rolled_back))
+            .collect::<Vec<_>>(),
+        [
+            "postgres_fdw|t|postgres_fdw_handler|postgres_fdw_validator|t",
+            "upstream|postgresql|18|{host=127.0.0.1,port=5432,dbname=postgres}",
+            "t|{user=postgres,password=secret}",
+            "t|{schema_name=public,table_name=items}",
+            "18|{host=127.0.0.1,port=5432,dbname=postgres}",
+            "{schema_name=public,table_name=items}",
+        ],
+        "created={} rolled_back={}",
+        String::from_utf8_lossy(&created),
+        String::from_utf8_lossy(&rolled_back),
+    );
+}
+
+#[test]
+fn foreign_data_privileges_and_savepoints_share_typed_catalog_state() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE fdw_owner; CREATE ROLE fdw_user; \
+         CREATE SCHEMA fdw_zone AUTHORIZATION fdw_user; \
+         CREATE FOREIGN DATA WRAPPER postgres_fdw \
+           HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO fdw_owner; \
+         SET ROLE fdw_owner; \
+         CREATE SERVER privilege_server FOREIGN DATA WRAPPER postgres_fdw \
+           OPTIONS (host '127.0.0.1', sslmode 'disable'); \
+         GRANT USAGE ON FOREIGN SERVER privilege_server TO fdw_user; \
+         CREATE USER MAPPING FOR fdw_user SERVER privilege_server OPTIONS (user 'remote'); \
+         RESET ROLE; SET ROLE fdw_user; \
+         CREATE FOREIGN TABLE fdw_zone.allowed (id integer) SERVER privilege_server; \
+         RESET ROLE",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let transaction = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; SAVEPOINT before_foreign_changes; \
+         ALTER SERVER privilege_server VERSION 'changed'; \
+         DROP FOREIGN TABLE fdw_zone.allowed; \
+         ROLLBACK TO SAVEPOINT before_foreign_changes; COMMIT; \
+         SELECT srvversion IS NULL, srvacl::text FROM pg_foreign_server \
+           WHERE srvname = 'privilege_server'; \
+         SELECT relkind FROM pg_class WHERE relname = 'allowed'",
+    );
+    assert_eq!(
+        data_rows(&transaction),
+        ["t|{fdw_owner=U/fdw_owner,fdw_user=U/fdw_owner}", "f"],
+        "{}",
+        String::from_utf8_lossy(&transaction)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE fdw_owner; REVOKE USAGE ON FOREIGN SERVER privilege_server FROM fdw_user; \
+         RESET ROLE",
+    );
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE fdw_user; CREATE FOREIGN TABLE fdw_zone.denied (id integer) \
+           SERVER privilege_server",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+}
+
+#[test]
+fn foreign_data_catalog_views_enforce_postgresql_credential_visibility() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE mapping_owner; CREATE ROLE mapped_user; CREATE ROLE mapping_observer; \
+         CREATE SCHEMA mapping_zone AUTHORIZATION mapped_user; \
+         CREATE FOREIGN DATA WRAPPER postgres_fdw \
+           HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO mapping_owner, mapping_observer; \
+         SET ROLE mapping_owner; \
+         CREATE SERVER catalog_server TYPE 'postgresql' VERSION '18' \
+           FOREIGN DATA WRAPPER postgres_fdw \
+           OPTIONS (host '127.0.0.1', dbname 'postgres'); \
+         GRANT USAGE ON FOREIGN SERVER catalog_server TO mapped_user, mapping_observer; \
+         CREATE USER MAPPING FOR mapped_user SERVER catalog_server \
+           OPTIONS (user 'remote_user', password 'secret'); \
+         RESET ROLE; SET ROLE mapped_user; \
+         CREATE FOREIGN TABLE mapping_zone.catalog_foreign (\
+           id integer OPTIONS (column_name 'remote_id')\
+         ) SERVER catalog_server OPTIONS (schema_name 'public', table_name 'source'); \
+         RESET ROLE",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+
+    let own = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE mapped_user; \
+         SELECT srvname, umoptions::text FROM pg_user_mappings; \
+         SELECT foreign_server_name, foreign_data_wrapper_name, foreign_server_type, \
+                foreign_server_version, authorization_identifier \
+           FROM information_schema.foreign_servers; \
+         SELECT foreign_table_schema, foreign_table_name, foreign_server_name \
+           FROM information_schema.foreign_tables; \
+         SELECT column_name, option_name, option_value \
+           FROM information_schema.column_options; \
+         SELECT option_name, option_value FROM information_schema.user_mapping_options \
+           ORDER BY option_name; RESET ROLE",
+    );
+    assert_eq!(
+        data_rows(&own),
+        [
+            "catalog_server|{user=remote_user,password=secret}",
+            "catalog_server|postgres_fdw|postgresql|18|mapping_owner",
+            "mapping_zone|catalog_foreign|catalog_server",
+            "id|column_name|remote_id",
+            "password|secret",
+            "user|remote_user",
+        ],
+        "{}",
+        String::from_utf8_lossy(&own)
+    );
+
+    let hidden = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE mapping_observer; \
+         SELECT umoptions IS NULL FROM pg_user_mapping; \
+         SELECT umoptions IS NULL FROM pg_user_mappings; \
+         SELECT option_name, option_value IS NULL \
+           FROM information_schema.user_mapping_options ORDER BY option_name; RESET ROLE",
+    );
+    assert_eq!(
+        data_rows(&hidden),
+        ["t", "t", "password|t", "user|t"],
+        "{}",
+        String::from_utf8_lossy(&hidden)
+    );
+}
+
+#[test]
+fn unsupported_foreign_table_mutations_fail_before_touching_local_storage() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FOREIGN DATA WRAPPER postgres_fdw \
+           HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         CREATE SERVER mutation_server FOREIGN DATA WRAPPER postgres_fdw \
+           OPTIONS (host '127.0.0.1'); \
+         CREATE USER MAPPING FOR CURRENT_USER SERVER mutation_server; \
+         CREATE FOREIGN TABLE mutation_target (id integer) SERVER mutation_server",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for statement in [
+        "INSERT INTO mutation_target VALUES (1)",
+        "UPDATE mutation_target SET id = 2",
+        "DELETE FROM mutation_target",
+        "MERGE INTO mutation_target t USING mutation_target s ON t.id = s.id WHEN MATCHED THEN DELETE",
+        "TRUNCATE mutation_target",
+        "COPY mutation_target TO STDOUT",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(rendered.contains("0A000"), "{statement}: {rendered}");
+    }
+    let catalog = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT relkind FROM pg_class WHERE relname = 'mutation_target'",
+    );
+    assert_eq!(data_rows(&catalog), ["f"]);
+}
+
+#[test]
+fn postgresql_dump_foreign_data_ddl_restores_without_reinterpretation() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FOREIGN DATA WRAPPER postgres_fdw \
+           HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         CREATE SERVER dump_server TYPE 'postgresql' VERSION '18' \
+           FOREIGN DATA WRAPPER postgres_fdw \
+           OPTIONS (dbname 'postgres', host '127.0.0.1', port '5432'); \
+         CREATE USER MAPPING FOR postgres SERVER dump_server \
+           OPTIONS (password 'secret', \"user\" 'postgres'); \
+         CREATE FOREIGN TABLE public.dump_foreign (id integer, label text) \
+           SERVER dump_server OPTIONS (schema_name 'public', table_name 'source'); \
+         ALTER FOREIGN TABLE ONLY public.dump_foreign ALTER COLUMN id \
+           OPTIONS (column_name 'remote_id'); \
+         SELECT fdwhandler::regproc, fdwvalidator::regproc FROM pg_foreign_data_wrapper; \
+         SELECT srvtype, srvversion, srvoptions::text FROM pg_foreign_server; \
+         SELECT umoptions::text FROM pg_user_mapping; \
+         SELECT c.relname, a.attfdwoptions::text \
+           FROM pg_foreign_table f JOIN pg_class c ON c.oid = f.ftrelid \
+           JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'id'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "postgres_fdw_handler|postgres_fdw_validator",
+            "postgresql|18|{dbname=postgres,host=127.0.0.1,port=5432}",
+            "{password=secret,user=postgres}",
+            "dump_foreign|{column_name=remote_id}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn foreign_data_alter_drop_and_dependency_lifecycles_are_atomic() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FOREIGN DATA WRAPPER lifecycle_fdw NO HANDLER NO VALIDATOR; \
+         ALTER FOREIGN DATA WRAPPER lifecycle_fdw \
+           HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         ALTER FOREIGN DATA WRAPPER lifecycle_fdw RENAME TO lifecycle_fdw_renamed; \
+         CREATE SERVER lifecycle_a FOREIGN DATA WRAPPER lifecycle_fdw_renamed \
+           OPTIONS (host '127.0.0.1'); \
+         CREATE SERVER lifecycle_b FOREIGN DATA WRAPPER lifecycle_fdw_renamed \
+           OPTIONS (host '127.0.0.2'); \
+         CREATE USER MAPPING FOR CURRENT_USER SERVER lifecycle_a OPTIONS (user 'before'); \
+         CREATE USER MAPPING FOR CURRENT_USER SERVER lifecycle_b OPTIONS (user 'second'); \
+         CREATE FOREIGN TABLE lifecycle_table (id integer) SERVER lifecycle_a \
+           OPTIONS (schema_name 'public', table_name 'source')",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let savepoint = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; SAVEPOINT before_foreign_alter; \
+         ALTER FOREIGN TABLE lifecycle_table OPTIONS (SET table_name 'changed'); \
+         ALTER USER MAPPING FOR CURRENT_USER SERVER lifecycle_a OPTIONS (SET user 'after'); \
+         ALTER FOREIGN DATA WRAPPER lifecycle_fdw_renamed NO HANDLER; \
+         ROLLBACK TO SAVEPOINT before_foreign_alter; COMMIT; \
+         SELECT s.srvname, f.ftoptions::text FROM pg_foreign_table f \
+           JOIN pg_foreign_server s ON s.oid = f.ftserver; \
+         SELECT umoptions::text FROM pg_user_mapping u JOIN pg_foreign_server s \
+           ON s.oid = u.umserver WHERE s.srvname = 'lifecycle_a'; \
+         SELECT fdwhandler::regproc FROM pg_foreign_data_wrapper",
+    );
+    assert_eq!(
+        data_rows(&savepoint),
+        [
+            "lifecycle_a|{schema_name=public,table_name=source}",
+            "{user=before}",
+            "postgres_fdw_handler",
+        ],
+        "{}",
+        String::from_utf8_lossy(&savepoint)
+    );
+    let renamed = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SERVER lifecycle_a RENAME TO lifecycle_a_renamed; \
+         SELECT s.srvname FROM pg_foreign_table f JOIN pg_foreign_server s \
+           ON s.oid = f.ftserver",
+    );
+    assert_eq!(data_rows(&renamed), ["lifecycle_a_renamed"]);
+
+    let restricted_server = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SERVER lifecycle_a_renamed RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted_server).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&restricted_server)
+    );
+    let cascade = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP SERVER lifecycle_a_renamed CASCADE; \
+         SELECT count(*) FROM pg_foreign_table; \
+         SELECT count(*) FROM pg_user_mapping; \
+         DROP FOREIGN DATA WRAPPER lifecycle_fdw_renamed CASCADE; \
+         SELECT count(*) FROM pg_foreign_server; \
+         SELECT count(*) FROM pg_foreign_data_wrapper",
+    );
+    assert_eq!(data_rows(&cascade), ["0", "1", "0", "0"]);
+}
+
+#[test]
+fn foreign_data_catalogs_survive_object_cold_checkpoint_recovery() {
+    let mut config = test_config("foreign-data-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("foreign-data-cold-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FOREIGN DATA WRAPPER postgres_fdw \
+             HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+         CREATE ROLE foreign_reader; \
+         GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO foreign_reader; \
+         CREATE SERVER durable_server TYPE '' VERSION '' FOREIGN DATA WRAPPER postgres_fdw \
+             OPTIONS (host '127.0.0.1', port '5432', dbname 'postgres'); \
+         GRANT USAGE ON FOREIGN SERVER durable_server TO foreign_reader; \
+         CREATE USER MAPPING FOR CURRENT_USER SERVER durable_server \
+             OPTIONS (user 'postgres', password 'secret'); \
+         CREATE FOREIGN TABLE durable_foreign (\
+             id integer OPTIONS (column_name 'remote_id'), value text\
+         ) SERVER durable_server OPTIONS (schema_name 'public', table_name 'durable_source')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT fdwname, fdwacl::text FROM pg_foreign_data_wrapper; \
+         SELECT srvname, srvtype IS NULL, length(srvtype), \
+                srvversion IS NULL, length(srvversion), srvoptions::text, srvacl::text \
+           FROM pg_foreign_server; \
+         SELECT umoptions::text FROM pg_user_mapping; \
+         SELECT c.relname, c.relkind, f.ftoptions::text \
+           FROM pg_foreign_table f JOIN pg_class c ON c.oid = f.ftrelid",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "postgres_fdw|{postgres=U/postgres,foreign_reader=U/postgres}",
+            "durable_server|f|0|f|0|{host=127.0.0.1,port=5432,dbname=postgres}|{postgres=U/postgres,foreign_reader=U/postgres}",
+            "{user=postgres,password=secret}",
+            "durable_foreign|f|{schema_name=public,table_name=durable_source}",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn foreign_data_catalogs_survive_wal_replay_before_checkpoint() {
+    let mut config = test_config("foreign-data-wal-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("foreign-data-wal-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FOREIGN DATA WRAPPER postgres_fdw \
+                 HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator; \
+             CREATE SERVER wal_server TYPE '' FOREIGN DATA WRAPPER postgres_fdw \
+                 OPTIONS (host '127.0.0.1', port '5432', dbname 'postgres'); \
+             CREATE USER MAPPING FOR CURRENT_USER SERVER wal_server \
+                 OPTIONS (user 'postgres'); \
+             CREATE FOREIGN TABLE wal_foreign (id integer) SERVER wal_server \
+                 OPTIONS (schema_name 'public', table_name 'source'); \
+             ALTER SERVER wal_server VERSION '' OPTIONS (ADD application_name 'pos3ql')",
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        engine.commit_wal().unwrap();
+    }
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT fdwname FROM pg_foreign_data_wrapper; \
+         SELECT srvname, srvtype IS NULL, length(srvtype), \
+                srvversion IS NULL, length(srvversion), srvoptions::text \
+           FROM pg_foreign_server; \
+         SELECT umoptions::text FROM pg_user_mapping; \
+         SELECT c.relname, c.relkind FROM pg_foreign_table f \
+           JOIN pg_class c ON c.oid = f.ftrelid",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "postgres_fdw",
+            "wal_server|f|0|f|0|{host=127.0.0.1,port=5432,dbname=postgres,application_name=pos3ql}",
+            "{user=postgres}",
+            "wal_foreign|f",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn large_objects_are_sparse_transactional_and_match_postgresql_functions() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -4545,6 +5011,11 @@ fn test_config(name: &str) -> Config {
     config.large_object_pages = 256;
     config.max_large_object_descriptors = 16;
     config.max_rules = 32;
+    config.max_foreign_data_wrappers = 2;
+    config.max_foreign_servers = 4;
+    config.max_user_mappings = 8;
+    config.foreign_receive_bytes = 16 << 10;
+    config.foreign_send_bytes = 8 << 10;
     config.table_rows = 1024;
     config.txn_rows = 2048;
     config.value_index_rows = 2048;

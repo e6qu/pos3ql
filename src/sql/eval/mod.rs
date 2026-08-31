@@ -240,6 +240,9 @@ pub mod sqlstate {
     pub const INVALID_SAVEPOINT_SPECIFICATION: &str = "3B001";
     pub const INVALID_TABLE_DEFINITION: &str = "42P16";
     pub const INVALID_OBJECT_DEFINITION: &str = "42P17";
+    pub const FDW_ERROR: &str = "HV000";
+    pub const FDW_INVALID_ATTRIBUTE_VALUE: &str = "HV024";
+    pub const FDW_INVALID_OPTION_NAME: &str = "HV00D";
     pub const GENERATED_ALWAYS: &str = "428C9";
     pub const INVALID_USE_OF_ESCAPE_CHARACTER: &str = "2200C";
     pub const LOCK_NOT_AVAILABLE: &str = "55P03";
@@ -5444,7 +5447,7 @@ pub(crate) fn boolean_argument<'a>(v: Datum<'a>, context: &str) -> Result<Datum<
     }
 }
 
-fn parse_bool(s: &str) -> Result<bool, SqlError> {
+pub(crate) fn parse_bool(s: &str) -> Result<bool, SqlError> {
     // Accepted spellings per PostgreSQL's boolean input, case-insensitive.
     let t = s.trim();
     if ["t", "true", "yes", "on", "1"]
@@ -5868,6 +5871,7 @@ fn regtype_builtin_name(type_oid: i32) -> Option<&'static str> {
         oid::ANYCOMPATIBLENONARRAY => "anycompatiblenonarray",
         oid::ANYCOMPATIBLERANGE => "anycompatiblerange",
         oid::ANYCOMPATIBLEMULTIRANGE => "anycompatiblemultirange",
+        oid::FDW_HANDLER => "fdw_handler",
         _ => return None,
     })
 }
@@ -5946,7 +5950,8 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
         | "anycompatiblearray"
         | "anycompatiblenonarray"
         | "anycompatiblerange"
-        | "anycompatiblemultirange") => match s {
+        | "anycompatiblemultirange"
+        | "fdw_handler") => match s {
             "regtype" => "regtype",
             "regclass" => "regclass",
             "regproc" => "regproc",
@@ -5957,6 +5962,7 @@ pub(crate) fn regtype_of_name<'a>(spelled: &str) -> Result<Datum<'a>, SqlError> 
             "regoperator" => "regoperator",
             "regconfig" => "regconfig",
             "regdictionary" => "regdictionary",
+            "fdw_handler" => "fdw_handler",
             "anyelement" => "anyelement",
             "anyarray" => "anyarray",
             "anynonarray" => "anynonarray",

@@ -27,7 +27,7 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v4";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v5";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -1191,7 +1191,13 @@ impl Checkpointer {
                     }
                     let has_toast = parse_bool_field(words.next(), "table toast relation")?;
                     let has_rules = parse_bool_field(words.next(), "table rewrite rules")?;
-                    let name = rest_of(line, 5)?;
+                    let kind: u8 = parse_field(words.next(), "table kind")?;
+                    let kind = match kind {
+                        0 => crate::storage::TableKind::Local,
+                        1 => crate::storage::TableKind::Foreign,
+                        _ => return Err(CheckpointSetupError::Corrupt("invalid table kind")),
+                    };
+                    let name = rest_of(line, 6)?;
                     let def = TableDef {
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
@@ -1200,6 +1206,7 @@ impl Checkpointer {
                         n_columns: n_cols,
                         has_toast,
                         has_rules,
+                        kind,
                         ..TableDef::empty()
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
@@ -2479,6 +2486,243 @@ impl Checkpointer {
                             published_lsn,
                         },
                     ));
+                }
+                Some("fdw") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let slot = parse_field(words.next(), "foreign wrapper slot")?;
+                    let created_at: u64 = parse_field(words.next(), "foreign wrapper sequence")?;
+                    let owner = decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("foreign wrapper owner missing"),
+                    )?)?;
+                    let handler = match parse_field::<u8>(words.next(), "foreign wrapper handler")?
+                    {
+                        0 => crate::storage::foreign::ForeignDataHandler::None,
+                        1 => crate::storage::foreign::ForeignDataHandler::Postgres,
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "invalid foreign wrapper handler",
+                            ));
+                        }
+                    };
+                    let validator =
+                        match parse_field::<u8>(words.next(), "foreign wrapper validator")? {
+                            0 => crate::storage::foreign::ForeignDataValidator::None,
+                            1 => crate::storage::foreign::ForeignDataValidator::Postgres,
+                            _ => {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "invalid foreign wrapper validator",
+                                ));
+                            }
+                        };
+                    let name = sql_name(&decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("foreign wrapper name missing"),
+                    )?)?)?;
+                    let option_count = parse_field(words.next(), "foreign wrapper options")?;
+                    let options = parse_foreign_options(&mut words, option_count)?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing foreign wrapper fields",
+                        ));
+                    }
+                    let owner = storage
+                        .find_role(&owner)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "foreign wrapper owner does not exist",
+                        ))?;
+                    storage
+                        .restore_foreign_wrapper(
+                            slot,
+                            created_at,
+                            crate::storage::foreign::ForeignDataWrapperDefinition {
+                                name,
+                                handler,
+                                validator,
+                                options,
+                            },
+                            owner as u16,
+                        )
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign wrapper"))?;
+                }
+                Some("fsrv") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let slot = parse_field(words.next(), "foreign server slot")?;
+                    let created_at: u64 = parse_field(words.next(), "foreign server sequence")?;
+                    let owner = decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("foreign server owner missing"),
+                    )?)?;
+                    let wrapper_name = decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("foreign server wrapper missing"),
+                    )?)?;
+                    let server_type =
+                        decode_optional_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("foreign server type missing"),
+                        )?)?;
+                    let version = decode_optional_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("foreign server version missing"),
+                    )?)?;
+                    let name =
+                        sql_name(&decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("foreign server name missing"),
+                        )?)?)?;
+                    let option_count = parse_field(words.next(), "foreign server options")?;
+                    let options = parse_foreign_options(&mut words, option_count)?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing foreign server fields",
+                        ));
+                    }
+                    let owner = storage
+                        .find_role(&owner)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "foreign server owner does not exist",
+                        ))?;
+                    let wrapper = storage
+                        .foreign_wrapper(&wrapper_name, 0)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "foreign server wrapper does not exist",
+                        ))?
+                        .0;
+                    storage
+                        .restore_foreign_server(
+                            slot,
+                            created_at,
+                            crate::storage::foreign::ForeignServerDefinition {
+                                name,
+                                wrapper: wrapper as u16,
+                                server_type: server_type.map(|value| StackStr::from_str(&value)),
+                                version: version.map(|value| StackStr::from_str(&value)),
+                                options,
+                            },
+                            owner as u16,
+                        )
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign server"))?;
+                }
+                Some("fum") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let slot = parse_field(words.next(), "user mapping slot")?;
+                    let created_at: u64 = parse_field(words.next(), "user mapping sequence")?;
+                    let server_name =
+                        decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt(
+                            "user mapping server missing",
+                        ))?)?;
+                    let user_kind: u8 = parse_field(words.next(), "user mapping kind")?;
+                    let user_name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("user mapping role missing"))?,
+                    )?;
+                    let option_count = parse_field(words.next(), "user mapping options")?;
+                    let options = parse_foreign_options(&mut words, option_count)?;
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing user mapping fields",
+                        ));
+                    }
+                    let server = storage
+                        .foreign_server(&server_name, 0)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "user mapping server does not exist",
+                        ))?
+                        .0;
+                    let user = match user_kind {
+                        0 if user_name.is_empty() => {
+                            crate::storage::foreign::ForeignMappingUser::Public
+                        }
+                        1 => crate::storage::foreign::ForeignMappingUser::Role(
+                            storage
+                                .find_role(&user_name)
+                                .ok_or(CheckpointSetupError::Corrupt(
+                                    "user mapping role does not exist",
+                                ))? as u16,
+                        ),
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt("invalid user mapping kind"));
+                        }
+                    };
+                    storage
+                        .restore_foreign_user_mapping(
+                            slot,
+                            created_at,
+                            crate::storage::foreign::UserMappingDefinition {
+                                server: server as u16,
+                                user,
+                                options,
+                            },
+                        )
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid user mapping"))?;
+                }
+                Some("ftab") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let slot = parse_field(words.next(), "foreign table slot")?;
+                    let created_at: u64 = parse_field(words.next(), "foreign table sequence")?;
+                    let schema = decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("foreign table schema missing"),
+                    )?)?;
+                    let table_name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("foreign table name missing"))?,
+                    )?;
+                    let server_name = decode_hex_name(words.next().ok_or(
+                        CheckpointSetupError::Corrupt("foreign table server missing"),
+                    )?)?;
+                    let option_count = parse_field(words.next(), "foreign table options")?;
+                    let options = parse_foreign_options(&mut words, option_count)?;
+                    let column_option_count: usize =
+                        parse_field(words.next(), "foreign column options")?;
+                    if column_option_count > crate::storage::foreign::MAX_FOREIGN_COLUMN_OPTIONS {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "too many foreign column options",
+                        ));
+                    }
+                    let mut column_options = crate::storage::foreign::ForeignColumnOptions::EMPTY;
+                    for _ in 0..column_option_count {
+                        let column = parse_field(words.next(), "foreign option column")?;
+                        let name = decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("foreign column option name missing"),
+                        )?)?;
+                        let value = decode_hex_name(words.next().ok_or(
+                            CheckpointSetupError::Corrupt("foreign column option value missing"),
+                        )?)?;
+                        let mut one = crate::storage::foreign::ForeignOptions::EMPTY;
+                        one.restore_option(&name, &value).map_err(|_| {
+                            CheckpointSetupError::Corrupt("invalid foreign column option")
+                        })?;
+                        column_options.append(column, one).map_err(|_| {
+                            CheckpointSetupError::Corrupt("invalid foreign column options")
+                        })?;
+                    }
+                    if words.next().is_some() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "trailing foreign table fields",
+                        ));
+                    }
+                    let table = storage.find_visible(&schema, &table_name, 0).ok_or(
+                        CheckpointSetupError::Corrupt("foreign table relation does not exist"),
+                    )?;
+                    if storage.table_def(table, 0).kind != crate::storage::TableKind::Foreign {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "foreign binding targets local table",
+                        ));
+                    }
+                    let server = storage
+                        .foreign_server(&server_name, 0)
+                        .ok_or(CheckpointSetupError::Corrupt(
+                            "foreign table server does not exist",
+                        ))?
+                        .0;
+                    storage
+                        .restore_foreign_table_binding(
+                            slot,
+                            created_at,
+                            crate::storage::foreign::ForeignTableDefinition {
+                                table: table as u16,
+                                server: server as u16,
+                                options,
+                                column_options,
+                            },
+                        )
+                        .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
                 Some("vw6") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
@@ -5730,10 +5974,14 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "table {slot} {} {} {} {}",
+                    "table {slot} {} {} {} {} {}",
                     table.def.n_columns,
                     u8::from(table.def.has_toast),
                     u8::from(table.def.has_rules),
+                    match table.def.kind {
+                        crate::storage::TableKind::Local => 0,
+                        crate::storage::TableKind::Foreign => 1,
+                    },
                     table.def.name.as_str()
                 ),
             )?;
@@ -6209,6 +6457,164 @@ impl Checkpointer {
                     ),
                 )?;
             }
+        }
+        for (slot, entry) in storage.checkpoint_foreign_wrappers() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                entry.database,
+            )?;
+            use core::fmt::Write as _;
+            let definition = entry.definition;
+            let owner = storage.role_name(entry.ownership.owner as usize, 0);
+            let mut line = StackStr::<12_288>::new();
+            let _ = write!(
+                line,
+                "fdw {} {} {} {} {} {} {}",
+                slot,
+                entry.created_at,
+                manifest_hex::<130>(owner.as_str()),
+                match definition.handler {
+                    crate::storage::foreign::ForeignDataHandler::None => 0,
+                    crate::storage::foreign::ForeignDataHandler::Postgres => 1,
+                },
+                match definition.validator {
+                    crate::storage::foreign::ForeignDataValidator::None => 0,
+                    crate::storage::foreign::ForeignDataValidator::Postgres => 1,
+                },
+                manifest_hex::<130>(definition.name.as_str()),
+                definition.options.entries().len(),
+            );
+            for option in definition.options.entries() {
+                let _ = write!(
+                    line,
+                    " {} {}",
+                    manifest_hex::<130>(option.name.as_str()),
+                    manifest_hex::<{ 2 * crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX + 1 }>(
+                        option.value.as_str()
+                    ),
+                );
+            }
+            write_manifest(&mut self.manifest_buf, line.as_str())?;
+        }
+        for (slot, entry) in storage.checkpoint_foreign_servers() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                entry.database,
+            )?;
+            use core::fmt::Write as _;
+            let definition = entry.definition;
+            let owner = storage.role_name(entry.ownership.owner as usize, 0);
+            let wrapper = storage.checkpoint_foreign_wrapper(definition.wrapper as usize);
+            let mut line = StackStr::<12_288>::new();
+            let _ = write!(
+                line,
+                "fsrv {} {} {} {} {} {} {} {}",
+                slot,
+                entry.created_at,
+                manifest_hex::<130>(owner.as_str()),
+                manifest_hex::<130>(wrapper.definition.name.as_str()),
+                manifest_optional_hex(definition.server_type),
+                manifest_optional_hex(definition.version),
+                manifest_hex::<130>(definition.name.as_str()),
+                definition.options.entries().len(),
+            );
+            for option in definition.options.entries() {
+                let _ = write!(
+                    line,
+                    " {} {}",
+                    manifest_hex::<130>(option.name.as_str()),
+                    manifest_hex::<{ 2 * crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX + 1 }>(
+                        option.value.as_str()
+                    ),
+                );
+            }
+            write_manifest(&mut self.manifest_buf, line.as_str())?;
+        }
+        for (slot, entry) in storage.checkpoint_foreign_user_mappings() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                entry.database,
+            )?;
+            use core::fmt::Write as _;
+            let definition = entry.definition;
+            let server = storage.checkpoint_foreign_server(definition.server as usize);
+            let (user_kind, user_name) = match definition.user {
+                crate::storage::foreign::ForeignMappingUser::Public => (0, StackStr::from_str("-")),
+                crate::storage::foreign::ForeignMappingUser::Role(slot) => (
+                    1,
+                    manifest_hex::<130>(storage.role_name(slot as usize, 0).as_str()),
+                ),
+            };
+            let mut line = StackStr::<12_288>::new();
+            let _ = write!(
+                line,
+                "fum {} {} {} {} {} {}",
+                slot,
+                entry.created_at,
+                manifest_hex::<130>(server.definition.name.as_str()),
+                user_kind,
+                user_name,
+                definition.options.entries().len(),
+            );
+            for option in definition.options.entries() {
+                let _ = write!(
+                    line,
+                    " {} {}",
+                    manifest_hex::<130>(option.name.as_str()),
+                    manifest_hex::<{ 2 * crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX + 1 }>(
+                        option.value.as_str()
+                    ),
+                );
+            }
+            write_manifest(&mut self.manifest_buf, line.as_str())?;
+        }
+        for (slot, entry) in storage.checkpoint_foreign_tables() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                entry.database,
+            )?;
+            use core::fmt::Write as _;
+            let definition = entry.definition;
+            let table = storage.table_def(definition.table as usize, 0);
+            let server = storage.checkpoint_foreign_server(definition.server as usize);
+            let mut line = StackStr::<40_960>::new();
+            let _ = write!(
+                line,
+                "ftab {} {} {} {} {} {}",
+                slot,
+                entry.created_at,
+                manifest_hex::<130>(table.schema.as_str()),
+                manifest_hex::<130>(table.name.as_str()),
+                manifest_hex::<130>(server.definition.name.as_str()),
+                definition.options.entries().len(),
+            );
+            for option in definition.options.entries() {
+                let _ = write!(
+                    line,
+                    " {} {}",
+                    manifest_hex::<130>(option.name.as_str()),
+                    manifest_hex::<{ 2 * crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX + 1 }>(
+                        option.value.as_str()
+                    ),
+                );
+            }
+            let _ = write!(line, " {}", definition.column_options.entries().len());
+            for column in definition.column_options.entries() {
+                let _ = write!(
+                    line,
+                    " {} {} {}",
+                    column.column,
+                    manifest_hex::<130>(column.option.name.as_str()),
+                    manifest_hex::<{ 2 * crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX + 1 }>(
+                        column.option.value.as_str()
+                    ),
+                );
+            }
+            write_manifest(&mut self.manifest_buf, line.as_str())?;
         }
         // View SQL and names are hex because the manifest is space-separated.
         for (view_slot, view) in storage.checkpoint_views() {
@@ -8904,6 +9310,30 @@ fn parse_field<T: core::str::FromStr>(
         .ok_or(CheckpointSetupError::Corrupt(what))
 }
 
+fn parse_foreign_options(
+    words: &mut core::str::Split<'_, char>,
+    count: usize,
+) -> Result<crate::storage::foreign::ForeignOptions, CheckpointSetupError> {
+    if count > crate::storage::foreign::MAX_FOREIGN_OPTIONS {
+        return Err(CheckpointSetupError::Corrupt("too many foreign options"));
+    }
+    let mut options = crate::storage::foreign::ForeignOptions::EMPTY;
+    for _ in 0..count {
+        let name = decode_hex_name(
+            words
+                .next()
+                .ok_or(CheckpointSetupError::Corrupt("foreign option name missing"))?,
+        )?;
+        let value = decode_hex_name(words.next().ok_or(CheckpointSetupError::Corrupt(
+            "foreign option value missing",
+        ))?)?;
+        options
+            .restore_option(&name, &value)
+            .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign option"))?;
+    }
+    Ok(options)
+}
+
 /// The name is everything after the first `skip` space-separated fields.
 fn rest_of(line: &str, skip: usize) -> Result<&str, CheckpointSetupError> {
     let mut at = 0;
@@ -8940,6 +9370,51 @@ fn decode_hex_name(hex: &str) -> Result<String, CheckpointSetupError> {
         );
     }
     String::from_utf8(bytes).map_err(|_| CheckpointSetupError::Corrupt("hex name not UTF-8"))
+}
+
+fn decode_optional_hex_name(value: &str) -> Result<Option<String>, CheckpointSetupError> {
+    match value.as_bytes().first() {
+        Some(b'0') if value.len() == 1 => Ok(None),
+        Some(b'1') => decode_hex_name(&value[1..]).map(Some),
+        _ => Err(CheckpointSetupError::Corrupt(
+            "invalid optional foreign value",
+        )),
+    }
+}
+
+fn manifest_hex<const N: usize>(value: &str) -> StackStr<N> {
+    use core::fmt::Write as _;
+    let mut encoded = StackStr::new();
+    if value.is_empty() {
+        let _ = encoded.write_char('-');
+    } else {
+        for byte in value.as_bytes() {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+    }
+    encoded
+}
+
+fn manifest_optional_hex(
+    value: Option<StackStr<{ crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX }>>,
+) -> StackStr<{ 2 * crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX + 2 }> {
+    use core::fmt::Write as _;
+    let mut encoded = StackStr::new();
+    match value {
+        None => {
+            let _ = encoded.write_char('0');
+        }
+        Some(value) => {
+            let _ = encoded.write_char('1');
+            let _ = encoded.write_str(
+                manifest_hex::<{ 2 * crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX + 1 }>(
+                    value.as_str(),
+                )
+                .as_str(),
+            );
+        }
+    }
+    encoded
 }
 
 fn encode_extension_package(

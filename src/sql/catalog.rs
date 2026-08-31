@@ -73,6 +73,22 @@ struct IntrinsicRoutine {
 
 const INTRINSIC_ROUTINES: &[IntrinsicRoutine] = &[
     IntrinsicRoutine {
+        oid: 540_000,
+        name: "postgres_fdw_handler",
+        result_oid: super::types::oid::FDW_HANDLER,
+        argument_types: "",
+        argument_count: 0,
+        volatility: "v",
+    },
+    IntrinsicRoutine {
+        oid: 540_001,
+        name: "postgres_fdw_validator",
+        result_oid: super::types::oid::VOID,
+        argument_types: "1009 26",
+        argument_count: 2,
+        volatility: "s",
+    },
+    IntrinsicRoutine {
         oid: 715,
         name: "lo_create",
         result_oid: 26,
@@ -1022,6 +1038,13 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
             name,
             "tables"
                 | "columns"
+                | "column_options"
+                | "foreign_data_wrapper_options"
+                | "foreign_data_wrappers"
+                | "foreign_server_options"
+                | "foreign_servers"
+                | "foreign_table_options"
+                | "foreign_tables"
                 | "schemata"
                 | "table_constraints"
                 | "key_column_usage"
@@ -1051,6 +1074,8 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "parameters"
                 | "routine_privileges"
                 | "role_routine_grants"
+                | "user_mapping_options"
+                | "user_mappings"
         ),
         Some(_) => false,
         None => matches!(
@@ -1093,6 +1118,8 @@ pub fn is_catalog_relation(qualifier: Option<&str>, name: &str) -> bool {
                 | "pg_subscription_rel"
                 | "pg_foreign_table"
                 | "pg_foreign_server"
+                | "pg_user_mapping"
+                | "pg_user_mappings"
                 | "pg_partitioned_table"
                 | "pg_description"
                 | "pg_shdescription"
@@ -1217,53 +1244,11 @@ pub fn synthesize<'a>(
         (false, "pg_rewrite") => pg_rewrite(storage, txid, arena),
         (false, "pg_trigger") => pg_trigger(storage, txid, arena),
         (false, "pg_event_trigger") => pg_event_trigger(storage, txid, arena),
-        (false, "pg_foreign_table") => finish(
-            def_of(
-                "pg_foreign_table",
-                &[
-                    ("ftrelid", ColType::Int4),
-                    ("ftserver", ColType::Int4),
-                    ("ftoptions", ColType::Array(super::types::ArrElem::Text)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
-        (false, "pg_foreign_server") => finish(
-            def_of(
-                "pg_foreign_server",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("srvname", ColType::Text),
-                    ("srvowner", ColType::Int4),
-                    ("srvfdw", ColType::Int4),
-                    ("srvtype", ColType::Text),
-                    ("srvversion", ColType::Text),
-                    ("srvacl", ColType::Array(super::types::ArrElem::AclItem)),
-                    ("srvoptions", ColType::Array(super::types::ArrElem::Text)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
-        (false, "pg_foreign_data_wrapper") => finish(
-            def_of(
-                "pg_foreign_data_wrapper",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("fdwname", ColType::Text),
-                    ("fdwowner", ColType::Int4),
-                    ("fdwhandler", ColType::Int4),
-                    ("fdwvalidator", ColType::Int4),
-                    ("fdwacl", ColType::Array(super::types::ArrElem::AclItem)),
-                    ("fdwoptions", ColType::Array(super::types::ArrElem::Text)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_foreign_table") => pg_foreign_table(storage, txid, arena),
+        (false, "pg_foreign_server") => pg_foreign_server(storage, txid, arena),
+        (false, "pg_foreign_data_wrapper") => pg_foreign_data_wrapper(storage, txid, arena),
+        (false, "pg_user_mapping") => pg_user_mapping(storage, txid, arena),
+        (false, "pg_user_mappings") => pg_user_mappings(storage, txid, arena),
         (false, "pg_partitioned_table") => pg_partitioned_table(storage, txid, arena),
         (false, "pg_settings") => pg_settings(arena),
         (false, "pg_prepared_xacts") => pg_prepared_xacts(storage, txid, arena),
@@ -1375,6 +1360,15 @@ pub fn synthesize<'a>(
         (false, "pg_rules") => pg_rules(storage, txid, arena),
         (true, "tables") => info_tables(storage, txid, arena),
         (true, "columns") => info_columns(storage, txid, arena),
+        (true, "column_options") => info_column_options(storage, txid, arena),
+        (true, "foreign_data_wrapper_options") => {
+            info_foreign_data_wrapper_options(storage, txid, arena)
+        }
+        (true, "foreign_data_wrappers") => info_foreign_data_wrappers(storage, txid, arena),
+        (true, "foreign_server_options") => info_foreign_server_options(storage, txid, arena),
+        (true, "foreign_servers") => info_foreign_servers(storage, txid, arena),
+        (true, "foreign_table_options") => info_foreign_table_options(storage, txid, arena),
+        (true, "foreign_tables") => info_foreign_tables(storage, txid, arena),
         (true, "schemata") => info_schemata(storage, txid, arena),
         (true, "table_constraints") => info_table_constraints(storage, txid, arena),
         (true, "key_column_usage") => info_key_column_usage(storage, txid, arena),
@@ -1408,6 +1402,8 @@ pub fn synthesize<'a>(
         (true, "role_routine_grants") => info_routine_privileges(storage, txid, arena, false),
         (true, "view_table_usage") => info_view_table_usage(storage, txid, arena),
         (true, "view_column_usage") => info_view_column_usage(storage, txid, arena),
+        (true, "user_mapping_options") => info_user_mapping_options(storage, txid, arena),
+        (true, "user_mappings") => info_user_mappings(storage, txid, arena),
         _ => Err(sql_err!(
             sqlstate::UNDEFINED_TABLE,
             "catalog relation \"{}\" is not implemented",
@@ -1424,6 +1420,361 @@ fn table_oid(_storage: &Storage, slot: usize) -> i32 {
 
 pub(crate) fn user_table_oid(slot: usize) -> i32 {
     FIRST_USER_OID + slot as i32
+}
+
+const FIRST_FOREIGN_DATA_WRAPPER_OID: i32 = 510_000;
+const FIRST_FOREIGN_SERVER_OID: i32 = 520_000;
+const FIRST_USER_MAPPING_OID: i32 = 530_000;
+
+const fn foreign_data_wrapper_oid(slot: usize) -> i32 {
+    FIRST_FOREIGN_DATA_WRAPPER_OID + slot as i32
+}
+
+const fn foreign_server_oid(slot: usize) -> i32 {
+    FIRST_FOREIGN_SERVER_OID + slot as i32
+}
+
+const fn user_mapping_oid(slot: usize) -> i32 {
+    FIRST_USER_MAPPING_OID + slot as i32
+}
+
+fn foreign_options_datum<'a>(
+    options: &crate::storage::foreign::ForeignOptions,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    if options.entries().is_empty() {
+        return Ok(Datum::Null);
+    }
+    let values = arena
+        .alloc_slice_with(options.entries().len(), |_| Datum::Null)
+        .map_err(|_| arena_full())?;
+    for (value, option) in values.iter_mut().zip(options.entries()) {
+        let rendered = stack_format!(322, "{}={}", option.name.as_str(), option.value.as_str());
+        *value = text(rendered.as_str(), arena)?;
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Text,
+        raw: super::array::build(values, arena)?,
+    })
+}
+
+fn foreign_routine_oid(storage: &Storage, txid: u32, name: &str) -> Result<i32, SqlError> {
+    routine_oid_by_name(storage, txid, name, false)?.ok_or_else(|| {
+        sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "foreign-data routine \"{}\" is missing from pg_proc",
+            name
+        )
+    })
+}
+
+fn pg_foreign_data_wrapper<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_foreign_data_wrapper",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("fdwname", ColType::Name),
+            ("fdwowner", ColType::Int4),
+            ("fdwhandler", ColType::Int4),
+            ("fdwvalidator", ColType::Int4),
+            ("fdwacl", ColType::Array(super::types::ArrElem::AclItem)),
+            ("fdwoptions", ColType::Array(super::types::ArrElem::Text)),
+        ],
+    );
+    let count = storage.foreign_wrappers(txid).count();
+    let rows = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (index, (slot, entry)) in storage.foreign_wrappers(txid).enumerate() {
+        let wrapper = entry.definition_for(txid);
+        rows[index] = row(
+            &[
+                Datum::Int4(2328),
+                Datum::Int4(foreign_data_wrapper_oid(slot)),
+                text(wrapper.name.as_str(), arena)?,
+                Datum::Int4(Storage::role_oid(entry.ownership.owner_to(txid) as usize)),
+                Datum::Int4(match wrapper.handler {
+                    crate::storage::foreign::ForeignDataHandler::None => 0,
+                    crate::storage::foreign::ForeignDataHandler::Postgres => {
+                        foreign_routine_oid(storage, txid, "postgres_fdw_handler")?
+                    }
+                }),
+                Datum::Int4(match wrapper.validator {
+                    crate::storage::foreign::ForeignDataValidator::None => 0,
+                    crate::storage::foreign::ForeignDataValidator::Postgres => {
+                        foreign_routine_oid(storage, txid, "postgres_fdw_validator")?
+                    }
+                }),
+                acl(
+                    storage,
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::ForeignDataWrapper,
+                        slot: slot as u16,
+                    },
+                    txid,
+                    arena,
+                )?,
+                foreign_options_datum(&wrapper.options, arena)?,
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, rows, arena)
+}
+
+fn pg_foreign_server<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_foreign_server",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("srvname", ColType::Name),
+            ("srvowner", ColType::Int4),
+            ("srvfdw", ColType::Int4),
+            ("srvtype", ColType::Text),
+            ("srvversion", ColType::Text),
+            ("srvacl", ColType::Array(super::types::ArrElem::AclItem)),
+            ("srvoptions", ColType::Array(super::types::ArrElem::Text)),
+        ],
+    );
+    let count = storage.foreign_servers(txid).count();
+    let rows = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (index, (slot, entry)) in storage.foreign_servers(txid).enumerate() {
+        let server = entry.definition_for(txid);
+        rows[index] = row(
+            &[
+                Datum::Int4(1417),
+                Datum::Int4(foreign_server_oid(slot)),
+                text(server.name.as_str(), arena)?,
+                Datum::Int4(Storage::role_oid(entry.ownership.owner_to(txid) as usize)),
+                Datum::Int4(foreign_data_wrapper_oid(server.wrapper as usize)),
+                match server.server_type {
+                    Some(value) => text(value.as_str(), arena)?,
+                    None => Datum::Null,
+                },
+                match server.version {
+                    Some(value) => text(value.as_str(), arena)?,
+                    None => Datum::Null,
+                },
+                acl(
+                    storage,
+                    crate::storage::AccessObject {
+                        class: crate::storage::AccessClass::ForeignServer,
+                        slot: slot as u16,
+                    },
+                    txid,
+                    arena,
+                )?,
+                foreign_options_datum(&server.options, arena)?,
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, rows, arena)
+}
+
+fn pg_foreign_table<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_foreign_table",
+        &[
+            ("ftrelid", ColType::Int4),
+            ("ftserver", ColType::Int4),
+            ("ftoptions", ColType::Array(super::types::ArrElem::Text)),
+        ],
+    );
+    let count = storage.foreign_tables(txid).count();
+    let rows = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (index, (_, entry)) in storage.foreign_tables(txid).enumerate() {
+        let table = entry.definition_for(txid);
+        rows[index] = row(
+            &[
+                Datum::Int4(user_table_oid(table.table as usize)),
+                Datum::Int4(foreign_server_oid(table.server as usize)),
+                foreign_options_datum(&table.options, arena)?,
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, rows, arena)
+}
+
+fn pg_user_mapping<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_user_mapping",
+        &[
+            ("oid", ColType::Int4),
+            ("umuser", ColType::Int4),
+            ("umserver", ColType::Int4),
+            ("umoptions", ColType::Array(super::types::ArrElem::Text)),
+        ],
+    );
+    let count = storage.foreign_user_mappings(txid).count();
+    let rows = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (index, (slot, entry)) in storage.foreign_user_mappings(txid).enumerate() {
+        let mapping = entry.definition_for(txid);
+        let user = match mapping.user {
+            crate::storage::foreign::ForeignMappingUser::Public => 0,
+            crate::storage::foreign::ForeignMappingUser::Role(slot) => {
+                Storage::role_oid(slot as usize)
+            }
+        };
+        rows[index] = row(
+            &[
+                Datum::Int4(user_mapping_oid(slot)),
+                Datum::Int4(user),
+                Datum::Int4(foreign_server_oid(mapping.server as usize)),
+                if foreign_mapping_options_visible(storage, mapping, txid) {
+                    foreign_options_datum(&mapping.options, arena)?
+                } else {
+                    Datum::Null
+                },
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, rows, arena)
+}
+
+fn pg_user_mappings<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_user_mappings",
+        &[
+            ("umid", ColType::Int4),
+            ("srvid", ColType::Int4),
+            ("srvname", ColType::Name),
+            ("umuser", ColType::Int4),
+            ("usename", ColType::Name),
+            ("umoptions", ColType::Array(super::types::ArrElem::Text)),
+        ],
+    );
+    let count = storage.foreign_user_mappings(txid).count();
+    let rows = arena
+        .alloc_slice_with(count, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    for (index, (slot, entry)) in storage.foreign_user_mappings(txid).enumerate() {
+        let mapping = entry.definition_for(txid);
+        let server = storage
+            .foreign_server_by_slot(mapping.server as usize, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "user mapping references a missing foreign server"
+                )
+            })?;
+        let (user, user_name) = match mapping.user {
+            crate::storage::foreign::ForeignMappingUser::Public => (0, text("PUBLIC", arena)?),
+            crate::storage::foreign::ForeignMappingUser::Role(role) => (
+                Storage::role_oid(role as usize),
+                text(storage.role_name(role as usize, txid).as_str(), arena)?,
+            ),
+        };
+        rows[index] = row(
+            &[
+                Datum::Int4(user_mapping_oid(slot)),
+                Datum::Int4(foreign_server_oid(mapping.server as usize)),
+                text(server.name.as_str(), arena)?,
+                Datum::Int4(user),
+                user_name,
+                if foreign_mapping_options_visible(storage, mapping, txid) {
+                    foreign_options_datum(&mapping.options, arena)?
+                } else {
+                    Datum::Null
+                },
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, rows, arena)
+}
+
+fn foreign_object_visible(
+    storage: &Storage,
+    class: crate::storage::AccessClass,
+    slot: usize,
+    txid: u32,
+) -> bool {
+    storage.current_role_slot(txid).is_some_and(|role| {
+        storage.has_object_privilege(
+            crate::storage::AccessObject {
+                class,
+                slot: slot as u16,
+            },
+            role,
+            crate::storage::PrivilegeSet::USAGE,
+            txid,
+        )
+    })
+}
+
+fn foreign_table_visible(storage: &Storage, slot: usize, txid: u32) -> bool {
+    let Some(role) = storage.current_role_slot(txid) else {
+        return false;
+    };
+    let object = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::Table,
+        slot: slot as u16,
+    };
+    [
+        crate::storage::PrivilegeSet::SELECT,
+        crate::storage::PrivilegeSet::INSERT,
+        crate::storage::PrivilegeSet::UPDATE,
+        crate::storage::PrivilegeSet::DELETE,
+        crate::storage::PrivilegeSet::TRUNCATE,
+        crate::storage::PrivilegeSet::REFERENCES,
+        crate::storage::PrivilegeSet::TRIGGER,
+        crate::storage::PrivilegeSet::MAINTAIN,
+    ]
+    .into_iter()
+    .any(|privilege| storage.has_object_privilege(object, role, privilege, txid))
+}
+
+fn foreign_mapping_options_visible(
+    storage: &Storage,
+    mapping: crate::storage::foreign::UserMappingDefinition,
+    txid: u32,
+) -> bool {
+    let Some(current) = storage.current_role_slot(txid) else {
+        return false;
+    };
+    if storage.role(current).attributes_to(txid).superuser {
+        return true;
+    }
+    let server = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::ForeignServer,
+        slot: mapping.server,
+    };
+    if storage.object_owner(server, txid) == current {
+        return true;
+    }
+    matches!(mapping.user, crate::storage::foreign::ForeignMappingUser::Role(role) if role as usize == current)
+        && storage.has_object_privilege(server, current, crate::storage::PrivilegeSet::USAGE, txid)
 }
 
 const PG_DATABASE_OWNER_OID: i32 = 6_171;
@@ -1557,6 +1908,8 @@ fn acl<'a>(
         crate::storage::AccessClass::Index => crate::storage::PrivilegeSet::NONE,
         crate::storage::AccessClass::Routine => crate::storage::PrivilegeSet::FUNCTION_ALL,
         crate::storage::AccessClass::LargeObject => crate::storage::PrivilegeSet::LARGE_OBJECT_ALL,
+        crate::storage::AccessClass::ForeignDataWrapper
+        | crate::storage::AccessClass::ForeignServer => crate::storage::PrivilegeSet::USAGE,
         crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
         crate::storage::AccessClass::Tablespace => crate::storage::PrivilegeSet::CREATE,
         crate::storage::AccessClass::Database => crate::storage::PrivilegeSet::DATABASE_ALL,
@@ -2782,7 +3135,7 @@ pub fn type_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
     if super::types::ColType::from_oid(oid).is_some()
         || matches!(
             oid,
-            26 | 2249 | 2202 | 2203 | 2204 | 2205 | 2206 | 4096 | 4097
+            26 | 2249 | 2202 | 2203 | 2204 | 2205 | 2206 | 3115 | 4096 | 4097
         )
     {
         return true;
@@ -4556,6 +4909,7 @@ pub fn builtin_type_identity(name: &str, allow_aliases: bool) -> Option<(&'stati
         "regrole" => Some(("regrole", oid::REGROLE)),
         "regconfig" => Some(("regconfig", oid::REGCONFIG)),
         "regdictionary" => Some(("regdictionary", oid::REGDICTIONARY)),
+        "fdw_handler" => Some(("fdw_handler", oid::FDW_HANDLER)),
         _ => None,
     };
     if catalog_only.is_some() {
@@ -7083,7 +7437,9 @@ fn pg_class<'a>(
         };
         // A table that has a matching matview catalog entry is a materialized
         // view (relkind 'm'), not an ordinary table ('r').
-        let relkind = if table_def.partition.is_partitioned() {
+        let relkind = if table_def.kind == crate::storage::TableKind::Foreign {
+            "f"
+        } else if table_def.partition.is_partitioned() {
             "p"
         } else if storage
             .find_matview(table_def.schema.as_str(), table_def.name.as_str(), txid)
@@ -8509,6 +8865,8 @@ fn extension_dependency_catalog_identity(
                 .find_map(|(candidate, object)| (candidate == slot).then_some(object.oid.get()))?
                 as i32,
         ),
+        AccessClass::ForeignDataWrapper => (2328, foreign_data_wrapper_oid(slot)),
+        AccessClass::ForeignServer => (1417, foreign_server_oid(slot)),
     })
 }
 
@@ -9602,6 +9960,16 @@ fn pg_attribute<'a>(
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attribute"));
             }
+            let foreign_column_options =
+                if let Some((_, binding)) = storage.foreign_table(slot as u16, txid) {
+                    let mut options = crate::storage::foreign::ForeignOptions::EMPTY;
+                    for option in binding.column_options.options_for(i as u16) {
+                        options.restore_option(option.name.as_str(), option.value.as_str())?;
+                    }
+                    foreign_options_datum(&options, arena)?
+                } else {
+                    Datum::Null
+                };
             out[n] = row(
                 &[
                     Datum::Int4(table_oid(storage, slot)),
@@ -9634,7 +10002,7 @@ fn pg_attribute<'a>(
                     text("i", arena)?,
                     Datum::Bool(true),
                     Datum::Null,
-                    Datum::Null,
+                    foreign_column_options,
                     Datum::Bool(false),
                     Datum::Null,
                     column_acl(
@@ -12089,6 +12457,16 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
             "p",
         ),
         (
+            super::types::oid::FDW_HANDLER,
+            "fdw_handler",
+            4,
+            "P",
+            0,
+            0,
+            0,
+            "p",
+        ),
+        (
             super::types::oid::ACLITEM,
             "aclitem",
             12,
@@ -13922,6 +14300,506 @@ fn pg_sequence<'a>(
     finish(def, &out[..n], arena)
 }
 
+fn info_foreign_data_wrappers<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "foreign_data_wrappers",
+        &[
+            ("foreign_data_wrapper_catalog", ColType::Text),
+            ("foreign_data_wrapper_name", ColType::Text),
+            ("authorization_identifier", ColType::Text),
+            ("library_name", ColType::Text),
+            ("foreign_data_wrapper_language", ColType::Text),
+        ],
+    );
+    let capacity = storage.foreign_wrappers(txid).count();
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let catalog = storage.current_database_name(txid);
+    let mut count = 0;
+    for (slot, entry) in storage.foreign_wrappers(txid) {
+        if !foreign_object_visible(
+            storage,
+            crate::storage::AccessClass::ForeignDataWrapper,
+            slot,
+            txid,
+        ) {
+            continue;
+        }
+        let wrapper = entry.definition_for(txid);
+        rows[count] = row(
+            &[
+                text(catalog.as_str(), arena)?,
+                text(wrapper.name.as_str(), arena)?,
+                owner_name(
+                    storage,
+                    crate::storage::AccessClass::ForeignDataWrapper,
+                    slot,
+                    txid,
+                    arena,
+                )?,
+                Datum::Null,
+                match wrapper.handler {
+                    crate::storage::foreign::ForeignDataHandler::None => Datum::Null,
+                    crate::storage::foreign::ForeignDataHandler::Postgres => {
+                        text("internal", arena)?
+                    }
+                },
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn info_foreign_data_wrapper_options<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "foreign_data_wrapper_options",
+        &[
+            ("foreign_data_wrapper_catalog", ColType::Text),
+            ("foreign_data_wrapper_name", ColType::Text),
+            ("option_name", ColType::Text),
+            ("option_value", ColType::Text),
+        ],
+    );
+    let capacity = storage
+        .foreign_wrappers(txid)
+        .map(|(_, entry)| entry.definition_for(txid).options.entries().len())
+        .sum();
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let catalog = storage.current_database_name(txid);
+    let mut count = 0;
+    for (slot, entry) in storage.foreign_wrappers(txid) {
+        if !foreign_object_visible(
+            storage,
+            crate::storage::AccessClass::ForeignDataWrapper,
+            slot,
+            txid,
+        ) {
+            continue;
+        }
+        let wrapper = entry.definition_for(txid);
+        for option in wrapper.options.entries() {
+            rows[count] = row(
+                &[
+                    text(catalog.as_str(), arena)?,
+                    text(wrapper.name.as_str(), arena)?,
+                    text(option.name.as_str(), arena)?,
+                    text(option.value.as_str(), arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn info_foreign_servers<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "foreign_servers",
+        &[
+            ("foreign_server_catalog", ColType::Text),
+            ("foreign_server_name", ColType::Text),
+            ("foreign_data_wrapper_catalog", ColType::Text),
+            ("foreign_data_wrapper_name", ColType::Text),
+            ("foreign_server_type", ColType::Text),
+            ("foreign_server_version", ColType::Text),
+            ("authorization_identifier", ColType::Text),
+        ],
+    );
+    let capacity = storage.foreign_servers(txid).count();
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let catalog = storage.current_database_name(txid);
+    let mut count = 0;
+    for (slot, entry) in storage.foreign_servers(txid) {
+        if !foreign_object_visible(
+            storage,
+            crate::storage::AccessClass::ForeignServer,
+            slot,
+            txid,
+        ) {
+            continue;
+        }
+        let server = entry.definition_for(txid);
+        let wrapper = storage
+            .foreign_wrapper_by_slot(server.wrapper as usize, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "foreign server references a missing foreign-data wrapper"
+                )
+            })?;
+        rows[count] = row(
+            &[
+                text(catalog.as_str(), arena)?,
+                text(server.name.as_str(), arena)?,
+                text(catalog.as_str(), arena)?,
+                text(wrapper.name.as_str(), arena)?,
+                server
+                    .server_type
+                    .map_or(Ok(Datum::Null), |value| text(value.as_str(), arena))?,
+                server
+                    .version
+                    .map_or(Ok(Datum::Null), |value| text(value.as_str(), arena))?,
+                owner_name(
+                    storage,
+                    crate::storage::AccessClass::ForeignServer,
+                    slot,
+                    txid,
+                    arena,
+                )?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn info_foreign_server_options<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "foreign_server_options",
+        &[
+            ("foreign_server_catalog", ColType::Text),
+            ("foreign_server_name", ColType::Text),
+            ("option_name", ColType::Text),
+            ("option_value", ColType::Text),
+        ],
+    );
+    let capacity = storage
+        .foreign_servers(txid)
+        .map(|(_, entry)| entry.definition_for(txid).options.entries().len())
+        .sum();
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let catalog = storage.current_database_name(txid);
+    let mut count = 0;
+    for (slot, entry) in storage.foreign_servers(txid) {
+        if !foreign_object_visible(
+            storage,
+            crate::storage::AccessClass::ForeignServer,
+            slot,
+            txid,
+        ) {
+            continue;
+        }
+        let server = entry.definition_for(txid);
+        for option in server.options.entries() {
+            rows[count] = row(
+                &[
+                    text(catalog.as_str(), arena)?,
+                    text(server.name.as_str(), arena)?,
+                    text(option.name.as_str(), arena)?,
+                    text(option.value.as_str(), arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn info_foreign_tables<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "foreign_tables",
+        &[
+            ("foreign_table_catalog", ColType::Text),
+            ("foreign_table_schema", ColType::Text),
+            ("foreign_table_name", ColType::Text),
+            ("foreign_server_catalog", ColType::Text),
+            ("foreign_server_name", ColType::Text),
+        ],
+    );
+    let capacity = storage.foreign_tables(txid).count();
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let catalog = storage.current_database_name(txid);
+    let mut count = 0;
+    for (_, entry) in storage.foreign_tables(txid) {
+        let foreign = entry.definition_for(txid);
+        if !foreign_table_visible(storage, foreign.table as usize, txid) {
+            continue;
+        }
+        let table = storage.table_def(foreign.table as usize, txid);
+        let server = storage
+            .foreign_server_by_slot(foreign.server as usize, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "foreign table references a missing foreign server"
+                )
+            })?;
+        rows[count] = row(
+            &[
+                text(catalog.as_str(), arena)?,
+                text(table.schema.as_str(), arena)?,
+                text(table.name.as_str(), arena)?,
+                text(catalog.as_str(), arena)?,
+                text(server.name.as_str(), arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn info_foreign_table_options<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "foreign_table_options",
+        &[
+            ("foreign_table_catalog", ColType::Text),
+            ("foreign_table_schema", ColType::Text),
+            ("foreign_table_name", ColType::Text),
+            ("option_name", ColType::Text),
+            ("option_value", ColType::Text),
+        ],
+    );
+    let capacity = storage
+        .foreign_tables(txid)
+        .map(|(_, entry)| entry.definition_for(txid).options.entries().len())
+        .sum();
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let catalog = storage.current_database_name(txid);
+    let mut count = 0;
+    for (_, entry) in storage.foreign_tables(txid) {
+        let foreign = entry.definition_for(txid);
+        if !foreign_table_visible(storage, foreign.table as usize, txid) {
+            continue;
+        }
+        let table = storage.table_def(foreign.table as usize, txid);
+        for option in foreign.options.entries() {
+            rows[count] = row(
+                &[
+                    text(catalog.as_str(), arena)?,
+                    text(table.schema.as_str(), arena)?,
+                    text(table.name.as_str(), arena)?,
+                    text(option.name.as_str(), arena)?,
+                    text(option.value.as_str(), arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn info_column_options<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "column_options",
+        &[
+            ("table_catalog", ColType::Text),
+            ("table_schema", ColType::Text),
+            ("table_name", ColType::Text),
+            ("column_name", ColType::Text),
+            ("option_name", ColType::Text),
+            ("option_value", ColType::Text),
+        ],
+    );
+    let capacity = storage
+        .foreign_tables(txid)
+        .map(|(_, entry)| entry.definition_for(txid).column_options.entries().len())
+        .sum();
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let catalog = storage.current_database_name(txid);
+    let mut count = 0;
+    for (_, entry) in storage.foreign_tables(txid) {
+        let foreign = entry.definition_for(txid);
+        if !foreign_table_visible(storage, foreign.table as usize, txid) {
+            continue;
+        }
+        let table = storage.table_def(foreign.table as usize, txid);
+        for option in foreign.column_options.entries() {
+            let column = table.columns.get(option.column as usize).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "foreign column option references a missing column"
+                )
+            })?;
+            rows[count] = row(
+                &[
+                    text(catalog.as_str(), arena)?,
+                    text(table.schema.as_str(), arena)?,
+                    text(table.name.as_str(), arena)?,
+                    text(column.name.as_str(), arena)?,
+                    text(option.option.name.as_str(), arena)?,
+                    text(option.option.value.as_str(), arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn info_user_mappings<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "user_mappings",
+        &[
+            ("authorization_identifier", ColType::Text),
+            ("foreign_server_catalog", ColType::Text),
+            ("foreign_server_name", ColType::Text),
+        ],
+    );
+    let capacity = storage.foreign_user_mappings(txid).count();
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let catalog = storage.current_database_name(txid);
+    let mut count = 0;
+    for (_, entry) in storage.foreign_user_mappings(txid) {
+        let mapping = entry.definition_for(txid);
+        if !foreign_object_visible(
+            storage,
+            crate::storage::AccessClass::ForeignServer,
+            mapping.server as usize,
+            txid,
+        ) {
+            continue;
+        }
+        let server = storage
+            .foreign_server_by_slot(mapping.server as usize, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "user mapping references a missing foreign server"
+                )
+            })?;
+        let authorization = match mapping.user {
+            crate::storage::foreign::ForeignMappingUser::Public => text("PUBLIC", arena)?,
+            crate::storage::foreign::ForeignMappingUser::Role(role) => {
+                text(storage.role_name(role as usize, txid).as_str(), arena)?
+            }
+        };
+        rows[count] = row(
+            &[
+                authorization,
+                text(catalog.as_str(), arena)?,
+                text(server.name.as_str(), arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
+}
+
+fn info_user_mapping_options<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "user_mapping_options",
+        &[
+            ("authorization_identifier", ColType::Text),
+            ("foreign_server_catalog", ColType::Text),
+            ("foreign_server_name", ColType::Text),
+            ("option_name", ColType::Text),
+            ("option_value", ColType::Text),
+        ],
+    );
+    let capacity = storage
+        .foreign_user_mappings(txid)
+        .map(|(_, entry)| entry.definition_for(txid).options.entries().len())
+        .sum();
+    let rows = arena
+        .alloc_slice_with(capacity, |_| &[] as &[Datum])
+        .map_err(|_| arena_full())?;
+    let catalog = storage.current_database_name(txid);
+    let mut count = 0;
+    for (_, entry) in storage.foreign_user_mappings(txid) {
+        let mapping = entry.definition_for(txid);
+        if !foreign_object_visible(
+            storage,
+            crate::storage::AccessClass::ForeignServer,
+            mapping.server as usize,
+            txid,
+        ) {
+            continue;
+        }
+        let server = storage
+            .foreign_server_by_slot(mapping.server as usize, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "user mapping references a missing foreign server"
+                )
+            })?;
+        for option in mapping.options.entries() {
+            let authorization = match mapping.user {
+                crate::storage::foreign::ForeignMappingUser::Public => text("PUBLIC", arena)?,
+                crate::storage::foreign::ForeignMappingUser::Role(role) => {
+                    text(storage.role_name(role as usize, txid).as_str(), arena)?
+                }
+            };
+            rows[count] = row(
+                &[
+                    authorization,
+                    text(catalog.as_str(), arena)?,
+                    text(server.name.as_str(), arena)?,
+                    text(option.name.as_str(), arena)?,
+                    if foreign_mapping_options_visible(storage, mapping, txid) {
+                        text(option.value.as_str(), arena)?
+                    } else {
+                        Datum::Null
+                    },
+                ],
+                arena,
+            )?;
+            count += 1;
+        }
+    }
+    finish(definition, &rows[..count], arena)
+}
+
 fn info_tables<'a>(
     storage: &Storage,
     txid: u32,
@@ -13956,7 +14834,14 @@ fn info_tables<'a>(
                     arena,
                 )?,
                 text(table.name.as_str(), arena)?,
-                text("BASE TABLE", arena)?,
+                text(
+                    if table.kind == crate::storage::TableKind::Foreign {
+                        "FOREIGN"
+                    } else {
+                        "BASE TABLE"
+                    },
+                    arena,
+                )?,
             ],
             arena,
         )?;
@@ -14584,6 +15469,27 @@ fn info_columns<'a>(
             continue;
         }
         let table = storage.table_def(slot, txid);
+        let foreign_updatable = storage
+            .foreign_table(slot as u16, txid)
+            .map(|(_, binding)| {
+                if let Some(value) = binding.options.get("updatable") {
+                    return super::eval::parse_bool(value);
+                }
+                let server = storage
+                    .foreign_server_by_slot(binding.server as usize, txid)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "foreign table references a missing foreign server"
+                        )
+                    })?;
+                server
+                    .options
+                    .get("updatable")
+                    .map_or(Ok(true), super::eval::parse_bool)
+            })
+            .transpose()?
+            .unwrap_or(true);
         for (i, c) in table.columns().iter().enumerate() {
             if n == out.len() {
                 return Err(sql_err!(
@@ -14600,7 +15506,7 @@ fn info_columns<'a>(
                     name: c.name.as_str(),
                     position: i + 1,
                     column: c,
-                    updatable: true,
+                    updatable: foreign_updatable,
                 },
                 arena,
             )?;

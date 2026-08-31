@@ -540,6 +540,33 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
+    CreateForeignDataWrapper(CreateForeignDataWrapper<'a>),
+    AlterForeignDataWrapper {
+        name: &'a str,
+        action: AlterForeignDataWrapperAction<'a>,
+    },
+    DropForeignDataWrapper {
+        names: &'a [&'a str],
+        if_exists: bool,
+        cascade: bool,
+    },
+    CreateForeignServer(CreateForeignServer<'a>),
+    AlterForeignServer {
+        name: &'a str,
+        action: AlterForeignServerAction<'a>,
+    },
+    DropForeignServer {
+        names: &'a [&'a str],
+        if_exists: bool,
+        cascade: bool,
+    },
+    CreateUserMapping(CreateUserMapping<'a>),
+    AlterUserMapping(AlterUserMapping<'a>),
+    DropUserMapping(DropUserMapping<'a>),
+    CreateForeignTable(CreateForeignTable<'a>),
+    AlterForeignTable(AlterTable<'a>),
+    DropForeignTable(DropTable<'a>),
+    ImportForeignSchema(ImportForeignSchema<'a>),
     CreateTextSearchParser(CreateTextSearchParser<'a>),
     CreateTextSearchTemplate(CreateTextSearchTemplate<'a>),
     CreateTextSearchDictionary(CreateTextSearchDictionary<'a>),
@@ -1115,6 +1142,126 @@ pub enum AlterConversionAction<'a> {
     Rename(&'a str),
     Owner(&'a str),
     SetSchema(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignOption<'a> {
+    pub name: &'a str,
+    pub value: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignOptionAction<'a> {
+    Add(ForeignOption<'a>),
+    Set(ForeignOption<'a>),
+    Drop(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignDataHandler<'a> {
+    None,
+    Function(QualName<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignDataValidator<'a> {
+    None,
+    Function(QualName<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateForeignDataWrapper<'a> {
+    pub name: &'a str,
+    pub handler: ForeignDataHandler<'a>,
+    pub validator: ForeignDataValidator<'a>,
+    pub options: &'a [ForeignOption<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterForeignDataWrapperAction<'a> {
+    Definition {
+        handler: Option<ForeignDataHandler<'a>>,
+        validator: Option<ForeignDataValidator<'a>>,
+        options: &'a [ForeignOptionAction<'a>],
+    },
+    Owner(&'a str),
+    Rename(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateForeignServer<'a> {
+    pub name: &'a str,
+    pub if_not_exists: bool,
+    pub server_type: Option<&'a str>,
+    pub version: Option<&'a str>,
+    pub wrapper: &'a str,
+    pub options: &'a [ForeignOption<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterForeignServerAction<'a> {
+    Definition {
+        /// Outer `None` means VERSION was not mentioned; inner `None` is
+        /// PostgreSQL's `VERSION NULL` and removes the version.
+        version: Option<Option<&'a str>>,
+        options: &'a [ForeignOptionAction<'a>],
+    },
+    Owner(&'a str),
+    Rename(&'a str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignUser<'a> {
+    Named(&'a str),
+    CurrentRole,
+    CurrentUser,
+    User,
+    Public,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateUserMapping<'a> {
+    pub user: ForeignUser<'a>,
+    pub server: &'a str,
+    pub if_not_exists: bool,
+    pub options: &'a [ForeignOption<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlterUserMapping<'a> {
+    pub user: ForeignUser<'a>,
+    pub server: &'a str,
+    pub options: &'a [ForeignOptionAction<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropUserMapping<'a> {
+    pub user: ForeignUser<'a>,
+    pub server: &'a str,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CreateForeignTable<'a> {
+    pub relation: CreateTable<'a>,
+    pub server: &'a str,
+    pub options: &'a [ForeignOption<'a>],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignSchemaSelection<'a> {
+    All,
+    LimitTo(&'a [&'a str]),
+    Except(&'a [&'a str]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportForeignSchema<'a> {
+    pub remote_schema: &'a str,
+    pub selection: ForeignSchemaSelection<'a>,
+    pub server: &'a str,
+    pub local_schema: &'a str,
+    pub options: &'a [ForeignOption<'a>],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1837,6 +1984,8 @@ pub enum PrivilegeObjectKind {
     Tablespace,
     Database,
     Type,
+    ForeignDataWrapper,
+    ForeignServer,
     AllTablesInSchema,
     AllSequencesInSchema,
     AllFunctionsInSchema,
@@ -2183,6 +2332,7 @@ pub enum AlterOwnerKind {
     Type,
     Domain,
     Table,
+    ForeignTable,
     View,
     MaterializedView,
     Sequence,
@@ -3384,6 +3534,9 @@ pub struct ColumnDef<'a> {
     pub type_mod: i32,
     /// The collation selected by `COLLATE` or the database default.
     pub collation: ParsedCollation<'a>,
+    /// Foreign-column options are parsed only by CREATE FOREIGN TABLE. An
+    /// ordinary table can therefore reach execution only with an empty list.
+    pub foreign_options: &'a [ForeignOption<'a>],
     pub not_null: bool,
     pub unique: bool,
     pub primary: bool,
@@ -3698,6 +3851,11 @@ pub enum AlterAction<'a> {
     RenameTable(&'a str),
     /// ALTER TABLE ... SET SCHEMA new_schema.
     SetSchema(&'a str),
+    SetForeignOptions(&'a [ForeignOptionAction<'a>]),
+    SetColumnForeignOptions {
+        column: &'a str,
+        options: &'a [ForeignOptionAction<'a>],
+    },
     RenameColumn {
         from: &'a str,
         to: &'a str,

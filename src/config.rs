@@ -83,6 +83,18 @@ pub struct Config {
     pub max_replication_slots: usize,
     /// Fixed number of durable logical replication subscriptions.
     pub max_subscriptions: usize,
+    /// Database-local foreign-data wrapper catalog slots.
+    pub max_foreign_data_wrappers: usize,
+    /// Database-local foreign-server catalog slots.
+    pub max_foreign_servers: usize,
+    /// Database-local foreign user-mapping catalog slots.
+    pub max_user_mappings: usize,
+    /// Fixed receive buffer for postgres_fdw queries.
+    pub foreign_receive_bytes: usize,
+    /// Fixed send buffer for postgres_fdw queries.
+    pub foreign_send_bytes: usize,
+    /// Additional roots for postgres_fdw TLS.
+    pub foreign_tls_ca_file: String,
     /// Fixed receive buffer for each outbound pgoutput subscription worker.
     pub subscription_receive_bytes: usize,
     /// Fixed send buffer for each outbound pgoutput subscription worker.
@@ -207,6 +219,12 @@ impl Config {
             extension_script_bytes: 4 * MIB,
             max_replication_slots: 16,
             max_subscriptions: 16,
+            max_foreign_data_wrappers: 16,
+            max_foreign_servers: 32,
+            max_user_mappings: 64,
+            foreign_receive_bytes: 256 * KIB,
+            foreign_send_bytes: 64 * KIB,
+            foreign_tls_ca_file: String::new(),
             subscription_receive_bytes: 64 * KIB,
             subscription_send_bytes: 16 * KIB,
             subscription_arena_bytes: MIB,
@@ -285,6 +303,27 @@ impl Config {
                     config.max_subscriptions =
                         parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
                 }
+                "max_foreign_data_wrappers" => {
+                    config.max_foreign_data_wrappers =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_foreign_servers" => {
+                    config.max_foreign_servers =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "max_user_mappings" => {
+                    config.max_user_mappings =
+                        parse_count(value).map_err(|m| ConfigError::at(line_no, m))? as usize
+                }
+                "foreign_receive_bytes" => {
+                    config.foreign_receive_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "foreign_send_bytes" => {
+                    config.foreign_send_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
+                "foreign_tls_ca_file" => config.foreign_tls_ca_file = value.to_string(),
                 "subscription_receive_bytes" => {
                     config.subscription_receive_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
@@ -608,6 +647,28 @@ impl Config {
                     .to_string(),
             ));
         }
+        for (name, capacity) in [
+            ("max_tables", config.max_tables),
+            (
+                "max_foreign_data_wrappers",
+                config.max_foreign_data_wrappers,
+            ),
+            ("max_foreign_servers", config.max_foreign_servers),
+            ("max_user_mappings", config.max_user_mappings),
+        ] {
+            if capacity > usize::from(u16::MAX) {
+                return Err(ConfigError::at(
+                    0,
+                    format!("{name} exceeds the 65535-slot catalog representation"),
+                ));
+            }
+        }
+        if config.foreign_receive_bytes == 0 || config.foreign_send_bytes == 0 {
+            return Err(ConfigError::at(
+                0,
+                "foreign PostgreSQL buffers must be greater than zero".to_string(),
+            ));
+        }
         if config.subscription_receive_bytes == 0
             || config.subscription_send_bytes == 0
             || config.subscription_arena_bytes == 0
@@ -869,6 +930,20 @@ sql_arena_bytes = 4096
         assert!(Config::parse("just some words\n").is_err());
         assert!(Config::parse("database_collation_locale = \n").is_err());
         assert!(Config::parse("collation_scratch_bytes = 0\n").is_err());
+    }
+
+    #[test]
+    fn typed_catalog_capacities_reject_unrepresentable_slots() {
+        for name in [
+            "max_tables",
+            "max_foreign_data_wrappers",
+            "max_foreign_servers",
+            "max_user_mappings",
+        ] {
+            let error = Config::parse(&format!("{name} = 65536\n")).unwrap_err();
+            assert!(error.message.contains("65535-slot"), "{name}: {error}");
+            Config::parse(&format!("{name} = 65535\n")).unwrap();
+        }
     }
 
     #[test]

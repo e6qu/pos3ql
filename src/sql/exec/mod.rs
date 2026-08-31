@@ -368,6 +368,30 @@ pub fn create_table(
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
+    create_table_kind(storage, wal, txn, statement, None, arena, responder)
+}
+
+#[derive(Clone, Copy)]
+struct ForeignTableCreation {
+    server: u16,
+    options: crate::storage::foreign::ForeignOptions,
+    column_options: crate::storage::foreign::ForeignColumnOptions,
+}
+
+fn create_table_kind(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    statement: &CreateTable,
+    foreign: Option<ForeignTableCreation>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let tag = if foreign.is_some() {
+        "CREATE FOREIGN TABLE"
+    } else {
+        "CREATE TABLE"
+    };
     let mut def = match build_partitioned_table_def(storage, statement, txn.txid, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
@@ -376,6 +400,11 @@ pub fn create_table(
     {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
+    };
+    def.kind = if foreign.is_some() {
+        crate::storage::TableKind::Foreign
+    } else {
+        crate::storage::TableKind::Local
     };
     // A copied constraint lands before the explicitly written ones, so a
     // duplicate primary key is caught with PostgreSQL's own message.
@@ -400,15 +429,56 @@ pub fn create_table(
     }
     match storage.create_table_in(def, txn.txid) {
         Ok(slot) => {
+            let foreign_slot = if let Some(foreign) = foreign {
+                match storage.create_foreign_table_binding(
+                    crate::storage::foreign::ForeignTableDefinition {
+                        table: slot as u16,
+                        server: foreign.server,
+                        options: foreign.options,
+                        column_options: foreign.column_options,
+                    },
+                    txn.txid,
+                ) {
+                    Ok(binding) => Some(binding),
+                    Err(error) => {
+                        storage.rollback_create(slot);
+                        return sql_fail(error);
+                    }
+                }
+            } else {
+                None
+            };
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(def)) {
                 // Nothing reached the journal; undo the in-memory apply.
+                if let Some(binding) = foreign_slot {
+                    storage.foreign_catalog_rollback_create(
+                        crate::storage::foreign::ForeignObjectClass::Table,
+                        binding,
+                    );
+                }
                 storage.rollback_create(slot);
                 return sql_fail(e);
             }
             if let Err(e) = txn.record_ddl(super::txn::DdlUndo::Created(slot as u32)) {
+                if let Some(binding) = foreign_slot {
+                    storage.foreign_catalog_rollback_create(
+                        crate::storage::foreign::ForeignObjectClass::Table,
+                        binding,
+                    );
+                }
                 storage.rollback_create(slot);
                 return sql_fail(e);
+            }
+            if let Some(binding) = foreign_slot
+                && let Err(error) =
+                    txn.record_ddl(super::txn::DdlUndo::ForeignTableCreated(binding as u32))
+            {
+                storage.foreign_catalog_rollback_create(
+                    crate::storage::foreign::ForeignObjectClass::Table,
+                    binding,
+                );
+                return sql_fail(error);
             }
             if let Err(error) = apply_default_privileges_to_new_object(
                 storage,
@@ -421,6 +491,9 @@ pub fn create_table(
                 return sql_fail(error);
             }
             for c in statement.columns {
+                if foreign.is_some() {
+                    break;
+                }
                 let Some(index) = def.column_index(c.name) else {
                     continue;
                 };
@@ -466,10 +539,1532 @@ pub fn create_table(
         }
         Err(e) => return sql_fail(e),
     }
-    if let Err(e) = copy_like_indexes(storage, wal, txn, statement, &def) {
+    if foreign.is_none()
+        && let Err(e) = copy_like_indexes(storage, wal, txn, statement, &def)
+    {
         return sql_fail(e);
     }
-    responder.command_complete("CREATE TABLE")?;
+    responder.command_complete(tag)?;
+    sql_ok()
+}
+
+pub fn create_foreign_table(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    statement: &super::ast::CreateForeignTable<'_>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    if !statement.relation.likes.is_empty() {
+        return sql_fail(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "LIKE is not allowed in CREATE FOREIGN TABLE"
+        ));
+    }
+    let Some((server, server_definition)) = storage.foreign_server(statement.server, txn.txid)
+    else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "server \"{}\" does not exist",
+            statement.server
+        ));
+    };
+    let Some(current) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role does not exist"
+        ));
+    };
+    if !storage.has_object_privilege(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::ForeignServer,
+            slot: server as u16,
+        },
+        current,
+        crate::storage::PrivilegeSet::USAGE,
+        txn.txid,
+    ) {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for server {}",
+            statement.server
+        ));
+    }
+    let options = match crate::storage::foreign::ForeignOptions::parse(statement.options) {
+        Ok(options) => options,
+        Err(error) => return sql_fail(error),
+    };
+    let wrapper = storage.foreign_wrapper_by_slot(server_definition.wrapper as usize, txn.txid);
+    if wrapper.is_some_and(|wrapper| {
+        wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+    }) && let Err(error) =
+        validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Table)
+    {
+        return sql_fail(error);
+    }
+    let mut column_options = crate::storage::foreign::ForeignColumnOptions::EMPTY;
+    for (column, definition) in statement.relation.columns.iter().enumerate() {
+        let options =
+            match crate::storage::foreign::ForeignOptions::parse(definition.foreign_options) {
+                Ok(options) => options,
+                Err(error) => return sql_fail(error),
+            };
+        if let Err(error) = column_options.append(column as u16, options) {
+            return sql_fail(error);
+        }
+        if wrapper.is_some_and(|wrapper| {
+            wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+        }) && let Err(error) =
+            validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Column)
+        {
+            return sql_fail(error);
+        }
+        if definition.identity.is_some() || definition.unique || definition.primary {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "identity and unique constraints are not supported on foreign tables"
+            ));
+        }
+    }
+    create_table_kind(
+        storage,
+        wal,
+        txn,
+        &statement.relation,
+        Some(ForeignTableCreation {
+            server: server as u16,
+            options,
+            column_options,
+        }),
+        arena,
+        responder,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PostgresForeignOptionContext {
+    Wrapper,
+    Server,
+    Mapping,
+    Table,
+    Column,
+    Import,
+}
+
+fn validate_positive_foreign_integer(value: &str, name: &str) -> Result<(), SqlError> {
+    if value.parse::<u32>().is_ok_and(|value| value != 0) {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::FDW_INVALID_ATTRIBUTE_VALUE,
+            "invalid value for integer option \"{}\": \"{}\"",
+            name,
+            value
+        ))
+    }
+}
+
+fn validate_postgres_foreign_option_value(name: &str, value: &str) -> Result<(), SqlError> {
+    match name {
+        "port" => {
+            if value.parse::<u16>().is_ok_and(|value| value != 0) {
+                Ok(())
+            } else {
+                Err(sql_err!(
+                    sqlstate::FDW_INVALID_ATTRIBUTE_VALUE,
+                    "invalid value for integer option \"port\": \"{}\"",
+                    value
+                ))
+            }
+        }
+        "connect_timeout" | "fetch_size" | "batch_size" => {
+            validate_positive_foreign_integer(value, name)
+        }
+        "sslmode" if matches!(value, "disable" | "prefer" | "require") => Ok(()),
+        "sslmode" => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "foreign sslmode \"{}\" is not supported",
+            value
+        )),
+        "updatable" | "truncatable" | "import_collate" | "import_default" | "import_generated"
+        | "import_not_null" => super::eval::parse_bool(value).map(|_| ()),
+        "host" | "hostaddr" => value.parse::<std::net::IpAddr>().map(|_| ()).map_err(|_| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "foreign PostgreSQL hosts must be numeric IP addresses"
+            )
+        }),
+        _ => Ok(()),
+    }
+}
+
+fn validate_postgres_foreign_options(
+    options: &crate::storage::foreign::ForeignOptions,
+    context: PostgresForeignOptionContext,
+) -> Result<(), SqlError> {
+    for option in options.entries() {
+        let name = option.name.as_str();
+        let accepted = match context {
+            PostgresForeignOptionContext::Wrapper => false,
+            PostgresForeignOptionContext::Server => matches!(
+                name,
+                "host"
+                    | "hostaddr"
+                    | "port"
+                    | "dbname"
+                    | "connect_timeout"
+                    | "application_name"
+                    | "sslmode"
+                    | "updatable"
+                    | "truncatable"
+            ),
+            PostgresForeignOptionContext::Mapping => matches!(name, "user" | "password"),
+            PostgresForeignOptionContext::Table => matches!(
+                name,
+                "schema_name" | "table_name" | "updatable" | "truncatable"
+            ),
+            PostgresForeignOptionContext::Column => name == "column_name",
+            PostgresForeignOptionContext::Import => matches!(
+                name,
+                "import_collate" | "import_default" | "import_generated" | "import_not_null"
+            ),
+        };
+        if !accepted {
+            return Err(sql_err!(
+                sqlstate::FDW_INVALID_OPTION_NAME,
+                "invalid option \"{}\"",
+                name
+            ));
+        }
+        validate_postgres_foreign_option_value(name, option.value.as_str())?;
+    }
+    Ok(())
+}
+
+pub fn import_foreign_schema(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &super::ast::ImportForeignSchema<'_>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some((server_slot, server)) = storage.foreign_server(command.server, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "server \"{}\" does not exist",
+            command.server
+        ));
+    };
+    let Some(current) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role does not exist"
+        ));
+    };
+    if !storage.has_object_privilege(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::ForeignServer,
+            slot: server_slot as u16,
+        },
+        current,
+        crate::storage::PrivilegeSet::USAGE,
+        txn.txid,
+    ) {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for server {}",
+            command.server
+        ));
+    }
+    let Some(wrapper) = storage.foreign_wrapper_by_slot(server.wrapper as usize, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "foreign-data wrapper for server does not exist"
+        ));
+    };
+    if wrapper.handler != crate::storage::foreign::ForeignDataHandler::Postgres {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "foreign-data wrapper has no executable PostgreSQL handler"
+        ));
+    }
+    let options = match crate::storage::foreign::ForeignOptions::parse(command.options) {
+        Ok(options) => options,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) =
+        validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Import)
+    {
+        return sql_fail(error);
+    }
+    let commands = match super::foreign::import_commands(storage, command, txn.txid, arena) {
+        Ok(commands) => commands,
+        Err(error) => return sql_fail(error),
+    };
+    for imported in commands {
+        let mut parser = match super::parser::Parser::new(imported.sql, arena) {
+            Ok(parser) => parser,
+            Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+        };
+        let statement = match parser.next_stmt() {
+            Ok(Some(Stmt::CreateForeignTable(statement))) => statement,
+            Ok(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::PROTOCOL_VIOLATION,
+                    "foreign import did not produce one foreign-table definition"
+                ));
+            }
+            Err(error) => return sql_fail(super::parse_error_to_sql(&error)),
+        };
+        let outcome = responder.without_command_complete(|responder| {
+            create_foreign_table(storage, wal, txn, &statement, arena, responder)
+        })?;
+        if let Err(error) = outcome {
+            return Ok(Err(error));
+        }
+    }
+    responder.command_complete("IMPORT FOREIGN SCHEMA")?;
+    sql_ok()
+}
+
+fn resolve_foreign_handler(
+    handler: super::ast::ForeignDataHandler<'_>,
+) -> Result<crate::storage::foreign::ForeignDataHandler, SqlError> {
+    match handler {
+        super::ast::ForeignDataHandler::None => {
+            Ok(crate::storage::foreign::ForeignDataHandler::None)
+        }
+        super::ast::ForeignDataHandler::Function(name)
+            if name.name.eq_ignore_ascii_case("postgres_fdw_handler") =>
+        {
+            Ok(crate::storage::foreign::ForeignDataHandler::Postgres)
+        }
+        super::ast::ForeignDataHandler::Function(name) => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "native foreign-data handler {} is not supported",
+            name.name
+        )),
+    }
+}
+
+fn resolve_foreign_validator(
+    validator: super::ast::ForeignDataValidator<'_>,
+) -> Result<crate::storage::foreign::ForeignDataValidator, SqlError> {
+    match validator {
+        super::ast::ForeignDataValidator::None => {
+            Ok(crate::storage::foreign::ForeignDataValidator::None)
+        }
+        super::ast::ForeignDataValidator::Function(name)
+            if name.name.eq_ignore_ascii_case("postgres_fdw_validator") =>
+        {
+            Ok(crate::storage::foreign::ForeignDataValidator::Postgres)
+        }
+        super::ast::ForeignDataValidator::Function(name) => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "native foreign-data validator {} is not supported",
+            name.name
+        )),
+    }
+}
+
+fn bounded_foreign_value(
+    value: Option<&str>,
+    what: &'static str,
+) -> Result<Option<StackStr<{ crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX }>>, SqlError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed = StackStr::from_str(value);
+    if parsed.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "{} exceeds {} bytes",
+            what,
+            crate::storage::foreign::FOREIGN_OPTION_VALUE_MAX
+        ));
+    }
+    Ok(Some(parsed))
+}
+
+pub fn create_foreign_data_wrapper(
+    storage: &mut Storage,
+    _wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &super::ast::CreateForeignDataWrapper<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some(current) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role does not exist"
+        ));
+    };
+    if !storage.role(current).attributes_to(txn.txid).superuser {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied to create foreign-data wrapper"
+        ));
+    }
+    let handler = match resolve_foreign_handler(command.handler) {
+        Ok(handler) => handler,
+        Err(error) => return sql_fail(error),
+    };
+    let validator = match resolve_foreign_validator(command.validator) {
+        Ok(validator) => validator,
+        Err(error) => return sql_fail(error),
+    };
+    let options = match crate::storage::foreign::ForeignOptions::parse(command.options) {
+        Ok(options) => options,
+        Err(error) => return sql_fail(error),
+    };
+    if validator == crate::storage::foreign::ForeignDataValidator::Postgres
+        && let Err(error) =
+            validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Wrapper)
+    {
+        return sql_fail(error);
+    }
+    let definition = crate::storage::foreign::ForeignDataWrapperDefinition {
+        name: match SqlName::parse(command.name) {
+            Ok(name) => name,
+            Err(error) => return sql_fail(error),
+        },
+        handler,
+        validator,
+        options,
+    };
+    let slot = match storage.create_foreign_wrapper(definition, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignDataWrapperCreated(slot as u32))
+    {
+        storage.foreign_catalog_rollback_create(
+            crate::storage::foreign::ForeignObjectClass::Wrapper,
+            slot,
+        );
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE FOREIGN DATA WRAPPER")?;
+    sql_ok()
+}
+
+pub fn create_foreign_server(
+    storage: &mut Storage,
+    _wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &super::ast::CreateForeignServer<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some((wrapper_slot, wrapper)) = storage.foreign_wrapper(command.wrapper, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "foreign-data wrapper \"{}\" does not exist",
+            command.wrapper
+        ));
+    };
+    let Some(current) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role does not exist"
+        ));
+    };
+    if !storage.has_object_privilege(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::ForeignDataWrapper,
+            slot: wrapper_slot as u16,
+        },
+        current,
+        crate::storage::PrivilegeSet::USAGE,
+        txn.txid,
+    ) {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for foreign-data wrapper {}",
+            command.wrapper
+        ));
+    }
+    let options = match crate::storage::foreign::ForeignOptions::parse(command.options) {
+        Ok(options) => options,
+        Err(error) => return sql_fail(error),
+    };
+    if wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+        && let Err(error) =
+            validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Server)
+    {
+        return sql_fail(error);
+    }
+    let definition = crate::storage::foreign::ForeignServerDefinition {
+        name: match SqlName::parse(command.name) {
+            Ok(name) => name,
+            Err(error) => return sql_fail(error),
+        },
+        wrapper: wrapper_slot as u16,
+        server_type: match bounded_foreign_value(command.server_type, "foreign server type") {
+            Ok(value) => value,
+            Err(error) => return sql_fail(error),
+        },
+        version: match bounded_foreign_value(command.version, "foreign server version") {
+            Ok(value) => value,
+            Err(error) => return sql_fail(error),
+        },
+        options,
+    };
+    let slot = match storage.create_foreign_server(definition, txn.txid) {
+        Ok(slot) => slot,
+        Err(error) if command.if_not_exists && error.sqlstate == sqlstate::DUPLICATE_OBJECT => {
+            responder.notice(
+                sqlstate::DUPLICATE_OBJECT,
+                stack_format!(128, "server \"{}\" already exists, skipping", command.name).as_str(),
+            )?;
+            responder.command_complete("CREATE SERVER")?;
+            return sql_ok();
+        }
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignServerCreated(slot as u32)) {
+        storage.foreign_catalog_rollback_create(
+            crate::storage::foreign::ForeignObjectClass::Server,
+            slot,
+        );
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE SERVER")?;
+    sql_ok()
+}
+
+fn resolve_foreign_mapping_user(
+    storage: &Storage,
+    user: super::ast::ForeignUser<'_>,
+    txid: u32,
+) -> Result<crate::storage::foreign::ForeignMappingUser, SqlError> {
+    if matches!(user, super::ast::ForeignUser::Public) {
+        return Ok(crate::storage::foreign::ForeignMappingUser::Public);
+    }
+    let name = match user {
+        super::ast::ForeignUser::Named(name) => StackStr::from_str(name),
+        super::ast::ForeignUser::CurrentRole
+        | super::ast::ForeignUser::CurrentUser
+        | super::ast::ForeignUser::User => super::eval::funcs::system::current_user_owned(),
+        super::ast::ForeignUser::Public => unreachable!(),
+    };
+    storage
+        .find_role_visible(name.as_str(), txid)
+        .and_then(|slot| u16::try_from(slot).ok())
+        .map(crate::storage::foreign::ForeignMappingUser::Role)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                name.as_str()
+            )
+        })
+}
+
+fn require_user_mapping_authority(
+    storage: &Storage,
+    server: usize,
+    user: crate::storage::foreign::ForeignMappingUser,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let current = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role does not exist"
+        )
+    })?;
+    let owns_server = storage.foreign_catalog_owner_to(
+        crate::storage::foreign::ForeignObjectClass::Server,
+        server,
+        txid,
+    ) as usize
+        == current;
+    let own_mapping = matches!(user, crate::storage::foreign::ForeignMappingUser::Role(role) if role as usize == current);
+    if storage.role(current).attributes_to(txid).superuser
+        || owns_server
+        || (own_mapping
+            && storage.has_object_privilege(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::ForeignServer,
+                    slot: server as u16,
+                },
+                current,
+                crate::storage::PrivilegeSet::USAGE,
+                txid,
+            ))
+    {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for server"
+        ))
+    }
+}
+
+pub fn create_user_mapping(
+    storage: &mut Storage,
+    _wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &super::ast::CreateUserMapping<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some((server_slot, server)) = storage.foreign_server(command.server, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "server \"{}\" does not exist",
+            command.server
+        ));
+    };
+    let user = match resolve_foreign_mapping_user(storage, command.user, txn.txid) {
+        Ok(user) => user,
+        Err(error) => return sql_fail(error),
+    };
+    let Some(current) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role does not exist"
+        ));
+    };
+    let owns_server = storage.foreign_catalog_owner_to(
+        crate::storage::foreign::ForeignObjectClass::Server,
+        server_slot,
+        txn.txid,
+    ) as usize
+        == current;
+    let own_mapping = matches!(user, crate::storage::foreign::ForeignMappingUser::Role(role) if role as usize == current);
+    if !storage.role(current).attributes_to(txn.txid).superuser
+        && !owns_server
+        && !(own_mapping
+            && storage.has_object_privilege(
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::ForeignServer,
+                    slot: server_slot as u16,
+                },
+                current,
+                crate::storage::PrivilegeSet::USAGE,
+                txn.txid,
+            ))
+    {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for server {}",
+            command.server
+        ));
+    }
+    let options = match crate::storage::foreign::ForeignOptions::parse(command.options) {
+        Ok(options) => options,
+        Err(error) => return sql_fail(error),
+    };
+    let wrapper = storage.foreign_wrapper_by_slot(server.wrapper as usize, txn.txid);
+    if wrapper.is_some_and(|wrapper| {
+        wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+    }) && let Err(error) =
+        validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Mapping)
+    {
+        return sql_fail(error);
+    }
+    let slot = match storage.create_foreign_user_mapping(
+        crate::storage::foreign::UserMappingDefinition {
+            server: server_slot as u16,
+            user,
+            options,
+        },
+        txn.txid,
+    ) {
+        Ok(slot) => slot,
+        Err(error) if command.if_not_exists && error.sqlstate == sqlstate::DUPLICATE_OBJECT => {
+            responder.notice(
+                sqlstate::DUPLICATE_OBJECT,
+                "user mapping already exists for server, skipping",
+            )?;
+            responder.command_complete("CREATE USER MAPPING")?;
+            return sql_ok();
+        }
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::UserMappingCreated(slot as u32)) {
+        storage.foreign_catalog_rollback_create(
+            crate::storage::foreign::ForeignObjectClass::Mapping,
+            slot,
+        );
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE USER MAPPING")?;
+    sql_ok()
+}
+
+fn require_foreign_owner(
+    storage: &Storage,
+    class: crate::storage::foreign::ForeignObjectClass,
+    slot: usize,
+    txid: u32,
+    noun: &'static str,
+) -> Result<(), SqlError> {
+    let current = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    let owner = storage.foreign_catalog_owner_to(class, slot, txid) as usize;
+    if storage.role(current).attributes_to(txid).superuser
+        || current == owner
+        || storage.role_can_set(current, owner, txid)
+    {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::INSUFFICIENT_PRIVILEGE,
+        "must be owner of {}",
+        noun
+    ))
+}
+
+fn alter_foreign_owner(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    class: crate::storage::foreign::ForeignObjectClass,
+    slot: usize,
+    role: &str,
+    noun: &'static str,
+) -> Result<(), SqlError> {
+    require_foreign_owner(storage, class, slot, txn.txid, noun)?;
+    let role = resolve_role_name(role);
+    let owner = storage
+        .find_role_visible(role.as_str(), txn.txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                role.as_str()
+            )
+        })?;
+    let current = storage.current_role_slot(txn.txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    if !storage.role(current).attributes_to(txn.txid).superuser
+        && !storage.role_can_set(current, owner, txn.txid)
+    {
+        return Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be able to SET ROLE \"{}\"",
+            role.as_str()
+        ));
+    }
+    let prior = storage.stage_foreign_catalog_owner(class, slot, owner as u16, txn.txid);
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignOwnerChanged {
+        class,
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_foreign_catalog_owner(class, slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn alter_foreign_data_wrapper(
+    storage: &mut Storage,
+    _wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    action: super::ast::AlterForeignDataWrapperAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some((slot, mut definition)) = storage.foreign_wrapper(name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "foreign-data wrapper \"{}\" does not exist",
+            name
+        ));
+    };
+    if let Err(error) = require_foreign_owner(
+        storage,
+        crate::storage::foreign::ForeignObjectClass::Wrapper,
+        slot,
+        txn.txid,
+        "foreign-data wrapper",
+    ) {
+        return sql_fail(error);
+    }
+    match action {
+        super::ast::AlterForeignDataWrapperAction::Owner(role) => {
+            if let Err(error) = alter_foreign_owner(
+                storage,
+                txn,
+                crate::storage::foreign::ForeignObjectClass::Wrapper,
+                slot,
+                role,
+                "foreign-data wrapper",
+            ) {
+                return sql_fail(error);
+            }
+        }
+        super::ast::AlterForeignDataWrapperAction::Rename(new_name) => {
+            if storage.foreign_wrapper(new_name, txn.txid).is_some() {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "foreign-data wrapper \"{}\" already exists",
+                    new_name
+                ));
+            }
+            definition.name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            let prior = match storage.alter_foreign_wrapper(slot, definition, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignDataWrapperAltered {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_foreign_wrapper_alter(slot, prior);
+                return sql_fail(error);
+            }
+        }
+        super::ast::AlterForeignDataWrapperAction::Definition {
+            handler,
+            validator,
+            options,
+        } => {
+            let prior_handler = definition.handler;
+            if let Some(handler) = handler {
+                definition.handler = match resolve_foreign_handler(handler) {
+                    Ok(handler) => handler,
+                    Err(error) => return sql_fail(error),
+                };
+            }
+            if let Some(validator) = validator {
+                definition.validator = match resolve_foreign_validator(validator) {
+                    Ok(validator) => validator,
+                    Err(error) => return sql_fail(error),
+                };
+            }
+            definition.options = match definition.options.alter(options) {
+                Ok(options) => options,
+                Err(error) => return sql_fail(error),
+            };
+            if definition.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+                && let Err(error) = validate_postgres_foreign_options(
+                    &definition.options,
+                    PostgresForeignOptionContext::Wrapper,
+                )
+            {
+                return sql_fail(error);
+            }
+            if definition.handler != prior_handler
+                && storage.has_foreign_table_for_wrapper(slot as u16, txn.txid)
+            {
+                responder.warning(
+                    sqlstate::WARNING,
+                    "changing the foreign-data wrapper handler can change behavior of existing foreign tables",
+                )?;
+            }
+            let prior = match storage.alter_foreign_wrapper(slot, definition, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignDataWrapperAltered {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_foreign_wrapper_alter(slot, prior);
+                return sql_fail(error);
+            }
+        }
+    }
+    responder.command_complete("ALTER FOREIGN DATA WRAPPER")?;
+    sql_ok()
+}
+
+pub fn alter_foreign_server(
+    storage: &mut Storage,
+    _wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    action: super::ast::AlterForeignServerAction<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some((slot, mut definition)) = storage.foreign_server(name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "server \"{}\" does not exist",
+            name
+        ));
+    };
+    if let Err(error) = require_foreign_owner(
+        storage,
+        crate::storage::foreign::ForeignObjectClass::Server,
+        slot,
+        txn.txid,
+        "server",
+    ) {
+        return sql_fail(error);
+    }
+    match action {
+        super::ast::AlterForeignServerAction::Owner(role) => {
+            if let Err(error) = alter_foreign_owner(
+                storage,
+                txn,
+                crate::storage::foreign::ForeignObjectClass::Server,
+                slot,
+                role,
+                "server",
+            ) {
+                return sql_fail(error);
+            }
+        }
+        super::ast::AlterForeignServerAction::Rename(new_name) => {
+            if storage.foreign_server(new_name, txn.txid).is_some() {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "server \"{}\" already exists",
+                    new_name
+                ));
+            }
+            definition.name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+        }
+        super::ast::AlterForeignServerAction::Definition { version, options } => {
+            if let Some(version) = version {
+                definition.version = match bounded_foreign_value(version, "foreign server version")
+                {
+                    Ok(version) => version,
+                    Err(error) => return sql_fail(error),
+                };
+            }
+            definition.options = match definition.options.alter(options) {
+                Ok(options) => options,
+                Err(error) => return sql_fail(error),
+            };
+            let Some(wrapper) =
+                storage.foreign_wrapper_by_slot(definition.wrapper as usize, txn.txid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "foreign-data wrapper for server does not exist"
+                ));
+            };
+            if wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+                && let Err(error) = validate_postgres_foreign_options(
+                    &definition.options,
+                    PostgresForeignOptionContext::Server,
+                )
+            {
+                return sql_fail(error);
+            }
+        }
+    }
+    if !matches!(action, super::ast::AlterForeignServerAction::Owner(_)) {
+        let prior = match storage.alter_foreign_server(slot, definition, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignServerAltered {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_foreign_server_alter(slot, prior);
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("ALTER SERVER")?;
+    sql_ok()
+}
+
+pub fn alter_user_mapping(
+    storage: &mut Storage,
+    _wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &super::ast::AlterUserMapping<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some((server_slot, server)) = storage.foreign_server(command.server, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "server \"{}\" does not exist",
+            command.server
+        ));
+    };
+    let user = match resolve_foreign_mapping_user(storage, command.user, txn.txid) {
+        Ok(user) => user,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = require_user_mapping_authority(storage, server_slot, user, txn.txid) {
+        return sql_fail(error);
+    }
+    let Some((slot, mut definition)) =
+        storage.foreign_user_mapping(server_slot as u16, user, txn.txid)
+    else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "user mapping does not exist for server \"{}\"",
+            command.server
+        ));
+    };
+    definition.options = match definition.options.alter(command.options) {
+        Ok(options) => options,
+        Err(error) => return sql_fail(error),
+    };
+    if storage
+        .foreign_wrapper_by_slot(server.wrapper as usize, txn.txid)
+        .is_some_and(|wrapper| {
+            wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+        })
+        && let Err(error) = validate_postgres_foreign_options(
+            &definition.options,
+            PostgresForeignOptionContext::Mapping,
+        )
+    {
+        return sql_fail(error);
+    }
+    let prior = match storage.alter_foreign_user_mapping(slot, definition, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::UserMappingAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_foreign_mapping_alter(slot, prior);
+        return sql_fail(error);
+    }
+    responder.command_complete("ALTER USER MAPPING")?;
+    sql_ok()
+}
+
+fn mark_user_mapping_drop(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    slot: usize,
+) -> Result<(), SqlError> {
+    storage.foreign_catalog_drop(
+        crate::storage::foreign::ForeignObjectClass::Mapping,
+        slot,
+        txn.txid,
+    );
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::UserMappingDropped(slot as u32)) {
+        storage.foreign_catalog_rollback_drop(
+            crate::storage::foreign::ForeignObjectClass::Mapping,
+            slot,
+            txn.txid,
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn drop_user_mapping(
+    storage: &mut Storage,
+    _wal: &mut Wal,
+    txn: &mut TxnState,
+    command: &super::ast::DropUserMapping<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some((server_slot, _)) = storage.foreign_server(command.server, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "server \"{}\" does not exist",
+            command.server
+        ));
+    };
+    let user = match resolve_foreign_mapping_user(storage, command.user, txn.txid) {
+        Ok(user) => user,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = require_user_mapping_authority(storage, server_slot, user, txn.txid) {
+        return sql_fail(error);
+    }
+    let Some((slot, _)) = storage.foreign_user_mapping(server_slot as u16, user, txn.txid) else {
+        if command.if_exists {
+            responder.notice(
+                sqlstate::UNDEFINED_OBJECT,
+                "user mapping does not exist for server, skipping",
+            )?;
+            responder.command_complete("DROP USER MAPPING")?;
+            return sql_ok();
+        }
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "user mapping does not exist for server \"{}\"",
+            command.server
+        ));
+    };
+    if let Err(error) = mark_user_mapping_drop(storage, txn, slot) {
+        return sql_fail(error);
+    }
+    responder.command_complete("DROP USER MAPPING")?;
+    sql_ok()
+}
+
+fn drop_foreign_table_slot(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    binding_slot: usize,
+    definition: crate::storage::foreign::ForeignTableDefinition,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    let table = *storage.table_def(definition.table as usize, txn.txid);
+    let name = QualName {
+        schema: Some(table.schema.as_str()),
+        name: table.name.as_str(),
+    };
+    let statement = DropTable {
+        names: core::slice::from_ref(&name),
+        if_exists: false,
+        cascade,
+    };
+    let outcome = responder.without_command_complete(|responder| {
+        drop_table_kind(
+            storage,
+            wal,
+            txn,
+            &statement,
+            Some(crate::storage::TableKind::Foreign),
+            "DROP FOREIGN TABLE",
+            responder,
+        )
+    });
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return sql_fail(error),
+        Err(error) => return Err(error),
+    }
+    storage.foreign_catalog_drop(
+        crate::storage::foreign::ForeignObjectClass::Table,
+        binding_slot,
+        txn.txid,
+    );
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignTableDropped(
+        binding_slot as u32,
+    )) {
+        storage.foreign_catalog_rollback_drop(
+            crate::storage::foreign::ForeignObjectClass::Table,
+            binding_slot,
+            txn.txid,
+        );
+        return sql_fail(error);
+    }
+    sql_ok()
+}
+
+fn mark_foreign_server_drop(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    if !cascade {
+        if storage
+            .first_user_mapping_for_server(slot as u16, txn.txid)
+            .is_some()
+            || storage
+                .first_foreign_table_for_server(slot as u16, txn.txid)
+                .is_some()
+        {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop server because other objects depend on it"
+            ));
+        }
+    } else {
+        while let Some((mapping, _)) = storage.first_user_mapping_for_server(slot as u16, txn.txid)
+        {
+            if let Err(error) = mark_user_mapping_drop(storage, txn, mapping) {
+                return sql_fail(error);
+            }
+        }
+        while let Some((binding, definition)) =
+            storage.first_foreign_table_for_server(slot as u16, txn.txid)
+        {
+            match drop_foreign_table_slot(storage, wal, txn, binding, definition, true, responder) {
+                Ok(Ok(())) => {}
+                other => return other,
+            }
+        }
+    }
+    storage.foreign_catalog_drop(
+        crate::storage::foreign::ForeignObjectClass::Server,
+        slot,
+        txn.txid,
+    );
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignServerDropped(slot as u32)) {
+        storage.foreign_catalog_rollback_drop(
+            crate::storage::foreign::ForeignObjectClass::Server,
+            slot,
+            txn.txid,
+        );
+        return sql_fail(error);
+    }
+    sql_ok()
+}
+
+pub fn drop_foreign_server(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[&str],
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        let Some((slot, _)) = storage.foreign_server(name, txn.txid) else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::UNDEFINED_OBJECT,
+                    stack_format!(128, "server \"{}\" does not exist, skipping", name).as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "server \"{}\" does not exist",
+                name
+            ));
+        };
+        if let Err(error) = require_foreign_owner(
+            storage,
+            crate::storage::foreign::ForeignObjectClass::Server,
+            slot,
+            txn.txid,
+            "server",
+        ) {
+            return sql_fail(error);
+        }
+        match mark_foreign_server_drop(storage, wal, txn, slot, cascade, responder) {
+            Ok(Ok(())) => {}
+            other => return other,
+        }
+    }
+    responder.command_complete("DROP SERVER")?;
+    sql_ok()
+}
+
+pub fn drop_foreign_data_wrapper(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[&str],
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    for name in names {
+        let Some((slot, _)) = storage.foreign_wrapper(name, txn.txid) else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::UNDEFINED_OBJECT,
+                    stack_format!(
+                        128,
+                        "foreign-data wrapper \"{}\" does not exist, skipping",
+                        name
+                    )
+                    .as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "foreign-data wrapper \"{}\" does not exist",
+                name
+            ));
+        };
+        if let Err(error) = require_foreign_owner(
+            storage,
+            crate::storage::foreign::ForeignObjectClass::Wrapper,
+            slot,
+            txn.txid,
+            "foreign-data wrapper",
+        ) {
+            return sql_fail(error);
+        }
+        if !cascade
+            && storage
+                .first_foreign_server_for_wrapper(slot as u16, txn.txid)
+                .is_some()
+        {
+            return sql_fail(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop foreign-data wrapper because other objects depend on it"
+            ));
+        }
+        if cascade {
+            while let Some((server, _)) =
+                storage.first_foreign_server_for_wrapper(slot as u16, txn.txid)
+            {
+                match mark_foreign_server_drop(storage, wal, txn, server, true, responder) {
+                    Ok(Ok(())) => {}
+                    other => return other,
+                }
+            }
+        }
+        storage.foreign_catalog_drop(
+            crate::storage::foreign::ForeignObjectClass::Wrapper,
+            slot,
+            txn.txid,
+        );
+        if let Err(error) =
+            txn.record_ddl(super::txn::DdlUndo::ForeignDataWrapperDropped(slot as u32))
+        {
+            storage.foreign_catalog_rollback_drop(
+                crate::storage::foreign::ForeignObjectClass::Wrapper,
+                slot,
+                txn.txid,
+            );
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("DROP FOREIGN DATA WRAPPER")?;
+    sql_ok()
+}
+
+pub fn drop_foreign_table(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    statement: &DropTable<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let mut bindings = [usize::MAX; 16];
+    let mut count = 0usize;
+    for name in statement.names {
+        if let Some(crate::storage::ResolvedRelation::Table(table)) =
+            storage.resolve_relation(name.schema, name.name, txn.txid)
+            && storage.table_def(table, txn.txid).kind == crate::storage::TableKind::Foreign
+        {
+            let Some((binding, _)) = storage.foreign_table(table as u16, txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "foreign table has no typed catalog binding"
+                ));
+            };
+            if !bindings[..count].contains(&binding) {
+                bindings[count] = binding;
+                count += 1;
+            }
+        }
+    }
+    match drop_table_kind(
+        storage,
+        wal,
+        txn,
+        statement,
+        Some(crate::storage::TableKind::Foreign),
+        "DROP FOREIGN TABLE",
+        responder,
+    ) {
+        Ok(Ok(())) => {}
+        other => return other,
+    }
+    for binding in &bindings[..count] {
+        storage.foreign_catalog_drop(
+            crate::storage::foreign::ForeignObjectClass::Table,
+            *binding,
+            txn.txid,
+        );
+        if let Err(error) =
+            txn.record_ddl(super::txn::DdlUndo::ForeignTableDropped(*binding as u32))
+        {
+            storage.foreign_catalog_rollback_drop(
+                crate::storage::foreign::ForeignObjectClass::Table,
+                *binding,
+                txn.txid,
+            );
+            return sql_fail(error);
+        }
+    }
+    sql_ok()
+}
+
+pub(crate) struct ForeignTableAlterRuntime<'a> {
+    pub(crate) scratch: &'a mut DmlScratch,
+    pub(crate) arena: &'a Arena,
+    pub(crate) sequence: &'a crate::sql::guc::SeqSession,
+}
+
+pub(crate) fn alter_foreign_table(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    statement: &AlterTable<'_>,
+    runtime: ForeignTableAlterRuntime<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let ForeignTableAlterRuntime {
+        scratch,
+        arena,
+        sequence,
+    } = runtime;
+    let table =
+        match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
+            Some(crate::storage::ResolvedRelation::Table(table))
+                if storage.table_def(table, txn.txid).kind
+                    == crate::storage::TableKind::Foreign =>
+            {
+                table
+            }
+            None if statement.if_exists => {
+                responder.notice(
+                    sqlstate::SUCCESSFUL_COMPLETION,
+                    stack_format!(
+                        160,
+                        "relation \"{}\" does not exist, skipping",
+                        statement.table.name
+                    )
+                    .as_str(),
+                )?;
+                responder.command_complete("ALTER FOREIGN TABLE")?;
+                return sql_ok();
+            }
+            Some(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "\"{}\" is not a foreign table",
+                    statement.table.name
+                ));
+            }
+            None => return sql_fail(undefined_qual(&statement.table)),
+        };
+    let Some((binding_slot, mut binding)) = storage.foreign_table(table as u16, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "foreign table has no typed catalog binding"
+        ));
+    };
+    let definition = *storage.table_def(table, txn.txid);
+    let mut ordinary = [AlterAction::DropDefault { column: "" }; 32];
+    let mut ordinary_count = 0usize;
+    let mut binding_changed = false;
+    for action in statement.actions {
+        match action {
+            AlterAction::SetForeignOptions(actions) => {
+                binding.options = match binding.options.alter(actions) {
+                    Ok(options) => options,
+                    Err(error) => return sql_fail(error),
+                };
+                binding_changed = true;
+            }
+            AlterAction::SetColumnForeignOptions { column, options } => {
+                let Some(column) = definition.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                binding.column_options = match binding.column_options.alter(column as u16, options)
+                {
+                    Ok(options) => options,
+                    Err(error) => return sql_fail(error),
+                };
+                binding_changed = true;
+            }
+            other => {
+                ordinary[ordinary_count] = *other;
+                ordinary_count += 1;
+            }
+        }
+    }
+    let Some(server) = storage.foreign_server_by_slot(binding.server as usize, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "foreign table server does not exist"
+        ));
+    };
+    if storage
+        .foreign_wrapper_by_slot(server.wrapper as usize, txn.txid)
+        .is_some_and(|wrapper| {
+            wrapper.validator == crate::storage::foreign::ForeignDataValidator::Postgres
+        })
+    {
+        if let Err(error) =
+            validate_postgres_foreign_options(&binding.options, PostgresForeignOptionContext::Table)
+        {
+            return sql_fail(error);
+        }
+        for column in 0..definition.n_columns {
+            let mut options = crate::storage::foreign::ForeignOptions::EMPTY;
+            for option in binding.column_options.options_for(column as u16) {
+                let parsed = super::ast::ForeignOption {
+                    name: option.name.as_str(),
+                    value: option.value.as_str(),
+                };
+                options = match options.alter(&[super::ast::ForeignOptionAction::Add(parsed)]) {
+                    Ok(options) => options,
+                    Err(error) => return sql_fail(error),
+                };
+            }
+            if let Err(error) =
+                validate_postgres_foreign_options(&options, PostgresForeignOptionContext::Column)
+            {
+                return sql_fail(error);
+            }
+        }
+    }
+    if ordinary_count != 0 {
+        let ordinary_statement = AlterTable {
+            table: statement.table,
+            if_exists: statement.if_exists,
+            only: statement.only,
+            actions: &ordinary[..ordinary_count],
+        };
+        match alter_table_inner(
+            storage,
+            wal,
+            txn,
+            scratch,
+            &ordinary_statement,
+            arena,
+            sequence,
+            responder,
+            false,
+            Some(crate::storage::TableKind::Foreign),
+            "ALTER FOREIGN TABLE",
+        ) {
+            Ok(Ok(())) => {}
+            other => return other,
+        }
+    } else {
+        if let Err(error) = storage.lock_table(
+            txn.txid,
+            table,
+            crate::sql::ast::TableLockMode::AccessExclusive,
+            false,
+        ) {
+            return sql_fail(error);
+        }
+        if let Err(error) = storage.require_owner(
+            storage.table_access_object(table, txn.txid),
+            txn.txid,
+            "foreign table",
+        ) {
+            return sql_fail(error);
+        }
+    }
+    if binding_changed {
+        let prior = match storage.alter_foreign_table_binding(binding_slot, binding, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ForeignTableAltered {
+            slot: binding_slot as u32,
+            prior,
+        }) {
+            storage.rollback_foreign_table_alter(binding_slot, prior);
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("ALTER FOREIGN TABLE")?;
     sql_ok()
 }
 
@@ -2368,6 +3963,26 @@ pub fn drop_table(
     statement: &DropTable,
     responder: &mut Responder,
 ) -> Outcome {
+    drop_table_kind(
+        storage,
+        wal,
+        txn,
+        statement,
+        Some(crate::storage::TableKind::Local),
+        "DROP TABLE",
+        responder,
+    )
+}
+
+fn drop_table_kind(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    statement: &DropTable,
+    expected_kind: Option<crate::storage::TableKind>,
+    tag: &'static str,
+    responder: &mut Responder,
+) -> Outcome {
     let mut selected_tables = [usize::MAX; 16];
     let mut selected_table_count = 0usize;
     for name in statement.names {
@@ -2437,6 +4052,19 @@ pub fn drop_table(
                 ));
             }
             Some(crate::storage::ResolvedRelation::Table(index)) => {
+                if expected_kind.is_some_and(|kind| storage.table_def(index, txn.txid).kind != kind)
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::WRONG_OBJECT_TYPE,
+                        "\"{}\" is not a {}",
+                        name.name,
+                        if expected_kind == Some(crate::storage::TableKind::Foreign) {
+                            "foreign table"
+                        } else {
+                            "table"
+                        }
+                    ));
+                }
                 if let Err(error) = storage.require_not_extension_member(
                     crate::storage::AccessObject {
                         class: crate::storage::AccessClass::Table,
@@ -2503,7 +4131,7 @@ pub fn drop_table(
                         cascade: statement.cascade,
                     };
                     let outcome = responder.without_command_complete(|responder| {
-                        drop_table(storage, wal, txn, &child_drop, responder)
+                        drop_table_kind(storage, wal, txn, &child_drop, None, tag, responder)
                     });
                     match outcome {
                         Ok(Ok(())) => {}
@@ -2800,7 +4428,7 @@ pub fn drop_table(
             _ => return sql_fail(undefined_kind("table", name.name)),
         }
     }
-    responder.command_complete("DROP TABLE")?;
+    responder.command_complete(tag)?;
     sql_ok()
 }
 
@@ -3181,6 +4809,7 @@ pub fn alter_owner(
         AlterOwnerKind::Type => ("type", "ALTER TYPE"),
         AlterOwnerKind::Domain => ("domain", "ALTER DOMAIN"),
         AlterOwnerKind::Table => ("table", "ALTER TABLE"),
+        AlterOwnerKind::ForeignTable => ("foreign table", "ALTER FOREIGN TABLE"),
         AlterOwnerKind::View => ("view", "ALTER VIEW"),
         AlterOwnerKind::MaterializedView => ("materialized view", "ALTER MATERIALIZED VIEW"),
         AlterOwnerKind::Sequence => ("sequence", "ALTER SEQUENCE"),
@@ -3210,7 +4839,7 @@ pub fn alter_owner(
             class: AccessClass::Domain,
             slot: slot as u16,
         }),
-        AlterOwnerKind::Table => match relation() {
+        AlterOwnerKind::Table | AlterOwnerKind::ForeignTable => match relation() {
             Some(crate::storage::ResolvedRelation::Table(slot)) => {
                 let definition = storage.table_def(slot, txn.txid);
                 storage
@@ -4904,6 +6533,7 @@ fn privilege_mask(
         AccessClass::Index => PrivilegeSet::NONE,
         AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
         AccessClass::LargeObject => PrivilegeSet::LARGE_OBJECT_ALL,
+        AccessClass::ForeignDataWrapper | AccessClass::ForeignServer => PrivilegeSet::USAGE,
         AccessClass::Composite => PrivilegeSet::TYPE_ALL,
         AccessClass::Tablespace => PrivilegeSet::CREATE,
         AccessClass::Database => PrivilegeSet::DATABASE_ALL,
@@ -5218,7 +6848,9 @@ fn apply_default_privileges_to_new_object(
         AccessClass::Extension
         | AccessClass::Trigger
         | AccessClass::EventTrigger
-        | AccessClass::LargeObject => return Ok(()),
+        | AccessClass::LargeObject
+        | AccessClass::ForeignDataWrapper
+        | AccessClass::ForeignServer => return Ok(()),
     };
     let owner = storage.object_owner(object, txn.txid) as u16;
     let schema = if object.class == AccessClass::Schema {
@@ -6253,7 +7885,7 @@ pub fn drop_owned(
             cascade,
         };
         let outcome = responder.without_command_complete(|responder| {
-            drop_table(storage, wal, txn, &statement, responder)
+            drop_table_kind(storage, wal, txn, &statement, None, "DROP TABLE", responder)
         });
         match outcome {
             Ok(Ok(())) => {}
@@ -6750,6 +8382,40 @@ fn resolve_privilege_objects(
                                 )
                             })?;
                         add_privilege_object(objects, &mut count, object)?;
+                    }
+                    PrivilegeObjectKind::ForeignDataWrapper => {
+                        let Some((slot, _)) = storage.foreign_wrapper(name.name, txid) else {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "foreign-data wrapper \"{}\" does not exist",
+                                name.name
+                            ));
+                        };
+                        add_privilege_object(
+                            objects,
+                            &mut count,
+                            AccessObject {
+                                class: AccessClass::ForeignDataWrapper,
+                                slot: slot as u16,
+                            },
+                        )?;
+                    }
+                    PrivilegeObjectKind::ForeignServer => {
+                        let Some((slot, _)) = storage.foreign_server(name.name, txid) else {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "server \"{}\" does not exist",
+                                name.name
+                            ));
+                        };
+                        add_privilege_object(
+                            objects,
+                            &mut count,
+                            AccessObject {
+                                class: AccessClass::ForeignServer,
+                                slot: slot as u16,
+                            },
+                        )?;
                     }
                     PrivilegeObjectKind::AllTablesInSchema => {
                         let schema = name.name;
@@ -29586,6 +31252,8 @@ fn cascade_drop_type_column(
         seq_session,
         responder,
         false,
+        None,
+        "ALTER TABLE",
     ) {
         Ok(result) => result,
         Err(_) => Err(sql_err!(
@@ -38225,6 +39893,12 @@ pub fn copy_begin(
         )
     })?;
     let def = storage.table_def(table_index, txid);
+    if def.kind == crate::storage::TableKind::Foreign {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "COPY of a foreign table is not supported"
+        ));
+    }
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if statement.columns.is_empty() {
         for (i, t) in targets.iter_mut().enumerate().take(def.n_columns) {
@@ -41572,6 +43246,12 @@ pub fn merge(
         }
     }
     let def = *storage.table_def(table_index, txn.txid);
+    if def.kind == crate::storage::TableKind::Foreign {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "foreign-table MERGE is not supported"
+        ));
+    }
     let target_alias = statement.target_alias.or(Some(statement.target.name));
     let mut update_columns = 0u64;
     let mut insert_columns = 0u64;
@@ -43918,6 +45598,12 @@ where
         Err(e) => return sql_fail(e),
     };
     let def = *storage.table_def(table_index, txn.txid);
+    if def.kind == crate::storage::TableKind::Foreign {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "foreign-table INSERT is not supported"
+        ));
+    }
     let authorization_role = match authorization.role(storage, txn.txid) {
         Ok(role) => role,
         Err(error) => return sql_fail(error),
@@ -44947,6 +46633,12 @@ pub(crate) fn update<'a>(
         Err(e) => return sql_fail(e),
     };
     let def = *storage.table_def(table_index, txn.txid);
+    if def.kind == crate::storage::TableKind::Foreign {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "foreign-table UPDATE is not supported"
+        ));
+    }
     let authorization_role = match authorization.role(storage, txn.txid) {
         Ok(role) => role,
         Err(error) => return sql_fail(error),
@@ -45748,6 +47440,12 @@ pub(crate) fn delete<'a>(
         Ok(i) => i,
         Err(e) => return sql_fail(e),
     };
+    if storage.table_def(table_index, txn.txid).kind == crate::storage::TableKind::Foreign {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "foreign-table DELETE is not supported"
+        ));
+    }
     let authorization_role = match authorization.role(storage, txn.txid) {
         Ok(role) => role,
         Err(error) => return sql_fail(error),
@@ -46200,6 +47898,12 @@ pub fn truncate(
             _ => return sql_fail(undefined_qual(name)),
         };
         if !list[..n].contains(&index) {
+            if storage.table_def(index, txn.txid).kind == crate::storage::TableKind::Foreign {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "foreign-table TRUNCATE is not supported"
+                ));
+            }
             if n == MAX_TRUNCATE_TABLES {
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -47019,6 +48723,8 @@ pub fn alter_table(
         seq_session,
         responder,
         true,
+        Some(crate::storage::TableKind::Local),
+        "ALTER TABLE",
     )
 }
 
@@ -47078,6 +48784,7 @@ fn alter_trigger_enabled(
     recurse: bool,
     responder: &mut Responder,
     emit_completion: bool,
+    tag: &'static str,
 ) -> Outcome {
     let mode = match enabled {
         crate::sql::ast::TriggerEnableMode::Origin => crate::storage::TriggerEnabled::Origin,
@@ -47207,7 +48914,7 @@ fn alter_trigger_enabled(
         ));
     }
     if emit_completion {
-        responder.command_complete("ALTER TABLE")?;
+        responder.command_complete(tag)?;
     }
     sql_ok()
 }
@@ -47919,6 +49626,8 @@ fn alter_table_inner(
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
     emit_completion: bool,
+    expected_kind: Option<crate::storage::TableKind>,
+    tag: &'static str,
 ) -> Outcome {
     let table_index =
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
@@ -47958,6 +49667,7 @@ fn alter_table_inner(
                     !statement.only,
                     responder,
                     emit_completion,
+                    tag,
                 );
             }
             None if statement.if_exists => {
@@ -47971,7 +49681,7 @@ fn alter_table_inner(
                     .as_str(),
                 )?;
                 if emit_completion {
-                    responder.command_complete("ALTER TABLE")?;
+                    responder.command_complete(tag)?;
                 }
                 return sql_ok();
             }
@@ -47986,6 +49696,18 @@ fn alter_table_inner(
         return sql_fail(error);
     }
     let def = *storage.table_def(table_index, txn.txid);
+    if expected_kind.is_some_and(|kind| def.kind != kind) {
+        return sql_fail(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a {}",
+            statement.table.name,
+            if expected_kind == Some(crate::storage::TableKind::Foreign) {
+                "foreign table"
+            } else {
+                "table"
+            }
+        ));
+    }
     if emit_completion
         && let Err(error) = storage.require_owner(
             storage.table_access_object(table_index, txn.txid),
@@ -48027,7 +49749,7 @@ fn alter_table_inner(
         if new_schema == def.schema.as_str() {
             // Already there: PostgreSQL treats this as a no-op success.
             if emit_completion {
-                responder.command_complete("ALTER TABLE")?;
+                responder.command_complete(tag)?;
             }
             return sql_ok();
         }
@@ -48090,7 +49812,7 @@ fn alter_table_inner(
             return sql_fail(error);
         }
         if emit_completion {
-            responder.command_complete("ALTER TABLE")?;
+            responder.command_complete(tag)?;
         }
         return sql_ok();
     }
@@ -48109,6 +49831,7 @@ fn alter_table_inner(
             !statement.only,
             responder,
             emit_completion,
+            tag,
         );
     }
 
@@ -48160,7 +49883,7 @@ fn alter_table_inner(
             return sql_fail(error);
         }
         if emit_completion {
-            responder.command_complete("ALTER TABLE")?;
+            responder.command_complete(tag)?;
         }
         return sql_ok();
     }
@@ -48247,6 +49970,12 @@ fn alter_table_inner(
     for action in statement.actions {
         match action {
             AlterAction::SetSchema(_) => unreachable!("SET SCHEMA is a standalone action"),
+            AlterAction::SetForeignOptions(_) | AlterAction::SetColumnForeignOptions { .. } => {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "foreign-table options require a foreign table"
+                ));
+            }
             AlterAction::SetTriggerEnabled { .. } => {
                 unreachable!("trigger enablement is a standalone action")
             }
@@ -49644,7 +51373,7 @@ fn alter_table_inner(
         }
     }
     if emit_completion {
-        responder.command_complete("ALTER TABLE")?;
+        responder.command_complete(tag)?;
     }
     sql_ok()
 }

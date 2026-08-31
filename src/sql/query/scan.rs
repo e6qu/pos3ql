@@ -652,7 +652,7 @@ fn pax_column_demand_bounded(
     fn collect(expression: &Expr, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
         match expression {
             Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
-                Ok(ResolvedColumn::Table(table, column)) if scope.derived[table].is_none() => {
+                Ok(ResolvedColumn::Table(table, column)) if scope.slots[table] != usize::MAX => {
                     columns.observe(table, column)
                 }
                 Ok(ResolvedColumn::Table(_, _)) => {}
@@ -1892,7 +1892,11 @@ fn scan_source_mode<'a>(
         )
     })?;
     for table in 0..scope.n {
-        if scope.derived[table].is_none() {
+        let catalog_table = scope.slots[table] != usize::MAX;
+        let foreign_table = catalog_table
+            && storage.table_def(scope.slots[table], txid).kind
+                == crate::storage::TableKind::Foreign;
+        if catalog_table && (scope.derived[table].is_none() || foreign_table) {
             let authorization_role =
                 scope.authorization_roles[table].map_or(current_role, usize::from);
             let object = storage.table_access_object(scope.slots[table], txid);

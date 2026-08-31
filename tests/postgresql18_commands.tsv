@@ -23,8 +23,8 @@ ALTER DEFAULT PRIVILEGES	complete	83_roles_acl.sql
 ALTER DOMAIN	partial	62_domains.sql
 ALTER EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
 ALTER EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native-library update execution is outside the architecture
-ALTER FOREIGN DATA WRAPPER	missing	-
-ALTER FOREIGN TABLE	missing	-
+ALTER FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh (native handlers are rejected)
+ALTER FOREIGN TABLE	complete	tests/external/ci_diff.sh
 ALTER FUNCTION	partial	90_routine_lifecycle.sql, 111_extension_lifecycle.sql, and 112_routine_bodies_attributes_do.sql
 ALTER GROUP	partial	83_roles_acl.sql
 ALTER INDEX	partial	107_index_lifecycle.sql and 111_extension_lifecycle.sql
@@ -42,7 +42,7 @@ ALTER ROUTINE	partial	90_routine_lifecycle.sql and aggregate extension dependenc
 ALTER RULE	complete	tests/external/differential/122_rewrite_rules.sql
 ALTER SCHEMA	partial	37_schemas.sql
 ALTER SEQUENCE	partial	54_sequence.sql
-ALTER SERVER	missing	-
+ALTER SERVER	complete	tests/external/ci_diff.sh
 ALTER STATISTICS	complete	109_extended_statistics.sql
 ALTER SUBSCRIPTION	partial	98_subscription.sql and subscription shard (definition, refresh, initial synchronization)
 ALTER SYSTEM	complete	118_database_configuration.sql
@@ -55,7 +55,7 @@ ALTER TEXT SEARCH TEMPLATE	complete	tests/external/differential/123_full_text_se
 ALTER TRIGGER	complete	101_trigger_timing.sql
 ALTER TYPE	partial	63_enums.sql
 ALTER USER	partial	83_roles_acl.sql
-ALTER USER MAPPING	missing	-
+ALTER USER MAPPING	complete	tests/external/ci_diff.sh
 ALTER VIEW	partial	76_stored_dependencies.sql
 ANALYZE	complete	48_vacuum_analyze.sql
 BEGIN	complete	05_transactions.sql
@@ -76,8 +76,8 @@ CREATE DATABASE	complete	118_database_configuration.sql
 CREATE DOMAIN	complete	62_domains.sql
 CREATE EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
 CREATE EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native libraries are rejected
-CREATE FOREIGN DATA WRAPPER	missing	-
-CREATE FOREIGN TABLE	missing	-
+CREATE FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh (native handlers are rejected)
+CREATE FOREIGN TABLE	complete	tests/external/ci_diff.sh
 CREATE FUNCTION	partial	87_sql_routines.sql and 112_routine_bodies_attributes_do.sql
 CREATE GROUP	partial	83_roles_acl.sql
 CREATE INDEX	partial	43_indexes.sql, 107_index_lifecycle.sql, and 108_index_operator_classes.sql
@@ -93,7 +93,7 @@ CREATE ROLE	partial	83_roles_acl.sql
 CREATE RULE	complete	tests/external/differential/122_rewrite_rules.sql
 CREATE SCHEMA	partial	37_schemas.sql
 CREATE SEQUENCE	complete	54_sequence.sql
-CREATE SERVER	missing	-
+CREATE SERVER	complete	tests/external/ci_diff.sh
 CREATE STATISTICS	complete	109_extended_statistics.sql
 CREATE SUBSCRIPTION	partial	98_subscription.sql and subscription shard (disabled and managed initial synchronization)
 CREATE TABLE	partial	14_surface.sql
@@ -107,7 +107,7 @@ CREATE TRANSFORM	missing	-
 CREATE TRIGGER	complete	101_trigger_timing.sql
 CREATE TYPE	partial	63_enums.sql
 CREATE USER	partial	83_roles_acl.sql
-CREATE USER MAPPING	missing	-
+CREATE USER MAPPING	complete	tests/external/ci_diff.sh
 CREATE VIEW	complete	76_stored_dependencies.sql
 DEALLOCATE	complete	14_surface.sql
 DECLARE	partial	39_cursors.sql
@@ -123,8 +123,8 @@ DROP DATABASE	complete	118_database_configuration.sql
 DROP DOMAIN	complete	62_domains.sql
 DROP EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
 DROP EXTENSION	partial	111_extension_lifecycle.sql covers SQL-package dependency classes; native packages are not loaded
-DROP FOREIGN DATA WRAPPER	missing	-
-DROP FOREIGN TABLE	missing	-
+DROP FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh
+DROP FOREIGN TABLE	complete	tests/external/ci_diff.sh
 DROP FUNCTION	partial	87_sql_routines.sql
 DROP GROUP	partial	83_roles_acl.sql
 DROP INDEX	complete	43_indexes.sql
@@ -142,7 +142,7 @@ DROP ROUTINE	partial	90_routine_lifecycle.sql
 DROP RULE	complete	tests/external/differential/122_rewrite_rules.sql
 DROP SCHEMA	complete	37_schemas.sql
 DROP SEQUENCE	complete	54_sequence.sql
-DROP SERVER	missing	-
+DROP SERVER	complete	tests/external/ci_diff.sh
 DROP STATISTICS	complete	109_extended_statistics.sql
 DROP SUBSCRIPTION	partial	98_subscription.sql (durable disabled lifecycle)
 DROP TABLE	complete	14_surface.sql
@@ -155,14 +155,14 @@ DROP TRANSFORM	missing	-
 DROP TRIGGER	complete	101_trigger_timing.sql
 DROP TYPE	complete	63_enums.sql
 DROP USER	partial	83_roles_acl.sql
-DROP USER MAPPING	missing	-
+DROP USER MAPPING	complete	tests/external/ci_diff.sh
 DROP VIEW	complete	76_stored_dependencies.sql
 END	complete	05_transactions.sql
 EXECUTE	complete	14_surface.sql
 EXPLAIN	partial	48_vacuum_analyze.sql
 FETCH	complete	39_cursors.sql
 GRANT	partial	83_roles_acl.sql
-IMPORT FOREIGN SCHEMA	missing	-
+IMPORT FOREIGN SCHEMA	complete	tests/external/ci_diff.sh
 INSERT	complete	02_dml_returning.sql
 LISTEN	complete	14_surface.sql
 LOAD	missing	-

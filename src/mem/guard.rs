@@ -18,12 +18,6 @@ pub struct GuardedAllocator;
 
 static FROZEN: AtomicBool = AtomicBool::new(false);
 
-/// Test-only escape hatch: when set, a fault increments [`violations`]
-/// instead of aborting, and the allocation proceeds. Nothing in the server
-/// enables this; it exists so the guard itself is testable.
-static COUNT_ONLY: AtomicBool = AtomicBool::new(false);
-static VIOLATIONS: AtomicU64 = AtomicU64::new(0);
-
 thread_local! {
     // const-initialized and droppable-free: accessing it never allocates,
     // which matters because it is read on every allocation.
@@ -31,6 +25,14 @@ thread_local! {
     // Inside a [`tls_scope`]: allocations are permitted post-freeze but
     // count against the global TLS pool budget.
     static TLS_SCOPE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    // Per-thread so testing the allocator cannot disable enforcement in a
+    // concurrently running test.
+    static COUNT_ONLY: Cell<bool> = const { Cell::new(false) };
+    static VIOLATIONS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Byte budget for the isolated TLS component (rustls), set once at startup;
@@ -81,19 +83,36 @@ pub fn forbid_alloc<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-pub fn set_count_only(enabled: bool) {
-    COUNT_ONLY.store(enabled, Ordering::SeqCst);
+#[cfg(test)]
+fn set_count_only(enabled: bool) {
+    COUNT_ONLY.with(|value| value.set(enabled));
 }
 
-pub fn violations() -> u64 {
-    VIOLATIONS.load(Ordering::SeqCst)
+#[cfg(test)]
+fn violations() -> u64 {
+    VIOLATIONS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn count_fault() -> bool {
+    COUNT_ONLY.with(|enabled| {
+        if !enabled.get() {
+            return false;
+        }
+        VIOLATIONS.with(|violations| violations.set(violations.get().saturating_add(1)));
+        true
+    })
+}
+
+#[cfg(not(test))]
+const fn count_fault() -> bool {
+    false
 }
 
 #[cold]
 #[inline(never)]
 fn tls_fault() {
-    if COUNT_ONLY.load(Ordering::SeqCst) {
-        VIOLATIONS.fetch_add(1, Ordering::SeqCst);
+    if count_fault() {
         return;
     }
     if std::thread::panicking() {
@@ -109,8 +128,7 @@ fn tls_fault() {
 #[cold]
 #[inline(never)]
 fn fault() {
-    if COUNT_ONLY.load(Ordering::SeqCst) {
-        VIOLATIONS.fetch_add(1, Ordering::SeqCst);
+    if count_fault() {
         return;
     }
     // A panic already in flight is itself the loud failure; the unwind
@@ -195,8 +213,8 @@ mod tests {
 
         let before = violations();
         forbid_alloc(|| {
-            let v: Vec<u8> = Vec::with_capacity(32);
-            drop(v);
+            let v: Vec<u8> = std::hint::black_box(Vec::with_capacity(32));
+            drop(std::hint::black_box(v));
         });
         let during = violations();
         assert!(
@@ -205,8 +223,8 @@ mod tests {
         );
 
         // Outside the scope allocation is clean again.
-        let v: Vec<u8> = Vec::with_capacity(32);
-        drop(v);
+        let v: Vec<u8> = std::hint::black_box(Vec::with_capacity(32));
+        drop(std::hint::black_box(v));
         assert_eq!(violations(), during);
 
         // The scope restores the previous state even on unwind.
@@ -215,8 +233,8 @@ mod tests {
         });
         assert!(unwound.is_err());
         let after_unwind = violations();
-        let v: Vec<u8> = Vec::with_capacity(32);
-        drop(v);
+        let v: Vec<u8> = std::hint::black_box(Vec::with_capacity(32));
+        drop(std::hint::black_box(v));
         assert_eq!(violations(), after_unwind);
 
         set_count_only(false);

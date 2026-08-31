@@ -899,6 +899,20 @@ impl<'a> Parser<'a> {
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
             });
         }
+        if options.settings {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "EXPLAIN option SETTINGS is not supported"),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
+        if options.generic_plan {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(96, "EXPLAIN option GENERIC_PLAN is not supported"),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
         let statement = self.statement()?;
         if matches!(statement, Stmt::Explain { .. }) {
             return Err(self.err_here("EXPLAIN cannot be nested"));
@@ -1258,6 +1272,7 @@ impl<'a> Parser<'a> {
                 self.advance()?;
                 Ok(Stmt::Checkpoint)
             }
+            Tok::Ident("cluster") => self.cluster(),
             Tok::Ident("reindex") => self.reindex(),
             Tok::Ident("vacuum") => self.vacuum_or_analyze(true),
             Tok::Ident("analyze") | Tok::Ident("analyse") => self.vacuum_or_analyze(false),
@@ -3326,38 +3341,98 @@ impl<'a> Parser<'a> {
     /// table with an optional column list.
     fn vacuum_or_analyze(&mut self, is_vacuum: bool) -> Result<Stmt<'a>, ParseError> {
         self.advance()?; // the VACUUM / ANALYZE keyword
-        let mut run_analyze = !is_vacuum;
+        let mut options = crate::sql::ast::VacuumOptions {
+            analyze: !is_vacuum,
+            ..crate::sql::ast::VacuumOptions::DEFAULT
+        };
+        let mut saw_full = false;
+        let mut saw_analyze = false;
         if self.eat_op("(")? {
-            // A parenthesized option list — consume up to the matching ')'.
-            let mut depth = 1;
-            while depth > 0 {
-                if self.peeked == Tok::Eof {
-                    return Err(self.unexpected("unterminated option list"));
-                }
-                if matches!(self.peeked, Tok::Ident(word) if word.eq_ignore_ascii_case("analyze") || word.eq_ignore_ascii_case("analyse"))
+            loop {
+                let option = self.any_ident("VACUUM option")?;
+                let value = {
+                    let _ = self.eat_op("=")?;
+                    self.explain_bool()?
+                };
+                if option.eq_ignore_ascii_case("full") && is_vacuum {
+                    if core::mem::replace(&mut saw_full, true) {
+                        return Err(self.err_here("VACUUM option FULL specified more than once"));
+                    }
+                    options.full = value;
+                } else if (option.eq_ignore_ascii_case("analyze")
+                    || option.eq_ignore_ascii_case("analyse"))
+                    && is_vacuum
                 {
-                    run_analyze = true;
-                }
-                if self.eat_op("(")? {
-                    depth += 1;
-                } else if self.eat_op(")")? {
-                    depth -= 1;
+                    if core::mem::replace(&mut saw_analyze, true) {
+                        return Err(self.err_here("VACUUM option ANALYZE specified more than once"));
+                    }
+                    options.analyze = value;
                 } else {
-                    self.advance()?;
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "unsupported {} option \"{}\"",
+                            if is_vacuum { "VACUUM" } else { "ANALYZE" },
+                            option
+                        ),
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    });
                 }
+                if self.eat_op(")")? {
+                    break;
+                }
+                self.expect_op(",")?;
             }
         } else {
-            // The bare-keyword form: FULL / FREEZE / VERBOSE / ANALYZE.
             loop {
-                if self.eat_ident("full")?
-                    || self.eat_ident("freeze")?
-                    || self.eat_ident("verbose")?
-                {
+                if self.eat_ident("full")? && is_vacuum {
+                    if core::mem::replace(&mut saw_full, true) {
+                        return Err(self.err_here("VACUUM option FULL specified more than once"));
+                    }
+                    options.full = true;
                     continue;
                 }
                 if self.eat_ident("analyze")? || self.eat_ident("analyse")? {
-                    run_analyze = true;
+                    if !is_vacuum {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(96, "unsupported ANALYZE option \"ANALYZE\""),
+                            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                        });
+                    }
+                    if core::mem::replace(&mut saw_analyze, true) {
+                        return Err(self.err_here("VACUUM option ANALYZE specified more than once"));
+                    }
+                    options.analyze = true;
                     continue;
+                }
+                if matches!(
+                    self.peeked,
+                    Tok::Ident(
+                        "full"
+                            | "freeze"
+                            | "verbose"
+                            | "skip_locked"
+                            | "disable_page_skipping"
+                            | "index_cleanup"
+                            | "process_toast"
+                            | "truncate"
+                            | "parallel"
+                            | "buffer_usage_limit"
+                    )
+                ) {
+                    let option = self.any_ident("maintenance option")?;
+                    return Err(ParseError {
+                        at: self.peek_at,
+                        message: stack_format!(
+                            96,
+                            "unsupported {} option \"{}\"",
+                            if is_vacuum { "VACUUM" } else { "ANALYZE" },
+                            option
+                        ),
+                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                    });
                 }
                 break;
             }
@@ -3402,10 +3477,7 @@ impl<'a> Parser<'a> {
         }
         let targets = self.arena_slice(&targets[..target_count])?;
         Ok(if is_vacuum {
-            Stmt::Vacuum {
-                targets,
-                analyze: run_analyze,
-            }
+            Stmt::Vacuum { targets, options }
         } else {
             Stmt::Analyze(targets)
         })
@@ -3952,6 +4024,26 @@ impl<'a> Parser<'a> {
                 verbose,
             },
         })
+    }
+
+    /// `CLUSTER [VERBOSE] [table [USING index]]`. The no-target form is a
+    /// closed `All` state; a table can carry an optional index and nothing
+    /// else can reach execution.
+    fn cluster(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("cluster")?;
+        let verbose = self.eat_ident("verbose")?;
+        let target = if matches!(self.peeked, Tok::Op(";") | Tok::Eof) {
+            crate::sql::ast::ClusterTarget::All
+        } else {
+            let table = self.qual_name("table name")?;
+            let index = if self.eat_ident("using")? {
+                Some(self.qual_name("index name")?)
+            } else {
+                None
+            };
+            crate::sql::ast::ClusterTarget::Table { table, index }
+        };
+        Ok(Stmt::Cluster { target, verbose })
     }
 
     fn subscription_publication_change(
@@ -7088,6 +7180,37 @@ mod tests {
                 crate::sql::ast::AlterTypeAction::SetSchema("archive")
             );
         });
+    }
+
+    #[test]
+    fn cluster_target_is_closed_and_allocation_free() {
+        with_parser(
+            "CLUSTER VERBOSE public.rows USING public.rows_id; CLUSTER",
+            |parser| {
+                let Some(Stmt::Cluster { target, verbose }) = parser.next_stmt().unwrap() else {
+                    panic!("CLUSTER target did not parse")
+                };
+                assert!(verbose);
+                assert_eq!(
+                    target,
+                    crate::sql::ast::ClusterTarget::Table {
+                        table: QualName {
+                            schema: Some("public"),
+                            name: "rows",
+                        },
+                        index: Some(QualName {
+                            schema: Some("public"),
+                            name: "rows_id",
+                        }),
+                    }
+                );
+                let Some(Stmt::Cluster { target, verbose }) = parser.next_stmt().unwrap() else {
+                    panic!("CLUSTER all did not parse")
+                };
+                assert!(!verbose);
+                assert_eq!(target, crate::sql::ast::ClusterTarget::All);
+            },
+        );
     }
 
     #[test]

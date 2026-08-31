@@ -27461,6 +27461,14 @@ fn vacuum_and_analyze() {
         let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
         assert!(text.contains("VACUUM"), "{cmd}: {text}");
     }
+    for cmd in [
+        "VACUUM FREEZE vt",
+        "VACUUM (SKIP_LOCKED) vt",
+        "ANALYZE (VERBOSE) vt",
+    ] {
+        let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
+        assert!(text.contains("0A000"), "{cmd}: {text}");
+    }
     for cmd in ["ANALYZE", "ANALYZE vt", "ANALYZE vt (a, b)"] {
         let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
         assert!(text.contains("ANALYZE"), "{cmd}: {text}");
@@ -27814,6 +27822,14 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "EXPLAIN (GENERIC_PLAN, ANALYZE) SELECT * FROM ep",
     );
     assert!(String::from_utf8_lossy(&invalid_generic).contains("22023"));
+    for command in [
+        "EXPLAIN (SETTINGS) SELECT * FROM ep",
+        "EXPLAIN (GENERIC_PLAN) SELECT * FROM ep",
+    ] {
+        let output = run_with(&mut engine, &mut budget, command);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("0A000"), "{command}: {text}");
+    }
 
     let detailed = data_rows(&run_with(
         &mut engine,
@@ -35051,6 +35067,110 @@ fn reindex_preserves_indexed_access_after_checkpoint_and_cold_restart() {
     drop(restarted);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn cluster_selection_survives_checkpoint_and_cold_restart() {
+    let mut config = test_config("cluster-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("cluster-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE cluster_recovery_rows (id int, value text); \
+         INSERT INTO cluster_recovery_rows VALUES (1, 'one'), (2, 'two'); \
+         CREATE INDEX cluster_recovery_id ON cluster_recovery_rows (id); \
+         CREATE INDEX cluster_recovery_value ON cluster_recovery_rows (value)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let clustered = run_with(
+        &mut engine,
+        &mut budget,
+        "CLUSTER cluster_recovery_rows USING cluster_recovery_value",
+    );
+    assert!(
+        !String::from_utf8_lossy(&clustered).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&clustered)
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT indexrelid::regclass::text, indisclustered \
+             FROM pg_index \
+             WHERE indrelid = 'cluster_recovery_rows'::regclass \
+             ORDER BY indexrelid::regclass::text; \
+             SELECT id FROM cluster_recovery_rows WHERE value = 'two'",
+        )),
+        ["cluster_recovery_id|f", "cluster_recovery_value|t", "2"]
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn cluster_rejects_an_index_from_another_relation_with_the_postgresql_class() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE cluster_target (id int); \
+         CREATE TABLE cluster_other (id int); \
+         CREATE INDEX cluster_other_id ON cluster_other (id)",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CLUSTER cluster_target USING cluster_other_id",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42809"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn cluster_table_is_transactional_but_cluster_all_is_not() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE cluster_transactional (id int); \
+         CREATE INDEX cluster_transactional_id ON cluster_transactional (id); \
+         BEGIN; \
+         CLUSTER cluster_transactional USING cluster_transactional_id; \
+         COMMIT",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let all = run_with(&mut engine, &mut budget, "BEGIN; CLUSTER; ROLLBACK");
+    assert!(
+        String::from_utf8_lossy(&all).contains("25001"),
+        "{}",
+        String::from_utf8_lossy(&all)
+    );
 }
 
 #[test]

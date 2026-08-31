@@ -2537,9 +2537,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + MAX_INDEX_COLS * 2
                 + 2
                 + 1
+                + 1
         }
         WalOp::AlterIndexDefinition { schema, name, .. } => {
-            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 1
+            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 2
         }
         WalOp::CreateTablespace { name, location, .. } => {
             8 + 1 + name.len() + 2 + location.len() + 24 + 2
@@ -3302,7 +3303,7 @@ fn append_index_definition(
         ok &= buffer.append(&statistic.to_le_bytes());
     }
     ok &= buffer.append(&definition.parent.unwrap_or(u16::MAX).to_le_bytes());
-    ok && buffer.append(&[kind])
+    ok && buffer.append(&[kind, u8::from(definition.clustered)])
 }
 
 fn append_tablespace_options(
@@ -5546,6 +5547,15 @@ fn decode_index_definition(
         _ => return None,
     };
     *at += 1;
+    let clustered = match *payload.get(*at)? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    *at += 1;
+    if clustered && !matches!(kind, crate::storage::IndexKind::Ordinary) {
+        return None;
+    }
     Some(crate::storage::IndexMutableDefinition {
         tablespace,
         options: crate::storage::IndexStorageOptions {
@@ -5555,6 +5565,7 @@ fn decode_index_definition(
         statistics,
         parent: (parent != u16::MAX).then_some(parent),
         kind,
+        clustered,
     })
 }
 
@@ -11375,7 +11386,10 @@ mod tests {
             nulls_not_distinct: true,
             predicate: Some("active AND value IS NOT NULL"),
             unique: true,
-            definition: crate::storage::IndexMutableDefinition::DEFAULT,
+            definition: crate::storage::IndexMutableDefinition {
+                clustered: true,
+                ..crate::storage::IndexMutableDefinition::DEFAULT
+            },
         };
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(
@@ -11391,6 +11405,7 @@ mod tests {
             include_columns,
             n_include_cols,
             nulls_not_distinct,
+            definition,
             ..
         }) = decode_op(KIND_CREATE_INDEX, payload.readable())
         else {
@@ -11399,7 +11414,40 @@ mod tests {
         assert_eq!(n_include_cols, 1);
         assert_eq!(include_columns[0], 2);
         assert!(nulls_not_distinct);
+        assert!(definition.clustered);
         assert_eq!(predicate, Some("active AND value IS NOT NULL"));
+    }
+
+    #[test]
+    fn clustered_index_definition_payload_round_trips() {
+        let operation = WalOp::AlterIndexDefinition {
+            schema: "public",
+            name: "clustered_rows",
+            definition: crate::storage::IndexMutableDefinition {
+                clustered: true,
+                ..crate::storage::IndexMutableDefinition::DEFAULT
+            },
+        };
+        let mut budget = Budget::new(4096);
+        let mut payload = FixedBuf::new(
+            &mut budget,
+            "clustered index definition WAL payload",
+            encoded_payload_len(&operation),
+        )
+        .unwrap();
+        assert!(append_payload(&mut payload, &operation));
+        assert_eq!(payload.len(), encoded_payload_len(&operation));
+        let Some(WalOp::AlterIndexDefinition {
+            schema,
+            name,
+            definition,
+        }) = decode_op(KIND_ALTER_INDEX_DEFINITION, payload.readable())
+        else {
+            panic!("clustered index definition WAL payload must decode");
+        };
+        assert_eq!(schema, "public");
+        assert_eq!(name, "clustered_rows");
+        assert!(definition.clustered);
     }
 
     #[test]

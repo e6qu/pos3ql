@@ -437,6 +437,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterIndexesTablespace { .. }
         | Stmt::DropIndex { .. }
         | Stmt::Reindex { .. }
+        | Stmt::Cluster { .. }
         | Stmt::Checkpoint
         | Stmt::AlterSystem { .. }
         | Stmt::AlterTable(_)
@@ -687,6 +688,7 @@ fn statement_tag(statement: &Stmt<'_>) -> &'static str {
         Stmt::Truncate { .. } => "TRUNCATE",
         Stmt::Vacuum { .. } => "VACUUM",
         Stmt::Checkpoint => "CHECKPOINT",
+        Stmt::Cluster { .. } => "CLUSTER",
         Stmt::Reindex { .. } => "REINDEX",
         Stmt::Notify { .. } => "NOTIFY",
         _ => "DDL",
@@ -811,6 +813,7 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::CreateIndex { .. } => "CREATE INDEX",
         Stmt::AlterIndex { .. } | Stmt::AlterIndexesTablespace { .. } => "ALTER INDEX",
         Stmt::DropIndex { .. } => "DROP INDEX",
+        Stmt::Cluster { .. } => "CLUSTER",
         Stmt::Reindex { .. } => "REINDEX",
         Stmt::CreateSchema { .. } => "CREATE SCHEMA",
         Stmt::DropSchema { .. } => "DROP SCHEMA",
@@ -1215,6 +1218,12 @@ fn top_level_only_command(statement: &Stmt<'_>) -> Option<&'static str> {
     match statement {
         Stmt::Checkpoint => Some("CHECKPOINT"),
         Stmt::Vacuum { .. } => Some("VACUUM"),
+        // A relation-specific CLUSTER is transactional; the all-relations
+        // form controls its own work across relations and is not.
+        Stmt::Cluster {
+            target: ast::ClusterTarget::All,
+            ..
+        } => Some("CLUSTER"),
         Stmt::AlterSystem { .. } => Some("ALTER SYSTEM"),
         Stmt::Discard(ast::DiscardTarget::All) => Some("DISCARD ALL"),
         Stmt::CommitPrepared(_) => Some("COMMIT PREPARED"),
@@ -6082,24 +6091,19 @@ impl Engine {
         &self,
         targets: &[ast::MaintenanceTarget<'_>],
         txid: u32,
+        mode: ast::TableLockMode,
     ) -> Result<(), SqlError> {
         if targets.is_empty() {
             for slot in 0..self.storage.table_count() {
                 if self.storage.table(slot).visible_to(txid) {
-                    self.storage.lock_table(
-                        txid,
-                        slot,
-                        ast::TableLockMode::ShareUpdateExclusive,
-                        false,
-                    )?;
+                    self.storage.lock_table(txid, slot, mode, false)?;
                 }
             }
             return Ok(());
         }
         for target in targets {
             let slot = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
-            self.storage
-                .lock_table(txid, slot, ast::TableLockMode::ShareUpdateExclusive, false)?;
+            self.storage.lock_table(txid, slot, mode, false)?;
         }
         Ok(())
     }
@@ -12430,6 +12434,14 @@ impl Engine {
                 *options,
                 responder,
             ),
+            Stmt::Cluster { target, verbose } => exec::cluster(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *target,
+                *verbose,
+                responder,
+            ),
             Stmt::CreateTablespace {
                 name,
                 owner,
@@ -13620,11 +13632,16 @@ impl Engine {
             // the whole store, which subsumes any named table. Without object
             // storage there is nothing to compact to, and — as VACUUM on a
             // table with nothing to reclaim does in PostgreSQL — it succeeds.
-            Stmt::Vacuum { targets, analyze } => {
-                if let Err(error) = self.lock_maintenance_targets(targets, txn.txid) {
+            Stmt::Vacuum { targets, options } => {
+                let mode = if options.full {
+                    ast::TableLockMode::AccessExclusive
+                } else {
+                    ast::TableLockMode::ShareUpdateExclusive
+                };
+                if let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode) {
                     return Ok(Err(error));
                 }
-                let validation = if *analyze {
+                let validation = if options.analyze {
                     self.analyze_targets(targets, txn).map(|_| ())
                 } else {
                     self.validate_maintenance_targets(targets, txn.txid)
@@ -13644,7 +13661,11 @@ impl Engine {
             // MVCC-visible row state. Cardinality and widths are exact for that
             // snapshot; distinct counts use the fixed-size estimator.
             Stmt::Analyze(targets) => {
-                if let Err(error) = self.lock_maintenance_targets(targets, txn.txid) {
+                if let Err(error) = self.lock_maintenance_targets(
+                    targets,
+                    txn.txid,
+                    ast::TableLockMode::ShareUpdateExclusive,
+                ) {
                     return Ok(Err(error));
                 }
                 if let Err(error) = self.analyze_targets(targets, txn) {

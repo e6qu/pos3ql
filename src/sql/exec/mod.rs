@@ -50169,6 +50169,91 @@ fn alter_table_inner(
         );
     }
 
+    // Metadata-only changes must not decode, re-home, or re-journal every row.
+    // They retain the exact row image and install one transaction-owned table
+    // definition, which is the same durable boundary used by row-security.
+    if statement.actions.iter().all(|action| {
+        matches!(
+            action,
+            AlterAction::SetTablespace(_)
+                | AlterAction::SetAccessMethod(_)
+                | AlterAction::SetPersistence(_)
+                | AlterAction::SetStatistics { .. }
+        )
+    }) {
+        let mut new_def = def;
+        for action in statement.actions {
+            match action {
+                AlterAction::SetTablespace(name) => {
+                    new_def.tablespace =
+                        match resolve_relation_tablespace(storage, Some(name), txn.txid) {
+                            Ok(tablespace) => tablespace,
+                            Err(error) => return sql_fail(error),
+                        };
+                }
+                AlterAction::SetAccessMethod(crate::sql::ast::TableAccessMethod::Heap) => {
+                    new_def.access_method = crate::storage::TableAccessMethod::Heap;
+                }
+                AlterAction::SetAccessMethod(crate::sql::ast::TableAccessMethod::Named(name)) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "access method \"{}\" does not exist",
+                        name
+                    ));
+                }
+                AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent) => {}
+                AlterAction::SetPersistence(_) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "unlogged tables are incompatible with object-native durable storage"
+                    ));
+                }
+                AlterAction::SetStatistics { column, target } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    new_def.columns[column].statistics_target = *target;
+                }
+                _ => unreachable!("metadata-only ALTER action"),
+            }
+        }
+        let mut mapping = [None; MAX_COLUMNS];
+        let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+        for column in 0..def.n_columns {
+            mapping[column] = Some(def.columns()[column].name);
+            wal_mapping[column] = column as u16;
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::BeginTableRewrite {
+                previous_schema: def.schema.as_str(),
+                previous_name: def.name.as_str(),
+                preserve_rows: true,
+                column_mapping: wal_mapping,
+            },
+        ) {
+            return sql_fail(error);
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(new_def)) {
+            return sql_fail(error);
+        }
+        if let Err(error) = storage.write_table_def(table_index, txn.txid, new_def, &mapping, false)
+        {
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
+            storage.rollback_table_def(table_index, txn.txid);
+            return sql_fail(error);
+        }
+        if emit_completion {
+            responder.command_complete(tag)?;
+        }
+        return sql_ok();
+    }
+
     // Collect every committed row up front: the row count decides whether an
     // added NOT NULL column needs a fill (a spilled table has rows even when
     // the overlay map has evicted them, so `rows.is_empty()` cannot answer

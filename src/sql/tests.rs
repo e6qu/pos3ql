@@ -36235,6 +36235,16 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
     let output = run_with(
         &mut engine,
         &mut budget,
+        "INSERT INTO table_definition_rows VALUES (42)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
         "
          SELECT c.relam, s.spcname FROM pg_class c JOIN pg_tablespace s ON s.oid = c.reltablespace \
           WHERE c.relname = 'table_definition_rows'",
@@ -36269,6 +36279,14 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
               WHERE attrelid = 'table_definition_rows'::regclass AND attname = 'id'",
         )),
         ["77"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM table_definition_rows",
+        )),
+        ["42"]
     );
     let output = run_with(
         &mut engine,

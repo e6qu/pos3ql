@@ -918,7 +918,7 @@ fn disambiguate_constraint_name(def: &TableDef, base: &str) -> Result<SqlName, S
 /// Whether `name` is already the name of any constraint on `def`: a stored
 /// CHECK, unique key, or foreign key, or one of the names synthesized for the
 /// single-column PRIMARY KEY / UNIQUE flags (`<table>_pkey` / `<table>_<col>_key`).
-fn constraint_name_taken(def: &TableDef, name: &str) -> bool {
+pub(super) fn constraint_name_taken(def: &TableDef, name: &str) -> bool {
     use core::fmt::Write as _;
     if def.checks[..def.n_checks]
         .iter()

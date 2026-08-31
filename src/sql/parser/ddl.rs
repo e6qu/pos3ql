@@ -7469,7 +7469,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a parenthesized, comma-separated column-name list.
-    fn column_name_list(&mut self) -> Result<&'a [&'a str], ParseError> {
+    pub(super) fn column_name_list(&mut self) -> Result<&'a [&'a str], ParseError> {
         self.expect_op("(")?;
         let mut columns: [&'a str; MAX_INDEX_COLS] = [""; MAX_INDEX_COLS];
         let mut k = 0;
@@ -7721,7 +7721,10 @@ impl<'a> Parser<'a> {
         Ok((timing, validation))
     }
 
-    fn constraint_timing(&mut self, allow_not_valid: bool) -> Result<ConstraintTiming, ParseError> {
+    pub(super) fn constraint_timing(
+        &mut self,
+        allow_not_valid: bool,
+    ) -> Result<ConstraintTiming, ParseError> {
         let (timing, validation) = self.constraint_attributes(true, false, allow_not_valid)?;
         debug_assert_eq!(validation, ConstraintValidation::EnforcedValidated);
         Ok(timing)

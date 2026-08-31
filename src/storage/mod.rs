@@ -30039,6 +30039,9 @@ impl Storage {
         if !index.visible_to(txid) {
             return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"));
         }
+        if index.name_for(txid) == name {
+            return Ok(index.pending_name);
+        }
         if let Some(blocker) = self
             .indexes
             .iter()
@@ -30060,6 +30063,13 @@ impl Storage {
                 && candidate.schema == index.schema
                 && candidate.name_for(txid) == name
         }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if self.relation_name_taken(index.schema.as_str(), name.as_str(), txid) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",

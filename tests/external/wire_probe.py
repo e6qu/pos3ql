@@ -3617,6 +3617,50 @@ def test_table_lifecycle_boundaries_over_raw_wire():
     s.close()
 
 
+def test_attached_index_constraint_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_attached_index_constraint (id integer); "
+        "CREATE UNIQUE INDEX wire_attached_index_constraint_idx "
+        "ON wire_attached_index_constraint (id); "
+        "ALTER TABLE wire_attached_index_constraint "
+        "ADD CONSTRAINT wire_attached_index_constraint_pkey "
+        "PRIMARY KEY USING INDEX wire_attached_index_constraint_idx",
+    )
+    catalog = simple_query(
+        s,
+        "SELECT conindid = (SELECT oid FROM pg_class WHERE relname = conname) "
+        "FROM pg_constraint WHERE conname = 'wire_attached_index_constraint_pkey'",
+    )
+    blocked = simple_query(s, "DROP INDEX wire_attached_index_constraint_pkey")
+    renamed = simple_query(
+        s,
+        "ALTER INDEX wire_attached_index_constraint_pkey "
+        "RENAME TO wire_attached_index_constraint_primary; "
+        "SELECT conname FROM pg_constraint "
+        "WHERE conname = 'wire_attached_index_constraint_primary'",
+    )
+    check(
+        "raw wire: attached index and constraint retain one identity",
+        not any(kind == b"E" for kind, _ in setup)
+        and first_text_row(catalog) == "t"
+        and has_sqlstate(blocked, "2BP01")
+        and not any(kind == b"E" for kind, _ in renamed)
+        and first_text_row(renamed) == "wire_attached_index_constraint_primary",
+        setup + catalog + blocked + renamed,
+    )
+    cleanup = simple_query(s, "DROP TABLE wire_attached_index_constraint")
+    check(
+        "raw wire: attached index fixture cleanup succeeds",
+        not any(kind == b"E" for kind, _ in cleanup),
+        cleanup,
+    )
+    s.close()
+
+
 def test_deferred_constraint_commit_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

@@ -2851,6 +2851,23 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         }
         // Multi-column PK / UNIQUE constraints.
         for uk in def.uniques() {
+            // ALTER TABLE ... ADD CONSTRAINT ... USING INDEX transfers the
+            // index relation into the constraint. Do not synthesize a second
+            // catalog index: matching name plus typed key positions is the
+            // durable attachment proof.
+            if storage
+                .indexes_for(def.schema.as_str(), table_name, txid)
+                .any(|index| {
+                    index.name_for(txid) == uk.name
+                        && index.n_cols == uk.n_cols
+                        && index.columns[..index.n_cols] == uk.columns[..uk.n_cols]
+                        && index.expressions[..index.n_cols]
+                            .iter()
+                            .all(Option::is_none)
+                })
+            {
+                continue;
+            }
             visit(mk(
                 uk.columns(),
                 [false; crate::storage::MAX_INDEX_COLS],
@@ -2888,6 +2905,14 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         }
         // Explicit CREATE INDEX on this table.
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
+            let attached = def.uniques().iter().find(|key| {
+                key.name == index.name_for(txid)
+                    && key.n_cols == index.n_cols
+                    && key.columns[..key.n_cols] == index.columns[..index.n_cols]
+                    && index.expressions[..index.n_cols]
+                        .iter()
+                        .all(Option::is_none)
+            });
             let mut info = mk(
                 &index.columns[..index.n_cols],
                 index.expressions.map(|expression| expression.is_some()),
@@ -2896,11 +2921,13 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 index.nulls_first,
                 index.predicate,
                 index.nulls_not_distinct,
-                false,
+                attached.is_some_and(|key| key.is_primary),
                 index.unique,
+                attached.is_some(),
                 false,
-                false,
-                crate::storage::ConstraintTiming::NotDeferrable,
+                attached.map_or(crate::storage::ConstraintTiming::NotDeferrable, |key| {
+                    key.timing
+                }),
                 stack_str_64(index.name_for(txid).as_str()),
             );
             info.oid = explicit_index_oid(&index);

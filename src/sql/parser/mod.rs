@@ -73,6 +73,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         AlterAction::AlterColumnType { .. } => 1,
         AlterAction::AddColumn(_) => 2,
         AlterAction::AddConstraint(_)
+        | AlterAction::AttachIndexConstraint { .. }
         | AlterAction::AlterConstraint { .. }
         | AlterAction::ValidateConstraint(_) => 3,
         AlterAction::SetDefault { .. }
@@ -5089,9 +5090,7 @@ impl<'a> Parser<'a> {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
             if self.eat_ident("constraint")? {
                 let cname = self.col_ident("constraint name")?;
-                return Ok(AlterAction::AddConstraint(
-                    self.table_constraint(Some(cname), true)?,
-                ));
+                return self.alter_table_add_constraint(Some(cname));
             }
             if matches!(
                 self.peeked,
@@ -5100,9 +5099,7 @@ impl<'a> Parser<'a> {
                     | Tok::Ident("check")
                     | Tok::Ident("foreign")
             ) {
-                return Ok(AlterAction::AddConstraint(
-                    self.table_constraint(None, true)?,
-                ));
+                return self.alter_table_add_constraint(None);
             }
             let _ = self.eat_ident("column")?;
             let name = self.col_ident("column name")?;
@@ -5421,6 +5418,54 @@ impl<'a> Parser<'a> {
         } else {
             Err(self.unexpected("expected ADD, DROP or ALTER"))
         }
+    }
+
+    /// Parses the constraint form of ALTER TABLE ADD. An existing unique
+    /// index is a distinct input state: its columns are catalog identities,
+    /// not a second spelling to resolve later from a column list.
+    fn alter_table_add_constraint(
+        &mut self,
+        name: Option<&'a str>,
+    ) -> Result<AlterAction<'a>, ParseError> {
+        let primary = if self.eat_ident("primary")? {
+            self.expect_ident("key")?;
+            Some(true)
+        } else if self.eat_ident("unique")? {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(primary) = primary else {
+            return Ok(AlterAction::AddConstraint(
+                self.table_constraint(name, true)?,
+            ));
+        };
+        if self.eat_ident("using")? {
+            self.expect_ident("index")?;
+            let index = self.qual_name("index name")?;
+            let timing = self.constraint_timing(false)?;
+            return Ok(AlterAction::AttachIndexConstraint {
+                name,
+                index,
+                primary,
+                timing,
+            });
+        }
+        let columns = self.column_name_list()?;
+        let timing = self.constraint_timing(false)?;
+        Ok(AlterAction::AddConstraint(if primary {
+            TableConstraint::PrimaryKey {
+                name,
+                columns,
+                timing,
+            }
+        } else {
+            TableConstraint::Unique {
+                name,
+                columns,
+                timing,
+            }
+        }))
     }
 
     fn prepare(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -8226,6 +8271,47 @@ mod tests {
         with_parser(
             "ALTER TABLE t ADD CONSTRAINT positive CHECK (id > 0) NOT VALID",
             |parser| assert!(parser.next_stmt().unwrap().is_some()),
+        );
+    }
+
+    #[test]
+    fn attached_index_constraints_preserve_the_index_identity_in_the_ast() {
+        with_parser(
+            "ALTER TABLE public.items ADD CONSTRAINT items_pkey \
+             PRIMARY KEY USING INDEX public.items_id_idx; \
+             ALTER TABLE public.items ADD UNIQUE USING INDEX items_code_idx",
+            |parser| {
+                let Some(Stmt::AlterTable(first)) = parser.next_stmt().unwrap() else {
+                    panic!()
+                };
+                assert!(matches!(
+                    first.actions,
+                    [AlterAction::AttachIndexConstraint {
+                        name: Some("items_pkey"),
+                        index: QualName {
+                            schema: Some("public"),
+                            name: "items_id_idx"
+                        },
+                        primary: true,
+                        timing: ConstraintTiming::NotDeferrable,
+                    }]
+                ));
+                let Some(Stmt::AlterTable(second)) = parser.next_stmt().unwrap() else {
+                    panic!()
+                };
+                assert!(matches!(
+                    second.actions,
+                    [AlterAction::AttachIndexConstraint {
+                        name: None,
+                        index: QualName {
+                            schema: None,
+                            name: "items_code_idx"
+                        },
+                        primary: false,
+                        timing: ConstraintTiming::NotDeferrable,
+                    }]
+                ));
+            },
         );
     }
 

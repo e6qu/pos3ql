@@ -4045,6 +4045,14 @@ pub enum AlterAction<'a> {
     /// ALTER TABLE ... ADD [CONSTRAINT name] <table constraint>. Existing rows
     /// are validated against the new constraint before it is attached.
     AddConstraint(TableConstraint<'a>),
+    /// ALTER TABLE ... ADD [CONSTRAINT name] { UNIQUE | PRIMARY KEY } USING
+    /// INDEX. The index and the constraint become one durable dependency.
+    AttachIndexConstraint {
+        name: Option<&'a str>,
+        index: QualName<'a>,
+        primary: bool,
+        timing: ConstraintTiming,
+    },
     /// ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name.
     DropConstraint {
         name: &'a str,

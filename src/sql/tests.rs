@@ -16881,6 +16881,166 @@ fn not_valid_and_not_enforced_constraints_have_distinct_lifecycles() {
 }
 
 #[test]
+fn unique_and_primary_key_constraints_attach_existing_indexes_durably() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE attached_keys (id integer, code integer); \
+         CREATE UNIQUE INDEX attached_keys_id_idx ON attached_keys (id); \
+         CREATE UNIQUE INDEX attached_keys_code_idx ON attached_keys (code); \
+         ALTER TABLE attached_keys ADD CONSTRAINT attached_keys_primary \
+           PRIMARY KEY USING INDEX attached_keys_id_idx; \
+         ALTER TABLE attached_keys ADD UNIQUE USING INDEX attached_keys_code_idx",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT conname, contype, conindid = (SELECT oid FROM pg_class \
+               WHERE relname = conname) \
+             FROM pg_constraint WHERE conrelid = 'attached_keys'::regclass \
+             ORDER BY conname",
+        )),
+        [
+            "attached_keys_code_idx|u|t",
+            "attached_keys_id_not_null|n|NULL",
+            "attached_keys_primary|p|t",
+        ]
+    );
+    let duplicate = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO attached_keys VALUES (1, 1); \
+         INSERT INTO attached_keys VALUES (1, 2)",
+    );
+    assert!(duplicate.contains("23505"), "{duplicate}");
+    let index_drop = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "DROP INDEX attached_keys_primary",
+    );
+    assert!(index_drop.contains("2BP01"), "{index_drop}");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER INDEX attached_keys_primary RENAME TO attached_keys_pkey; \
+         ALTER TABLE attached_keys DROP CONSTRAINT attached_keys_pkey",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT relname FROM pg_class WHERE relname IN \
+               ('attached_keys_primary', 'attached_keys_pkey')",
+        )),
+        Vec::<String>::new()
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE attached_key_savepoint (id integer); \
+         CREATE UNIQUE INDEX attached_key_savepoint_idx ON attached_key_savepoint (id); \
+         BEGIN; SAVEPOINT attached; \
+         ALTER TABLE attached_key_savepoint ADD CONSTRAINT attached_key_savepoint_pkey \
+           PRIMARY KEY USING INDEX attached_key_savepoint_idx; \
+         ROLLBACK TO attached; COMMIT",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT count(*) FROM pg_constraint \
+             WHERE conrelid = 'attached_key_savepoint'::regclass",
+        )),
+        ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT relname FROM pg_class WHERE relname = 'attached_key_savepoint_idx'",
+        )),
+        ["attached_key_savepoint_idx"]
+    );
+}
+
+#[test]
+fn index_constraint_attachment_rejects_incompatible_indexes_without_catalog_state() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE rejected_attachment (id integer, value integer); \
+         CREATE INDEX rejected_attachment_plain ON rejected_attachment (id); \
+         CREATE UNIQUE INDEX rejected_attachment_partial \
+           ON rejected_attachment (value) WHERE value > 0",
+    );
+    let ordinary = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE rejected_attachment ADD CONSTRAINT rejected_attachment_plain_key \
+           UNIQUE USING INDEX rejected_attachment_plain",
+    );
+    assert!(ordinary.contains("42809"), "{ordinary}");
+    let partial = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE rejected_attachment ADD CONSTRAINT rejected_attachment_partial_key \
+           UNIQUE USING INDEX rejected_attachment_partial",
+    );
+    assert!(partial.contains("0A000"), "{partial}");
+    let deferred = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE UNIQUE INDEX rejected_attachment_deferred ON rejected_attachment (id); \
+         ALTER TABLE rejected_attachment ADD CONSTRAINT rejected_attachment_deferred_key \
+           UNIQUE USING INDEX rejected_attachment_deferred DEFERRABLE",
+    );
+    assert!(deferred.contains("0A000"), "{deferred}");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT count(*) FROM pg_constraint \
+             WHERE conrelid = 'rejected_attachment'::regclass",
+        )),
+        ["0"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE index_rename_source (id integer); \
+         CREATE UNIQUE INDEX index_rename_source_idx ON index_rename_source (id); \
+         CREATE TABLE index_rename_taken (id integer)",
+    );
+    let collision = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER INDEX index_rename_source_idx RENAME TO index_rename_taken",
+    );
+    assert!(collision.contains("42P07"), "{collision}");
+}
+
+#[test]
 fn exclusion_constraints_enforce_predicates_and_transaction_modes() {
     let (mut engine, mut budget) = test_engine();
     let mut txn = TxnState::new(&mut budget, 256).unwrap();
@@ -17273,7 +17433,12 @@ fn constraint_lifecycle_survives_cold_object_store_recovery() {
            CONSTRAINT durable_drop_key UNIQUE (id)); \
          CREATE TABLE durable_drop_child (parent_id integer \
            REFERENCES durable_drop_parent(id)); \
-         ALTER TABLE durable_drop_parent DROP CONSTRAINT durable_drop_key CASCADE",
+         ALTER TABLE durable_drop_parent DROP CONSTRAINT durable_drop_key CASCADE; \
+         CREATE TABLE durable_attached_key (id integer); \
+         CREATE UNIQUE INDEX durable_attached_key_idx ON durable_attached_key (id); \
+         ALTER TABLE durable_attached_key ADD CONSTRAINT durable_attached_key_pkey \
+           PRIMARY KEY USING INDEX durable_attached_key_idx; \
+         ALTER INDEX durable_attached_key_pkey RENAME TO durable_attached_key_primary",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -17310,6 +17475,20 @@ fn constraint_lifecycle_survives_cold_object_store_recovery() {
               WHERE conrelid = 'durable_drop_child'::regclass AND contype = 'f'",
         )),
         ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT conname, contype, conindid = (SELECT oid FROM pg_class \
+               WHERE relname = conname) \
+             FROM pg_constraint \
+             WHERE conrelid = 'durable_attached_key'::regclass",
+        )),
+        [
+            "durable_attached_key_primary|p|t",
+            "durable_attached_key_id_not_null|n|NULL",
+        ]
     );
     let mut txn = TxnState::new(&mut recovered_budget, 256).unwrap();
 

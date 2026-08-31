@@ -38097,28 +38097,9 @@ pub fn alter_index(
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
-            let prior = match storage.rename_index(slot, new_name, txn.txid) {
-                Ok(prior) => prior,
-                Err(error) => return sql_fail(error),
-            };
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::RenameIndex {
-                    schema: schema.as_str(),
-                    name: name.name,
-                    new_name: new_name.as_str(),
-                },
-            ) {
-                storage.rollback_index_rename(slot, prior);
-                return sql_fail(error);
-            }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::IndexRenamed {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_index_rename(slot, prior);
+            if let Err(error) =
+                rename_attached_index_constraint(storage, wal, txn, table, slot, new_name)
+            {
                 return sql_fail(error);
             }
         }
@@ -39279,6 +39260,45 @@ fn stage_index_drop(
     Ok(())
 }
 
+fn stage_index_rename(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    new_name: SqlName,
+) -> Result<(), SqlError> {
+    let index = storage
+        .index_visible_to(slot, txn.txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
+    let schema = index.schema;
+    let old_name = index.name_for(txn.txid);
+    if old_name == new_name {
+        return Ok(());
+    }
+    let prior = storage.rename_index(slot, new_name, txn.txid)?;
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::RenameIndex {
+            schema: schema.as_str(),
+            name: old_name.as_str(),
+            new_name: new_name.as_str(),
+        },
+    ) {
+        storage.rollback_index_rename(slot, prior);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::IndexRenamed {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_index_rename(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub struct DropIndexCommand<'a> {
     pub names: &'a [QualName<'a>],
     pub if_exists: bool,
@@ -39363,6 +39383,20 @@ pub fn drop_index(
                 return sql_fail(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                     "cannot drop index \"{}\" because it is used as replica identity",
+                    name.name
+                ));
+            }
+            if let Some(table) = storage.index_table_slot_to(slot, txn.txid)
+                && attached_constraint_index(
+                    storage,
+                    storage.table_def(table, txn.txid),
+                    definition.name_for(txn.txid).as_str(),
+                    txn.txid,
+                ) == Some(slot)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop index \"{}\" because constraint requires it",
                     name.name
                 ));
             }
@@ -48690,6 +48724,225 @@ fn named_key_columns(
     None
 }
 
+/// An attached key constraint and its btree relation share the constraint
+/// name and exact key positions. This is the durable dependency proof: it
+/// survives WAL and checkpoint replay without a parallel mutable flag.
+fn attached_constraint_index(
+    storage: &Storage,
+    definition: &TableDef,
+    name: &str,
+    txid: u32,
+) -> Option<usize> {
+    let (columns, n_columns) = named_key_columns(definition, name)?;
+    let slot = storage.index_slot(definition.schema.as_str(), name, txid)?;
+    let index = storage.index_visible_to(slot, txid)?;
+    (storage
+        .index_table_slot_to(slot, txid)
+        .is_some_and(|table| {
+            let owner = storage.table_def(table, txid);
+            owner.schema == definition.schema && owner.name == definition.name
+        })
+        && index.n_cols == n_columns
+        && index.columns[..n_columns] == columns[..n_columns]
+        && index.expressions[..n_columns].iter().all(Option::is_none))
+    .then_some(slot)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_constraint_using_index(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table_index: usize,
+    definition: &TableDef,
+    new_definition: &mut TableDef,
+    name: Option<&str>,
+    index_name: crate::sql::ast::QualName<'_>,
+    primary: bool,
+    timing: crate::sql::ast::ConstraintTiming,
+) -> Result<(), SqlError> {
+    if timing.is_deferrable() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "attaching a deferrable constraint to an existing index is not supported"
+        ));
+    }
+    let schema = index_name.schema.unwrap_or(definition.schema.as_str());
+    let slot = storage
+        .index_slot(schema, index_name.name, txn.txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "index \"{}\" does not exist",
+                index_name.name
+            )
+        })?;
+    let index = storage.index_visible_to(slot, txn.txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "index \"{}\" does not exist",
+            index_name.name
+        )
+    })?;
+    if storage.index_table_slot_to(slot, txn.txid) != Some(table_index) {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "index \"{}\" is not an index for table \"{}\"",
+            index.name_for(txn.txid).as_str(),
+            definition.name.as_str()
+        ));
+    }
+    if !index.unique {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "index \"{}\" is not unique",
+            index.name_for(txn.txid).as_str()
+        ));
+    }
+    if index.predicate.is_some()
+        || index.expressions[..index.n_cols]
+            .iter()
+            .any(Option::is_some)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot attach partial or expression index \"{}\" as a constraint",
+            index.name_for(txn.txid).as_str()
+        ));
+    }
+    if !matches!(
+        index.mutable_for(txn.txid).kind,
+        crate::storage::IndexKind::Ordinary
+    ) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot attach partitioned index \"{}\" as a constraint",
+            index.name_for(txn.txid).as_str()
+        ));
+    }
+    if index.nulls_not_distinct
+        || index.descending[..index.n_cols]
+            .iter()
+            .any(|descending| *descending)
+        || index.nulls_first[..index.n_cols]
+            .iter()
+            .any(|nulls_first| *nulls_first)
+        || index.explicit_collations[..index.n_cols]
+            .iter()
+            .any(|explicit| *explicit)
+        || index.operator_classes[..index.n_cols]
+            .iter()
+            .any(Option::is_some)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "index \"{}\" has key semantics that cannot become a table constraint",
+            index.name_for(txn.txid).as_str()
+        ));
+    }
+    let constraint_name = match name {
+        Some(name) => SqlName::parse(name)?,
+        None => index.name_for(txn.txid),
+    };
+    if crate::sql::exec::ddl::constraint_name_taken(new_definition, constraint_name.as_str()) {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "constraint \"{}\" for relation \"{}\" already exists",
+            constraint_name.as_str(),
+            definition.name.as_str()
+        ));
+    }
+    if primary {
+        if new_definition.columns().iter().any(|column| column.primary)
+            || new_definition.uniques().iter().any(|key| key.is_primary)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                "multiple primary keys for table \"{}\" are not allowed",
+                definition.name.as_str()
+            ));
+        }
+        for &column in &index.columns[..index.n_cols] {
+            new_definition.columns[column as usize].not_null =
+                new_definition.columns[column as usize].not_null.add_local();
+        }
+    }
+    crate::sql::exec::ddl::add_unique_key(
+        new_definition,
+        Some(constraint_name.as_str()),
+        if primary { "pkey" } else { "key" },
+        &index.columns,
+        index.n_cols,
+        primary,
+        timing,
+    )?;
+    stage_index_rename(storage, wal, txn, slot, constraint_name)
+}
+
+fn rename_attached_index_constraint(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table_index: usize,
+    index_slot: usize,
+    new_name: SqlName,
+) -> Result<(), SqlError> {
+    let current = *storage.table_def(table_index, txn.txid);
+    let index = storage
+        .index_visible_to(index_slot, txn.txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
+    let old_name = index.name_for(txn.txid);
+    if attached_constraint_index(storage, &current, old_name.as_str(), txn.txid) != Some(index_slot)
+    {
+        return stage_index_rename(storage, wal, txn, index_slot, new_name);
+    }
+    if old_name == new_name {
+        return Ok(());
+    }
+    if crate::sql::exec::ddl::constraint_name_taken(&current, new_name.as_str()) {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "constraint \"{}\" for relation \"{}\" already exists",
+            new_name.as_str(),
+            current.name.as_str()
+        ));
+    }
+    let mut altered = current;
+    if !rename_stored_constraint(&mut altered, old_name.as_str(), new_name) {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "attached index \"{}\" has no matching constraint",
+            old_name.as_str()
+        ));
+    }
+    stage_index_rename(storage, wal, txn, index_slot, new_name)?;
+    let mut mapping = [None; MAX_COLUMNS];
+    let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+    for column in 0..current.n_columns {
+        mapping[column] = Some(current.columns()[column].name);
+        wal_mapping[column] = column as u16;
+    }
+    let lsn = storage.bump_lsn();
+    wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::BeginTableRewrite {
+            previous_schema: current.schema.as_str(),
+            previous_name: current.name.as_str(),
+            preserve_rows: true,
+            column_mapping: wal_mapping,
+        },
+    )?;
+    let lsn = storage.bump_lsn();
+    wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered))?;
+    storage.write_table_def(table_index, txn.txid, altered, &mapping, false)?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
+        storage.rollback_table_def(table_index, txn.txid);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn drop_dependent_foreign_keys(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -51155,6 +51408,28 @@ fn alter_table_inner(
                 }
                 validate_definition = true;
             }
+            AlterAction::AttachIndexConstraint {
+                name,
+                index,
+                primary,
+                timing,
+            } => {
+                if let Err(error) = attach_constraint_using_index(
+                    storage,
+                    wal,
+                    txn,
+                    table_index,
+                    &def,
+                    &mut new_def,
+                    *name,
+                    *index,
+                    *primary,
+                    *timing,
+                ) {
+                    return sql_fail(error);
+                }
+                validate_definition = true;
+            }
             AlterAction::AlterConstraint { name, alteration } => {
                 if let Some(index) = new_def.fkeys[..new_def.n_fkeys]
                     .iter()
@@ -51296,6 +51571,7 @@ fn alter_table_inner(
                 if_exists,
                 cascade,
             } => {
+                let attached_index = attached_constraint_index(storage, &new_def, name, txn.txid);
                 if named_key_columns(&new_def, name).is_some()
                     && let Err(error) = drop_dependent_foreign_keys(
                         storage,
@@ -51315,6 +51591,11 @@ fn alter_table_inner(
                         Err(error) => return sql_fail(error),
                     };
                     if let Err(error) = txn.drop_constraint(table_index as u32, name) {
+                        return sql_fail(error);
+                    }
+                    if let Some(slot) = attached_index
+                        && let Err(error) = stage_index_drop(storage, wal, txn, slot)
+                    {
                         return sql_fail(error);
                     }
                 } else {
@@ -51340,6 +51621,7 @@ fn alter_table_inner(
                 }
             }
             AlterAction::RenameConstraint { from, to } => {
+                let attached_index = attached_constraint_index(storage, &new_def, from, txn.txid);
                 // The new name must be free among this table's constraints.
                 let taken = new_def.checks[..new_def.n_checks]
                     .iter()
@@ -51387,6 +51669,11 @@ fn alter_table_inner(
                     Err(error) => return sql_fail(error),
                 };
                 if let Err(error) = txn.rename_constraint(table_index as u32, old_name, new_name) {
+                    return sql_fail(error);
+                }
+                if let Some(slot) = attached_index
+                    && let Err(error) = stage_index_rename(storage, wal, txn, slot, new_name)
+                {
                     return sql_fail(error);
                 }
             }

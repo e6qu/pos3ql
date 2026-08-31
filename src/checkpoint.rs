@@ -6921,13 +6921,14 @@ impl Checkpointer {
         // loop; this line records only the defining query.
         for (matview_slot, mv) in storage.checkpoint_matviews() {
             write_database_context(&mut self.manifest_buf, &mut database_context, mv.database)?;
+            let backing = storage.table_def(storage.matview_table(matview_slot), 0);
             use core::fmt::Write;
             let mut hex = StackStr::<{ 2 * crate::storage::VIEW_SQL_MAX }>::new();
             for b in mv.sql.as_str().as_bytes() {
                 let _ = write!(hex, "{b:02x}");
             }
             let mut hschema = StackStr::<130>::new();
-            for b in mv.schema.as_str().as_bytes() {
+            for b in backing.schema.as_str().as_bytes() {
                 let _ = write!(hschema, "{b:02x}");
             }
             let mut hpath = StackStr::<260>::new();
@@ -6935,7 +6936,7 @@ impl Checkpointer {
                 let _ = write!(hpath, "{b:02x}");
             }
             let mut hname = StackStr::<130>::new();
-            for b in mv.name.as_str().as_bytes() {
+            for b in backing.name.as_str().as_bytes() {
                 let _ = write!(hname, "{b:02x}");
             }
             write_manifest(
@@ -10634,10 +10635,15 @@ fn load_matview(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
     let _ = write!(buffer, "{sql}");
     let mut path_buffer = StackStr::<128>::new();
     let _ = write!(path_buffer, "{path}");
+    let backing_table =
+        storage
+            .find_visible(&schema, &name, 0)
+            .ok_or(CheckpointSetupError::Corrupt(
+                "materialized-view backing relation",
+            ))?;
     let slot = storage
         .create_matview(
-            sql_name(&schema)?,
-            sql_name(&name)?,
+            backing_table,
             crate::storage::StoredQueryDefinition {
                 sql: buffer,
                 creation_path: path_buffer,

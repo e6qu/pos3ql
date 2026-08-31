@@ -26094,6 +26094,204 @@ fn matview_survives_restart() {
 }
 
 #[test]
+fn alter_materialized_view_identity_owner_comments_and_recovery() {
+    let config = test_config("alter-materialized-view-lifecycle");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA materialized_target;
+         CREATE TABLE materialized_source (value integer);
+         INSERT INTO materialized_source VALUES (7);
+         CREATE MATERIALIZED VIEW materialized_old AS SELECT value FROM materialized_source;
+         COMMENT ON MATERIALIZED VIEW materialized_old IS 'durable materialized view';
+         CREATE ROLE materialized_owner;",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let tablespace = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLESPACE materialized_space LOCATION '/object/materialized-space'",
+    );
+    assert!(
+        !message_types(&tablespace).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&tablespace)
+    );
+    let old_oid = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT oid FROM pg_class WHERE relname = 'materialized_old'",
+    ))[0]
+        .to_owned();
+    let rollback = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER MATERIALIZED VIEW materialized_old RENAME TO materialized_new;
+         SELECT value FROM materialized_new;
+         SELECT obj_description('materialized_new'::regclass);
+         SELECT relname FROM pg_class WHERE relname = 'materialized_new';
+         ROLLBACK;",
+    );
+    assert_eq!(
+        data_rows(&rollback),
+        ["7", "durable materialized view", "materialized_new"],
+        "{}",
+        String::from_utf8_lossy(&rollback)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM materialized_old",
+        )),
+        ["7"]
+    );
+    let collision = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE materialized_taken (value integer);
+         ALTER MATERIALIZED VIEW materialized_old RENAME TO materialized_taken",
+    );
+    assert!(
+        String::from_utf8_lossy(&collision).contains("42P07"),
+        "{}",
+        String::from_utf8_lossy(&collision)
+    );
+    let altered = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER MATERIALIZED VIEW materialized_old SET SCHEMA materialized_target;
+         ALTER MATERIALIZED VIEW materialized_target.materialized_old RENAME TO materialized_new;
+         ALTER MATERIALIZED VIEW materialized_target.materialized_new SET TABLESPACE materialized_space;
+         ALTER MATERIALIZED VIEW materialized_target.materialized_new OWNER TO materialized_owner;
+         GRANT USAGE ON SCHEMA materialized_target TO materialized_owner;
+         GRANT SELECT ON materialized_source TO materialized_owner;
+         SELECT oid, relname, relkind FROM pg_class WHERE relname = 'materialized_new';
+         SELECT schemaname, matviewname, matviewowner, ispopulated
+           FROM pg_matviews WHERE matviewname = 'materialized_new';
+         SELECT tablespace, hasindexes FROM pg_matviews
+           WHERE schemaname = 'materialized_target' AND matviewname = 'materialized_new';
+         SELECT obj_description('materialized_target.materialized_new'::regclass);
+         SET ROLE materialized_owner;
+         SELECT value FROM materialized_target.materialized_new;
+         REFRESH MATERIALIZED VIEW materialized_target.materialized_new;
+         RESET ROLE;",
+    );
+    let rows = data_rows(&altered);
+    assert!(
+        !message_types(&altered).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&altered)
+    );
+    assert_eq!(rows.len(), 5, "{}", String::from_utf8_lossy(&altered));
+    assert_eq!(rows[0], format!("{old_oid}|materialized_new|m"));
+    assert_eq!(
+        rows[1],
+        "materialized_target|materialized_new|materialized_owner|t"
+    );
+    assert_eq!(rows[2], "materialized_space|f");
+    assert_eq!(rows[3], "durable materialized view");
+    assert_eq!(rows[4], "7");
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_values = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT value FROM materialized_target.materialized_new",
+    );
+    assert_eq!(
+        data_rows(&recovered_values),
+        ["7"],
+        "{}",
+        String::from_utf8_lossy(&recovered_values)
+    );
+    let recovered_catalog = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT schemaname, matviewname, matviewowner FROM pg_matviews
+           WHERE matviewname = 'materialized_new'",
+    );
+    assert_eq!(
+        data_rows(&recovered_catalog),
+        ["materialized_target|materialized_new|materialized_owner"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT tablespace, hasindexes FROM pg_matviews
+               WHERE schemaname = 'materialized_target' AND matviewname = 'materialized_new'",
+        )),
+        ["materialized_space|f"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT count(*) FROM pg_tables WHERE tablename = 'materialized_new'",
+        )),
+        ["0"]
+    );
+    let recovered_relation = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT relname, relkind FROM pg_class WHERE relname LIKE 'materialized%' ORDER BY relname",
+    );
+    assert_eq!(
+        data_rows(&recovered_relation),
+        ["materialized_new|m", "materialized_source|r"],
+        "{}",
+        String::from_utf8_lossy(&recovered_relation)
+    );
+    let recovered_comment = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT obj_description('materialized_target.materialized_new'::regclass)",
+    );
+    assert_eq!(
+        data_rows(&recovered_comment),
+        ["durable materialized view"],
+        "{}",
+        String::from_utf8_lossy(&recovered_comment)
+    );
+    let dropped = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "DROP MATERIALIZED VIEW materialized_target.materialized_new;
+         SELECT count(*) FROM pg_matviews WHERE matviewname = 'materialized_new'",
+    );
+    assert_eq!(
+        data_rows(&dropped),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    recovered.commit_wal().unwrap();
+    drop(recovered);
+
+    let mut final_budget = Budget::new(1 << 29);
+    let mut final_engine = Engine::new(&config, &mut final_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut final_engine,
+            &mut final_budget,
+            "SELECT count(*) FROM pg_matviews WHERE matviewname = 'materialized_new'",
+        )),
+        ["0"]
+    );
+}
+
+#[test]
 fn sequence_basics() {
     let (mut e, mut b) = test_engine();
     // A persistent session GucState so currval/lastval survive across statements.

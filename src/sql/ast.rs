@@ -107,6 +107,15 @@ pub enum AlterViewAction<'a> {
     ResetOptions(&'a [ViewOptionName]),
 }
 
+/// `ALTER MATERIALIZED VIEW` deliberately exposes only operations whose
+/// backing-relation effects have one durable implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterMaterializedViewAction<'a> {
+    RenameTo(&'a str),
+    SetSchema(&'a str),
+    SetTablespace(&'a str),
+}
+
 /// One explicitly named relation in a publication.  An empty `columns` slice
 /// means the PostgreSQL default: publish every column.  Keeping the selected
 /// names beside their relation prevents later execution from losing a column
@@ -450,6 +459,11 @@ pub enum Stmt<'a> {
         name: QualName<'a>,
         if_exists: bool,
         action: AlterViewAction<'a>,
+    },
+    AlterMaterializedView {
+        name: QualName<'a>,
+        if_exists: bool,
+        action: AlterMaterializedViewAction<'a>,
     },
     /// A rewrite rule is parsed into its closed event/mode states and complete
     /// action statements. Source slices are retained for durable catalog text.

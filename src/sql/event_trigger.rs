@@ -963,21 +963,11 @@ fn comment_reference(
                         .columns()
                         .get(subid as usize - 1)
                         .map(|column| column.name),
-                    ObjectRef::MaterializedView(view_slot) => {
-                        let view = storage.matview(view_slot);
-                        (0..storage.table_count())
-                            .find(|table_slot| {
-                                let table = storage.table_def(*table_slot, txid);
-                                table.schema == view.schema && table.name == view.name
-                            })
-                            .and_then(|table_slot| {
-                                storage
-                                    .table_def(table_slot, txid)
-                                    .columns()
-                                    .get(subid as usize - 1)
-                                    .map(|column| column.name)
-                            })
-                    }
+                    ObjectRef::MaterializedView(view_slot) => storage
+                        .table_def(storage.matview_table(view_slot), txid)
+                        .columns()
+                        .get(subid as usize - 1)
+                        .map(|column| column.name),
                     ObjectRef::View(_) => match statement {
                         Stmt::Comment {
                             target: crate::sql::ast::CommentTarget::Column { column, .. },
@@ -1016,18 +1006,9 @@ fn comment_reference(
                         ObjectRef::Table(slot) => EventObjectRef::TableRowType(
                             u16::try_from(slot).map_err(|_| graph_full())?,
                         ),
-                        ObjectRef::MaterializedView(slot) => {
-                            let view = storage.matview(slot);
-                            let backing = (0..storage.table_count())
-                                .find(|table_slot| {
-                                    let table = storage.table_def(*table_slot, txid);
-                                    table.schema == view.schema && table.name == view.name
-                                })
-                                .ok_or_else(graph_full)?;
-                            EventObjectRef::TableRowType(
-                                u16::try_from(backing).map_err(|_| graph_full())?,
-                            )
-                        }
+                        ObjectRef::MaterializedView(slot) => EventObjectRef::TableRowType(
+                            u16::try_from(storage.matview_table(slot)).map_err(|_| graph_full())?,
+                        ),
                         ObjectRef::View(slot) => EventObjectRef::ViewRowType(
                             u16::try_from(slot).map_err(|_| graph_full())?,
                         ),
@@ -1557,20 +1538,15 @@ fn primary_object(
             )
         }
         ObjectRef::MaterializedView(slot) => {
-            let view = storage.matview(slot);
-            let table_slot = (0..storage.table_count())
-                .find(|candidate| {
-                    let table = &storage.table(*candidate).def;
-                    table.schema == view.schema && table.name == view.name
-                })
-                .ok_or_else(graph_full)?;
+            let table_slot = storage.matview_table(slot);
+            let table = storage.table_def(table_slot, txid);
             base_object(
                 catalog::PG_CLASS_OID,
                 catalog::user_table_oid(table_slot),
                 "materialized view",
-                Some(view.schema.as_str()),
-                Some(view.name.as_str()),
-                qualified(view.schema.as_str(), view.name.as_str())?,
+                Some(table.schema.as_str()),
+                Some(table.name.as_str()),
+                qualified(table.schema.as_str(), table.name.as_str())?,
                 false,
             )
         }
@@ -2906,14 +2882,7 @@ fn push_drop_dependents(
     match reference {
         ObjectRef::Table(slot) => push_table_drop_dependents(storage, txid, slot, output, count),
         ObjectRef::MaterializedView(slot) => {
-            let view = storage.matview(slot);
-            let table_slot = (0..storage.table_count())
-                .find(|candidate| {
-                    let table = &storage.table(*candidate).def;
-                    table.schema == view.schema && table.name == view.name
-                })
-                .ok_or_else(graph_full)?;
-            push_table_drop_dependents(storage, txid, table_slot, output, count)
+            push_table_drop_dependents(storage, txid, storage.matview_table(slot), output, count)
         }
         ObjectRef::View(slot) => {
             push_view_drop_dependents(storage, slot, parent_is_normal, output, count)

@@ -347,6 +347,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Truncate { .. }
         | Stmt::CreateView { .. }
         | Stmt::AlterView { .. }
+        | Stmt::AlterMaterializedView { .. }
         | Stmt::CreateRule(_)
         | Stmt::AlterRule { .. }
         | Stmt::DropRule(_)
@@ -704,6 +705,7 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::AlterTable(_) => "ALTER TABLE",
         Stmt::CreateView { .. } => "CREATE VIEW",
         Stmt::AlterView { .. } => "ALTER VIEW",
+        Stmt::AlterMaterializedView { .. } => "ALTER MATERIALIZED VIEW",
         Stmt::DropView { .. } => "DROP VIEW",
         Stmt::CreateRule(_) => "CREATE RULE",
         Stmt::AlterRule { .. } => "ALTER RULE",
@@ -11549,6 +11551,22 @@ impl Engine {
                 *action,
                 responder,
             ),
+            Stmt::AlterMaterializedView {
+                name,
+                if_exists,
+                action,
+            } => exec::alter_materialized_view(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                &mut self.dml_scratch,
+                *name,
+                *if_exists,
+                *action,
+                arena,
+                guc.seq_session(),
+                responder,
+            ),
             Stmt::CreateRule(rule) => exec::create_rule(
                 &mut self.storage,
                 &mut self.wal,
@@ -17272,9 +17290,16 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             let _ = write!(creation_path, "{path}");
             let dependencies =
                 storage.rebind_stored_query_dependencies(dependencies.materialize()?, 0)?;
+            let backing_table = storage.find_visible(schema, name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "journal materialized view backing relation \"{}.{}\" does not exist",
+                    schema,
+                    name
+                )
+            })?;
             let slot = storage.create_matview(
-                crate::storage::SqlName::parse(schema)?,
-                crate::storage::SqlName::parse(name)?,
+                backing_table,
                 crate::storage::StoredQueryDefinition {
                     sql: buffer,
                     creation_path,

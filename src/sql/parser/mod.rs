@@ -4477,28 +4477,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
-            let if_exists = if self.eat_ident("if")? {
-                self.expect_ident("exists")?;
-                true
-            } else {
-                false
-            };
-            let name = self.qual_name("materialized view name")?;
-            if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
-                if if_exists {
-                    return Err(self.err_here("IF EXISTS is not allowed with DEPENDS ON EXTENSION"));
-                }
-                let enabled = !self.eat_ident("no")?;
-                self.expect_ident("depends")?;
-                self.expect_ident("on")?;
-                self.expect_ident("extension")?;
-                return Ok(Stmt::AlterMaterializedViewExtensionDependency {
-                    name,
-                    extension: self.col_ident("extension name")?,
-                    enabled,
-                });
-            }
-            return self.alter_owner(AlterOwnerKind::MaterializedView, name, if_exists);
+            return self.alter_materialized_view();
         }
         if self.eat_ident("view")? {
             return self.alter_view();
@@ -4576,6 +4555,56 @@ impl<'a> Parser<'a> {
             crate::sql::ast::AlterViewAction::ResetOptions(self.view_option_names()?)
         };
         Ok(Stmt::AlterView {
+            name,
+            if_exists,
+            action,
+        })
+    }
+
+    fn alter_materialized_view(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let if_exists = if self.eat_ident("if")? {
+            self.expect_ident("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.qual_name("materialized view name")?;
+        if self.peeked == Tok::Ident("depends") || self.peeked == Tok::Ident("no") {
+            if if_exists {
+                return Err(self.err_here("IF EXISTS is not allowed with DEPENDS ON EXTENSION"));
+            }
+            let enabled = !self.eat_ident("no")?;
+            self.expect_ident("depends")?;
+            self.expect_ident("on")?;
+            self.expect_ident("extension")?;
+            return Ok(Stmt::AlterMaterializedViewExtensionDependency {
+                name,
+                extension: self.col_ident("extension name")?,
+                enabled,
+            });
+        }
+        if self.peeked == Tok::Ident("owner") {
+            return self.alter_owner(AlterOwnerKind::MaterializedView, name, if_exists);
+        }
+        let action = if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            crate::sql::ast::AlterMaterializedViewAction::RenameTo(
+                self.col_ident("new materialized view name")?,
+            )
+        } else {
+            self.expect_ident("set")?;
+            if self.eat_ident("schema")? {
+                crate::sql::ast::AlterMaterializedViewAction::SetSchema(
+                    self.col_ident("schema name")?,
+                )
+            } else {
+                self.expect_ident("tablespace")?;
+                crate::sql::ast::AlterMaterializedViewAction::SetTablespace(
+                    self.col_ident("tablespace name")?,
+                )
+            }
+        };
+        Ok(Stmt::AlterMaterializedView {
             name,
             if_exists,
             action,
@@ -7609,6 +7638,57 @@ mod tests {
                 crate::sql::ast::AlterTypeAction::SetSchema("archive")
             );
         });
+    }
+
+    #[test]
+    fn alter_materialized_view_lifecycle_is_typed_without_runtime_allocation() {
+        with_parser(
+            "ALTER MATERIALIZED VIEW IF EXISTS public.snapshot RENAME TO archive; \
+             ALTER MATERIALIZED VIEW public.archive SET SCHEMA reporting; \
+             ALTER MATERIALIZED VIEW reporting.archive SET TABLESPACE cold_store",
+            |parser| {
+                let Some(Stmt::AlterMaterializedView {
+                    name,
+                    if_exists,
+                    action,
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER MATERIALIZED VIEW RENAME did not parse")
+                };
+                assert_eq!(
+                    name,
+                    QualName {
+                        schema: Some("public"),
+                        name: "snapshot"
+                    }
+                );
+                assert!(if_exists);
+                assert_eq!(
+                    action,
+                    crate::sql::ast::AlterMaterializedViewAction::RenameTo("archive")
+                );
+                let Some(Stmt::AlterMaterializedView { action, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER MATERIALIZED VIEW SET SCHEMA did not parse")
+                };
+                assert_eq!(
+                    action,
+                    crate::sql::ast::AlterMaterializedViewAction::SetSchema("reporting")
+                );
+                let Some(Stmt::AlterMaterializedView { action, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER MATERIALIZED VIEW SET TABLESPACE did not parse")
+                };
+                assert_eq!(
+                    action,
+                    crate::sql::ast::AlterMaterializedViewAction::SetTablespace("cold_store")
+                );
+            },
+        );
+        with_parser(
+            "ALTER MATERIALIZED VIEW snapshot SET (fillfactor = 90)",
+            |parser| assert!(parser.next_stmt().is_err()),
+        );
     }
 
     #[test]

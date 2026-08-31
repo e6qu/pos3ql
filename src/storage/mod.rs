@@ -4504,8 +4504,9 @@ impl PublicationDef {
 pub struct MatviewDef {
     pub(crate) database: DatabaseOid,
     pub created_at: u64,
-    pub schema: SqlName,
-    pub name: SqlName,
+    /// The physical relation that owns the materialized rows and the sole
+    /// source of this catalog object's relation identity.
+    pub(crate) backing_table: u16,
     pub sql: StackStr<VIEW_SQL_MAX>,
     pub creation_path: StackStr<128>,
     pub ownership: Ownership,
@@ -11333,8 +11334,7 @@ impl Storage {
                 .push(MatviewDef {
                     database: DatabaseOid::POSTGRES,
                     created_at: 0,
-                    schema: SqlName::parse("").expect("empty name fits"),
-                    name: SqlName::parse("").expect("empty name fits"),
+                    backing_table: u16::MAX,
                     sql: StackStr::new(),
                     creation_path: StackStr::new(),
                     ownership: Ownership::BOOTSTRAP,
@@ -14338,15 +14338,8 @@ impl Storage {
             }
             AccessClass::MaterializedView => {
                 let definition = &self.matviews[slot];
-                let backing = self.tables.iter().position(|table| {
-                    table.database == definition.database
-                        && table.def.schema == definition.schema
-                        && table.def.name == definition.name
-                });
-                backing.map_or((definition.schema, definition.name), |table| {
-                    let table = self.table_def(table, txid);
-                    (table.schema, table.name)
-                })
+                let table = self.table_def(usize::from(definition.backing_table), txid);
+                (table.schema, table.name)
             }
             AccessClass::Sequence => {
                 let definition = self.sequence_for(slot, txid);
@@ -23612,8 +23605,11 @@ impl Storage {
         self.matviews.iter().find(|m| {
             m.database == self.current_database
                 && m.visible_to(txid)
-                && m.schema.as_str() == schema
-                && m.name.as_str() == name
+                && self.table_slot_visible_to(usize::from(m.backing_table), txid)
+                && {
+                    let table = self.table_def(usize::from(m.backing_table), txid);
+                    table.schema.as_str() == schema && table.name.as_str() == name
+                }
         })
     }
 
@@ -23623,8 +23619,23 @@ impl Storage {
         self.matviews.iter().position(|m| {
             m.database == self.current_database
                 && m.visible_to(txid)
-                && m.schema.as_str() == schema
-                && m.name.as_str() == name
+                && self.table_slot_visible_to(usize::from(m.backing_table), txid)
+                && {
+                    let table = self.table_def(usize::from(m.backing_table), txid);
+                    table.schema.as_str() == schema && table.name.as_str() == name
+                }
+        })
+    }
+
+    pub(crate) fn matview_table(&self, slot: usize) -> usize {
+        usize::from(self.matviews[slot].backing_table)
+    }
+
+    pub(crate) fn matview_slot_for_table(&self, table: usize, txid: u32) -> Option<usize> {
+        self.matviews.iter().position(|matview| {
+            matview.database == self.current_database
+                && matview.visible_to(txid)
+                && usize::from(matview.backing_table) == table
         })
     }
 
@@ -23637,21 +23648,26 @@ impl Storage {
     /// table's own creation, so no `find_table`/`or_replace` handling is needed.
     pub fn create_matview(
         &mut self,
-        schema: SqlName,
-        name: SqlName,
+        backing_table: usize,
         query: StoredQueryDefinition,
         populated: bool,
         txid: u32,
     ) -> Result<usize, SqlError> {
-        self.require_schema_create(schema.as_str(), txid)?;
+        let definition = *self.table_def(backing_table, txid);
+        if !self.table_slot_visible_to(backing_table, txid) {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_TABLE,
+                "materialized view backing relation does not exist"
+            ));
+        }
         if let Some(blocker) = self.matviews.iter().find_map(|m| {
             (m.database == self.current_database
-                && m.schema.as_str() == schema.as_str()
-                && m.name.as_str() == name.as_str())
-            .then_some(m.ddl_state.pending_txid()?)
-            .filter(|&owner| owner != txid)
+                && m.ddl_state != CatalogDdlState::Absent
+                && m.backing_table == backing_table as u16)
+                .then_some(m.ddl_state.pending_txid()?)
+                .filter(|&owner| owner != txid)
         }) {
-            return Err(self.catalog_ddl_wait_error(txid, blocker, name.as_str()));
+            return Err(self.catalog_ddl_wait_error(txid, blocker, definition.name.as_str()));
         }
         let Some(new) = self
             .matviews
@@ -23673,8 +23689,7 @@ impl Storage {
         self.matviews[new] = MatviewDef {
             database: self.current_database,
             created_at: self.catalog_seq,
-            schema,
-            name,
+            backing_table: backing_table as u16,
             sql: query.sql,
             creation_path: query.creation_path,
             ownership,
@@ -23692,19 +23707,20 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.matviews.iter().find_map(|m| {
-            (m.database == self.current_database
-                && m.schema.as_str() == schema
-                && m.name.as_str() == name)
-                .then_some(m.ddl_state.pending_txid()?)
-                .filter(|&owner| owner != txid)
+            (m.database == self.current_database && m.ddl_state != CatalogDdlState::Absent && {
+                let table = self.table_def(usize::from(m.backing_table), txid);
+                table.schema.as_str() == schema && table.name.as_str() == name
+            })
+            .then_some(m.ddl_state.pending_txid()?)
+            .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.matviews.iter().position(|m| {
-            m.database == self.current_database
-                && m.visible_to(txid)
-                && m.schema.as_str() == schema
-                && m.name.as_str() == name
+            m.database == self.current_database && m.visible_to(txid) && {
+                let table = self.table_def(usize::from(m.backing_table), txid);
+                table.schema.as_str() == schema && table.name.as_str() == name
+            }
         }) else {
             return Ok(None);
         };
@@ -23722,7 +23738,8 @@ impl Storage {
     }
 
     pub fn commit_matview_drop(&mut self, slot: usize) {
-        let (schema, name) = (self.matviews[slot].schema, self.matviews[slot].name);
+        let definition = self.tables[usize::from(self.matviews[slot].backing_table)].def;
+        let (schema, name) = (definition.schema, definition.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.matviews[slot].ddl_state = self.matviews[slot].ddl_state.commit_drop();
         self.clear_extension_dependencies_for_object(AccessObject {
@@ -31069,15 +31086,6 @@ impl Storage {
         let name = self.tables[index].def.name;
         self.tables[index].def.schema = new_schema;
         self.tables[index].mark_dirty();
-        for matview in self.matviews.iter_mut() {
-            if matview.database == database_oid
-                && matview.ddl_state == CatalogDdlState::Present
-                && matview.schema == old_schema
-                && matview.name == name
-            {
-                matview.schema = new_schema;
-            }
-        }
         for x in self.indexes.iter_mut() {
             if x.database == database_oid
                 && x.ddl_state == CatalogDdlState::Present

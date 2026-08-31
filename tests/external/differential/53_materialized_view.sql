@@ -29,6 +29,27 @@ SELECT * FROM mv ORDER BY id;
 -- lists it.
 SELECT relkind FROM pg_class WHERE relname = 'mv';
 SELECT matviewname, ispopulated FROM pg_matviews WHERE matviewname = 'mv';
+SELECT tablespace IS NULL, hasindexes FROM pg_matviews WHERE matviewname = 'mv';
+
+-- Materialized-view identity is the backing relation identity. ALTER keeps
+-- rows, comments, catalogs, and transaction visibility together.
+CREATE SCHEMA mv_life_source;
+CREATE SCHEMA mv_life_target;
+CREATE MATERIALIZED VIEW mv_life_source.old_name AS SELECT id FROM base WHERE id > 1;
+COMMENT ON MATERIALIZED VIEW mv_life_source.old_name IS 'moved materialized view';
+BEGIN;
+ALTER MATERIALIZED VIEW mv_life_source.old_name RENAME TO rollback_name;
+SELECT id FROM mv_life_source.rollback_name ORDER BY id;
+SELECT obj_description('mv_life_source.rollback_name'::regclass);
+ROLLBACK;
+SELECT id FROM mv_life_source.old_name ORDER BY id;
+ALTER MATERIALIZED VIEW mv_life_source.old_name SET SCHEMA mv_life_target;
+ALTER MATERIALIZED VIEW mv_life_target.old_name RENAME TO durable_name;
+SELECT schemaname, matviewname FROM pg_matviews WHERE matviewname = 'durable_name';
+SELECT obj_description('mv_life_target.durable_name'::regclass);
+DROP MATERIALIZED VIEW mv_life_target.durable_name;
+DROP SCHEMA mv_life_source;
+DROP SCHEMA mv_life_target;
 
 -- WITH NO DATA creates it unpopulated; REFRESH fills it.
 CREATE MATERIALIZED VIEW mv2 AS SELECT id FROM base WITH NO DATA;

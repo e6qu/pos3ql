@@ -2946,6 +2946,21 @@ pub enum RelationPersistence {
     Temporary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnStorage {
+    Plain,
+    External,
+    Extended,
+    Main,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnCompression {
+    Default,
+    Pglz,
+    Lz4,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PartitionClause<'a> {
     None,
@@ -3957,6 +3972,14 @@ pub enum AlterAction<'a> {
     SetStatistics {
         column: &'a str,
         target: i16,
+    },
+    SetStorage {
+        column: &'a str,
+        storage: ColumnStorage,
+    },
+    SetCompression {
+        column: &'a str,
+        compression: ColumnCompression,
     },
     /// ALTER [COLUMN] col [SET DATA] TYPE newtype [USING expr]. Without `using`
     /// the stored value is cast through the assignment cast; with it, `using`

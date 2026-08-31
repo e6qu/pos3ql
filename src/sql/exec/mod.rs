@@ -50342,6 +50342,12 @@ fn alter_table_inner(
                     ));
                 }
             }
+            AlterAction::SetStorage { .. } | AlterAction::SetCompression { .. } => {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "column storage and compression require a durable row codec implementation"
+                ));
+            }
             AlterAction::SetTablespace(name) => {
                 new_def.tablespace =
                     match resolve_relation_tablespace(storage, Some(name), txn.txid) {

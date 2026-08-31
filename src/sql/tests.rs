@@ -799,6 +799,29 @@ fn large_objects_survive_checkpoint_wal_and_prepared_transaction_recovery() {
 }
 
 #[test]
+fn unsupported_column_storage_and_compression_fail_loudly() {
+    let (mut engine, mut budget) = test_engine();
+    assert!(
+        !String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE storage_boundary_rows (payload text)"
+        ))
+        .contains("ERROR")
+    );
+    for statement in [
+        "ALTER TABLE storage_boundary_rows ALTER COLUMN payload SET STORAGE EXTERNAL",
+        "ALTER TABLE storage_boundary_rows ALTER COLUMN payload SET COMPRESSION pglz",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains("0A000"),
+            "{statement}"
+        );
+    }
+}
+
+#[test]
 fn full_text_values_functions_operators_storage_and_generated_columns() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

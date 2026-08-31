@@ -80,6 +80,8 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::SetNotNull { .. }
         | AlterAction::DropNotNull { .. }
         | AlterAction::SetStatistics { .. }
+        | AlterAction::SetStorage { .. }
+        | AlterAction::SetCompression { .. }
         | AlterAction::AddIdentity { .. }
         | AlterAction::DropIdentity { .. } => 4,
         AlterAction::SetForeignOptions(_) | AlterAction::SetColumnForeignOptions { .. } => 4,
@@ -5254,6 +5256,41 @@ impl<'a> Parser<'a> {
                             .ok_or_else(|| self.err_here("statistics target is out of range"))?
                     };
                     Ok(AlterAction::SetStatistics { column, target })
+                } else if self.eat_ident("storage")? {
+                    let storage = match self.any_ident("column storage")? {
+                        value if value.eq_ignore_ascii_case("plain") => {
+                            crate::sql::ast::ColumnStorage::Plain
+                        }
+                        value if value.eq_ignore_ascii_case("external") => {
+                            crate::sql::ast::ColumnStorage::External
+                        }
+                        value if value.eq_ignore_ascii_case("extended") => {
+                            crate::sql::ast::ColumnStorage::Extended
+                        }
+                        value if value.eq_ignore_ascii_case("main") => {
+                            crate::sql::ast::ColumnStorage::Main
+                        }
+                        _ => return Err(self.err_here("unrecognized column storage")),
+                    };
+                    Ok(AlterAction::SetStorage { column, storage })
+                } else if self.eat_ident("compression")? {
+                    let compression = if self.eat_ident("default")? {
+                        crate::sql::ast::ColumnCompression::Default
+                    } else {
+                        match self.any_ident("column compression")? {
+                            value if value.eq_ignore_ascii_case("pglz") => {
+                                crate::sql::ast::ColumnCompression::Pglz
+                            }
+                            value if value.eq_ignore_ascii_case("lz4") => {
+                                crate::sql::ast::ColumnCompression::Lz4
+                            }
+                            _ => return Err(self.err_here("unrecognized column compression")),
+                        }
+                    };
+                    Ok(AlterAction::SetCompression {
+                        column,
+                        compression,
+                    })
                 } else {
                     self.expect_ident("not")?;
                     self.expect_ident("null")?;

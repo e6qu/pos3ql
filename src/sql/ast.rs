@@ -3960,6 +3960,9 @@ pub enum AlterAction<'a> {
         enabled: TriggerEnableMode,
     },
     SetRowLevelSecurity(RowLevelSecurityAlteration),
+    /// ALTER TABLE ... REPLICA IDENTITY controls the old tuple emitted for
+    /// logical UPDATE and DELETE messages.
+    SetReplicaIdentity(ReplicaIdentityTarget<'a>),
     AttachPartition {
         child: QualName<'a>,
         bound: PartitionBound<'a>,
@@ -3967,6 +3970,17 @@ pub enum AlterAction<'a> {
     DetachPartition {
         child: QualName<'a>,
     },
+}
+
+/// The closed SQL forms of `ALTER TABLE ... REPLICA IDENTITY`. An index target
+/// remains a qualified relation name until catalog resolution proves it is a
+/// usable index of the altered table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaIdentityTarget<'a> {
+    Default,
+    Full,
+    Nothing,
+    Index(QualName<'a>),
 }
 
 /// The independently optional attributes of `ALTER CONSTRAINT`. Execution

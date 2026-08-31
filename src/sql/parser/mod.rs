@@ -88,6 +88,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::RenameConstraint { .. }
         | AlterAction::SetTriggerEnabled { .. }
         | AlterAction::SetRowLevelSecurity(_)
+        | AlterAction::SetReplicaIdentity(_)
         | AlterAction::AttachPartition { .. }
         | AlterAction::DetachPartition { .. }
         | AlterAction::SetSchema(_) => 5,
@@ -4982,6 +4983,20 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here("concurrent partition detach is not supported"));
             }
             Ok(AlterAction::DetachPartition { child })
+        } else if self.eat_ident("replica")? {
+            self.expect_ident("identity")?;
+            let target = if self.eat_ident("default")? {
+                crate::sql::ast::ReplicaIdentityTarget::Default
+            } else if self.eat_ident("full")? {
+                crate::sql::ast::ReplicaIdentityTarget::Full
+            } else if self.eat_ident("nothing")? {
+                crate::sql::ast::ReplicaIdentityTarget::Nothing
+            } else {
+                self.expect_ident("using")?;
+                self.expect_ident("index")?;
+                crate::sql::ast::ReplicaIdentityTarget::Index(self.qual_name("index name")?)
+            };
+            Ok(AlterAction::SetReplicaIdentity(target))
         } else if self.eat_ident("add")? {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
             if self.eat_ident("constraint")? {

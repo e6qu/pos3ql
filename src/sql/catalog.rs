@@ -7488,7 +7488,15 @@ fn pg_class<'a>(
                     0
                 }),
                 text("p", arena)?, // relpersistence: permanent
-                text("d", arena)?, // relreplident: default
+                text(
+                    match table_def.replica_identity {
+                        crate::storage::ReplicaIdentityMode::Default => "d",
+                        crate::storage::ReplicaIdentityMode::Full => "f",
+                        crate::storage::ReplicaIdentityMode::Nothing => "n",
+                        crate::storage::ReplicaIdentityMode::Index => "i",
+                    },
+                    arena,
+                )?,
                 Datum::Int4(PG_CLASS_OID),
                 Datum::Int4(FIRST_TABLE_COMPOSITE_TYPE_OID + slot as i32),
                 acl(storage, relation_object, txid, arena)?,
@@ -9639,7 +9647,10 @@ fn pg_index<'a>(
                         .is_none_or(|definition| definition.kind.valid()),
                 ),
                 Datum::Bool(!info.timing.is_deferrable()),
-                Datum::Bool(false), // indisreplident
+                Datum::Bool(
+                    info.explicit_definition
+                        .is_some_and(|definition| definition.replica_identity),
+                ),
                 Datum::Bool(info.nulls_not_distinct),
                 Datum::Int4((info.n_cols + info.n_include_cols) as i32),
                 Datum::Int4(info.n_cols as i32),

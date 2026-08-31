@@ -9,6 +9,35 @@ use super::wire::MsgOut;
 use crate::sql::types::Datum;
 use crate::storage::ColumnMeta;
 
+/// PostgreSQL's relation-level logical replica identity code. A parser-free
+/// closed type keeps relation metadata and old-tuple tags coherent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplicaIdentity {
+    Default,
+    Nothing,
+    Full,
+    Index,
+}
+
+impl ReplicaIdentity {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Default => b'd',
+            Self::Nothing => b'n',
+            Self::Full => b'f',
+            Self::Index => b'i',
+        }
+    }
+
+    pub const fn old_tuple_tag(self) -> Option<u8> {
+        match self {
+            Self::Default | Self::Index => Some(b'K'),
+            Self::Full => Some(b'O'),
+            Self::Nothing => None,
+        }
+    }
+}
+
 /// A pgoutput protocol version accepted by PostgreSQL 18.
 ///
 /// The value crosses the wire only after this parser boundary, so downstream
@@ -67,28 +96,36 @@ pub fn commit(message: &mut MsgOut, commit_lsn: u64) {
     message.i64(0);
 }
 
+/// Complete pgoutput Relation metadata, assembled before encoding so the
+/// parallel column fields cannot diverge at the wire boundary.
+pub struct Relation<'a> {
+    pub relation_id: u32,
+    pub schema: &'a str,
+    pub name: &'a str,
+    pub columns: &'a [ColumnMeta],
+    pub type_oids: &'a [i32],
+    pub replica_identity: ReplicaIdentity,
+    pub key_columns: &'a [bool],
+}
+
 /// pgoutput Relation declaration. Every field is binary and typed by the
 /// exact PostgreSQL OID/typmod carried by the durable table definition.
-pub fn relation(
-    message: &mut MsgOut,
-    relation_id: u32,
-    schema: &str,
-    name: &str,
-    columns: &[ColumnMeta],
-    type_oids: &[i32],
-) {
-    debug_assert_eq!(columns.len(), type_oids.len());
+pub fn relation(message: &mut MsgOut, relation: Relation<'_>) {
+    debug_assert_eq!(relation.columns.len(), relation.type_oids.len());
+    debug_assert_eq!(relation.columns.len(), relation.key_columns.len());
     message.u8(b'R');
-    message.i32(relation_id as i32);
-    message.cstr(schema);
-    message.cstr(name);
-    // Every row-change message below carries a complete old tuple.  Advertise
-    // the matching replica identity instead of claiming DEFAULT while sending
-    // a tuple shape a subscriber is not entitled to expect from DEFAULT.
-    message.u8(b'f');
-    message.i16(columns.len() as i16);
-    for (column, type_oid) in columns.iter().zip(type_oids) {
-        message.u8(u8::from(column.primary));
+    message.i32(relation.relation_id as i32);
+    message.cstr(relation.schema);
+    message.cstr(relation.name);
+    message.u8(relation.replica_identity.code());
+    message.i16(relation.columns.len() as i16);
+    for ((column, type_oid), key) in relation
+        .columns
+        .iter()
+        .zip(relation.type_oids)
+        .zip(relation.key_columns)
+    {
+        message.u8(u8::from(*key));
         message.cstr(column.name.as_str());
         message.i32(*type_oid);
         message.i32(column.type_mod);
@@ -111,28 +148,41 @@ pub fn insert(message: &mut MsgOut, relation_id: u32, values: &[Datum], binary: 
     tuple(message, values, binary);
 }
 
-/// pgoutput Update. The previous tuple is emitted with the `O` tag, which is
-/// valid for FULL replica identity and lets subscribers apply changes without
-/// consulting the publisher's current heap.
+/// pgoutput Update carries the exact old-tuple tag required by the relation's
+/// typed replica-identity mode.
 pub fn update(
     message: &mut MsgOut,
     relation_id: u32,
     old_values: &[Datum],
     new_values: &[Datum],
     binary: bool,
+    replica_identity: ReplicaIdentity,
 ) {
+    let old_tag = replica_identity
+        .old_tuple_tag()
+        .expect("UPDATE requires a usable replica identity");
     message.u8(b'U');
     message.i32(relation_id as i32);
-    message.u8(b'O');
+    message.u8(old_tag);
     tuple(message, old_values, binary);
     tuple(message, new_values, binary);
 }
 
-/// pgoutput Delete with the removed tuple under FULL replica identity.
-pub fn delete(message: &mut MsgOut, relation_id: u32, old_values: &[Datum], binary: bool) {
+/// pgoutput Delete carries the exact old-tuple tag required by the relation's
+/// typed replica-identity mode.
+pub fn delete(
+    message: &mut MsgOut,
+    relation_id: u32,
+    old_values: &[Datum],
+    binary: bool,
+    replica_identity: ReplicaIdentity,
+) {
+    let old_tag = replica_identity
+        .old_tuple_tag()
+        .expect("DELETE requires a usable replica identity");
     message.u8(b'D');
     message.i32(relation_id as i32);
-    message.u8(b'O');
+    message.u8(old_tag);
     tuple(message, old_values, binary);
 }
 
@@ -185,18 +235,63 @@ mod tests {
     }
 
     #[test]
-    fn update_and_delete_carry_full_replica_identity_tuples() {
+    fn update_and_delete_carry_the_declared_replica_identity_tuple_kind() {
         let mut budget = Budget::new(1024);
         let mut buffer = FixedBuf::new(&mut budget, "pgoutput", 256).unwrap();
         let mut frame = MsgOut::begin(&mut buffer, b'd');
-        update(&mut frame, 7, &[Datum::Int4(1)], &[Datum::Int4(2)], true);
-        delete(&mut frame, 7, &[Datum::Int4(2)], true);
+        update(
+            &mut frame,
+            7,
+            &[Datum::Int4(1)],
+            &[Datum::Int4(2)],
+            true,
+            ReplicaIdentity::Index,
+        );
+        delete(
+            &mut frame,
+            7,
+            &[Datum::Int4(2)],
+            true,
+            ReplicaIdentity::Full,
+        );
         frame.finish().unwrap();
         let bytes = buffer.readable();
         assert_eq!(bytes[5], b'U');
-        assert_eq!(bytes[10], b'O');
+        assert_eq!(bytes[10], b'K');
         assert_eq!(bytes[35], b'D');
         assert_eq!(bytes[40], b'O');
+    }
+
+    #[test]
+    fn relation_declares_index_identity_and_only_its_key_columns() {
+        let mut budget = Budget::new(1024);
+        let mut buffer = FixedBuf::new(&mut budget, "pgoutput", 256).unwrap();
+        let mut frame = MsgOut::begin(&mut buffer, b'd');
+        let mut columns = [ColumnMeta::EMPTY; 2];
+        columns[0].name = crate::storage::SqlName::parse("alternate").unwrap();
+        columns[1].name = crate::storage::SqlName::parse("payload").unwrap();
+        relation(
+            &mut frame,
+            Relation {
+                relation_id: 7,
+                schema: "public",
+                name: "replica_rows",
+                columns: &columns,
+                type_oids: &[23, 25],
+                replica_identity: ReplicaIdentity::Index,
+                key_columns: &[true, false],
+            },
+        );
+        frame.finish().unwrap();
+        let bytes = buffer.readable();
+        let marker = bytes
+            .windows(b"replica_rows\0".len())
+            .position(|window| window == b"replica_rows\0")
+            .unwrap()
+            + b"replica_rows\0".len();
+        assert_eq!(bytes[marker], b'i');
+        assert_eq!(bytes[marker + 3], 1);
+        assert_eq!(bytes[marker + 3 + 1 + b"alternate\0".len() + 8], 0);
     }
 
     #[test]

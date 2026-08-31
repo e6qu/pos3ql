@@ -1279,6 +1279,81 @@ struct ReplicationType {
     name: SqlName,
 }
 
+#[derive(Clone, Copy)]
+struct LogicalReplicaIdentity {
+    wire: pgoutput::ReplicaIdentity,
+    key_mask: u64,
+}
+
+impl LogicalReplicaIdentity {
+    fn usable_for_change(self) -> bool {
+        self.key_mask != 0
+    }
+}
+
+fn logical_replica_identity(
+    storage: &Storage,
+    table_slot: usize,
+) -> Result<LogicalReplicaIdentity, SqlError> {
+    let definition = storage.table_def(table_slot, 0);
+    let all_columns = if definition.n_columns == crate::storage::MAX_COLUMNS {
+        u64::MAX
+    } else {
+        (1u64 << definition.n_columns) - 1
+    };
+    match definition.replica_identity {
+        crate::storage::ReplicaIdentityMode::Nothing => Ok(LogicalReplicaIdentity {
+            wire: pgoutput::ReplicaIdentity::Nothing,
+            key_mask: 0,
+        }),
+        crate::storage::ReplicaIdentityMode::Full => Ok(LogicalReplicaIdentity {
+            wire: pgoutput::ReplicaIdentity::Full,
+            key_mask: all_columns,
+        }),
+        crate::storage::ReplicaIdentityMode::Default => {
+            let key_mask = definition
+                .columns()
+                .iter()
+                .enumerate()
+                .fold(0u64, |mask, (column, definition)| {
+                    mask | (u64::from(definition.primary) << column)
+                });
+            Ok(LogicalReplicaIdentity {
+                wire: pgoutput::ReplicaIdentity::Default,
+                key_mask,
+            })
+        }
+        crate::storage::ReplicaIdentityMode::Index => {
+            let mut selected = None;
+            for slot in 0..storage.index_count() {
+                let Some(index) = storage.index_visible_to(slot, 0) else {
+                    continue;
+                };
+                if storage.index_table_slot(slot) != Some(table_slot)
+                    || !index.mutable_for(0).replica_identity
+                {
+                    continue;
+                }
+                if selected.replace(index).is_some() {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "relation has more than one replica identity index"
+                    ));
+                }
+            }
+            let key_mask = selected.map_or(0, |index| {
+                index.columns[..index.n_cols]
+                    .iter()
+                    .fold(0u64, |mask, column| mask | (1u64 << column))
+            });
+            Ok(LogicalReplicaIdentity {
+                wire: pgoutput::ReplicaIdentity::Index,
+                key_mask,
+            })
+        }
+    }
+}
+
 fn replication_column_types(
     storage: &Storage,
     columns: &[ColumnMeta],
@@ -1307,6 +1382,7 @@ fn replication_column_types(
 
 fn emit_replication_relation(
     storage: &Storage,
+    table_slot: usize,
     definition: &crate::storage::TableDef,
     relation_id: u32,
     column_mask: u64,
@@ -1314,10 +1390,13 @@ fn emit_replication_relation(
     end_lsn: u64,
 ) -> Result<(), SqlError> {
     let mut selected_columns = [crate::storage::ColumnMeta::EMPTY; crate::storage::MAX_COLUMNS];
+    let mut selected_key_columns = [false; crate::storage::MAX_COLUMNS];
     let mut selected_count = 0usize;
+    let replica_identity = logical_replica_identity(storage, table_slot)?;
     for (index, column) in definition.columns().iter().enumerate() {
         if column_mask & (1u64 << index) != 0 {
             selected_columns[selected_count] = *column;
+            selected_key_columns[selected_count] = replica_identity.key_mask & (1u64 << index) != 0;
             selected_count += 1;
         }
     }
@@ -1358,11 +1437,15 @@ fn emit_replication_relation(
             pgoutput::xlog_data(message, end_lsn, end_lsn, |plugin| {
                 pgoutput::relation(
                     plugin,
-                    relation_id,
-                    definition.schema.as_str(),
-                    definition.name.as_str(),
-                    columns,
-                    &type_oids[..columns.len()],
+                    pgoutput::Relation {
+                        relation_id,
+                        schema: definition.schema.as_str(),
+                        name: definition.name.as_str(),
+                        columns,
+                        type_oids: &type_oids[..columns.len()],
+                        replica_identity: replica_identity.wire,
+                        key_columns: &selected_key_columns[..columns.len()],
+                    },
                 )
             })
         })
@@ -1407,6 +1490,7 @@ fn emit_pending_truncates(
             }
             emit_replication_relation(
                 storage,
+                output_slot,
                 definition,
                 relation_id,
                 u64::MAX,
@@ -1560,6 +1644,13 @@ fn publication_column_mask(
     table_slot: usize,
     operation: PublicationOperation,
 ) -> Result<Option<u64>, SqlError> {
+    if matches!(
+        operation,
+        PublicationOperation::Update | PublicationOperation::Delete
+    ) && !logical_replica_identity(storage, table_slot)?.usable_for_change()
+    {
+        return Ok(None);
+    }
     let mut selected = 0u64;
     let mut matched = false;
     let implicit_mask = |publication: &crate::storage::PublicationDef| {
@@ -3417,8 +3508,11 @@ impl Engine {
                                         PublicationOperation::Update,
                                     )?;
                                     let relation_id = output_slot as u32 + 1;
+                                    let replica_identity =
+                                        logical_replica_identity(storage, output_slot)?;
                                     emit_replication_relation(
                                         storage,
+                                        output_slot,
                                         storage.table_def(output_slot, 0),
                                         relation_id,
                                         column_mask,
@@ -3430,7 +3524,7 @@ impl Engine {
                                             let (old_projected, old_count) =
                                                 project_replication_values(
                                                     &old_values[..column_count],
-                                                    column_mask,
+                                                    replica_identity.key_mask,
                                                 );
                                             let (projected, projected_count) =
                                                 project_replication_values(
@@ -3445,12 +3539,14 @@ impl Engine {
                                                         &old_projected[..old_count],
                                                         &projected[..projected_count],
                                                         binary,
+                                                        replica_identity.wire,
                                                     ),
                                                     (true, false) => pgoutput::delete(
                                                         plugin,
                                                         relation_id,
                                                         &old_projected[..old_count],
                                                         binary,
+                                                        replica_identity.wire,
                                                     ),
                                                     (false, true) => pgoutput::insert(
                                                         plugin,
@@ -3482,6 +3578,7 @@ impl Engine {
                                     let relation_id = output_slot as u32 + 1;
                                     emit_replication_relation(
                                         storage,
+                                        output_slot,
                                         storage.table_def(output_slot, 0),
                                         relation_id,
                                         column_mask,
@@ -3579,8 +3676,11 @@ impl Engine {
                                     PublicationOperation::Delete,
                                 )?;
                                 let relation_id = output_slot as u32 + 1;
+                                let replica_identity =
+                                    logical_replica_identity(storage, output_slot)?;
                                 emit_replication_relation(
                                     storage,
+                                    output_slot,
                                     storage.table_def(output_slot, 0),
                                     relation_id,
                                     column_mask,
@@ -3592,7 +3692,7 @@ impl Engine {
                                         let (projected, projected_count) =
                                             project_replication_values(
                                                 &values[..column_count],
-                                                column_mask,
+                                                replica_identity.key_mask,
                                             );
                                         pgoutput::xlog_data(message, lsn, end_lsn, |plugin| {
                                             pgoutput::delete(
@@ -3600,6 +3700,7 @@ impl Engine {
                                                 relation_id,
                                                 &projected[..projected_count],
                                                 binary,
+                                                replica_identity.wire,
                                             )
                                         })
                                     })

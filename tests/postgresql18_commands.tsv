@@ -46,7 +46,7 @@ ALTER SERVER	complete	tests/external/ci_diff.sh
 ALTER STATISTICS	complete	109_extended_statistics.sql
 ALTER SUBSCRIPTION	partial	98_subscription.sql and subscription shard (definition, refresh, initial synchronization)
 ALTER SYSTEM	complete	118_database_configuration.sql
-ALTER TABLE	partial	45_alter_column.sql
+ALTER TABLE	partial	45_alter_column.sql and 125_replica_identity.sql
 ALTER TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 ALTER TEXT SEARCH CONFIGURATION	complete	tests/external/differential/123_full_text_search.sql
 ALTER TEXT SEARCH DICTIONARY	complete	tests/external/differential/123_full_text_search.sql

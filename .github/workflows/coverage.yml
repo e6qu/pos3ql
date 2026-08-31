@@ -147,9 +147,15 @@ jobs:
         run: sh tools/coverage.sh
 
   spill-differential:
-    name: shard spilldiff
+    name: shard spilldiff-${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: a, corpus_shard: "0-of-2" }
+          - { name: b, corpus_shard: "1-of-2" }
     services:
       postgres:
         image: postgres:18
@@ -194,6 +200,7 @@ jobs:
           POS3QL_REFERENCE_PSQL: psql
           POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
           POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
+          POS3QL_DIFF_CORPUS_SHARD: ${{ matrix.corpus_shard }}
           COVERAGE_SHARD: runtest:spilldiff
         run: sh tools/coverage.sh
 

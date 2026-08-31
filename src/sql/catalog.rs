@@ -10013,7 +10013,12 @@ fn pg_attribute<'a>(
                     // PostgreSQL's ordinary extended storage policy.
                     text(type_storage(c.ctype), arena)?,
                     text("", arena)?, // attcompression: type default
-                    Datum::Int4(i32::from(c.statistics_target)),
+                    // PostgreSQL exposes its durable `-1` default sentinel as NULL.
+                    if c.statistics_target < 0 {
+                        Datum::Null
+                    } else {
+                        Datum::Int4(i32::from(c.statistics_target))
+                    },
                     Datum::Bool(false), // attisdropped
                     Datum::Int4(i as i32 + 1),
                     text("i", arena)?,

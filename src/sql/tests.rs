@@ -36563,6 +36563,16 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
     );
     let text = String::from_utf8_lossy(&output);
     assert_eq!(data_rows(&output), ["2|table_definition_space"], "{text}");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attstattarget FROM pg_attribute \
+              WHERE attrelid = 'table_definition_rows'::regclass AND attname = 'id'",
+        )),
+        ["NULL"],
+        "the internal default-statistics sentinel must retain PostgreSQL's catalog meaning"
+    );
     let output = run_with(
         &mut engine,
         &mut budget,

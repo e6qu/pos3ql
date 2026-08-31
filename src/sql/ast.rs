@@ -2916,7 +2916,85 @@ pub struct CreateTable<'a> {
     /// The table's partitioning role.  This is structured at parse time so
     /// execution never needs to reinterpret a SQL fragment as a bound.
     pub partition: PartitionClause<'a>,
+    /// PostgreSQL table inheritance or typed-table membership. The executor
+    /// rejects these closed states until it can preserve their scan and
+    /// dependency semantics through durable storage.
+    pub membership: TableMembership<'a>,
+    /// Relation persistence requested by the client. Only permanent tables
+    /// can enter object-native durable storage.
+    pub persistence: RelationPersistence,
+    /// The PostgreSQL table access method, resolved before storage mutation.
+    pub access_method: TableAccessMethod<'a>,
+    /// An explicit relation tablespace. `None` selects the database default.
+    pub tablespace: Option<&'a str>,
+    /// Heap storage options. They are parsed as a closed state rather than
+    /// accepted as inert catalog text.
+    pub storage_options: RelationStorageOptions,
     pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TableMembership<'a> {
+    None,
+    Inherits(&'a [QualName<'a>]),
+    OfType(QualName<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelationStorageOptions {
+    pub fillfactor: Option<u8>,
+}
+
+impl RelationStorageOptions {
+    pub const DEFAULT: Self = Self { fillfactor: None };
+
+    pub const fn is_empty(self) -> bool {
+        self.fillfactor.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelationStorageOptionNames {
+    pub fillfactor: bool,
+}
+
+impl RelationStorageOptionNames {
+    pub const EMPTY: Self = Self { fillfactor: false };
+}
+
+/// Parsed access-method spelling; only an executable variant can reach a
+/// durable relation definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAccessMethod<'a> {
+    Heap,
+    /// A syntactically valid access-method name whose catalog resolution is
+    /// deferred to execution. It cannot reach storage unless it resolves to
+    /// one of the executable variants above.
+    Named(&'a str),
+}
+
+/// PostgreSQL's table-persistence grammar, parsed before execution decides
+/// whether the object-native durability contract can realize it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationPersistence {
+    Permanent,
+    Unlogged,
+    Temporary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnStorage {
+    Plain,
+    External,
+    Extended,
+    Main,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnCompression {
+    Default,
+    Pglz,
+    Lz4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3917,6 +3995,21 @@ pub enum AlterAction<'a> {
         column: &'a str,
         if_exists: bool,
     },
+    /// ALTER [COLUMN] col SET GENERATED { ALWAYS | BY DEFAULT }.
+    SetIdentityMode {
+        column: &'a str,
+        always: bool,
+    },
+    /// ALTER [COLUMN] col SET EXPRESSION AS (expr).
+    SetGeneratedExpression {
+        column: &'a str,
+        expression_text: &'a str,
+    },
+    /// ALTER [COLUMN] col SET identity-sequence options.
+    AlterIdentitySequence {
+        column: &'a str,
+        options: SeqOptions<'a>,
+    },
     /// ALTER [COLUMN] col SET NOT NULL — validated against existing rows.
     SetNotNull {
         column: &'a str,
@@ -3924,6 +4017,20 @@ pub enum AlterAction<'a> {
     /// ALTER [COLUMN] col DROP NOT NULL.
     DropNotNull {
         column: &'a str,
+    },
+    /// ALTER [COLUMN] col SET STATISTICS target. `-1` is PostgreSQL's
+    /// `DEFAULT` target and remains a valid stored value.
+    SetStatistics {
+        column: &'a str,
+        target: i16,
+    },
+    SetStorage {
+        column: &'a str,
+        storage: ColumnStorage,
+    },
+    SetCompression {
+        column: &'a str,
+        compression: ColumnCompression,
     },
     /// ALTER [COLUMN] col [SET DATA] TYPE newtype [USING expr]. Without `using`
     /// the stored value is cast through the assignment cast; with it, `using`
@@ -3938,6 +4045,14 @@ pub enum AlterAction<'a> {
     /// ALTER TABLE ... ADD [CONSTRAINT name] <table constraint>. Existing rows
     /// are validated against the new constraint before it is attached.
     AddConstraint(TableConstraint<'a>),
+    /// ALTER TABLE ... ADD [CONSTRAINT name] { UNIQUE | PRIMARY KEY } USING
+    /// INDEX. The index and the constraint become one durable dependency.
+    AttachIndexConstraint {
+        name: Option<&'a str>,
+        index: QualName<'a>,
+        primary: bool,
+        timing: ConstraintTiming,
+    },
     /// ALTER TABLE ... DROP CONSTRAINT [IF EXISTS] name.
     DropConstraint {
         name: &'a str,
@@ -3960,6 +4075,17 @@ pub enum AlterAction<'a> {
         enabled: TriggerEnableMode,
     },
     SetRowLevelSecurity(RowLevelSecurityAlteration),
+    SetPersistence(RelationPersistence),
+    SetStorageOptions(RelationStorageOptions),
+    ResetStorageOptions(RelationStorageOptionNames),
+    SetInheritance {
+        parent: QualName<'a>,
+        inherit: bool,
+    },
+    /// ALTER TABLE ... SET TABLESPACE name.
+    SetTablespace(&'a str),
+    /// ALTER TABLE ... SET ACCESS METHOD heap.
+    SetAccessMethod(TableAccessMethod<'a>),
     /// ALTER TABLE ... REPLICA IDENTITY controls the old tuple emitted for
     /// logical UPDATE and DELETE messages.
     SetReplicaIdentity(ReplicaIdentityTarget<'a>),
@@ -3969,7 +4095,15 @@ pub enum AlterAction<'a> {
     },
     DetachPartition {
         child: QualName<'a>,
+        mode: PartitionDetachMode,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionDetachMode {
+    Immediate,
+    Concurrent,
+    Finalize,
 }
 
 /// The closed SQL forms of `ALTER TABLE ... REPLICA IDENTITY`. An index target

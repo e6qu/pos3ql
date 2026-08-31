@@ -799,6 +799,29 @@ fn large_objects_survive_checkpoint_wal_and_prepared_transaction_recovery() {
 }
 
 #[test]
+fn unsupported_column_storage_and_compression_fail_loudly() {
+    let (mut engine, mut budget) = test_engine();
+    assert!(
+        !String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE storage_boundary_rows (payload text)"
+        ))
+        .contains("ERROR")
+    );
+    for statement in [
+        "ALTER TABLE storage_boundary_rows ALTER COLUMN payload SET STORAGE EXTERNAL",
+        "ALTER TABLE storage_boundary_rows ALTER COLUMN payload SET COMPRESSION pglz",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains("0A000"),
+            "{statement}"
+        );
+    }
+}
+
+#[test]
 fn full_text_values_functions_operators_storage_and_generated_columns() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -16858,6 +16881,170 @@ fn not_valid_and_not_enforced_constraints_have_distinct_lifecycles() {
 }
 
 #[test]
+fn unique_and_primary_key_constraints_attach_existing_indexes_durably() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE attached_keys (id integer, code integer); \
+         CREATE UNIQUE INDEX attached_keys_id_idx ON attached_keys (id); \
+         CREATE UNIQUE INDEX attached_keys_code_idx ON attached_keys (code); \
+         ALTER TABLE attached_keys ADD CONSTRAINT attached_keys_primary \
+           PRIMARY KEY USING INDEX attached_keys_id_idx; \
+         ALTER TABLE attached_keys ADD UNIQUE USING INDEX attached_keys_code_idx",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT conname, contype, conindid = (SELECT oid FROM pg_class \
+               WHERE relname = conname) \
+             FROM pg_constraint WHERE conrelid = 'attached_keys'::regclass \
+             ORDER BY conname",
+        )),
+        [
+            "attached_keys_code_idx|u|t",
+            "attached_keys_id_not_null|n|NULL",
+            "attached_keys_primary|p|t",
+        ]
+    );
+    let duplicate = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "INSERT INTO attached_keys VALUES (1, 1); \
+         INSERT INTO attached_keys VALUES (1, 2)",
+    );
+    assert!(duplicate.contains("23505"), "{duplicate}");
+    let index_drop = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "DROP INDEX attached_keys_primary",
+    );
+    assert!(index_drop.contains("2BP01"), "{index_drop}");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE attached_keys RENAME CONSTRAINT attached_keys_code_idx \
+           TO attached_keys_code_key; \
+         ALTER INDEX attached_keys_primary RENAME TO attached_keys_pkey; \
+         ALTER TABLE attached_keys DROP CONSTRAINT attached_keys_pkey; \
+         ALTER TABLE attached_keys DROP CONSTRAINT attached_keys_code_key",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT relname FROM pg_class WHERE relname IN \
+               ('attached_keys_primary', 'attached_keys_pkey', \
+                'attached_keys_code_idx', 'attached_keys_code_key')",
+        )),
+        Vec::<String>::new()
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE attached_key_savepoint (id integer); \
+         CREATE UNIQUE INDEX attached_key_savepoint_idx ON attached_key_savepoint (id); \
+         BEGIN; SAVEPOINT attached; \
+         ALTER TABLE attached_key_savepoint ADD CONSTRAINT attached_key_savepoint_pkey \
+           PRIMARY KEY USING INDEX attached_key_savepoint_idx; \
+         ROLLBACK TO attached; COMMIT",
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT count(*) FROM pg_constraint \
+             WHERE conrelid = 'attached_key_savepoint'::regclass",
+        )),
+        ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT relname FROM pg_class WHERE relname = 'attached_key_savepoint_idx'",
+        )),
+        ["attached_key_savepoint_idx"]
+    );
+}
+
+#[test]
+fn index_constraint_attachment_rejects_incompatible_indexes_without_catalog_state() {
+    let (mut engine, mut budget) = test_engine();
+    let mut txn = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE rejected_attachment (id integer, value integer); \
+         CREATE INDEX rejected_attachment_plain ON rejected_attachment (id); \
+         CREATE UNIQUE INDEX rejected_attachment_partial \
+           ON rejected_attachment (value) WHERE value > 0",
+    );
+    let ordinary = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE rejected_attachment ADD CONSTRAINT rejected_attachment_plain_key \
+           UNIQUE USING INDEX rejected_attachment_plain",
+    );
+    assert!(ordinary.contains("42809"), "{ordinary}");
+    let partial = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER TABLE rejected_attachment ADD CONSTRAINT rejected_attachment_partial_key \
+           UNIQUE USING INDEX rejected_attachment_partial",
+    );
+    assert!(partial.contains("0A000"), "{partial}");
+    let deferred = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE UNIQUE INDEX rejected_attachment_deferred ON rejected_attachment (id); \
+         ALTER TABLE rejected_attachment ADD CONSTRAINT rejected_attachment_deferred_key \
+           UNIQUE USING INDEX rejected_attachment_deferred DEFERRABLE",
+    );
+    assert!(deferred.contains("0A000"), "{deferred}");
+    assert_eq!(
+        data_rows(&run_with_txn_bytes(
+            &mut engine,
+            &mut budget,
+            &mut txn,
+            "SELECT count(*) FROM pg_constraint \
+             WHERE conrelid = 'rejected_attachment'::regclass",
+        )),
+        ["0"]
+    );
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "CREATE TABLE index_rename_source (id integer); \
+         CREATE UNIQUE INDEX index_rename_source_idx ON index_rename_source (id); \
+         CREATE TABLE index_rename_taken (id integer)",
+    );
+    let collision = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut txn,
+        "ALTER INDEX index_rename_source_idx RENAME TO index_rename_taken",
+    );
+    assert!(collision.contains("42P07"), "{collision}");
+}
+
+#[test]
 fn exclusion_constraints_enforce_predicates_and_transaction_modes() {
     let (mut engine, mut budget) = test_engine();
     let mut txn = TxnState::new(&mut budget, 256).unwrap();
@@ -17250,7 +17437,12 @@ fn constraint_lifecycle_survives_cold_object_store_recovery() {
            CONSTRAINT durable_drop_key UNIQUE (id)); \
          CREATE TABLE durable_drop_child (parent_id integer \
            REFERENCES durable_drop_parent(id)); \
-         ALTER TABLE durable_drop_parent DROP CONSTRAINT durable_drop_key CASCADE",
+         ALTER TABLE durable_drop_parent DROP CONSTRAINT durable_drop_key CASCADE; \
+         CREATE TABLE durable_attached_key (id integer); \
+         CREATE UNIQUE INDEX durable_attached_key_idx ON durable_attached_key (id); \
+         ALTER TABLE durable_attached_key ADD CONSTRAINT durable_attached_key_pkey \
+           PRIMARY KEY USING INDEX durable_attached_key_idx; \
+         ALTER INDEX durable_attached_key_pkey RENAME TO durable_attached_key_primary",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -17287,6 +17479,20 @@ fn constraint_lifecycle_survives_cold_object_store_recovery() {
               WHERE conrelid = 'durable_drop_child'::regclass AND contype = 'f'",
         )),
         ["0"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT conname, contype, conindid = (SELECT oid FROM pg_class \
+               WHERE relname = conname) \
+             FROM pg_constraint \
+             WHERE conrelid = 'durable_attached_key'::regclass",
+        )),
+        [
+            "durable_attached_key_primary|p|t",
+            "durable_attached_key_id_not_null|n|NULL",
+        ]
     );
     let mut txn = TxnState::new(&mut recovered_budget, 256).unwrap();
 
@@ -26208,6 +26414,97 @@ fn generated_column_survives_restart() {
 }
 
 #[test]
+fn generated_expression_evolution_rewrites_rows_and_survives_cold_recovery() {
+    let mut config = test_config("generated-expression-evolution");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace =
+        format!("generated-expression-evolution-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE generated_expression_evolution (\
+           a int, b int GENERATED ALWAYS AS (a + 1) STORED\
+         ); \
+         INSERT INTO generated_expression_evolution (a) VALUES (2), (4); \
+         ALTER TABLE generated_expression_evolution \
+           ALTER COLUMN b SET EXPRESSION AS (a * 10)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT a, b FROM generated_expression_evolution ORDER BY a"
+        )),
+        ["2|20", "4|40"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE generated_expression_evolution SET a = 3 WHERE a = 2",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT a, b FROM generated_expression_evolution ORDER BY a"
+        )),
+        ["3|30", "4|40"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE generated_expression_plain (a int)",
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TABLE generated_expression_plain ALTER COLUMN a SET EXPRESSION AS (a + 1)"
+        ))
+        .contains("55000")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TABLE generated_expression_evolution \
+             ALTER COLUMN b SET EXPRESSION AS (random())"
+        ))
+        .contains("42P17")
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    run_with(
+        &mut cold,
+        &mut cold_budget,
+        "INSERT INTO generated_expression_evolution (a) VALUES (5)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT a, b FROM generated_expression_evolution ORDER BY a"
+        )),
+        ["3|30", "4|40", "5|50"]
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn identity_columns() {
     let (mut e, mut b) = test_engine();
     run_with(
@@ -26279,6 +26576,48 @@ fn identity_columns() {
             "SELECT attidentity FROM pg_attribute WHERE attrelid='ib'::regclass AND attname='id'"
         )),
         ["d"]
+    );
+    // SET GENERATED changes both catalog rendering and explicit-insert
+    // semantics without replacing the owned sequence or rewriting rows.
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE ib ALTER COLUMN id SET GENERATED ALWAYS",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut e,
+            &mut b,
+            "SELECT attidentity FROM pg_attribute WHERE attrelid='ib'::regclass AND attname='id'"
+        )),
+        ["a"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "INSERT INTO ib (id, v) VALUES (51, 'rejected')"
+        ))
+        .contains("428C9")
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "ALTER TABLE ib ALTER COLUMN id SET GENERATED BY DEFAULT; \
+         INSERT INTO ib (id, v) VALUES (51, 'accepted')",
+    );
+    assert_eq!(
+        data_rows(&run_with(&mut e, &mut b, "SELECT id FROM ib WHERE id = 51")),
+        ["51"]
+    );
+    run_with(&mut e, &mut b, "CREATE TABLE id_not_identity (id int)");
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "ALTER TABLE id_not_identity ALTER COLUMN id SET GENERATED ALWAYS"
+        ))
+        .contains("55000")
     );
     // Identity with START/INCREMENT options.
     run_with(
@@ -26556,6 +26895,162 @@ fn identity_survives_restart() {
             .contains("42P01"),
         "a renamed ordinary OWNED BY dependency survives WAL replay"
     );
+}
+
+#[test]
+fn identity_generation_mode_survives_wal_checkpoint_and_cold_recovery() {
+    let mut config = test_config("identity-generation-mode-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("identity-generation-mode-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE identity_generation_mode (id int GENERATED BY DEFAULT AS IDENTITY, v text); \
+         INSERT INTO identity_generation_mode (id, v) VALUES (40, 'before'); \
+         ALTER TABLE identity_generation_mode ALTER COLUMN id SET GENERATED ALWAYS",
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT attidentity FROM pg_attribute \
+             WHERE attrelid = 'identity_generation_mode'::regclass AND attname = 'id'"
+        )),
+        ["a"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "INSERT INTO identity_generation_mode (id, v) VALUES (41, 'rejected')"
+        ))
+        .contains("428C9")
+    );
+    run_with(
+        &mut cold,
+        &mut cold_budget,
+        "ALTER TABLE identity_generation_mode ALTER COLUMN id SET GENERATED BY DEFAULT; \
+         INSERT INTO identity_generation_mode (id, v) VALUES (41, 'accepted')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT id, v FROM identity_generation_mode ORDER BY id"
+        )),
+        ["40|before", "41|accepted"]
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn identity_sequence_options_are_durable_metadata_operations() {
+    let mut config = test_config("identity-sequence-options");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("identity-sequence-options-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE identity_sequence_options (\
+           id int GENERATED BY DEFAULT AS IDENTITY, payload text\
+         ); \
+         INSERT INTO identity_sequence_options (payload) VALUES ('before'); \
+         ALTER TABLE identity_sequence_options \
+           ALTER COLUMN id SET INCREMENT BY 5, ALTER COLUMN id RESTART WITH 10; \
+         INSERT INTO identity_sequence_options (payload) VALUES ('after'), ('after again')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, payload FROM identity_sequence_options ORDER BY id; \
+             SELECT increment_by, start_value FROM pg_sequences \
+              WHERE sequencename = 'identity_sequence_options_id_seq'"
+        )),
+        ["1|before", "10|after", "15|after again", "5|1"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE identity_sequence_plain (id int)",
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TABLE identity_sequence_plain ALTER COLUMN id RESTART WITH 10"
+        ))
+        .contains("55000")
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO identity_sequence_options (payload) VALUES ('wal restart')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id, payload FROM identity_sequence_options ORDER BY id"
+        )),
+        ["1|before", "10|after", "15|after again", "20|wal restart"]
+    );
+    assert!(restarted.checkpoint().unwrap());
+    drop(restarted);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    run_with(
+        &mut cold,
+        &mut cold_budget,
+        "INSERT INTO identity_sequence_options (payload) VALUES ('cold')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT id, payload FROM identity_sequence_options ORDER BY id"
+        )),
+        [
+            "1|before",
+            "10|after",
+            "15|after again",
+            "20|wal restart",
+            "25|cold",
+        ]
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]
@@ -36207,6 +36702,269 @@ fn default_index_tablespace_remains_implicit_in_pg_class() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+}
+
+#[test]
+fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLESPACE table_definition_space LOCATION '/object/table-definition'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE table_definition_rows (id integer) USING heap TABLESPACE table_definition_space",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO table_definition_rows VALUES (42)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "
+         SELECT c.relam, s.spcname FROM pg_class c JOIN pg_tablespace s ON s.oid = c.reltablespace \
+          WHERE c.relname = 'table_definition_rows'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(data_rows(&output), ["2|table_definition_space"], "{text}");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attstattarget FROM pg_attribute \
+              WHERE attrelid = 'table_definition_rows'::regclass AND attname = 'id'",
+        )),
+        ["NULL"],
+        "the internal default-statistics sentinel must retain PostgreSQL's catalog meaning"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows SET ACCESS METHOD heap",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows ALTER COLUMN id SET STATISTICS 77",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attstattarget FROM pg_attribute \
+              WHERE attrelid = 'table_definition_rows'::regclass AND attname = 'id'",
+        )),
+        ["77"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id FROM table_definition_rows",
+        )),
+        ["42"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows SET TABLESPACE pg_default",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT relam, reltablespace FROM pg_class WHERE relname = 'table_definition_rows'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert_eq!(data_rows(&output), ["2|0"], "{text}");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLESPACE table_definition_space",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows SET TABLESPACE no_such_tablespace",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("42704"),
+        "missing tablespaces must fail at the typed relation boundary: {text}"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE unknown_access_method_rows (id integer) USING unknown_am",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("42704"),
+        "unknown access methods must not be accepted as inert metadata: {text}"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows SET ACCESS METHOD unknown_am",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42704"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    for statement in [
+        "CREATE UNLOGGED TABLE unlogged_object_native_rows (id integer)",
+        "CREATE TEMP TABLE temporary_object_native_rows (id integer)",
+        "ALTER TABLE table_definition_rows SET UNLOGGED",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains("0A000"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows SET LOGGED",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn unimplemented_table_lifecycle_forms_are_typed_and_loud() {
+    let (mut engine, mut budget) = test_engine();
+    for statement in [
+        "CREATE TABLE table_storage_option_rows (id integer) WITH (fillfactor = 80)",
+        "CREATE TABLE inheritance_parent_rows (id integer); \
+         CREATE TABLE inheritance_child_rows (id integer) INHERITS (inheritance_parent_rows)",
+        "CREATE TYPE typed_table_row AS (id integer); \
+         CREATE TABLE typed_table_rows OF typed_table_row",
+        "CREATE TABLE alter_inheritance_rows (id integer); \
+         ALTER TABLE alter_inheritance_rows INHERIT inheritance_parent_rows",
+        "CREATE TABLE alter_storage_option_rows (id integer); \
+         ALTER TABLE alter_storage_option_rows SET (fillfactor = 80)",
+        "CREATE TABLE reset_storage_option_rows (id integer); \
+         ALTER TABLE reset_storage_option_rows RESET (fillfactor)",
+        "CREATE TABLE detach_parent_rows (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE detach_child_rows PARTITION OF detach_parent_rows FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE detach_parent_rows DETACH PARTITION detach_child_rows CONCURRENTLY",
+        "CREATE TABLE finalize_parent_rows (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE finalize_child_rows PARTITION OF finalize_parent_rows FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE finalize_parent_rows DETACH PARTITION finalize_child_rows FINALIZE",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("0A000"),
+            "{statement} must fail as a typed architecture boundary: {text}"
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_class \
+              WHERE relname IN ('table_storage_option_rows', 'inheritance_child_rows', 'typed_table_rows')",
+        )),
+        ["0"],
+        "rejected metadata must not leave inert durable relations behind"
+    );
+}
+
+#[test]
+fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery() {
+    let mut config = test_config("table-definition-metadata-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("table-definition-metadata-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for statement in [
+        "CREATE TABLESPACE table_definition_recovery_space LOCATION '/object/table-definition-recovery'",
+        "CREATE TABLE table_definition_recovery_rows (id integer) USING heap TABLESPACE table_definition_recovery_space",
+        "ALTER TABLE table_definition_recovery_rows ALTER COLUMN id SET STATISTICS 91",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT c.relam, s.spcname FROM pg_class c JOIN pg_tablespace s \
+               ON s.oid = c.reltablespace WHERE c.relname = 'table_definition_recovery_rows'",
+        )),
+        ["2|table_definition_recovery_space"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT attstattarget FROM pg_attribute \
+              WHERE attrelid = 'table_definition_recovery_rows'::regclass AND attname = 'id'",
+        )),
+        ["91"]
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

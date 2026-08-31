@@ -99,6 +99,7 @@ fn empty_meta() -> ColumnMeta {
         identity_always: false,
         auto_increment_step: 1,
         user_type: None,
+        statistics_target: -1,
     }
 }
 
@@ -314,6 +315,7 @@ pub(super) fn build_column(
         identity_always,
         auto_increment_step,
         user_type,
+        statistics_target: -1,
     })
 }
 
@@ -916,7 +918,7 @@ fn disambiguate_constraint_name(def: &TableDef, base: &str) -> Result<SqlName, S
 /// Whether `name` is already the name of any constraint on `def`: a stored
 /// CHECK, unique key, or foreign key, or one of the names synthesized for the
 /// single-column PRIMARY KEY / UNIQUE flags (`<table>_pkey` / `<table>_<col>_key`).
-fn constraint_name_taken(def: &TableDef, name: &str) -> bool {
+pub(super) fn constraint_name_taken(def: &TableDef, name: &str) -> bool {
     use core::fmt::Write as _;
     if def.checks[..def.n_checks]
         .iter()

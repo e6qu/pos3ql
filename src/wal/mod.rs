@@ -2143,7 +2143,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             })
         }
         WalOp::CreateTable(def) => {
-            let mut n = 1 + def.name.as_str().len() + 2 + 2;
+            let mut n = 1 + def.name.as_str().len() + 2 + 2 + 3;
             for c in def.columns() {
                 let default_value = c.default.constant().copied();
                 n += 1 + c.name.as_str().len() + 3 + 4 + encoded_default_len(&default_value);
@@ -2155,6 +2155,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .unwrap_or(0);
                 // auto_increment_step (i64).
                 n += 8;
+                n += 2; // attstattarget
                 // User-defined column: name, then a format marker and schema.
                 if let Some(identity) = c.user_type {
                     n += 1 + identity.name.as_str().len();
@@ -3615,6 +3616,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     crate::storage::TableKind::Foreign => 1,
                 },
             ]);
+            ok &= buffer.append(&def.tablespace.to_le_bytes());
+            ok &= buffer.append(&[def.access_method.code()]);
             for c in def.columns() {
                 ok &= name_bytes(buffer, c.name.as_str());
                 // Bit 7 (the last free per-column flag bit) marks a domain-typed
@@ -3636,6 +3639,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&(de.len() as u16).to_le_bytes());
                 ok &= buffer.append(de.as_bytes());
                 ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
+                ok &= buffer.append(&c.statistics_target.to_le_bytes());
                 if let Some(identity) = c.user_type {
                     ok &= name_bytes(buffer, identity.name.as_str());
                     ok &= buffer.append(&[u8::MAX]);
@@ -5978,6 +5982,10 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 _ => return None,
             };
             at += 1;
+            let tablespace = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            let access_method = crate::storage::TableAccessMethod::from_code(*payload.get(at)?)?;
+            at += 1;
             let mut def = TableDef {
                 name: SqlName::parse(name).ok()?,
                 columns: [ColumnMeta {
@@ -5994,10 +6002,13 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     identity_always: false,
                     auto_increment_step: 1,
                     user_type: None,
+                    statistics_target: -1,
                 }; MAX_COLUMNS],
                 n_columns: n_cols,
                 has_toast,
                 kind,
+                tablespace,
+                access_method,
                 ..TableDef::empty()
             };
             for i in 0..n_cols {
@@ -6022,6 +6033,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let auto_increment_step =
                     i64::from_le_bytes(payload.get(at..at + 8)?.try_into().unwrap());
                 at += 8;
+                let statistics_target =
+                    i16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
                 // Bit 7 set means a durable user-type identity follows.
                 let user_type = if meta[1] & 128 != 0 {
                     let name = SqlName::parse(take_name(&mut at)?).ok()?;
@@ -6051,6 +6065,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     identity_always: meta[1] & 64 != 0,
                     auto_increment_step,
                     user_type,
+                    statistics_target,
                 };
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
@@ -10424,6 +10439,7 @@ mod tests {
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type: None,
+                statistics_target: -1,
             }; MAX_COLUMNS],
             n_columns: 2,
             ..TableDef::empty()
@@ -10442,6 +10458,7 @@ mod tests {
             identity_always: false,
             auto_increment_step: 1,
             user_type: None,
+            statistics_target: -1,
         };
         def.columns[1] = ColumnMeta {
             name: SqlName::parse("v").unwrap(),
@@ -10460,6 +10477,7 @@ mod tests {
             identity_always: false,
             auto_increment_step: 1,
             user_type: None,
+            statistics_target: -1,
         };
         // Exercise every durable constraint state in one table record.
         let mut uk = UniqueKey::EMPTY;

@@ -73,21 +73,35 @@ fn alter_pass(action: &AlterAction) -> u8 {
         AlterAction::AlterColumnType { .. } => 1,
         AlterAction::AddColumn(_) => 2,
         AlterAction::AddConstraint(_)
+        | AlterAction::AttachIndexConstraint { .. }
         | AlterAction::AlterConstraint { .. }
         | AlterAction::ValidateConstraint(_) => 3,
         AlterAction::SetDefault { .. }
         | AlterAction::DropDefault { .. }
         | AlterAction::SetNotNull { .. }
         | AlterAction::DropNotNull { .. }
+        | AlterAction::SetStatistics { .. }
+        | AlterAction::SetStorage { .. }
+        | AlterAction::SetCompression { .. }
         | AlterAction::AddIdentity { .. }
-        | AlterAction::DropIdentity { .. } => 4,
-        AlterAction::SetForeignOptions(_) | AlterAction::SetColumnForeignOptions { .. } => 4,
+        | AlterAction::DropIdentity { .. }
+        | AlterAction::SetIdentityMode { .. }
+        | AlterAction::SetGeneratedExpression { .. }
+        | AlterAction::AlterIdentitySequence { .. } => 4,
+        AlterAction::SetForeignOptions(_)
+        | AlterAction::SetColumnForeignOptions { .. }
+        | AlterAction::SetStorageOptions(_)
+        | AlterAction::ResetStorageOptions(_) => 4,
         // Standalone forms; never appear in a multi-action list.
         AlterAction::RenameTable(_)
         | AlterAction::RenameColumn { .. }
         | AlterAction::RenameConstraint { .. }
         | AlterAction::SetTriggerEnabled { .. }
         | AlterAction::SetRowLevelSecurity(_)
+        | AlterAction::SetPersistence(_)
+        | AlterAction::SetInheritance { .. }
+        | AlterAction::SetTablespace(_)
+        | AlterAction::SetAccessMethod(_)
         | AlterAction::SetReplicaIdentity(_)
         | AlterAction::AttachPartition { .. }
         | AlterAction::DetachPartition { .. }
@@ -4541,8 +4555,28 @@ impl<'a> Parser<'a> {
         // combine them with a comma-separated subcommand list, so they parse to
         // a single-element list on their own.
         if self.eat_ident("set")? {
-            self.expect_ident("schema")?;
-            let action = AlterAction::SetSchema(self.col_ident("schema name")?);
+            let action = if self.eat_ident("schema")? {
+                AlterAction::SetSchema(self.col_ident("schema name")?)
+            } else if self.eat_ident("logged")? {
+                AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent)
+            } else if self.eat_ident("unlogged")? {
+                AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Unlogged)
+            } else if self.eat_ident("tablespace")? {
+                AlterAction::SetTablespace(self.col_ident("tablespace name")?)
+            } else if self.eat_op("(")? {
+                let options = self.relation_storage_options()?;
+                self.expect_op(")")?;
+                AlterAction::SetStorageOptions(options)
+            } else {
+                self.expect_ident("access")?;
+                self.expect_ident("method")?;
+                let method = self.any_ident("table access method")?;
+                AlterAction::SetAccessMethod(if method.eq_ignore_ascii_case("heap") {
+                    crate::sql::ast::TableAccessMethod::Heap
+                } else {
+                    crate::sql::ast::TableAccessMethod::Named(method)
+                })
+            };
             return Ok(Self::alter_table_statement(
                 foreign,
                 AlterTable {
@@ -4595,19 +4629,25 @@ impl<'a> Parser<'a> {
             ));
         }
         if self.eat_ident("no")? {
-            self.expect_ident("force")?;
-            self.expect_ident("row")?;
-            self.expect_ident("level")?;
-            self.expect_ident("security")?;
+            let action = if self.eat_ident("inherit")? {
+                AlterAction::SetInheritance {
+                    parent: self.qual_name("parent relation name")?,
+                    inherit: false,
+                }
+            } else {
+                self.expect_ident("force")?;
+                self.expect_ident("row")?;
+                self.expect_ident("level")?;
+                self.expect_ident("security")?;
+                AlterAction::SetRowLevelSecurity(RowLevelSecurityAlteration::NoForce)
+            };
             return Ok(Self::alter_table_statement(
                 foreign,
                 AlterTable {
                     table,
                     if_exists,
                     only,
-                    actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
-                        RowLevelSecurityAlteration::NoForce,
-                    )])?,
+                    actions: self.arena_slice(&[action])?,
                 },
             ));
         }
@@ -4979,10 +5019,25 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("detach")? {
             self.expect_ident("partition")?;
             let child = self.qual_name("partition name")?;
-            if self.eat_ident("concurrently")? || self.eat_ident("finalize")? {
-                return Err(self.err_here("concurrent partition detach is not supported"));
-            }
-            Ok(AlterAction::DetachPartition { child })
+            let mode = if self.eat_ident("concurrently")? {
+                crate::sql::ast::PartitionDetachMode::Concurrent
+            } else if self.eat_ident("finalize")? {
+                crate::sql::ast::PartitionDetachMode::Finalize
+            } else {
+                crate::sql::ast::PartitionDetachMode::Immediate
+            };
+            Ok(AlterAction::DetachPartition { child, mode })
+        } else if self.eat_ident("inherit")? {
+            Ok(AlterAction::SetInheritance {
+                parent: self.qual_name("parent relation name")?,
+                inherit: true,
+            })
+        } else if self.eat_ident("no")? {
+            self.expect_ident("inherit")?;
+            Ok(AlterAction::SetInheritance {
+                parent: self.qual_name("parent relation name")?,
+                inherit: false,
+            })
         } else if self.eat_ident("replica")? {
             self.expect_ident("identity")?;
             let target = if self.eat_ident("default")? {
@@ -4997,13 +5052,45 @@ impl<'a> Parser<'a> {
                 crate::sql::ast::ReplicaIdentityTarget::Index(self.qual_name("index name")?)
             };
             Ok(AlterAction::SetReplicaIdentity(target))
+        } else if self.eat_ident("set")? {
+            if self.eat_ident("logged")? {
+                Ok(AlterAction::SetPersistence(
+                    crate::sql::ast::RelationPersistence::Permanent,
+                ))
+            } else if self.eat_ident("unlogged")? {
+                Ok(AlterAction::SetPersistence(
+                    crate::sql::ast::RelationPersistence::Unlogged,
+                ))
+            } else if self.eat_ident("tablespace")? {
+                Ok(AlterAction::SetTablespace(
+                    self.col_ident("tablespace name")?,
+                ))
+            } else if self.eat_op("(")? {
+                let options = self.relation_storage_options()?;
+                self.expect_op(")")?;
+                Ok(AlterAction::SetStorageOptions(options))
+            } else {
+                self.expect_ident("access")?;
+                self.expect_ident("method")?;
+                let method = self.any_ident("table access method")?;
+                Ok(AlterAction::SetAccessMethod(
+                    if method.eq_ignore_ascii_case("heap") {
+                        crate::sql::ast::TableAccessMethod::Heap
+                    } else {
+                        crate::sql::ast::TableAccessMethod::Named(method)
+                    },
+                ))
+            }
+        } else if self.eat_ident("reset")? {
+            self.expect_op("(")?;
+            let names = self.relation_storage_option_names()?;
+            self.expect_op(")")?;
+            Ok(AlterAction::ResetStorageOptions(names))
         } else if self.eat_ident("add")? {
             // ADD [CONSTRAINT name] <table constraint> vs ADD [COLUMN] <def>.
             if self.eat_ident("constraint")? {
                 let cname = self.col_ident("constraint name")?;
-                return Ok(AlterAction::AddConstraint(
-                    self.table_constraint(Some(cname), true)?,
-                ));
+                return self.alter_table_add_constraint(Some(cname));
             }
             if matches!(
                 self.peeked,
@@ -5012,9 +5099,7 @@ impl<'a> Parser<'a> {
                     | Tok::Ident("check")
                     | Tok::Ident("foreign")
             ) {
-                return Ok(AlterAction::AddConstraint(
-                    self.table_constraint(None, true)?,
-                ));
+                return self.alter_table_add_constraint(None);
             }
             let _ = self.eat_ident("column")?;
             let name = self.col_ident("column name")?;
@@ -5197,6 +5282,88 @@ impl<'a> Parser<'a> {
                         value,
                         value_text,
                     })
+                } else if self.eat_ident("statistics")? {
+                    let target = if self.eat_ident("default")? {
+                        -1
+                    } else {
+                        i16::try_from(self.seq_int()?)
+                            .ok()
+                            .filter(|target| (-1..=10_000).contains(target))
+                            .ok_or_else(|| self.err_here("statistics target is out of range"))?
+                    };
+                    Ok(AlterAction::SetStatistics { column, target })
+                } else if self.eat_ident("storage")? {
+                    let storage = match self.any_ident("column storage")? {
+                        value if value.eq_ignore_ascii_case("plain") => {
+                            crate::sql::ast::ColumnStorage::Plain
+                        }
+                        value if value.eq_ignore_ascii_case("external") => {
+                            crate::sql::ast::ColumnStorage::External
+                        }
+                        value if value.eq_ignore_ascii_case("extended") => {
+                            crate::sql::ast::ColumnStorage::Extended
+                        }
+                        value if value.eq_ignore_ascii_case("main") => {
+                            crate::sql::ast::ColumnStorage::Main
+                        }
+                        _ => return Err(self.err_here("unrecognized column storage")),
+                    };
+                    Ok(AlterAction::SetStorage { column, storage })
+                } else if self.eat_ident("compression")? {
+                    let compression = if self.eat_ident("default")? {
+                        crate::sql::ast::ColumnCompression::Default
+                    } else {
+                        match self.any_ident("column compression")? {
+                            value if value.eq_ignore_ascii_case("pglz") => {
+                                crate::sql::ast::ColumnCompression::Pglz
+                            }
+                            value if value.eq_ignore_ascii_case("lz4") => {
+                                crate::sql::ast::ColumnCompression::Lz4
+                            }
+                            _ => return Err(self.err_here("unrecognized column compression")),
+                        }
+                    };
+                    Ok(AlterAction::SetCompression {
+                        column,
+                        compression,
+                    })
+                } else if self.eat_ident("generated")? {
+                    let always = if self.eat_ident("always")? {
+                        true
+                    } else {
+                        self.expect_ident("by")?;
+                        self.expect_ident("default")?;
+                        false
+                    };
+                    Ok(AlterAction::SetIdentityMode { column, always })
+                } else if self.eat_ident("expression")? {
+                    self.expect_ident("as")?;
+                    self.expect_op("(")?;
+                    let start = self.peek_at;
+                    let _ = self.expression(0)?;
+                    let expression_text = self.text[start..self.peek_at].trim_end();
+                    self.expect_op(")")?;
+                    Ok(AlterAction::SetGeneratedExpression {
+                        column,
+                        expression_text,
+                    })
+                } else if matches!(
+                    self.peeked,
+                    Tok::Ident(
+                        "increment"
+                            | "minvalue"
+                            | "maxvalue"
+                            | "start"
+                            | "cache"
+                            | "cycle"
+                            | "no"
+                            | "restart"
+                    )
+                ) {
+                    Ok(AlterAction::AlterIdentitySequence {
+                        column,
+                        options: self.seq_options(true)?,
+                    })
                 } else {
                     self.expect_ident("not")?;
                     self.expect_ident("null")?;
@@ -5229,12 +5396,76 @@ impl<'a> Parser<'a> {
                         Err(self.err_here("a column cannot be turned into a generated column"))
                     }
                 }
+            } else if self.eat_ident("restart")? {
+                let restart = if self.eat_ident("with")?
+                    || matches!(self.peeked, Tok::Num(_))
+                    || self.peeked == Tok::Op("-")
+                {
+                    Some(self.seq_int()?)
+                } else {
+                    None
+                };
+                Ok(AlterAction::AlterIdentitySequence {
+                    column,
+                    options: crate::sql::ast::SeqOptions {
+                        restart: Some(restart),
+                        ..crate::sql::ast::SeqOptions::EMPTY
+                    },
+                })
             } else {
-                Err(self.unexpected("expected TYPE, SET, DROP or ADD"))
+                Err(self.unexpected("expected TYPE, SET, DROP, ADD or RESTART"))
             }
         } else {
             Err(self.unexpected("expected ADD, DROP or ALTER"))
         }
+    }
+
+    /// Parses the constraint form of ALTER TABLE ADD. An existing unique
+    /// index is a distinct input state: its columns are catalog identities,
+    /// not a second spelling to resolve later from a column list.
+    fn alter_table_add_constraint(
+        &mut self,
+        name: Option<&'a str>,
+    ) -> Result<AlterAction<'a>, ParseError> {
+        let primary = if self.eat_ident("primary")? {
+            self.expect_ident("key")?;
+            Some(true)
+        } else if self.eat_ident("unique")? {
+            Some(false)
+        } else {
+            None
+        };
+        let Some(primary) = primary else {
+            return Ok(AlterAction::AddConstraint(
+                self.table_constraint(name, true)?,
+            ));
+        };
+        if self.eat_ident("using")? {
+            self.expect_ident("index")?;
+            let index = self.qual_name("index name")?;
+            let timing = self.constraint_timing(false)?;
+            return Ok(AlterAction::AttachIndexConstraint {
+                name,
+                index,
+                primary,
+                timing,
+            });
+        }
+        let columns = self.column_name_list()?;
+        let timing = self.constraint_timing(false)?;
+        Ok(AlterAction::AddConstraint(if primary {
+            TableConstraint::PrimaryKey {
+                name,
+                columns,
+                timing,
+            }
+        } else {
+            TableConstraint::Unique {
+                name,
+                columns,
+                timing,
+            }
+        }))
     }
 
     fn prepare(&mut self) -> Result<Stmt<'a>, ParseError> {
@@ -7010,6 +7241,59 @@ mod tests {
     }
 
     #[test]
+    fn table_lifecycle_boundaries_are_closed_parse_states() {
+        with_parser(
+            "CREATE TABLE inherited_child (id integer) WITH (fillfactor = 80) INHERITS (parent_one, parent_two); \
+             CREATE TABLE typed_child OF public.row_type; \
+             ALTER TABLE inherited_child SET (fillfactor = 70); \
+             ALTER TABLE inherited_child RESET (fillfactor); \
+             ALTER TABLE partitioned_parent DETACH PARTITION partitioned_child CONCURRENTLY; \
+             ALTER TABLE partitioned_parent DETACH PARTITION partitioned_child FINALIZE",
+            |parser| {
+                let Some(Stmt::CreateTable(inherited)) = parser.next_stmt().unwrap() else {
+                    panic!("inheritance definition did not parse")
+                };
+                assert_eq!(inherited.storage_options.fillfactor, Some(80));
+                assert!(matches!(
+                    inherited.membership,
+                    crate::sql::ast::TableMembership::Inherits(parents)
+                        if parents == [QualName::bare("parent_one"), QualName::bare("parent_two")]
+                ));
+                let Some(Stmt::CreateTable(typed)) = parser.next_stmt().unwrap() else {
+                    panic!("typed table definition did not parse")
+                };
+                assert!(matches!(
+                    typed.membership,
+                    crate::sql::ast::TableMembership::OfType(QualName {
+                        schema: Some("public"),
+                        name: "row_type"
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterTable(AlterTable { actions, .. }))
+                        if matches!(actions, [AlterAction::SetStorageOptions(options)] if options.fillfactor == Some(70))
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterTable(AlterTable { actions, .. }))
+                        if matches!(actions, [AlterAction::ResetStorageOptions(names)] if names.fillfactor)
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterTable(AlterTable { actions, .. }))
+                        if matches!(actions, [AlterAction::DetachPartition { mode: crate::sql::ast::PartitionDetachMode::Concurrent, .. }])
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::AlterTable(AlterTable { actions, .. }))
+                        if matches!(actions, [AlterAction::DetachPartition { mode: crate::sql::ast::PartitionDetachMode::Finalize, .. }])
+                ));
+            },
+        );
+    }
+
+    #[test]
     fn default_partition_uses_postgresqls_bound_syntax() {
         with_parser(
             "CREATE TABLE leaf PARTITION OF parent FOR VALUES DEFAULT",
@@ -7987,6 +8271,47 @@ mod tests {
         with_parser(
             "ALTER TABLE t ADD CONSTRAINT positive CHECK (id > 0) NOT VALID",
             |parser| assert!(parser.next_stmt().unwrap().is_some()),
+        );
+    }
+
+    #[test]
+    fn attached_index_constraints_preserve_the_index_identity_in_the_ast() {
+        with_parser(
+            "ALTER TABLE public.items ADD CONSTRAINT items_pkey \
+             PRIMARY KEY USING INDEX public.items_id_idx; \
+             ALTER TABLE public.items ADD UNIQUE USING INDEX items_code_idx",
+            |parser| {
+                let Some(Stmt::AlterTable(first)) = parser.next_stmt().unwrap() else {
+                    panic!()
+                };
+                assert!(matches!(
+                    first.actions,
+                    [AlterAction::AttachIndexConstraint {
+                        name: Some("items_pkey"),
+                        index: QualName {
+                            schema: Some("public"),
+                            name: "items_id_idx"
+                        },
+                        primary: true,
+                        timing: ConstraintTiming::NotDeferrable,
+                    }]
+                ));
+                let Some(Stmt::AlterTable(second)) = parser.next_stmt().unwrap() else {
+                    panic!()
+                };
+                assert!(matches!(
+                    second.actions,
+                    [AlterAction::AttachIndexConstraint {
+                        name: None,
+                        index: QualName {
+                            schema: None,
+                            name: "items_code_idx"
+                        },
+                        primary: false,
+                        timing: ConstraintTiming::NotDeferrable,
+                    }]
+                ));
+            },
         );
     }
 

@@ -259,6 +259,48 @@ struct OwnedSequencePlan {
     owner: crate::storage::SequenceOwner,
 }
 
+#[derive(Clone, Copy)]
+struct IdentitySequenceAlteration {
+    slot: usize,
+    spec: SeqSpec,
+    restart: Option<i64>,
+}
+
+fn plan_identity_sequence_alteration(
+    alterations: &mut [Option<IdentitySequenceAlteration>; MAX_COLUMNS],
+    n_alterations: &mut usize,
+    slot: usize,
+    options: &crate::sql::ast::SeqOptions,
+    base: SeqSpec,
+) -> Result<(), SqlError> {
+    let existing = alterations[..*n_alterations]
+        .iter()
+        .position(|alteration| alteration.is_some_and(|alteration| alteration.slot == slot));
+    let prior = existing.map_or(base, |index| {
+        alterations[index]
+            .expect("identity sequence alteration is present")
+            .spec
+    });
+    let (spec, restart) = resolve_seq_spec(options, Some(prior))?;
+    if let Some(index) = existing {
+        let alteration = alterations[index]
+            .as_mut()
+            .expect("identity sequence alteration");
+        alteration.spec = spec;
+        if options.restart.is_some() {
+            alteration.restart = restart;
+        }
+    } else {
+        alterations[*n_alterations] = Some(IdentitySequenceAlteration {
+            slot,
+            spec,
+            restart,
+        });
+        *n_alterations += 1;
+    }
+    Ok(())
+}
+
 fn default_owned_sequence_name(table: &str, column: &str) -> Result<SqlName, SqlError> {
     use core::fmt::Write as _;
     let mut name = crate::util::StackStr::<64>::new();
@@ -392,6 +434,38 @@ fn create_table_kind(
     } else {
         "CREATE TABLE"
     };
+    match statement.membership {
+        crate::sql::ast::TableMembership::None => {}
+        crate::sql::ast::TableMembership::Inherits(_) => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "table inheritance requires object-native inherited-relation scans and dependencies"
+            ));
+        }
+        crate::sql::ast::TableMembership::OfType(_) => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "typed tables require durable row-type membership"
+            ));
+        }
+    }
+    if !statement.storage_options.is_empty() {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "table storage options require an object-native row layout implementation"
+        ));
+    }
+    if statement.persistence != crate::sql::ast::RelationPersistence::Permanent {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "{} tables are incompatible with object-native durable storage",
+            match statement.persistence {
+                crate::sql::ast::RelationPersistence::Permanent => unreachable!(),
+                crate::sql::ast::RelationPersistence::Unlogged => "unlogged",
+                crate::sql::ast::RelationPersistence::Temporary => "temporary",
+            }
+        ));
+    }
     let mut def = match build_partitioned_table_def(storage, statement, txn.txid, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
@@ -405,6 +479,20 @@ fn create_table_kind(
         crate::storage::TableKind::Foreign
     } else {
         crate::storage::TableKind::Local
+    };
+    def.access_method = match statement.access_method {
+        crate::sql::ast::TableAccessMethod::Heap => crate::storage::TableAccessMethod::Heap,
+        crate::sql::ast::TableAccessMethod::Named(name) => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "access method \"{}\" does not exist",
+                name
+            ));
+        }
+    };
+    def.tablespace = match resolve_relation_tablespace(storage, statement.tablespace, txn.txid) {
+        Ok(tablespace) => tablespace,
+        Err(error) => return sql_fail(error),
     };
     // A copied constraint lands before the explicitly written ones, so a
     // duplicate primary key is caught with PostgreSQL's own message.
@@ -29072,6 +29160,7 @@ pub fn create_table_as(
             identity_always: false,
             auto_increment_step: 1,
             user_type,
+            statistics_target: -1,
         };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
@@ -35934,6 +36023,7 @@ fn verify_composite_attribute_type(
                             identity_always: false,
                             auto_increment_step: 1,
                             user_type: change.replacement.user_type,
+                            statistics_target: -1,
                         };
                         let converted = coerce(
                             field.value,
@@ -37501,7 +37591,7 @@ pub fn create_index(
         },
         None => None,
     };
-    let tablespace = match resolve_index_tablespace(storage, command.tablespace, txn.txid) {
+    let tablespace = match resolve_relation_tablespace(storage, command.tablespace, txn.txid) {
         Ok(tablespace) => tablespace,
         Err(error) => return sql_fail(error),
     };
@@ -38007,28 +38097,9 @@ pub fn alter_index(
                 Ok(name) => name,
                 Err(error) => return sql_fail(error),
             };
-            let prior = match storage.rename_index(slot, new_name, txn.txid) {
-                Ok(prior) => prior,
-                Err(error) => return sql_fail(error),
-            };
-            let lsn = storage.bump_lsn();
-            if let Err(error) = wal.stage(
-                txn.txid,
-                lsn,
-                &WalOp::RenameIndex {
-                    schema: schema.as_str(),
-                    name: name.name,
-                    new_name: new_name.as_str(),
-                },
-            ) {
-                storage.rollback_index_rename(slot, prior);
-                return sql_fail(error);
-            }
-            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::IndexRenamed {
-                slot: slot as u32,
-                prior,
-            }) {
-                storage.rollback_index_rename(slot, prior);
+            if let Err(error) =
+                rename_attached_index_constraint(storage, wal, txn, table, slot, new_name)
+            {
                 return sql_fail(error);
             }
         }
@@ -38038,7 +38109,7 @@ pub fn alter_index(
                 .expect("resolved index is visible")
                 .mutable_for(txn.txid);
             definition.tablespace =
-                match resolve_index_tablespace(storage, Some(tablespace), txn.txid) {
+                match resolve_relation_tablespace(storage, Some(tablespace), txn.txid) {
                     Ok(tablespace) => tablespace,
                     Err(error) => return sql_fail(error),
                 };
@@ -38231,7 +38302,7 @@ pub fn alter_indexes_tablespace(
             ));
         }
     };
-    let target_slot = match resolve_index_tablespace(storage, Some(command.target), txn.txid) {
+    let target_slot = match resolve_relation_tablespace(storage, Some(command.target), txn.txid) {
         Ok(slot) => slot,
         Err(error) => return sql_fail(error),
     };
@@ -38280,7 +38351,7 @@ fn stored_tablespace_options(
     }
 }
 
-fn resolve_index_tablespace(
+fn resolve_relation_tablespace(
     storage: &Storage,
     name: Option<&str>,
     txid: u32,
@@ -39189,6 +39260,45 @@ fn stage_index_drop(
     Ok(())
 }
 
+fn stage_index_rename(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    slot: usize,
+    new_name: SqlName,
+) -> Result<(), SqlError> {
+    let index = storage
+        .index_visible_to(slot, txn.txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
+    let schema = index.schema;
+    let old_name = index.name_for(txn.txid);
+    if old_name == new_name {
+        return Ok(());
+    }
+    let prior = storage.rename_index(slot, new_name, txn.txid)?;
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::RenameIndex {
+            schema: schema.as_str(),
+            name: old_name.as_str(),
+            new_name: new_name.as_str(),
+        },
+    ) {
+        storage.rollback_index_rename(slot, prior);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::IndexRenamed {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_index_rename(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub struct DropIndexCommand<'a> {
     pub names: &'a [QualName<'a>],
     pub if_exists: bool,
@@ -39273,6 +39383,20 @@ pub fn drop_index(
                 return sql_fail(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
                     "cannot drop index \"{}\" because it is used as replica identity",
+                    name.name
+                ));
+            }
+            if let Some(table) = storage.index_table_slot_to(slot, txn.txid)
+                && attached_constraint_index(
+                    storage,
+                    storage.table_def(table, txn.txid),
+                    definition.name_for(txn.txid).as_str(),
+                    txn.txid,
+                ) == Some(slot)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop index \"{}\" because constraint requires it",
                     name.name
                 ));
             }
@@ -39500,7 +39624,7 @@ pub fn reindex(
     }
     if let Some(tablespace) = options.tablespace {
         let selected_tablespace =
-            match resolve_index_tablespace(storage, Some(tablespace), txn.txid) {
+            match resolve_relation_tablespace(storage, Some(tablespace), txn.txid) {
                 Ok(tablespace) => tablespace,
                 Err(error) => return sql_fail(error),
             };
@@ -45054,6 +45178,7 @@ pub(crate) fn view_trigger_definition(
             identity_always: false,
             auto_increment_step: 1,
             user_type,
+            statistics_target: -1,
         };
     }
     Ok(definition)
@@ -48599,6 +48724,225 @@ fn named_key_columns(
     None
 }
 
+/// An attached key constraint and its btree relation share the constraint
+/// name and exact key positions. This is the durable dependency proof: it
+/// survives WAL and checkpoint replay without a parallel mutable flag.
+fn attached_constraint_index(
+    storage: &Storage,
+    definition: &TableDef,
+    name: &str,
+    txid: u32,
+) -> Option<usize> {
+    let (columns, n_columns) = named_key_columns(definition, name)?;
+    let slot = storage.index_slot(definition.schema.as_str(), name, txid)?;
+    let index = storage.index_visible_to(slot, txid)?;
+    (storage
+        .index_table_slot_to(slot, txid)
+        .is_some_and(|table| {
+            let owner = storage.table_def(table, txid);
+            owner.schema == definition.schema && owner.name == definition.name
+        })
+        && index.n_cols == n_columns
+        && index.columns[..n_columns] == columns[..n_columns]
+        && index.expressions[..n_columns].iter().all(Option::is_none))
+    .then_some(slot)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_constraint_using_index(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table_index: usize,
+    definition: &TableDef,
+    new_definition: &mut TableDef,
+    name: Option<&str>,
+    index_name: crate::sql::ast::QualName<'_>,
+    primary: bool,
+    timing: crate::sql::ast::ConstraintTiming,
+) -> Result<(), SqlError> {
+    if timing.is_deferrable() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "attaching a deferrable constraint to an existing index is not supported"
+        ));
+    }
+    let schema = index_name.schema.unwrap_or(definition.schema.as_str());
+    let slot = storage
+        .index_slot(schema, index_name.name, txn.txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "index \"{}\" does not exist",
+                index_name.name
+            )
+        })?;
+    let index = storage.index_visible_to(slot, txn.txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "index \"{}\" does not exist",
+            index_name.name
+        )
+    })?;
+    if storage.index_table_slot_to(slot, txn.txid) != Some(table_index) {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "index \"{}\" is not an index for table \"{}\"",
+            index.name_for(txn.txid).as_str(),
+            definition.name.as_str()
+        ));
+    }
+    if !index.unique {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "index \"{}\" is not unique",
+            index.name_for(txn.txid).as_str()
+        ));
+    }
+    if index.predicate.is_some()
+        || index.expressions[..index.n_cols]
+            .iter()
+            .any(Option::is_some)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot attach partial or expression index \"{}\" as a constraint",
+            index.name_for(txn.txid).as_str()
+        ));
+    }
+    if !matches!(
+        index.mutable_for(txn.txid).kind,
+        crate::storage::IndexKind::Ordinary
+    ) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot attach partitioned index \"{}\" as a constraint",
+            index.name_for(txn.txid).as_str()
+        ));
+    }
+    if index.nulls_not_distinct
+        || index.descending[..index.n_cols]
+            .iter()
+            .any(|descending| *descending)
+        || index.nulls_first[..index.n_cols]
+            .iter()
+            .any(|nulls_first| *nulls_first)
+        || index.explicit_collations[..index.n_cols]
+            .iter()
+            .any(|explicit| *explicit)
+        || index.operator_classes[..index.n_cols]
+            .iter()
+            .any(Option::is_some)
+    {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "index \"{}\" has key semantics that cannot become a table constraint",
+            index.name_for(txn.txid).as_str()
+        ));
+    }
+    let constraint_name = match name {
+        Some(name) => SqlName::parse(name)?,
+        None => index.name_for(txn.txid),
+    };
+    if crate::sql::exec::ddl::constraint_name_taken(new_definition, constraint_name.as_str()) {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "constraint \"{}\" for relation \"{}\" already exists",
+            constraint_name.as_str(),
+            definition.name.as_str()
+        ));
+    }
+    if primary {
+        if new_definition.columns().iter().any(|column| column.primary)
+            || new_definition.uniques().iter().any(|key| key.is_primary)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                "multiple primary keys for table \"{}\" are not allowed",
+                definition.name.as_str()
+            ));
+        }
+        for &column in &index.columns[..index.n_cols] {
+            new_definition.columns[column as usize].not_null =
+                new_definition.columns[column as usize].not_null.add_local();
+        }
+    }
+    crate::sql::exec::ddl::add_unique_key(
+        new_definition,
+        Some(constraint_name.as_str()),
+        if primary { "pkey" } else { "key" },
+        &index.columns,
+        index.n_cols,
+        primary,
+        timing,
+    )?;
+    stage_index_rename(storage, wal, txn, slot, constraint_name)
+}
+
+fn rename_attached_index_constraint(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table_index: usize,
+    index_slot: usize,
+    new_name: SqlName,
+) -> Result<(), SqlError> {
+    let current = *storage.table_def(table_index, txn.txid);
+    let index = storage
+        .index_visible_to(index_slot, txn.txid)
+        .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
+    let old_name = index.name_for(txn.txid);
+    if attached_constraint_index(storage, &current, old_name.as_str(), txn.txid) != Some(index_slot)
+    {
+        return stage_index_rename(storage, wal, txn, index_slot, new_name);
+    }
+    if old_name == new_name {
+        return Ok(());
+    }
+    if crate::sql::exec::ddl::constraint_name_taken(&current, new_name.as_str()) {
+        return Err(sql_err!(
+            sqlstate::DUPLICATE_OBJECT,
+            "constraint \"{}\" for relation \"{}\" already exists",
+            new_name.as_str(),
+            current.name.as_str()
+        ));
+    }
+    let mut altered = current;
+    if !rename_stored_constraint(&mut altered, old_name.as_str(), new_name) {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "attached index \"{}\" has no matching constraint",
+            old_name.as_str()
+        ));
+    }
+    stage_index_rename(storage, wal, txn, index_slot, new_name)?;
+    let mut mapping = [None; MAX_COLUMNS];
+    let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+    for column in 0..current.n_columns {
+        mapping[column] = Some(current.columns()[column].name);
+        wal_mapping[column] = column as u16;
+    }
+    let lsn = storage.bump_lsn();
+    wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::BeginTableRewrite {
+            previous_schema: current.schema.as_str(),
+            previous_name: current.name.as_str(),
+            preserve_rows: true,
+            column_mapping: wal_mapping,
+        },
+    )?;
+    let lsn = storage.bump_lsn();
+    wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered))?;
+    storage.write_table_def(table_index, txn.txid, altered, &mapping, false)?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
+        storage.rollback_table_def(table_index, txn.txid);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn drop_dependent_foreign_keys(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -49483,7 +49827,24 @@ fn alter_partition_attachment(
     };
     let (child_name, parsed_bound) = match action {
         AlterAction::AttachPartition { child, bound } => (child, Some(bound)),
-        AlterAction::DetachPartition { child } => (child, None),
+        AlterAction::DetachPartition { child, mode } => {
+            match mode {
+                crate::sql::ast::PartitionDetachMode::Immediate => {}
+                crate::sql::ast::PartitionDetachMode::Concurrent => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "concurrent partition detach requires an object-native concurrent DDL protocol"
+                    ));
+                }
+                crate::sql::ast::PartitionDetachMode::Finalize => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "partition detach finalization requires an object-native concurrent DDL protocol"
+                    ));
+                }
+            }
+            (child, None)
+        }
         _ => unreachable!("partition attachment action was classified by the caller"),
     };
     let Some(crate::storage::ResolvedRelation::Table(child)) =
@@ -50141,6 +50502,219 @@ fn alter_table_inner(
         );
     }
 
+    // Metadata-only changes must not decode, re-home, or re-journal every row.
+    // They retain the exact row image and install one transaction-owned table
+    // definition, which is the same durable boundary used by row-security.
+    if statement.actions.iter().all(|action| {
+        matches!(
+            action,
+            AlterAction::SetTablespace(_)
+                | AlterAction::SetAccessMethod(_)
+                | AlterAction::SetPersistence(_)
+                | AlterAction::SetStatistics { .. }
+                | AlterAction::SetIdentityMode { .. }
+                | AlterAction::AlterIdentitySequence { .. }
+        )
+    }) {
+        let mut new_def = def;
+        let mut sequence_alterations = [None; MAX_COLUMNS];
+        let mut n_sequence_alterations = 0usize;
+        for action in statement.actions {
+            match action {
+                AlterAction::SetTablespace(name) => {
+                    new_def.tablespace =
+                        match resolve_relation_tablespace(storage, Some(name), txn.txid) {
+                            Ok(tablespace) => tablespace,
+                            Err(error) => return sql_fail(error),
+                        };
+                }
+                AlterAction::SetAccessMethod(crate::sql::ast::TableAccessMethod::Heap) => {
+                    new_def.access_method = crate::storage::TableAccessMethod::Heap;
+                }
+                AlterAction::SetAccessMethod(crate::sql::ast::TableAccessMethod::Named(name)) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "access method \"{}\" does not exist",
+                        name
+                    ));
+                }
+                AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent) => {}
+                AlterAction::SetPersistence(_) => {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "unlogged tables are incompatible with object-native durable storage"
+                    ));
+                }
+                AlterAction::SetStatistics { column, target } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    new_def.columns[column].statistics_target = *target;
+                }
+                AlterAction::SetIdentityMode { column, always } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    if !new_def.columns[column].is_identity {
+                        return sql_fail(sql_err!(
+                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            "column \"{}\" of relation \"{}\" is not an identity column",
+                            column,
+                            statement.table.name
+                        ));
+                    }
+                    new_def.columns[column].identity_always = *always;
+                }
+                AlterAction::AlterIdentitySequence { column, options } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    if !new_def.columns[column].is_identity {
+                        return sql_fail(sql_err!(
+                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            "column \"{}\" of relation \"{}\" is not an identity column",
+                            new_def.columns[column].name.as_str(),
+                            statement.table.name
+                        ));
+                    }
+                    let identity_column = new_def.columns[column].name;
+                    let Some(slot) = storage.generated_sequence_slot(
+                        new_def.schema.as_str(),
+                        new_def.name.as_str(),
+                        identity_column.as_str(),
+                        txn.txid,
+                    ) else {
+                        return sql_fail(sql_err!(
+                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            "identity column \"{}\" has no generator sequence",
+                            identity_column.as_str()
+                        ));
+                    };
+                    let sequence = storage.sequence_for(slot, txn.txid);
+                    let base = SeqSpec {
+                        data_type: sequence.data_type,
+                        increment: sequence.increment,
+                        min_value: sequence.min_value,
+                        max_value: sequence.max_value,
+                        start_value: sequence.start_value,
+                        cache: sequence.cache,
+                        cycle: sequence.cycle,
+                    };
+                    if let Err(error) = plan_identity_sequence_alteration(
+                        &mut sequence_alterations,
+                        &mut n_sequence_alterations,
+                        slot,
+                        options,
+                        base,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Some(increment) = options.increment {
+                        new_def.columns[column].auto_increment_step = increment;
+                    }
+                }
+                _ => unreachable!("metadata-only ALTER action"),
+            }
+        }
+        let mut mapping = [None; MAX_COLUMNS];
+        let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+        for column in 0..def.n_columns {
+            mapping[column] = Some(def.columns()[column].name);
+            wal_mapping[column] = column as u16;
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::BeginTableRewrite {
+                previous_schema: def.schema.as_str(),
+                previous_name: def.name.as_str(),
+                preserve_rows: true,
+                column_mapping: wal_mapping,
+            },
+        ) {
+            return sql_fail(error);
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(new_def)) {
+            return sql_fail(error);
+        }
+        for alteration in sequence_alterations[..n_sequence_alterations]
+            .iter()
+            .flatten()
+        {
+            let sequence = storage.sequence_for(alteration.slot, txn.txid);
+            let prior = match storage.stage_sequence_alter(
+                alteration.slot,
+                crate::storage::SequenceAlteration {
+                    schema: sequence.schema,
+                    spec: alteration.spec,
+                    owner: sequence.owner,
+                    generator_for: sequence.generator_for,
+                    restart: alteration.restart,
+                },
+                txn.txid,
+            ) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let sequence = storage.sequence_for(alteration.slot, txn.txid);
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateSequence {
+                    schema: sequence.schema.as_str(),
+                    name: sequence.name.as_str(),
+                    data_type: alteration.spec.data_type.to_u8(),
+                    increment: alteration.spec.increment,
+                    min_value: alteration.spec.min_value,
+                    max_value: alteration.spec.max_value,
+                    start_value: alteration.spec.start_value,
+                    cache: alteration.spec.cache,
+                    cycle: alteration.spec.cycle,
+                    owner: sequence.owner,
+                    generator_for: sequence.generator_for,
+                },
+            ) {
+                storage.rollback_sequence_alter(alteration.slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SequenceAltered {
+                slot: alteration.slot as u32,
+                prior,
+            }) {
+                storage.rollback_sequence_alter(alteration.slot, prior);
+                return sql_fail(error);
+            }
+            seq_session.invalidate_cache(alteration.slot);
+        }
+        if let Err(error) = storage.write_table_def(table_index, txn.txid, new_def, &mapping, false)
+        {
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
+            storage.rollback_table_def(table_index, txn.txid);
+            return sql_fail(error);
+        }
+        if emit_completion {
+            responder.command_complete(tag)?;
+        }
+        return sql_ok();
+    }
+
+    if statement.actions.iter().any(|action| {
+        matches!(
+            action,
+            AlterAction::SetStorage { .. } | AlterAction::SetCompression { .. }
+        )
+    }) {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "column storage and compression require a durable row codec implementation"
+        ));
+    }
+
     // Collect every committed row up front: the row count decides whether an
     // added NOT NULL column needs a fill (a spilled table has rows even when
     // the overlay map has evicted them, so `rows.is_empty()` cannot answer
@@ -50197,9 +50771,12 @@ fn alter_table_inner(
     let mut added_any = false;
     let mut dropped_any = false;
     let mut retyped_any = false;
+    let mut generated_changed = false;
     let mut validate_definition = false;
     let mut identity_sequences: [Option<OwnedSequencePlan>; MAX_COLUMNS] = [None; MAX_COLUMNS];
     let mut n_identity_sequences = 0usize;
+    let mut identity_sequence_alterations = [None; MAX_COLUMNS];
+    let mut n_identity_sequence_alterations = 0usize;
     let mut owned_sequences_to_drop = [usize::MAX; crate::storage::MAX_SEQUENCES];
     let mut n_owned_sequences_to_drop = 0usize;
     let mut column_renames = [(SqlName::EMPTY, SqlName::EMPTY); MAX_COLUMNS];
@@ -50220,6 +50797,53 @@ fn alter_table_inner(
             }
             AlterAction::SetRowLevelSecurity(_) => {
                 unreachable!("row-level security is a standalone action")
+            }
+            AlterAction::SetPersistence(persistence) => {
+                if *persistence != crate::sql::ast::RelationPersistence::Permanent {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "unlogged tables are incompatible with object-native durable storage"
+                    ));
+                }
+            }
+            AlterAction::SetStorageOptions(_) | AlterAction::ResetStorageOptions(_) => {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "table storage options require an object-native row layout implementation"
+                ));
+            }
+            AlterAction::SetInheritance { .. } => {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "table inheritance requires object-native inherited-relation scans and dependencies"
+                ));
+            }
+            AlterAction::SetStorage { .. } | AlterAction::SetCompression { .. } => {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "column storage and compression require a durable row codec implementation"
+                ));
+            }
+            AlterAction::SetTablespace(name) => {
+                new_def.tablespace =
+                    match resolve_relation_tablespace(storage, Some(name), txn.txid) {
+                        Ok(tablespace) => tablespace,
+                        Err(error) => return sql_fail(error),
+                    };
+            }
+            AlterAction::SetAccessMethod(method) => {
+                new_def.access_method = match method {
+                    crate::sql::ast::TableAccessMethod::Heap => {
+                        crate::storage::TableAccessMethod::Heap
+                    }
+                    crate::sql::ast::TableAccessMethod::Named(name) => {
+                        return sql_fail(sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "access method \"{}\" does not exist",
+                            name
+                        ));
+                    }
+                };
             }
             AlterAction::SetReplicaIdentity(target) => {
                 let (mode, selected) = match resolve_replica_identity_target(
@@ -50559,6 +51183,91 @@ fn alter_table_inner(
                 new_def.columns[i].auto_increment = false;
                 new_def.columns[i].auto_increment_step = 1;
             }
+            AlterAction::SetIdentityMode { column, always } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if !new_def.columns[i].is_identity {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" is not an identity column",
+                        column,
+                        statement.table.name
+                    ));
+                }
+                new_def.columns[i].identity_always = *always;
+            }
+            AlterAction::AlterIdentitySequence { column, options } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if !new_def.columns[i].is_identity {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" is not an identity column",
+                        new_def.columns[i].name.as_str(),
+                        statement.table.name
+                    ));
+                }
+                let identity_column = new_def.columns[i].name;
+                let Some(slot) = storage.generated_sequence_slot(
+                    new_def.schema.as_str(),
+                    new_def.name.as_str(),
+                    identity_column.as_str(),
+                    txn.txid,
+                ) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "identity column \"{}\" has no generator sequence",
+                        identity_column.as_str()
+                    ));
+                };
+                let sequence = storage.sequence_for(slot, txn.txid);
+                let base = SeqSpec {
+                    data_type: sequence.data_type,
+                    increment: sequence.increment,
+                    min_value: sequence.min_value,
+                    max_value: sequence.max_value,
+                    start_value: sequence.start_value,
+                    cache: sequence.cache,
+                    cycle: sequence.cycle,
+                };
+                if let Err(error) = plan_identity_sequence_alteration(
+                    &mut identity_sequence_alterations,
+                    &mut n_identity_sequence_alterations,
+                    slot,
+                    options,
+                    base,
+                ) {
+                    return sql_fail(error);
+                }
+                if let Some(increment) = options.increment {
+                    new_def.columns[i].auto_increment_step = increment;
+                }
+            }
+            AlterAction::SetGeneratedExpression {
+                column,
+                expression_text,
+            } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if !new_def.columns[i].default.is_generated() {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" is not a generated column",
+                        column,
+                        statement.table.name
+                    ));
+                }
+                let expression = match ddl::resolve_generated(expression_text, arena) {
+                    Ok(expression) => expression,
+                    Err(error) => return sql_fail(error),
+                };
+                new_def.columns[i].default = crate::storage::ColumnDefault::Generated(expression);
+                generated_changed = true;
+                validate_definition = true;
+            }
             AlterAction::SetNotNull { column } => {
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
@@ -50587,6 +51296,12 @@ fn alter_table_inner(
                     ));
                 }
                 new_def.columns[i].not_null = new_def.columns[i].not_null.drop_local();
+            }
+            AlterAction::SetStatistics { column, target } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                new_def.columns[i].statistics_target = *target;
             }
             AlterAction::AlterColumnType {
                 column,
@@ -50690,6 +51405,28 @@ fn alter_table_inner(
                     arena,
                 ) {
                     return sql_fail(e);
+                }
+                validate_definition = true;
+            }
+            AlterAction::AttachIndexConstraint {
+                name,
+                index,
+                primary,
+                timing,
+            } => {
+                if let Err(error) = attach_constraint_using_index(
+                    storage,
+                    wal,
+                    txn,
+                    table_index,
+                    &def,
+                    &mut new_def,
+                    *name,
+                    *index,
+                    *primary,
+                    *timing,
+                ) {
+                    return sql_fail(error);
                 }
                 validate_definition = true;
             }
@@ -50834,6 +51571,7 @@ fn alter_table_inner(
                 if_exists,
                 cascade,
             } => {
+                let attached_index = attached_constraint_index(storage, &new_def, name, txn.txid);
                 if named_key_columns(&new_def, name).is_some()
                     && let Err(error) = drop_dependent_foreign_keys(
                         storage,
@@ -50853,6 +51591,11 @@ fn alter_table_inner(
                         Err(error) => return sql_fail(error),
                     };
                     if let Err(error) = txn.drop_constraint(table_index as u32, name) {
+                        return sql_fail(error);
+                    }
+                    if let Some(slot) = attached_index
+                        && let Err(error) = stage_index_drop(storage, wal, txn, slot)
+                    {
                         return sql_fail(error);
                     }
                 } else {
@@ -50878,6 +51621,7 @@ fn alter_table_inner(
                 }
             }
             AlterAction::RenameConstraint { from, to } => {
+                let attached_index = attached_constraint_index(storage, &new_def, from, txn.txid);
                 // The new name must be free among this table's constraints.
                 let taken = new_def.checks[..new_def.n_checks]
                     .iter()
@@ -50927,6 +51671,11 @@ fn alter_table_inner(
                 if let Err(error) = txn.rename_constraint(table_index as u32, old_name, new_name) {
                     return sql_fail(error);
                 }
+                if let Some(slot) = attached_index
+                    && let Err(error) = stage_index_rename(storage, wal, txn, slot, new_name)
+                {
+                    return sql_fail(error);
+                }
             }
         }
     }
@@ -50943,8 +51692,13 @@ fn alter_table_inner(
     if let Err(error) = validate_partitioned_unique_keys(&new_def) {
         return sql_fail(error);
     }
+    if generated_changed
+        && let Err(error) = crate::sql::exec::ddl::validate_generated_refs(&new_def, arena)
+    {
+        return sql_fail(error);
+    }
 
-    let has_rewrite = added_any || dropped_any || retyped_any;
+    let has_rewrite = added_any || dropped_any || retyped_any || generated_changed;
 
     let mut old_schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut old_schema);
@@ -51338,6 +52092,56 @@ fn alter_table_inner(
             Ok(None) => {}
             Err(error) => return sql_fail(error),
         }
+    }
+    for alteration in identity_sequence_alterations[..n_identity_sequence_alterations]
+        .iter()
+        .flatten()
+    {
+        let sequence = storage.sequence_for(alteration.slot, txn.txid);
+        let prior = match storage.stage_sequence_alter(
+            alteration.slot,
+            crate::storage::SequenceAlteration {
+                schema: sequence.schema,
+                spec: alteration.spec,
+                owner: sequence.owner,
+                generator_for: sequence.generator_for,
+                restart: alteration.restart,
+            },
+            txn.txid,
+        ) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        let sequence = storage.sequence_for(alteration.slot, txn.txid);
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::CreateSequence {
+                schema: sequence.schema.as_str(),
+                name: sequence.name.as_str(),
+                data_type: alteration.spec.data_type.to_u8(),
+                increment: alteration.spec.increment,
+                min_value: alteration.spec.min_value,
+                max_value: alteration.spec.max_value,
+                start_value: alteration.spec.start_value,
+                cache: alteration.spec.cache,
+                cycle: alteration.spec.cycle,
+                owner: sequence.owner,
+                generator_for: sequence.generator_for,
+            },
+        ) {
+            storage.rollback_sequence_alter(alteration.slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SequenceAltered {
+            slot: alteration.slot as u32,
+            prior,
+        }) {
+            storage.rollback_sequence_alter(alteration.slot, prior);
+            return sql_fail(error);
+        }
+        seq_session.invalidate_cache(alteration.slot);
     }
     let rebind = |link: Option<crate::storage::SequenceOwner>, require_generator: bool| {
         let mut link = link?;
@@ -52704,6 +53508,7 @@ fn coerce_composite_value_inner<'a>(
             identity_always: false,
             auto_increment_step: 1,
             user_type: field.user_type,
+            statistics_target: -1,
         };
         out.name = arena.alloc_str(field.name.as_str()).map_err(|_| {
             sql_err!(

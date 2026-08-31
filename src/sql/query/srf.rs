@@ -1302,6 +1302,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
         identity_always: false,
         auto_increment_step: 1,
         user_type: None,
+        statistics_target: -1,
     };
     let mut columns = [blank; MAX_COLUMNS];
     for i in 0..n_cols {

@@ -855,6 +855,8 @@ pub struct ColumnMeta {
     /// schema-qualified identity. Runtime enum/domain slots are rebound from
     /// this identity after restart.
     pub user_type: Option<UserTypeName>,
+    /// PostgreSQL's `attstattarget`; -1 selects the server default.
+    pub statistics_target: i16,
 }
 
 /// Durable provenance of a table column's effective `NOT NULL` constraint.
@@ -1028,6 +1030,7 @@ impl ColumnMeta {
         identity_always: false,
         auto_increment_step: 1,
         user_type: None,
+        statistics_target: -1,
     };
 }
 
@@ -1303,6 +1306,11 @@ pub struct TableDef {
     pub schema: SqlName,
     pub name: SqlName,
     pub kind: TableKind,
+    /// The durable PostgreSQL-visible table access method. The object-native
+    /// row representation implements the ordinary heap relation contract.
+    pub access_method: TableAccessMethod,
+    /// Stable tablespace identity; zero is the database default.
+    pub tablespace: u16,
     pub columns: [ColumnMeta; MAX_COLUMNS],
     pub n_columns: usize,
     pub uniques: [UniqueKey; MAX_UNIQUES],
@@ -1365,6 +1373,29 @@ impl ReplicaIdentityMode {
 pub enum TableKind {
     Local,
     Foreign,
+}
+
+/// The table access methods that have an executable object-native relation
+/// implementation. A closed type prevents an accepted catalog spelling from
+/// becoming behaviorless metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAccessMethod {
+    Heap,
+}
+
+impl TableAccessMethod {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Heap => 0,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Heap),
+            _ => None,
+        }
+    }
 }
 
 /// The two independent pg_class row-security flags. A policy may exist while
@@ -1488,6 +1519,8 @@ impl TableDef {
             schema: SqlName::EMPTY,
             name: SqlName::EMPTY,
             kind: TableKind::Local,
+            access_method: TableAccessMethod::Heap,
+            tablespace: 0,
             columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: 0,
             uniques: [UniqueKey::EMPTY; MAX_UNIQUES],
@@ -10895,6 +10928,7 @@ impl Storage {
                             identity_always: false,
                             auto_increment_step: 1,
                             user_type: None,
+                            statistics_target: -1,
                         }; MAX_COLUMNS],
                         n_columns: 0,
                         ..TableDef::empty()
@@ -30005,6 +30039,9 @@ impl Storage {
         if !index.visible_to(txid) {
             return Err(sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"));
         }
+        if index.name_for(txid) == name {
+            return Ok(index.pending_name);
+        }
         if let Some(blocker) = self
             .indexes
             .iter()
@@ -30026,6 +30063,13 @@ impl Storage {
                 && candidate.schema == index.schema
                 && candidate.name_for(txid) == name
         }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_TABLE,
+                "relation \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+        if self.relation_name_taken(index.schema.as_str(), name.as_str(), txid) {
             return Err(sql_err!(
                 sqlstate::DUPLICATE_TABLE,
                 "relation \"{}\" already exists",
@@ -30750,6 +30794,9 @@ impl Storage {
             .any(|index| index.visible_to(txid) && index.mutable_for(txid).tablespace == id)
             || self.databases.iter().any(|database| {
                 database.visible_to(txid) && database.definition_for(txid).tablespace == id
+            })
+            || self.tables.iter().enumerate().any(|(table_slot, table)| {
+                table.visible_to(txid) && self.table_def(table_slot, txid).tablespace == id
             })
         {
             return Err(sql_err!(
@@ -34832,6 +34879,7 @@ mod tests {
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type: None,
+                statistics_target: -1,
             }; MAX_COLUMNS],
             n_columns: columns.len(),
             ..TableDef::empty()
@@ -34855,6 +34903,7 @@ mod tests {
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type: None,
+                statistics_target: -1,
             };
         }
         def

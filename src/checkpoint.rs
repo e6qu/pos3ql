@@ -1197,7 +1197,13 @@ impl Checkpointer {
                         1 => crate::storage::TableKind::Foreign,
                         _ => return Err(CheckpointSetupError::Corrupt("invalid table kind")),
                     };
-                    let name = rest_of(line, 6)?;
+                    let tablespace: u16 = parse_field(words.next(), "table tablespace")?;
+                    let access_method = crate::storage::TableAccessMethod::from_code(parse_field(
+                        words.next(),
+                        "table access method",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid table access method"))?;
+                    let name = rest_of(line, 8)?;
                     let def = TableDef {
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
@@ -1207,6 +1213,8 @@ impl Checkpointer {
                         has_toast,
                         has_rules,
                         kind,
+                        tablespace,
+                        access_method,
                         ..TableDef::empty()
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
@@ -1232,6 +1240,11 @@ impl Checkpointer {
                         )?))
                     };
                     let auto_increment_step: i64 = parse_field(words.next(), "col step")?;
+                    let statistics_target: i16 =
+                        parse_field(words.next(), "col statistics target")?;
+                    if !(-1..=10_000).contains(&statistics_target) {
+                        return Err(CheckpointSetupError::Corrupt("column statistics target"));
+                    }
                     let ctype = ColType::from_code(type_code)
                         .ok_or(CheckpointSetupError::Corrupt("unknown column type code"))?;
                     let collation = crate::sql::ast::Collation::from_code(parse_field::<u8>(
@@ -1266,7 +1279,7 @@ impl Checkpointer {
                             ));
                         }
                     };
-                    let name = rest_of(line, 10)?;
+                    let name = rest_of(line, 11)?;
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
@@ -1293,6 +1306,7 @@ impl Checkpointer {
                         is_identity: not_null & 64 != 0,
                         identity_always: not_null & 128 != 0,
                         auto_increment_step,
+                        statistics_target,
                     };
                     *seen += 1;
                 }
@@ -6000,7 +6014,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "table {slot} {} {} {} {} {}",
+                    "table {slot} {} {} {} {} {} {} {}",
                     table.def.n_columns,
                     u8::from(table.def.has_toast),
                     u8::from(table.def.has_rules),
@@ -6008,6 +6022,8 @@ impl Checkpointer {
                         crate::storage::TableKind::Local => 0,
                         crate::storage::TableKind::Foreign => 1,
                     },
+                    table.def.tablespace,
+                    table.def.access_method.code(),
                     table.def.name.as_str()
                 ),
             )?;
@@ -6084,13 +6100,14 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "col3 {} {} {} {} {} {} {} {} {} {}",
+                        "col3 {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         c.type_mod,
                         default_hex.as_str(),
                         dexpr_hex.as_str(),
                         c.auto_increment_step,
+                        c.statistics_target,
                         c.collation.code(),
                         domain_schema_hex.as_str(),
                         domain_hex.as_str(),
@@ -10818,6 +10835,7 @@ fn empty_column() -> ColumnMeta {
         identity_always: false,
         auto_increment_step: 1,
         user_type: None,
+        statistics_target: -1,
     }
 }
 

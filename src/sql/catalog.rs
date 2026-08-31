@@ -2851,6 +2851,23 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         }
         // Multi-column PK / UNIQUE constraints.
         for uk in def.uniques() {
+            // ALTER TABLE ... ADD CONSTRAINT ... USING INDEX transfers the
+            // index relation into the constraint. Do not synthesize a second
+            // catalog index: matching name plus typed key positions is the
+            // durable attachment proof.
+            if storage
+                .indexes_for(def.schema.as_str(), table_name, txid)
+                .any(|index| {
+                    index.name_for(txid) == uk.name
+                        && index.n_cols == uk.n_cols
+                        && index.columns[..index.n_cols] == uk.columns[..uk.n_cols]
+                        && index.expressions[..index.n_cols]
+                            .iter()
+                            .all(Option::is_none)
+                })
+            {
+                continue;
+            }
             visit(mk(
                 uk.columns(),
                 [false; crate::storage::MAX_INDEX_COLS],
@@ -2888,6 +2905,14 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
         }
         // Explicit CREATE INDEX on this table.
         for index in storage.indexes_for(def.schema.as_str(), table_name, txid) {
+            let attached = def.uniques().iter().find(|key| {
+                key.name == index.name_for(txid)
+                    && key.n_cols == index.n_cols
+                    && key.columns[..key.n_cols] == index.columns[..index.n_cols]
+                    && index.expressions[..index.n_cols]
+                        .iter()
+                        .all(Option::is_none)
+            });
             let mut info = mk(
                 &index.columns[..index.n_cols],
                 index.expressions.map(|expression| expression.is_some()),
@@ -2896,11 +2921,13 @@ fn visit_indexes(storage: &Storage, txid: u32, mut visit: impl FnMut(IdxInfo)) {
                 index.nulls_first,
                 index.predicate,
                 index.nulls_not_distinct,
-                false,
+                attached.is_some_and(|key| key.is_primary),
                 index.unique,
+                attached.is_some(),
                 false,
-                false,
-                crate::storage::ConstraintTiming::NotDeferrable,
+                attached.map_or(crate::storage::ConstraintTiming::NotDeferrable, |key| {
+                    key.timing
+                }),
                 stack_str_64(index.name_for(txid).as_str()),
             );
             info.oid = explicit_index_oid(&index);
@@ -5913,6 +5940,7 @@ fn materialize_def(specification: SynthDef<'_>) -> TableDef {
             identity_always: false,
             auto_increment_step: 1,
             user_type: None,
+            statistics_target: -1,
         }; MAX_COLUMNS],
         n_columns: specification.columns.len(),
         ..TableDef::empty()
@@ -7471,7 +7499,9 @@ fn pg_class<'a>(
                 Datum::Int4(table_def.n_columns as i32),
                 Datum::Float8(reltuples),
                 Datum::Int4(relpages),
-                Datum::Int4(0), // relam
+                Datum::Int4(match table_def.access_method {
+                    crate::storage::TableAccessMethod::Heap => 2,
+                }),
                 Datum::Int4(relation_owner),
                 Datum::Int4(n_checks), // relchecks
                 Datum::Bool(has_index),
@@ -7480,7 +7510,7 @@ fn pg_class<'a>(
                 Datum::Bool(table_def.row_level_security.enabled),
                 Datum::Bool(table_def.row_level_security.forced),
                 Datum::Bool(table_def.partition.is_attached()),
-                Datum::Int4(0), // reltablespace
+                Datum::Int4(catalog_tablespace_oid(storage, table_def.tablespace, txid)),
                 Datum::Int4(0), // reloftype
                 Datum::Int4(if table_def.has_toast {
                     toast_relation_oid(slot)
@@ -10009,8 +10039,13 @@ fn pg_attribute<'a>(
                     // Fixed-width values are plain; variable-width values use
                     // PostgreSQL's ordinary extended storage policy.
                     text(type_storage(c.ctype), arena)?,
-                    text("", arena)?,   // attcompression: type default
-                    Datum::Int4(-1),    // attstattarget: use server default
+                    text("", arena)?, // attcompression: type default
+                    // PostgreSQL exposes its durable `-1` default sentinel as NULL.
+                    if c.statistics_target < 0 {
+                        Datum::Null
+                    } else {
+                        Datum::Int4(i32::from(c.statistics_target))
+                    },
                     Datum::Bool(false), // attisdropped
                     Datum::Int4(i as i32 + 1),
                     text("i", arena)?,
@@ -10102,6 +10137,7 @@ fn pg_attribute<'a>(
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type: field.user_type,
+                statistics_target: -1,
             };
             out[n] = row(
                 &[
@@ -15559,6 +15595,7 @@ fn info_columns<'a>(
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type,
+                statistics_target: -1,
             };
             out[n] = info_column_row(
                 storage,
@@ -16975,6 +17012,7 @@ fn info_column_privileges<'a>(
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type,
+                statistics_target: -1,
             };
         }
         append_relation(
@@ -17489,6 +17527,7 @@ fn info_column_type_usage<'a>(
                 identity_always: false,
                 auto_increment_step: 1,
                 user_type,
+                statistics_target: -1,
             };
             append(
                 view.schema.as_str(),

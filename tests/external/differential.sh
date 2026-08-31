@@ -99,6 +99,25 @@ if [[ -n "$CORPUS_SHARD" ]]; then
   fi
 fi
 
+# A sharded run has one explicitly assigned owner for the non-corpus probes.
+# Repeating them in every shard needlessly consumes the fixed CI time budget.
+if [[ -n "$CORPUS_SHARD" && -z "${POS3QL_DIFF_AUXILIARY+x}" ]]; then
+  printf '%s\n' 'FAIL: sharded differential runs require POS3QL_DIFF_AUXILIARY=all or none'
+  exit 1
+fi
+if [[ -n "$CORPUS_SHARD" ]]; then
+  DIFF_AUXILIARY=$POS3QL_DIFF_AUXILIARY
+else
+  DIFF_AUXILIARY=all
+fi
+case "$DIFF_AUXILIARY" in
+all | none) ;;
+*)
+  printf 'FAIL: POS3QL_DIFF_AUXILIARY must be all or none (got %q)\n' "$DIFF_AUXILIARY"
+  exit 1
+  ;;
+esac
+
 corpus_file_count=0
 for corpus_file in "$EXT"/differential/*.sql; do
   [[ -f "$corpus_file" ]] || continue
@@ -327,6 +346,7 @@ for f in $EXT/differential/*.sql; do
   corpus_ordinal=$((corpus_ordinal + 1))
 done
 
+if [[ "$DIFF_AUXILIARY" == "all" ]]; then
 # Exact-error corpora: the SQLSTATE normalizer above makes wording invisible,
 # which let five message-fidelity fixes ship guarded only by unit tests. These
 # corpora compare the full ERROR line — SQLSTATE and message text — dropping
@@ -449,6 +469,9 @@ if (( FUZZ_COUNT > 0 )); then
     bad "generated SQL differential"
     cat "$WORK/fuzz.out"
   fi
+fi
+else
+  printf '%s\n' 'SKIP: shared exact-error, binary-COPY, type-fidelity, sqllogictest, and fuzz probes are assigned to another shard'
 fi
 
 printf '\npassed: %s  failed: %s\n' "$PASS" "$FAIL"

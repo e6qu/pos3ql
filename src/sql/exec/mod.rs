@@ -50179,6 +50179,7 @@ fn alter_table_inner(
                 | AlterAction::SetAccessMethod(_)
                 | AlterAction::SetPersistence(_)
                 | AlterAction::SetStatistics { .. }
+                | AlterAction::SetIdentityMode { .. }
         )
     }) {
         let mut new_def = def;
@@ -50213,6 +50214,20 @@ fn alter_table_inner(
                         return sql_fail(undefined_column(column));
                     };
                     new_def.columns[column].statistics_target = *target;
+                }
+                AlterAction::SetIdentityMode { column, always } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    if !new_def.columns[column].is_identity {
+                        return sql_fail(sql_err!(
+                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            "column \"{}\" of relation \"{}\" is not an identity column",
+                            column,
+                            statement.table.name
+                        ));
+                    }
+                    new_def.columns[column].identity_always = *always;
                 }
                 _ => unreachable!("metadata-only ALTER action"),
             }
@@ -50252,6 +50267,18 @@ fn alter_table_inner(
             responder.command_complete(tag)?;
         }
         return sql_ok();
+    }
+
+    if statement.actions.iter().any(|action| {
+        matches!(
+            action,
+            AlterAction::SetStorage { .. } | AlterAction::SetCompression { .. }
+        )
+    }) {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "column storage and compression require a durable row codec implementation"
+        ));
     }
 
     // Collect every committed row up front: the row count decides whether an
@@ -50310,6 +50337,7 @@ fn alter_table_inner(
     let mut added_any = false;
     let mut dropped_any = false;
     let mut retyped_any = false;
+    let mut generated_changed = false;
     let mut validate_definition = false;
     let mut identity_sequences: [Option<OwnedSequencePlan>; MAX_COLUMNS] = [None; MAX_COLUMNS];
     let mut n_identity_sequences = 0usize;
@@ -50707,6 +50735,43 @@ fn alter_table_inner(
                 new_def.columns[i].auto_increment = false;
                 new_def.columns[i].auto_increment_step = 1;
             }
+            AlterAction::SetIdentityMode { column, always } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if !new_def.columns[i].is_identity {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" is not an identity column",
+                        column,
+                        statement.table.name
+                    ));
+                }
+                new_def.columns[i].identity_always = *always;
+            }
+            AlterAction::SetGeneratedExpression {
+                column,
+                expression_text,
+            } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if !new_def.columns[i].default.is_generated() {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" is not a generated column",
+                        column,
+                        statement.table.name
+                    ));
+                }
+                let expression = match ddl::resolve_generated(expression_text, arena) {
+                    Ok(expression) => expression,
+                    Err(error) => return sql_fail(error),
+                };
+                new_def.columns[i].default = crate::storage::ColumnDefault::Generated(expression);
+                generated_changed = true;
+                validate_definition = true;
+            }
             AlterAction::SetNotNull { column } => {
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
@@ -51097,8 +51162,13 @@ fn alter_table_inner(
     if let Err(error) = validate_partitioned_unique_keys(&new_def) {
         return sql_fail(error);
     }
+    if generated_changed
+        && let Err(error) = crate::sql::exec::ddl::validate_generated_refs(&new_def, arena)
+    {
+        return sql_fail(error);
+    }
 
-    let has_rewrite = added_any || dropped_any || retyped_any;
+    let has_rewrite = added_any || dropped_any || retyped_any || generated_changed;
 
     let mut old_schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut old_schema);

@@ -3959,6 +3959,16 @@ pub enum AlterAction<'a> {
         column: &'a str,
         if_exists: bool,
     },
+    /// ALTER [COLUMN] col SET GENERATED { ALWAYS | BY DEFAULT }.
+    SetIdentityMode {
+        column: &'a str,
+        always: bool,
+    },
+    /// ALTER [COLUMN] col SET EXPRESSION AS (expr).
+    SetGeneratedExpression {
+        column: &'a str,
+        expression_text: &'a str,
+    },
     /// ALTER [COLUMN] col SET NOT NULL — validated against existing rows.
     SetNotNull {
         column: &'a str,

@@ -83,7 +83,9 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::SetStorage { .. }
         | AlterAction::SetCompression { .. }
         | AlterAction::AddIdentity { .. }
-        | AlterAction::DropIdentity { .. } => 4,
+        | AlterAction::DropIdentity { .. }
+        | AlterAction::SetIdentityMode { .. }
+        | AlterAction::SetGeneratedExpression { .. } => 4,
         AlterAction::SetForeignOptions(_) | AlterAction::SetColumnForeignOptions { .. } => 4,
         // Standalone forms; never appear in a multi-action list.
         AlterAction::RenameTable(_)
@@ -5290,6 +5292,26 @@ impl<'a> Parser<'a> {
                     Ok(AlterAction::SetCompression {
                         column,
                         compression,
+                    })
+                } else if self.eat_ident("generated")? {
+                    let always = if self.eat_ident("always")? {
+                        true
+                    } else {
+                        self.expect_ident("by")?;
+                        self.expect_ident("default")?;
+                        false
+                    };
+                    Ok(AlterAction::SetIdentityMode { column, always })
+                } else if self.eat_ident("expression")? {
+                    self.expect_ident("as")?;
+                    self.expect_op("(")?;
+                    let start = self.peek_at;
+                    let _ = self.expression(0)?;
+                    let expression_text = self.text[start..self.peek_at].trim_end();
+                    self.expect_op(")")?;
+                    Ok(AlterAction::SetGeneratedExpression {
+                        column,
+                        expression_text,
                     })
                 } else {
                     self.expect_ident("not")?;

@@ -3969,6 +3969,11 @@ pub enum AlterAction<'a> {
         column: &'a str,
         expression_text: &'a str,
     },
+    /// ALTER [COLUMN] col SET identity-sequence options.
+    AlterIdentitySequence {
+        column: &'a str,
+        options: SeqOptions<'a>,
+    },
     /// ALTER [COLUMN] col SET NOT NULL — validated against existing rows.
     SetNotNull {
         column: &'a str,

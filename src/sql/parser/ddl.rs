@@ -4443,7 +4443,7 @@ impl<'a> Parser<'a> {
 
     /// The shared CREATE/ALTER SEQUENCE option list. `allow_restart` enables the
     /// ALTER-only `RESTART [WITH n]` clause.
-    fn seq_options(
+    pub(super) fn seq_options(
         &mut self,
         allow_restart: bool,
     ) -> Result<crate::sql::ast::SeqOptions<'a>, ParseError> {

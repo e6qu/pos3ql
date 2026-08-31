@@ -259,6 +259,48 @@ struct OwnedSequencePlan {
     owner: crate::storage::SequenceOwner,
 }
 
+#[derive(Clone, Copy)]
+struct IdentitySequenceAlteration {
+    slot: usize,
+    spec: SeqSpec,
+    restart: Option<i64>,
+}
+
+fn plan_identity_sequence_alteration(
+    alterations: &mut [Option<IdentitySequenceAlteration>; MAX_COLUMNS],
+    n_alterations: &mut usize,
+    slot: usize,
+    options: &crate::sql::ast::SeqOptions,
+    base: SeqSpec,
+) -> Result<(), SqlError> {
+    let existing = alterations[..*n_alterations]
+        .iter()
+        .position(|alteration| alteration.is_some_and(|alteration| alteration.slot == slot));
+    let prior = existing.map_or(base, |index| {
+        alterations[index]
+            .expect("identity sequence alteration is present")
+            .spec
+    });
+    let (spec, restart) = resolve_seq_spec(options, Some(prior))?;
+    if let Some(index) = existing {
+        let alteration = alterations[index]
+            .as_mut()
+            .expect("identity sequence alteration");
+        alteration.spec = spec;
+        if options.restart.is_some() {
+            alteration.restart = restart;
+        }
+    } else {
+        alterations[*n_alterations] = Some(IdentitySequenceAlteration {
+            slot,
+            spec,
+            restart,
+        });
+        *n_alterations += 1;
+    }
+    Ok(())
+}
+
 fn default_owned_sequence_name(table: &str, column: &str) -> Result<SqlName, SqlError> {
     use core::fmt::Write as _;
     let mut name = crate::util::StackStr::<64>::new();
@@ -50180,9 +50222,12 @@ fn alter_table_inner(
                 | AlterAction::SetPersistence(_)
                 | AlterAction::SetStatistics { .. }
                 | AlterAction::SetIdentityMode { .. }
+                | AlterAction::AlterIdentitySequence { .. }
         )
     }) {
         let mut new_def = def;
+        let mut sequence_alterations = [None; MAX_COLUMNS];
+        let mut n_sequence_alterations = 0usize;
         for action in statement.actions {
             match action {
                 AlterAction::SetTablespace(name) => {
@@ -50229,6 +50274,54 @@ fn alter_table_inner(
                     }
                     new_def.columns[column].identity_always = *always;
                 }
+                AlterAction::AlterIdentitySequence { column, options } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    if !new_def.columns[column].is_identity {
+                        return sql_fail(sql_err!(
+                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            "column \"{}\" of relation \"{}\" is not an identity column",
+                            new_def.columns[column].name.as_str(),
+                            statement.table.name
+                        ));
+                    }
+                    let identity_column = new_def.columns[column].name;
+                    let Some(slot) = storage.generated_sequence_slot(
+                        new_def.schema.as_str(),
+                        new_def.name.as_str(),
+                        identity_column.as_str(),
+                        txn.txid,
+                    ) else {
+                        return sql_fail(sql_err!(
+                            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            "identity column \"{}\" has no generator sequence",
+                            identity_column.as_str()
+                        ));
+                    };
+                    let sequence = storage.sequence_for(slot, txn.txid);
+                    let base = SeqSpec {
+                        data_type: sequence.data_type,
+                        increment: sequence.increment,
+                        min_value: sequence.min_value,
+                        max_value: sequence.max_value,
+                        start_value: sequence.start_value,
+                        cache: sequence.cache,
+                        cycle: sequence.cycle,
+                    };
+                    if let Err(error) = plan_identity_sequence_alteration(
+                        &mut sequence_alterations,
+                        &mut n_sequence_alterations,
+                        slot,
+                        options,
+                        base,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    if let Some(increment) = options.increment {
+                        new_def.columns[column].auto_increment_step = increment;
+                    }
+                }
                 _ => unreachable!("metadata-only ALTER action"),
             }
         }
@@ -50254,6 +50347,56 @@ fn alter_table_inner(
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(new_def)) {
             return sql_fail(error);
+        }
+        for alteration in sequence_alterations[..n_sequence_alterations]
+            .iter()
+            .flatten()
+        {
+            let sequence = storage.sequence_for(alteration.slot, txn.txid);
+            let prior = match storage.stage_sequence_alter(
+                alteration.slot,
+                crate::storage::SequenceAlteration {
+                    schema: sequence.schema,
+                    spec: alteration.spec,
+                    owner: sequence.owner,
+                    generator_for: sequence.generator_for,
+                    restart: alteration.restart,
+                },
+                txn.txid,
+            ) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let sequence = storage.sequence_for(alteration.slot, txn.txid);
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::CreateSequence {
+                    schema: sequence.schema.as_str(),
+                    name: sequence.name.as_str(),
+                    data_type: alteration.spec.data_type.to_u8(),
+                    increment: alteration.spec.increment,
+                    min_value: alteration.spec.min_value,
+                    max_value: alteration.spec.max_value,
+                    start_value: alteration.spec.start_value,
+                    cache: alteration.spec.cache,
+                    cycle: alteration.spec.cycle,
+                    owner: sequence.owner,
+                    generator_for: sequence.generator_for,
+                },
+            ) {
+                storage.rollback_sequence_alter(alteration.slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SequenceAltered {
+                slot: alteration.slot as u32,
+                prior,
+            }) {
+                storage.rollback_sequence_alter(alteration.slot, prior);
+                return sql_fail(error);
+            }
+            seq_session.invalidate_cache(alteration.slot);
         }
         if let Err(error) = storage.write_table_def(table_index, txn.txid, new_def, &mapping, false)
         {
@@ -50341,6 +50484,8 @@ fn alter_table_inner(
     let mut validate_definition = false;
     let mut identity_sequences: [Option<OwnedSequencePlan>; MAX_COLUMNS] = [None; MAX_COLUMNS];
     let mut n_identity_sequences = 0usize;
+    let mut identity_sequence_alterations = [None; MAX_COLUMNS];
+    let mut n_identity_sequence_alterations = 0usize;
     let mut owned_sequences_to_drop = [usize::MAX; crate::storage::MAX_SEQUENCES];
     let mut n_owned_sequences_to_drop = 0usize;
     let mut column_renames = [(SqlName::EMPTY, SqlName::EMPTY); MAX_COLUMNS];
@@ -50748,6 +50893,54 @@ fn alter_table_inner(
                     ));
                 }
                 new_def.columns[i].identity_always = *always;
+            }
+            AlterAction::AlterIdentitySequence { column, options } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if !new_def.columns[i].is_identity {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" is not an identity column",
+                        new_def.columns[i].name.as_str(),
+                        statement.table.name
+                    ));
+                }
+                let identity_column = new_def.columns[i].name;
+                let Some(slot) = storage.generated_sequence_slot(
+                    new_def.schema.as_str(),
+                    new_def.name.as_str(),
+                    identity_column.as_str(),
+                    txn.txid,
+                ) else {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "identity column \"{}\" has no generator sequence",
+                        identity_column.as_str()
+                    ));
+                };
+                let sequence = storage.sequence_for(slot, txn.txid);
+                let base = SeqSpec {
+                    data_type: sequence.data_type,
+                    increment: sequence.increment,
+                    min_value: sequence.min_value,
+                    max_value: sequence.max_value,
+                    start_value: sequence.start_value,
+                    cache: sequence.cache,
+                    cycle: sequence.cycle,
+                };
+                if let Err(error) = plan_identity_sequence_alteration(
+                    &mut identity_sequence_alterations,
+                    &mut n_identity_sequence_alterations,
+                    slot,
+                    options,
+                    base,
+                ) {
+                    return sql_fail(error);
+                }
+                if let Some(increment) = options.increment {
+                    new_def.columns[i].auto_increment_step = increment;
+                }
             }
             AlterAction::SetGeneratedExpression {
                 column,
@@ -51562,6 +51755,56 @@ fn alter_table_inner(
             Ok(None) => {}
             Err(error) => return sql_fail(error),
         }
+    }
+    for alteration in identity_sequence_alterations[..n_identity_sequence_alterations]
+        .iter()
+        .flatten()
+    {
+        let sequence = storage.sequence_for(alteration.slot, txn.txid);
+        let prior = match storage.stage_sequence_alter(
+            alteration.slot,
+            crate::storage::SequenceAlteration {
+                schema: sequence.schema,
+                spec: alteration.spec,
+                owner: sequence.owner,
+                generator_for: sequence.generator_for,
+                restart: alteration.restart,
+            },
+            txn.txid,
+        ) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        let sequence = storage.sequence_for(alteration.slot, txn.txid);
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::CreateSequence {
+                schema: sequence.schema.as_str(),
+                name: sequence.name.as_str(),
+                data_type: alteration.spec.data_type.to_u8(),
+                increment: alteration.spec.increment,
+                min_value: alteration.spec.min_value,
+                max_value: alteration.spec.max_value,
+                start_value: alteration.spec.start_value,
+                cache: alteration.spec.cache,
+                cycle: alteration.spec.cycle,
+                owner: sequence.owner,
+                generator_for: sequence.generator_for,
+            },
+        ) {
+            storage.rollback_sequence_alter(alteration.slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SequenceAltered {
+            slot: alteration.slot as u32,
+            prior,
+        }) {
+            storage.rollback_sequence_alter(alteration.slot, prior);
+            return sql_fail(error);
+        }
+        seq_session.invalidate_cache(alteration.slot);
     }
     let rebind = |link: Option<crate::storage::SequenceOwner>, require_generator: bool| {
         let mut link = link?;

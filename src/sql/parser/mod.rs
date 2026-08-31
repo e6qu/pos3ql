@@ -85,7 +85,8 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::AddIdentity { .. }
         | AlterAction::DropIdentity { .. }
         | AlterAction::SetIdentityMode { .. }
-        | AlterAction::SetGeneratedExpression { .. } => 4,
+        | AlterAction::SetGeneratedExpression { .. }
+        | AlterAction::AlterIdentitySequence { .. } => 4,
         AlterAction::SetForeignOptions(_) | AlterAction::SetColumnForeignOptions { .. } => 4,
         // Standalone forms; never appear in a multi-action list.
         AlterAction::RenameTable(_)
@@ -5313,6 +5314,23 @@ impl<'a> Parser<'a> {
                         column,
                         expression_text,
                     })
+                } else if matches!(
+                    self.peeked,
+                    Tok::Ident(
+                        "increment"
+                            | "minvalue"
+                            | "maxvalue"
+                            | "start"
+                            | "cache"
+                            | "cycle"
+                            | "no"
+                            | "restart"
+                    )
+                ) {
+                    Ok(AlterAction::AlterIdentitySequence {
+                        column,
+                        options: self.seq_options(true)?,
+                    })
                 } else {
                     self.expect_ident("not")?;
                     self.expect_ident("null")?;
@@ -5345,8 +5363,24 @@ impl<'a> Parser<'a> {
                         Err(self.err_here("a column cannot be turned into a generated column"))
                     }
                 }
+            } else if self.eat_ident("restart")? {
+                let restart = if self.eat_ident("with")?
+                    || matches!(self.peeked, Tok::Num(_))
+                    || self.peeked == Tok::Op("-")
+                {
+                    Some(self.seq_int()?)
+                } else {
+                    None
+                };
+                Ok(AlterAction::AlterIdentitySequence {
+                    column,
+                    options: crate::sql::ast::SeqOptions {
+                        restart: Some(restart),
+                        ..crate::sql::ast::SeqOptions::EMPTY
+                    },
+                })
             } else {
-                Err(self.unexpected("expected TYPE, SET, DROP or ADD"))
+                Err(self.unexpected("expected TYPE, SET, DROP, ADD or RESTART"))
             }
         } else {
             Err(self.unexpected("expected ADD, DROP or ALTER"))

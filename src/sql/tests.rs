@@ -10269,6 +10269,96 @@ fn logical_replication_publication_column_lists_project_relation_and_tuple_on_si
     );
 }
 
+#[test]
+fn logical_replication_emits_the_selected_replica_identity_tuple_kind() {
+    std::thread::Builder::new()
+        .name("logical-replica-identity".into())
+        .stack_size(8 << 20)
+        .spawn(logical_replication_emits_the_selected_replica_identity_tuple_kind_on_sized_stack)
+        .expect("logical replica identity test thread starts")
+        .join()
+        .expect("logical replica identity test thread completes");
+}
+
+fn logical_replication_emits_the_selected_replica_identity_tuple_kind_on_sized_stack() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    let setup = run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE replica_identity_stream (id int PRIMARY KEY, alternate int NOT NULL, payload text); \
+         CREATE UNIQUE INDEX replica_identity_stream_alternate \
+           ON replica_identity_stream (alternate); \
+         CREATE PUBLICATION replica_identity_changes FOR TABLE replica_identity_stream \
+           WITH (publish = 'update'); \
+         INSERT INTO replica_identity_stream VALUES (1, 10, 'before')",
+    );
+    assert!(!setup.contains("ERROR"), "{setup}");
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "replica identity scratch", 1 << 16).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "replica identity send", 1 << 16).unwrap();
+    let publication = crate::storage::SqlName::parse("replica_identity_changes").unwrap();
+
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "ALTER TABLE replica_identity_stream REPLICA IDENTITY \
+           USING INDEX replica_identity_stream_alternate; \
+         UPDATE replica_identity_stream SET payload = 'indexed' WHERE id = 1",
+    );
+    engine
+        .emit_replication_transaction(
+            floor,
+            &[publication],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("indexed replica identity update is retained");
+    assert!(
+        send.readable()
+            .windows(6)
+            .any(|frame| frame[0] == b'U' && frame[5] == b'K'),
+        "{:?}",
+        send.readable()
+    );
+
+    scratch.clear();
+    send.clear();
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "ALTER TABLE replica_identity_stream REPLICA IDENTITY FULL; \
+         UPDATE replica_identity_stream SET payload = 'full' WHERE id = 1",
+    );
+    engine
+        .emit_replication_transaction(
+            floor,
+            &[publication],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("full replica identity update is retained");
+    assert!(
+        send.readable()
+            .windows(6)
+            .any(|frame| frame[0] == b'U' && frame[5] == b'O'),
+        "{:?}",
+        send.readable()
+    );
+}
+
 fn logical_replication_generated_column_policy_is_typed_and_applied_on_sized_stack() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();
@@ -35171,6 +35261,165 @@ fn cluster_table_is_transactional_but_cluster_all_is_not() {
         "{}",
         String::from_utf8_lossy(&all)
     );
+}
+
+#[test]
+fn replica_identity_is_typed_transactional_and_catalog_visible() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE replica_identity_rows (id int PRIMARY KEY, alternate int NOT NULL); \
+         CREATE UNIQUE INDEX replica_identity_alternate ON replica_identity_rows (alternate); \
+         ALTER TABLE replica_identity_rows REPLICA IDENTITY USING INDEX replica_identity_alternate",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relreplident FROM pg_class WHERE oid = 'replica_identity_rows'::regclass; \
+             SELECT indisreplident FROM pg_index \
+              WHERE indexrelid = 'replica_identity_alternate'::regclass",
+        )),
+        ["i", "t"]
+    );
+    let transactional = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         ALTER TABLE replica_identity_rows REPLICA IDENTITY NOTHING; \
+         SELECT relreplident FROM pg_class WHERE oid = 'replica_identity_rows'::regclass; \
+         ROLLBACK; \
+         SELECT relreplident FROM pg_class WHERE oid = 'replica_identity_rows'::regclass",
+    );
+    assert_eq!(data_rows(&transactional), ["n", "i"]);
+    let dropped = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP INDEX replica_identity_alternate",
+    );
+    assert!(
+        String::from_utf8_lossy(&dropped).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&dropped)
+    );
+    let default = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE replica_identity_rows REPLICA IDENTITY DEFAULT; \
+         DROP INDEX replica_identity_alternate; \
+         SELECT relreplident FROM pg_class WHERE oid = 'replica_identity_rows'::regclass",
+    );
+    assert_eq!(data_rows(&default), ["d"]);
+    let combined = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE replica_identity_rows \
+           REPLICA IDENTITY FULL, ADD COLUMN payload text; \
+         SELECT relreplident FROM pg_class WHERE oid = 'replica_identity_rows'::regclass",
+    );
+    assert_eq!(data_rows(&combined), ["f"]);
+
+    let dropped_by_column = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE replica_identity_dropped_index (id int, alternate int NOT NULL); \
+         CREATE UNIQUE INDEX replica_identity_dropped_index_alternate \
+           ON replica_identity_dropped_index (alternate); \
+         ALTER TABLE replica_identity_dropped_index REPLICA IDENTITY \
+           USING INDEX replica_identity_dropped_index_alternate; \
+         ALTER TABLE replica_identity_dropped_index DROP COLUMN alternate; \
+         SELECT relreplident FROM pg_class \
+          WHERE oid = 'replica_identity_dropped_index'::regclass; \
+         SELECT count(*) FROM pg_index \
+          WHERE indrelid = 'replica_identity_dropped_index'::regclass \
+            AND indisreplident",
+    );
+    assert_eq!(data_rows(&dropped_by_column), ["i", "0"]);
+
+    let invalid_setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE replica_identity_invalid_candidates (nullable_key int, required_key int NOT NULL); \
+         CREATE INDEX replica_identity_nonunique ON replica_identity_invalid_candidates (required_key); \
+         CREATE UNIQUE INDEX replica_identity_nullable ON replica_identity_invalid_candidates (nullable_key); \
+         CREATE UNIQUE INDEX replica_identity_expression ON replica_identity_invalid_candidates ((required_key + 1))",
+    );
+    assert!(
+        !String::from_utf8_lossy(&invalid_setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&invalid_setup)
+    );
+    for (index, sqlstate) in [
+        ("replica_identity_nonunique", "42809"),
+        ("replica_identity_nullable", "42809"),
+        ("replica_identity_expression", "0A000"),
+    ] {
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "ALTER TABLE replica_identity_invalid_candidates REPLICA IDENTITY USING INDEX {index}"
+            ),
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains(sqlstate),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
+fn replica_identity_selection_survives_checkpoint_and_cold_restart() {
+    let mut config = test_config("replica-identity-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("replica-identity-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE replica_identity_recovery (id int PRIMARY KEY, alternate int NOT NULL); \
+         CREATE UNIQUE INDEX replica_identity_recovery_alternate \
+           ON replica_identity_recovery (alternate); \
+         ALTER TABLE replica_identity_recovery REPLICA IDENTITY \
+           USING INDEX replica_identity_recovery_alternate",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT relreplident FROM pg_class \
+              WHERE oid = 'replica_identity_recovery'::regclass; \
+             SELECT indisreplident FROM pg_index \
+              WHERE indexrelid = 'replica_identity_recovery_alternate'::regclass",
+        )),
+        ["i", "t"]
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

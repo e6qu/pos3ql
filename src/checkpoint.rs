@@ -1616,6 +1616,10 @@ impl Checkpointer {
                             _ => return Err(CheckpointSetupError::Corrupt("rls forced")),
                         },
                     };
+                    def.replica_identity = crate::storage::ReplicaIdentityMode::from_code(
+                        parse_field(words.next(), "replica identity mode")?,
+                    )
+                    .ok_or(CheckpointSetupError::Corrupt("replica identity mode"))?;
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing rls fields"));
                     }
@@ -5043,6 +5047,16 @@ impl Checkpointer {
                             "partitioned index cannot be clustered",
                         ));
                     }
+                    let replica_identity = match parse_field(words.next(), "idx replica identity")?
+                    {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "bad index replica identity",
+                            ));
+                        }
+                    };
                     if words.next().is_some() {
                         return Err(CheckpointSetupError::Corrupt("trailing idx fields"));
                     }
@@ -5089,6 +5103,7 @@ impl Checkpointer {
                                     parent: (parent != u16::MAX).then_some(parent),
                                     kind,
                                     clustered,
+                                    replica_identity,
                                 },
                                 pending_definition: None,
                                 ddl_state: crate::storage::CatalogDdlState::Present,
@@ -6011,9 +6026,10 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rls {} {}",
+                    "rls {} {} {}",
                     u8::from(table.def.row_level_security.enabled),
                     u8::from(table.def.row_level_security.forced),
+                    table.def.replica_identity.code(),
                 ),
             )?;
             for c in table.def.columns() {
@@ -8130,7 +8146,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {}",
+                    "idx {} {} {} {}{} {} {} {} {} {} {} {} {} {}{} {}{}{}{} {} {} {} {}{} {} {} {} {}",
                     index.created_at,
                     u8::from(index.unique),
                     index.n_cols,
@@ -8158,6 +8174,7 @@ impl Checkpointer {
                     mutable.parent.unwrap_or(u16::MAX),
                     kind,
                     u8::from(mutable.clustered),
+                    u8::from(mutable.replica_identity),
                 ),
             )?;
         }

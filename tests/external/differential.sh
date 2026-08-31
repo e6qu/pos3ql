@@ -82,6 +82,32 @@ fi
 FUZZ_COUNT=${POS3QL_FUZZ_COUNT:-0}
 FUZZ_SEED=${POS3QL_FUZZ_SEED:-1}
 DIFF_OBJECT_PREFIX=${POS3QL_DIFF_OBJECT_STORE_PREFIX:-}
+CORPUS_SHARD=${POS3QL_DIFF_CORPUS_SHARD:-}
+CORPUS_SHARD_INDEX=0
+CORPUS_SHARD_COUNT=1
+
+if [[ -n "$CORPUS_SHARD" ]]; then
+  if [[ ! "$CORPUS_SHARD" =~ ^([0-9]+)-of-([1-9][0-9]*)$ ]]; then
+    printf 'FAIL: POS3QL_DIFF_CORPUS_SHARD must be INDEX-of-COUNT\n'
+    exit 1
+  fi
+  CORPUS_SHARD_INDEX=${BASH_REMATCH[1]}
+  CORPUS_SHARD_COUNT=${BASH_REMATCH[2]}
+  if (( CORPUS_SHARD_INDEX >= CORPUS_SHARD_COUNT )); then
+    printf 'FAIL: POS3QL_DIFF_CORPUS_SHARD index must be smaller than count\n'
+    exit 1
+  fi
+fi
+
+corpus_file_count=0
+for corpus_file in "$EXT"/differential/*.sql; do
+  [[ -f "$corpus_file" ]] || continue
+  corpus_file_count=$((corpus_file_count + 1))
+done
+if (( CORPUS_SHARD_COUNT > corpus_file_count )); then
+  printf 'FAIL: POS3QL_DIFF_CORPUS_SHARD count exceeds the corpus count\n'
+  exit 1
+fi
 
 if [[ "${POS3QL_DIFF_OBJECT_STORE:-off}" == "on" && -z "$DIFF_OBJECT_PREFIX" ]]; then
   printf '%s\n' 'FAIL: durable differential runs require POS3QL_DIFF_OBJECT_STORE_PREFIX'
@@ -282,7 +308,12 @@ restart_pos3ql_clean() {
 
 printf '%s\n' '=== corpus diffs (real PostgreSQL vs pos3ql) ==='
 reset_pair
+corpus_ordinal=0
 for f in $EXT/differential/*.sql; do
+  if (( corpus_ordinal % CORPUS_SHARD_COUNT != CORPUS_SHARD_INDEX )); then
+    corpus_ordinal=$((corpus_ordinal + 1))
+    continue
+  fi
   name=$(basename "$f" .sql)
   run_corpus "$PG_PORT" "$name.pg" "$f"
   run_corpus "$P3_PORT" "$name.p3" "$f"
@@ -293,6 +324,7 @@ for f in $EXT/differential/*.sql; do
     head -30 "$WORK/$name.diff"
   fi
   reset_pair
+  corpus_ordinal=$((corpus_ordinal + 1))
 done
 
 # Exact-error corpora: the SQLSTATE normalizer above makes wording invisible,

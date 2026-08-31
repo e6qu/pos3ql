@@ -2203,7 +2203,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             }
             n += def.n_columns;
             n += encoded_partition_len(def.partition);
-            n += 2;
+            n += 3;
             n
         }
         WalOp::BeginTableRewrite {
@@ -2538,9 +2538,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 2
                 + 1
                 + 1
+                + 1
         }
         WalOp::AlterIndexDefinition { schema, name, .. } => {
-            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 2
+            1 + schema.len() + 1 + name.len() + 2 + 1 + 1 + MAX_INDEX_COLS * 2 + 2 + 3
         }
         WalOp::CreateTablespace { name, location, .. } => {
             8 + 1 + name.len() + 2 + location.len() + 24 + 2
@@ -3303,7 +3304,11 @@ fn append_index_definition(
         ok &= buffer.append(&statistic.to_le_bytes());
     }
     ok &= buffer.append(&definition.parent.unwrap_or(u16::MAX).to_le_bytes());
-    ok && buffer.append(&[kind, u8::from(definition.clustered)])
+    ok && buffer.append(&[
+        kind,
+        u8::from(definition.clustered),
+        u8::from(definition.replica_identity),
+    ])
 }
 
 fn append_tablespace_options(
@@ -3702,6 +3707,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= buffer.append(&[
                 u8::from(def.row_level_security.enabled),
                 u8::from(def.row_level_security.forced),
+                def.replica_identity.code(),
             ]);
             ok
         }
@@ -5553,6 +5559,12 @@ fn decode_index_definition(
         _ => return None,
     };
     *at += 1;
+    let replica_identity = match *payload.get(*at)? {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    *at += 1;
     if clustered && !matches!(kind, crate::storage::IndexKind::Ordinary) {
         return None;
     }
@@ -5566,6 +5578,7 @@ fn decode_index_definition(
         parent: (parent != u16::MAX).then_some(parent),
         kind,
         clustered,
+        replica_identity,
     })
 }
 
@@ -6202,6 +6215,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 },
             };
             at += 2;
+            def.replica_identity =
+                crate::storage::ReplicaIdentityMode::from_code(*payload.get(at)?)?;
+            at += 1;
             (at == payload.len()).then_some(WalOp::CreateTable(def))
         }
         KIND_REWRITE_TABLE => {

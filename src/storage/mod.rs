@@ -1319,7 +1319,46 @@ pub struct TableDef {
     /// PostgreSQL leaves `relhasrules` set after the last rule is dropped.
     pub has_rules: bool,
     pub row_level_security: RowLevelSecurityState,
+    /// The table-owned replica-identity mode. `Index` normally has one
+    /// selected index definition, but PostgreSQL retains this mode when a
+    /// dependent index disappears with a dropped column.
+    pub replica_identity: ReplicaIdentityMode,
     pub partition: PartitionDef,
+}
+
+/// The durable table modes of PostgreSQL logical replica identity. The index
+/// choice itself lives on the selected index so index lifecycle, WAL and
+/// catalog rendering share one owner. `Index` may deliberately have no
+/// selection after PostgreSQL drops a dependent index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaIdentityMode {
+    Default,
+    Full,
+    Nothing,
+    Index,
+}
+
+impl ReplicaIdentityMode {
+    pub const DEFAULT: Self = Self::Default;
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Default => b'd',
+            Self::Full => b'f',
+            Self::Nothing => b'n',
+            Self::Index => b'i',
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b'd' => Some(Self::Default),
+            b'f' => Some(Self::Full),
+            b'n' => Some(Self::Nothing),
+            b'i' => Some(Self::Index),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1462,6 +1501,7 @@ impl TableDef {
             has_toast: false,
             has_rules: false,
             row_level_security: RowLevelSecurityState::DISABLED,
+            replica_identity: ReplicaIdentityMode::DEFAULT,
             partition: PartitionDef::NONE,
         }
     }
@@ -7806,6 +7846,9 @@ pub struct IndexMutableDefinition {
     /// PostgreSQL's `pg_index.indisclustered`: at most one ordinary index on
     /// a relation is the selected CLUSTER ordering.
     pub clustered: bool,
+    /// PostgreSQL's `pg_index.indisreplident`. Storage permits at most one
+    /// selected index for a relation; the owning table records `Index` mode.
+    pub replica_identity: bool,
 }
 
 impl IndexMutableDefinition {
@@ -7816,6 +7859,7 @@ impl IndexMutableDefinition {
         parent: None,
         kind: IndexKind::Ordinary,
         clustered: false,
+        replica_identity: false,
     };
 }
 
@@ -30047,6 +30091,12 @@ impl Storage {
                 "partitioned index cannot be selected for clustering"
             ));
         }
+        if def.mutable.replica_identity && !matches!(def.mutable.kind, IndexKind::Ordinary) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                "partitioned index cannot be selected as replica identity"
+            ));
+        }
         if def.mutable.clustered
             && self.indexes.iter().any(|index| {
                 index.database == self.current_database
@@ -30059,6 +30109,20 @@ impl Storage {
             return Err(sql_err!(
                 crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
                 "relation already has a clustered index"
+            ));
+        }
+        if def.mutable.replica_identity
+            && self.indexes.iter().any(|index| {
+                index.database == self.current_database
+                    && index.visible_to(txid)
+                    && index.schema == def.schema
+                    && index.table == def.table
+                    && index.mutable_for(txid).replica_identity
+            })
+        {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                "relation already has a replica identity index"
             ));
         }
         if let Some(blocker) = self.indexes.iter().find_map(|index| {
@@ -30122,6 +30186,12 @@ impl Storage {
                 "partitioned index cannot be selected for clustering"
             ));
         }
+        if definition.replica_identity && !matches!(definition.kind, IndexKind::Ordinary) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                "partitioned index cannot be selected as replica identity"
+            ));
+        }
         let pending = self.indexes[slot].pending_definition;
         if let Some(pending) = pending
             && pending.txid != txid
@@ -30145,6 +30215,22 @@ impl Storage {
                 return Err(sql_err!(
                     crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
                     "relation already has a clustered index"
+                ));
+            }
+        }
+        if definition.replica_identity {
+            let index = self.indexes[slot];
+            if self.indexes.iter().enumerate().any(|(other_slot, other)| {
+                other_slot != slot
+                    && other.database == self.current_database
+                    && other.visible_to(txid)
+                    && other.schema == index.schema
+                    && other.table == index.table
+                    && other.mutable_for(txid).replica_identity
+            }) {
+                return Err(sql_err!(
+                    crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION,
+                    "relation already has a replica identity index"
                 ));
             }
         }

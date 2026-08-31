@@ -12127,7 +12127,7 @@ fn publication_members(
             debug_assert!(column_index < crate::storage::MAX_COLUMNS);
         }
         if require_replica_identity {
-            validate_publication_column_mask(definition, mask)?;
+            validate_publication_column_mask(storage, slot, mask, txid)?;
         }
         if let Some(filter) = table.filter {
             if let Some(function) = filter.contains_nonimmutable_function() {
@@ -12147,7 +12147,10 @@ fn publication_members(
                     ColType::from_oid(type_oid).map_or("unknown", |ty| ty.name())
                 ));
             }
-            if require_replica_identity && referenced & !replica_identity_columns(definition) != 0 {
+            if require_replica_identity
+                && replica_identity_columns(storage, slot, txid)?
+                    .is_none_or(|identity| referenced & !identity != 0)
+            {
                 return Err(sql_err!(
                     sqlstate::INVALID_PARAMETER_VALUE,
                     "publication row filter must use only replica identity columns"
@@ -12192,25 +12195,24 @@ fn validate_publication_replica_identity(
         .iter()
         .zip(&definition.table_column_masks[..definition.table_count])
     {
-        validate_publication_column_mask(storage.table_def(*table as usize, 0), *mask)?;
+        validate_publication_column_mask(storage, *table as usize, *mask, 0)?;
     }
     Ok(())
 }
 
-fn validate_publication_column_mask(definition: &TableDef, mask: u64) -> Result<(), SqlError> {
+fn validate_publication_column_mask(
+    storage: &Storage,
+    table_slot: usize,
+    mask: u64,
+    txid: u32,
+) -> Result<(), SqlError> {
     if mask == 0 {
         return Ok(());
     }
-    let all_columns = if definition.n_columns == MAX_COLUMNS {
-        u64::MAX
-    } else {
-        (1u64 << definition.n_columns) - 1
-    };
-    let identity = replica_identity_columns(definition);
-    if identity != 0 && mask & identity == identity {
-        return Ok(());
-    }
-    if identity == 0 && mask == all_columns {
+    let identity = replica_identity_columns(storage, table_slot, txid)?;
+    if let Some(identity) = identity
+        && mask & identity == identity
+    {
         return Ok(());
     }
     Err(sql_err!(
@@ -12219,22 +12221,53 @@ fn validate_publication_column_mask(definition: &TableDef, mask: u64) -> Result<
     ))
 }
 
-fn replica_identity_columns(definition: &TableDef) -> u64 {
-    let identity = definition
-        .columns()
-        .iter()
-        .enumerate()
-        .fold(0u64, |mask, (index, column)| {
-            mask | (u64::from(column.primary) << index)
-        });
-    if identity == 0 {
-        if definition.n_columns == MAX_COLUMNS {
-            u64::MAX
-        } else {
-            (1u64 << definition.n_columns) - 1
-        }
+fn replica_identity_columns(
+    storage: &Storage,
+    table_slot: usize,
+    txid: u32,
+) -> Result<Option<u64>, SqlError> {
+    let definition = storage.table_def(table_slot, txid);
+    let all_columns = if definition.n_columns == MAX_COLUMNS {
+        u64::MAX
     } else {
-        identity
+        (1u64 << definition.n_columns) - 1
+    };
+    match definition.replica_identity {
+        crate::storage::ReplicaIdentityMode::Nothing => Ok(None),
+        crate::storage::ReplicaIdentityMode::Full => Ok(Some(all_columns)),
+        crate::storage::ReplicaIdentityMode::Default => {
+            let identity = definition
+                .columns()
+                .iter()
+                .enumerate()
+                .fold(0u64, |mask, (index, column)| {
+                    mask | (u64::from(column.primary) << index)
+                });
+            Ok((identity != 0).then_some(identity))
+        }
+        crate::storage::ReplicaIdentityMode::Index => {
+            let mut identity = None;
+            for index_slot in 0..storage.index_count() {
+                let Some(index) = storage.index_visible_to(index_slot, txid) else {
+                    continue;
+                };
+                if storage.index_table_slot_to(index_slot, txid) != Some(table_slot)
+                    || !index.mutable_for(txid).replica_identity
+                {
+                    continue;
+                }
+                let columns = index.columns[..index.n_cols]
+                    .iter()
+                    .fold(0u64, |mask, column| mask | (1u64 << column));
+                if identity.replace(columns).is_some() {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "relation has more than one replica identity index"
+                    ));
+                }
+            }
+            Ok(identity)
+        }
     }
 }
 
@@ -39236,6 +39269,13 @@ pub fn drop_index(
             let definition = storage
                 .index_visible_to(slot, txn.txid)
                 .expect("resolved index is visible");
+            if definition.mutable_for(txn.txid).replica_identity {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop index \"{}\" because it is used as replica identity",
+                    name.name
+                ));
+            }
             if definition.mutable_for(txn.txid).parent.is_some() {
                 return sql_fail(sql_err!(
                     sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -50070,6 +50110,22 @@ fn alter_table_inner(
         return sql_ok();
     }
 
+    if let [AlterAction::SetReplicaIdentity(target)] = statement.actions {
+        return alter_table_replica_identity(
+            storage,
+            wal,
+            txn,
+            ReplicaIdentityAlter {
+                table_index,
+                definition: def,
+                target: *target,
+            },
+            responder,
+            emit_completion,
+            tag,
+        );
+    }
+
     if let [action @ (AlterAction::AttachPartition { .. } | AlterAction::DetachPartition { .. })] =
         statement.actions
     {
@@ -50148,6 +50204,7 @@ fn alter_table_inner(
     let mut n_owned_sequences_to_drop = 0usize;
     let mut column_renames = [(SqlName::EMPTY, SqlName::EMPTY); MAX_COLUMNS];
     let mut n_column_renames = 0usize;
+    let mut replica_identity_selection: Option<Option<usize>> = None;
 
     for action in statement.actions {
         match action {
@@ -50163,6 +50220,20 @@ fn alter_table_inner(
             }
             AlterAction::SetRowLevelSecurity(_) => {
                 unreachable!("row-level security is a standalone action")
+            }
+            AlterAction::SetReplicaIdentity(target) => {
+                let (mode, selected) = match resolve_replica_identity_target(
+                    storage,
+                    table_index,
+                    &new_def,
+                    *target,
+                    txn.txid,
+                ) {
+                    Ok(selection) => selection,
+                    Err(error) => return sql_fail(error),
+                };
+                new_def.replica_identity = mode;
+                replica_identity_selection = Some(selected);
             }
             AlterAction::AttachPartition { .. } | AlterAction::DetachPartition { .. } => {
                 unreachable!("partition attachment is a standalone action")
@@ -51165,6 +51236,13 @@ fn alter_table_inner(
         return sql_fail(error);
     }
 
+    if let Some(selected) = replica_identity_selection
+        && let Err(error) =
+            stage_replica_identity_selection(storage, wal, txn, table_index, selected)
+    {
+        return sql_fail(error);
+    }
+
     // Journal the in-place shape change and the re-homed rows. Every fallible
     // content step is already done; only WAL append can fail here, and it does
     // so before any in-memory swap.
@@ -51553,6 +51631,230 @@ fn alter_table_inner(
             }
             Err(error) => return sql_fail(error),
         }
+    }
+    if emit_completion {
+        responder.command_complete(tag)?;
+    }
+    sql_ok()
+}
+
+fn selected_replica_identity_index(
+    storage: &Storage,
+    table_index: usize,
+    txid: u32,
+) -> Result<Option<usize>, SqlError> {
+    let mut selected = None;
+    for slot in 0..storage.index_count() {
+        let Some(index) = storage.index_visible_to(slot, txid) else {
+            continue;
+        };
+        if storage.index_table_slot_to(slot, txid) != Some(table_index)
+            || !index.mutable_for(txid).replica_identity
+        {
+            continue;
+        }
+        if selected.replace(slot).is_some() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "relation has more than one replica identity index"
+            ));
+        }
+    }
+    Ok(selected)
+}
+
+fn stage_replica_identity_selection(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table_index: usize,
+    selected: Option<usize>,
+) -> Result<(), SqlError> {
+    let prior = selected_replica_identity_index(storage, table_index, txn.txid)?;
+    if prior == selected {
+        return Ok(());
+    }
+    if let Some(slot) = prior {
+        let mut mutable = storage
+            .index_visible_to(slot, txn.txid)
+            .expect("selected replica identity index is visible")
+            .mutable_for(txn.txid);
+        mutable.replica_identity = false;
+        stage_index_definition(storage, wal, txn, slot, mutable)?;
+    }
+    if let Some(slot) = selected {
+        let mut mutable = storage
+            .index_visible_to(slot, txn.txid)
+            .expect("resolved replica identity index is visible")
+            .mutable_for(txn.txid);
+        mutable.replica_identity = true;
+        stage_index_definition(storage, wal, txn, slot, mutable)?;
+    }
+    Ok(())
+}
+
+fn resolve_replica_identity_target(
+    storage: &Storage,
+    table_index: usize,
+    definition: &TableDef,
+    target: crate::sql::ast::ReplicaIdentityTarget<'_>,
+    txid: u32,
+) -> Result<(crate::storage::ReplicaIdentityMode, Option<usize>), SqlError> {
+    match target {
+        crate::sql::ast::ReplicaIdentityTarget::Default => {
+            Ok((crate::storage::ReplicaIdentityMode::Default, None))
+        }
+        crate::sql::ast::ReplicaIdentityTarget::Full => {
+            Ok((crate::storage::ReplicaIdentityMode::Full, None))
+        }
+        crate::sql::ast::ReplicaIdentityTarget::Nothing => {
+            Ok((crate::storage::ReplicaIdentityMode::Nothing, None))
+        }
+        crate::sql::ast::ReplicaIdentityTarget::Index(name) => {
+            let schema = name.schema.unwrap_or(definition.schema.as_str());
+            let slot = storage.index_slot(schema, name.name, txid).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "index \"{}\" does not exist",
+                    name.name
+                )
+            })?;
+            validate_replica_identity_index(storage, table_index, definition, slot, txid)?;
+            Ok((crate::storage::ReplicaIdentityMode::Index, Some(slot)))
+        }
+    }
+}
+
+fn validate_replica_identity_index(
+    storage: &Storage,
+    table_index: usize,
+    definition: &TableDef,
+    slot: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let index = storage.index_visible_to(slot, txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "replica identity index does not exist"
+        )
+    })?;
+    if storage.index_table_slot_to(slot, txid) != Some(table_index) {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "index \"{}\" is not an index for table \"{}\"",
+            index.name_for(txid).as_str(),
+            definition.name.as_str()
+        ));
+    }
+    if !index.unique {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "cannot use non-unique index \"{}\" as replica identity",
+            index.name_for(txid).as_str()
+        ));
+    }
+    if index.predicate.is_some() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot use partial index \"{}\" as replica identity",
+            index.name_for(txid).as_str()
+        ));
+    }
+    if !matches!(
+        index.mutable_for(txid).kind,
+        crate::storage::IndexKind::Ordinary
+    ) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot use partitioned index \"{}\" as replica identity",
+            index.name_for(txid).as_str()
+        ));
+    }
+    for position in 0..index.n_cols {
+        if index.expressions[position].is_some() {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot use expression index \"{}\" as replica identity",
+                index.name_for(txid).as_str()
+            ));
+        }
+        let column = definition.columns()[index.columns[position] as usize];
+        if !column.not_null.is_required() {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "index \"{}\" cannot be used as replica identity because column \"{}\" is nullable",
+                index.name_for(txid).as_str(),
+                column.name.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct ReplicaIdentityAlter<'a> {
+    table_index: usize,
+    definition: TableDef,
+    target: crate::sql::ast::ReplicaIdentityTarget<'a>,
+}
+
+fn alter_table_replica_identity(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    alteration: ReplicaIdentityAlter<'_>,
+    responder: &mut Responder,
+    emit_completion: bool,
+    tag: &'static str,
+) -> Outcome {
+    let ReplicaIdentityAlter {
+        table_index,
+        definition,
+        target,
+    } = alteration;
+    let (mode, selected) = match resolve_replica_identity_target(
+        storage,
+        table_index,
+        &definition,
+        target,
+        txn.txid,
+    ) {
+        Ok(selection) => selection,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = stage_replica_identity_selection(storage, wal, txn, table_index, selected) {
+        return sql_fail(error);
+    }
+    let mut next = definition;
+    next.replica_identity = mode;
+    let mut mapping = [None; MAX_COLUMNS];
+    let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+    for column in 0..definition.n_columns {
+        mapping[column] = Some(definition.columns()[column].name);
+        wal_mapping[column] = column as u16;
+    }
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::BeginTableRewrite {
+            previous_schema: definition.schema.as_str(),
+            previous_name: definition.name.as_str(),
+            preserve_rows: true,
+            column_mapping: wal_mapping,
+        },
+    ) {
+        return sql_fail(error);
+    }
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::CreateTable(next)) {
+        return sql_fail(error);
+    }
+    if let Err(error) = storage.write_table_def(table_index, txn.txid, next, &mapping, false) {
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
+        storage.rollback_table_def(table_index, txn.txid);
+        return sql_fail(error);
     }
     if emit_completion {
         responder.command_complete(tag)?;

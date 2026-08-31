@@ -346,6 +346,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::DropTable(_)
         | Stmt::Truncate { .. }
         | Stmt::CreateView { .. }
+        | Stmt::AlterView { .. }
         | Stmt::CreateRule(_)
         | Stmt::AlterRule { .. }
         | Stmt::DropRule(_)
@@ -702,6 +703,7 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::Truncate { .. } => return None,
         Stmt::AlterTable(_) => "ALTER TABLE",
         Stmt::CreateView { .. } => "CREATE VIEW",
+        Stmt::AlterView { .. } => "ALTER VIEW",
         Stmt::DropView { .. } => "DROP VIEW",
         Stmt::CreateRule(_) => "CREATE RULE",
         Stmt::AlterRule { .. } => "ALTER RULE",
@@ -4767,6 +4769,12 @@ impl Engine {
                 DdlUndo::ViewSchemaChanged { slot, .. } => {
                     self.storage.commit_view_schema(*slot as usize, txn.txid)
                 }
+                DdlUndo::ViewRenamed { slot, .. } => {
+                    self.storage.commit_view_rename(*slot as usize, txn.txid)
+                }
+                DdlUndo::ViewSecurityChanged { slot, .. } => {
+                    self.storage.commit_view_security(*slot as usize, txn.txid)
+                }
                 DdlUndo::RuleCreated { slot, .. } => {
                     self.storage.commit_rule_create(*slot as usize)
                 }
@@ -5639,6 +5647,12 @@ impl Engine {
             }
             DdlUndo::ViewSchemaChanged { slot, prior } => {
                 self.storage.rollback_view_schema(slot as usize, prior)
+            }
+            DdlUndo::ViewRenamed { slot, prior } => {
+                self.storage.rollback_view_rename(slot as usize, prior)
+            }
+            DdlUndo::ViewSecurityChanged { slot, prior } => {
+                self.storage.rollback_view_security(slot as usize, prior)
             }
             DdlUndo::PublicationCreated(slot) => {
                 self.storage.rollback_publication_create(slot as usize)
@@ -11522,6 +11536,19 @@ impl Engine {
                 arena,
                 responder,
             ),
+            Stmt::AlterView {
+                name,
+                if_exists,
+                action,
+            } => exec::alter_view(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                *name,
+                *if_exists,
+                *action,
+                responder,
+            ),
             Stmt::CreateRule(rule) => exec::create_rule(
                 &mut self.storage,
                 &mut self.wal,
@@ -16721,6 +16748,50 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             if let Some(slot) = storage.drop_view(schema, name, 0)? {
                 storage.commit_view_drop(slot);
             }
+        }
+        WalOp::SetViewSecurity {
+            schema,
+            name,
+            security_invoker,
+        } => {
+            let slot = storage
+                .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
+                .map(|object| object.slot as usize)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "journal changes unknown view \"{}\"",
+                        name
+                    )
+                })?;
+            storage.stage_view_security(
+                slot,
+                if security_invoker {
+                    crate::storage::ViewSecurity::Invoker
+                } else {
+                    crate::storage::ViewSecurity::Definer
+                },
+                0,
+            )?;
+            storage.commit_view_security(slot, 0);
+        }
+        WalOp::RenameView {
+            schema,
+            name,
+            new_name,
+        } => {
+            let slot = storage
+                .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
+                .map(|object| object.slot as usize)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "journal changes unknown view \"{}\"",
+                        name
+                    )
+                })?;
+            storage.stage_view_rename(slot, crate::storage::SqlName::parse(new_name)?, 0)?;
+            storage.commit_view_rename(slot, 0);
         }
         WalOp::SetRule {
             slot,

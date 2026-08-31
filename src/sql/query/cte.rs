@@ -4559,9 +4559,11 @@ fn subst_tableref<'a>(
                     )
                 })?,
         };
-        context
-            .storage
-            .require_schema_usage_as(view.schema.as_str(), requester, context.txid)?;
+        context.storage.require_schema_usage_as(
+            view.schema_for(context.txid).as_str(),
+            requester,
+            context.txid,
+        )?;
         let view_object = crate::storage::AccessObject {
             class: crate::storage::AccessClass::View,
             slot: slot as u16,
@@ -4575,10 +4577,10 @@ fn subst_tableref<'a>(
             return Err(sql_err!(
                 sqlstate::INSUFFICIENT_PRIVILEGE,
                 "permission denied for view {}",
-                view.name.as_str()
+                view.name_for(context.txid).as_str()
             ));
         }
-        let authorization_role = match view.security {
+        let authorization_role = match view.security_for(context.txid) {
             crate::storage::ViewSecurity::Definer => {
                 Some(context.storage.object_owner(view_object, context.txid) as u16)
             }

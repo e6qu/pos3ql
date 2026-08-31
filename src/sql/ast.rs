@@ -61,6 +61,52 @@ pub enum ViewSecurity {
     Invoker,
 }
 
+/// PostgreSQL's three view options.  Parsing them as a closed state keeps a
+/// later executor from treating a misspelled option as inert catalog text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewOption {
+    CheckOption(ViewCheckOption),
+    SecurityBarrier(bool),
+    SecurityInvoker(bool),
+}
+
+/// One option name accepted by `ALTER VIEW ... RESET (...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewOptionName {
+    CheckOption,
+    SecurityBarrier,
+    SecurityInvoker,
+}
+
+/// `check_option` is neither a boolean nor an arbitrary string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewCheckOption {
+    Local,
+    Cascaded,
+}
+
+/// One `ALTER VIEW` action.  Options and exposed-column operations remain
+/// separate from stored-query replacement, preserving PostgreSQL's object
+/// identity and dependency semantics.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AlterViewAction<'a> {
+    SetDefault {
+        column: &'a str,
+        expression: &'a str,
+    },
+    DropDefault {
+        column: &'a str,
+    },
+    RenameColumn {
+        from: &'a str,
+        to: &'a str,
+    },
+    RenameTo(&'a str),
+    SetSchema(&'a str),
+    SetOptions(&'a [ViewOption]),
+    ResetOptions(&'a [ViewOptionName]),
+}
+
 /// One explicitly named relation in a publication.  An empty `columns` slice
 /// means the PostgreSQL default: publish every column.  Keeping the selected
 /// names beside their relation prevents later execution from losing a column
@@ -397,6 +443,13 @@ pub enum Stmt<'a> {
         or_replace: bool,
         security: ViewSecurity,
         sql: &'a str,
+    },
+    /// `ALTER VIEW` retains a closed action rather than sharing the broader
+    /// table-action grammar, whose accepted states are deliberately different.
+    AlterView {
+        name: QualName<'a>,
+        if_exists: bool,
+        action: AlterViewAction<'a>,
     },
     /// A rewrite rule is parsed into its closed event/mode states and complete
     /// action statements. Source slices are retained for durable catalog text.

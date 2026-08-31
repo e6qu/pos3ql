@@ -1961,8 +1961,8 @@ fn collect_table_ref<'a>(
                     slot: slot as u16,
                     identity: StoredDependencyIdentity::Name,
                     referenced_columns: 0,
-                    schema: view.schema,
-                    name: view.name,
+                    schema: view.schema_for(txid),
+                    name: view.name_for(txid),
                     referenced_schema: SqlName::parse(table.schema.unwrap_or(""))?,
                     referenced_name: SqlName::parse(table.table)?,
                 })?;

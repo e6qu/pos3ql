@@ -3663,6 +3663,8 @@ pub struct ViewDef {
     pub security: ViewSecurity,
     pub ownership: Ownership,
     pending_schema: Option<PendingObjectSchema>,
+    pending_name: Option<PendingViewName>,
+    pending_security: Option<PendingViewSecurity>,
     ddl_state: CatalogDdlState,
 }
 
@@ -3676,12 +3678,39 @@ impl ViewDef {
             .filter(|pending| pending.txid == txid)
             .map_or(self.schema, |pending| pending.schema)
     }
+
+    pub(crate) fn security_for(&self, txid: u32) -> ViewSecurity {
+        self.pending_security
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.security, |pending| pending.security)
+    }
+
+    pub(crate) fn name_for(&self, txid: u32) -> SqlName {
+        self.pending_name
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.name, |pending| pending.name)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingObjectSchema {
     pub txid: u32,
     pub schema: SqlName,
+}
+
+/// A transaction-visible `security_invoker` change.  The closed enum means a
+/// view can never expose a transient spelling that query authorization would
+/// have to reinterpret at execution time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingViewSecurity {
+    pub txid: u32,
+    pub security: ViewSecurity,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingViewName {
+    pub txid: u32,
+    pub name: SqlName,
 }
 
 /// A logical publication.  Publications are database-scoped catalog objects;
@@ -10606,8 +10635,8 @@ impl Storage {
                 DependencyClass::View => self.views.iter().position(|view| {
                     view.database == self.current_database
                         && view.visible_to(txid)
-                        && view.schema.as_str() == schema
-                        && view.name.as_str() == name
+                        && view.schema_for(txid).as_str() == schema
+                        && view.name_for(txid).as_str() == name
                 }),
                 DependencyClass::Domain => self.domain_slot(schema, name, txid),
                 DependencyClass::Enum => self.enum_slot(schema, name, txid),
@@ -11014,6 +11043,8 @@ impl Storage {
                     security: ViewSecurity::Definer,
                     ownership: Ownership::BOOTSTRAP,
                     pending_schema: None,
+                    pending_name: None,
+                    pending_security: None,
                     ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to max_tables");
@@ -14237,7 +14268,7 @@ impl Storage {
                 view.database == self.current_database
                     && view.visible_to(txid)
                     && view.schema_for(txid).as_str() == schema
-                    && view.name.as_str() == name
+                    && view.name_for(txid).as_str() == name
             }),
             AccessClass::MaterializedView => self.matview_slot(schema, name, txid),
             AccessClass::Sequence => self.sequence_slot(schema, name, txid),
@@ -14303,7 +14334,7 @@ impl Storage {
             }
             AccessClass::View => {
                 let definition = &self.views[slot];
-                (definition.schema_for(txid), definition.name)
+                (definition.schema_for(txid), definition.name_for(txid))
             }
             AccessClass::MaterializedView => {
                 let definition = &self.matviews[slot];
@@ -18147,7 +18178,7 @@ impl Storage {
                 v.database == self.current_database
                     && v.visible_to(txid)
                     && v.schema_for(txid).as_str() == schema
-                    && v.name.as_str() == name
+                    && v.name_for(txid).as_str() == name
             })
             .map(ResolvedRelation::View)
     }
@@ -23531,7 +23562,7 @@ impl Storage {
             v.database == self.current_database
                 && v.visible_to(txid)
                 && v.schema_for(txid).as_str() == schema
-                && v.name.as_str() == name
+                && v.name_for(txid).as_str() == name
         })
     }
 
@@ -26530,6 +26561,8 @@ impl Storage {
             security,
             ownership,
             pending_schema: None,
+            pending_name: None,
+            pending_security: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         let mut source = StackStr::<RULE_SQL_MAX>::new();
@@ -26652,7 +26685,29 @@ impl Storage {
                 self.views[slot].name.as_str(),
             ));
         }
+        let (old_schema, old_name) = {
+            let view = &self.views[slot];
+            (view.schema_for(txid), view.name_for(txid))
+        };
         self.views[slot].pending_schema = Some(PendingObjectSchema { txid, schema });
+        let visible_schema = self.views[slot].schema_for(txid);
+        let name = self.views[slot].name_for(txid);
+        self.stage_object_comment_identity(
+            CommentClass::Relation,
+            old_schema,
+            old_name,
+            visible_schema,
+            name,
+            txid,
+        );
+        self.stage_object_comment_identity(
+            CommentClass::Type,
+            old_schema,
+            old_name,
+            visible_schema,
+            name,
+            txid,
+        );
         Ok(prior)
     }
 
@@ -26667,19 +26722,161 @@ impl Storage {
         let name = self.views[slot].name;
         self.views[slot].schema = pending.schema;
         self.views[slot].pending_schema = None;
-        for comment in self.comments.iter_mut() {
-            if comment.used
-                && matches!(comment.class, CommentClass::Relation | CommentClass::Type)
-                && comment.schema == old_schema
-                && comment.name == name
-            {
-                comment.schema = pending.schema;
-            }
-        }
+        self.commit_object_comment_identity(CommentClass::Relation, old_schema, name, txid);
+        self.commit_object_comment_identity(CommentClass::Type, old_schema, name, txid);
     }
 
     pub(crate) fn rollback_view_schema(&mut self, slot: usize, prior: Option<PendingObjectSchema>) {
+        let txid = self.views[slot].pending_schema.map(|pending| pending.txid);
+        let (old_schema, old_name) = txid.map_or((SqlName::EMPTY, SqlName::EMPTY), |txid| {
+            let view = &self.views[slot];
+            (view.schema_for(txid), view.name_for(txid))
+        });
         self.views[slot].pending_schema = prior;
+        if let Some(txid) = txid {
+            let (visible_schema, name) = {
+                let view = &self.views[slot];
+                (view.schema_for(txid), view.name_for(txid))
+            };
+            self.stage_object_comment_identity(
+                CommentClass::Relation,
+                old_schema,
+                old_name,
+                visible_schema,
+                name,
+                txid,
+            );
+            self.stage_object_comment_identity(
+                CommentClass::Type,
+                old_schema,
+                old_name,
+                visible_schema,
+                name,
+                txid,
+            );
+        }
+    }
+
+    pub(crate) fn stage_view_rename(
+        &mut self,
+        slot: usize,
+        name: SqlName,
+        txid: u32,
+    ) -> Result<Option<PendingViewName>, SqlError> {
+        let prior = self.views[slot].pending_name;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                prior.expect("checked Some").txid,
+                self.views[slot].name.as_str(),
+            ));
+        }
+        let (old_schema, old_name) = {
+            let view = &self.views[slot];
+            (view.schema_for(txid), view.name_for(txid))
+        };
+        self.views[slot].pending_name = Some(PendingViewName { txid, name });
+        let new_schema = self.views[slot].schema_for(txid);
+        let new_name = self.views[slot].name_for(txid);
+        self.stage_object_comment_identity(
+            CommentClass::Relation,
+            old_schema,
+            old_name,
+            new_schema,
+            new_name,
+            txid,
+        );
+        self.stage_object_comment_identity(
+            CommentClass::Type,
+            old_schema,
+            old_name,
+            new_schema,
+            new_name,
+            txid,
+        );
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_view_rename(&mut self, slot: usize, txid: u32) {
+        let Some(pending) = self.views[slot]
+            .pending_name
+            .filter(|pending| pending.txid == txid)
+        else {
+            return;
+        };
+        let old_schema = self.views[slot].schema;
+        let old_name = self.views[slot].name;
+        self.views[slot].name = pending.name;
+        self.views[slot].pending_name = None;
+        self.commit_object_comment_identity(CommentClass::Relation, old_schema, old_name, txid);
+        self.commit_object_comment_identity(CommentClass::Type, old_schema, old_name, txid);
+    }
+
+    pub(crate) fn rollback_view_rename(&mut self, slot: usize, prior: Option<PendingViewName>) {
+        let txid = self.views[slot].pending_name.map(|pending| pending.txid);
+        let (old_schema, old_name) = txid.map_or((SqlName::EMPTY, SqlName::EMPTY), |txid| {
+            let view = &self.views[slot];
+            (view.schema_for(txid), view.name_for(txid))
+        });
+        self.views[slot].pending_name = prior;
+        if let Some(txid) = txid {
+            let view = &self.views[slot];
+            let new_schema = view.schema_for(txid);
+            let new_name = view.name_for(txid);
+            self.stage_object_comment_identity(
+                CommentClass::Relation,
+                old_schema,
+                old_name,
+                new_schema,
+                new_name,
+                txid,
+            );
+            self.stage_object_comment_identity(
+                CommentClass::Type,
+                old_schema,
+                old_name,
+                new_schema,
+                new_name,
+                txid,
+            );
+        }
+    }
+
+    pub(crate) fn stage_view_security(
+        &mut self,
+        slot: usize,
+        security: ViewSecurity,
+        txid: u32,
+    ) -> Result<Option<PendingViewSecurity>, SqlError> {
+        let prior = self.views[slot].pending_security;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                prior.expect("checked Some").txid,
+                self.views[slot].name.as_str(),
+            ));
+        }
+        self.views[slot].pending_security = Some(PendingViewSecurity { txid, security });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_view_security(&mut self, slot: usize, txid: u32) {
+        let Some(pending) = self.views[slot]
+            .pending_security
+            .filter(|pending| pending.txid == txid)
+        else {
+            return;
+        };
+        self.views[slot].security = pending.security;
+        self.views[slot].pending_security = None;
+    }
+
+    pub(crate) fn rollback_view_security(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingViewSecurity>,
+    ) {
+        self.views[slot].pending_security = prior;
     }
 
     /// Promotes an uncommitted DROP VIEW into the committed catalog.

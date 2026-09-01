@@ -3223,10 +3223,7 @@ fn scan_source_mode<'a>(
             }
         } else if depth == 0
             || (scope.derived[order[depth]].is_none()
-                && storage
-                    .table_def(scope.slots[order[depth]], txid)
-                    .partition
-                    .is_partitioned())
+                && storage.relation_has_descendants(scope.slots[order[depth]], txid))
         {
             // Outermost scan: iterate in heap-offset (insertion) order so a
             // per-row error surfaces on the same row as PostgreSQL, whose heap
@@ -3237,7 +3234,7 @@ fn scan_source_mode<'a>(
             // ordering an inner join scan would re-snapshot per outer row.
             let slot = scope.slots[order[depth]];
             if source_ref(from, order[depth]).inheritance == RelationInheritance::Descendants
-                && storage.table_def(slot, txid).partition.is_partitioned()
+                && storage.relation_has_descendants(slot, txid)
             {
                 let leaves = arena
                     .alloc_slice_with(storage.table_count(), |_| usize::MAX)
@@ -3255,7 +3252,7 @@ fn scan_source_mode<'a>(
                     leaves[0] = leaf;
                     1
                 } else {
-                    storage.partition_leaf_slots(slot, txid, leaves)?
+                    storage.relation_leaf_slots(slot, txid, leaves)?
                 };
                 let mut index = 0usize;
                 let mut aborted = false;
@@ -3270,7 +3267,26 @@ fn scan_source_mode<'a>(
                         index += 1;
                         let keep_scanning = recycled(arena, recycle_rows, retain_match, || {
                             let bytes = storage.row_bytes(leaf, rowid, home, arena)?;
-                            visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
+                            if leaf == slot {
+                                visit_candidate!(this, BoundRow::Encoded(bytes), Some(rowid))
+                            } else {
+                                let physical = storage.table_def(leaf, txid);
+                                let values = arena
+                                    .alloc_slice_with(physical.n_columns, |_| Datum::Null)
+                                    .map_err(|_| arena_full())?;
+                                let mut schema = [ColType::Bool; MAX_COLUMNS];
+                                physical.schema(&mut schema);
+                                rowenc::decode(bytes, &schema[..physical.n_columns], values)?;
+                                refresh_catalog_object_names(storage, txid, values, arena)?;
+                                let logical_width = scope.defs[order[depth]]
+                                    .expect("resolved logical relation")
+                                    .n_columns;
+                                visit_candidate!(
+                                    this,
+                                    BoundRow::Values(&values[..logical_width]),
+                                    Some(rowid)
+                                )
+                            }
                         })?;
                         if !keep_scanning {
                             aborted = true;

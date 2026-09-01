@@ -38541,12 +38541,8 @@ fn unimplemented_table_lifecycle_forms_are_typed_and_loud() {
     let (mut engine, mut budget) = test_engine();
     for statement in [
         "CREATE TABLE table_storage_option_rows (id integer) WITH (fillfactor = 80)",
-        "CREATE TABLE inheritance_parent_rows (id integer); \
-         CREATE TABLE inheritance_child_rows (id integer) INHERITS (inheritance_parent_rows)",
         "CREATE TYPE typed_table_row AS (id integer); \
          CREATE TABLE typed_table_rows OF typed_table_row",
-        "CREATE TABLE alter_inheritance_rows (id integer); \
-         ALTER TABLE alter_inheritance_rows INHERIT inheritance_parent_rows",
         "CREATE TABLE alter_storage_option_rows (id integer); \
          ALTER TABLE alter_storage_option_rows SET (fillfactor = 80)",
         "CREATE TABLE reset_storage_option_rows (id integer); \
@@ -38570,10 +38566,126 @@ fn unimplemented_table_lifecycle_forms_are_typed_and_loud() {
             &mut engine,
             &mut budget,
             "SELECT count(*) FROM pg_class \
-              WHERE relname IN ('table_storage_option_rows', 'inheritance_child_rows', 'typed_table_rows')",
+              WHERE relname IN ('table_storage_option_rows', 'typed_table_rows')",
         )),
         ["0"],
         "rejected metadata must not leave inert durable relations behind"
+    );
+}
+
+#[test]
+fn table_inheritance_is_durable_typed_and_visible_to_parent_dml() {
+    let (mut engine, mut budget) = test_engine();
+    for statement in [
+        "CREATE TABLE inheritance_parent_rows (id integer NOT NULL DEFAULT 7 CHECK (id > 0), payload text)",
+        "CREATE TABLE inheritance_child_rows (extra text) INHERITS (inheritance_parent_rows)",
+        "INSERT INTO inheritance_parent_rows VALUES (2, 'parent')",
+        "INSERT INTO inheritance_child_rows (id, payload, extra) VALUES (1, 'child', 'x')",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let parent_rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id, payload FROM inheritance_parent_rows ORDER BY id",
+    );
+    assert_eq!(data_rows(&parent_rows), ["1|child", "2|parent"]);
+    assert_eq!(
+        copy_data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "COPY inheritance_parent_rows TO STDOUT",
+        )),
+        ["2\tparent", "1\tchild"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE inheritance_parent_rows ADD COLUMN unsafe_change integer",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, payload FROM ONLY inheritance_parent_rows ORDER BY id",
+        )),
+        ["2|parent"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE inheritance_parent_rows SET payload = 'updated' WHERE id = 1",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT payload FROM inheritance_child_rows",
+        )),
+        ["updated"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT inhseqno FROM pg_inherits WHERE inhrelid = 'inheritance_child_rows'::regclass",
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT conislocal, coninhcount FROM pg_constraint \
+             WHERE conrelid = 'inheritance_child_rows'::regclass AND conname = 'inheritance_parent_rows_id_check'",
+        )),
+        ["f|1"]
+    );
+    for statement in [
+        "ALTER TABLE inheritance_child_rows NO INHERIT inheritance_parent_rows",
+        "ALTER TABLE inheritance_child_rows INHERIT inheritance_parent_rows",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE inheritance_parent_rows",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TABLE inheritance_parent_rows CASCADE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 
@@ -38590,7 +38702,9 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for statement in [
         "CREATE TABLESPACE table_definition_recovery_space LOCATION '/object/table-definition-recovery'",
-        "CREATE TABLE table_definition_recovery_rows (id integer) USING heap TABLESPACE table_definition_recovery_space",
+        "CREATE TABLE table_definition_recovery_rows (id integer NOT NULL CHECK (id > 0)) USING heap TABLESPACE table_definition_recovery_space",
+        "CREATE TABLE table_definition_recovery_child (extra text) INHERITS (table_definition_recovery_rows)",
+        "INSERT INTO table_definition_recovery_child VALUES (1, 'child')",
         "ALTER TABLE table_definition_recovery_rows ALTER COLUMN id SET STATISTICS 91",
     ] {
         let output = run_with(&mut engine, &mut budget, statement);
@@ -38623,6 +38737,21 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
               WHERE attrelid = 'table_definition_recovery_rows'::regclass AND attname = 'id'",
         )),
         ["91"]
+    );
+    let inherited_recovery_rows = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT id FROM table_definition_recovery_rows",
+    );
+    assert_eq!(data_rows(&inherited_recovery_rows), ["1"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT inhseqno FROM pg_inherits \
+             WHERE inhrelid = 'table_definition_recovery_child'::regclass",
+        )),
+        ["1"]
     );
     drop(restarted);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);

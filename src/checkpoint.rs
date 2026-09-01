@@ -27,7 +27,7 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v5";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v6";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -1203,7 +1203,21 @@ impl Checkpointer {
                         "table access method",
                     )?)
                     .ok_or(CheckpointSetupError::Corrupt("invalid table access method"))?;
-                    let name = rest_of(line, 8)?;
+                    let inheritance_count: usize =
+                        parse_field(words.next(), "table inheritance count")?;
+                    if inheritance_count > crate::storage::MAX_TABLE_INHERITANCE_PARENTS {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "too many table inheritance parents",
+                        ));
+                    }
+                    let mut inheritance = crate::storage::TableInheritance::NONE;
+                    for _ in 0..inheritance_count {
+                        let parent: u16 = parse_field(words.next(), "table inheritance parent")?;
+                        inheritance.append(usize::from(parent)).map_err(|_| {
+                            CheckpointSetupError::Corrupt("invalid table inheritance")
+                        })?;
+                    }
+                    let name = rest_of(line, 9 + inheritance_count)?;
                     let def = TableDef {
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
@@ -1215,6 +1229,7 @@ impl Checkpointer {
                         kind,
                         tablespace,
                         access_method,
+                        inheritance,
                         ..TableDef::empty()
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
@@ -6023,22 +6038,43 @@ impl Checkpointer {
                 table.database,
             )?;
             // Table + columns into the manifest.
-            write_manifest(
-                &mut self.manifest_buf,
-                format_args!(
-                    "table {slot} {} {} {} {} {} {} {}",
-                    table.def.n_columns,
-                    u8::from(table.def.has_toast),
-                    u8::from(table.def.has_rules),
-                    match table.def.kind {
-                        crate::storage::TableKind::Local => 0,
-                        crate::storage::TableKind::Foreign => 1,
-                    },
-                    table.def.tablespace,
-                    table.def.access_method.code(),
-                    table.def.name.as_str()
-                ),
-            )?;
+            let mut table_line = StackStr::<256>::new();
+            use core::fmt::Write as _;
+            write!(
+                table_line,
+                "table {slot} {} {} {} {} {} {} {}",
+                table.def.n_columns,
+                u8::from(table.def.has_toast),
+                u8::from(table.def.has_rules),
+                match table.def.kind {
+                    crate::storage::TableKind::Local => 0,
+                    crate::storage::TableKind::Foreign => 1,
+                },
+                table.def.tablespace,
+                table.def.access_method.code(),
+                table.def.inheritance.parents_ref().len(),
+            )
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table manifest line exceeds fixed capacity"
+                )
+            })?;
+            for parent in table.def.inheritance.parents_ref() {
+                write!(table_line, " {parent}").map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "table manifest line exceeds fixed capacity"
+                    )
+                })?;
+            }
+            write!(table_line, " {}", table.def.name.as_str()).map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table manifest line exceeds fixed capacity"
+                )
+            })?;
+            write_manifest(&mut self.manifest_buf, table_line.as_str())?;
             if table.def.schema.as_str() != "public" {
                 use core::fmt::Write;
                 let mut hex = StackStr::<130>::new();

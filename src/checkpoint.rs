@@ -27,7 +27,7 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v8";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v9";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -10997,7 +10997,7 @@ fn write_partition_manifest(
 ) -> Result<(), SqlError> {
     let mut line = StackStr::<4096>::new();
     use core::fmt::Write;
-    let _ = write!(line, "part 3");
+    let _ = write!(line, "part 4");
     if let Some(scheme) = partition.scheme {
         let strategy = match scheme.strategy {
             PartitionStrategy::Range => "r",
@@ -11049,7 +11049,54 @@ fn write_partition_manifest(
     } else {
         let _ = write!(line, " n");
     }
+    if let Some(detached) = partition.detached_bound {
+        let strategy = match detached.scheme.strategy {
+            PartitionStrategy::Range => "r",
+            PartitionStrategy::List => "l",
+            PartitionStrategy::Hash => "h",
+        };
+        let _ = write!(line, " d {strategy} {}", detached.scheme.n_keys);
+        for key in &detached.scheme.keys[..usize::from(detached.scheme.n_keys)] {
+            let _ = write!(line, " {key}");
+        }
+        write_partition_bound_manifest(&mut line, detached.bound);
+    } else {
+        let _ = write!(line, " n");
+    }
     write_manifest(buffer, line.as_str())
+}
+
+fn write_partition_bound_manifest(line: &mut StackStr<4096>, bound: PartitionBound) {
+    use core::fmt::Write;
+    match bound {
+        PartitionBound::Default => {
+            let _ = write!(line, " d");
+        }
+        PartitionBound::Hash { modulus, remainder } => {
+            let _ = write!(line, " h {modulus} {remainder}");
+        }
+        PartitionBound::List { values, n_values } => {
+            let _ = write!(line, " l {n_values}");
+            for value in &values[..usize::from(n_values)] {
+                let _ = write!(line, " {}", default_to_hex(&Some(*value)).as_str());
+            }
+        }
+        PartitionBound::Range {
+            lower,
+            upper,
+            n_keys,
+        } => {
+            let _ = write!(line, " r {n_keys}");
+            for i in 0..usize::from(n_keys) {
+                let _ = write!(
+                    line,
+                    " {} {}",
+                    partition_bound_value_text(lower[i]).as_str(),
+                    partition_bound_value_text(upper[i]).as_str()
+                );
+            }
+        }
+    }
 }
 
 fn partition_bound_value_text(
@@ -11078,7 +11125,7 @@ fn parse_partition_manifest(
     words: &mut core::str::Split<'_, char>,
 ) -> Result<PartitionDef, CheckpointSetupError> {
     let corrupt = || CheckpointSetupError::Corrupt("bad partition metadata");
-    if words.next().ok_or_else(corrupt)? != "3" {
+    if words.next().ok_or_else(corrupt)? != "4" {
         return Err(corrupt());
     }
     let scheme = match words.next().ok_or_else(corrupt)? {
@@ -11163,7 +11210,82 @@ fn parse_partition_manifest(
         }
         _ => return Err(corrupt()),
     };
-    Ok(PartitionDef { scheme, attachment })
+    let detached_bound = match words.next().ok_or_else(corrupt)? {
+        "n" => None,
+        "d" => {
+            let strategy = match words.next().ok_or_else(corrupt)? {
+                "r" => PartitionStrategy::Range,
+                "l" => PartitionStrategy::List,
+                "h" => PartitionStrategy::Hash,
+                _ => return Err(corrupt()),
+            };
+            let n_keys: u8 = parse_field(words.next(), "detached partition key count")?;
+            if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
+                return Err(corrupt());
+            }
+            let mut keys = [0u16; crate::storage::MAX_PARTITION_KEYS];
+            for key in &mut keys[..usize::from(n_keys)] {
+                *key = parse_field(words.next(), "detached partition key")?;
+            }
+            Some(crate::storage::DetachedPartitionBound {
+                scheme: crate::storage::PartitionScheme {
+                    strategy,
+                    keys,
+                    n_keys,
+                },
+                bound: parse_partition_bound_manifest(words)?,
+            })
+        }
+        _ => return Err(corrupt()),
+    };
+    Ok(PartitionDef {
+        scheme,
+        attachment,
+        detached_bound,
+    })
+}
+
+fn parse_partition_bound_manifest(
+    words: &mut core::str::Split<'_, char>,
+) -> Result<PartitionBound, CheckpointSetupError> {
+    let corrupt = || CheckpointSetupError::Corrupt("bad partition bound");
+    match words.next().ok_or_else(corrupt)? {
+        "d" => Ok(PartitionBound::Default),
+        "h" => Ok(PartitionBound::Hash {
+            modulus: parse_field(words.next(), "partition modulus")?,
+            remainder: parse_field(words.next(), "partition remainder")?,
+        }),
+        "l" => {
+            let n_values: u8 = parse_field(words.next(), "partition list count")?;
+            if usize::from(n_values) > crate::storage::MAX_PARTITION_LIST_VALUES {
+                return Err(corrupt());
+            }
+            let mut values = [OwnedDatum::Null; crate::storage::MAX_PARTITION_LIST_VALUES];
+            for value in &mut values[..usize::from(n_values)] {
+                *value =
+                    default_from_hex(words.next().ok_or_else(corrupt)?)?.ok_or_else(corrupt)?;
+            }
+            Ok(PartitionBound::List { values, n_values })
+        }
+        "r" => {
+            let n_keys: u8 = parse_field(words.next(), "partition key count")?;
+            if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
+                return Err(corrupt());
+            }
+            let mut lower = [PartitionBoundValue::MinValue; crate::storage::MAX_PARTITION_KEYS];
+            let mut upper = lower;
+            for i in 0..usize::from(n_keys) {
+                lower[i] = partition_bound_value_from_text(words.next().ok_or_else(corrupt)?)?;
+                upper[i] = partition_bound_value_from_text(words.next().ok_or_else(corrupt)?)?;
+            }
+            Ok(PartitionBound::Range {
+                lower,
+                upper,
+                n_keys,
+            })
+        }
+        _ => Err(corrupt()),
+    }
 }
 
 #[cfg(test)]

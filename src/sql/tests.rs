@@ -38601,6 +38601,21 @@ fn concurrent_partition_detach_routes_through_durable_attachment_state() {
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(data_rows(&output), ["0", "1", "f"], "{text}");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO detach_child_rows VALUES (10)",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("23514"), "{text}");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM detach_child_rows",
+        )),
+        ["1"]
+    );
 
     let output = run_with(
         &mut engine,
@@ -38802,6 +38817,21 @@ fn pending_partition_detach_survives_object_cold_recovery_and_finalizes() {
             "SELECT relispartition FROM pg_class WHERE relname = 'pending_recovery_child'",
         )),
         ["f"]
+    );
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO pending_recovery_child VALUES (10)",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("23514"), "{text}");
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT count(*) FROM pending_recovery_child",
+        )),
+        ["1"]
     );
     drop(restarted);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
@@ -39148,6 +39178,16 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
              SELECT relispartition FROM pg_class WHERE relname = 'table_definition_detach_child'",
         )),
         ["0", "1", "f"]
+    );
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO table_definition_detach_child VALUES (10)",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&output)
     );
     assert_eq!(
         data_rows(&run_with(

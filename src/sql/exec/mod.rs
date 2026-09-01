@@ -52081,6 +52081,7 @@ fn alter_partition_attachment(
             bound: resolved,
             state: crate::storage::PartitionAttachmentState::Attached,
         });
+        new_def.partition.detached_bound = None;
     } else {
         let Some(attachment) = child_def.partition.attachment else {
             return sql_fail(sql_err!(
@@ -52098,8 +52099,13 @@ fn alter_partition_attachment(
             ));
         }
         let detach_mode = detach_mode.expect("detach has a mode");
-        let finish_detach = |definition: &mut crate::storage::TableDef| {
+        let finish_detach = |definition: &mut crate::storage::TableDef, retain_bound: bool| {
             definition.partition.attachment = None;
+            definition.partition.detached_bound =
+                retain_bound.then_some(crate::storage::DetachedPartitionBound {
+                    scheme,
+                    bound: attachment.bound,
+                });
             for column in definition.columns.iter_mut().take(definition.n_columns) {
                 column.not_null = column.not_null.localize();
             }
@@ -52108,7 +52114,7 @@ fn alter_partition_attachment(
             (
                 crate::sql::ast::PartitionDetachMode::Immediate,
                 crate::storage::PartitionAttachmentState::Attached,
-            ) => finish_detach(&mut new_def),
+            ) => finish_detach(&mut new_def, false),
             (
                 crate::sql::ast::PartitionDetachMode::Immediate,
                 crate::storage::PartitionAttachmentState::DetachPending,
@@ -52176,7 +52182,7 @@ fn alter_partition_attachment(
                     });
                     txn.begin_concurrent_partition_detach();
                 } else {
-                    finish_detach(&mut new_def);
+                    finish_detach(&mut new_def, true);
                 }
             }
             (
@@ -52196,7 +52202,7 @@ fn alter_partition_attachment(
                         "partition detach is waiting for concurrent transactions"
                     ));
                 }
-                finish_detach(&mut new_def);
+                finish_detach(&mut new_def, true);
             }
             (
                 crate::sql::ast::PartitionDetachMode::Finalize,

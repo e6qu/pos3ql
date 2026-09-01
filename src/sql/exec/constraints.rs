@@ -1258,6 +1258,7 @@ pub(crate) fn enforce_row_constraints(
             arena,
         )?;
     }
+    check_detached_partition_bound(def, values)?;
     check_row_checks(storage, def, checks, values, txid, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
     check_or_defer_fk_child(
@@ -1290,9 +1291,29 @@ pub(crate) fn check_row_content(
 ) -> Result<(), SqlError> {
     check_not_null(def, values)?;
     check_index_tuple_sizes(storage, def, values, txid)?;
+    check_detached_partition_bound(def, values)?;
     check_row_checks(storage, def, checks, values, txid, arena, params)?;
     check_domain_constraints(storage, def, values, txid, arena, params)?;
     check_fk_child(storage, def, values, txid)?;
+    Ok(())
+}
+
+fn check_detached_partition_bound(def: &TableDef, values: &[Datum]) -> Result<(), SqlError> {
+    if let Some(detached) = def.partition.detached_bound
+        && !crate::storage::partition_bound_matches(
+            detached.scheme.strategy,
+            detached.scheme.keys,
+            detached.scheme.n_keys,
+            detached.bound,
+            values,
+        )?
+    {
+        return Err(sql_err!(
+            crate::sql::eval::sqlstate::CHECK_VIOLATION,
+            "new row for relation \"{}\" violates partition constraint",
+            def.name.as_str()
+        ));
+    }
     Ok(())
 }
 

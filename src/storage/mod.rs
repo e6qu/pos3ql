@@ -1458,6 +1458,18 @@ impl RowLevelSecurityState {
 pub struct PartitionDef {
     pub scheme: Option<PartitionScheme>,
     pub attachment: Option<PartitionAttachment>,
+    /// A concurrent detach leaves this typed bound on the child.  It is the
+    /// executable equivalent of PostgreSQL's generated partition CHECK.
+    pub detached_bound: Option<DetachedPartitionBound>,
+}
+
+/// The parent partitioning rule retained by a concurrently detached child.
+/// Keeping the resolved key positions and bound together avoids re-parsing a
+/// catalog expression on every row write.
+#[derive(Debug, Clone, Copy)]
+pub struct DetachedPartitionBound {
+    pub scheme: PartitionScheme,
+    pub bound: PartitionBound,
 }
 
 /// Inline catalog capacity for direct ordinary-inheritance parents.
@@ -1597,6 +1609,7 @@ impl PartitionDef {
     pub const NONE: Self = Self {
         scheme: None,
         attachment: None,
+        detached_bound: None,
     };
 
     pub const fn parent(
@@ -1611,6 +1624,7 @@ impl PartitionDef {
                 n_keys,
             }),
             attachment: None,
+            detached_bound: None,
         }
     }
 
@@ -1622,6 +1636,7 @@ impl PartitionDef {
                 bound,
                 state: PartitionAttachmentState::Attached,
             }),
+            detached_bound: None,
         }
     }
 

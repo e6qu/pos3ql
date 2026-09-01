@@ -3217,28 +3217,32 @@ fn encoded_partition_len(partition: PartitionDef) -> usize {
     let scheme = partition
         .scheme
         .map_or(0, |scheme| 2 + usize::from(scheme.n_keys) * 2);
-    let attachment = partition.attachment.map_or(0, |attachment| {
-        3 + match attachment.bound {
-            PartitionBound::Default => 1,
-            PartitionBound::Hash { .. } => 1 + 8,
-            PartitionBound::List { n_values, values } => {
-                2 + values[..usize::from(n_values)]
-                    .iter()
-                    .map(|value| encoded_default_len(&Some(*value)))
-                    .sum::<usize>()
-            }
-            PartitionBound::Range {
-                n_keys,
-                lower,
-                upper,
-            } => {
-                2 + (0..usize::from(n_keys))
-                    .map(|i| encoded_bound_value_len(lower[i]) + encoded_bound_value_len(upper[i]))
-                    .sum::<usize>()
-            }
+    let bound_len = |bound| match bound {
+        PartitionBound::Default => 1,
+        PartitionBound::Hash { .. } => 1 + 8,
+        PartitionBound::List { n_values, values } => {
+            2 + values[..usize::from(n_values)]
+                .iter()
+                .map(|value| encoded_default_len(&Some(*value)))
+                .sum::<usize>()
         }
+        PartitionBound::Range {
+            n_keys,
+            lower,
+            upper,
+        } => {
+            2 + (0..usize::from(n_keys))
+                .map(|i| encoded_bound_value_len(lower[i]) + encoded_bound_value_len(upper[i]))
+                .sum::<usize>()
+        }
+    };
+    let attachment = partition
+        .attachment
+        .map_or(0, |attachment| 3 + bound_len(attachment.bound));
+    let detached = partition.detached_bound.map_or(0, |detached| {
+        2 + usize::from(detached.scheme.n_keys) * 2 + bound_len(detached.bound)
     });
-    1 + scheme + attachment
+    1 + scheme + attachment + detached
 }
 
 fn encoded_bound_value_len(value: PartitionBoundValue) -> usize {
@@ -3249,8 +3253,9 @@ fn encoded_bound_value_len(value: PartitionBoundValue) -> usize {
 }
 
 fn append_partition(buffer: &mut FixedBuf, partition: PartitionDef) -> bool {
-    let flags =
-        u8::from(partition.scheme.is_some()) | (u8::from(partition.attachment.is_some()) << 1);
+    let flags = u8::from(partition.scheme.is_some())
+        | (u8::from(partition.attachment.is_some()) << 1)
+        | (u8::from(partition.detached_bound.is_some()) << 2);
     let mut ok = buffer.append(&[flags]);
     if let Some(scheme) = partition.scheme {
         let strategy = match scheme.strategy {
@@ -3269,33 +3274,50 @@ fn append_partition(buffer: &mut FixedBuf, partition: PartitionDef) -> bool {
             crate::storage::PartitionAttachmentState::Attached => 0,
             crate::storage::PartitionAttachmentState::DetachPending => 1,
         }]);
-        match attachment.bound {
-            PartitionBound::Default => ok &= buffer.append(&[0]),
-            PartitionBound::Range {
-                lower,
-                upper,
-                n_keys,
-            } => {
-                ok &= buffer.append(&[1, n_keys]);
-                for i in 0..usize::from(n_keys) {
-                    ok &= append_bound_value(buffer, lower[i])
-                        && append_bound_value(buffer, upper[i]);
-                }
-            }
-            PartitionBound::List { values, n_values } => {
-                ok &= buffer.append(&[2, n_values]);
-                for value in &values[..usize::from(n_values)] {
-                    ok &= append_default(buffer, &Some(*value));
-                }
-            }
-            PartitionBound::Hash { modulus, remainder } => {
-                ok &= buffer.append(&[3])
-                    && buffer.append(&modulus.to_le_bytes())
-                    && buffer.append(&remainder.to_le_bytes())
-            }
+        ok &= append_partition_bound(buffer, attachment.bound);
+    }
+    if let Some(detached) = partition.detached_bound {
+        let strategy = match detached.scheme.strategy {
+            PartitionStrategy::Range => 0,
+            PartitionStrategy::List => 1,
+            PartitionStrategy::Hash => 2,
+        };
+        ok &= buffer.append(&[strategy, detached.scheme.n_keys]);
+        for key in &detached.scheme.keys[..usize::from(detached.scheme.n_keys)] {
+            ok &= buffer.append(&key.to_le_bytes());
         }
+        ok &= append_partition_bound(buffer, detached.bound);
     }
     ok
+}
+
+fn append_partition_bound(buffer: &mut FixedBuf, bound: PartitionBound) -> bool {
+    match bound {
+        PartitionBound::Default => buffer.append(&[0]),
+        PartitionBound::Range {
+            lower,
+            upper,
+            n_keys,
+        } => {
+            let mut ok = buffer.append(&[1, n_keys]);
+            for i in 0..usize::from(n_keys) {
+                ok &= append_bound_value(buffer, lower[i]) && append_bound_value(buffer, upper[i]);
+            }
+            ok
+        }
+        PartitionBound::List { values, n_values } => {
+            let mut ok = buffer.append(&[2, n_values]);
+            for value in &values[..usize::from(n_values)] {
+                ok &= append_default(buffer, &Some(*value));
+            }
+            ok
+        }
+        PartitionBound::Hash { modulus, remainder } => {
+            buffer.append(&[3])
+                && buffer.append(&modulus.to_le_bytes())
+                && buffer.append(&remainder.to_le_bytes())
+        }
+    }
 }
 
 fn append_bound_value(buffer: &mut FixedBuf, value: PartitionBoundValue) -> bool {
@@ -5728,7 +5750,7 @@ fn decode_database_definition(
     let collation_version = short(at)?;
     let flags = *payload.get(*at)?;
     *at += 1;
-    if flags & !3 != 0 {
+    if flags & !7 != 0 {
         return None;
     }
     let connection_limit = i32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
@@ -9877,7 +9899,7 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
 fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
     let flags = *payload.get(*at)?;
     *at += 1;
-    if flags & !3 != 0 {
+    if flags & !7 != 0 {
         return None;
     }
     let scheme = if flags & 1 != 0 {
@@ -9915,49 +9937,7 @@ fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
             _ => return None,
         };
         *at += 1;
-        let tag = *payload.get(*at)?;
-        *at += 1;
-        let bound = match tag {
-            0 => PartitionBound::Default,
-            1 => {
-                let n_keys = *payload.get(*at)?;
-                *at += 1;
-                if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
-                    return None;
-                }
-                let mut lower = [PartitionBoundValue::MinValue; crate::storage::MAX_PARTITION_KEYS];
-                let mut upper = lower;
-                for i in 0..usize::from(n_keys) {
-                    lower[i] = decode_bound_value(payload, at)?;
-                    upper[i] = decode_bound_value(payload, at)?;
-                }
-                PartitionBound::Range {
-                    lower,
-                    upper,
-                    n_keys,
-                }
-            }
-            2 => {
-                let n_values = *payload.get(*at)?;
-                *at += 1;
-                if usize::from(n_values) > crate::storage::MAX_PARTITION_LIST_VALUES {
-                    return None;
-                }
-                let mut values = [OwnedDatum::Null; crate::storage::MAX_PARTITION_LIST_VALUES];
-                for value in &mut values[..usize::from(n_values)] {
-                    *value = decode_default(payload, at)??;
-                }
-                PartitionBound::List { values, n_values }
-            }
-            3 => {
-                let modulus = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
-                *at += 4;
-                let remainder = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
-                *at += 4;
-                PartitionBound::Hash { modulus, remainder }
-            }
-            _ => return None,
-        };
+        let bound = decode_partition_bound(payload, at)?;
         Some(crate::storage::PartitionAttachment {
             parent,
             bound,
@@ -9966,7 +9946,86 @@ fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
     } else {
         None
     };
-    Some(PartitionDef { scheme, attachment })
+    let detached_bound = if flags & 4 != 0 {
+        let strategy = match *payload.get(*at)? {
+            0 => PartitionStrategy::Range,
+            1 => PartitionStrategy::List,
+            2 => PartitionStrategy::Hash,
+            _ => return None,
+        };
+        *at += 1;
+        let n_keys = *payload.get(*at)?;
+        *at += 1;
+        if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
+            return None;
+        }
+        let mut keys = [0u16; crate::storage::MAX_PARTITION_KEYS];
+        for key in &mut keys[..usize::from(n_keys)] {
+            *key = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
+            *at += 2;
+        }
+        Some(crate::storage::DetachedPartitionBound {
+            scheme: crate::storage::PartitionScheme {
+                strategy,
+                keys,
+                n_keys,
+            },
+            bound: decode_partition_bound(payload, at)?,
+        })
+    } else {
+        None
+    };
+    Some(PartitionDef {
+        scheme,
+        attachment,
+        detached_bound,
+    })
+}
+
+fn decode_partition_bound(payload: &[u8], at: &mut usize) -> Option<PartitionBound> {
+    let tag = *payload.get(*at)?;
+    *at += 1;
+    match tag {
+        0 => Some(PartitionBound::Default),
+        1 => {
+            let n_keys = *payload.get(*at)?;
+            *at += 1;
+            if usize::from(n_keys) > crate::storage::MAX_PARTITION_KEYS {
+                return None;
+            }
+            let mut lower = [PartitionBoundValue::MinValue; crate::storage::MAX_PARTITION_KEYS];
+            let mut upper = lower;
+            for i in 0..usize::from(n_keys) {
+                lower[i] = decode_bound_value(payload, at)?;
+                upper[i] = decode_bound_value(payload, at)?;
+            }
+            Some(PartitionBound::Range {
+                lower,
+                upper,
+                n_keys,
+            })
+        }
+        2 => {
+            let n_values = *payload.get(*at)?;
+            *at += 1;
+            if usize::from(n_values) > crate::storage::MAX_PARTITION_LIST_VALUES {
+                return None;
+            }
+            let mut values = [OwnedDatum::Null; crate::storage::MAX_PARTITION_LIST_VALUES];
+            for value in &mut values[..usize::from(n_values)] {
+                *value = decode_default(payload, at)??;
+            }
+            Some(PartitionBound::List { values, n_values })
+        }
+        3 => {
+            let modulus = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+            *at += 4;
+            let remainder = u32::from_le_bytes(payload.get(*at..*at + 4)?.try_into().ok()?);
+            *at += 4;
+            Some(PartitionBound::Hash { modulus, remainder })
+        }
+        _ => None,
+    }
 }
 
 fn decode_bound_value(payload: &[u8], at: &mut usize) -> Option<PartitionBoundValue> {
@@ -10771,6 +10830,20 @@ mod tests {
         );
         definition.partition.attachment.as_mut().unwrap().state =
             crate::storage::PartitionAttachmentState::DetachPending;
+        definition.partition.detached_bound = Some(crate::storage::DetachedPartitionBound {
+            scheme: crate::storage::PartitionScheme {
+                strategy: PartitionStrategy::Range,
+                keys: [0; crate::storage::MAX_PARTITION_KEYS],
+                n_keys: 1,
+            },
+            bound: PartitionBound::Range {
+                lower: [PartitionBoundValue::Value(OwnedDatum::Int4(10));
+                    crate::storage::MAX_PARTITION_KEYS],
+                upper: [PartitionBoundValue::Value(OwnedDatum::Int4(20));
+                    crate::storage::MAX_PARTITION_KEYS],
+                n_keys: 1,
+            },
+        });
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "partition table payload", 4096).unwrap();
         assert!(append_payload(
@@ -10804,6 +10877,17 @@ mod tests {
             state,
             crate::storage::PartitionAttachmentState::DetachPending
         );
+        assert!(matches!(
+            restored.partition.detached_bound,
+            Some(crate::storage::DetachedPartitionBound {
+                scheme: crate::storage::PartitionScheme {
+                    strategy: PartitionStrategy::Range,
+                    n_keys: 1,
+                    ..
+                },
+                bound: PartitionBound::Range { n_keys: 1, .. },
+            })
+        ));
         assert_eq!(
             restored.columns[0].not_null,
             crate::storage::NotNullOrigin::LocalAndInherited

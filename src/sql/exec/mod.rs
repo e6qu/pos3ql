@@ -51718,16 +51718,21 @@ fn alter_table_inheritance(
     sql_ok()
 }
 
+struct PartitionAttachmentRequest<'a> {
+    parent: usize,
+    action: AlterAction<'a>,
+}
+
 fn alter_partition_attachment(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
-    parent: usize,
-    action: AlterAction<'_>,
+    request: PartitionAttachmentRequest<'_>,
     arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
+    let PartitionAttachmentRequest { parent, action } = request;
     let parent_def = *storage.table_def(parent, txn.txid);
     let Some(scheme) = parent_def.partition.scheme else {
         return sql_fail(sql_err!(
@@ -52452,8 +52457,10 @@ fn alter_table_inner(
             wal,
             txn,
             scratch,
-            table_index,
-            *action,
+            PartitionAttachmentRequest {
+                parent: table_index,
+                action: *action,
+            },
             arena,
             responder,
         );

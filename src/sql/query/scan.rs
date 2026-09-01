@@ -653,10 +653,7 @@ fn pax_column_demand_bounded(
     fn collect(expression: &Expr, scope: &QueryScope, columns: &mut PaxColumnDemand) -> bool {
         match expression {
             Expr::Column { qualifier, name } => match scope.find_column(*qualifier, name) {
-                Ok(ResolvedColumn::Table(table, column)) if scope.slots[table] != usize::MAX => {
-                    columns.observe(table, column)
-                }
-                Ok(ResolvedColumn::Table(_, _)) => {}
+                Ok(ResolvedColumn::Table(table, column)) => columns.observe(table, column),
                 // An unresolved name can be an enclosing correlated column.
                 // The select walker records it against the enclosing physical
                 // scope while this inner scan needs no local span for it.
@@ -1893,6 +1890,67 @@ fn scan_source_mode<'a>(
         )
     })?;
     for table in 0..scope.n {
+        if let Some(view) = scope.view_accesses[table] {
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::View,
+                slot: view,
+            };
+            if !storage.has_object_privilege(
+                object,
+                current_role,
+                crate::storage::PrivilegeSet::SELECT,
+                txid,
+            ) {
+                let definition = scope.defs[table].ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "expanded view source has no output definition"
+                    )
+                })?;
+                let demanded = pax_demand.selected_mask(table).unwrap_or_else(|| {
+                    if definition.n_columns == u64::BITS as usize {
+                        u64::MAX
+                    } else {
+                        (1u64 << definition.n_columns) - 1
+                    }
+                });
+                let mut allowed = demanded != 0;
+                if demanded == 0 {
+                    allowed = (0..definition.n_columns).any(|column| {
+                        crate::storage::ColumnPrivilegeTarget::new(object, column as u16).is_ok_and(
+                            |target| {
+                                storage.has_column_privilege(
+                                    target,
+                                    current_role,
+                                    crate::storage::PrivilegeSet::SELECT,
+                                    txid,
+                                )
+                            },
+                        )
+                    });
+                }
+                for column in 0..definition.n_columns {
+                    if demanded & (1u64 << column) == 0 {
+                        continue;
+                    }
+                    let target = crate::storage::ColumnPrivilegeTarget::new(object, column as u16)?;
+                    allowed &= storage.has_column_privilege(
+                        target,
+                        current_role,
+                        crate::storage::PrivilegeSet::SELECT,
+                        txid,
+                    );
+                }
+                if !allowed {
+                    let view = storage.view(view as usize);
+                    return Err(sql_err!(
+                        sqlstate::INSUFFICIENT_PRIVILEGE,
+                        "permission denied for view {}",
+                        view.name_for(txid).as_str()
+                    ));
+                }
+            }
+        }
         let catalog_table = scope.slots[table] != usize::MAX;
         let foreign_table = catalog_table
             && storage.table_def(scope.slots[table], txid).kind

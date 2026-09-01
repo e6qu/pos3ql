@@ -339,6 +339,45 @@ def test_aclitem_array_wire_identity():
     s.close()
 
 
+def test_view_column_acl_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE ROLE wire_view_column_reader; "
+        "CREATE TABLE wire_view_column_base (visible text, hidden text); "
+        "INSERT INTO wire_view_column_base VALUES ('shown', 'private'); "
+        "CREATE VIEW wire_view_column_acl AS "
+        "SELECT visible, hidden FROM wire_view_column_base; "
+        "GRANT SELECT (visible) ON wire_view_column_acl TO wire_view_column_reader",
+    )
+    check(
+        "view column ACL wire: setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    visible = simple_query(
+        s,
+        "SET ROLE wire_view_column_reader; "
+        "SELECT visible FROM wire_view_column_acl",
+    )
+    hidden = simple_query(s, "SELECT hidden FROM wire_view_column_acl")
+    reset = simple_query(
+        s,
+        "RESET ROLE; DROP VIEW wire_view_column_acl; "
+        "DROP TABLE wire_view_column_base; DROP ROLE wire_view_column_reader",
+    )
+    check(
+        "view column ACL wire: projected grant admits only its named output",
+        first_text_row(visible) == "shown"
+        and has_sqlstate(hidden, "42501")
+        and not any(kind == b"E" for kind, _ in reset),
+        (visible, hidden, reset),
+    )
+    s.close()
+
+
 def test_unknown_minor_negotiates():
     s = connect()
     s.sendall(startup_payload(7))  # 3.7 does not exist

@@ -206,6 +206,29 @@ RESET ROLE;
 REVOKE GRANT OPTION FOR SELECT (visible)
   ON column_privilege_target FROM column_delegate CASCADE;
 SELECT has_column_privilege('column_leaf', 'column_privilege_target', 'visible', 'SELECT');
+CREATE VIEW column_privilege_view AS
+  SELECT visible, secret FROM column_privilege_target;
+GRANT SELECT (visible) ON column_privilege_view TO column_actor;
+SELECT has_column_privilege('column_actor', 'column_privilege_view', 'visible', 'SELECT'),
+       has_column_privilege('column_actor', 'column_privilege_view', 'secret', 'SELECT');
+SET ROLE column_actor;
+SELECT visible FROM column_privilege_view ORDER BY visible;
+RESET ROLE;
+CREATE ROLE view_column_writer;
+CREATE TABLE view_column_write_base (id integer, hidden text);
+CREATE VIEW view_column_write AS SELECT id FROM view_column_write_base;
+GRANT INSERT (id), UPDATE (id), SELECT (id) ON view_column_write TO view_column_writer;
+GRANT DELETE ON view_column_write TO view_column_writer;
+SET ROLE view_column_writer;
+INSERT INTO view_column_write (id) VALUES (1) RETURNING id;
+UPDATE view_column_write SET id = 2 WHERE id = 1 RETURNING id;
+DELETE FROM view_column_write WHERE id = 2;
+RESET ROLE;
+SELECT count(*) FROM view_column_write_base;
+DROP VIEW view_column_write;
+DROP TABLE view_column_write_base;
+DROP ROLE view_column_writer;
+DROP VIEW column_privilege_view;
 DROP TABLE column_privilege_child;
 DROP TABLE column_privilege_target;
 DROP ROLE column_leaf;

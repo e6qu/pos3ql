@@ -7169,6 +7169,7 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
          CREATE ROLE column_reader; \
          CREATE ROLE column_leaf; \
          CREATE ROLE column_owner; \
+         CREATE ROLE view_column_reader; \
          GRANT CREATE ON SCHEMA public TO column_writer, column_owner; \
          CREATE TABLE column_acl_target ( \
            id integer PRIMARY KEY, visible text, mutable text, secret text \
@@ -7453,7 +7454,8 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
         &mut engine,
         &mut budget,
         "CREATE VIEW column_acl_view AS SELECT visible, secret FROM column_acl_target; \
-         GRANT SELECT ON column_acl_view TO column_writer",
+         GRANT SELECT ON column_acl_view TO column_writer; \
+         GRANT SELECT (visible) ON column_acl_view TO view_column_reader",
     );
     assert_eq!(
         data_rows(&run_with(
@@ -7464,12 +7466,46 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
         )),
         ["t"]
     );
-    let view_column_grant = run_with(
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT has_column_privilege( \
+               'view_column_reader', 'column_acl_view', 'visible', 'SELECT'), \
+                    has_column_privilege( \
+               'view_column_reader', 'column_acl_view', 'secret', 'SELECT'); \
+             SET ROLE view_column_reader; \
+             SELECT visible FROM column_acl_view; \
+             RESET ROLE"
+        )),
+        ["t|f", "shown", "second"]
+    );
+    let denied_view_column = run_with(
         &mut engine,
         &mut budget,
-        "GRANT SELECT (visible) ON column_acl_view TO column_writer",
+        "SET ROLE view_column_reader; SELECT secret FROM column_acl_view",
     );
-    assert!(String::from_utf8_lossy(&view_column_grant).contains("0A000"));
+    assert!(String::from_utf8_lossy(&denied_view_column).contains("42501"));
+    run_with(&mut engine, &mut budget, "RESET ROLE");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT SELECT (visible) ON column_acl_view TO column_reader WITH GRANT OPTION; \
+         SET ROLE column_reader; \
+         GRANT SELECT (visible) ON column_acl_view TO column_leaf; \
+         RESET ROLE; \
+         REVOKE GRANT OPTION FOR SELECT (visible) ON column_acl_view \
+           FROM column_reader CASCADE",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT has_column_privilege( \
+               'column_leaf', 'column_acl_view', 'visible', 'SELECT')"
+        )),
+        ["f"]
+    );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -7486,9 +7522,19 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
                'column_writer', 'column_acl_target', 'secret', 'SELECT'); \
              SELECT attacl::text FROM pg_attribute \
               WHERE attrelid = 'column_owned_target'::regclass AND attname = 'visible'; \
+             SELECT has_column_privilege( \
+               'view_column_reader', 'column_acl_view', 'visible', 'SELECT'), \
+                    has_column_privilege( \
+               'view_column_reader', 'column_acl_view', 'secret', 'SELECT'); \
              SET ROLE column_writer; SELECT visible FROM column_acl_target; RESET ROLE"
         )),
-        ["t|f", "{column_writer=r/column_reader}", "shown", "second"]
+        [
+            "t|f",
+            "{column_writer=r/column_reader}",
+            "t|f",
+            "shown",
+            "second"
+        ]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -36903,6 +36949,39 @@ fn updatable_view_dml() {
         data_rows(&run_with(&mut e, &mut b, "SELECT x FROM v ORDER BY x")),
         ["3", "5", "9"]
     );
+}
+
+#[test]
+fn updatable_view_column_privileges_authorize_definer_rewrites() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE view_column_writer; \
+         CREATE TABLE view_column_write_base (id integer, hidden text); \
+         CREATE VIEW view_column_write AS SELECT id FROM view_column_write_base; \
+         GRANT INSERT (id), UPDATE (id), SELECT (id) ON view_column_write \
+           TO view_column_writer; \
+         GRANT DELETE ON view_column_write TO view_column_writer",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE view_column_writer; \
+         INSERT INTO view_column_write (id) VALUES (1) RETURNING id; \
+         UPDATE view_column_write SET id = 2 WHERE id = 1 RETURNING id; \
+         DELETE FROM view_column_write WHERE id = 2; \
+         RESET ROLE; \
+         SELECT count(*) FROM view_column_write_base",
+    );
+    assert_eq!(data_rows(&output), ["1", "2", "0"]);
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE view_column_writer; \
+         INSERT INTO view_column_write_base (id) VALUES (3)",
+    );
+    assert!(String::from_utf8_lossy(&denied).contains("42501"));
 }
 
 #[test]

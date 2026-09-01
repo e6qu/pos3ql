@@ -15746,6 +15746,50 @@ impl Storage {
         self.column_acl_entries.len()
     }
 
+    /// Enumerate the durable column-ACL targets attached to one relation.
+    /// Object-level grant-option revocation must visit only targets that can
+    /// actually have downstream grants; a view has no backing `TableDef` to
+    /// use as a surrogate column list.
+    pub(crate) fn column_acl_targets(
+        &self,
+        relation: AccessObject,
+        txid: u32,
+        output: &mut [ColumnPrivilegeTarget; MAX_COLUMN_ACL_ENTRIES],
+    ) -> usize {
+        let mut count = 0usize;
+        for entry in self.column_acl_entries.iter() {
+            let (visible, _, _, _, _) = Self::column_acl_visible(entry, txid);
+            if !visible
+                || entry.target.relation != relation
+                || output[..count].contains(&entry.target)
+            {
+                continue;
+            }
+            output[count] = entry.target;
+            count += 1;
+        }
+        count
+    }
+
+    /// Whether a role has a privilege on at least one explicitly-granted
+    /// column. This is the only legal relation-level admission for a view
+    /// without an object-level grant; exact projected-column checks still run
+    /// at the query-scope boundary.
+    pub(crate) fn has_any_column_privilege(
+        &self,
+        relation: AccessObject,
+        role: usize,
+        privilege: PrivilegeSet,
+        txid: u32,
+    ) -> bool {
+        self.column_acl_entries.iter().any(|entry| {
+            let (visible, _, _, _, _) = Self::column_acl_visible(entry, txid);
+            visible
+                && entry.target.relation == relation
+                && self.has_column_privilege(entry.target, role, privilege, txid)
+        })
+    }
+
     pub(crate) fn dependent_column_acl_slots(
         &self,
         target: ColumnPrivilegeTarget,

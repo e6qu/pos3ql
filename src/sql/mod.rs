@@ -9105,6 +9105,60 @@ impl Engine {
         responder: &mut Responder,
         capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        let authorization = match match statement {
+            Stmt::Insert(insert) => storage
+                .resolve_relation(insert.table.schema, insert.table.name, txn.txid)
+                .and_then(|relation| match relation {
+                    crate::storage::ResolvedRelation::View(view) => Some(view),
+                    _ => None,
+                })
+                .map_or(Ok(authorization), |view| {
+                    exec::require_view_dml_privileges(
+                        storage,
+                        statement,
+                        authorization,
+                        view,
+                        txn.txid,
+                        arena,
+                    )
+                }),
+            Stmt::Update(update) => storage
+                .resolve_relation(update.table.schema, update.table.name, txn.txid)
+                .and_then(|relation| match relation {
+                    crate::storage::ResolvedRelation::View(view) => Some(view),
+                    _ => None,
+                })
+                .map_or(Ok(authorization), |view| {
+                    exec::require_view_dml_privileges(
+                        storage,
+                        statement,
+                        authorization,
+                        view,
+                        txn.txid,
+                        arena,
+                    )
+                }),
+            Stmt::Delete(delete) => storage
+                .resolve_relation(delete.table.schema, delete.table.name, txn.txid)
+                .and_then(|relation| match relation {
+                    crate::storage::ResolvedRelation::View(view) => Some(view),
+                    _ => None,
+                })
+                .map_or(Ok(authorization), |view| {
+                    exec::require_view_dml_privileges(
+                        storage,
+                        statement,
+                        authorization,
+                        view,
+                        txn.txid,
+                        arena,
+                    )
+                }),
+            _ => Ok(authorization),
+        } {
+            Ok(authorization) => authorization,
+            Err(error) => return Ok(Err(error)),
+        };
         match statement {
             Stmt::Insert(insert) => {
                 if let Some(crate::storage::ResolvedRelation::View(view)) =
@@ -13032,6 +13086,7 @@ impl Engine {
             } => exec::grant_privileges(
                 &mut self.storage,
                 txn,
+                arena,
                 privileges,
                 *target,
                 grantees,
@@ -13049,6 +13104,7 @@ impl Engine {
             } => exec::revoke_privileges(
                 &mut self.storage,
                 txn,
+                arena,
                 *grant_option_only,
                 privileges,
                 *target,
@@ -18321,7 +18377,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             })?;
             if !matches!(
                 class,
-                crate::storage::AccessClass::Table | crate::storage::AccessClass::MaterializedView
+                crate::storage::AccessClass::Table
+                    | crate::storage::AccessClass::View
+                    | crate::storage::AccessClass::MaterializedView
             ) {
                 return Err(sql_err!(
                     sqlstate::INTERNAL_ERROR,
@@ -18348,6 +18406,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 crate::storage::AccessClass::MaterializedView => storage
                     .find_table(schema, name)
                     .map(|table| storage.table_def(table, 0).n_columns),
+                crate::storage::AccessClass::View => Some(crate::sql::exec::MAX_PROJ),
                 _ => unreachable!("column ACL WAL decoder restricts object classes"),
             };
             if column_count.is_some_and(|count| column as usize >= count) {

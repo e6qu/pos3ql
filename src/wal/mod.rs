@@ -9164,7 +9164,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let class = crate::storage::AccessClass::from_u8(class)?;
             if !matches!(
                 class,
-                crate::storage::AccessClass::Table | crate::storage::AccessClass::MaterializedView
+                crate::storage::AccessClass::Table
+                    | crate::storage::AccessClass::View
+                    | crate::storage::AccessClass::MaterializedView
             ) {
                 return None;
             }
@@ -10350,7 +10352,7 @@ mod tests {
     }
 
     #[test]
-    fn column_acl_codec_rejects_unexecutable_relation_classes() {
+    fn column_acl_codec_accepts_view_relation_classes() {
         let mut budget = Budget::new(1024);
         let mut payload = FixedBuf::new(&mut budget, "view column acl wal", 1024).unwrap();
         assert!(append_payload(
@@ -10366,7 +10368,14 @@ mod tests {
                 grant_options: crate::storage::PrivilegeSet::NONE,
             }
         ));
-        assert!(decode_op(KIND_SET_COLUMN_ACL, payload.readable()).is_none());
+        assert!(matches!(
+            decode_op(KIND_SET_COLUMN_ACL, payload.readable()),
+            Some(WalOp::SetColumnAcl {
+                class,
+                column: 0,
+                ..
+            }) if class == crate::storage::AccessClass::View as u8
+        ));
     }
 
     #[test]

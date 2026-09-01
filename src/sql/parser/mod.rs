@@ -2417,6 +2417,7 @@ impl<'a> Parser<'a> {
                 with_ordinality: false,
                 lateral: false,
                 authorization_role: None,
+                view_access: None,
             };
             let select = Select {
                 items: self.arena_slice(&[SelectItem::Wildcard])?,
@@ -2505,6 +2506,7 @@ impl<'a> Parser<'a> {
                     with_ordinality: false,
                     lateral: false,
                     authorization_role: None,
+                    view_access: None,
                 }; MAX_LIST];
                 let mut count = 0usize;
                 loop {
@@ -2563,6 +2565,7 @@ impl<'a> Parser<'a> {
                     with_ordinality,
                     lateral,
                     authorization_role: None,
+                    view_access: None,
                 });
             }
             self.lexer.reset(mark);
@@ -2606,6 +2609,7 @@ impl<'a> Parser<'a> {
                 with_ordinality: false,
                 lateral,
                 authorization_role: None,
+                view_access: None,
             });
         }
         let parenthesized = inheritance == RelationInheritance::Only && self.eat_op("(")?;
@@ -2732,6 +2736,7 @@ impl<'a> Parser<'a> {
             with_ordinality,
             lateral,
             authorization_role: None,
+            view_access: None,
         })
     }
 
@@ -2834,6 +2839,7 @@ impl<'a> Parser<'a> {
                 with_ordinality: false,
                 lateral: false,
                 authorization_role: None,
+                view_access: None,
             },
             kind: JoinKind::Inner,
             on: None,

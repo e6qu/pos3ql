@@ -8860,6 +8860,7 @@ fn column_privilege_target(
     relation: crate::storage::AccessObject,
     name: &str,
     txid: u32,
+    arena: &crate::mem::arena::Arena,
 ) -> Result<crate::storage::ColumnPrivilegeTarget, SqlError> {
     let column = match relation.class {
         crate::storage::AccessClass::Table => relation.slot as usize,
@@ -8876,10 +8877,22 @@ fn column_privilege_target(
                 })?
         }
         crate::storage::AccessClass::View => {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "column privileges on views are not supported"
-            ));
+            let view = storage.view(relation.slot as usize);
+            let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+            let count =
+                super::catalog::describe_view(storage, txid, view, arena, &mut descriptions)?;
+            let column = descriptions[..count]
+                .iter()
+                .position(|description| description.name == name)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        view.name_for(txid).as_str()
+                    )
+                })?;
+            return crate::storage::ColumnPrivilegeTarget::new(relation, column as u16);
         }
         _ => {
             return Err(sql_err!(
@@ -9039,6 +9052,7 @@ fn revoke_dependent_column_privileges(
 pub fn grant_privileges(
     storage: &mut Storage,
     txn: &mut TxnState,
+    arena: &crate::mem::arena::Arena,
     privileges: &[crate::sql::ast::PrivilegeSpec<'_>],
     target: crate::sql::ast::PrivilegeTarget<'_>,
     grantees: &[&str],
@@ -9151,10 +9165,11 @@ pub fn grant_privileges(
                     Err(error) => return sql_fail(error),
                 };
                 for column in specification.columns {
-                    let target = match column_privilege_target(storage, *object, column, txn.txid) {
-                        Ok(target) => target,
-                        Err(error) => return sql_fail(error),
-                    };
+                    let target =
+                        match column_privilege_target(storage, *object, column, txn.txid, arena) {
+                            Ok(target) => target,
+                            Err(error) => return sql_fail(error),
+                        };
                     if !storage.has_column_grant_option(target, grantor, requested, txn.txid) {
                         return sql_fail(sql_err!(
                             sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -9199,6 +9214,7 @@ pub fn grant_privileges(
 pub fn revoke_privileges(
     storage: &mut Storage,
     txn: &mut TxnState,
+    arena: &crate::mem::arena::Arena,
     grant_option_only: bool,
     privileges: &[crate::sql::ast::PrivilegeSpec<'_>],
     target: crate::sql::ast::PrivilegeTarget<'_>,
@@ -9277,30 +9293,29 @@ pub fn revoke_privileges(
                         .union(crate::storage::PrivilegeSet::REFERENCES)
                         .0,
             );
-            if grantee != PUBLIC_ROLE && removed_column_options.0 != 0 {
-                let table = match object.class {
-                    crate::storage::AccessClass::Table => Some(object.slot as usize),
-                    crate::storage::AccessClass::MaterializedView => {
-                        let (schema, name) = storage.access_object_name_to(*object, txn.txid);
-                        storage.find_table(schema.as_str(), name.as_str())
-                    }
-                    _ => None,
-                };
-                if let Some(table) = table {
-                    for column in 0..storage.table_def(table, txn.txid).n_columns {
-                        let target =
-                            crate::storage::ColumnPrivilegeTarget::new(*object, column as u16)
-                                .expect("table-like access objects accept column privileges");
-                        if let Err(error) = revoke_dependent_column_privileges(
-                            storage,
-                            txn,
-                            target,
-                            grantee,
-                            removed_column_options,
-                            cascade,
-                        ) {
-                            return sql_fail(error);
-                        }
+            if grantee != PUBLIC_ROLE
+                && removed_column_options.0 != 0
+                && matches!(
+                    object.class,
+                    crate::storage::AccessClass::Table
+                        | crate::storage::AccessClass::View
+                        | crate::storage::AccessClass::MaterializedView
+                )
+            {
+                let mut targets = [crate::storage::ColumnPrivilegeTarget::new(*object, 0)
+                    .expect("table-like access objects accept column privileges");
+                    crate::storage::MAX_COLUMN_ACL_ENTRIES];
+                let target_count = storage.column_acl_targets(*object, txn.txid, &mut targets);
+                for target in &targets[..target_count] {
+                    if let Err(error) = revoke_dependent_column_privileges(
+                        storage,
+                        txn,
+                        *target,
+                        grantee,
+                        removed_column_options,
+                        cascade,
+                    ) {
+                        return sql_fail(error);
                     }
                 }
             }
@@ -9420,10 +9435,11 @@ pub fn revoke_privileges(
                     Err(error) => return sql_fail(error),
                 };
                 for column in specification.columns {
-                    let target = match column_privilege_target(storage, *object, column, txn.txid) {
-                        Ok(target) => target,
-                        Err(error) => return sql_fail(error),
-                    };
+                    let target =
+                        match column_privilege_target(storage, *object, column, txn.txid, arena) {
+                            Ok(target) => target,
+                            Err(error) => return sql_fail(error),
+                        };
                     if !storage.has_column_grant_option(target, grantor, requested, txn.txid) {
                         return sql_fail(sql_err!(
                             sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -43994,6 +44010,7 @@ pub fn describe_merge_returning<'a>(
         with_ordinality: false,
         lateral: false,
         authorization_role: None,
+        view_access: None,
     };
     let joins = arena
         .alloc_slice_copy(&[Join {
@@ -55277,16 +55294,10 @@ pub(crate) fn require_rewrite_input_privileges(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let role = authorization.role(storage, txid)?;
-    let (relation, privilege) = match statement {
-        crate::sql::ast::Stmt::Insert(insert) => {
-            (insert.table, crate::storage::PrivilegeSet::INSERT)
-        }
-        crate::sql::ast::Stmt::Update(update) => {
-            (update.table, crate::storage::PrivilegeSet::UPDATE)
-        }
-        crate::sql::ast::Stmt::Delete(delete) => {
-            (delete.table, crate::storage::PrivilegeSet::DELETE)
-        }
+    let relation = match statement {
+        crate::sql::ast::Stmt::Insert(insert) => insert.table,
+        crate::sql::ast::Stmt::Update(update) => update.table,
+        crate::sql::ast::Stmt::Delete(delete) => delete.table,
         _ => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -55328,10 +55339,10 @@ pub(crate) fn require_rewrite_input_privileges(
                 role,
                 txid,
             )?,
-            crate::storage::DependencyClass::View => require_view_privilege_as(
+            crate::storage::DependencyClass::View => require_view_read_privilege_as(
                 storage,
                 slot,
-                crate::storage::PrivilegeSet::SELECT,
+                dependency.referenced_columns,
                 role,
                 txid,
             )?,
@@ -55339,7 +55350,8 @@ pub(crate) fn require_rewrite_input_privileges(
         }
     }
     if let Some(crate::storage::ResolvedRelation::View(view)) = resolved {
-        return require_view_privilege_as(storage, view, privilege, role, txid);
+        let _ = require_view_dml_privileges(storage, statement, authorization, view, txid, arena)?;
+        return Ok(());
     }
     match statement {
         crate::sql::ast::Stmt::Insert(insert) => {
@@ -55681,6 +55693,271 @@ fn require_view_privilege_as(
         "permission denied for view {}",
         definition.name.as_str()
     ))
+}
+
+fn require_view_column_privilege_as(
+    storage: &Storage,
+    view: usize,
+    privilege: crate::storage::PrivilegeSet,
+    columns: u64,
+    role: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let definition = storage.view(view);
+    storage.require_schema_usage_as(definition.schema.as_str(), role, txid)?;
+    let object = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::View,
+        slot: view as u16,
+    };
+    if storage.has_object_privilege(object, role, privilege, txid) {
+        return Ok(());
+    }
+    let allowed = columns != 0
+        && (0..u64::BITS as usize)
+            .filter(|column| columns & (1u64 << column) != 0)
+            .all(|column| {
+                crate::storage::ColumnPrivilegeTarget::new(object, column as u16)
+                    .is_ok_and(|target| storage.has_column_privilege(target, role, privilege, txid))
+            });
+    if allowed {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::INSUFFICIENT_PRIVILEGE,
+        "permission denied for view {}",
+        definition.name.as_str()
+    ))
+}
+
+fn require_view_read_privilege_as(
+    storage: &Storage,
+    view: usize,
+    columns: u64,
+    role: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let definition = storage.view(view);
+    storage.require_schema_usage_as(definition.schema.as_str(), role, txid)?;
+    let object = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::View,
+        slot: view as u16,
+    };
+    if storage.has_object_privilege(object, role, crate::storage::PrivilegeSet::SELECT, txid) {
+        return Ok(());
+    }
+    if columns == 0
+        && storage.has_any_column_privilege(
+            object,
+            role,
+            crate::storage::PrivilegeSet::SELECT,
+            txid,
+        )
+    {
+        return Ok(());
+    }
+    require_view_column_privilege_as(
+        storage,
+        view,
+        crate::storage::PrivilegeSet::SELECT,
+        columns,
+        role,
+        txid,
+    )
+}
+
+fn view_privilege_definition(
+    storage: &Storage,
+    view: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<TableDef, SqlError> {
+    let definition = storage.view(view);
+    let mut descriptions = [super::types::ColDesc::new("", 0, 0); MAX_PROJ];
+    let count = super::catalog::describe_view(storage, txid, definition, arena, &mut descriptions)?;
+    let mut columns = [crate::storage::ColumnMeta::EMPTY; crate::storage::MAX_COLUMNS];
+    if count > columns.len() {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "too many view columns"
+        ));
+    }
+    for (column, description) in columns.iter_mut().zip(&descriptions[..count]) {
+        column.name = crate::storage::SqlName::parse(description.name)?;
+    }
+    Ok(TableDef {
+        schema: definition.schema_for(txid),
+        name: definition.name_for(txid),
+        columns,
+        n_columns: count,
+        ..TableDef::empty()
+    })
+}
+
+/// Checks the invoker's visible view privileges before its DML target is
+/// rewritten to a base relation. The rewrite then runs as the view owner for
+/// a definer view, matching the already-established SELECT boundary.
+pub(crate) fn require_view_dml_privileges(
+    storage: &Storage,
+    statement: &crate::sql::ast::Stmt<'_>,
+    authorization: DmlAuthorization,
+    view: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<DmlAuthorization, SqlError> {
+    let role = authorization.role(storage, txid)?;
+    let definition = view_privilege_definition(storage, view, txid, arena)?;
+    let target_mask = |names: &[&str]| -> Result<u64, SqlError> {
+        if names.is_empty() {
+            return Ok(all_columns_mask(&definition));
+        }
+        names.iter().try_fold(0u64, |mask, name| {
+            definition.column_index(name).map_or_else(
+                || {
+                    Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        definition.name.as_str()
+                    ))
+                },
+                |column| Ok(mask | (1u64 << column)),
+            )
+        })
+    };
+    match statement {
+        crate::sql::ast::Stmt::Insert(insert) => {
+            require_view_column_privilege_as(
+                storage,
+                view,
+                crate::storage::PrivilegeSet::INSERT,
+                target_mask(insert.columns)?,
+                role,
+                txid,
+            )?;
+            let reads = returning_dml_target_columns(
+                insert.returning,
+                &definition,
+                None,
+                storage,
+                txid,
+                arena,
+            )?;
+            if reads != 0 {
+                require_view_column_privilege_as(
+                    storage,
+                    view,
+                    crate::storage::PrivilegeSet::SELECT,
+                    reads,
+                    role,
+                    txid,
+                )?;
+            }
+        }
+        crate::sql::ast::Stmt::Update(update) => {
+            let mut writes = 0u64;
+            let mut reads = 0u64;
+            for (name, expression) in update.assignments {
+                writes |= target_mask(core::slice::from_ref(name))?;
+                reads |= expression_dml_target_columns(
+                    expression,
+                    &definition,
+                    update.alias,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
+            if let Some(expression) = update.where_clause {
+                reads |= expression_dml_target_columns(
+                    expression,
+                    &definition,
+                    update.alias,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
+            reads |= returning_dml_target_columns(
+                update.returning,
+                &definition,
+                update.alias,
+                storage,
+                txid,
+                arena,
+            )?;
+            require_view_column_privilege_as(
+                storage,
+                view,
+                crate::storage::PrivilegeSet::UPDATE,
+                writes,
+                role,
+                txid,
+            )?;
+            if reads != 0 {
+                require_view_column_privilege_as(
+                    storage,
+                    view,
+                    crate::storage::PrivilegeSet::SELECT,
+                    reads,
+                    role,
+                    txid,
+                )?;
+            }
+        }
+        crate::sql::ast::Stmt::Delete(delete) => {
+            require_view_privilege_as(
+                storage,
+                view,
+                crate::storage::PrivilegeSet::DELETE,
+                role,
+                txid,
+            )?;
+            let mut reads = returning_dml_target_columns(
+                delete.returning,
+                &definition,
+                delete.alias,
+                storage,
+                txid,
+                arena,
+            )?;
+            if let Some(expression) = delete.where_clause {
+                reads |= expression_dml_target_columns(
+                    expression,
+                    &definition,
+                    delete.alias,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
+            if reads != 0 {
+                require_view_column_privilege_as(
+                    storage,
+                    view,
+                    crate::storage::PrivilegeSet::SELECT,
+                    reads,
+                    role,
+                    txid,
+                )?;
+            }
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view privilege target is not data-modifying"
+            ));
+        }
+    }
+    Ok(match storage.view(view).security_for(txid) {
+        crate::storage::ViewSecurity::Definer => DmlAuthorization::RuleOwner(storage.object_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::View,
+                slot: view as u16,
+            },
+            txid,
+        ) as u16),
+        crate::storage::ViewSecurity::Invoker => authorization,
+    })
 }
 
 /// Public view of the OID-to-ColType mapping for value-level renderers

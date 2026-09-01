@@ -5216,6 +5216,7 @@ fn over_one_row<'a>(
             with_ordinality: false,
             lateral: false,
             authorization_role: None,
+            view_access: None,
         },
         joins: &[],
     };

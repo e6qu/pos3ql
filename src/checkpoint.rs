@@ -2161,6 +2161,7 @@ impl Checkpointer {
                             matches!(
                                 class,
                                 crate::storage::AccessClass::Table
+                                    | crate::storage::AccessClass::View
                                     | crate::storage::AccessClass::MaterializedView
                             )
                         })
@@ -2197,6 +2198,7 @@ impl Checkpointer {
                         crate::storage::AccessClass::MaterializedView => storage
                             .find_table(&schema, &name)
                             .map(|table| storage.table_def(table, 0).n_columns),
+                        crate::storage::AccessClass::View => Some(crate::sql::exec::MAX_PROJ),
                         _ => unreachable!("cacl class was restricted above"),
                     };
                     if column_count.is_some_and(|count| column as usize >= count) {

@@ -2852,6 +2852,9 @@ pub struct TableRef<'a> {
     /// Set only by stored-view expansion; ordinary parsed references use the
     /// current effective role.
     pub authorization_role: Option<u16>,
+    /// Source view retained across expansion so projected column privileges
+    /// remain enforceable after its body becomes a derived table.
+    pub view_access: Option<u16>,
 }
 
 impl TableRef<'_> {

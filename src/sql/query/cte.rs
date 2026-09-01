@@ -10,8 +10,8 @@ use crate::mem::arena::Arena;
 use crate::sql::ast::{
     Collation, Cte, CteCycleMark, CteMaterialization, CteSearchOrder, Delete, Expr, FromClause,
     GroupingSetQuantifier, Insert, Join, JoinKind, MaterializedCte, Merge, MergeSourceAction,
-    MergeTargetAction, MergeWhen, OnConflict, OnConflictTarget, OrderBy, Select, SelectItem, SetOp,
-    SetQuery, SetTree, Stmt, TableRef, Update,
+    MergeTargetAction, MergeWhen, OnConflict, OnConflictTarget, OrderBy, Returning, Select,
+    SelectItem, SetOp, SetQuery, SetTree, Stmt, TableRef, Update,
 };
 use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
 use crate::sql::exec::MAX_PROJ;
@@ -1338,7 +1338,10 @@ pub fn rewrite_view_dml<'a>(
                 require_view_column(view_name, exposed_columns, column)?;
             }
             let adjusted = Insert {
-                returning: expanded_returning(insert.returning)?,
+                returning: Returning {
+                    items: expanded_returning(insert.returning.items)?,
+                    ..insert.returning
+                },
                 ..*insert
             };
             let adjusted = arena.alloc(adjusted).map_err(|_| arena_full())?;
@@ -1349,7 +1352,10 @@ pub fn rewrite_view_dml<'a>(
                 require_view_column(view_name, exposed_columns, column)?;
             }
             let adjusted = Update {
-                returning: expanded_returning(update.returning)?,
+                returning: Returning {
+                    items: expanded_returning(update.returning.items)?,
+                    ..update.returning
+                },
                 ..*update
             };
             let adjusted = arena.alloc(adjusted).map_err(|_| arena_full())?;
@@ -1357,7 +1363,10 @@ pub fn rewrite_view_dml<'a>(
         }
         Stmt::Delete(delete) => {
             let adjusted = Delete {
-                returning: expanded_returning(delete.returning)?,
+                returning: Returning {
+                    items: expanded_returning(delete.returning.items)?,
+                    ..delete.returning
+                },
                 ..*delete
             };
             let adjusted = arena.alloc(adjusted).map_err(|_| arena_full())?;
@@ -2063,7 +2072,7 @@ fn statement_references(statement: &Stmt<'_>, name: &str) -> usize {
                             .update_where
                             .map_or(0, |expression| expr_references(expression, name))
                 })
-                + returning_references(insert.returning, name)
+                + returning_references(insert.returning.items, name)
         }
         Stmt::Update(update) => {
             update.from.map_or(0, |from| from_references(from, name))
@@ -2075,14 +2084,14 @@ fn statement_references(statement: &Stmt<'_>, name: &str) -> usize {
                 + update
                     .where_clause
                     .map_or(0, |expression| expr_references(expression, name))
-                + returning_references(update.returning, name)
+                + returning_references(update.returning.items, name)
         }
         Stmt::Delete(delete) => {
             delete.using.map_or(0, |from| from_references(from, name))
                 + delete
                     .where_clause
                     .map_or(0, |expression| expr_references(expression, name))
-                + returning_references(delete.returning, name)
+                + returning_references(delete.returning.items, name)
         }
         Stmt::Merge(merge) => {
             tref_references(&merge.source, name)
@@ -2107,7 +2116,7 @@ fn statement_references(statement: &Stmt<'_>, name: &str) -> usize {
                             }
                     })
                     .sum::<usize>()
-                + returning_references(merge.returning, name)
+                + returning_references(merge.returning.items, name)
         }
         _ => 0,
     }
@@ -4187,7 +4196,10 @@ fn subst_insert<'a>(
         rows,
         select,
         on_conflict,
-        returning: subst_select_items(statement.returning, context, arena)?,
+        returning: Returning {
+            items: subst_select_items(statement.returning.items, context, arena)?,
+            ..statement.returning
+        },
         overriding: statement.overriding,
     })
 }
@@ -4210,7 +4222,10 @@ fn subst_update<'a>(
             None => None,
         },
         where_clause: opt_subst(statement.where_clause, context, arena)?,
-        returning: subst_select_items(statement.returning, context, arena)?,
+        returning: Returning {
+            items: subst_select_items(statement.returning.items, context, arena)?,
+            ..statement.returning
+        },
     })
 }
 
@@ -4231,7 +4246,10 @@ fn subst_delete<'a>(
             None => None,
         },
         where_clause: opt_subst(statement.where_clause, context, arena)?,
-        returning: subst_select_items(statement.returning, context, arena)?,
+        returning: Returning {
+            items: subst_select_items(statement.returning.items, context, arena)?,
+            ..statement.returning
+        },
     })
 }
 
@@ -4298,7 +4316,10 @@ fn subst_merge<'a>(
         whens: arena
             .alloc_slice_copy(&whens[..statement.whens.len()])
             .map_err(|_| arena_full())?,
-        returning: subst_select_items(statement.returning, context, arena)?,
+        returning: Returning {
+            items: subst_select_items(statement.returning.items, context, arena)?,
+            ..statement.returning
+        },
     })
 }
 

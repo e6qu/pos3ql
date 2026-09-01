@@ -1233,6 +1233,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
                                 &crate::sql::exec::CatalogCols {
                                     definition: None,
                                     alias: None,
+                                    output_aliases: &[],
                                     storage,
                                     txid,
                                 },
@@ -1249,6 +1250,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
                     &crate::sql::exec::CatalogCols {
                         definition: None,
                         alias: None,
+                        output_aliases: &[],
                         storage,
                         txid,
                     },

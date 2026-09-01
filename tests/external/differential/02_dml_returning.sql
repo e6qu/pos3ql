@@ -17,6 +17,22 @@ PREPARE dq (int) AS SELECT $1 + 1;
 EXECUTE dq(41);
 DEALLOCATE dq;
 
+-- PostgreSQL 18 exposes typed old/new images only to RETURNING. A supplied
+-- output alias replaces the default spelling and a missing image is NULL.
+CREATE TABLE d2_images (id int PRIMARY KEY, value text);
+INSERT INTO d2_images VALUES (1, 'one')
+  RETURNING WITH (OLD AS before, NEW AS after) before.value, after.value;
+UPDATE d2_images SET value = 'two' WHERE id = 1
+  RETURNING WITH (OLD AS before, NEW AS after) before.value, after.value;
+INSERT INTO d2_images VALUES (1, 'three') ON CONFLICT (id) DO UPDATE SET value = excluded.value
+  RETURNING WITH (OLD AS before, NEW AS after) before.value, after.value;
+WITH changed AS (
+  DELETE FROM d2_images WHERE id = 1
+    RETURNING WITH (OLD AS before, NEW AS after) before.value AS old_value, after.value AS new_value
+)
+SELECT old_value, new_value FROM changed;
+DROP TABLE d2_images;
+
 -- PRIMARY KEY / UNIQUE enforcement.
 CREATE TABLE pk2 (id int PRIMARY KEY, email text UNIQUE, note text);
 INSERT INTO pk2 VALUES (1, 'a@x', 'first');

@@ -28673,7 +28673,7 @@ fn typed_complex_defaults_survive_wal_checkpoint_and_set_default() {
 #[test]
 fn alter_column_default_and_not_null() {
     let config = test_config("alter-column");
-    let mut b = Budget::new(1 << 26);
+    let mut b = Budget::new(1 << 27);
     let mut e = Engine::new(&config, &mut b).unwrap();
     run_with(&mut e, &mut b, "CREATE TABLE ac (id int, a int, b text)");
     run_with(&mut e, &mut b, "INSERT INTO ac VALUES (1, NULL, 'x')");
@@ -28775,7 +28775,7 @@ fn alter_column_type_rewrites_and_persists() {
         );
     }
     // The rewritten shape and values survive a restart.
-    let mut b = Budget::new(1 << 27);
+    let mut b = Budget::new(1 << 26);
     let mut e = Engine::new(&config, &mut b).unwrap();
     let bytes = run_with(
         &mut e,

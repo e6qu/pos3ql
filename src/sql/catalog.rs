@@ -5779,20 +5779,35 @@ fn inherited_foreign_key_parent_oid(
         })
 }
 
-fn check_is_inherited(
+fn check_inheritance_count(
     storage: &Storage,
     txid: u32,
     child_slot: usize,
     child: &crate::storage::CheckConstraint,
-) -> bool {
-    let Some(attachment) = storage.table_def(child_slot, txid).partition.attachment else {
-        return false;
-    };
-    storage
-        .table_def(usize::from(attachment.parent), txid)
-        .checks()
-        .iter()
-        .any(|parent| parent.name == child.name && parent.expression == child.expression)
+) -> usize {
+    let definition = storage.table_def(child_slot, txid);
+    let partition_count = usize::from(definition.partition.attachment.is_some_and(|attachment| {
+        storage
+            .table_def(usize::from(attachment.parent), txid)
+            .checks()
+            .iter()
+            .any(|parent| parent.name == child.name && parent.expression == child.expression)
+    }));
+    partition_count
+        + definition
+            .inheritance
+            .parents_ref()
+            .iter()
+            .filter(|parent| {
+                storage
+                    .table_def(usize::from(**parent), txid)
+                    .checks()
+                    .iter()
+                    .any(|parent| {
+                        parent.name == child.name && parent.expression == child.expression
+                    })
+            })
+            .count()
 }
 
 fn append_constraint_attributes(
@@ -7680,30 +7695,44 @@ fn pg_inherits<'a>(
         })
         .count();
     let rows = arena
-        .alloc_slice_with(storage.table_count() + inherited_indexes, |_| {
-            &[] as &[Datum]
-        })
+        .alloc_slice_with(
+            storage.table_count() * (1 + crate::storage::MAX_TABLE_INHERITANCE_PARENTS)
+                + inherited_indexes,
+            |_| &[] as &[Datum],
+        )
         .map_err(|_| arena_full())?;
     let mut n = 0;
     for child in 0..storage.table_count() {
         if !storage.table_slot_visible_to(child, txid) {
             continue;
         }
-        let Some(crate::storage::PartitionAttachment { parent, .. }) =
-            storage.table_def(child, txid).partition.attachment
-        else {
-            continue;
-        };
-        rows[n] = row(
-            &[
-                Datum::Int4(table_oid(storage, child)),
-                Datum::Int4(table_oid(storage, usize::from(parent))),
-                Datum::Int4(1),
-                Datum::Bool(false),
-            ],
-            arena,
-        )?;
-        n += 1;
+        let definition = storage.table_def(child, txid);
+        for (position, parent) in definition.inheritance.parents_ref().iter().enumerate() {
+            rows[n] = row(
+                &[
+                    Datum::Int4(table_oid(storage, child)),
+                    Datum::Int4(table_oid(storage, usize::from(*parent))),
+                    Datum::Int4((position + 1) as i32),
+                    Datum::Bool(false),
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+        if let Some(crate::storage::PartitionAttachment { parent, .. }) =
+            definition.partition.attachment
+        {
+            rows[n] = row(
+                &[
+                    Datum::Int4(table_oid(storage, child)),
+                    Datum::Int4(table_oid(storage, usize::from(parent))),
+                    Datum::Int4(1),
+                    Datum::Bool(false),
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
     }
     for index in indexes {
         let parent_oid = if index.constraint_parent_oid != 0 {
@@ -8851,7 +8880,8 @@ fn pg_constraint<'a>(
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_constraint"));
             }
-            let inherited = check_is_inherited(storage, txid, slot, check);
+            let inheritance_count = check_inheritance_count(storage, txid, slot, check);
+            let inherited = inheritance_count != 0;
             out[n] = row(
                 &[
                     Datum::Int4(
@@ -8882,7 +8912,7 @@ fn pg_constraint<'a>(
                     )),
                     text(" ", arena)?,
                     Datum::Bool(!inherited),
-                    Datum::Int4(i32::from(inherited)),
+                    Datum::Int4(inheritance_count as i32),
                     Datum::Bool(false),
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,

@@ -2234,6 +2234,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             }
             n += def.n_columns;
             n += encoded_partition_len(def.partition);
+            n += 1 + def.inheritance.parents_ref().len() * 2;
             n += 3;
             n
         }
@@ -3747,6 +3748,10 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(&[column.collation.code()]);
             }
             ok &= append_partition(buffer, def.partition);
+            ok &= buffer.append(&[def.inheritance.parents_ref().len() as u8]);
+            for parent in def.inheritance.parents_ref() {
+                ok &= buffer.append(&parent.to_le_bytes());
+            }
             ok &= buffer.append(&[
                 u8::from(def.row_level_security.enabled),
                 u8::from(def.row_level_security.forced),
@@ -6284,6 +6289,16 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 }
             }
             def.partition = decode_partition(payload, &mut at)?;
+            let n_parents = *payload.get(at)? as usize;
+            at += 1;
+            if n_parents > crate::storage::MAX_TABLE_INHERITANCE_PARENTS {
+                return None;
+            }
+            for _ in 0..n_parents {
+                let parent = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                at += 2;
+                def.inheritance.append(usize::from(parent)).ok()?;
+            }
             def.row_level_security = crate::storage::RowLevelSecurityState {
                 enabled: match *payload.get(at)? {
                     0 => false,
@@ -10695,6 +10710,8 @@ mod tests {
     fn table_payload_round_trip_preserves_typed_partition_bounds() {
         let mut definition = sample_def();
         definition.columns[0].not_null = crate::storage::NotNullOrigin::LocalAndInherited;
+        definition.inheritance.append(3).unwrap();
+        definition.inheritance.append(7).unwrap();
         definition.partition = PartitionDef::child(
             4,
             PartitionBound::Range {
@@ -10714,6 +10731,7 @@ mod tests {
         let Some(WalOp::CreateTable(restored)) = decode_op(KIND_CREATE, payload.readable()) else {
             panic!("partition table definition did not decode")
         };
+        assert_eq!(restored.inheritance.parents_ref(), &[3, 7]);
         let Some(crate::storage::PartitionAttachment {
             parent,
             bound:

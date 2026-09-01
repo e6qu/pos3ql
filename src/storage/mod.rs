@@ -1331,6 +1331,9 @@ pub struct TableDef {
     /// selected index definition, but PostgreSQL retains this mode when a
     /// dependent index disappears with a dropped column.
     pub replica_identity: ReplicaIdentityMode,
+    /// Direct PostgreSQL table-inheritance parents. Slots are durable catalog
+    /// identities; a parent cannot be dropped or reused while this edge exists.
+    pub inheritance: TableInheritance,
     pub partition: PartitionDef,
 }
 
@@ -1421,6 +1424,79 @@ impl RowLevelSecurityState {
 pub struct PartitionDef {
     pub scheme: Option<PartitionScheme>,
     pub attachment: Option<PartitionAttachment>,
+}
+
+/// Inline catalog capacity for direct ordinary-inheritance parents.
+pub(crate) const MAX_TABLE_INHERITANCE_PARENTS: usize = 8;
+
+/// Direct table-inheritance edges.  This is deliberately separate from
+/// partition attachment: a partition owns routing and cannot also be treated
+/// as an ordinary inherited child merely because both affect relation scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableInheritance {
+    parents: [u16; MAX_TABLE_INHERITANCE_PARENTS],
+    n_parents: u8,
+}
+
+impl TableInheritance {
+    pub const NONE: Self = Self {
+        parents: [0; MAX_TABLE_INHERITANCE_PARENTS],
+        n_parents: 0,
+    };
+
+    pub fn parents_ref(&self) -> &[u16] {
+        &self.parents[..usize::from(self.n_parents)]
+    }
+
+    pub fn contains(&self, parent: usize) -> bool {
+        u16::try_from(parent)
+            .ok()
+            .is_some_and(|parent| self.parents_ref().contains(&parent))
+    }
+
+    pub fn append(&mut self, parent: usize) -> Result<(), SqlError> {
+        let parent = u16::try_from(parent).map_err(|_| {
+            sql_err!(
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many tables"
+            )
+        })?;
+        if self.parents_ref().contains(&parent) {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::DUPLICATE_TABLE,
+                "relation already inherits from the specified parent"
+            ));
+        }
+        let index = usize::from(self.n_parents);
+        if index == self.parents.len() {
+            return Err(sql_err!(
+                crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "a table can inherit from at most {} parents",
+                MAX_TABLE_INHERITANCE_PARENTS
+            ));
+        }
+        self.parents[index] = parent;
+        self.n_parents += 1;
+        Ok(())
+    }
+
+    pub fn remove(&mut self, parent: usize) -> bool {
+        let Some(parent) = u16::try_from(parent).ok() else {
+            return false;
+        };
+        let Some(index) = self
+            .parents_ref()
+            .iter()
+            .position(|stored| *stored == parent)
+        else {
+            return false;
+        };
+        let count = usize::from(self.n_parents);
+        self.parents.copy_within(index + 1..count, index);
+        self.n_parents -= 1;
+        self.parents[count - 1] = 0;
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1535,6 +1611,7 @@ impl TableDef {
             has_rules: false,
             row_level_security: RowLevelSecurityState::DISABLED,
             replica_identity: ReplicaIdentityMode::DEFAULT,
+            inheritance: TableInheritance::NONE,
             partition: PartitionDef::NONE,
         }
     }
@@ -20482,9 +20559,59 @@ impl Storage {
         Ok(true)
     }
 
-    /// Expands a logical relation to physical scan leaves without allocating.
-    /// The caller supplies startup-bounded/statement-arena storage sized from
-    /// the configured table catalog.
+    /// Expands a logical relation through both ordinary inheritance and
+    /// partition attachment without allocating. A non-partitioned relation
+    /// contributes its own rows before its descendants; partitioned relations
+    /// contribute only their leaves. The caller supplies bounded storage sized
+    /// from the configured table catalog.
+    pub fn relation_leaf_slots(
+        &self,
+        root: usize,
+        txid: u32,
+        out: &mut [usize],
+    ) -> Result<usize, SqlError> {
+        fn visit(
+            storage: &Storage,
+            root: usize,
+            txid: u32,
+            out: &mut [usize],
+            n: &mut usize,
+        ) -> Result<(), SqlError> {
+            if out[..*n].contains(&root) {
+                return Ok(());
+            }
+            if !storage.table_def(root, txid).partition.is_partitioned() {
+                if *n == out.len() {
+                    return Err(sql_err!(
+                        crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "relation scan exceeds configured table capacity"
+                    ));
+                }
+                out[*n] = root;
+                *n += 1;
+            }
+            for child in 0..storage.table_count() {
+                if !storage.table(child).visible_to(txid) {
+                    continue;
+                }
+                let child_def = storage.table_def(child, txid);
+                let partition_child = child_def
+                    .partition
+                    .attachment
+                    .is_some_and(|attachment| usize::from(attachment.parent) == root);
+                if !partition_child && !child_def.inheritance.contains(root) {
+                    continue;
+                }
+                visit(storage, child, txid, out, n)?;
+            }
+            Ok(())
+        }
+        let mut n = 0;
+        visit(self, root, txid, out, &mut n)?;
+        Ok(n)
+    }
+
+    /// Routes writes by partition bounds; scans use `relation_leaf_slots`.
     pub fn partition_leaf_slots(
         &self,
         root: usize,
@@ -20531,6 +20658,20 @@ impl Storage {
         Ok(n)
     }
 
+    /// Whether a relation has a direct partition or ordinary-inheritance
+    /// descendant in the transaction-visible catalog.
+    pub fn relation_has_descendants(&self, root: usize, txid: u32) -> bool {
+        (0..self.table_count()).any(|child| {
+            self.table(child).visible_to(txid)
+                && (self
+                    .table_def(child, txid)
+                    .partition
+                    .attachment
+                    .is_some_and(|attachment| usize::from(attachment.parent) == root)
+                    || self.table_def(child, txid).inheritance.contains(root))
+        })
+    }
+
     /// Whether `table` is a physical descendant of `ancestor` in the catalog
     /// snapshot. Attachment slots are typed and acyclic at DDL time, so this
     /// walk cannot reinterpret an unrelated table as part of the hierarchy.
@@ -20547,6 +20688,51 @@ impl Storage {
             }
         }
         false
+    }
+
+    /// Whether `table` is an ordinary-inheritance or partition descendant of
+    /// `ancestor` in the visible catalog. The bounded depth guard turns a
+    /// corrupted durable cycle into a false relation instead of an unbounded
+    /// recovery or scan walk; DDL validates and prevents that state normally.
+    pub(crate) fn relation_descends_from(&self, table: usize, ancestor: usize, txid: u32) -> bool {
+        fn visit(
+            storage: &Storage,
+            table: usize,
+            ancestor: usize,
+            txid: u32,
+            depth: usize,
+        ) -> bool {
+            if depth == storage.table_count() {
+                return false;
+            }
+            let definition = storage.table_def(table, txid);
+            if definition
+                .partition
+                .attachment
+                .is_some_and(|attachment| usize::from(attachment.parent) == ancestor)
+                || definition.inheritance.contains(ancestor)
+            {
+                return true;
+            }
+            if let Some(attachment) = definition.partition.attachment
+                && visit(
+                    storage,
+                    usize::from(attachment.parent),
+                    ancestor,
+                    txid,
+                    depth + 1,
+                )
+            {
+                return true;
+            }
+            definition
+                .inheritance
+                .parents_ref()
+                .iter()
+                .copied()
+                .any(|parent| visit(storage, usize::from(parent), ancestor, txid, depth + 1))
+        }
+        table != ancestor && visit(self, table, ancestor, txid, 0)
     }
 
     /// Finds the physical owner of a row identity emitted while scanning a

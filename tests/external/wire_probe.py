@@ -3766,21 +3766,37 @@ def test_table_lifecycle_boundaries_over_raw_wire():
     )
     checks = [
         simple_query(s, "CREATE TABLE wire_lifecycle_storage (id integer) WITH (fillfactor = 80)"),
-        simple_query(s, "CREATE TABLE wire_lifecycle_inherited (id integer) INHERITS (wire_lifecycle_plain)"),
         simple_query(s, "CREATE TABLE wire_lifecycle_typed OF wire_lifecycle_row"),
         simple_query(s, "ALTER TABLE wire_lifecycle_plain SET (fillfactor = 80)"),
-        simple_query(s, "ALTER TABLE wire_lifecycle_plain INHERIT wire_lifecycle_parent"),
         simple_query(s, "ALTER TABLE wire_lifecycle_parent DETACH PARTITION wire_lifecycle_child CONCURRENTLY"),
     ]
+    inherited = simple_query(
+        s,
+        "CREATE TABLE wire_lifecycle_inherited (extra text) INHERITS (wire_lifecycle_plain); "
+        "INSERT INTO wire_lifecycle_inherited VALUES (1, 'child'); "
+        "UPDATE wire_lifecycle_plain SET id = 2 WHERE id = 1",
+    )
+    inherited_row = simple_query(s, "SELECT id FROM wire_lifecycle_inherited")
+    inherited_catalog = simple_query(
+        s,
+        "SELECT inhseqno FROM pg_inherits WHERE inhrelid = 'wire_lifecycle_inherited'::regclass",
+    )
     check(
-        "raw wire: unimplemented table lifecycle forms return typed feature errors",
+        "raw wire: table inheritance is executable and remaining lifecycle boundaries are typed",
         not any(kind == b"E" for kind, _ in setup)
-        and all(has_sqlstate(messages, "0A000") for messages in checks),
-        setup + [message for messages in checks for message in messages],
+        and all(has_sqlstate(messages, "0A000") for messages in checks)
+        and not any(kind == b"E" for kind, _ in inherited)
+        and first_text_row(inherited_row) == "2"
+        and first_text_row(inherited_catalog) == "1",
+        setup
+        + [message for messages in checks for message in messages]
+        + inherited
+        + inherited_row
+        + inherited_catalog,
     )
     cleanup = simple_query(
         s,
-        "DROP TABLE wire_lifecycle_child, wire_lifecycle_parent, wire_lifecycle_plain; "
+        "DROP TABLE wire_lifecycle_child, wire_lifecycle_parent, wire_lifecycle_plain CASCADE; "
         "DROP TYPE wire_lifecycle_row",
     )
     check(

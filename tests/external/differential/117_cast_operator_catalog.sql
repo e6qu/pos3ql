@@ -189,3 +189,27 @@ DROP FUNCTION differential_int_prefix(integer);
 DROP FUNCTION differential_int_same(integer, integer);
 DROP FUNCTION differential_int_compare(integer, integer);
 DROP TYPE differential_mood;
+
+CREATE TABLE differential_constraint_comment (
+  value integer,
+  CONSTRAINT differential_constraint_first CHECK (value > 0),
+  CONSTRAINT differential_constraint_second CHECK (value < 100)
+);
+COMMENT ON CONSTRAINT differential_constraint_second
+  ON differential_constraint_comment IS 'constraint catalog comment';
+ALTER TABLE differential_constraint_comment
+  DROP CONSTRAINT differential_constraint_first;
+SELECT obj_description(oid, 'pg_constraint')
+FROM pg_constraint
+WHERE conrelid = 'differential_constraint_comment'::regclass
+  AND conname = 'differential_constraint_second';
+ALTER TABLE differential_constraint_comment
+  RENAME CONSTRAINT differential_constraint_second
+  TO differential_constraint_renamed;
+SELECT obj_description(oid, 'pg_constraint')
+FROM pg_constraint
+WHERE conrelid = 'differential_constraint_comment'::regclass
+  AND conname = 'differential_constraint_renamed';
+ALTER TABLE differential_constraint_comment
+  DROP CONSTRAINT differential_constraint_renamed;
+DROP TABLE differential_constraint_comment;

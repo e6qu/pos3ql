@@ -577,6 +577,11 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingComment>,
     },
+    /// A table-constraint rename changed a comment's transaction-local name.
+    ConstraintCommentRenamed {
+        slot: u32,
+        prior: Option<crate::storage::PendingCommentIdentity>,
+    },
 }
 
 /// Sized for a DROP SCHEMA CASCADE closure: every contained table, view and
@@ -1527,6 +1532,26 @@ impl TxnState {
             }
         }
         identity
+    }
+
+    pub(crate) fn dropped_constraint_names(
+        &self,
+        table: u32,
+    ) -> impl Iterator<Item = crate::storage::SqlName> + '_ {
+        self.constraint_renames
+            .iter()
+            .filter_map(move |event| match *event {
+                ConstraintLifecycle::Drop {
+                    identity:
+                        ConstraintIdentity::Table {
+                            table: dropped_table,
+                            name,
+                            ..
+                        },
+                    ..
+                } if dropped_table == table => Some(name),
+                _ => None,
+            })
     }
 
     pub(crate) fn constraint_identity_is_current(&self, identity: ConstraintIdentity) -> bool {

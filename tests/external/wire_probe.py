@@ -4564,6 +4564,8 @@ def test_catalog_comments_over_raw_wire():
     result = simple_query(
         s,
         "CREATE TABLE wire_catalog_comment (id integer, category integer); "
+        "ALTER TABLE wire_catalog_comment ADD CONSTRAINT wire_catalog_constraint "
+        "CHECK (id > 0); "
         "CREATE POLICY wire_catalog_policy ON wire_catalog_comment FOR SELECT USING (true); "
         "CREATE STATISTICS wire_catalog_statistics (ndistinct) "
         "ON id, category FROM wire_catalog_comment; "
@@ -4599,6 +4601,8 @@ def test_catalog_comments_over_raw_wire():
         "IS 'wire operator family'; "
         "COMMENT ON OPERATOR CLASS wire_catalog_comment_class USING btree "
         "IS 'wire operator class'; "
+        "COMMENT ON CONSTRAINT wire_catalog_constraint ON wire_catalog_comment "
+        "IS 'wire constraint'; "
         "SELECT obj_description(oid, 'pg_policy') FROM pg_policy "
         "WHERE polname = 'wire_catalog_policy'; "
         "SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext "
@@ -4617,6 +4621,9 @@ def test_catalog_comments_over_raw_wire():
         "WHERE opfname = 'wire_catalog_comment_family'; "
         "SELECT obj_description(oid, 'pg_opclass') FROM pg_opclass "
         "WHERE opcname = 'wire_catalog_comment_class'; "
+        "SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint "
+        "WHERE conrelid = 'wire_catalog_comment'::regclass "
+        "AND conname = 'wire_catalog_constraint'; "
         "DROP OPERATOR CLASS wire_catalog_comment_class USING btree; "
         "DROP OPERATOR FAMILY wire_catalog_comment_family USING btree; "
         "DROP OPERATOR === (integer, integer); "
@@ -4646,6 +4653,7 @@ def test_catalog_comments_over_raw_wire():
             "wire operator",
             "wire operator family",
             "wire operator class",
+            "wire constraint",
         ],
         result,
     )

@@ -29609,6 +29609,38 @@ pub fn comment(
                 crate::storage::policy_oid(policy) as u32,
             )
         }
+        CommentTarget::Constraint {
+            name: constraint,
+            table,
+        } => {
+            let table = match policy_table(storage, &table, txid) {
+                Ok(table) => table,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) =
+                storage.require_owner(storage.table_access_object(table, txid), txid, "table")
+            {
+                return sql_fail(error);
+            }
+            if super::catalog::table_constraint_oid(storage, txid, table, constraint).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "constraint \"{}\" for table \"{}\" does not exist",
+                    constraint,
+                    storage.table_def(table, txid).name.as_str()
+                ));
+            }
+            let name = match SqlName::parse(constraint) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (
+                CommentClass::Constraint,
+                storage.table_def(table, txid).schema,
+                name,
+                table as u32,
+            )
+        }
         CommentTarget::Statistics(statistics_name) => {
             let Some(slot) = storage.extended_statistics_slot_on_path(
                 statistics_name.schema,
@@ -53715,6 +53747,144 @@ fn alter_table_inner(
     if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_index as u32)) {
         storage.rollback_table_def(table_index, txn.txid);
         return sql_fail(error);
+    }
+    let mut dropped_constraints = [None; crate::sql::txn::MAX_DEFERRED_CONSTRAINTS];
+    let mut dropped_constraint_count = 0usize;
+    for dropped_table in 0..storage.table_count() {
+        for name in txn.dropped_constraint_names(dropped_table as u32) {
+            let identity = (dropped_table as u32, name);
+            if !dropped_constraints[..dropped_constraint_count].contains(&Some(identity)) {
+                dropped_constraints[dropped_constraint_count] = Some(identity);
+                dropped_constraint_count += 1;
+            }
+        }
+    }
+    for (dropped_table, name) in dropped_constraints[..dropped_constraint_count]
+        .iter()
+        .flatten()
+    {
+        let dropped_table = *dropped_table as usize;
+        let schema = storage.table_def(dropped_table, txn.txid).schema;
+        if storage
+            .comment_text(
+                crate::storage::CommentClass::Constraint,
+                schema.as_str(),
+                name.as_str(),
+                dropped_table as u32,
+                txn.txid,
+            )
+            .is_none()
+        {
+            continue;
+        }
+        let (slot, prior) = match storage.set_comment(
+            crate::storage::CommentClass::Constraint,
+            schema,
+            *name,
+            dropped_table as u32,
+            None,
+            txn.txid,
+        ) {
+            Ok(comment) => comment,
+            Err(error) => return sql_fail(error),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::Comment {
+                class: crate::storage::CommentClass::Constraint.to_u8(),
+                schema: schema.as_str(),
+                name: name.as_str(),
+                subid: dropped_table as u32,
+                text: None,
+            },
+        ) {
+            storage.restore_comment_pending(slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CommentSet {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.restore_comment_pending(slot, prior);
+            return sql_fail(error);
+        }
+    }
+    for action in statement.actions {
+        let AlterAction::RenameConstraint { from, to } = action else {
+            continue;
+        };
+        let old_name = match SqlName::parse(from) {
+            Ok(name) => name,
+            Err(error) => return sql_fail(error),
+        };
+        let new_name = match SqlName::parse(to) {
+            Ok(name) => name,
+            Err(error) => return sql_fail(error),
+        };
+        let text = match storage
+            .comment_text(
+                crate::storage::CommentClass::Constraint,
+                def.schema.as_str(),
+                old_name.as_str(),
+                table_index as u32,
+                txn.txid,
+            )
+            .map(crate::storage::comment_stackstr)
+            .transpose()
+        {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(error) => return sql_fail(error),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::Comment {
+                class: crate::storage::CommentClass::Constraint.to_u8(),
+                schema: def.schema.as_str(),
+                name: old_name.as_str(),
+                subid: table_index as u32,
+                text: None,
+            },
+        ) {
+            return sql_fail(error);
+        }
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::Comment {
+                class: crate::storage::CommentClass::Constraint.to_u8(),
+                schema: def.schema.as_str(),
+                name: new_name.as_str(),
+                subid: table_index as u32,
+                text: Some(text.as_str()),
+            },
+        ) {
+            return sql_fail(error);
+        }
+        let Some((slot, prior)) = storage.stage_constraint_comment_rename(
+            table_index,
+            def.schema,
+            old_name,
+            new_name,
+            txn.txid,
+        ) else {
+            return sql_fail(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "constraint comment disappeared during rename"
+            ));
+        };
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ConstraintCommentRenamed {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.restore_comment_identity_pending(slot, prior);
+            return sql_fail(error);
+        }
     }
     if let Err(error) = rewrite_table_policy_column_references(
         storage,

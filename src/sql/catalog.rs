@@ -4795,6 +4795,18 @@ fn pg_description<'a>(
                 };
                 (storage.operator_class(slot).oid(), PG_OPCLASS_OID)
             }
+            crate::storage::CommentClass::Constraint => {
+                let Ok(table) = usize::try_from(subid) else {
+                    continue;
+                };
+                if !storage.table_slot_visible_to(table, txid) {
+                    continue;
+                }
+                let Some(oid) = table_constraint_oid(storage, txid, table, name) else {
+                    continue;
+                };
+                (oid, PG_CONSTRAINT_OID)
+            }
             crate::storage::CommentClass::Extension => {
                 let Some(slot) = storage.extension_slot(name, txid) else {
                     continue;
@@ -4951,6 +4963,7 @@ fn pg_description<'a>(
                 | crate::storage::CommentClass::Operator
                 | crate::storage::CommentClass::OperatorFamily
                 | crate::storage::CommentClass::OperatorClass
+                | crate::storage::CommentClass::Constraint
         ) {
             0
         } else {
@@ -5365,6 +5378,16 @@ pub fn comment_text_for<'a>(
                                 && csub == oid.get() as u32
                         })
             }
+            "pg_constraint" => {
+                class == crate::storage::CommentClass::Constraint
+                    && subid == 0
+                    && signed_oid.is_some_and(|oid| {
+                        usize::try_from(csub).ok().is_some_and(|table| {
+                            storage.table_slot_visible_to(table, txid)
+                                && table_constraint_oid(storage, txid, table, name) == Some(oid)
+                        })
+                    })
+            }
             "pg_trigger" => {
                 class == crate::storage::CommentClass::Trigger
                     && subid == 0
@@ -5552,6 +5575,59 @@ pub(crate) const FIRST_FK_OID: i32 = 200_000;
 pub(crate) const FIRST_CHECK_OID: i32 = 300_000;
 pub(crate) const FIRST_DOMAIN_CHECK_OID: i32 = 400_000;
 pub(crate) const FIRST_NOT_NULL_OID: i32 = 450_000;
+
+/// The current catalog OID of a named table constraint. Constraint comments
+/// retain the table-slot/name identity because index and check positions are
+/// presentation-derived and can change after an unrelated DROP CONSTRAINT.
+pub(crate) fn table_constraint_oid(
+    storage: &Storage,
+    txid: u32,
+    table_slot: usize,
+    name: &str,
+) -> Option<i32> {
+    if !storage.table_slot_visible_to(table_slot, txid) {
+        return None;
+    }
+    let mut index_constraint = None;
+    visit_indexes(storage, txid, |index| {
+        if index.is_constraint && index.table_slot == table_slot && index.name.as_str() == name {
+            index_constraint = Some(index.oid + 500_000);
+        }
+    });
+    if index_constraint.is_some() {
+        return index_constraint;
+    }
+    let table = storage.table_def(table_slot, txid);
+    if let Some((index, _)) = table
+        .checks()
+        .iter()
+        .enumerate()
+        .find(|(_, constraint)| constraint.name.as_str() == name)
+    {
+        return Some(
+            FIRST_CHECK_OID + table_slot as i32 * crate::storage::MAX_CHECKS as i32 + index as i32,
+        );
+    }
+    if let Some((index, _)) = table
+        .fkeys()
+        .iter()
+        .enumerate()
+        .find(|(_, constraint)| constraint.name.as_str() == name)
+    {
+        return Some(FIRST_FK_OID + table_slot as i32 * MAX_INDEXES_PER_TABLE + index as i32);
+    }
+    table
+        .columns()
+        .iter()
+        .enumerate()
+        .find(|(_, column)| {
+            column.not_null.is_required()
+                && not_null_constraint_name(table, column).as_str() == name
+        })
+        .map(|(index, _)| {
+            FIRST_NOT_NULL_OID + table_slot as i32 * MAX_COLUMNS as i32 + index as i32
+        })
+}
 
 /// Enumerates every foreign-key constraint, resolving each child/parent table to
 /// its OID. A child whose parent no longer exists is skipped (it cannot be

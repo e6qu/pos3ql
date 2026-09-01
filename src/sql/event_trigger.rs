@@ -1134,6 +1134,16 @@ fn comment_reference(
                     .ok_or_else(graph_full)?,
             ))
         }
+        CommentClass::Constraint => {
+            let table = usize::try_from(subid).map_err(|_| graph_full())?;
+            let oid = catalog::table_constraint_oid(storage, txid, table, name.as_str())
+                .ok_or_else(graph_full)?;
+            EventObjectRef::TableConstraint {
+                table: u16::try_from(table).map_err(|_| graph_full())?,
+                oid,
+                name: StackStr::from_str(name.as_str()),
+            }
+        }
         CommentClass::Role => EventObjectRef::Primary(ObjectRef::Role(
             storage
                 .role_slot_by_oid(i32::try_from(subid).map_err(|_| graph_full())?, txid)

@@ -2976,6 +2976,8 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
               SELECT object_type FROM pg_event_trigger_ddl_commands(); RETURN; END'; \
          CREATE EVENT TRIGGER capture_comment_catalog_event_end ON ddl_command_end \
            WHEN TAG IN ('COMMENT') EXECUTE FUNCTION capture_comment_catalog_event(); \
+         CREATE TABLE comment_event_constraints (value integer, \
+           CONSTRAINT comment_event_checked CHECK (value > 0)); \
          CREATE TYPE comment_event_mood AS ENUM ('low', 'high'); \
          CREATE FUNCTION comment_event_mood_text(comment_event_mood) RETURNS text \
            LANGUAGE SQL RETURN 'mood'; \
@@ -3000,6 +3002,7 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
          COMMENT ON OPERATOR === (integer, integer) IS 'operator'; \
          COMMENT ON OPERATOR FAMILY comment_event_family USING btree IS 'family'; \
          COMMENT ON OPERATOR CLASS comment_event_class USING btree IS 'class'; \
+         COMMENT ON CONSTRAINT comment_event_checked ON comment_event_constraints IS 'constraint'; \
          SELECT kind FROM comment_catalog_events ORDER BY kind",
         1 << 20,
     );
@@ -3007,8 +3010,68 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(
         data_rows(&output),
-        ["cast", "operator", "operator class", "operator family"]
+        [
+            "cast",
+            "operator",
+            "operator class",
+            "operator family",
+            "table constraint",
+        ]
     );
+}
+
+#[test]
+fn constraint_comments_keep_identity_through_catalog_churn_and_lifecycle() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE comment_constraint_target (value integer, \
+           CONSTRAINT comment_constraint_first CHECK (value > 0), \
+           CONSTRAINT comment_constraint_second CHECK (value < 100)); \
+         COMMENT ON CONSTRAINT comment_constraint_second ON comment_constraint_target \
+           IS 'stable constraint comment'; \
+         ALTER TABLE comment_constraint_target DROP CONSTRAINT comment_constraint_first; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'comment_constraint_target'::regclass \
+             AND conname = 'comment_constraint_second'; \
+         ALTER TABLE comment_constraint_target \
+           RENAME CONSTRAINT comment_constraint_second TO comment_constraint_renamed; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'comment_constraint_target'::regclass \
+             AND conname = 'comment_constraint_renamed'; \
+         ALTER TABLE comment_constraint_target DROP CONSTRAINT comment_constraint_renamed; \
+         ALTER TABLE comment_constraint_target \
+           ADD CONSTRAINT comment_constraint_renamed CHECK (value < 100); \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'comment_constraint_target'::regclass \
+             AND conname = 'comment_constraint_renamed'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "stable constraint comment",
+            "stable constraint comment",
+            "NULL"
+        ]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE comment_constraint_parent (id integer PRIMARY KEY); \
+         CREATE TABLE comment_constraint_child (parent_id integer, \
+           CONSTRAINT comment_constraint_fk \
+             FOREIGN KEY (parent_id) REFERENCES comment_constraint_parent(id)); \
+         COMMENT ON CONSTRAINT comment_constraint_fk ON comment_constraint_child \
+           IS 'cascade cleanup'; \
+         ALTER TABLE comment_constraint_parent \
+           DROP CONSTRAINT comment_constraint_parent_pkey CASCADE",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(engine.storage.checkpoint_comments().count(), 0);
 }
 
 #[test]
@@ -30334,6 +30397,8 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
         &mut engine,
         &mut budget,
         "CREATE TABLE recovered_comment_target (id integer, category integer); \
+         ALTER TABLE recovered_comment_target ADD CONSTRAINT recovered_comment_checked \
+           CHECK (id > 0); \
          CREATE POLICY recovered_comment_policy ON recovered_comment_target FOR SELECT USING (true); \
          CREATE STATISTICS recovered_comment_statistics (ndistinct) \
            ON id, category FROM recovered_comment_target; \
@@ -30352,6 +30417,10 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
          COMMENT ON SUBSCRIPTION recovered_comment_subscription IS 'subscription durable'; \
          COMMENT ON ROLE recovered_comment_role IS 'role durable'; \
          COMMENT ON SERVER recovered_comment_server IS 'server durable'; \
+         COMMENT ON CONSTRAINT recovered_comment_checked ON recovered_comment_target \
+           IS 'constraint durable'; \
+         ALTER TABLE recovered_comment_target \
+           RENAME CONSTRAINT recovered_comment_checked TO recovered_comment_checked_renamed; \
          ALTER ROLE recovered_comment_role RENAME TO recovered_comment_role_renamed; \
          ALTER SERVER recovered_comment_server RENAME TO recovered_comment_server_renamed",
     );
@@ -30380,7 +30449,10 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
          SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
            WHERE rolname = 'recovered_comment_role_renamed'; \
          SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server \
-           WHERE srvname = 'recovered_comment_server_renamed'",
+           WHERE srvname = 'recovered_comment_server_renamed'; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'recovered_comment_target'::regclass \
+             AND conname = 'recovered_comment_checked_renamed'",
     );
     assert_eq!(
         data_rows(&output),
@@ -30391,6 +30463,7 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
             "subscription durable",
             "role durable",
             "server durable",
+            "constraint durable",
         ]
     );
     drop(cold);
@@ -30457,6 +30530,14 @@ fn comment_errors_match_postgres() {
             "COMMENT ON COLUMN cs.last_value IS 'x'"
         ))
         .contains("42809")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON CONSTRAINT missing_comment_constraint ON ct IS 'x'"
+        ))
+        .contains("42704")
     );
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON SCHEMA nope IS 'x'"))

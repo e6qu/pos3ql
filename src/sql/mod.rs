@@ -5181,6 +5181,7 @@ impl Engine {
                 DdlUndo::CommentSet { slot, .. } => {
                     self.storage.commit_comment(*slot as usize, txn.txid);
                 }
+                DdlUndo::ConstraintCommentRenamed { .. } => {}
             }
         }
         for &advance in txn.subscription_advances() {
@@ -5910,6 +5911,10 @@ impl Engine {
             }
             DdlUndo::CommentSet { slot, prior } => {
                 self.storage.restore_comment_pending(slot as usize, prior);
+            }
+            DdlUndo::ConstraintCommentRenamed { slot, prior } => {
+                self.storage
+                    .restore_comment_identity_pending(slot as usize, prior);
             }
         }
     }

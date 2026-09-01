@@ -6245,6 +6245,13 @@ impl<'a> Parser<'a> {
                 name,
                 table: self.qual_name("policy relation")?,
             })
+        } else if self.eat_ident("constraint")? {
+            let name = self.col_ident("constraint name")?;
+            self.expect_ident("on")?;
+            CommentTarget::Constraint {
+                name,
+                table: self.qual_name("constraint table")?,
+            }
         } else if self.eat_ident("statistics")? {
             CommentTarget::Statistics(self.qual_name("statistics name")?)
         } else if self.eat_ident("role")? {
@@ -8758,7 +8765,8 @@ mod tests {
             "COMMENT ON CAST (public.mood AS text) IS 'cast'; \
              COMMENT ON OPERATOR public.=== (integer, integer) IS 'operator'; \
              COMMENT ON OPERATOR FAMILY public.int_family USING btree IS 'family'; \
-             COMMENT ON OPERATOR CLASS public.int_class USING btree IS 'class'",
+             COMMENT ON OPERATOR CLASS public.int_class USING btree IS 'class'; \
+             COMMENT ON CONSTRAINT int_checked ON public.items IS 'constraint'",
             |parser| {
                 assert!(matches!(
                     parser.next_stmt().unwrap(),
@@ -8785,6 +8793,13 @@ mod tests {
                     parser.next_stmt().unwrap(),
                     Some(Stmt::Comment {
                         target: crate::sql::ast::CommentTarget::OperatorClass { .. },
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::Constraint { .. },
                         ..
                     })
                 ));

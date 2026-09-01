@@ -2499,6 +2499,11 @@ pub enum CommentTarget<'a> {
     Rule(TriggerIdentity<'a>),
     /// POLICY name ON table; policy names are relation-local.
     Policy(PolicyIdentity<'a>),
+    /// CONSTRAINT name ON table; constraint names are relation-local.
+    Constraint {
+        name: &'a str,
+        table: QualName<'a>,
+    },
     Statistics(QualName<'a>),
     /// ROLE name; roles are cluster-wide catalog objects.
     Role(&'a str),

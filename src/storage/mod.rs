@@ -9360,6 +9360,7 @@ pub enum CommentClass {
     Operator,
     OperatorFamily,
     OperatorClass,
+    Constraint,
 }
 
 impl CommentClass {
@@ -9392,6 +9393,7 @@ impl CommentClass {
             CommentClass::Operator => 24,
             CommentClass::OperatorFamily => 25,
             CommentClass::OperatorClass => 26,
+            CommentClass::Constraint => 27,
         }
     }
 
@@ -9424,6 +9426,7 @@ impl CommentClass {
             24 => CommentClass::Operator,
             25 => CommentClass::OperatorFamily,
             26 => CommentClass::OperatorClass,
+            27 => CommentClass::Constraint,
             _ => return None,
         })
     }
@@ -9461,7 +9464,7 @@ pub struct PendingComment {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PendingCommentIdentity {
+pub(crate) struct PendingCommentIdentity {
     txid: u32,
     schema: SqlName,
     name: SqlName,
@@ -17229,6 +17232,46 @@ impl Storage {
         ))
     }
 
+    /// Moves the transaction-visible identity of a table-constraint comment.
+    /// The table slot is durable for the life of the relation; the current
+    /// constraint catalog OID is derived only when exposing pg_catalog.
+    pub(crate) fn stage_constraint_comment_rename(
+        &mut self,
+        table: usize,
+        schema: SqlName,
+        old_name: SqlName,
+        new_name: SqlName,
+        txid: u32,
+    ) -> Option<(usize, Option<PendingCommentIdentity>)> {
+        let database = Some(self.current_database);
+        let slot = self.comments.iter().position(|comment| {
+            comment.matches_to(
+                database,
+                CommentClass::Constraint,
+                schema.as_str(),
+                old_name.as_str(),
+                table as u32,
+                txid,
+            )
+        })?;
+        let prior = self.comments[slot].pending_identity;
+        self.comments[slot].pending_identity = Some(PendingCommentIdentity {
+            txid,
+            schema,
+            name: new_name,
+        });
+        Some((slot, prior))
+    }
+
+    pub(crate) fn restore_comment_identity_pending(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingCommentIdentity>,
+    ) {
+        self.comments[slot].pending_identity = prior;
+        self.reap_comment(slot);
+    }
+
     fn stage_trigger_comment_rename(
         &mut self,
         old_name: SqlName,
@@ -21791,6 +21834,23 @@ impl Storage {
                     name: visible.name,
                 });
             }
+            if comment.used
+                && comment.database == database
+                && comment.class == CommentClass::Constraint
+                && comment.subid == index as u32
+                && comment.schema == committed.schema
+                && changed
+            {
+                let name = comment
+                    .pending_identity
+                    .filter(|identity| identity.txid == txid)
+                    .map_or(comment.name, |identity| identity.name);
+                comment.pending_identity = Some(PendingCommentIdentity {
+                    txid,
+                    schema: visible.schema,
+                    name,
+                });
+            }
         }
     }
 
@@ -21808,7 +21868,27 @@ impl Storage {
         definition.has_rules |= self.tables[index].def.has_rules;
         self.set_table_def(index, definition, &pending.column_mapping);
         self.clear_pending_table_defs(index);
+        self.commit_constraint_comment_identities(index, txid);
         pending.rewrites_rows
+    }
+
+    fn commit_constraint_comment_identities(&mut self, table: usize, txid: u32) {
+        for comment in self.comments.iter_mut().filter(|comment| {
+            comment.used
+                && comment.database == Some(self.current_database)
+                && comment.class == CommentClass::Constraint
+                && comment.subid == table as u32
+                && comment
+                    .pending_identity
+                    .is_some_and(|identity| identity.txid == txid)
+        }) {
+            let identity = comment
+                .pending_identity
+                .take()
+                .expect("filtered pending constraint comment identity");
+            comment.schema = identity.schema;
+            comment.name = identity.name;
+        }
     }
 
     pub fn finish_table_def_commit(&mut self, index: usize, rewrote_rows: bool) {
@@ -22144,6 +22224,7 @@ impl Storage {
         let (schema, name) = (self.tables[index].def.schema, self.tables[index].def.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
+        self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
@@ -22183,6 +22264,7 @@ impl Storage {
         let (schema, name) = (self.tables[index].def.schema, self.tables[index].def.name);
         self.drop_object_comments(CommentClass::Relation, schema.as_str(), name.as_str());
         self.drop_object_comments(CommentClass::Type, schema.as_str(), name.as_str());
+        self.drop_comments_by_subid(CommentClass::Constraint, index as u32);
         self.release_enforcers(index);
         self.clear_pending_table_defs(index);
         self.clear_pending_table_statistics(index);
@@ -35369,10 +35451,11 @@ mod tests {
             CommentClass::Operator,
             CommentClass::OperatorFamily,
             CommentClass::OperatorClass,
+            CommentClass::Constraint,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(27), None);
+        assert_eq!(CommentClass::from_u8(28), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 

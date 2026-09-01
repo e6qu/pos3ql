@@ -3005,6 +3005,8 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
          COMMENT ON OPERATOR CLASS comment_event_class USING btree IS 'class'; \
          COMMENT ON CONSTRAINT comment_event_checked ON comment_event_constraints IS 'constraint'; \
          COMMENT ON FOREIGN DATA WRAPPER comment_event_fdw IS 'wrapper'; \
+         COMMENT ON ACCESS METHOD btree IS 'access method'; \
+         COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'language'; \
          SELECT kind FROM comment_catalog_events ORDER BY kind",
         1 << 20,
     );
@@ -3013,8 +3015,10 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
     assert_eq!(
         data_rows(&output),
         [
+            "access method",
             "cast",
             "foreign data wrapper",
+            "language",
             "operator",
             "operator class",
             "operator family",
@@ -30397,6 +30401,56 @@ fn role_and_foreign_server_comments_keep_stable_catalog_identity() {
 }
 
 #[test]
+fn static_catalog_comments_are_typed_and_durable() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "COMMENT ON ACCESS METHOD btree IS 'access method comment'; \
+         COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'language comment'; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'btree'; \
+         SELECT obj_description(oid, 'pg_language') FROM pg_language \
+           WHERE lanname = 'plpgsql'; \
+         SELECT classoid, objsubid, description FROM pg_description \
+           WHERE description IN ('access method comment', 'language comment') \
+           ORDER BY description",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "access method comment",
+            "language comment",
+            "2601|0|access method comment",
+            "2612|0|language comment",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         COMMENT ON ACCESS METHOD btree IS 'discarded access comment'; \
+         COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'discarded language comment'; \
+         ROLLBACK; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'btree'; \
+         SELECT obj_description(oid, 'pg_language') FROM pg_language \
+           WHERE lanname = 'plpgsql'; \
+         COMMENT ON ACCESS METHOD btree IS NULL; \
+         COMMENT ON PROCEDURAL LANGUAGE plpgsql IS NULL; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'btree'; \
+         SELECT obj_description(oid, 'pg_language') FROM pg_language \
+           WHERE lanname = 'plpgsql'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["access method comment", "language comment", "NULL", "NULL",],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
     let mut config = test_config("catalog-comment-cold-recovery");
     config.object_store_on = true;
@@ -30433,6 +30487,8 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
          COMMENT ON ROLE recovered_comment_role IS 'role durable'; \
          COMMENT ON FOREIGN DATA WRAPPER recovered_comment_fdw IS 'wrapper durable'; \
          COMMENT ON SERVER recovered_comment_server IS 'server durable'; \
+         COMMENT ON ACCESS METHOD btree IS 'access method durable'; \
+         COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'language durable'; \
          COMMENT ON CONSTRAINT recovered_comment_checked ON recovered_comment_target \
            IS 'constraint durable'; \
          ALTER TABLE recovered_comment_target \
@@ -30470,6 +30526,9 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
            FROM pg_foreign_data_wrapper WHERE fdwname = 'recovered_comment_fdw_renamed'; \
          SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server \
            WHERE srvname = 'recovered_comment_server_renamed'; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'btree'; \
+         SELECT obj_description(oid, 'pg_language') FROM pg_language \
+           WHERE lanname = 'plpgsql'; \
          SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
            WHERE conrelid = 'recovered_comment_target'::regclass \
              AND conname = 'recovered_comment_checked_renamed'",
@@ -30484,6 +30543,8 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
             "role durable",
             "wrapper durable",
             "server durable",
+            "access method durable",
+            "language durable",
             "constraint durable",
         ]
     );
@@ -30595,6 +30656,41 @@ fn comment_errors_match_postgres() {
             "COMMENT ON FOREIGN DATA WRAPPER missing_comment_fdw IS 'x'"
         ))
         .contains("42704")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON ACCESS METHOD missing_comment_access_method IS 'x'"
+        ))
+        .contains("42704")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON PROCEDURAL LANGUAGE missing_comment_language IS 'x'"
+        ))
+        .contains("42704")
+    );
+    let denied = run_with(
+        &mut e,
+        &mut b,
+        "CREATE ROLE comment_static_catalog_regular; \
+         GRANT comment_static_catalog_regular TO postgres; \
+         SET ROLE comment_static_catalog_regular; \
+         COMMENT ON ACCESS METHOD btree IS 'denied'",
+    );
+    let denied = String::from_utf8_lossy(&denied);
+    assert!(
+        denied.contains("42501") && denied.contains("must be superuser"),
+        "{denied}"
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "REVOKE comment_static_catalog_regular FROM postgres; \
+         DROP ROLE comment_static_catalog_regular",
     );
     assert!(
         !String::from_utf8_lossy(&run_with(

@@ -2507,6 +2507,10 @@ pub enum CommentTarget<'a> {
     Statistics(QualName<'a>),
     /// ROLE name; roles are cluster-wide catalog objects.
     Role(&'a str),
+    /// ACCESS METHOD name. The catalog-visible identity is a fixed OID.
+    AccessMethod(&'a str),
+    /// PROCEDURAL LANGUAGE name. The catalog-visible identity is a fixed OID.
+    ProceduralLanguage(&'a str),
     /// CAST (source AS target).
     Cast {
         source_type: &'a str,

@@ -6256,6 +6256,12 @@ impl<'a> Parser<'a> {
             CommentTarget::Statistics(self.qual_name("statistics name")?)
         } else if self.eat_ident("role")? {
             CommentTarget::Role(self.col_ident("role name")?)
+        } else if self.eat_ident("access")? {
+            self.expect_ident("method")?;
+            CommentTarget::AccessMethod(self.col_ident("access method name")?)
+        } else if self.eat_ident("procedural")? {
+            self.expect_ident("language")?;
+            CommentTarget::ProceduralLanguage(self.col_ident("procedural language name")?)
         } else if self.eat_ident("cast")? {
             self.expect_op("(")?;
             let source_type = self.unmodified_type_name()?;
@@ -8767,7 +8773,9 @@ mod tests {
              COMMENT ON OPERATOR FAMILY public.int_family USING btree IS 'family'; \
              COMMENT ON OPERATOR CLASS public.int_class USING btree IS 'class'; \
              COMMENT ON CONSTRAINT int_checked ON public.items IS 'constraint'; \
-             COMMENT ON FOREIGN DATA WRAPPER app_fdw IS 'wrapper'",
+             COMMENT ON FOREIGN DATA WRAPPER app_fdw IS 'wrapper'; \
+             COMMENT ON ACCESS METHOD btree IS 'access method'; \
+             COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'language'",
             |parser| {
                 assert!(matches!(
                     parser.next_stmt().unwrap(),
@@ -8808,6 +8816,20 @@ mod tests {
                     parser.next_stmt().unwrap(),
                     Some(Stmt::Comment {
                         target: crate::sql::ast::CommentTarget::ForeignDataWrapper("app_fdw"),
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::AccessMethod("btree"),
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::ProceduralLanguage("plpgsql"),
                         ..
                     })
                 ));

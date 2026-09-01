@@ -9362,6 +9362,8 @@ pub enum CommentClass {
     OperatorClass,
     Constraint,
     ForeignDataWrapper,
+    AccessMethod,
+    ProceduralLanguage,
 }
 
 impl CommentClass {
@@ -9396,6 +9398,8 @@ impl CommentClass {
             CommentClass::OperatorClass => 26,
             CommentClass::Constraint => 27,
             CommentClass::ForeignDataWrapper => 28,
+            CommentClass::AccessMethod => 29,
+            CommentClass::ProceduralLanguage => 30,
         }
     }
 
@@ -9430,6 +9434,8 @@ impl CommentClass {
             26 => CommentClass::OperatorClass,
             27 => CommentClass::Constraint,
             28 => CommentClass::ForeignDataWrapper,
+            29 => CommentClass::AccessMethod,
+            30 => CommentClass::ProceduralLanguage,
             _ => return None,
         })
     }
@@ -9475,9 +9481,10 @@ pub(crate) struct PendingCommentIdentity {
 
 /// A comment attached to a database object, keyed by `(class, schema, name,
 /// subid)` — restart-stable, since object OIDs derive from catalog slots but
-/// names do not. `subid` is 0 for a relation or schema and the 1-based column
-/// number for a column comment. `live` is the committed text (`None` once
-/// removed), `pending` the owning transaction's uncommitted overlay.
+/// names do not. `subid` is 0 for object comments, a column number for column
+/// comments, or the stable catalog OID for static and slot-addressed objects.
+/// `live` is the committed text (`None` once removed), `pending` the owning
+/// transaction's uncommitted overlay.
 #[derive(Clone, Copy, Debug)]
 pub struct CommentEntry {
     pub used: bool,
@@ -17153,6 +17160,8 @@ impl Storage {
                 | CommentClass::Operator
                 | CommentClass::OperatorFamily
                 | CommentClass::OperatorClass
+                | CommentClass::AccessMethod
+                | CommentClass::ProceduralLanguage
         )
     }
 
@@ -35460,10 +35469,12 @@ mod tests {
             CommentClass::OperatorClass,
             CommentClass::Constraint,
             CommentClass::ForeignDataWrapper,
+            CommentClass::AccessMethod,
+            CommentClass::ProceduralLanguage,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(29), None);
+        assert_eq!(CommentClass::from_u8(31), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 

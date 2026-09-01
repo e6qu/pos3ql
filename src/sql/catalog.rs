@@ -37,6 +37,8 @@ pub(crate) const PG_CLASS_OID: i32 = 1259;
 pub(crate) const PG_NAMESPACE_OID: i32 = 2615;
 pub(crate) const PG_TYPE_OID: i32 = 1247;
 pub(crate) const PG_PROC_OID: i32 = 1255;
+pub(crate) const PG_AM_OID: i32 = 2601;
+pub(crate) const PG_LANGUAGE_OID: i32 = 2612;
 const PG_AMOP_OID: i32 = 2602;
 const PG_AMPROC_OID: i32 = 2603;
 pub(crate) const PG_CAST_OID: i32 = 2605;
@@ -60,6 +62,42 @@ pub(crate) const PG_STATISTIC_EXT_OID: i32 = 3381;
 pub(crate) const PG_EXTENSION_OID: i32 = 3079;
 pub(crate) const PG_PUBLICATION_OID: i32 = 6104;
 pub(crate) const PG_SUBSCRIPTION_OID: i32 = 6107;
+
+const ACCESS_METHODS: [(&str, i32); 3] = [("btree", 403), ("hash", 405), ("gist", 783)];
+const INTERNAL_LANGUAGE_OID: i32 = 12;
+const C_LANGUAGE_OID: i32 = 13;
+const SQL_LANGUAGE_OID: i32 = 14;
+const PLPGSQL_LANGUAGE_OID: i32 = 13_563;
+const PROCEDURAL_LANGUAGES: [(&str, i32); 4] = [
+    ("internal", INTERNAL_LANGUAGE_OID),
+    ("c", C_LANGUAGE_OID),
+    ("sql", SQL_LANGUAGE_OID),
+    ("plpgsql", PLPGSQL_LANGUAGE_OID),
+];
+
+pub(crate) fn access_method_oid(name: &str) -> Option<i32> {
+    ACCESS_METHODS
+        .iter()
+        .find_map(|(candidate, oid)| (*candidate == name).then_some(*oid))
+}
+
+pub(crate) fn access_method_name(oid: i32) -> Option<&'static str> {
+    ACCESS_METHODS
+        .iter()
+        .find_map(|(name, candidate)| (*candidate == oid).then_some(*name))
+}
+
+pub(crate) fn procedural_language_oid(name: &str) -> Option<i32> {
+    PROCEDURAL_LANGUAGES
+        .iter()
+        .find_map(|(candidate, oid)| (*candidate == name).then_some(*oid))
+}
+
+pub(crate) fn procedural_language_name(oid: i32) -> Option<&'static str> {
+    PROCEDURAL_LANGUAGES
+        .iter()
+        .find_map(|(name, candidate)| (*candidate == oid).then_some(*name))
+}
 
 #[derive(Clone, Copy)]
 struct IntrinsicRoutine {
@@ -1181,51 +1219,7 @@ pub fn synthesize<'a>(
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
         (false, "pg_indexes") => pg_indexes(storage, txid, arena),
-        (false, "pg_am") => finish(
-            def_of(
-                "pg_am",
-                &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("amname", ColType::Text),
-                    ("amhandler", ColType::Int4),
-                    ("amtype", ColType::Bpchar),
-                ],
-            ),
-            &[
-                row(
-                    &[
-                        Datum::Int4(2601),
-                        Datum::Int4(403),
-                        text("btree", arena)?,
-                        Datum::Int4(0),
-                        text("i", arena)?,
-                    ],
-                    arena,
-                )?,
-                row(
-                    &[
-                        Datum::Int4(2601),
-                        Datum::Int4(405),
-                        text("hash", arena)?,
-                        Datum::Int4(0),
-                        text("i", arena)?,
-                    ],
-                    arena,
-                )?,
-                row(
-                    &[
-                        Datum::Int4(2601),
-                        Datum::Int4(783),
-                        text("gist", arena)?,
-                        Datum::Int4(0),
-                        text("i", arena)?,
-                    ],
-                    arena,
-                )?,
-            ],
-            arena,
-        ),
+        (false, "pg_am") => pg_am(arena),
         (false, "pg_constraint") => pg_constraint(storage, txid, arena),
         (false, "pg_index") => pg_index(storage, txid, arena),
         (false, "pg_stats") => pg_stats(storage, txid, arena),
@@ -3335,7 +3329,22 @@ fn routine_name_matches(written: &str, schema: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod routine_name_tests {
-    use super::routine_name_matches;
+    use super::{
+        ACCESS_METHODS, PROCEDURAL_LANGUAGES, access_method_name, access_method_oid,
+        procedural_language_name, procedural_language_oid, routine_name_matches,
+    };
+
+    #[test]
+    fn static_comment_catalog_identities_round_trip() {
+        for (name, oid) in ACCESS_METHODS {
+            assert_eq!(access_method_oid(name), Some(oid));
+            assert_eq!(access_method_name(oid), Some(name));
+        }
+        for (name, oid) in PROCEDURAL_LANGUAGES {
+            assert_eq!(procedural_language_oid(name), Some(oid));
+            assert_eq!(procedural_language_name(oid), Some(name));
+        }
+    }
 
     #[test]
     fn routine_names_parse_identifier_spelling() {
@@ -4765,6 +4774,24 @@ fn pg_description<'a>(
                 };
                 (foreign_data_wrapper_oid(slot), 2328)
             }
+            crate::storage::CommentClass::AccessMethod => {
+                let Ok(oid) = i32::try_from(subid) else {
+                    continue;
+                };
+                if access_method_name(oid) != Some(name) {
+                    continue;
+                }
+                (oid, PG_AM_OID)
+            }
+            crate::storage::CommentClass::ProceduralLanguage => {
+                let Ok(oid) = i32::try_from(subid) else {
+                    continue;
+                };
+                if procedural_language_name(oid) != Some(name) {
+                    continue;
+                }
+                (oid, PG_LANGUAGE_OID)
+            }
             crate::storage::CommentClass::Cast => {
                 let Some((_, cast)) = storage
                     .casts_visible_to(txid)
@@ -4969,6 +4996,8 @@ fn pg_description<'a>(
                 | crate::storage::CommentClass::Subscription
                 | crate::storage::CommentClass::ForeignServer
                 | crate::storage::CommentClass::ForeignDataWrapper
+                | crate::storage::CommentClass::AccessMethod
+                | crate::storage::CommentClass::ProceduralLanguage
                 | crate::storage::CommentClass::Cast
                 | crate::storage::CommentClass::Operator
                 | crate::storage::CommentClass::OperatorFamily
@@ -5362,6 +5391,22 @@ pub fn comment_text_for<'a>(
                             foreign_data_wrapper_oid(slot) == wrapper_oid
                                 && storage.foreign_wrapper_by_slot(slot, txid).is_some()
                         })
+                    })
+            }
+            "pg_am" => {
+                class == crate::storage::CommentClass::AccessMethod
+                    && subid == 0
+                    && signed_oid.is_some_and(|access_method_oid| {
+                        csub == access_method_oid as u32
+                            && access_method_name(access_method_oid) == Some(name)
+                    })
+            }
+            "pg_language" => {
+                class == crate::storage::CommentClass::ProceduralLanguage
+                    && subid == 0
+                    && signed_oid.is_some_and(|language_oid| {
+                        csub == language_oid as u32
+                            && procedural_language_name(language_oid) == Some(name)
                     })
             }
             "pg_cast" => {
@@ -11623,6 +11668,33 @@ fn pg_event_trigger<'a>(
     finish(definition, &rows[..count], arena)
 }
 
+fn pg_am<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+    let definition = def_of(
+        "pg_am",
+        &[
+            ("tableoid", ColType::Int4),
+            ("oid", ColType::Int4),
+            ("amname", ColType::Text),
+            ("amhandler", ColType::Int4),
+            ("amtype", ColType::Bpchar),
+        ],
+    );
+    let mut rows: [&[Datum]; ACCESS_METHODS.len()] = [&[]; ACCESS_METHODS.len()];
+    for (index, (name, oid)) in ACCESS_METHODS.iter().enumerate() {
+        rows[index] = row(
+            &[
+                Datum::Int4(PG_AM_OID),
+                Datum::Int4(*oid),
+                text(name, arena)?,
+                Datum::Int4(0),
+                text("i", arena)?,
+            ],
+            arena,
+        )?;
+    }
+    finish(definition, &rows, arena)
+}
+
 fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_language",
@@ -11641,8 +11713,8 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     );
     let internal = row(
         &[
-            Datum::Int4(2612),
-            Datum::Int4(12),
+            Datum::Int4(PG_LANGUAGE_OID),
+            Datum::Int4(INTERNAL_LANGUAGE_OID),
             text("internal", arena)?,
             Datum::Int4(10),
             Datum::Bool(false),
@@ -11656,8 +11728,8 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     )?;
     let c = row(
         &[
-            Datum::Int4(2612),
-            Datum::Int4(13),
+            Datum::Int4(PG_LANGUAGE_OID),
+            Datum::Int4(C_LANGUAGE_OID),
             text("c", arena)?,
             Datum::Int4(10),
             Datum::Bool(false),
@@ -11671,8 +11743,8 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     )?;
     let sql = row(
         &[
-            Datum::Int4(2612),
-            Datum::Int4(14),
+            Datum::Int4(PG_LANGUAGE_OID),
+            Datum::Int4(SQL_LANGUAGE_OID),
             text("sql", arena)?,
             Datum::Int4(10),
             Datum::Bool(true),
@@ -11686,8 +11758,8 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     )?;
     let plpgsql = row(
         &[
-            Datum::Int4(2612),
-            Datum::Int4(13563),
+            Datum::Int4(PG_LANGUAGE_OID),
+            Datum::Int4(PLPGSQL_LANGUAGE_OID),
             text("plpgsql", arena)?,
             Datum::Int4(10),
             Datum::Bool(true),

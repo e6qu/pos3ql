@@ -29709,6 +29709,45 @@ pub fn comment(
                 Storage::role_oid(role) as u32,
             )
         }
+        CommentTarget::AccessMethod(access_method_name) => {
+            let Some(oid) = super::catalog::access_method_oid(access_method_name) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "access method \"{}\" does not exist",
+                    access_method_name
+                ));
+            };
+            if let Err(error) = require_static_catalog_comment_superuser(storage, txid) {
+                return sql_fail(error);
+            }
+            let name = match SqlName::parse(access_method_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (CommentClass::AccessMethod, SqlName::EMPTY, name, oid as u32)
+        }
+        CommentTarget::ProceduralLanguage(language_name) => {
+            let Some(oid) = super::catalog::procedural_language_oid(language_name) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "language \"{}\" does not exist",
+                    language_name
+                ));
+            };
+            if let Err(error) = require_static_catalog_comment_superuser(storage, txid) {
+                return sql_fail(error);
+            }
+            let name = match SqlName::parse(language_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (
+                CommentClass::ProceduralLanguage,
+                SqlName::EMPTY,
+                name,
+                oid as u32,
+            )
+        }
         CommentTarget::Cast {
             source_type,
             target_type,
@@ -30036,6 +30075,23 @@ pub fn comment(
     }
     responder.command_complete("COMMENT")?;
     sql_ok()
+}
+
+fn require_static_catalog_comment_superuser(storage: &Storage, txid: u32) -> Result<(), SqlError> {
+    let current = storage.current_role_slot(txid).ok_or_else(|| {
+        sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        )
+    })?;
+    if storage.role(current).attributes_to(txid).superuser {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser"
+        ))
+    }
 }
 
 /// CREATE TABLE ... AS <query> [WITH [NO] DATA]: build a table from the query's

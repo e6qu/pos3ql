@@ -62,6 +62,8 @@ COMMENT ON ROUTINE cmt_fn(integer) IS 'cmttest routine';
 COMMENT ON FOREIGN DATA WRAPPER cmt_fdw IS 'cmttest wrapper';
 COMMENT ON SERVER cmt_server IS 'cmttest server';
 COMMENT ON FOREIGN TABLE cmt_foreign_table IS 'cmttest foreign table';
+COMMENT ON ACCESS METHOD btree IS 'cmttest access method';
+COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'cmttest language';
 
 -- Read them back through the standard helpers.
 SELECT obj_description('cmt_t'::regclass) AS table_comment;
@@ -89,6 +91,10 @@ SELECT obj_description(oid, 'pg_foreign_server') AS server_comment
 SELECT obj_description(oid, 'pg_foreign_data_wrapper') AS wrapper_comment
   FROM pg_foreign_data_wrapper WHERE fdwname = 'cmt_fdw';
 SELECT obj_description('cmt_foreign_table'::regclass) AS foreign_table_comment;
+SELECT obj_description(oid, 'pg_am') AS access_method_comment
+  FROM pg_am WHERE amname = 'btree';
+SELECT obj_description(oid, 'pg_language') AS language_comment
+  FROM pg_language WHERE lanname = 'plpgsql';
 
 -- CREATE OR REPLACE preserves the view object's relation, column, and
 -- composite-type comments.
@@ -169,6 +175,8 @@ SELECT obj_description(oid, 'pg_type') AS enum_after_recreate
 COMMENT ON TYPE integer IS NULL;
 COMMENT ON TYPE regclass IS NULL;
 COMMENT ON TYPE integer[] IS NULL;
+COMMENT ON ACCESS METHOD btree IS NULL;
+COMMENT ON PROCEDURAL LANGUAGE plpgsql IS NULL;
 DROP FUNCTION cmt_fn(integer);
 CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1';
 SELECT obj_description(oid, 'pg_proc') AS recreated_function_comment

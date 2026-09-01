@@ -337,6 +337,8 @@ enum ObjectRef {
     ForeignDataWrapper(usize),
     ForeignServer(usize),
     Role(usize),
+    AccessMethod(i32),
+    ProceduralLanguage(i32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1156,6 +1158,18 @@ fn comment_reference(
         CommentClass::ForeignDataWrapper => EventObjectRef::Primary(ObjectRef::ForeignDataWrapper(
             usize::try_from(subid).map_err(|_| graph_full())?,
         )),
+        CommentClass::AccessMethod => {
+            let oid = i32::try_from(subid).map_err(|_| graph_full())?;
+            (catalog::access_method_name(oid) == Some(name.as_str()))
+                .then_some(EventObjectRef::Primary(ObjectRef::AccessMethod(oid)))
+                .ok_or_else(graph_full)?
+        }
+        CommentClass::ProceduralLanguage => {
+            let oid = i32::try_from(subid).map_err(|_| graph_full())?;
+            (catalog::procedural_language_name(oid) == Some(name.as_str()))
+                .then_some(EventObjectRef::Primary(ObjectRef::ProceduralLanguage(oid)))
+                .ok_or_else(graph_full)?
+        }
         CommentClass::LargeObject => {
             let oid = name
                 .as_str()
@@ -1956,6 +1970,30 @@ fn primary_object(
                 None,
                 Some(role.name_to(txid).as_str()),
                 StackStr::from_str(identifier(role.name_to(txid).as_str()).as_str()),
+                false,
+            )
+        }
+        ObjectRef::AccessMethod(oid) => {
+            let name = catalog::access_method_name(oid).ok_or_else(graph_full)?;
+            base_object(
+                catalog::PG_AM_OID,
+                oid,
+                "access method",
+                None,
+                Some(name),
+                StackStr::from_str(identifier(name).as_str()),
+                false,
+            )
+        }
+        ObjectRef::ProceduralLanguage(oid) => {
+            let name = catalog::procedural_language_name(oid).ok_or_else(graph_full)?;
+            base_object(
+                catalog::PG_LANGUAGE_OID,
+                oid,
+                "language",
+                None,
+                Some(name),
+                StackStr::from_str(identifier(name).as_str()),
                 false,
             )
         }

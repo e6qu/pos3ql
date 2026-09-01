@@ -63,7 +63,7 @@ CALL	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql (lone top-leve
 CHECKPOINT	complete	40_copy.sql
 CLOSE	complete	39_cursors.sql
 CLUSTER	complete	tests/external/differential/124_cluster.sql and object-cold recovery
-COMMENT	partial	59_comment.sql; typed routine, policy, statistics, role, foreign-server, foreign-table, publication, and subscription identities
+COMMENT	partial	59_comment.sql; typed routine, policy, statistics, role, foreign-data-wrapper, foreign-server, foreign-table, publication, subscription, access-method, and procedural-language identities
 COMMIT	complete	05_transactions.sql
 COMMIT PREPARED	complete	120_two_phase_transactions.sql
 COPY	complete	40_copy.sql

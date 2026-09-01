@@ -4596,6 +4596,8 @@ def test_catalog_comments_over_raw_wire():
         "COMMENT ON FOREIGN DATA WRAPPER wire_catalog_comment_fdw IS 'wire wrapper'; "
         "COMMENT ON SERVER wire_catalog_comment_server IS 'wire server'; "
         "COMMENT ON FOREIGN TABLE wire_catalog_comment_foreign IS 'wire foreign table'; "
+        "COMMENT ON ACCESS METHOD btree IS 'wire access method'; "
+        "COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'wire language'; "
         "COMMENT ON CAST (wire_catalog_comment_mood AS text) IS 'wire cast'; "
         "COMMENT ON OPERATOR === (integer, integer) IS 'wire operator'; "
         "COMMENT ON OPERATOR FAMILY wire_catalog_comment_family USING btree "
@@ -4615,6 +4617,8 @@ def test_catalog_comments_over_raw_wire():
         "SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server "
         "WHERE srvname = 'wire_catalog_comment_server'; "
         "SELECT obj_description('wire_catalog_comment_foreign'::regclass); "
+        "SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'btree'; "
+        "SELECT obj_description(oid, 'pg_language') FROM pg_language WHERE lanname = 'plpgsql'; "
         "SELECT obj_description(oid, 'pg_cast') FROM pg_cast "
         "WHERE castsource = 'wire_catalog_comment_mood'::regtype "
         "AND casttarget = 'text'::regtype; "
@@ -4653,6 +4657,8 @@ def test_catalog_comments_over_raw_wire():
             "wire wrapper",
             "wire server",
             "wire foreign table",
+            "wire access method",
+            "wire language",
             "wire cast",
             "wire operator",
             "wire operator family",

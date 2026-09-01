@@ -591,22 +591,22 @@ fn collect_statement(
                 )?;
                 collect_expr!(merge.on, Some(&scope), no_excluded)?;
                 for when in merge.whens {
-                    if let Some(condition) = when.cond {
+                    if let Some(condition) = when.condition() {
                         collect_expr!(condition, Some(&scope), no_excluded)?;
                     }
-                    match when.action {
-                        crate::sql::ast::MergeAction::Update(assignments) => {
+                    match when.action() {
+                        crate::sql::ast::MergeActionRef::Update(assignments) => {
                             for (_, expression) in assignments {
                                 collect_expr!(expression, Some(&scope), no_excluded)?;
                             }
                         }
-                        crate::sql::ast::MergeAction::Insert { values, .. } => {
+                        crate::sql::ast::MergeActionRef::Insert { values, .. } => {
                             for expression in values {
                                 collect_expr!(expression, Some(&scope), no_excluded)?;
                             }
                         }
-                        crate::sql::ast::MergeAction::Delete
-                        | crate::sql::ast::MergeAction::DoNothing => {}
+                        crate::sql::ast::MergeActionRef::Delete
+                        | crate::sql::ast::MergeActionRef::DoNothing => {}
                     }
                 }
                 Ok(())

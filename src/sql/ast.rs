@@ -3980,31 +3980,117 @@ pub struct Merge<'a> {
     pub whens: &'a [MergeWhen<'a>],
 }
 
-/// One `WHEN [NOT] MATCHED [AND cond] THEN action` clause.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MergeWhen<'a> {
-    pub matched: bool,
-    /// The `AND cond` refinement (None = always applies).
-    pub cond: Option<&'a Expr<'a>>,
-    pub action: MergeAction<'a>,
+/// The candidate-row kind selected by a MERGE `WHEN` clause.
+///
+/// The parser resolves PostgreSQL's implicit `NOT MATCHED` spelling to
+/// `NotMatchedByTarget`, so later stages never need to infer its meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMatchKind {
+    Matched,
+    NotMatchedBySource,
+    NotMatchedByTarget,
 }
 
-/// A MERGE clause's action.
+impl MergeMatchKind {
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Matched => 0,
+            Self::NotMatchedBySource => 1,
+            Self::NotMatchedByTarget => 2,
+        }
+    }
+}
+
+/// Actions valid for a candidate that has a target row.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MergeAction<'a> {
-    /// `UPDATE SET col = expr, ...` (WHEN MATCHED only).
+pub enum MergeTargetAction<'a> {
     Update(&'a [(&'a str, &'a Expr<'a>)]),
-    /// `DELETE` (WHEN MATCHED only).
     Delete,
-    /// `INSERT [(cols)] VALUES (exprs)` or `INSERT DEFAULT VALUES` (WHEN NOT
-    /// MATCHED only). Empty `values` means DEFAULT VALUES.
+    DoNothing,
+}
+
+/// Actions valid for a candidate that has a source row but no target row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MergeSourceAction<'a> {
     Insert {
         columns: &'a [&'a str],
         values: &'a [&'a Expr<'a>],
         default_values: bool,
     },
-    /// `DO NOTHING`.
     DoNothing,
+}
+
+/// One `WHEN ... [AND cond] THEN action` clause. Its variant carries the only
+/// action domain PostgreSQL permits for that candidate state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MergeWhen<'a> {
+    Matched {
+        cond: Option<&'a Expr<'a>>,
+        action: MergeTargetAction<'a>,
+    },
+    NotMatchedBySource {
+        cond: Option<&'a Expr<'a>>,
+        action: MergeTargetAction<'a>,
+    },
+    NotMatchedByTarget {
+        cond: Option<&'a Expr<'a>>,
+        action: MergeSourceAction<'a>,
+    },
+}
+
+/// A non-storable view over the typed action domains for executor walks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MergeActionRef<'a> {
+    Update(&'a [(&'a str, &'a Expr<'a>)]),
+    Delete,
+    Insert {
+        columns: &'a [&'a str],
+        values: &'a [&'a Expr<'a>],
+        default_values: bool,
+    },
+    DoNothing,
+}
+
+impl<'a> MergeWhen<'a> {
+    pub const fn kind(self) -> MergeMatchKind {
+        match self {
+            Self::Matched { .. } => MergeMatchKind::Matched,
+            Self::NotMatchedBySource { .. } => MergeMatchKind::NotMatchedBySource,
+            Self::NotMatchedByTarget { .. } => MergeMatchKind::NotMatchedByTarget,
+        }
+    }
+
+    pub const fn condition(self) -> Option<&'a Expr<'a>> {
+        match self {
+            Self::Matched { cond, .. }
+            | Self::NotMatchedBySource { cond, .. }
+            | Self::NotMatchedByTarget { cond, .. } => cond,
+        }
+    }
+
+    pub const fn action(self) -> MergeActionRef<'a> {
+        match self {
+            Self::Matched { action, .. } | Self::NotMatchedBySource { action, .. } => {
+                match action {
+                    MergeTargetAction::Update(assignments) => MergeActionRef::Update(assignments),
+                    MergeTargetAction::Delete => MergeActionRef::Delete,
+                    MergeTargetAction::DoNothing => MergeActionRef::DoNothing,
+                }
+            }
+            Self::NotMatchedByTarget { action, .. } => match action {
+                MergeSourceAction::Insert {
+                    columns,
+                    values,
+                    default_values,
+                } => MergeActionRef::Insert {
+                    columns,
+                    values,
+                    default_values,
+                },
+                MergeSourceAction::DoNothing => MergeActionRef::DoNothing,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

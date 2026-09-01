@@ -1187,7 +1187,7 @@ fn text_search_catalog_survives_checkpoint_and_cold_object_recovery() {
 fn prepared_transactions_commit_rollback_catalog_and_lock_contracts() {
     let mut config = test_config("prepared-transactions");
     config.max_prepared_transactions = 3;
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
 
     let setup = run_with(
@@ -27621,6 +27621,110 @@ fn merge_statement() {
         "{}",
         String::from_utf8_lossy(&no_action)
     );
+
+    let by_source = run_with(
+        &mut e,
+        &mut b,
+        "MERGE INTO tgt AS target USING src AS source ON target.id = source.id \
+         WHEN NOT MATCHED BY SOURCE AND target.id < 5 \
+           THEN UPDATE SET n = target.n + 100; \
+         SELECT id, n FROM tgt WHERE id IN (1, 10) ORDER BY id",
+    );
+    assert_eq!(data_rows(&by_source), ["1|110", "10|99"]);
+    let by_source_scope = run_with(
+        &mut e,
+        &mut b,
+        "MERGE INTO tgt AS target USING src AS source ON target.id = source.id \
+         WHEN NOT MATCHED BY SOURCE AND source.id IS NULL THEN DELETE",
+    );
+    assert!(
+        String::from_utf8_lossy(&by_source_scope).contains("42P01"),
+        "{}",
+        String::from_utf8_lossy(&by_source_scope)
+    );
+    let explicit_by_target = run_with_arena_bytes(
+        &mut e,
+        &mut b,
+        "MERGE INTO tgt AS target USING (VALUES (11, 'eleven')) AS source(id, v) \
+         ON target.id = source.id \
+         WHEN NOT MATCHED BY TARGET THEN INSERT (id, v, n) VALUES (source.id, source.v, 11); \
+         SELECT id, v, n FROM tgt WHERE id = 11",
+        1 << 20,
+    );
+    assert_eq!(
+        data_rows(&explicit_by_target),
+        ["11|eleven|11"],
+        "{}",
+        String::from_utf8_lossy(&explicit_by_target)
+    );
+    let unreachable = run_with(
+        &mut e,
+        &mut b,
+        "MERGE INTO tgt AS target USING src AS source ON target.id = source.id \
+         WHEN NOT MATCHED BY SOURCE THEN DELETE \
+         WHEN NOT MATCHED BY SOURCE THEN DO NOTHING",
+    );
+    assert!(
+        String::from_utf8_lossy(&unreachable).contains("unreachable WHEN clause"),
+        "{}",
+        String::from_utf8_lossy(&unreachable)
+    );
+    for invalid in [
+        "MERGE INTO tgt AS target USING src AS source ON target.id = source.id \
+         WHEN NOT MATCHED BY SOURCE THEN INSERT (id) VALUES (source.id)",
+        "MERGE INTO tgt AS target USING src AS source ON target.id = source.id \
+         WHEN NOT MATCHED BY TARGET THEN UPDATE SET n = 0",
+    ] {
+        let output = run_with(&mut e, &mut b, invalid);
+        assert!(
+            String::from_utf8_lossy(&output).contains("42601"),
+            "{invalid}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+}
+
+#[test]
+fn merge_by_source_survives_object_only_recovery() {
+    let mut config = test_config("merge-by-source-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("merge-by-source-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let changed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE merge_recovery_target (id integer PRIMARY KEY, value text); \
+         CREATE TABLE merge_recovery_source (id integer); \
+         INSERT INTO merge_recovery_target VALUES (1, 'old'), (2, 'remove'); \
+         MERGE INTO merge_recovery_target AS target USING merge_recovery_source AS source \
+           ON target.id = source.id \
+           WHEN NOT MATCHED BY SOURCE AND target.id = 1 THEN UPDATE SET value = 'kept' \
+           WHEN NOT MATCHED BY SOURCE THEN DELETE; \
+         SELECT id, value FROM merge_recovery_target ORDER BY id",
+    );
+    assert_eq!(data_rows(&changed), ["1|kept"]);
+    assert!(engine.checkpoint().unwrap());
+    engine.commit_wal().unwrap();
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT id, value FROM merge_recovery_target ORDER BY id",
+    );
+    assert_eq!(data_rows(&recovered), ["1|kept"]);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

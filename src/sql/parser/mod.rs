@@ -1512,12 +1512,49 @@ impl<'a> Parser<'a> {
         Ok(None)
     }
 
-    fn returning(&mut self) -> Result<&'a [SelectItem<'a>], ParseError> {
-        if self.eat_ident("returning")? {
-            self.select_items()
-        } else {
-            Ok(&[])
+    fn returning(&mut self) -> Result<crate::sql::ast::Returning<'a>, ParseError> {
+        use crate::sql::ast::Returning;
+        if !self.eat_ident("returning")? {
+            return Ok(Returning::NONE);
         }
+        let (old_alias, new_alias) = if self.eat_ident("with")? {
+            self.expect_op("(")?;
+            let mut old_alias = None;
+            let mut new_alias = None;
+            loop {
+                let is_old = if self.eat_ident("old")? {
+                    true
+                } else {
+                    self.expect_ident("new")?;
+                    false
+                };
+                self.expect_ident("as")?;
+                let alias = self.col_ident("RETURNING output alias")?;
+                let slot = if is_old {
+                    &mut old_alias
+                } else {
+                    &mut new_alias
+                };
+                if slot.replace(alias).is_some() {
+                    return Err(self.err_here("RETURNING output alias specified more than once"));
+                }
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            if old_alias == new_alias && old_alias.is_some() {
+                return Err(self.err_here("RETURNING OLD and NEW output aliases must differ"));
+            }
+            (old_alias, new_alias)
+        } else {
+            (None, None)
+        };
+        Ok(Returning {
+            items: self.select_items()?,
+            old_alias,
+            new_alias,
+        })
     }
 
     /// A SELECT through HAVING, without the trailing ORDER BY / LIMIT / OFFSET

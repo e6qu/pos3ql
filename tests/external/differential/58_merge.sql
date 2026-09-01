@@ -66,6 +66,12 @@ WITH changed AS (
 )
 SELECT action, id, v FROM changed ORDER BY id;
 
+-- PostgreSQL expands an unqualified MERGE RETURNING star as source followed
+-- by the affected target row.
+MERGE INTO mg_tgt t USING (VALUES (2, 'star returned')) s(id, v) ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  RETURNING *;
+
 DROP TABLE mg_tgt;
 DROP TABLE mg_src;
 

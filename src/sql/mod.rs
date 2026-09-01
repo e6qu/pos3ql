@@ -7720,10 +7720,10 @@ impl Engine {
                 }
             };
         }
-        let (target, returning) = match statement {
-            Stmt::Insert(insert) => (insert.table, insert.returning),
-            Stmt::Update(update) => (update.table, update.returning),
-            Stmt::Delete(delete) => (delete.table, delete.returning),
+        let (target, returning, target_alias) = match statement {
+            Stmt::Insert(insert) => (insert.table, insert.returning, None),
+            Stmt::Update(update) => (update.table, update.returning, update.alias),
+            Stmt::Delete(delete) => (delete.table, delete.returning, delete.alias),
             _ => {
                 responder.no_data()?;
                 return Ok(true);
@@ -7733,7 +7733,7 @@ impl Engine {
             responder.no_data()?;
             return Ok(true);
         }
-        let (target, returning) =
+        let (target, returning, target_alias) =
             match query::resolve_view_for_dml(&self.storage, target, txn.txid, arena) {
                 Ok(Some(view)) => {
                     let rewritten = match query::rewrite_view_dml(
@@ -7752,15 +7752,15 @@ impl Engine {
                             return Ok(false);
                         }
                     };
-                    let returning = match rewritten {
-                        Stmt::Insert(insert) => insert.returning,
-                        Stmt::Update(update) => update.returning,
-                        Stmt::Delete(delete) => delete.returning,
+                    let (returning, target_alias) = match rewritten {
+                        Stmt::Insert(insert) => (insert.returning, None),
+                        Stmt::Update(update) => (update.returning, update.alias),
+                        Stmt::Delete(delete) => (delete.returning, delete.alias),
                         _ => unreachable!("view rewrite keeps its statement kind"),
                     };
-                    (view.base, returning)
+                    (view.base, returning, target_alias)
                 }
-                Ok(None) => (target, returning),
+                Ok(None) => (target, returning, target_alias),
                 Err(error) => {
                     responder.error(error.sqlstate, error.message.as_str())?;
                     return Ok(false);
@@ -7775,10 +7775,11 @@ impl Engine {
         };
         let definition = *self.storage.table_def(table_index, txn.txid);
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match query::describe_catalog_items(
+        match exec::describe_returning_items(
             returning,
             Some(&definition),
-            &self.storage,
+            target_alias,
+            Some(&self.storage),
             txn.txid,
             &mut columns,
         ) {
@@ -8089,10 +8090,16 @@ impl Engine {
                         .alloc(*self.storage.table_def(idx, txn.txid))
                         .map_err(|_| query::arena_full_pub())?;
                     let mut local = [ColDesc::new("", 0, 0); MAX_PROJ];
-                    let count = query::describe_catalog_items(
+                    let count = exec::describe_returning_items(
                         returning.1,
                         Some(&*def),
-                        &self.storage,
+                        match dml {
+                            Stmt::Insert(_) => None,
+                            Stmt::Update(update) => update.alias,
+                            Stmt::Delete(delete) => delete.alias,
+                            _ => unreachable!(),
+                        },
+                        Some(&self.storage),
                         txn.txid,
                         &mut local,
                     )?;

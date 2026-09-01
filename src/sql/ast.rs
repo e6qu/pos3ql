@@ -3894,6 +3894,46 @@ impl CopyOptions<'_> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Returning<'a> {
+    /// `RETURNING` output items (empty = no clause).
+    pub items: &'a [SelectItem<'a>],
+    /// The name visible for the pre-change target row. `None` means the
+    /// PostgreSQL spelling `old`; a supplied alias hides that spelling.
+    pub old_alias: Option<&'a str>,
+    /// The name visible for the post-change target row. `None` means the
+    /// PostgreSQL spelling `new`; a supplied alias hides that spelling.
+    pub new_alias: Option<&'a str>,
+}
+
+impl<'a> Returning<'a> {
+    pub const NONE: Self = Self {
+        items: &[],
+        old_alias: None,
+        new_alias: None,
+    };
+
+    pub const fn is_empty(self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The only name visible for the pre-change image in this output scope.
+    pub const fn old_name(self) -> &'a str {
+        match self.old_alias {
+            Some(alias) => alias,
+            None => "old",
+        }
+    }
+
+    /// The only name visible for the post-change image in this output scope.
+    pub const fn new_name(self) -> &'a str {
+        match self.new_alias {
+            Some(alias) => alias,
+            None => "new",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Insert<'a> {
     pub table: QualName<'a>,
     /// Empty means "all columns in table order".
@@ -3904,8 +3944,7 @@ pub struct Insert<'a> {
     pub select: Option<&'a Select<'a>>,
     /// ON CONFLICT clause, when present.
     pub on_conflict: Option<OnConflict<'a>>,
-    /// RETURNING items (empty = none).
-    pub returning: &'a [SelectItem<'a>],
+    pub returning: Returning<'a>,
     /// `OVERRIDING { SYSTEM | USER } VALUE` for identity columns.
     pub overriding: Overriding,
 }
@@ -3955,7 +3994,7 @@ pub struct Update<'a> {
     /// Extra tables joined for the assignment/WHERE (`UPDATE t SET ... FROM e`).
     pub from: Option<&'a FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
-    pub returning: &'a [SelectItem<'a>],
+    pub returning: Returning<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3965,7 +4004,7 @@ pub struct Delete<'a> {
     /// Extra tables joined for the WHERE (`DELETE FROM t USING e`).
     pub using: Option<&'a FromClause<'a>>,
     pub where_clause: Option<&'a Expr<'a>>,
-    pub returning: &'a [SelectItem<'a>],
+    pub returning: Returning<'a>,
 }
 
 /// `MERGE INTO target [AS alias] USING source [AS alias] ON cond WHEN ...`.
@@ -3978,8 +4017,7 @@ pub struct Merge<'a> {
     pub source: TableRef<'a>,
     pub on: &'a Expr<'a>,
     pub whens: &'a [MergeWhen<'a>],
-    /// `RETURNING` output items (empty = none).
-    pub returning: &'a [SelectItem<'a>],
+    pub returning: Returning<'a>,
 }
 
 /// The candidate-row kind selected by a MERGE `WHEN` clause.

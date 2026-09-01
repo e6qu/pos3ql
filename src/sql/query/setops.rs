@@ -1153,6 +1153,7 @@ fn register_first_leaf_record_shapes(
                             &crate::sql::exec::CatalogCols {
                                 definition: None,
                                 alias: None,
+                                output_aliases: &[],
                                 storage,
                                 txid,
                             },

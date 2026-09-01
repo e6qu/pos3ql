@@ -201,6 +201,149 @@ impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
     }
 }
 
+/// The output-only `OLD`/`NEW` namespace.  A missing image is still a typed
+/// target row: PostgreSQL exposes each of its fields as NULL rather than
+/// removing the namespace for an INSERT or DELETE result.
+struct ReturningLookup<'d, 'v> {
+    definition: &'d TableDef,
+    target_alias: Option<&'d str>,
+    current: &'v [Datum<'v>],
+    old_name: &'d str,
+    old: Option<&'v [Datum<'v>]>,
+    new_name: &'d str,
+    new: Option<&'v [Datum<'v>]>,
+}
+
+impl<'v> ReturningLookup<'_, 'v> {
+    fn image(&self, qualifier: &str) -> Option<Option<&[Datum<'v>]>> {
+        if qualifier == self.old_name {
+            Some(self.old)
+        } else if qualifier == self.new_name {
+            Some(self.new)
+        } else {
+            None
+        }
+    }
+
+    fn image_column(&self, image: Option<&[Datum<'v>]>, name: &str) -> Result<Datum<'v>, SqlError> {
+        let index = self
+            .definition
+            .column_index(name)
+            .ok_or_else(|| undefined_column(name))?;
+        Ok(image.map_or(Datum::Null, |values| values[index]))
+    }
+
+    fn image_fields(
+        &self,
+        image: Option<&[Datum<'v>]>,
+        arena: &'v Arena,
+    ) -> Result<&'v [super::types::RecordField<'v>], SqlError> {
+        let mut fields = [super::types::RecordField {
+            name: "",
+            type_oid: 0,
+            value: Datum::Null,
+        }; MAX_COLUMNS];
+        for (index, field) in fields
+            .iter_mut()
+            .enumerate()
+            .take(self.definition.n_columns)
+        {
+            let column = &self.definition.columns()[index];
+            field.name = arena.alloc_str(column.name.as_str()).map_err(|_| {
+                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "record exceeds the arena")
+            })?;
+            field.type_oid = column.ctype.oid();
+            field.value = image.map_or(Datum::Null, |values| values[index]);
+        }
+        let fields = arena
+            .alloc_slice_copy(&fields[..self.definition.n_columns])
+            .map_err(|_| sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "record exceeds the arena"))?;
+        Ok(&*fields)
+    }
+}
+
+impl<'v> ColumnLookup<'v> for ReturningLookup<'_, 'v> {
+    fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
+        if let Some(qualifier) = qualifier
+            && let Some(image) = self.image(qualifier)
+        {
+            return self.image_column(image, name);
+        }
+        let context = RowCtx {
+            def: self.definition,
+            values: self.current,
+            alias: self.target_alias,
+        };
+        context.lookup(qualifier, name)
+    }
+
+    fn whole_row_fields(
+        &self,
+        table: &str,
+        arena: &'v Arena,
+    ) -> Result<Option<&'v [super::types::RecordField<'v>]>, SqlError> {
+        if let Some(image) = self.image(table) {
+            return self.image_fields(image, arena).map(Some);
+        }
+        let context = RowCtx {
+            def: self.definition,
+            values: self.current,
+            alias: self.target_alias,
+        };
+        context.whole_row_fields(table, arena)
+    }
+
+    fn col_type(&self, qualifier: Option<&str>, name: &str) -> Option<ColType> {
+        if qualifier.is_some_and(|qualifier| self.image(qualifier).is_some()) {
+            return self
+                .definition
+                .column_index(name)
+                .map(|i| self.definition.columns()[i].ctype);
+        }
+        RowCtx {
+            def: self.definition,
+            values: self.current,
+            alias: self.target_alias,
+        }
+        .col_type(qualifier, name)
+    }
+
+    fn collation(&self, qualifier: Option<&str>, name: &str) -> crate::sql::ast::Collation {
+        if qualifier.is_some_and(|qualifier| self.image(qualifier).is_some()) {
+            return self
+                .definition
+                .column_index(name)
+                .map(|i| self.definition.columns()[i].collation)
+                .unwrap_or(crate::sql::ast::Collation::None);
+        }
+        RowCtx {
+            def: self.definition,
+            values: self.current,
+            alias: self.target_alias,
+        }
+        .collation(qualifier, name)
+    }
+
+    fn column_user_type(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<crate::storage::UserTypeName> {
+        if qualifier.is_some_and(|qualifier| self.image(qualifier).is_some()) {
+            return self
+                .definition
+                .column_index(name)
+                .and_then(|i| self.definition.columns()[i].user_type);
+        }
+        RowCtx {
+            def: self.definition,
+            values: self.current,
+            alias: self.target_alias,
+        }
+        .column_user_type(qualifier, name)
+    }
+}
+
 type Outcome = Result<Result<(), SqlError>, WireFull>;
 
 fn sql_ok() -> Outcome {
@@ -213,6 +356,7 @@ fn sql_fail(e: SqlError) -> Outcome {
 
 mod describe;
 pub(crate) use describe::CatalogCols;
+pub(crate) use describe::describe_returning_items;
 pub use describe::{
     ColTypeResolver, DefCols, NoCols, RECORD_FIELD_NAMES, check_row_field_types,
     could_not_identify, derived_name, describe_items, expr_record_handle as expr_record_handle_pub,
@@ -3730,7 +3874,10 @@ enum ConflictOutcome<'a> {
     Skip,
     /// DO UPDATE applied; carries the arena-encoded updated row so RETURNING can
     /// project the post-update values (PostgreSQL returns the updated row).
-    Updated(&'a [u8]),
+    Updated {
+        old: &'a [Datum<'a>],
+        new: &'a [u8],
+    },
 }
 
 /// Applies an ON CONFLICT clause to one candidate row, against the arbiter
@@ -4005,7 +4152,18 @@ where
         transition_capture.push_old(&existing[..def.n_columns], arena)?;
         transition_capture.push_new(&new_values[..def.n_columns], arena)?;
     }
-    Ok(ConflictOutcome::Updated(new_bytes))
+    let old = arena
+        .alloc_slice_copy(&existing[..def.n_columns])
+        .map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "conflict row exceeds the statement arena"
+            )
+        })?;
+    Ok(ConflictOutcome::Updated {
+        old: &*old,
+        new: new_bytes,
+    })
 }
 
 /// Assigns each omitted/defaulted auto-increment column its next value. A
@@ -43689,11 +43847,26 @@ struct MergeLookup<'d, 'v> {
     /// PostgreSQL-visible: referring to the source there is a missing
     /// FROM-clause entry, not a NULL-valued row.
     source: Option<&'v [Datum<'v>]>,
+    /// Names and images exist only while evaluating a `RETURNING` list.
+    old_name: Option<&'d str>,
+    old: Option<&'v [Datum<'v>]>,
+    new_name: Option<&'d str>,
+    new: Option<&'v [Datum<'v>]>,
 }
 
 impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         match qualifier {
+            Some(q) if self.old_name == Some(q) => self
+                .target_def
+                .column_index(name)
+                .map(|i| self.old.map_or(Datum::Null, |values| values[i]))
+                .ok_or_else(|| undefined_column(name)),
+            Some(q) if self.new_name == Some(q) => self
+                .target_def
+                .column_index(name)
+                .map(|i| self.new.map_or(Datum::Null, |values| values[i]))
+                .ok_or_else(|| undefined_column(name)),
             Some(q) if q == self.target_alias => self
                 .target_def
                 .column_index(name)
@@ -43762,6 +43935,13 @@ impl<'d> MergeLookup<'d, '_> {
         name: &str,
     ) -> Option<&'d crate::storage::ColumnMeta> {
         match qualifier {
+            Some(qualifier)
+                if self.old_name == Some(qualifier) || self.new_name == Some(qualifier) =>
+            {
+                self.target_def
+                    .column_index(name)
+                    .map(|index| &self.target_def.columns()[index])
+            }
             Some(qualifier) if qualifier == self.target_alias => self
                 .target_def
                 .column_index(name)
@@ -43888,19 +44068,28 @@ fn merge_source_columns(
             | crate::sql::ast::MergeActionRef::DoNothing => {}
         }
     }
-    for item in statement.returning {
-        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
-            && !merge_source_demand(expression, source_alias, source, &mut columns)
-        {
-            return None;
+    for item in statement.returning.items {
+        match item {
+            SelectItem::Wildcard => columns |= all_columns_mask(source),
+            SelectItem::TableWildcard(qualifier)
+                if qualifier.eq_ignore_ascii_case(source_alias) =>
+            {
+                columns |= all_columns_mask(source);
+            }
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression)
+                if !merge_source_demand(expression, source_alias, source, &mut columns) =>
+            {
+                return None;
+            }
+            SelectItem::TableWildcard(_) | SelectItem::Expr { .. } | SelectItem::RecordStar(_) => {}
         }
     }
     Some(columns)
 }
 
-/// Describes `MERGE RETURNING` in its target-and-source scope. An unqualified
-/// star follows DML `RETURNING` and expands only the target relation; qualified
-/// stars and expressions retain both namespaces.
+/// Describes `MERGE RETURNING` in its source-and-target output scope. PostgreSQL
+/// expands an unqualified star in that order; qualified names retain their
+/// ordinary namespaces and output aliases map to the target shape.
 pub fn describe_merge_returning<'a>(
     storage: &'a Storage,
     txid: u32,
@@ -43943,12 +44132,142 @@ pub fn describe_merge_returning<'a>(
         })
         .map_err(|_| super::query::arena_full_pub())?;
     let scope = super::query::QueryScope::resolve_schema(storage, from, txid, arena)?;
+    let output_alias = |item: &SelectItem<'a>| {
+        let mut alias = None;
+        let mut conflicting = false;
+        let mut note = |qualifier: &str| {
+            if qualifier != statement.returning.old_name()
+                && qualifier != statement.returning.new_name()
+            {
+                return;
+            }
+            let name = if qualifier == statement.returning.old_name() {
+                statement.returning.old_name()
+            } else {
+                statement.returning.new_name()
+            };
+            if alias.is_some_and(|known| known != name) {
+                conflicting = true;
+            } else {
+                alias = Some(name);
+            }
+        };
+        match item {
+            SelectItem::TableWildcard(qualifier) => {
+                note(qualifier);
+            }
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                expression.for_each_column_reference(&mut |qualifier, _| {
+                    if let Some(qualifier) = qualifier {
+                        note(qualifier);
+                    }
+                });
+            }
+            SelectItem::Wildcard => {}
+        }
+        (!conflicting).then_some(alias).flatten()
+    };
+    let uses_output_alias = |item: &SelectItem<'a>| {
+        let mut found = false;
+        match item {
+            SelectItem::TableWildcard(qualifier) => {
+                found = *qualifier == statement.returning.old_name()
+                    || *qualifier == statement.returning.new_name();
+            }
+            SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
+                expression.for_each_column_reference(&mut |qualifier, _| {
+                    found |= qualifier.is_some_and(|qualifier| {
+                        qualifier == statement.returning.old_name()
+                            || qualifier == statement.returning.new_name()
+                    });
+                });
+            }
+            SelectItem::Wildcard => {}
+        }
+        found
+    };
     let mut count = 0usize;
-    for item in statement.returning {
-        if matches!(item, SelectItem::Wildcard) {
+    for item in statement.returning.items {
+        if let Some(alias) = output_alias(item) {
+            let saved_name = scope.names[0];
+            scope.names[0] = alias;
+            let width = super::query::describe_scope_items(
+                core::slice::from_ref(item),
+                &scope,
+                None,
+                storage,
+                txid,
+                arena,
+                &mut out[count..],
+            );
+            scope.names[0] = saved_name;
+            count += width?;
+        } else if uses_output_alias(item) {
+            let old_target = TableRef {
+                alias: Some(statement.returning.old_name()),
+                ..target
+            };
+            let new_target = TableRef {
+                alias: Some(statement.returning.new_name()),
+                ..target
+            };
+            let joins = arena
+                .alloc_slice_copy(&[
+                    Join {
+                        table: statement.source,
+                        kind: JoinKind::Cross,
+                        on: None,
+                        using: None,
+                        natural: false,
+                    },
+                    Join {
+                        table: old_target,
+                        kind: JoinKind::Cross,
+                        on: None,
+                        using: None,
+                        natural: false,
+                    },
+                    Join {
+                        table: new_target,
+                        kind: JoinKind::Cross,
+                        on: None,
+                        using: None,
+                        natural: false,
+                    },
+                ])
+                .map_err(|_| super::query::arena_full_pub())?;
+            let output_from = arena
+                .alloc(FromClause {
+                    base: target,
+                    joins,
+                })
+                .map_err(|_| super::query::arena_full_pub())?;
+            let output_scope =
+                super::query::QueryScope::resolve_schema(storage, output_from, txid, arena)?;
+            count += super::query::describe_scope_items(
+                core::slice::from_ref(item),
+                &output_scope,
+                None,
+                storage,
+                txid,
+                arena,
+                &mut out[count..],
+            )?;
+        } else if matches!(item, SelectItem::Wildcard) {
+            let source_star =
+                SelectItem::TableWildcard(statement.source.alias.unwrap_or(statement.source.table));
             let target_star =
                 SelectItem::TableWildcard(statement.target_alias.unwrap_or(statement.target.name));
-            let width = super::query::describe_scope_items(
+            count += super::query::describe_scope_items(
+                core::slice::from_ref(&source_star),
+                &scope,
+                None,
+                storage,
+                txid,
+                arena,
+                &mut out[count..],
+            )?;
+            count += super::query::describe_scope_items(
                 core::slice::from_ref(&target_star),
                 &scope,
                 None,
@@ -43957,7 +44276,6 @@ pub fn describe_merge_returning<'a>(
                 arena,
                 &mut out[count..],
             )?;
-            count += width;
         } else {
             let width = super::query::describe_scope_items(
                 core::slice::from_ref(item),
@@ -44410,15 +44728,26 @@ pub fn merge<'a>(
     };
     let source_def = &source_def;
     if !statement.returning.is_empty() && !capturing {
+        let mark = arena.mark();
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
         let count =
             match describe_merge_returning(storage, txn.txid, statement, arena, &mut columns) {
                 Ok(count) => count,
-                Err(error) => return sql_fail(error),
+                Err(error) => {
+                    unsafe { arena.rewind_to(mark) };
+                    return sql_fail(error);
+                }
             };
-        responder.row_description(&columns[..count])?;
+        if let Err(wire) = responder.row_description(&columns[..count]) {
+            unsafe { arena.rewind_to(mark) };
+            return Err(wire);
+        }
+        // RowDescription has copied every descriptor, so its temporary scope
+        // must not reduce the bounded arena available to the source snapshot.
+        unsafe { arena.rewind_to(mark) };
     }
     // Pass 1: count source rows. Pass 2: encode each to arena bytes.
+    let source_count_mark = arena.mark();
     let mut n_source = 0usize;
     if let Err(e) = super::query::select_into_rows(
         storage,
@@ -44433,8 +44762,12 @@ pub fn merge<'a>(
             Ok(())
         },
     ) {
+        unsafe { arena.rewind_to(source_count_mark) };
         return sql_fail(e);
     }
+    // Counting cannot retain a datum: retaining its temporary query rows
+    // would make a small VALUES source consume the output arena twice.
+    unsafe { arena.rewind_to(source_count_mark) };
     let empty: &[u8] = &[];
     let source_rows: &mut [&[u8]] = match arena.alloc_slice_with(n_source, |_| empty) {
         Ok(r) => r,
@@ -44682,6 +45015,10 @@ pub fn merge<'a>(
                 source_def,
                 source_alias,
                 source: (!by_source).then_some(sv),
+                old_name: None,
+                old: None,
+                new_name: None,
+                new: None,
             };
             if !by_source {
                 match eval_merge_expression(
@@ -44834,6 +45171,8 @@ pub fn merge<'a>(
                                 source_alias,
                                 (!by_source).then_some(sv),
                                 statement.returning,
+                                Some(target_vals[j]),
+                                None,
                                 "DELETE",
                                 arena,
                                 params,
@@ -45095,6 +45434,8 @@ pub fn merge<'a>(
                                 source_alias,
                                 (!by_source).then_some(sv),
                                 statement.returning,
+                                Some(target_vals[j]),
+                                Some(&new_values[..def.n_columns]),
                                 "UPDATE",
                                 arena,
                                 params,
@@ -45186,6 +45527,8 @@ pub fn merge<'a>(
                                         source_alias,
                                         Some(sv),
                                         statement.returning,
+                                        None,
+                                        Some(inserted),
                                         "INSERT",
                                         arena,
                                         params,
@@ -45599,14 +45942,15 @@ where
     ) {
         Ok(ConflictOutcome::Store) => {}
         Ok(ConflictOutcome::Skip) => return Ok(Ok(false)),
-        Ok(ConflictOutcome::Updated(row_bytes)) => {
+        Ok(ConflictOutcome::Updated { old, new }) => {
             if !statement.returning.is_empty()
                 && let Err(error) = emit_conflict_returning(
                     storage,
                     txn.txid,
                     definition,
-                    row_bytes,
+                    new,
                     statement.returning,
+                    Some(old),
                     arena,
                     params,
                     responder,
@@ -45674,6 +46018,8 @@ where
             None,
             &values[..definition.n_columns],
             statement.returning,
+            None,
+            Some(&values[..definition.n_columns]),
             arena,
             params,
             responder,
@@ -45885,7 +46231,7 @@ pub(crate) fn instead_of_view_dml<'a>(
     if !returning.is_empty() && !capturing {
         let mut description = [ColDesc::new("", 0, 0); MAX_PROJ];
         let count = match super::query::describe_catalog_items_as(
-            returning,
+            returning.items,
             Some(&def),
             alias,
             storage,
@@ -46195,6 +46541,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                         update.alias,
                         new,
                         returning,
+                        Some(&old[..def.n_columns]),
+                        Some(new),
                         arena,
                         params,
                         responder,
@@ -46295,6 +46643,8 @@ pub(crate) fn instead_of_view_dml<'a>(
                         delete.alias,
                         &old[..def.n_columns],
                         returning,
+                        Some(&old[..def.n_columns]),
+                        None,
                         arena,
                         params,
                         responder,
@@ -46441,7 +46791,7 @@ fn finish_instead_of_view_new_row<'a>(
     definition: &TableDef,
     event: u8,
     values: &mut [Datum<'a>],
-    returning: &[SelectItem<'a>],
+    returning: crate::sql::ast::Returning<'a>,
     params: &[Datum<'a>],
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<Result<bool, SqlError>, WireFull> {
@@ -46466,7 +46816,17 @@ fn finish_instead_of_view_new_row<'a>(
     }
     if !returning.is_empty() {
         match emit_projected(
-            storage, txn.txid, definition, None, values, returning, arena, params, responder,
+            storage,
+            txn.txid,
+            definition,
+            None,
+            values,
+            returning,
+            None,
+            Some(values),
+            arena,
+            params,
+            responder,
             capture,
         ) {
             Ok(Ok(())) => {}
@@ -46754,10 +47114,11 @@ where
     // being captured for a data-modifying CTE, which describes them itself.
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match super::query::describe_catalog_items(
+        match describe_returning_items(
             statement.returning,
             Some(&def),
-            storage,
+            None,
+            Some(storage),
             txn.txid,
             &mut columns,
         ) {
@@ -47285,7 +47646,8 @@ fn emit_conflict_returning(
     txid: u32,
     def: &TableDef,
     row_bytes: &[u8],
-    items: &[SelectItem],
+    returning: crate::sql::ast::Returning<'_>,
+    old: Option<&[Datum]>,
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
@@ -47303,7 +47665,9 @@ fn emit_conflict_returning(
         def,
         None,
         &updated[..def.n_columns],
-        items,
+        returning,
+        old,
+        Some(&updated[..def.n_columns]),
         arena,
         params,
         responder,
@@ -47317,17 +47681,27 @@ fn emit_projected(
     txid: u32,
     def: &TableDef,
     alias: Option<&str>,
-    values: &[Datum],
-    items: &[SelectItem],
+    current: &[Datum],
+    returning: crate::sql::ast::Returning<'_>,
+    old: Option<&[Datum]>,
+    new: Option<&[Datum]>,
     arena: &Arena,
     params: &[Datum],
     responder: &mut Responder,
     capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Result<Result<(), SqlError>, WireFull> {
-    let context = RowCtx { def, values, alias };
+    let context = ReturningLookup {
+        definition: def,
+        target_alias: alias,
+        current,
+        old_name: returning.old_name(),
+        old,
+        new_name: returning.new_name(),
+        new,
+    };
     let mut expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     let mut expression_count = 0usize;
-    for item in items {
+    for item in returning.items {
         let expression = match item {
             SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) => {
                 Some(*expression)
@@ -47357,24 +47731,27 @@ fn emit_projected(
     };
     let mut projected = [Datum::Null; MAX_PROJ];
     let mut n = 0;
-    for item in items {
+    for item in returning.items {
         match item {
             SelectItem::Wildcard => {
-                for v in context.values {
+                for v in current {
                     projected[n] = *v;
                     n += 1;
                 }
             }
             SelectItem::TableWildcard(q) => {
-                if !crate::sql::eval::qualifier_answers_target(def, alias, q) {
+                let image = context.image(q);
+                if image.is_none() && !crate::sql::eval::qualifier_answers_target(def, alias, q) {
                     return Ok(Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
                         "missing FROM-clause entry for table \"{}\"",
                         q
                     )));
                 }
-                for v in context.values {
-                    projected[n] = *v;
+                for index in 0..def.n_columns {
+                    projected[n] = image.map_or(current[index], |values| {
+                        values.map_or(Datum::Null, |values| values[index])
+                    });
                     n += 1;
                 }
             }
@@ -47449,7 +47826,9 @@ fn emit_merge_returning<'a>(
     source_def: &TableDef,
     source_alias: &str,
     source: Option<&[Datum<'a>]>,
-    items: &[SelectItem<'a>],
+    returning: crate::sql::ast::Returning<'a>,
+    old: Option<&[Datum<'a>]>,
+    new: Option<&[Datum<'a>]>,
     action: &str,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -47463,10 +47842,14 @@ fn emit_merge_returning<'a>(
         source_def,
         source_alias,
         source,
+        old_name: Some(returning.old_name()),
+        old,
+        new_name: Some(returning.new_name()),
+        new,
     };
     let mut expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
     let mut expression_count = 0usize;
-    for item in items {
+    for item in returning.items {
         if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
             expressions[expression_count] = Some(*expression);
             expression_count += 1;
@@ -47491,9 +47874,13 @@ fn emit_merge_returning<'a>(
     };
     let mut projected = [Datum::Null; MAX_PROJ];
     let mut n = 0usize;
-    for item in items {
+    for item in returning.items {
         match item {
             SelectItem::Wildcard => {
+                for index in 0..source_def.n_columns {
+                    projected[n] = source.map_or(Datum::Null, |values| values[index]);
+                    n += 1;
+                }
                 for value in target {
                     projected[n] = *value;
                     n += 1;
@@ -47502,6 +47889,19 @@ fn emit_merge_returning<'a>(
             SelectItem::TableWildcard(qualifier) if *qualifier == target_alias => {
                 for value in target {
                     projected[n] = *value;
+                    n += 1;
+                }
+            }
+            SelectItem::TableWildcard(qualifier)
+                if *qualifier == returning.old_name() || *qualifier == returning.new_name() =>
+            {
+                let image = if *qualifier == returning.old_name() {
+                    old
+                } else {
+                    new
+                };
+                for index in 0..target_def.n_columns {
+                    projected[n] = image.map_or(Datum::Null, |values| values[index]);
                     n += 1;
                 }
             }
@@ -47597,20 +47997,50 @@ fn expression_dml_target_columns(
     txid: u32,
     arena: &Arena,
 ) -> Result<u64, SqlError> {
+    expression_dml_target_columns_with_output_aliases(
+        expression,
+        definition,
+        alias,
+        storage,
+        txid,
+        arena,
+        &[],
+    )
+}
+
+fn expression_dml_target_columns_with_output_aliases(
+    expression: &Expr,
+    definition: &TableDef,
+    alias: Option<&str>,
+    storage: &Storage,
+    txid: u32,
+    arena: &Arena,
+    output_aliases: &[&str],
+) -> Result<u64, SqlError> {
     let target_name = alias.unwrap_or(definition.name.as_str());
     fn directly_read_columns(
         expression: &Expr,
         definition: &TableDef,
         target_name: &str,
+        output_aliases: &[&str],
     ) -> Result<u64, SqlError> {
         let columns = match expression {
             Expr::Column { qualifier, name }
             | Expr::RoutineParam {
                 qualifier, name, ..
-            } if qualifier.is_none_or(|qualifier| qualifier == target_name) => definition
-                .column_index(name)
-                .map_or(0, |column| 1u64 << column),
-            Expr::WholeRow(qualifier) if *qualifier == target_name => all_columns_mask(definition),
+            } if qualifier.is_none_or(|qualifier| {
+                qualifier == target_name || output_aliases.contains(&qualifier)
+            }) =>
+            {
+                definition
+                    .column_index(name)
+                    .map_or(0, |column| 1u64 << column)
+            }
+            Expr::WholeRow(qualifier)
+                if *qualifier == target_name || output_aliases.contains(qualifier) =>
+            {
+                all_columns_mask(definition)
+            }
             Expr::SchemaColumn {
                 schema,
                 table,
@@ -47624,12 +48054,12 @@ fn expression_dml_target_columns(
         };
         let mut child_columns = columns;
         super::query::walk_children(expression, &mut |child| {
-            child_columns |= directly_read_columns(child, definition, target_name)?;
+            child_columns |= directly_read_columns(child, definition, target_name, output_aliases)?;
             Ok(())
         })?;
         Ok(child_columns)
     }
-    let mut columns = directly_read_columns(expression, definition, target_name)?;
+    let mut columns = directly_read_columns(expression, definition, target_name, output_aliases)?;
     if super::query::expression_has_correlated_subquery(expression, storage, txid, arena)? {
         columns |= all_columns_mask(definition);
     }
@@ -47637,26 +48067,37 @@ fn expression_dml_target_columns(
 }
 
 fn returning_dml_target_columns(
-    returning: &[SelectItem],
+    returning: crate::sql::ast::Returning<'_>,
     definition: &TableDef,
     alias: Option<&str>,
     storage: &Storage,
     txid: u32,
     arena: &Arena,
 ) -> Result<u64, SqlError> {
+    let output_aliases = [returning.old_name(), returning.new_name()];
     let mut columns = 0u64;
-    for item in returning {
+    for item in returning.items {
         columns |= match item {
             SelectItem::Wildcard => all_columns_mask(definition),
             SelectItem::TableWildcard(qualifier) => {
-                if crate::sql::eval::qualifier_answers_target(definition, alias, qualifier) {
+                if output_aliases.contains(qualifier)
+                    || crate::sql::eval::qualifier_answers_target(definition, alias, qualifier)
+                {
                     all_columns_mask(definition)
                 } else {
                     0
                 }
             }
             SelectItem::RecordStar(expression) | SelectItem::Expr { expression, .. } => {
-                expression_dml_target_columns(expression, definition, alias, storage, txid, arena)?
+                expression_dml_target_columns_with_output_aliases(
+                    expression,
+                    definition,
+                    alias,
+                    storage,
+                    txid,
+                    arena,
+                    &output_aliases,
+                )?
             }
         };
     }
@@ -48011,11 +48452,11 @@ pub(crate) fn update<'a>(
 
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match super::query::describe_catalog_items_as(
+        match describe_returning_items(
             statement.returning,
             Some(&def),
             statement.alias,
-            storage,
+            Some(storage),
             txn.txid,
             &mut columns,
         ) {
@@ -48433,6 +48874,8 @@ pub(crate) fn update<'a>(
                 statement.alias,
                 &new_values[..def.n_columns],
                 statement.returning,
+                Some(&old_transition[..def.n_columns]),
+                Some(&new_values[..def.n_columns]),
                 arena,
                 params,
                 responder,
@@ -48710,11 +49153,11 @@ pub(crate) fn delete<'a>(
     }
     if !statement.returning.is_empty() && !capturing {
         let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-        match super::query::describe_catalog_items_as(
+        match describe_returning_items(
             statement.returning,
             Some(&def),
             statement.alias,
-            storage,
+            Some(storage),
             txn.txid,
             &mut columns,
         ) {
@@ -48820,6 +49263,8 @@ pub(crate) fn delete<'a>(
                     statement.alias,
                     &old_values[..def.n_columns],
                     statement.returning,
+                    Some(&old_values[..def.n_columns]),
+                    None,
                     arena,
                     params,
                     responder,

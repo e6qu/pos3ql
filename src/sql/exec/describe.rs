@@ -39,6 +39,20 @@ pub fn describe_items<'q>(
     txid: u32,
     out: &mut [ColDesc<'q>],
 ) -> Result<usize, SqlError> {
+    describe_items_with_output_aliases(items, def, table_alias, &[], storage, txid, out)
+}
+
+/// Single-target descriptor with names that exist only in a DML `RETURNING`
+/// output scope (`old`/`new`, or aliases supplied by `WITH`).
+pub(crate) fn describe_items_with_output_aliases<'q>(
+    items: &[SelectItem<'q>],
+    def: Option<&'q TableDef>,
+    table_alias: Option<&str>,
+    output_aliases: &[&str],
+    storage: Option<&'q crate::storage::Storage>,
+    txid: u32,
+    out: &mut [ColDesc<'q>],
+) -> Result<usize, SqlError> {
     struct DescribeCatalog<'a> {
         storage: &'a crate::storage::Storage,
         txid: u32,
@@ -156,8 +170,10 @@ pub fn describe_items<'q>(
                 }
             }
             SelectItem::TableWildcard(q) => {
-                let matches = def
-                    .is_some_and(|d| crate::sql::eval::qualifier_answers_target(d, table_alias, q));
+                let matches = output_aliases.contains(q)
+                    || def.is_some_and(|d| {
+                        crate::sql::eval::qualifier_answers_target(d, table_alias, q)
+                    });
                 if !matches {
                     return Err(sql_err!(
                         sqlstate::UNDEFINED_TABLE,
@@ -174,7 +190,15 @@ pub fn describe_items<'q>(
                 }
             }
             SelectItem::RecordStar(base) => {
-                describe_record_star(base, def, table_alias, storage, txid, &mut push)?;
+                describe_record_star(
+                    base,
+                    def,
+                    table_alias,
+                    output_aliases,
+                    storage,
+                    txid,
+                    &mut push,
+                )?;
             }
             SelectItem::Expr { expression, alias } => {
                 let catalog_resolver;
@@ -183,6 +207,7 @@ pub fn describe_items<'q>(
                         catalog_resolver = CatalogCols {
                             definition: def,
                             alias: table_alias,
+                            output_aliases,
                             storage,
                             txid,
                         };
@@ -192,6 +217,7 @@ pub fn describe_items<'q>(
                         Some(definition) => &AliasedDefCols {
                             definition,
                             alias: table_alias,
+                            output_aliases,
                         },
                         None => &NoCols,
                     },
@@ -234,6 +260,7 @@ pub fn describe_items<'q>(
                             &AliasedDefCols {
                                 definition,
                                 alias: table_alias,
+                                output_aliases,
                             },
                             catalog_access,
                         )?,
@@ -260,9 +287,32 @@ pub fn describe_items<'q>(
     Ok(n)
 }
 
+/// Describe a single DML target's `RETURNING` list, including the names that
+/// PostgreSQL adds only to the output scope.
+pub(crate) fn describe_returning_items<'q>(
+    returning: crate::sql::ast::Returning<'q>,
+    definition: Option<&'q TableDef>,
+    target_alias: Option<&str>,
+    storage: Option<&'q crate::storage::Storage>,
+    txid: u32,
+    out: &mut [ColDesc<'q>],
+) -> Result<usize, SqlError> {
+    let output_aliases = [returning.old_name(), returning.new_name()];
+    describe_items_with_output_aliases(
+        returning.items,
+        definition,
+        target_alias,
+        &output_aliases,
+        storage,
+        txid,
+        out,
+    )
+}
+
 pub(crate) struct CatalogCols<'a> {
     pub(crate) definition: Option<&'a TableDef>,
     pub(crate) alias: Option<&'a str>,
+    pub(crate) output_aliases: &'a [&'a str],
     pub(crate) storage: &'a crate::storage::Storage,
     pub(crate) txid: u32,
 }
@@ -286,6 +336,7 @@ impl ColTypeResolver for CatalogCols<'_> {
             Some(definition) => AliasedDefCols {
                 definition,
                 alias: self.alias,
+                output_aliases: self.output_aliases,
             }
             .resolve(qualifier, name),
             None => NoCols.resolve(qualifier, name),
@@ -295,6 +346,7 @@ impl ColTypeResolver for CatalogCols<'_> {
     fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
         let definition = self.definition?;
         if let Some(qualifier) = qualifier
+            && !self.output_aliases.contains(&qualifier)
             && !crate::sql::eval::qualifier_answers_target(definition, self.alias, qualifier)
         {
             return None;
@@ -469,15 +521,17 @@ impl ColTypeResolver for CatalogCols<'_> {
     }
 
     fn is_whole_row(&self, name: &str) -> bool {
-        self.definition.is_some_and(|definition| {
-            crate::sql::eval::qualifier_answers_target(definition, self.alias, name)
-        })
+        self.output_aliases.contains(&name)
+            || self.definition.is_some_and(|definition| {
+                crate::sql::eval::qualifier_answers_target(definition, self.alias, name)
+            })
     }
 
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
         let definition = self.definition?;
-        crate::sql::eval::qualifier_answers_target(definition, self.alias, name)
-            .then(|| definition.columns())
+        (self.output_aliases.contains(&name)
+            || crate::sql::eval::qualifier_answers_target(definition, self.alias, name))
+        .then(|| definition.columns())
     }
 
     fn record_column_handle(&self, qualifier: Option<&str>, name: &str) -> Option<i32> {
@@ -485,6 +539,7 @@ impl ColTypeResolver for CatalogCols<'_> {
         AliasedDefCols {
             definition,
             alias: self.alias,
+            output_aliases: self.output_aliases,
         }
         .record_column_handle(qualifier, name)
     }
@@ -517,6 +572,7 @@ fn describe_record_star<'q>(
     base: &Expr<'q>,
     def: Option<&'q TableDef>,
     table_alias: Option<&str>,
+    output_aliases: &[&str],
     storage: Option<&'q crate::storage::Storage>,
     txid: u32,
     push: &mut impl FnMut(ColDesc<'q>) -> Result<(), SqlError>,
@@ -530,6 +586,7 @@ fn describe_record_star<'q>(
                     catalog_resolver = CatalogCols {
                         definition,
                         alias: table_alias,
+                        output_aliases,
                         storage,
                         txid,
                     };
@@ -539,6 +596,7 @@ fn describe_record_star<'q>(
                     aliased_resolver = AliasedDefCols {
                         definition,
                         alias: table_alias,
+                        output_aliases,
                     };
                     &aliased_resolver
                 }
@@ -581,6 +639,7 @@ fn describe_record_star<'q>(
             let resolver = CatalogCols {
                 definition: def,
                 alias: table_alias,
+                output_aliases,
                 storage,
                 txid,
             };
@@ -622,8 +681,10 @@ fn describe_record_star<'q>(
         | Expr::Column {
             qualifier: None,
             name: table,
-        } if def
-            .is_some_and(|d| crate::sql::eval::qualifier_answers_target(d, table_alias, table)) =>
+        } if output_aliases.contains(table)
+            || def.is_some_and(|d| {
+                crate::sql::eval::qualifier_answers_target(d, table_alias, table)
+            }) =>
         {
             for c in def.expect("matched").columns() {
                 push(
@@ -639,6 +700,7 @@ fn describe_record_star<'q>(
                 Some(definition) => &AliasedDefCols {
                     definition,
                     alias: table_alias,
+                    output_aliases,
                 },
                 None => &NoCols,
             };
@@ -715,6 +777,7 @@ fn describe_record_star<'q>(
                 Some(definition) => &AliasedDefCols {
                     definition,
                     alias: table_alias,
+                    output_aliases,
                 },
                 None => &NoCols,
             };
@@ -2172,10 +2235,12 @@ impl<'a> ColumnLookup<'a> for DefCols<'_> {
 pub(crate) struct AliasedDefCols<'d, 'a> {
     pub definition: &'d TableDef,
     pub alias: Option<&'a str>,
+    pub output_aliases: &'a [&'a str],
 }
 impl ColTypeResolver for AliasedDefCols<'_, '_> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
         if let Some(qualifier) = qualifier
+            && !self.output_aliases.contains(&qualifier)
             && !crate::sql::eval::qualifier_answers_target(self.definition, self.alias, qualifier)
         {
             return Err(sql_err!(
@@ -2215,11 +2280,13 @@ impl ColTypeResolver for AliasedDefCols<'_, '_> {
         })
     }
     fn is_whole_row(&self, name: &str) -> bool {
-        crate::sql::eval::qualifier_answers_target(self.definition, self.alias, name)
+        self.output_aliases.contains(&name)
+            || crate::sql::eval::qualifier_answers_target(self.definition, self.alias, name)
     }
     fn table_columns(&self, name: &str) -> Option<&[ColumnMeta]> {
-        crate::sql::eval::qualifier_answers_target(self.definition, self.alias, name)
-            .then(|| self.definition.columns())
+        (self.output_aliases.contains(&name)
+            || crate::sql::eval::qualifier_answers_target(self.definition, self.alias, name))
+        .then(|| self.definition.columns())
     }
 }
 
@@ -2402,6 +2469,7 @@ pub(crate) fn infer_type_catalog(
         &CatalogCols {
             definition,
             alias: None,
+            output_aliases: &[],
             storage,
             txid,
         },

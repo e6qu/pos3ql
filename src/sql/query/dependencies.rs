@@ -443,11 +443,22 @@ fn collect_statement(
                         collect_expr!(expression, Some(&scope), excluded)?;
                     }
                 }
-                for item in insert.returning {
+                for item in insert.returning.items {
                     if let SelectItem::Expr { expression, .. }
                     | SelectItem::RecordStar(expression) = item
                     {
-                        collect_expr!(expression, Some(&scope), no_excluded)?;
+                        collect_returning_expression(
+                            expression,
+                            insert.returning,
+                            scope.defs[0].expect("target resolved"),
+                            insert.table.name,
+                            storage,
+                            txid,
+                            &scope,
+                            dependencies,
+                            arena,
+                            context,
+                        )?;
                     }
                 }
                 Ok(())
@@ -498,11 +509,22 @@ fn collect_statement(
                 if let Some(expression) = update.where_clause {
                     collect_expr!(expression, Some(&scope), no_excluded)?;
                 }
-                for item in update.returning {
+                for item in update.returning.items {
                     if let SelectItem::Expr { expression, .. }
                     | SelectItem::RecordStar(expression) = item
                     {
-                        collect_expr!(expression, Some(&scope), no_excluded)?;
+                        collect_returning_expression(
+                            expression,
+                            update.returning,
+                            scope.defs[0].expect("target resolved"),
+                            update.alias.unwrap_or(update.table.name),
+                            storage,
+                            txid,
+                            &scope,
+                            dependencies,
+                            arena,
+                            context,
+                        )?;
                     }
                 }
                 Ok(())
@@ -550,11 +572,22 @@ fn collect_statement(
                 if let Some(expression) = delete.where_clause {
                     collect_expr!(expression, Some(&scope), no_excluded)?;
                 }
-                for item in delete.returning {
+                for item in delete.returning.items {
                     if let SelectItem::Expr { expression, .. }
                     | SelectItem::RecordStar(expression) = item
                     {
-                        collect_expr!(expression, Some(&scope), no_excluded)?;
+                        collect_returning_expression(
+                            expression,
+                            delete.returning,
+                            scope.defs[0].expect("target resolved"),
+                            delete.alias.unwrap_or(delete.table.name),
+                            storage,
+                            txid,
+                            &scope,
+                            dependencies,
+                            arena,
+                            context,
+                        )?;
                     }
                 }
                 Ok(())
@@ -609,11 +642,22 @@ fn collect_statement(
                         | crate::sql::ast::MergeActionRef::DoNothing => {}
                     }
                 }
-                for item in merge.returning {
+                for item in merge.returning.items {
                     if let SelectItem::Expr { expression, .. }
                     | SelectItem::RecordStar(expression) = item
                     {
-                        collect_expr!(expression, Some(&scope), no_excluded)?;
+                        collect_returning_expression(
+                            expression,
+                            merge.returning,
+                            scope.defs[0].expect("target resolved"),
+                            merge.target_alias.unwrap_or(merge.target.name),
+                            storage,
+                            txid,
+                            &scope,
+                            dependencies,
+                            arena,
+                            context,
+                        )?;
                     }
                 }
                 Ok(())
@@ -625,20 +669,47 @@ fn collect_statement(
     }
 }
 
-fn collect_dml_routine_calls(
-    expression: &Expr<'_>,
+fn collect_dml_routine_calls<'a>(
+    expression: &Expr<'a>,
     storage: &Storage,
     txid: u32,
-    scope: Option<&super::QueryScope<'_>>,
+    scope: Option<&super::QueryScope<'a>>,
     excluded: Option<&crate::storage::TableDef>,
     dependencies: &mut StoredQueryDependencies,
-    context: CollectionContext<'_>,
+    context: CollectionContext<'a>,
+) -> Result<(), SqlError> {
+    collect_dml_routine_calls_with_output(
+        expression,
+        storage,
+        txid,
+        scope,
+        excluded,
+        dependencies,
+        context,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the DML dependency boundary keeps catalog, scope, and output aliases explicit"
+)]
+fn collect_dml_routine_calls_with_output<'a>(
+    expression: &Expr<'a>,
+    storage: &Storage,
+    txid: u32,
+    scope: Option<&super::QueryScope<'a>>,
+    excluded: Option<&crate::storage::TableDef>,
+    dependencies: &mut StoredQueryDependencies,
+    context: CollectionContext<'a>,
+    returning_output: Option<(&crate::storage::TableDef, [&'a str; 2])>,
 ) -> Result<(), SqlError> {
     let resolver = DependencyTypes {
         scope,
         excluded,
         storage,
         txid,
+        returning_output,
         transition: context.transition,
     };
     let mut needs_scope = false;
@@ -689,6 +760,66 @@ fn collect_dml_routine_calls(
         ));
     }
     Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "RETURNING dependency collection needs the explicit DML analysis boundary"
+)]
+fn collect_returning_expression<'a>(
+    expression: &Expr<'a>,
+    returning: crate::sql::ast::Returning<'a>,
+    target: &crate::storage::TableDef,
+    target_qualifier: &str,
+    storage: &Storage,
+    txid: u32,
+    scope: &super::QueryScope<'a>,
+    dependencies: &mut StoredQueryDependencies,
+    arena: &Arena,
+    context: CollectionContext<'a>,
+) -> Result<(), SqlError> {
+    collect_expression(
+        expression,
+        storage,
+        txid,
+        CteNames::EMPTY,
+        dependencies,
+        arena,
+        context,
+    )?;
+    let aliases = [returning.old_name(), returning.new_name()];
+    let mut failure = None;
+    expression.for_each_column_reference(&mut |qualifier, name| {
+        if failure.is_some() {
+            return;
+        }
+        let resolved = if qualifier.is_some_and(|qualifier| aliases.contains(&qualifier)) {
+            scope.find_column(Some(target_qualifier), name)
+        } else {
+            scope.find_column(qualifier, name)
+        };
+        match resolved {
+            Ok(resolved) => {
+                if let Err(error) = mark_resolved_column(scope, resolved, dependencies) {
+                    failure = Some(error);
+                }
+            }
+            Err(error) => failure = Some(error),
+        }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    collect_dml_routine_calls_with_output(
+        expression,
+        storage,
+        txid,
+        Some(scope),
+        None,
+        dependencies,
+        context,
+        Some((target, aliases)),
+    )
 }
 
 fn record_dml_column_references(
@@ -980,10 +1111,25 @@ struct DependencyTypes<'scope, 'definition, 'storage> {
     transition: Option<&'scope dyn ColTypeResolver>,
     storage: &'storage Storage,
     txid: u32,
+    returning_output: Option<(&'storage crate::storage::TableDef, [&'definition str; 2])>,
 }
 
 impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<ColType, SqlError> {
+        if let Some((definition, aliases)) = self.returning_output
+            && qualifier.is_some_and(|qualifier| aliases.contains(&qualifier))
+        {
+            return definition
+                .column_index(name)
+                .map(|index| definition.columns()[index].ctype)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        name
+                    )
+                });
+        }
         if qualifier.is_some_and(|qualifier| {
             qualifier.eq_ignore_ascii_case("old") || qualifier.eq_ignore_ascii_case("new")
         }) && let Some(transition) = self.transition
@@ -1007,6 +1153,21 @@ impl ColTypeResolver for DependencyTypes<'_, '_, '_> {
     }
 
     fn column_meta(&self, qualifier: Option<&str>, name: &str) -> Option<StaticTypeMeta> {
+        if let Some((definition, aliases)) = self.returning_output
+            && qualifier.is_some_and(|qualifier| aliases.contains(&qualifier))
+        {
+            let column = definition.columns().get(definition.column_index(name)?)?;
+            return Some(StaticTypeMeta {
+                ctype: column.ctype,
+                type_oid: self.storage.routine_type_oid(
+                    column.ctype,
+                    column.user_type,
+                    self.txid,
+                )?,
+                type_mod: column.type_mod,
+                collation: column.collation,
+            });
+        }
         if qualifier.is_some_and(|qualifier| {
             qualifier.eq_ignore_ascii_case("old") || qualifier.eq_ignore_ascii_case("new")
         }) && let Some(transition) = self.transition
@@ -1214,6 +1375,7 @@ fn collect_routine_dependencies(
         transition: context.transition,
         storage,
         txid,
+        returning_output: None,
     };
     let needs_scope =
         collect_routine_dependencies_with_resolver(select, storage, txid, dependencies, &resolver)?;
@@ -1233,6 +1395,7 @@ fn collect_routine_dependencies(
                 transition: context.transition,
                 storage,
                 txid,
+                returning_output: None,
             };
             if collect_routine_dependencies_with_resolver(
                 select,
@@ -1289,6 +1452,7 @@ pub(super) fn stored_routine_dependency_for_call(
         transition: None,
         storage,
         txid,
+        returning_output: None,
     };
     let mut argument_oids = [0_i32; crate::storage::MAX_ROUTINE_ARGUMENTS];
     for (output, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {

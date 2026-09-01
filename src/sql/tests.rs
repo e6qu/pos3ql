@@ -27685,6 +27685,120 @@ fn merge_statement() {
 }
 
 #[test]
+fn returning_old_new_aliases_cover_dml_conflict_cte_and_describe() {
+    let (mut engine, mut budget) = test_engine();
+    let mut parse_budget = Budget::new(1 << 16);
+    let parse_arena = Arena::new(&mut parse_budget, "returning aliases", 1 << 14).unwrap();
+    let parsed = crate::sql::parser::parse_stored_statement(
+        "INSERT INTO returning_images VALUES (1, 'one') \
+         RETURNING WITH (OLD AS before, NEW AS after) before.id, after.id",
+        &parse_arena,
+    )
+    .unwrap();
+    let Stmt::Insert(parsed) = *parsed else {
+        unreachable!()
+    };
+    assert_eq!(parsed.returning.old_alias, Some("before"));
+    assert_eq!(parsed.returning.new_alias, Some("after"));
+    let duplicate = crate::sql::parser::parse_stored_statement(
+        "INSERT INTO returning_images VALUES (1, 'one') \
+         RETURNING WITH (OLD AS image, NEW AS image) image.id",
+        &parse_arena,
+    )
+    .unwrap_err();
+    assert!(
+        duplicate.message.as_str().contains("must differ"),
+        "{duplicate:?}"
+    );
+    macro_rules! run {
+        ($sql:expr) => {
+            run_with(&mut engine, &mut budget, $sql)
+        };
+    }
+    run!("CREATE TABLE returning_images (id integer PRIMARY KEY, value text)");
+    let inserted = run!(
+        "INSERT INTO returning_images VALUES (1, 'one') \
+         RETURNING WITH (OLD AS before, NEW AS after) before.id, after.id, before.value, after.value"
+    );
+    assert_eq!(
+        data_rows(&inserted),
+        ["NULL|1|NULL|one"],
+        "{}",
+        String::from_utf8_lossy(&inserted)
+    );
+    let hidden_default = run!(
+        "INSERT INTO returning_images VALUES (9, 'hidden') \
+         RETURNING WITH (OLD AS before) old.value"
+    );
+    assert!(
+        String::from_utf8_lossy(&hidden_default).contains("42P01"),
+        "{}",
+        String::from_utf8_lossy(&hidden_default)
+    );
+    let updated = run!(
+        "UPDATE returning_images SET value = 'two' WHERE id = 1 \
+         RETURNING WITH (OLD AS before, NEW AS after) before.value, after.value"
+    );
+    assert_eq!(data_rows(&updated), ["one|two"]);
+    let conflicted = run!(
+        "INSERT INTO returning_images VALUES (1, 'three') ON CONFLICT (id) \
+         DO UPDATE SET value = excluded.value \
+         RETURNING WITH (OLD AS before, NEW AS after) before.value, after.value"
+    );
+    assert_eq!(data_rows(&conflicted), ["two|three"]);
+    let captured = run!(
+        "WITH changed AS (UPDATE returning_images SET value = 'four' WHERE id = 1 \
+           RETURNING WITH (OLD AS before, NEW AS after) before.value AS old_value, after.value AS new_value) \
+         SELECT old_value, new_value FROM changed"
+    );
+    assert_eq!(data_rows(&captured), ["three|four"]);
+    let deleted = run!(
+        "DELETE FROM returning_images WHERE id = 1 \
+         RETURNING WITH (OLD AS before, NEW AS after) before.id, after.id, before.value, after.value"
+    );
+    assert_eq!(data_rows(&deleted), ["1|NULL|four|NULL"]);
+
+    run!("INSERT INTO returning_images VALUES (2, 'describe')");
+    let described = describe_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE returning_images SET value = value \
+         RETURNING WITH (OLD AS before, NEW AS after) before.id, after.value",
+    );
+    assert_eq!(row_description_names(&described), ["id", "value"]);
+    assert_eq!(
+        row_description_type_oids(&described),
+        [crate::sql::types::oid::INT4, crate::sql::types::oid::TEXT]
+    );
+
+    let merged = run!(
+        "CREATE TABLE returning_source (id integer, value text); \
+         INSERT INTO returning_source VALUES (2, 'merged'), (3, 'created'); \
+         MERGE INTO returning_images AS target USING returning_source AS source ON target.id = source.id \
+         WHEN MATCHED THEN UPDATE SET value = source.value \
+         WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value) \
+         RETURNING WITH (OLD AS before, NEW AS after) merge_action(), before.value || source.value, after.value"
+    );
+    assert_eq!(
+        data_rows(&merged),
+        ["UPDATE|describemerged|merged", "INSERT|NULL|created"],
+        "{}",
+        String::from_utf8_lossy(&merged)
+    );
+    let merge_star = run!(
+        "UPDATE returning_source SET value = 'star' WHERE id = 2; \
+         MERGE INTO returning_images AS target USING returning_source AS source \
+         ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = source.value RETURNING *"
+    );
+    assert_eq!(
+        data_rows(&merge_star),
+        ["3|created|3|created", "2|star|2|star"],
+        "{}",
+        String::from_utf8_lossy(&merge_star)
+    );
+}
+
+#[test]
 fn merge_returning_streams_actions_and_materializes_ctes() {
     let (mut engine, mut budget) = test_engine();
     let direct = run_with(
@@ -27752,6 +27866,27 @@ fn merge_returning_streams_actions_and_materializes_ctes() {
         String::from_utf8_lossy(&invalid_context).contains("0A000"),
         "{}",
         String::from_utf8_lossy(&invalid_context)
+    );
+}
+
+#[test]
+fn merge_returning_star_emits_source_then_target_for_values_source() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE merge_star_target (id integer PRIMARY KEY, value text); \
+         INSERT INTO merge_star_target VALUES (1, 'old'); \
+         MERGE INTO merge_star_target AS target \
+         USING (VALUES (1, 'new', 'unreferenced')) AS source(id, value, extra) \
+         ON target.id = source.id \
+         WHEN MATCHED THEN UPDATE SET value = source.value RETURNING *",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1|new|unreferenced|1|new"],
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 

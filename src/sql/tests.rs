@@ -25779,6 +25779,7 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
              CREATE FUNCTION recovered_pair_echo(value recovered_pair) RETURNS recovered_pair LANGUAGE SQL AS 'SELECT $1'; \
              CREATE FUNCTION recovered_overload(value integer) RETURNS text LANGUAGE SQL AS 'SELECT ''integer'''; \
              CREATE FUNCTION recovered_overload(value recovered_count) RETURNS text LANGUAGE SQL AS 'SELECT ''domain'''; \
+             COMMENT ON FUNCTION recovered_state_echo(recovered_state) IS 'recovered routine comment'; \
              ALTER FUNCTION recovered_overload(recovered_count) RENAME TO recovered_domain_overload; \
              DROP FUNCTION recovered_overload(integer)",
         );
@@ -25798,6 +25799,8 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
                 recovered_counts_echo(ARRAY[3::recovered_count]::recovered_count[])::text, \
                 recovered_pair_echo(ROW(9, 'nine')::recovered_pair)::text, \
                 recovered_domain_overload(1::recovered_count); \
+         SELECT obj_description(oid, 'pg_proc') FROM pg_proc \
+          WHERE proname = 'recovered_state_echo'; \
          SELECT pg_typeof(recovered_state_echo('ready'::recovered_state)), \
                 pg_typeof(recovered_counts_echo(ARRAY[1::recovered_count]::recovered_count[])), \
                 pg_typeof(recovered_pair_echo(ROW(1, 'one')::recovered_pair))",
@@ -25806,6 +25809,7 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
         data_rows(&output),
         [
             "done|{3}|(9,nine)|domain",
+            "recovered routine comment",
             "recovered_state|recovered_count[]|recovered_pair",
         ],
         "{}",
@@ -25820,11 +25824,13 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
         &mut checkpoint_budget,
         "SELECT recovered_state_echo('ready'::recovered_state)::text, \
                 recovered_counts_echo(ARRAY[4::recovered_count]::recovered_count[])::text, \
-                recovered_pair_echo(ROW(2, 'two')::recovered_pair)::text",
+                recovered_pair_echo(ROW(2, 'two')::recovered_pair)::text; \
+         SELECT obj_description(oid, 'pg_proc') FROM pg_proc \
+          WHERE proname = 'recovered_state_echo'",
     );
     assert_eq!(
         data_rows(&checkpoint_output),
-        ["ready|{4}|(2,two)"],
+        ["ready|{4}|(2,two)", "recovered routine comment"],
         "{}",
         String::from_utf8_lossy(&checkpoint_output)
     );
@@ -30032,6 +30038,51 @@ fn comment_roundtrip_and_removal() {
 }
 
 #[test]
+fn routine_comments_are_typed_durable_and_do_not_survive_drop() {
+    let (mut e, mut b) = test_engine_with_budget(1 << 28);
+    let created = run_with(
+        &mut e,
+        &mut b,
+        "CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE PROCEDURE cmt_proc(value integer) LANGUAGE SQL AS 'SELECT value'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "COMMENT ON FUNCTION cmt_fn(integer) IS 'the function'; \
+         COMMENT ON PROCEDURE cmt_proc(integer) IS 'the procedure'; \
+         COMMENT ON ROUTINE cmt_fn(integer) IS 'the routine'",
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT proname, obj_description(oid, 'pg_proc') FROM pg_proc \
+         WHERE proname IN ('cmt_fn', 'cmt_proc') ORDER BY proname",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        ["cmt_fn|the routine", "cmt_proc|the procedure"]
+    );
+    run_with(&mut e, &mut b, "DROP FUNCTION cmt_fn(integer)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1'",
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT obj_description(oid, 'pg_proc') FROM pg_proc WHERE proname = 'cmt_fn'",
+    );
+    assert_eq!(data_rows(&bytes), ["NULL"]);
+}
+
+#[test]
 fn comment_errors_match_postgres() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE ct (a int)");
@@ -30039,6 +30090,12 @@ fn comment_errors_match_postgres() {
     run_with(&mut e, &mut b, "CREATE INDEX ci ON ct (a)");
     run_with(&mut e, &mut b, "CREATE SEQUENCE cs");
     run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('low', 'high')");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE FUNCTION cmt_overload(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE FUNCTION cmt_overload(value text) RETURNS text LANGUAGE SQL AS 'SELECT $1'",
+    );
     // Missing relation, wrong kind, missing column, missing schema.
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TABLE nope IS 'x'"))
@@ -30107,6 +30164,14 @@ fn comment_errors_match_postgres() {
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON DOMAIN ct IS 'x'"))
             .contains("42809")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON FUNCTION cmt_overload IS 'x'"
+        ))
+        .contains("42725")
     );
 }
 

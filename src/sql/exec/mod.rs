@@ -26672,6 +26672,72 @@ fn remove_extension_config(
     Ok(())
 }
 
+pub(crate) fn resolve_routine_identity(
+    storage: &Storage,
+    txid: u32,
+    identity: &super::ast::RoutineIdentity<'_>,
+    expected: crate::sql::ast::RoutineTargetKind,
+) -> Result<usize, SqlError> {
+    use crate::sql::ast::RoutineTargetKind;
+    let arguments = resolve_routine_signature(storage, txid, identity.argument_types)?;
+    let find_in = |schema: &str| -> Result<Option<usize>, SqlError> {
+        if identity.signature_is_explicit {
+            Ok(storage.routine_slot_by_declared_signature(
+                schema,
+                identity.name.name,
+                &arguments[..identity.argument_types.len()],
+                txid,
+            ))
+        } else {
+            storage
+                .routine_slot_by_name_unambiguous(schema, identity.name.name, txid)
+                .map_err(|()| {
+                    sql_err!(
+                        sqlstate::AMBIGUOUS_FUNCTION,
+                        "routine \"{}\" is not unique",
+                        identity.name.name
+                    )
+                })
+        }
+    };
+    let slot = if let Some(schema) = identity.name.schema {
+        find_in(schema)?
+    } else {
+        let mut found = None;
+        for entry in storage.path().entries() {
+            let crate::storage::PathEntry::Schema(slot) = entry else {
+                continue;
+            };
+            if let Some(slot) = find_in(storage.schema_def(*slot as usize).name.as_str())? {
+                found = Some(slot);
+                break;
+            }
+        }
+        found
+    }
+    .ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "routine \"{}\" does not exist",
+            identity.name.name
+        )
+    })?;
+    let actual = match storage.routine_for(slot, txid).kind {
+        crate::storage::RoutineKind::Procedure => RoutineTargetKind::Procedure,
+        crate::storage::RoutineKind::Aggregate(_) => RoutineTargetKind::Aggregate,
+        _ => RoutineTargetKind::Function,
+    };
+    if expected != RoutineTargetKind::Either && expected != actual {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "{} \"{}\" does not exist",
+            expected.noun(),
+            identity.name.name
+        ));
+    }
+    Ok(slot)
+}
+
 pub(crate) fn resolve_extension_member(
     storage: &Storage,
     txid: u32,
@@ -26682,56 +26748,7 @@ pub(crate) fn resolve_extension_member(
     let routine_object = |identity: &super::ast::RoutineIdentity<'_>,
                           expected: RoutineTargetKind|
      -> Result<AccessObject, SqlError> {
-        let arguments = resolve_routine_signature(storage, txid, identity.argument_types)?;
-        let find_in = |schema: &str| {
-            if identity.signature_is_explicit {
-                storage.routine_slot_by_declared_signature(
-                    schema,
-                    identity.name.name,
-                    &arguments[..identity.argument_types.len()],
-                    txid,
-                )
-            } else {
-                storage
-                    .routine_slot_by_name_unambiguous(schema, identity.name.name, txid)
-                    .ok()
-                    .flatten()
-            }
-        };
-        let slot = if let Some(schema) = identity.name.schema {
-            find_in(schema)
-        } else {
-            storage
-                .path()
-                .entries()
-                .iter()
-                .find_map(|entry| match entry {
-                    crate::storage::PathEntry::Schema(slot) => {
-                        find_in(storage.schema_def(*slot as usize).name.as_str())
-                    }
-                    crate::storage::PathEntry::Catalog => None,
-                })
-        }
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "routine \"{}\" does not exist",
-                identity.name.name
-            )
-        })?;
-        let actual = match storage.routine_for(slot, txid).kind {
-            crate::storage::RoutineKind::Procedure => RoutineTargetKind::Procedure,
-            crate::storage::RoutineKind::Aggregate(_) => RoutineTargetKind::Aggregate,
-            _ => RoutineTargetKind::Function,
-        };
-        if expected != RoutineTargetKind::Either && expected != actual {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "{} \"{}\" does not exist",
-                expected.noun(),
-                identity.name.name
-            ));
-        }
+        let slot = resolve_routine_identity(storage, txid, identity, expected)?;
         Ok(AccessObject {
             class: AccessClass::Routine,
             slot: slot as u16,
@@ -29572,6 +29589,22 @@ pub fn comment(
                 SqlName::EMPTY,
                 name,
                 target.comment_subid(),
+            )
+        }
+        CommentTarget::Routine { kind, identity } => {
+            let slot = match resolve_routine_identity(storage, txid, &identity, kind) {
+                Ok(slot) => slot,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = storage.require_routine_owner(slot, txid) {
+                return sql_fail(error);
+            }
+            let routine = storage.routine_for(slot, txid);
+            (
+                CommentClass::Routine,
+                routine.schema_for(txid),
+                routine.name_for(txid),
+                crate::storage::routine_oid(&routine) as u32,
             )
         }
         CommentTarget::Type {

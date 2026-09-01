@@ -9349,6 +9349,7 @@ pub enum CommentClass {
     TextSearchDictionary,
     TextSearchConfiguration,
     LargeObject,
+    Routine,
 }
 
 impl CommentClass {
@@ -9370,6 +9371,7 @@ impl CommentClass {
             CommentClass::TextSearchDictionary => 13,
             CommentClass::TextSearchConfiguration => 14,
             CommentClass::LargeObject => 15,
+            CommentClass::Routine => 16,
         }
     }
 
@@ -9391,6 +9393,7 @@ impl CommentClass {
             13 => CommentClass::TextSearchDictionary,
             14 => CommentClass::TextSearchConfiguration,
             15 => CommentClass::LargeObject,
+            16 => CommentClass::Routine,
             _ => return None,
         })
     }
@@ -17402,6 +17405,22 @@ impl Storage {
                 && c.pending.is_none()
                 && c.name.as_str() == name
                 && c.schema.as_str() == schema
+            {
+                self.comments[slot].live = None;
+                self.reap_comment(slot);
+            }
+        }
+    }
+
+    fn drop_comments_by_subid(&mut self, class: CommentClass, subid: u32) {
+        let database = self.comment_database(class);
+        for slot in 0..self.comments.len() {
+            let comment = &self.comments[slot];
+            if comment.used
+                && comment.database == database
+                && comment.class == class
+                && comment.pending.is_none()
+                && comment.subid == subid
             {
                 self.comments[slot].live = None;
                 self.reap_comment(slot);
@@ -29116,11 +29135,13 @@ impl Storage {
     }
 
     pub(crate) fn commit_routine_drop(&mut self, slot: usize) {
+        let oid = routine_oid(&self.routines[slot]) as u32;
         self.routines[slot].ddl_state = self.routines[slot].ddl_state.commit_drop();
         let object = Self::routine_access_object(slot);
         self.clear_object_acl_entries(object);
         self.clear_extension_dependencies_for_object(object);
         self.routine_dependencies[slot] = StoredQueryDependencies::EMPTY;
+        self.drop_comments_by_subid(CommentClass::Routine, oid);
         for dependency in self.pending_routine_dependencies.iter_mut() {
             if dependency.used && usize::from(dependency.routine) == slot {
                 *dependency = PendingRoutineDependencies::EMPTY;
@@ -35234,10 +35255,11 @@ mod tests {
             CommentClass::TextSearchDictionary,
             CommentClass::TextSearchConfiguration,
             CommentClass::LargeObject,
+            CommentClass::Routine,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(16), None);
+        assert_eq!(CommentClass::from_u8(17), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 

@@ -2227,10 +2227,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn extension_routine_identity(
-        &mut self,
-        kind: RoutineTargetKind,
-    ) -> Result<ExtensionMemberIdentity<'a>, ParseError> {
+    pub(super) fn routine_identity(&mut self) -> Result<RoutineIdentity<'a>, ParseError> {
         let name = self.qual_name("routine name")?;
         let mut argument_types = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
         let mut count = 0usize;
@@ -2251,13 +2248,20 @@ impl<'a> Parser<'a> {
                 self.expect_op(",")?;
             }
         }
+        Ok(RoutineIdentity {
+            name,
+            argument_types: self.arena_slice(&argument_types[..count])?,
+            signature_is_explicit,
+        })
+    }
+
+    fn extension_routine_identity(
+        &mut self,
+        kind: RoutineTargetKind,
+    ) -> Result<ExtensionMemberIdentity<'a>, ParseError> {
         Ok(ExtensionMemberIdentity::Routine {
             kind,
-            identity: RoutineIdentity {
-                name,
-                argument_types: self.arena_slice(&argument_types[..count])?,
-                signature_is_explicit,
-            },
+            identity: self.routine_identity()?,
         })
     }
 

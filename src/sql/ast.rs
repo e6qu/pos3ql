@@ -2495,6 +2495,12 @@ pub enum CommentTarget<'a> {
     Trigger(TriggerIdentity<'a>),
     /// RULE name ON relation; rewrite-rule names are relation-local.
     Rule(TriggerIdentity<'a>),
+    /// FUNCTION / PROCEDURE / ROUTINE identity, including its PostgreSQL
+    /// overload signature.
+    Routine {
+        kind: RoutineTargetKind,
+        identity: RoutineIdentity<'a>,
+    },
     /// TYPE name, or DOMAIN name when `domain_only` requires that kind.
     Type {
         name: &'a str,

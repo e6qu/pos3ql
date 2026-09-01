@@ -11,6 +11,8 @@ DROP MATERIALIZED VIEW IF EXISTS cmt_mv;
 DROP VIEW IF EXISTS cmt_v;
 DROP TABLE IF EXISTS cmt_t;
 DROP SEQUENCE IF EXISTS cmt_s;
+DROP FUNCTION IF EXISTS cmt_fn(integer);
+DROP PROCEDURE IF EXISTS cmt_proc(integer);
 DROP TYPE IF EXISTS cmt_enum;
 DROP DOMAIN IF EXISTS cmt_domain;
 DROP SCHEMA IF EXISTS cmt_ns CASCADE;
@@ -23,6 +25,8 @@ CREATE SEQUENCE cmt_s;
 CREATE SCHEMA cmt_ns;
 CREATE TYPE cmt_enum AS ENUM ('a', 'b');
 CREATE DOMAIN cmt_domain AS int CHECK (VALUE > 0);
+CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1';
+CREATE PROCEDURE cmt_proc(value integer) LANGUAGE SQL AS 'SELECT value';
 
 -- Set comments on every object kind that carries an OID here.
 COMMENT ON TABLE cmt_t IS 'cmttest table';
@@ -41,6 +45,9 @@ COMMENT ON TYPE cmt_v IS 'cmttest view row type';
 COMMENT ON TYPE cmt_mv IS 'cmttest matview row type';
 COMMENT ON TYPE regclass IS 'cmttest regclass type';
 COMMENT ON TYPE integer[] IS 'cmttest array type';
+COMMENT ON FUNCTION cmt_fn(integer) IS 'cmttest function';
+COMMENT ON PROCEDURE cmt_proc(integer) IS 'cmttest procedure';
+COMMENT ON ROUTINE cmt_fn(integer) IS 'cmttest routine';
 
 -- Read them back through the standard helpers.
 SELECT obj_description('cmt_t'::regclass) AS table_comment;
@@ -59,6 +66,10 @@ SELECT obj_description(oid, 'pg_type') AS type_comment
  ORDER BY typname;
 SELECT obj_description(2205, 'pg_type') AS regclass_type_comment,
        obj_description(1007, 'pg_type') AS array_type_comment;
+SELECT proname, obj_description(oid, 'pg_proc') AS routine_comment
+  FROM pg_proc
+ WHERE proname IN ('cmt_fn', 'cmt_proc')
+ ORDER BY proname;
 
 -- CREATE OR REPLACE preserves the view object's relation, column, and
 -- composite-type comments.
@@ -137,6 +148,12 @@ SELECT obj_description(oid, 'pg_type') AS enum_after_recreate
 COMMENT ON TYPE integer IS NULL;
 COMMENT ON TYPE regclass IS NULL;
 COMMENT ON TYPE integer[] IS NULL;
+DROP FUNCTION cmt_fn(integer);
+CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1';
+SELECT obj_description(oid, 'pg_proc') AS recreated_function_comment
+  FROM pg_proc WHERE proname = 'cmt_fn';
+DROP FUNCTION cmt_fn(integer);
+DROP PROCEDURE cmt_proc(integer);
 DROP TYPE cmt_enum;
 DROP DOMAIN cmt_domain;
 DROP MATERIALIZED VIEW cmt_mv;

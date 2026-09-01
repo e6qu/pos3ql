@@ -6158,7 +6158,7 @@ impl<'a> Parser<'a> {
 
     /// `COMMENT ON <object> IS { 'text' | NULL }`.
     fn comment(&mut self) -> Result<Stmt<'a>, ParseError> {
-        use crate::sql::ast::{CommentRelKind, CommentTarget};
+        use crate::sql::ast::{CommentRelKind, CommentTarget, RoutineTargetKind};
         self.expect_ident("comment")?;
         self.expect_ident("on")?;
         let target = if self.eat_ident("table")? {
@@ -6238,6 +6238,21 @@ impl<'a> Parser<'a> {
                 name,
                 table: self.qual_name("rule relation")?,
             })
+        } else if self.eat_ident("function")? {
+            CommentTarget::Routine {
+                kind: RoutineTargetKind::Function,
+                identity: self.routine_identity()?,
+            }
+        } else if self.eat_ident("procedure")? {
+            CommentTarget::Routine {
+                kind: RoutineTargetKind::Procedure,
+                identity: self.routine_identity()?,
+            }
+        } else if self.eat_ident("routine")? {
+            CommentTarget::Routine {
+                kind: RoutineTargetKind::Either,
+                identity: self.routine_identity()?,
+            }
         } else if self.eat_ident("type")? {
             CommentTarget::Type {
                 name: self.comment_type_name()?,

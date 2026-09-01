@@ -4792,6 +4792,18 @@ fn pg_description<'a>(
                 }
                 (raw_oid as i32, PG_LARGEOBJECT_OID)
             }
+            crate::storage::CommentClass::Routine => {
+                let Ok(oid) = i32::try_from(subid) else {
+                    continue;
+                };
+                let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+                    continue;
+                };
+                (
+                    crate::storage::routine_oid(&storage.routine_for(slot, txid)),
+                    PG_PROC_OID,
+                )
+            }
             crate::storage::CommentClass::Rule => {
                 let rule = storage
                     .rules_visible_to(txid)
@@ -4838,7 +4850,9 @@ fn pg_description<'a>(
         };
         let catalog_subid = if matches!(
             class,
-            crate::storage::CommentClass::Trigger | crate::storage::CommentClass::Rule
+            crate::storage::CommentClass::Trigger
+                | crate::storage::CommentClass::Rule
+                | crate::storage::CommentClass::Routine
         ) {
             0
         } else {
@@ -5287,6 +5301,14 @@ pub fn comment_text_for<'a>(
                         definition.name.as_str() == name
                             && definition.target.comment_subid() == csub
                             && Some(rule.oid()) == signed_oid
+                    })
+            }
+            "pg_proc" => {
+                class == crate::storage::CommentClass::Routine
+                    && subid == 0
+                    && signed_oid.is_some_and(|oid| {
+                        i32::try_from(csub) == Ok(oid)
+                            && storage.routine_slot_by_oid(oid, txid).is_some()
                     })
             }
             _ => {

@@ -3476,6 +3476,8 @@ def test_type_schema_moves_over_raw_wire():
         "CREATE TYPE wire_moved_point AS (x integer, y integer); "
         "CREATE TYPE wire_alterable_point AS (value integer); "
         "ALTER TYPE wire_alterable_point ALTER ATTRIBUTE value TYPE bigint; "
+        "CREATE ROLE wire_composite_type_owner; "
+        "ALTER TYPE wire_alterable_point OWNER TO wire_composite_type_owner; "
         "CREATE TABLE wire_moved_values (state wire_moved_state, point wire_moved_point, points wire_moved_point[]); "
         "INSERT INTO wire_moved_values VALUES ('ready', ROW(3,4)::wire_moved_point, ARRAY[ROW(5,6)::wire_moved_point]); "
         "ALTER TYPE wire_moved_state SET SCHEMA wire_moved_types; "
@@ -3499,6 +3501,27 @@ def test_type_schema_moves_over_raw_wire():
             )
         )
         == "wire_moved_types.wire_moved_point[]:bigint",
+    )
+    check(
+        "raw wire: ALTER TYPE OWNER resolves a named composite",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT pg_get_userbyid(typowner) FROM pg_type "
+                "WHERE typname = 'wire_alterable_point'",
+            )
+        )
+        == "wire_composite_type_owner",
+    )
+    cleanup = simple_query(
+        s,
+        "ALTER TYPE wire_alterable_point OWNER TO postgres; "
+        "DROP ROLE wire_composite_type_owner",
+    )
+    check(
+        "raw wire: named-composite owner cleanup succeeds",
+        not any(kind == b"E" for kind, _ in cleanup),
+        cleanup,
     )
     s.close()
 

@@ -31825,9 +31825,11 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         for statement in [
             "CREATE SCHEMA durable_types",
+            "CREATE ROLE durable_type_owner",
             "CREATE TYPE coordinate AS (x integer, y integer)",
             "CREATE TYPE altered_coordinate AS (value integer)",
             "ALTER TYPE altered_coordinate ALTER ATTRIBUTE value TYPE bigint",
+            "ALTER TYPE altered_coordinate OWNER TO durable_type_owner",
             "CREATE TYPE place AS (name varchar(7) COLLATE \"C\", point coordinate)",
             "CREATE TABLE durable_places (value place)",
             "INSERT INTO durable_places VALUES (ROW('Station', ROW(4, 8)::coordinate)::place)",
@@ -31897,6 +31899,14 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         )),
         ["bigint"]
     );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_userbyid(typowner) FROM pg_type WHERE typname = 'altered_coordinate'",
+        )),
+        ["durable_type_owner"]
+    );
     let bytes = run_with(
         &mut engine,
         &mut budget,
@@ -31916,6 +31926,16 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
             .contains("column point of composite type place depends on type coordinate_renamed"),
         "{}",
         String::from_utf8_lossy(&bytes)
+    );
+    let restored = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TYPE altered_coordinate OWNER TO postgres; DROP ROLE durable_type_owner",
+    );
+    assert!(
+        !String::from_utf8_lossy(&restored).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&restored)
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

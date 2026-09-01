@@ -8398,6 +8398,12 @@ impl Checkpointer {
                 slot: slot as u16,
             })?;
         }
+        for (slot, _) in storage.checkpoint_composites() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Composite,
+                slot: slot as u16,
+            })?;
+        }
         for (slot, _) in storage.checkpoint_indexes() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Index,

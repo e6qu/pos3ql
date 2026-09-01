@@ -5150,14 +5150,9 @@ pub fn alter_owner(
                 class: AccessClass::Schema,
                 slot: slot as u16,
             }),
-        AlterOwnerKind::Type => (match name.schema {
-            Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
-            None => storage.resolve_enum_slot(name.name, txn.txid),
-        })
-        .map(|slot| AccessObject {
-            class: AccessClass::Enum,
-            slot: slot as u16,
-        }),
+        AlterOwnerKind::Type => storage
+            .resolve_alter_type_target(name.schema, name.name, txn.txid)
+            .map(crate::storage::AlterTypeTarget::access_object),
         AlterOwnerKind::Domain => (match name.schema {
             Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
             None => storage.resolve_domain_slot(name.name, txn.txid),

@@ -13,6 +13,9 @@ DROP TYPE IF EXISTS composite_lifecycle;
 DROP TYPE IF EXISTS composite_alterable;
 DROP TYPE IF EXISTS composite_lifecycle_schema.composite_moved;
 DROP SCHEMA IF EXISTS composite_lifecycle_schema CASCADE;
+DROP SCHEMA IF EXISTS type_owner_first CASCADE;
+DROP SCHEMA IF EXISTS type_owner_later CASCADE;
+DROP ROLE IF EXISTS composite_type_owner;
 
 CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
 CREATE TABLE enum_t (id int, m mood, moods mood[]);
@@ -99,13 +102,39 @@ DROP TYPE enum_composite_name;
 
 CREATE TYPE composite_alterable AS (value integer);
 ALTER TYPE composite_alterable ALTER ATTRIBUTE value TYPE bigint;
+CREATE ROLE composite_type_owner;
+ALTER TYPE composite_alterable OWNER TO composite_type_owner;
 COMMENT ON TYPE composite_alterable IS 'standalone composite';
 SELECT atttypid::regtype
   FROM pg_attribute
  WHERE attrelid = 'composite_alterable'::regclass AND attname = 'value';
 SELECT 'composite_alterable'::regclass::text;
 SELECT obj_description('composite_alterable'::regtype, 'pg_type');
+SELECT pg_get_userbyid(typowner) FROM pg_type WHERE typname = 'composite_alterable';
+CREATE SCHEMA type_owner_first;
+CREATE SCHEMA type_owner_later;
+GRANT CREATE ON SCHEMA type_owner_first, type_owner_later TO composite_type_owner;
+CREATE TYPE type_owner_first.owner_target AS ENUM ('ready');
+CREATE TYPE type_owner_later.owner_target AS (value integer);
+SET search_path TO type_owner_first, type_owner_later, public;
+ALTER TYPE owner_target OWNER TO composite_type_owner;
+SET search_path TO type_owner_later, type_owner_first, public;
+ALTER TYPE owner_target OWNER TO composite_type_owner;
+RESET search_path;
+SELECT n.nspname, pg_get_userbyid(t.typowner)
+  FROM pg_type t
+  JOIN pg_namespace n ON n.oid = t.typnamespace
+ WHERE t.typname = 'owner_target'
+ ORDER BY n.nspname;
+ALTER TYPE type_owner_first.owner_target OWNER TO postgres;
+ALTER TYPE type_owner_later.owner_target OWNER TO postgres;
+DROP TYPE type_owner_first.owner_target;
+DROP TYPE type_owner_later.owner_target;
+DROP SCHEMA type_owner_first;
+DROP SCHEMA type_owner_later;
+ALTER TYPE composite_alterable OWNER TO postgres;
 DROP TYPE composite_alterable;
+DROP ROLE composite_type_owner;
 
 -- A named composite evolves through typed field identity. Existing scalar and
 -- array values, nullability, type changes, schema moves, and renames retain

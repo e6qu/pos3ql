@@ -3753,7 +3753,7 @@ def test_partitioned_tables_over_raw_wire():
     s.close()
 
 
-def test_table_lifecycle_boundaries_over_raw_wire():
+def test_table_lifecycle_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))
     drain_startup(s)
@@ -3764,12 +3764,19 @@ def test_table_lifecycle_boundaries_over_raw_wire():
         "CREATE TYPE wire_lifecycle_row AS (id integer); "
         "CREATE TABLE wire_lifecycle_plain (id integer)",
     )
-    checks = [
-        simple_query(s, "CREATE TABLE wire_lifecycle_storage (id integer) WITH (fillfactor = 80)"),
-        simple_query(s, "CREATE TABLE wire_lifecycle_typed OF wire_lifecycle_row"),
-        simple_query(s, "ALTER TABLE wire_lifecycle_plain SET (fillfactor = 80)"),
-        simple_query(s, "ALTER TABLE wire_lifecycle_parent DETACH PARTITION wire_lifecycle_child CONCURRENTLY"),
-    ]
+    storage = simple_query(
+        s,
+        "CREATE TABLE wire_lifecycle_storage (id integer) WITH (fillfactor = 80); "
+        "ALTER TABLE wire_lifecycle_plain SET (fillfactor = 80); "
+        "SELECT reloptions::text FROM pg_class WHERE relname = 'wire_lifecycle_plain'",
+    )
+    typed = simple_query(s, "CREATE TABLE wire_lifecycle_typed OF wire_lifecycle_row")
+    detach = simple_query(
+        s,
+        "INSERT INTO wire_lifecycle_parent VALUES (4); "
+        "ALTER TABLE wire_lifecycle_parent DETACH PARTITION wire_lifecycle_child CONCURRENTLY; "
+        "SELECT count(*) FROM wire_lifecycle_parent",
+    )
     inherited = simple_query(
         s,
         "CREATE TABLE wire_lifecycle_inherited (extra text) INHERITS (wire_lifecycle_plain); "
@@ -3782,21 +3789,27 @@ def test_table_lifecycle_boundaries_over_raw_wire():
         "SELECT inhseqno FROM pg_inherits WHERE inhrelid = 'wire_lifecycle_inherited'::regclass",
     )
     check(
-        "raw wire: table inheritance is executable and remaining lifecycle boundaries are typed",
+        "raw wire: typed table, storage options, and concurrent detach are executable",
         not any(kind == b"E" for kind, _ in setup)
-        and all(has_sqlstate(messages, "0A000") for messages in checks)
+        and not any(kind == b"E" for kind, _ in storage)
+        and first_text_row(storage) == "{fillfactor=80}"
+        and not any(kind == b"E" for kind, _ in typed)
+        and not any(kind == b"E" for kind, _ in detach)
+        and first_text_row(detach) == "0"
         and not any(kind == b"E" for kind, _ in inherited)
         and first_text_row(inherited_row) == "2"
         and first_text_row(inherited_catalog) == "1",
         setup
-        + [message for messages in checks for message in messages]
+        + storage
+        + typed
+        + detach
         + inherited
         + inherited_row
         + inherited_catalog,
     )
     cleanup = simple_query(
         s,
-        "DROP TABLE wire_lifecycle_child, wire_lifecycle_parent, wire_lifecycle_plain CASCADE; "
+        "DROP TABLE wire_lifecycle_child, wire_lifecycle_parent, wire_lifecycle_plain, wire_lifecycle_storage, wire_lifecycle_typed CASCADE; "
         "DROP TYPE wire_lifecycle_row",
     )
     check(

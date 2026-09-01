@@ -6878,6 +6878,17 @@ impl Engine {
                 responder.error(e.sqlstate, e.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
             }
+            if txn.take_concurrent_partition_detach() {
+                if let Err(error) = self.commit_txn(txn, guc) {
+                    responder.error(error.sqlstate, error.message.as_str())?;
+                    return Ok(ExecutionStatus::Complete);
+                }
+                return Ok(ExecutionStatus::Blocked {
+                    completed_statements: statement_index,
+                    output_mark,
+                    io_wait: false,
+                });
+            }
             txn.compact_completed_constraints();
         }
         if !executed_any {
@@ -6999,6 +7010,13 @@ impl Engine {
         .and_then(|()| query::check_timeout());
         match outcome {
             Ok(()) => {
+                if txn.take_concurrent_partition_detach() {
+                    if let Err(error) = self.commit_txn(txn, guc) {
+                        responder.error(error.sqlstate, error.message.as_str())?;
+                        return Ok(ExtendedExecutionStatus::Complete(false));
+                    }
+                    return Ok(ExtendedExecutionStatus::Blocked { io_wait: false });
+                }
                 txn.compact_completed_constraints();
                 Ok(ExtendedExecutionStatus::Complete(true))
             }

@@ -7719,7 +7719,7 @@ fn pg_inherits<'a>(
             )?;
             n += 1;
         }
-        if let Some(crate::storage::PartitionAttachment { parent, .. }) =
+        if let Some(crate::storage::PartitionAttachment { parent, state, .. }) =
             definition.partition.attachment
         {
             rows[n] = row(
@@ -7727,7 +7727,10 @@ fn pg_inherits<'a>(
                     Datum::Int4(table_oid(storage, child)),
                     Datum::Int4(table_oid(storage, usize::from(parent))),
                     Datum::Int4(1),
-                    Datum::Bool(false),
+                    Datum::Bool(matches!(
+                        state,
+                        crate::storage::PartitionAttachmentState::DetachPending
+                    )),
                 ],
                 arena,
             )?;
@@ -7924,6 +7927,19 @@ fn pg_class<'a>(
                 },
             );
         let relation_owner = Storage::role_oid(storage.object_owner(relation_object, txid));
+        let reloptions = match table_def.storage_options.fillfactor {
+            Some(fillfactor) => Datum::Array {
+                element: super::types::ArrElem::Text,
+                raw: super::array::build(
+                    &[text(
+                        stack_format!(32, "fillfactor={fillfactor}").as_str(),
+                        arena,
+                    )?],
+                    arena,
+                )?,
+            },
+            None => Datum::Null,
+        };
         out[n] = row(
             &[
                 Datum::Int4(toid),
@@ -7945,7 +7961,12 @@ fn pg_class<'a>(
                 Datum::Bool(table_def.row_level_security.forced),
                 Datum::Bool(table_def.partition.is_attached()),
                 Datum::Int4(catalog_tablespace_oid(storage, table_def.tablespace, txid)),
-                Datum::Int4(0), // reloftype
+                Datum::Int4(
+                    table_def
+                        .type_membership
+                        .composite_slot()
+                        .map_or(0, |slot| crate::sql::types::oid::composite_oid(slot as u16)),
+                ),
                 Datum::Int4(if table_def.has_toast {
                     toast_relation_oid(slot)
                 } else {
@@ -7968,7 +7989,7 @@ fn pg_class<'a>(
                 Datum::Int4(0),
                 Datum::Int4(0),
                 Datum::Int4(0),
-                Datum::Null,
+                reloptions,
                 Datum::Bool(true),
                 table_def
                     .partition

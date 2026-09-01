@@ -185,6 +185,9 @@ pub struct TxnState {
     trigger_depth: u16,
     rule_stack: [i32; MAX_RULE_NESTING],
     rule_depth: u8,
+    /// A concurrent partition detach published its first durable phase. The
+    /// protocol executor commits that phase before it parks for finalization.
+    concurrent_partition_detach_pending: bool,
     /// Every row write, in order: (table slot, rowid, pending image before the
     /// write). Recorded per write (not per row) so `ROLLBACK TO SAVEPOINT` can
     /// reverse-replay to any earlier point.
@@ -737,6 +740,7 @@ impl TxnState {
             trigger_depth: 0,
             rule_stack: [0; MAX_RULE_NESTING],
             rule_depth: 0,
+            concurrent_partition_detach_pending: false,
             touched: FixedVec::new(budget, "txn_touched", capacity)?,
             truncates: FixedVec::new(budget, "txn_truncates", MAX_TXN_DDL)?,
             truncate_wal_tables: FixedBuf::new(
@@ -899,6 +903,18 @@ impl TxnState {
 
     pub fn is_explicit(&self) -> bool {
         self.mode == TxnMode::Explicit
+    }
+
+    pub(crate) fn begin_concurrent_partition_detach(&mut self) {
+        self.concurrent_partition_detach_pending = true;
+    }
+
+    pub(crate) fn concurrent_partition_detach_pending(&self) -> bool {
+        self.concurrent_partition_detach_pending
+    }
+
+    pub(crate) fn take_concurrent_partition_detach(&mut self) -> bool {
+        core::mem::take(&mut self.concurrent_partition_detach_pending)
     }
 
     pub(crate) fn has_savepoints(&self) -> bool {
@@ -2024,6 +2040,7 @@ impl TxnState {
         self.ddl_origins.clear();
         self.ddl_origin = 0;
         self.next_ddl_origin = 0;
+        self.concurrent_partition_detach_pending = false;
         self.statistics_undo.clear();
         self.savepoints.clear();
         // Commit flushes these before clearing; rollback drops them here.

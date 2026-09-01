@@ -228,6 +228,7 @@ pub(crate) struct SstWriter {
     pax_refs: [DataBlockRef; MAX_COLUMNS],
     pax_columns: usize,
     pax_enabled: bool,
+    pax_fillfactor: u8,
     /// Framed logical PAX blocks waiting to become one immutable container.
     packed: Box<[u8]>,
     packed_len: usize,
@@ -282,6 +283,7 @@ impl SstWriter {
             pax_refs: [DataBlockRef::Direct(BlockId([0u8; 32])); MAX_COLUMNS],
             pax_columns: 0,
             pax_enabled: false,
+            pax_fillfactor: 100,
             packed: vec![0u8; MAX_PAYLOAD].into_boxed_slice(),
             packed_len: 0,
             packed_index_start: 0,
@@ -317,6 +319,7 @@ impl SstWriter {
         self.pax_refs.fill(DataBlockRef::Direct(BlockId([0u8; 32])));
         self.pax_columns = 0;
         self.pax_enabled = false;
+        self.pax_fillfactor = 100;
     }
 
     /// Selects the table row layout for the next SST.  Callers must choose it
@@ -332,6 +335,16 @@ impl SstWriter {
         self.pax_schema[..schema.len()].copy_from_slice(schema);
         self.pax_columns = schema.len();
         self.pax_enabled = true;
+        Ok(())
+    }
+
+    /// Chooses the durable PAX data-block occupancy for the next relation SST.
+    pub(crate) fn set_pax_fillfactor(&mut self, fillfactor: Option<u8>) -> Result<(), SstError> {
+        let fillfactor = fillfactor.unwrap_or(100);
+        if self.pending_len != 0 || !(10..=100).contains(&fillfactor) {
+            return Err(SstError::PaxEncoding);
+        }
+        self.pax_fillfactor = fillfactor;
         Ok(())
     }
 
@@ -373,7 +386,10 @@ impl SstWriter {
             return self.append_chained(store, key, row);
         }
         let limit = if self.pax_enabled {
-            PACKED_PAX_TARGET.saturating_sub(128)
+            PACKED_PAX_TARGET
+                .saturating_mul(usize::from(self.pax_fillfactor))
+                .saturating_div(100)
+                .saturating_sub(128)
         } else {
             MAX_PAYLOAD
         };
@@ -467,7 +483,10 @@ impl SstWriter {
             return Err(SstError::KeyOutOfOrder);
         }
         let limit = if self.pax_enabled {
-            PACKED_PAX_TARGET.saturating_sub(128)
+            PACKED_PAX_TARGET
+                .saturating_mul(usize::from(self.pax_fillfactor))
+                .saturating_div(100)
+                .saturating_sub(128)
         } else {
             MAX_PAYLOAD
         };
@@ -2646,6 +2665,30 @@ mod tests {
             block_type,
             BlockType::SstDataV2 | BlockType::SstDataV2Lz4
         ));
+    }
+
+    #[test]
+    fn pax_fillfactor_changes_durable_data_block_occupancy() {
+        fn data_blocks(fillfactor: u8) -> usize {
+            let (_budget, mut store) = store();
+            let payload = vec![b'x'; 4096];
+            let text = core::str::from_utf8(&payload).unwrap();
+            let row = [Datum::Text(text)];
+            let mut encoded = vec![0; rowenc::encoded_len(&row)];
+            rowenc::encode(&row, &mut encoded);
+            let mut writer = SstWriter::new();
+            writer.set_pax_schema(&[ColType::Text]).unwrap();
+            writer.set_pax_fillfactor(Some(fillfactor)).unwrap();
+            for rowid in 1..=128 {
+                writer
+                    .append_version(&mut store, SstKey::at(rowid, 1), &encoded)
+                    .unwrap();
+            }
+            writer.finish(&mut store).unwrap();
+            writer.index_len
+        }
+
+        assert!(data_blocks(70) > data_blocks(100));
     }
 
     #[test]

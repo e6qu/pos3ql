@@ -334,6 +334,7 @@ enum ObjectRef {
     Subscription(usize),
     Extension(usize),
     LargeObject(usize),
+    ForeignDataWrapper(usize),
     ForeignServer(usize),
     Role(usize),
 }
@@ -1152,6 +1153,9 @@ fn comment_reference(
         CommentClass::ForeignServer => EventObjectRef::Primary(ObjectRef::ForeignServer(
             usize::try_from(subid).map_err(|_| graph_full())?,
         )),
+        CommentClass::ForeignDataWrapper => EventObjectRef::Primary(ObjectRef::ForeignDataWrapper(
+            usize::try_from(subid).map_err(|_| graph_full())?,
+        )),
         CommentClass::LargeObject => {
             let oid = name
                 .as_str()
@@ -1926,6 +1930,20 @@ fn primary_object(
                 None,
                 Some(server.name.as_str()),
                 StackStr::from_str(identifier(server.name.as_str()).as_str()),
+                false,
+            )
+        }
+        ObjectRef::ForeignDataWrapper(slot) => {
+            let wrapper = storage
+                .foreign_wrapper_by_slot(slot, txid)
+                .ok_or_else(graph_full)?;
+            base_object(
+                2328,
+                catalog::foreign_data_wrapper_oid(slot),
+                "foreign data wrapper",
+                None,
+                Some(wrapper.name.as_str()),
+                StackStr::from_str(identifier(wrapper.name.as_str()).as_str()),
                 false,
             )
         }

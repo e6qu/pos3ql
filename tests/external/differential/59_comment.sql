@@ -59,6 +59,7 @@ COMMENT ON FUNCTION cmt_fn(integer) IS 'cmttest function';
 COMMENT ON PROCEDURE cmt_proc(integer) IS 'cmttest procedure';
 COMMENT ON AGGREGATE cmt_sum(integer) IS 'cmttest aggregate';
 COMMENT ON ROUTINE cmt_fn(integer) IS 'cmttest routine';
+COMMENT ON FOREIGN DATA WRAPPER cmt_fdw IS 'cmttest wrapper';
 COMMENT ON SERVER cmt_server IS 'cmttest server';
 COMMENT ON FOREIGN TABLE cmt_foreign_table IS 'cmttest foreign table';
 
@@ -85,6 +86,8 @@ SELECT proname, obj_description(oid, 'pg_proc') AS routine_comment
  ORDER BY proname;
 SELECT obj_description(oid, 'pg_foreign_server') AS server_comment
   FROM pg_foreign_server WHERE srvname = 'cmt_server';
+SELECT obj_description(oid, 'pg_foreign_data_wrapper') AS wrapper_comment
+  FROM pg_foreign_data_wrapper WHERE fdwname = 'cmt_fdw';
 SELECT obj_description('cmt_foreign_table'::regclass) AS foreign_table_comment;
 
 -- CREATE OR REPLACE preserves the view object's relation, column, and

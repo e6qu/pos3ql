@@ -2976,6 +2976,7 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
               SELECT object_type FROM pg_event_trigger_ddl_commands(); RETURN; END'; \
          CREATE EVENT TRIGGER capture_comment_catalog_event_end ON ddl_command_end \
            WHEN TAG IN ('COMMENT') EXECUTE FUNCTION capture_comment_catalog_event(); \
+         CREATE FOREIGN DATA WRAPPER comment_event_fdw NO HANDLER NO VALIDATOR; \
          CREATE TABLE comment_event_constraints (value integer, \
            CONSTRAINT comment_event_checked CHECK (value > 0)); \
          CREATE TYPE comment_event_mood AS ENUM ('low', 'high'); \
@@ -3003,6 +3004,7 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
          COMMENT ON OPERATOR FAMILY comment_event_family USING btree IS 'family'; \
          COMMENT ON OPERATOR CLASS comment_event_class USING btree IS 'class'; \
          COMMENT ON CONSTRAINT comment_event_checked ON comment_event_constraints IS 'constraint'; \
+         COMMENT ON FOREIGN DATA WRAPPER comment_event_fdw IS 'wrapper'; \
          SELECT kind FROM comment_catalog_events ORDER BY kind",
         1 << 20,
     );
@@ -3012,6 +3014,7 @@ fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
         data_rows(&output),
         [
             "cast",
+            "foreign data wrapper",
             "operator",
             "operator class",
             "operator family",
@@ -30336,17 +30339,23 @@ fn role_and_foreign_server_comments_keep_stable_catalog_identity() {
          CREATE SERVER comment_server FOREIGN DATA WRAPPER comment_fdw; \
          CREATE FOREIGN TABLE comment_foreign_table (id integer) SERVER comment_server; \
          COMMENT ON ROLE comment_role IS 'role comment'; \
+         COMMENT ON FOREIGN DATA WRAPPER comment_fdw IS 'wrapper comment'; \
          COMMENT ON SERVER comment_server IS 'server comment'; \
          COMMENT ON FOREIGN TABLE comment_foreign_table IS 'foreign table comment'; \
          SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
            WHERE rolname = 'comment_role'; \
+         SELECT obj_description(oid, 'pg_foreign_data_wrapper') \
+           FROM pg_foreign_data_wrapper WHERE fdwname = 'comment_fdw'; \
          SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server \
            WHERE srvname = 'comment_server'; \
          SELECT obj_description('comment_foreign_table'::regclass); \
          ALTER ROLE comment_role RENAME TO comment_role_renamed; \
+         ALTER FOREIGN DATA WRAPPER comment_fdw RENAME TO comment_fdw_renamed; \
          ALTER SERVER comment_server RENAME TO comment_server_renamed; \
          SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
            WHERE rolname = 'comment_role_renamed'; \
+         SELECT obj_description(oid, 'pg_foreign_data_wrapper') \
+           FROM pg_foreign_data_wrapper WHERE fdwname = 'comment_fdw_renamed'; \
          SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server \
            WHERE srvname = 'comment_server_renamed'",
     );
@@ -30354,9 +30363,11 @@ fn role_and_foreign_server_comments_keep_stable_catalog_identity() {
         data_rows(&output),
         [
             "role comment",
+            "wrapper comment",
             "server comment",
             "foreign table comment",
             "role comment",
+            "wrapper comment",
             "server comment"
         ],
         "{}",
@@ -30368,17 +30379,21 @@ fn role_and_foreign_server_comments_keep_stable_catalog_identity() {
         "DROP ROLE comment_role_renamed; \
          DROP FOREIGN TABLE comment_foreign_table; \
          DROP SERVER comment_server_renamed; \
+         DROP FOREIGN DATA WRAPPER comment_fdw_renamed; \
          CREATE ROLE comment_role_renamed; \
-         CREATE SERVER comment_server_renamed FOREIGN DATA WRAPPER comment_fdw; \
+         CREATE FOREIGN DATA WRAPPER comment_fdw_renamed NO HANDLER NO VALIDATOR; \
+         CREATE SERVER comment_server_renamed FOREIGN DATA WRAPPER comment_fdw_renamed; \
          SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
            WHERE rolname = 'comment_role_renamed'; \
+         SELECT obj_description(oid, 'pg_foreign_data_wrapper') \
+           FROM pg_foreign_data_wrapper WHERE fdwname = 'comment_fdw_renamed'; \
          SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server \
            WHERE srvname = 'comment_server_renamed'; \
          DROP SERVER comment_server_renamed; \
-         DROP FOREIGN DATA WRAPPER comment_fdw; \
+         DROP FOREIGN DATA WRAPPER comment_fdw_renamed; \
          DROP ROLE comment_role_renamed",
     );
-    assert_eq!(data_rows(&output), ["NULL", "NULL"]);
+    assert_eq!(data_rows(&output), ["NULL", "NULL", "NULL"]);
 }
 
 #[test]
@@ -30416,12 +30431,15 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
          COMMENT ON PUBLICATION recovered_comment_publication IS 'publication durable'; \
          COMMENT ON SUBSCRIPTION recovered_comment_subscription IS 'subscription durable'; \
          COMMENT ON ROLE recovered_comment_role IS 'role durable'; \
+         COMMENT ON FOREIGN DATA WRAPPER recovered_comment_fdw IS 'wrapper durable'; \
          COMMENT ON SERVER recovered_comment_server IS 'server durable'; \
          COMMENT ON CONSTRAINT recovered_comment_checked ON recovered_comment_target \
            IS 'constraint durable'; \
          ALTER TABLE recovered_comment_target \
            RENAME CONSTRAINT recovered_comment_checked TO recovered_comment_checked_renamed; \
          ALTER ROLE recovered_comment_role RENAME TO recovered_comment_role_renamed; \
+         ALTER FOREIGN DATA WRAPPER recovered_comment_fdw \
+           RENAME TO recovered_comment_fdw_renamed; \
          ALTER SERVER recovered_comment_server RENAME TO recovered_comment_server_renamed",
     );
     assert!(
@@ -30448,6 +30466,8 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
            WHERE subname = 'recovered_comment_subscription'; \
          SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
            WHERE rolname = 'recovered_comment_role_renamed'; \
+         SELECT obj_description(oid, 'pg_foreign_data_wrapper') \
+           FROM pg_foreign_data_wrapper WHERE fdwname = 'recovered_comment_fdw_renamed'; \
          SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server \
            WHERE srvname = 'recovered_comment_server_renamed'; \
          SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
@@ -30462,6 +30482,7 @@ fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
             "publication durable",
             "subscription durable",
             "role durable",
+            "wrapper durable",
             "server durable",
             "constraint durable",
         ]
@@ -30576,12 +30597,12 @@ fn comment_errors_match_postgres() {
         .contains("42704")
     );
     assert!(
-        String::from_utf8_lossy(&run_with(
+        !String::from_utf8_lossy(&run_with(
             &mut e,
             &mut b,
             "COMMENT ON FOREIGN DATA WRAPPER cmt_comment_fdw IS 'x'"
         ))
-        .contains("42601")
+        .contains("ERROR")
     );
     assert!(
         String::from_utf8_lossy(&run_with(

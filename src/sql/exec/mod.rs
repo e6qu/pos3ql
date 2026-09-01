@@ -29816,17 +29816,26 @@ pub fn comment(
             )
         }
         CommentTarget::ForeignDataWrapper(wrapper_name) => {
-            if storage.foreign_wrapper(wrapper_name, txid).is_none() {
+            let Some((slot, wrapper)) = storage.foreign_wrapper(wrapper_name, txid) else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "foreign-data wrapper \"{}\" does not exist",
                     wrapper_name
                 ));
+            };
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::ForeignDataWrapper,
+                slot: slot as u16,
+            };
+            if let Err(error) = storage.require_owner(object, txid, "foreign-data wrapper") {
+                return sql_fail(error);
             }
-            return sql_fail(sql_err!(
-                sqlstate::SYNTAX_ERROR,
-                "COMMENT ON FOREIGN DATA WRAPPER is not supported"
-            ));
+            (
+                CommentClass::ForeignDataWrapper,
+                SqlName::EMPTY,
+                wrapper.name,
+                slot as u32,
+            )
         }
         CommentTarget::ForeignServer(server_name) => {
             let Some((slot, server)) = storage.foreign_server(server_name, txid) else {

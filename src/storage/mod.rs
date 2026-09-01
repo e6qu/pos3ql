@@ -9361,6 +9361,7 @@ pub enum CommentClass {
     OperatorFamily,
     OperatorClass,
     Constraint,
+    ForeignDataWrapper,
 }
 
 impl CommentClass {
@@ -9394,6 +9395,7 @@ impl CommentClass {
             CommentClass::OperatorFamily => 25,
             CommentClass::OperatorClass => 26,
             CommentClass::Constraint => 27,
+            CommentClass::ForeignDataWrapper => 28,
         }
     }
 
@@ -9427,6 +9429,7 @@ impl CommentClass {
             25 => CommentClass::OperatorFamily,
             26 => CommentClass::OperatorClass,
             27 => CommentClass::Constraint,
+            28 => CommentClass::ForeignDataWrapper,
             _ => return None,
         })
     }
@@ -10650,6 +10653,9 @@ impl Storage {
         }
         if class == foreign::ForeignObjectClass::Server {
             self.drop_comments_by_subid(CommentClass::ForeignServer, slot as u32);
+        }
+        if class == foreign::ForeignObjectClass::Wrapper {
+            self.drop_comments_by_subid(CommentClass::ForeignDataWrapper, slot as u32);
         }
     }
 
@@ -17141,6 +17147,7 @@ impl Storage {
         matches!(
             class,
             CommentClass::Role
+                | CommentClass::ForeignDataWrapper
                 | CommentClass::ForeignServer
                 | CommentClass::Cast
                 | CommentClass::Operator
@@ -35452,10 +35459,11 @@ mod tests {
             CommentClass::OperatorFamily,
             CommentClass::OperatorClass,
             CommentClass::Constraint,
+            CommentClass::ForeignDataWrapper,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(28), None);
+        assert_eq!(CommentClass::from_u8(29), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 

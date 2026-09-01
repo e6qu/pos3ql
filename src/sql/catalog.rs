@@ -1426,7 +1426,7 @@ const FIRST_FOREIGN_DATA_WRAPPER_OID: i32 = 510_000;
 const FIRST_FOREIGN_SERVER_OID: i32 = 520_000;
 const FIRST_USER_MAPPING_OID: i32 = 530_000;
 
-const fn foreign_data_wrapper_oid(slot: usize) -> i32 {
+pub(crate) const fn foreign_data_wrapper_oid(slot: usize) -> i32 {
     FIRST_FOREIGN_DATA_WRAPPER_OID + slot as i32
 }
 
@@ -4756,6 +4756,15 @@ fn pg_description<'a>(
                 };
                 (foreign_server_oid(slot), 1417)
             }
+            crate::storage::CommentClass::ForeignDataWrapper => {
+                let Ok(slot) = usize::try_from(subid) else {
+                    continue;
+                };
+                let Some(_) = storage.foreign_wrapper_by_slot(slot, txid) else {
+                    continue;
+                };
+                (foreign_data_wrapper_oid(slot), 2328)
+            }
             crate::storage::CommentClass::Cast => {
                 let Some((_, cast)) = storage
                     .casts_visible_to(txid)
@@ -4959,6 +4968,7 @@ fn pg_description<'a>(
                 | crate::storage::CommentClass::Publication
                 | crate::storage::CommentClass::Subscription
                 | crate::storage::CommentClass::ForeignServer
+                | crate::storage::CommentClass::ForeignDataWrapper
                 | crate::storage::CommentClass::Cast
                 | crate::storage::CommentClass::Operator
                 | crate::storage::CommentClass::OperatorFamily
@@ -5341,6 +5351,16 @@ pub fn comment_text_for<'a>(
                         usize::try_from(csub).ok().is_some_and(|slot| {
                             foreign_server_oid(slot) == server_oid
                                 && storage.foreign_server_by_slot(slot, txid).is_some()
+                        })
+                    })
+            }
+            "pg_foreign_data_wrapper" => {
+                class == crate::storage::CommentClass::ForeignDataWrapper
+                    && subid == 0
+                    && signed_oid.is_some_and(|wrapper_oid| {
+                        usize::try_from(csub).ok().is_some_and(|slot| {
+                            foreign_data_wrapper_oid(slot) == wrapper_oid
+                                && storage.foreign_wrapper_by_slot(slot, txid).is_some()
                         })
                     })
             }

@@ -4593,6 +4593,7 @@ def test_catalog_comments_over_raw_wire():
         "COMMENT ON POLICY wire_catalog_policy ON wire_catalog_comment IS 'wire policy'; "
         "COMMENT ON STATISTICS wire_catalog_statistics IS 'wire statistics'; "
         "COMMENT ON ROLE wire_catalog_comment_role IS 'wire role'; "
+        "COMMENT ON FOREIGN DATA WRAPPER wire_catalog_comment_fdw IS 'wire wrapper'; "
         "COMMENT ON SERVER wire_catalog_comment_server IS 'wire server'; "
         "COMMENT ON FOREIGN TABLE wire_catalog_comment_foreign IS 'wire foreign table'; "
         "COMMENT ON CAST (wire_catalog_comment_mood AS text) IS 'wire cast'; "
@@ -4609,6 +4610,8 @@ def test_catalog_comments_over_raw_wire():
         "WHERE stxname = 'wire_catalog_statistics'; "
         "SELECT shobj_description(oid, 'pg_authid') FROM pg_roles "
         "WHERE rolname = 'wire_catalog_comment_role'; "
+        "SELECT obj_description(oid, 'pg_foreign_data_wrapper') FROM pg_foreign_data_wrapper "
+        "WHERE fdwname = 'wire_catalog_comment_fdw'; "
         "SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server "
         "WHERE srvname = 'wire_catalog_comment_server'; "
         "SELECT obj_description('wire_catalog_comment_foreign'::regclass); "
@@ -4647,6 +4650,7 @@ def test_catalog_comments_over_raw_wire():
             "wire policy",
             "wire statistics",
             "wire role",
+            "wire wrapper",
             "wire server",
             "wire foreign table",
             "wire cast",

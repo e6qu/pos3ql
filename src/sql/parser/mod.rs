@@ -8766,7 +8766,8 @@ mod tests {
              COMMENT ON OPERATOR public.=== (integer, integer) IS 'operator'; \
              COMMENT ON OPERATOR FAMILY public.int_family USING btree IS 'family'; \
              COMMENT ON OPERATOR CLASS public.int_class USING btree IS 'class'; \
-             COMMENT ON CONSTRAINT int_checked ON public.items IS 'constraint'",
+             COMMENT ON CONSTRAINT int_checked ON public.items IS 'constraint'; \
+             COMMENT ON FOREIGN DATA WRAPPER app_fdw IS 'wrapper'",
             |parser| {
                 assert!(matches!(
                     parser.next_stmt().unwrap(),
@@ -8800,6 +8801,13 @@ mod tests {
                     parser.next_stmt().unwrap(),
                     Some(Stmt::Comment {
                         target: crate::sql::ast::CommentTarget::Constraint { .. },
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::ForeignDataWrapper("app_fdw"),
                         ..
                     })
                 ));

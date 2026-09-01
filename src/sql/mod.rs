@@ -4777,6 +4777,9 @@ impl Engine {
                 DdlUndo::ViewSecurityChanged { slot, .. } => {
                     self.storage.commit_view_security(*slot as usize, txn.txid)
                 }
+                DdlUndo::ViewCheckOptionChanged { slot, .. } => self
+                    .storage
+                    .commit_view_check_option(*slot as usize, txn.txid),
                 DdlUndo::RuleCreated { slot, .. } => {
                     self.storage.commit_rule_create(*slot as usize)
                 }
@@ -5656,6 +5659,9 @@ impl Engine {
             DdlUndo::ViewSecurityChanged { slot, prior } => {
                 self.storage.rollback_view_security(slot as usize, prior)
             }
+            DdlUndo::ViewCheckOptionChanged { slot, prior } => self
+                .storage
+                .rollback_view_check_option(slot as usize, prior),
             DdlUndo::PublicationCreated(slot) => {
                 self.storage.rollback_publication_create(slot as usize)
             }
@@ -9184,9 +9190,13 @@ impl Engine {
                         capture,
                     );
                 }
-                let insert =
+                let (insert, view_check) =
                     match query::resolve_view_for_dml(storage, insert.table, txn.txid, arena) {
                         Ok(Some(view)) => {
+                            let view_check = view.check_option.map(|_| exec::ViewCheck {
+                                predicate: view.where_clause,
+                                view_name: insert.table.name,
+                            });
                             let rewritten = match query::rewrite_view_dml(
                                 statement,
                                 insert.table.name,
@@ -9206,7 +9216,7 @@ impl Engine {
                             } else {
                                 rewritten.columns
                             };
-                            match arena.alloc(Insert {
+                            let rewritten = match arena.alloc(Insert {
                                 table: view.base,
                                 columns,
                                 rows: rewritten.rows,
@@ -9217,9 +9227,10 @@ impl Engine {
                             }) {
                                 Ok(rewritten) => &*rewritten,
                                 Err(_) => return Ok(Err(query::arena_full_pub())),
-                            }
+                            };
+                            (rewritten, view_check)
                         }
-                        Ok(None) => insert,
+                        Ok(None) => (insert, None),
                         Err(error) => return Ok(Err(error)),
                     };
                 exec::insert(
@@ -9228,6 +9239,7 @@ impl Engine {
                     scratch,
                     insert,
                     authorization,
+                    view_check,
                     arena,
                     params,
                     guc.seq_session(),
@@ -9263,9 +9275,13 @@ impl Engine {
                         capture,
                     );
                 }
-                let update =
+                let (update, view_check) =
                     match query::resolve_view_for_dml(storage, update.table, txn.txid, arena) {
                         Ok(Some(view)) => {
+                            let view_check = view.check_option.map(|_| exec::ViewCheck {
+                                predicate: view.where_clause,
+                                view_name: update.table.name,
+                            });
                             let rewritten = match query::rewrite_view_dml(
                                 statement,
                                 update.table.name,
@@ -9288,7 +9304,7 @@ impl Engine {
                                 Ok(where_clause) => where_clause,
                                 Err(error) => return Ok(Err(error)),
                             };
-                            match arena.alloc(Update {
+                            let rewritten = match arena.alloc(Update {
                                 table: view.base,
                                 alias: update.alias,
                                 assignments: rewritten.assignments,
@@ -9298,9 +9314,10 @@ impl Engine {
                             }) {
                                 Ok(rewritten) => &*rewritten,
                                 Err(_) => return Ok(Err(query::arena_full_pub())),
-                            }
+                            };
+                            (rewritten, view_check)
                         }
-                        Ok(None) => update,
+                        Ok(None) => (update, None),
                         Err(error) => return Ok(Err(error)),
                     };
                 exec::update(
@@ -9309,6 +9326,7 @@ impl Engine {
                     scratch,
                     update,
                     authorization,
+                    view_check,
                     arena,
                     params,
                     guc.seq_session(),
@@ -11652,6 +11670,7 @@ impl Engine {
                 name,
                 or_replace,
                 security,
+                check_option,
                 sql,
             } => exec::create_view(
                 &mut self.storage,
@@ -11661,6 +11680,7 @@ impl Engine {
                     name,
                     or_replace: *or_replace,
                     security: *security,
+                    check_option: *check_option,
                     sql,
                     raw_path: guc.search_path().as_str(),
                 },
@@ -11675,9 +11695,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                *name,
-                *if_exists,
-                *action,
+                exec::AlterViewCommand {
+                    name: *name,
+                    if_exists: *if_exists,
+                    action: *action,
+                },
+                arena,
                 responder,
             ),
             Stmt::AlterMaterializedView {
@@ -12892,6 +12915,7 @@ impl Engine {
                         name,
                         or_replace,
                         security,
+                        check_option,
                         sql,
                     } = requalified
                     {
@@ -12915,6 +12939,7 @@ impl Engine {
                                 name,
                                 or_replace: *or_replace,
                                 security: *security,
+                                check_option: *check_option,
                                 sql,
                                 raw_path: schema_path,
                             },
@@ -15700,11 +15725,13 @@ fn requalify_schema_element<'a>(
             name,
             or_replace,
             security,
+            check_option,
             sql,
         } => Stmt::CreateView {
             name: requalify(*name)?,
             or_replace: *or_replace,
             security: *security,
+            check_option: *check_option,
             sql,
         },
         ast::CreateSchemaElement::Index {
@@ -16863,6 +16890,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             sql,
             path,
             security_invoker,
+            check_option,
             dependencies,
         } => {
             // Replay reconstructs committed state: create then promote.
@@ -16881,10 +16909,23 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     creation_path,
                     dependencies,
                 },
-                if security_invoker {
-                    crate::storage::ViewSecurity::Invoker
-                } else {
-                    crate::storage::ViewSecurity::Definer
+                crate::storage::ViewOptions {
+                    security: if security_invoker {
+                        crate::storage::ViewSecurity::Invoker
+                    } else {
+                        crate::storage::ViewSecurity::Definer
+                    },
+                    check_option: match check_option {
+                        0 => None,
+                        code => Some(crate::storage::ViewCheckOption::from_code(code).ok_or_else(
+                            || {
+                                sql_err!(
+                                    sqlstate::DATA_EXCEPTION,
+                                    "journal has invalid view check option"
+                                )
+                            },
+                        )?),
+                    },
                 },
                 true,
                 0,
@@ -16924,6 +16965,35 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 0,
             )?;
             storage.commit_view_security(slot, 0);
+        }
+        WalOp::SetViewCheckOption {
+            schema,
+            name,
+            check_option,
+        } => {
+            let slot = storage
+                .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
+                .map(|object| object.slot as usize)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "journal changes unknown view \"{}\"",
+                        name
+                    )
+                })?;
+            let check_option = match check_option {
+                0 => None,
+                code => Some(crate::storage::ViewCheckOption::from_code(code).ok_or_else(
+                    || {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "journal has invalid view check option"
+                        )
+                    },
+                )?),
+            };
+            storage.stage_view_check_option(slot, check_option, 0)?;
+            storage.commit_view_check_option(slot, 0);
         }
         WalOp::RenameView {
             schema,

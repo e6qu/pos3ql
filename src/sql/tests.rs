@@ -6229,6 +6229,137 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
 }
 
 #[test]
+fn view_check_option_is_typed_enforced_transactional_and_durable() {
+    let mut config = test_config("view-check-option");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("view-check-option-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE check_option_rows (value integer);
+         CREATE VIEW positive_rows WITH (check_option = local) AS
+           SELECT value FROM check_option_rows WHERE value > 0;
+         INSERT INTO positive_rows VALUES (1);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let unsupported = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW grouped_check_option WITH (check_option = local) AS \
+         SELECT count(*) AS value FROM check_option_rows",
+    );
+    assert!(
+        String::from_utf8_lossy(&unsupported).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&unsupported)
+    );
+    let rejected_insert = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO positive_rows VALUES (-1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected_insert).contains("44000"),
+        "{}",
+        String::from_utf8_lossy(&rejected_insert)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM check_option_rows",
+        )),
+        ["1"]
+    );
+    let rejected_update = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE positive_rows SET value = -1",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected_update).contains("44000"),
+        "{}",
+        String::from_utf8_lossy(&rejected_update)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM check_option_rows",
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT check_option FROM information_schema.views WHERE table_name = 'positive_rows'; \
+             SELECT reloptions FROM pg_class WHERE relname = 'positive_rows'",
+        )),
+        ["LOCAL", "{check_option=local}"]
+    );
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER VIEW positive_rows SET (check_option = cascaded);
+         SELECT check_option FROM information_schema.views WHERE table_name = 'positive_rows';
+         ROLLBACK;
+         BEGIN;
+         ALTER VIEW positive_rows RESET (check_option);
+         SELECT check_option FROM information_schema.views WHERE table_name = 'positive_rows';
+         ROLLBACK;
+         SELECT check_option FROM information_schema.views WHERE table_name = 'positive_rows'",
+    );
+    assert_eq!(data_rows(&rolled_back), ["CASCADED", "NONE", "LOCAL"]);
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER VIEW positive_rows SET (check_option = cascaded)",
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT check_option FROM information_schema.views WHERE table_name = 'positive_rows'",
+        )),
+        ["CASCADED"]
+    );
+    let rejected_after_recovery = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "INSERT INTO positive_rows VALUES (-1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected_after_recovery).contains("44000"),
+        "{}",
+        String::from_utf8_lossy(&rejected_after_recovery)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT value FROM check_option_rows",
+        )),
+        ["1"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn alter_view_set_schema_preserves_identity_dependencies_and_comments() {
     let config = test_config("alter-view-set-schema");
     let mut budget = Budget::new(1 << 29);

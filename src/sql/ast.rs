@@ -230,6 +230,7 @@ pub enum CreateSchemaElement<'a> {
         name: QualName<'a>,
         or_replace: bool,
         security: ViewSecurity,
+        check_option: Option<ViewCheckOption>,
         sql: &'a str,
     },
     Index {
@@ -451,6 +452,7 @@ pub enum Stmt<'a> {
         name: QualName<'a>,
         or_replace: bool,
         security: ViewSecurity,
+        check_option: Option<ViewCheckOption>,
         sql: &'a str,
     },
     /// `ALTER VIEW` retains a closed action rather than sharing the broader

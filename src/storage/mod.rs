@@ -3652,6 +3652,44 @@ pub enum ViewSecurity {
     Invoker,
 }
 
+/// A persisted view check policy. Absence is PostgreSQL's default: writes
+/// through the view are not required to remain visible through its predicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewCheckOption {
+    Local,
+    Cascaded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewOptions {
+    pub security: ViewSecurity,
+    pub check_option: Option<ViewCheckOption>,
+}
+
+impl ViewOptions {
+    pub const DEFAULT: Self = Self {
+        security: ViewSecurity::Definer,
+        check_option: None,
+    };
+}
+
+impl ViewCheckOption {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Local => 1,
+            Self::Cascaded => 2,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Local),
+            2 => Some(Self::Cascaded),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ViewDef {
     pub(crate) database: DatabaseOid,
@@ -3661,10 +3699,12 @@ pub struct ViewDef {
     pub name: SqlName,
     pub(crate) return_rule: u16,
     pub security: ViewSecurity,
+    pub check_option: Option<ViewCheckOption>,
     pub ownership: Ownership,
     pending_schema: Option<PendingObjectSchema>,
     pending_name: Option<PendingViewName>,
     pending_security: Option<PendingViewSecurity>,
+    pending_check_option: Option<PendingViewCheckOption>,
     ddl_state: CatalogDdlState,
 }
 
@@ -3683,6 +3723,12 @@ impl ViewDef {
         self.pending_security
             .filter(|pending| pending.txid == txid)
             .map_or(self.security, |pending| pending.security)
+    }
+
+    pub(crate) fn check_option_for(&self, txid: u32) -> Option<ViewCheckOption> {
+        self.pending_check_option
+            .filter(|pending| pending.txid == txid)
+            .map_or(self.check_option, |pending| pending.check_option)
     }
 
     pub(crate) fn name_for(&self, txid: u32) -> SqlName {
@@ -3705,6 +3751,12 @@ pub(crate) struct PendingObjectSchema {
 pub(crate) struct PendingViewSecurity {
     pub txid: u32,
     pub security: ViewSecurity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingViewCheckOption {
+    pub txid: u32,
+    pub check_option: Option<ViewCheckOption>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -11068,10 +11120,12 @@ impl Storage {
                     name: SqlName::parse("").expect("empty name fits"),
                     return_rule: u16::MAX,
                     security: ViewSecurity::Definer,
+                    check_option: None,
                     ownership: Ownership::BOOTSTRAP,
                     pending_schema: None,
                     pending_name: None,
                     pending_security: None,
+                    pending_check_option: None,
                     ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to max_tables");
@@ -26640,7 +26694,7 @@ impl Storage {
         schema: SqlName,
         name: SqlName,
         query: StoredQueryDefinition,
-        security: ViewSecurity,
+        options: ViewOptions,
         or_replace: bool,
         txid: u32,
     ) -> Result<(usize, Option<usize>), SqlError> {
@@ -26700,11 +26754,13 @@ impl Storage {
             schema,
             name,
             return_rule: u16::MAX,
-            security,
+            security: options.security,
+            check_option: options.check_option,
             ownership,
             pending_schema: None,
             pending_name: None,
             pending_security: None,
+            pending_check_option: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         let mut source = StackStr::<RULE_SQL_MAX>::new();
@@ -27019,6 +27075,43 @@ impl Storage {
         prior: Option<PendingViewSecurity>,
     ) {
         self.views[slot].pending_security = prior;
+    }
+
+    pub(crate) fn stage_view_check_option(
+        &mut self,
+        slot: usize,
+        check_option: Option<ViewCheckOption>,
+        txid: u32,
+    ) -> Result<Option<PendingViewCheckOption>, SqlError> {
+        let prior = self.views[slot].pending_check_option;
+        if prior.is_some_and(|pending| pending.txid != txid) {
+            return Err(self.catalog_ddl_wait_error(
+                txid,
+                prior.expect("checked Some").txid,
+                self.views[slot].name.as_str(),
+            ));
+        }
+        self.views[slot].pending_check_option = Some(PendingViewCheckOption { txid, check_option });
+        Ok(prior)
+    }
+
+    pub(crate) fn commit_view_check_option(&mut self, slot: usize, txid: u32) {
+        let Some(pending) = self.views[slot]
+            .pending_check_option
+            .filter(|pending| pending.txid == txid)
+        else {
+            return;
+        };
+        self.views[slot].check_option = pending.check_option;
+        self.views[slot].pending_check_option = None;
+    }
+
+    pub(crate) fn rollback_view_check_option(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingViewCheckOption>,
+    ) {
+        self.views[slot].pending_check_option = prior;
     }
 
     /// Promotes an uncommitted DROP VIEW into the committed catalog.

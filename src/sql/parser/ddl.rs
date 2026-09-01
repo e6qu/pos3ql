@@ -4740,11 +4740,13 @@ impl<'a> Parser<'a> {
                     name,
                     or_replace,
                     security,
+                    check_option,
                     sql,
                 } => CreateSchemaElement::View {
                     name,
                     or_replace,
                     security,
+                    check_option,
                     sql,
                 },
                 Stmt::CreateIndex {
@@ -5151,27 +5153,28 @@ impl<'a> Parser<'a> {
     fn create_view(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("view name")?;
         let mut security = ViewSecurity::Definer;
+        let mut check_option = None;
         if self.eat_ident("with")? {
             self.expect_op("(")?;
-            let mut seen_security = false;
-            loop {
-                if !self.eat_ident("security_invoker")? {
-                    return Err(self.err_here("unsupported view option"));
-                }
-                if seen_security {
-                    return Err(self.err_here("conflicting or redundant options"));
-                }
-                seen_security = true;
-                security = if self.subscription_bool_option("security_invoker")? {
-                    ViewSecurity::Invoker
-                } else {
-                    ViewSecurity::Definer
-                };
-                if !self.eat_op(",")? {
-                    break;
+            for option in self.view_options()? {
+                match option {
+                    crate::sql::ast::ViewOption::SecurityInvoker(enabled) => {
+                        security = if *enabled {
+                            ViewSecurity::Invoker
+                        } else {
+                            ViewSecurity::Definer
+                        };
+                    }
+                    crate::sql::ast::ViewOption::CheckOption(option) => {
+                        check_option = Some(*option);
+                    }
+                    crate::sql::ast::ViewOption::SecurityBarrier(true) => {
+                        return Err(self
+                            .err_here("security_barrier requires a predicate-ordering boundary"));
+                    }
+                    crate::sql::ast::ViewOption::SecurityBarrier(false) => {}
                 }
             }
-            self.expect_op(")")?;
         }
         self.expect_ident("as")?;
         // Capture the raw SELECT text (re-parsed at query time).
@@ -5184,6 +5187,7 @@ impl<'a> Parser<'a> {
             name,
             or_replace,
             security,
+            check_option,
             sql,
         })
     }

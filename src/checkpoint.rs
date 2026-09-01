@@ -2744,7 +2744,7 @@ impl Checkpointer {
                         )
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
-                Some("vw6") => {
+                Some("vw7") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_view(storage, line)?;
                 }
@@ -6695,7 +6695,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "vw6 {} {} {} {} {} {}",
+                    "vw7 {} {} {} {} {} {} {}",
                     hex.as_str(),
                     hschema.as_str(),
                     hpath.as_str(),
@@ -6704,6 +6704,8 @@ impl Checkpointer {
                         view.security,
                         crate::storage::ViewSecurity::Invoker
                     )),
+                    view.check_option
+                        .map_or(0, crate::storage::ViewCheckOption::code),
                     ManifestDependencies(storage.view_dependencies(view_slot))
                 ),
             )?;
@@ -10602,6 +10604,12 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
         1 => crate::storage::ViewSecurity::Invoker,
         _ => return Err(CheckpointSetupError::Corrupt("invalid view security")),
     };
+    let check_option = match parse_field::<u8>(words.next(), "view check option missing")? {
+        0 => None,
+        code => crate::storage::ViewCheckOption::from_code(code)
+            .ok_or(CheckpointSetupError::Corrupt("invalid view check option"))
+            .map(Some)?,
+    };
     let dependencies = parse_stored_query_dependencies(&mut words)?;
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
@@ -10617,7 +10625,10 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
                 creation_path: path_buffer,
                 dependencies,
             },
-            security,
+            crate::storage::ViewOptions {
+                security,
+                check_option,
+            },
             true,
             0,
         )

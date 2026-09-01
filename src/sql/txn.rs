@@ -257,6 +257,10 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingViewSecurity>,
     },
+    ViewCheckOptionChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingViewCheckOption>,
+    },
     RuleCreated {
         slot: u32,
         prior_table_rule_txid: Option<u32>,

@@ -7854,14 +7854,29 @@ fn pg_class<'a>(
         }
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
         let n_columns = describe_view(storage, txid, view, arena, &mut columns)?;
-        let reloptions = if matches!(
+        let mut option_values = [Datum::Null; 2];
+        let mut option_count = 0;
+        if matches!(
             view.security_for(txid),
             crate::storage::ViewSecurity::Invoker
         ) {
-            let values = [text("security_invoker=true", arena)?];
+            option_values[option_count] = text("security_invoker=true", arena)?;
+            option_count += 1;
+        }
+        if let Some(option) = view.check_option_for(txid) {
+            option_values[option_count] = text(
+                match option {
+                    crate::storage::ViewCheckOption::Local => "check_option=local",
+                    crate::storage::ViewCheckOption::Cascaded => "check_option=cascaded",
+                },
+                arena,
+            )?;
+            option_count += 1;
+        }
+        let reloptions = if option_count != 0 {
             Datum::Array {
                 element: super::types::ArrElem::Text,
-                raw: super::array::build(&values, arena)?,
+                raw: super::array::build(&option_values[..option_count], arena)?,
             }
         } else {
             Datum::Null
@@ -15268,7 +15283,14 @@ fn info_views<'a>(
                 text(view.schema_for(txid).as_str(), arena)?,
                 text(view.name_for(txid).as_str(), arena)?,
                 text(storage.view_sql_for(view), arena)?,
-                text("NONE", arena)?,
+                text(
+                    match view.check_option_for(txid) {
+                        None => "NONE",
+                        Some(crate::storage::ViewCheckOption::Local) => "LOCAL",
+                        Some(crate::storage::ViewCheckOption::Cascaded) => "CASCADED",
+                    },
+                    arena,
+                )?,
                 text(writable, arena)?,
                 text(writable, arena)?,
                 text("NO", arena)?,

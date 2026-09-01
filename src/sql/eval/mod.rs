@@ -152,6 +152,7 @@ pub mod sqlstate {
     pub const DUPLICATE_TABLE: &str = "42P07";
     pub const DUPLICATE_SCHEMA: &str = "42P06";
     pub const INSUFFICIENT_PRIVILEGE: &str = "42501";
+    pub const WITH_CHECK_OPTION_VIOLATION: &str = "44000";
     pub const INVALID_GRANT_OPERATION: &str = "0LP01";
     pub const OBJECT_IN_USE: &str = "55006";
     pub const WARNING_PRIVILEGE_NOT_GRANTED: &str = "01007";

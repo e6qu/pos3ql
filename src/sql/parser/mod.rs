@@ -2000,11 +2000,14 @@ impl<'a> Parser<'a> {
                 crate::sql::ast::CteMaterialization::Default
             };
             self.expect_op("(")?;
-            // A data-modifying CTE body is an INSERT/UPDATE/DELETE (run once,
+            // A data-modifying CTE body is an INSERT/UPDATE/DELETE/MERGE (run once,
             // its RETURNING becomes the relation); anything else is a query.
             let (boxed, dml) = if matches!(
                 self.peeked,
-                Tok::Ident("insert") | Tok::Ident("update") | Tok::Ident("delete")
+                Tok::Ident("insert")
+                    | Tok::Ident("update")
+                    | Tok::Ident("delete")
+                    | Tok::Ident("merge")
             ) {
                 let stmt = self.statement()?;
                 let boxed_stmt = self
@@ -6005,12 +6008,14 @@ impl<'a> Parser<'a> {
         if n == 0 {
             return Err(self.err_here("MERGE requires at least one WHEN clause"));
         }
+        let returning = self.returning()?;
         Ok(Stmt::Merge(Merge {
             target,
             target_alias,
             source,
             on,
             whens: self.arena_slice(&whens[..n])?,
+            returning,
         }))
     }
 

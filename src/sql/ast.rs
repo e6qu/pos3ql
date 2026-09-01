@@ -3978,6 +3978,8 @@ pub struct Merge<'a> {
     pub source: TableRef<'a>,
     pub on: &'a Expr<'a>,
     pub whens: &'a [MergeWhen<'a>],
+    /// `RETURNING` output items (empty = none).
+    pub returning: &'a [SelectItem<'a>],
 }
 
 /// The candidate-row kind selected by a MERGE `WHEN` clause.

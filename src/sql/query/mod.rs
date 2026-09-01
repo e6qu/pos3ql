@@ -889,6 +889,7 @@ pub(crate) fn statement_returns_rows(statement: &Stmt<'_>) -> bool {
         Stmt::Insert(insert) => !insert.returning.is_empty(),
         Stmt::Update(update) => !update.returning.is_empty(),
         Stmt::Delete(delete) => !delete.returning.is_empty(),
+        Stmt::Merge(merge) => !merge.returning.is_empty(),
         Stmt::With { statement, .. } => statement_returns_rows(statement),
         _ => false,
     }
@@ -3466,6 +3467,7 @@ fn correlated_row_hooks<'scratch, 'a>(
         srf_index: None,
         project_sets: None,
         sequences: base.sequences,
+        merge_action: base.merge_action,
     }
 }
 
@@ -4841,6 +4843,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
         srf_index: None,
         project_sets: None,
         sequences: seq,
+        merge_action: None,
     };
 
     // Plan-time type analysis: validate operator/aggregate types across every
@@ -5395,6 +5398,7 @@ pub(crate) fn constant_select_resumable<'a, 'statement>(
         srf_index: None,
         project_sets: None,
         sequences: seq,
+        merge_action: None,
     };
 
     // Aggregates (or GROUP BY / HAVING) without FROM: PostgreSQL aggregates
@@ -5976,6 +5980,7 @@ fn select_into_rows_mode<'a>(
                 catalog: Some(&catalog),
                 srf_index: None,
                 project_sets: None,
+                merge_action: None,
             };
             let Some((ptrs, values)) = fromless_aggregate_hooks(
                 statement,
@@ -6059,6 +6064,7 @@ fn select_into_rows_mode<'a>(
             srf_index: None,
             project_sets: None,
             sequences: seq,
+            merge_action: None,
         };
         let (rows, width) = grouped_rows(
             storage,
@@ -6148,6 +6154,7 @@ fn select_into_rows_mode<'a>(
             srf_index: None,
             project_sets: None,
             sequences: seq,
+            merge_action: None,
         };
         let srf_call = find_srf(statement.items);
         let project_set =
@@ -6219,6 +6226,7 @@ fn select_into_rows_mode<'a>(
         srf_index: None,
         project_sets: None,
         sequences: seq,
+        merge_action: None,
     };
 
     // Window functions (`OVER (...)`) in the projection: materialize the rows
@@ -8266,6 +8274,7 @@ pub fn first_from_match<'a>(
         srf_index: None,
         project_sets: None,
         sequences: None,
+        merge_action: None,
     };
     let mut found = false;
     let mut expressions = [&Expr::Null; MAX_PROJ + 1];

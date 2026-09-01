@@ -43888,24 +43888,109 @@ fn merge_source_columns(
             | crate::sql::ast::MergeActionRef::DoNothing => {}
         }
     }
+    for item in statement.returning {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
+            && !merge_source_demand(expression, source_alias, source, &mut columns)
+        {
+            return None;
+        }
+    }
     Some(columns)
+}
+
+/// Describes `MERGE RETURNING` in its target-and-source scope. An unqualified
+/// star follows DML `RETURNING` and expands only the target relation; qualified
+/// stars and expressions retain both namespaces.
+pub fn describe_merge_returning<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a crate::sql::ast::Merge<'a>,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+) -> Result<usize, SqlError> {
+    use crate::sql::ast::{FromClause, Join, JoinKind, RelationInheritance, TableRef};
+
+    let target = TableRef {
+        schema: statement.target.schema,
+        table: statement.target.name,
+        alias: statement.target_alias,
+        subquery: None,
+        func_args: None,
+        func_argument_names: &[],
+        func_variadic: false,
+        rows_from: None,
+        col_alias: None,
+        inheritance: RelationInheritance::Descendants,
+        sample: None,
+        cte: None,
+        with_ordinality: false,
+        lateral: false,
+        authorization_role: None,
+    };
+    let joins = arena
+        .alloc_slice_copy(&[Join {
+            table: statement.source,
+            kind: JoinKind::Cross,
+            on: None,
+            using: None,
+            natural: false,
+        }])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let from = arena
+        .alloc(FromClause {
+            base: target,
+            joins,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let scope = super::query::QueryScope::resolve_schema(storage, from, txid, arena)?;
+    let mut count = 0usize;
+    for item in statement.returning {
+        if matches!(item, SelectItem::Wildcard) {
+            let target_star =
+                SelectItem::TableWildcard(statement.target_alias.unwrap_or(statement.target.name));
+            let width = super::query::describe_scope_items(
+                core::slice::from_ref(&target_star),
+                &scope,
+                None,
+                storage,
+                txid,
+                arena,
+                &mut out[count..],
+            )?;
+            count += width;
+        } else {
+            let width = super::query::describe_scope_items(
+                core::slice::from_ref(item),
+                &scope,
+                None,
+                storage,
+                txid,
+                arena,
+                &mut out[count..],
+            )?;
+            count += width;
+        }
+    }
+    Ok(count)
 }
 
 /// `MERGE INTO target USING source ON cond WHEN ...`. Candidate rows are the
 /// source/target join plus unmatched rows from either side requested by the
 /// `WHEN` clauses. A target row affected twice is a cardinality error (21000).
-#[allow(clippy::too_many_arguments)]
-pub fn merge(
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn merge<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
-    statement: &crate::sql::ast::Merge,
-    arena: &Arena,
-    params: &[Datum],
+    statement: &'a crate::sql::ast::Merge<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
+    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Outcome {
     use crate::sql::ast::MergeActionRef as MergeAction;
+    let capturing = capture.is_some();
     let target_qual = crate::sql::ast::QualName {
         schema: statement.target.schema,
         name: statement.target.name,
@@ -44012,6 +44097,14 @@ pub fn merge(
                 MergeAction::Delete | MergeAction::DoNothing => {}
             }
         }
+        columns |= returning_dml_target_columns(
+            statement.returning,
+            &def,
+            statement.target_alias,
+            storage,
+            txn.txid,
+            arena,
+        )?;
         Ok(columns)
     })() {
         Ok(reads) => reads,
@@ -44316,6 +44409,15 @@ pub fn merge(
         Err(error) => return sql_fail(error),
     };
     let source_def = &source_def;
+    if !statement.returning.is_empty() && !capturing {
+        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let count =
+            match describe_merge_returning(storage, txn.txid, statement, arena, &mut columns) {
+                Ok(count) => count,
+                Err(error) => return sql_fail(error),
+            };
+        responder.row_description(&columns[..count])?;
+    }
     // Pass 1: count source rows. Pass 2: encode each to arena bytes.
     let mut n_source = 0usize;
     if let Err(e) = super::query::select_into_rows(
@@ -44721,6 +44823,28 @@ pub fn merge(
                         {
                             return sql_fail(error);
                         }
+                        if !statement.returning.is_empty() {
+                            match emit_merge_returning(
+                                storage,
+                                txn.txid,
+                                &def,
+                                target_alias,
+                                target_vals[j],
+                                source_def,
+                                source_alias,
+                                (!by_source).then_some(sv),
+                                statement.returning,
+                                "DELETE",
+                                arena,
+                                params,
+                                responder,
+                                &mut capture,
+                            ) {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => return sql_fail(error),
+                                Err(wire) => return Err(wire),
+                            }
+                        }
                         affected_count += 1;
                     }
                     MergeAction::Update(assignments) => {
@@ -44960,6 +45084,28 @@ pub fn merge(
                                 return sql_fail(error);
                             }
                         }
+                        if !statement.returning.is_empty() {
+                            match emit_merge_returning(
+                                storage,
+                                txn.txid,
+                                &def,
+                                target_alias,
+                                &new_values[..def.n_columns],
+                                source_def,
+                                source_alias,
+                                (!by_source).then_some(sv),
+                                statement.returning,
+                                "UPDATE",
+                                arena,
+                                params,
+                                responder,
+                                &mut capture,
+                            ) {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => return sql_fail(error),
+                                Err(wire) => return Err(wire),
+                            }
+                        }
                         affected[j] = true;
                         affected_count += 1;
                     }
@@ -45028,8 +45174,32 @@ pub fn merge(
                             scratch,
                             insert_transitions.as_mut(),
                         ) {
-                            Ok(true) => affected_count += 1,
-                            Ok(false) => {}
+                            Ok(Some(inserted)) => {
+                                if !statement.returning.is_empty() {
+                                    match emit_merge_returning(
+                                        storage,
+                                        txn.txid,
+                                        &def,
+                                        target_alias,
+                                        inserted,
+                                        source_def,
+                                        source_alias,
+                                        Some(sv),
+                                        statement.returning,
+                                        "INSERT",
+                                        arena,
+                                        params,
+                                        responder,
+                                        &mut capture,
+                                    ) {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(error)) => return sql_fail(error),
+                                        Err(wire) => return Err(wire),
+                                    }
+                                }
+                                affected_count += 1;
+                            }
+                            Ok(None) => {}
                             Err(error) => return sql_fail(error),
                         }
                     }
@@ -45091,7 +45261,14 @@ pub fn merge(
             return sql_fail(error);
         }
     }
-    responder.command_complete(stack_format!(32, "MERGE {}", affected_count).as_str())?;
+    if capturing {
+        responder.set_affected_rows(affected_count);
+    } else {
+        responder.command_complete_rows(
+            stack_format!(32, "MERGE {}", affected_count).as_str(),
+            affected_count,
+        )?;
+    }
     sql_ok()
 }
 
@@ -45112,13 +45289,13 @@ fn merge_insert<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     table_index: usize,
-    def: &TableDef,
+    def: &'a TableDef,
     columns: &[&str],
-    values: &[&Expr],
+    values: &[&'a Expr<'a>],
     default_values: bool,
-    source_ctx: &RowCtx,
-    generated: &constraints::ParsedDefaults,
-    defaults: &constraints::ParsedDefaults,
+    source_ctx: &RowCtx<'_, 'a, '_>,
+    generated: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
+    defaults: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
     seq_session: &crate::sql::guc::SeqSession,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -45127,7 +45304,7 @@ fn merge_insert<'a>(
     responder: &mut Responder,
     scratch: &mut DmlScratch,
     transition_capture: Option<&mut TransitionCapture<'a>>,
-) -> Result<bool, SqlError> {
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
     // Target columns for the supplied values: the named list, or all columns.
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if columns.is_empty() {
@@ -45225,7 +45402,7 @@ fn merge_insert<'a>(
         None,
         Some(&mut row_arr[..def.n_columns]),
     )? {
-        return Ok(false);
+        return Ok(None);
     }
     compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
     storage.validate_partition_target(initial_target, &row_arr[..def.n_columns], txn.txid)?;
@@ -45295,7 +45472,10 @@ fn merge_insert<'a>(
     if let Some(transition_capture) = transition_capture {
         transition_capture.push_new(&row_arr[..def.n_columns], arena)?;
     }
-    Ok(true)
+    let returned = arena
+        .alloc_slice_copy(&row_arr[..def.n_columns])
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(Some(&*returned))
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -47256,6 +47436,151 @@ fn emit_projected(
     Ok(Ok(()))
 }
 
+/// Emits one MERGE `RETURNING` row. The candidate lookup keeps the source
+/// namespace absent for target-only candidates, exactly as it was while the
+/// action expression was evaluated.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn emit_merge_returning<'a>(
+    storage: &Storage,
+    txid: u32,
+    target_def: &TableDef,
+    target_alias: &str,
+    target: &[Datum<'a>],
+    source_def: &TableDef,
+    source_alias: &str,
+    source: Option<&[Datum<'a>]>,
+    items: &[SelectItem<'a>],
+    action: &str,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    responder: &mut Responder,
+    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+) -> Result<Result<(), SqlError>, WireFull> {
+    let lookup = MergeLookup {
+        target_def,
+        target_alias,
+        target,
+        source_def,
+        source_alias,
+        source,
+    };
+    let mut expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
+    let mut expression_count = 0usize;
+    for item in items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            expressions[expression_count] = Some(*expression);
+            expression_count += 1;
+        }
+    }
+    let subqueries = match super::query::subquery_hooks(
+        &expressions[..expression_count],
+        storage,
+        txid,
+        arena,
+        params,
+    ) {
+        Ok(subqueries) => subqueries,
+        Err(error) => return Ok(Err(error)),
+    };
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        subs: Some(&subqueries),
+        catalog: Some(&catalog),
+        merge_action: Some(action),
+        ..NO_HOOKS
+    };
+    let mut projected = [Datum::Null; MAX_PROJ];
+    let mut n = 0usize;
+    for item in items {
+        match item {
+            SelectItem::Wildcard => {
+                for value in target {
+                    projected[n] = *value;
+                    n += 1;
+                }
+            }
+            SelectItem::TableWildcard(qualifier) if *qualifier == target_alias => {
+                for value in target {
+                    projected[n] = *value;
+                    n += 1;
+                }
+            }
+            SelectItem::TableWildcard(qualifier) if *qualifier == source_alias => {
+                let Some(source) = source else {
+                    return Ok(Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "missing FROM-clause entry for table \"{}\"",
+                        qualifier
+                    )));
+                };
+                for value in source {
+                    projected[n] = *value;
+                    n += 1;
+                }
+            }
+            SelectItem::TableWildcard(qualifier) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    qualifier
+                )));
+            }
+            SelectItem::RecordStar(expression) => {
+                match super::eval::record_star_expand(expression, arena, params, &lookup, &hooks) {
+                    Ok(fields) => {
+                        for field in fields {
+                            projected[n] = field.value;
+                            n += 1;
+                        }
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+            SelectItem::Expr { expression, .. } => {
+                match eval_full(expression, arena, params, &lookup, &hooks) {
+                    Ok(value) => {
+                        projected[n] = value;
+                        n += 1;
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+        }
+    }
+    for value in projected.iter_mut().take(n) {
+        if let Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } = *value
+        {
+            *value = match decode_stored_composite_text(
+                text,
+                slot,
+                physical_fields,
+                storage,
+                txid,
+                arena,
+            ) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+        }
+    }
+    if let Some(sink) = capture.as_deref_mut() {
+        match sink(&projected[..n]) {
+            Ok(()) => Ok(Ok(())),
+            Err(error) => Ok(Err(error)),
+        }
+    } else {
+        match crate::sql::query::emit_data_row(storage, txid, arena, responder, &projected[..n]) {
+            Ok(Ok(())) => Ok(Ok(())),
+            Ok(Err(error)) => Ok(Err(error)),
+            Err(wire) => Err(wire),
+        }
+    }
+}
+
 fn all_columns_mask(definition: &TableDef) -> u64 {
     if definition.n_columns == u64::BITS as usize {
         u64::MAX
@@ -47527,6 +47852,7 @@ pub(crate) fn update<'a>(
         srf_index: None,
         project_sets: None,
         sequences: None,
+        merge_action: None,
     };
     let current_role = authorization_role;
     let update_security = match super::query::plan_row_security(
@@ -48275,6 +48601,7 @@ pub(crate) fn delete<'a>(
         srf_index: None,
         project_sets: None,
         sequences: None,
+        merge_action: None,
     };
     let current_role = authorization_role;
     let delete_security = match super::query::plan_row_security(

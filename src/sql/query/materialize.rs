@@ -176,6 +176,7 @@ fn for_each_materialized_projection<'a>(
             srf_index: None,
             project_sets: None,
             sequences: hooks.sequences,
+            merge_action: hooks.merge_action,
         };
         &owned_hooks
     };

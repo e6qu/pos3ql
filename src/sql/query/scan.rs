@@ -300,6 +300,7 @@ pub(crate) fn row_security_passes<'a>(
             srf_index: None,
             project_sets: None,
             sequences: base_hooks.sequences,
+            merge_action: base_hooks.merge_action,
         };
         let mut permissive = plan.permissive_always;
         for predicate in &plan.predicates[..plan.count] {

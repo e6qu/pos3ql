@@ -609,6 +609,13 @@ fn collect_statement(
                         | crate::sql::ast::MergeActionRef::DoNothing => {}
                     }
                 }
+                for item in merge.returning {
+                    if let SelectItem::Expr { expression, .. }
+                    | SelectItem::RecordStar(expression) = item
+                    {
+                        collect_expr!(expression, Some(&scope), no_excluded)?;
+                    }
+                }
                 Ok(())
             })();
             unsafe { arena.rewind_to(mark) };

@@ -7697,6 +7697,29 @@ impl Engine {
         txn: &TxnState,
         responder: &mut Responder,
     ) -> Result<bool, WireFull> {
+        if let Stmt::Merge(merge) = statement {
+            if merge.returning.is_empty() {
+                responder.no_data()?;
+                return Ok(true);
+            }
+            let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+            return match exec::describe_merge_returning(
+                &self.storage,
+                txn.txid,
+                merge,
+                arena,
+                &mut columns,
+            ) {
+                Ok(count) => {
+                    responder.row_description(&columns[..count])?;
+                    Ok(true)
+                }
+                Err(error) => {
+                    responder.error(error.sqlstate, error.message.as_str())?;
+                    Ok(false)
+                }
+            };
+        }
         let (target, returning) = match statement {
             Stmt::Insert(insert) => (insert.table, insert.returning),
             Stmt::Update(update) => (update.table, update.returning),
@@ -7808,7 +7831,7 @@ impl Engine {
             Stmt::With { statement, .. } => {
                 self.describe_data_modification(statement, arena, txn, responder)
             }
-            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+            Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
                 self.describe_data_modification(&statement, arena, txn, responder)
             }
             Stmt::Select(s) => {
@@ -8026,35 +8049,62 @@ impl Engine {
                     txn.txid,
                 )),
             )?;
-            let (target, returning) = match dml {
+            let returning = match dml {
                 Stmt::Insert(i) => (&i.table, i.returning),
                 Stmt::Update(u) => (&u.table, u.returning),
                 Stmt::Delete(d) => (&d.table, d.returning),
+                Stmt::Merge(m) => (&m.target, m.returning),
                 _ => {
                     return Err(sql_err!(
                         sqlstate::FEATURE_NOT_SUPPORTED,
-                        "a data-modifying WITH sub-statement must be INSERT, UPDATE or DELETE"
+                        "a data-modifying WITH sub-statement must be INSERT, UPDATE, DELETE or MERGE"
                     ));
                 }
             };
             // Describe the RETURNING columns against the target table, applying
             // the CTE's optional rename list.
-            let described_target =
-                match query::resolve_view_for_dml(&self.storage, *target, txn.txid, arena)? {
-                    Some(view) => view.base,
-                    None => *target,
-                };
-            let idx =
-                crate::sql::exec::resolve_dml_table(&self.storage, &described_target, txn.txid)?;
-            let def = *self.storage.table_def(idx, txn.txid);
             let mut descs = [ColDesc::new("", 0, 0); MAX_PROJ];
-            let ncols = query::describe_catalog_items(
-                returning,
-                Some(&def),
-                &self.storage,
-                txn.txid,
-                &mut descs,
-            )?;
+            let ncols = match dml {
+                Stmt::Merge(merge) => exec::describe_merge_returning(
+                    &self.storage,
+                    txn.txid,
+                    merge,
+                    arena,
+                    &mut descs,
+                )?,
+                _ => {
+                    let target = returning.0;
+                    let described_target =
+                        match query::resolve_view_for_dml(&self.storage, *target, txn.txid, arena)?
+                        {
+                            Some(view) => view.base,
+                            None => *target,
+                        };
+                    let idx = crate::sql::exec::resolve_dml_table(
+                        &self.storage,
+                        &described_target,
+                        txn.txid,
+                    )?;
+                    let def = arena
+                        .alloc(*self.storage.table_def(idx, txn.txid))
+                        .map_err(|_| query::arena_full_pub())?;
+                    let mut local = [ColDesc::new("", 0, 0); MAX_PROJ];
+                    let count = query::describe_catalog_items(
+                        returning.1,
+                        Some(&*def),
+                        &self.storage,
+                        txn.txid,
+                        &mut local,
+                    )?;
+                    for index in 0..count {
+                        descs[index] = local[index];
+                        descs[index].name = arena
+                            .alloc_str(local[index].name)
+                            .map_err(|_| query::arena_full_pub())?;
+                    }
+                    count
+                }
+            };
             if cte.columns.len() > ncols {
                 return Err(sql_err!(
                     sqlstate::INVALID_COLUMN_REFERENCE,
@@ -8105,19 +8155,32 @@ impl Engine {
                 len += 1;
                 Ok(())
             };
-            let outcome = Self::execute_data_modification(
-                &mut self.storage,
-                &mut self.dml_scratch,
-                &self.work,
-                dml,
-                exec::DmlAuthorization::Invoker,
-                txn,
-                params,
-                guc,
-                responder,
-                Some(&mut sink),
-                self.current_conn_id,
-            );
+            let outcome = match dml {
+                Stmt::Merge(_) => Self::execute_merge(
+                    &mut self.storage,
+                    &mut self.dml_scratch,
+                    &self.work,
+                    dml,
+                    txn,
+                    params,
+                    guc,
+                    responder,
+                    Some(&mut sink),
+                ),
+                _ => Self::execute_data_modification(
+                    &mut self.storage,
+                    &mut self.dml_scratch,
+                    &self.work,
+                    dml,
+                    exec::DmlAuthorization::Invoker,
+                    txn,
+                    params,
+                    guc,
+                    responder,
+                    Some(&mut sink),
+                    self.current_conn_id,
+                ),
+            };
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(e),
@@ -8983,7 +9046,7 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_merge<'a>(
+    fn execute_merge<'a, 'capture>(
         storage: &mut Storage,
         scratch: &mut exec::DmlScratch,
         arena: &'a Arena,
@@ -8992,6 +9055,7 @@ impl Engine {
         params: &[Datum<'a>],
         guc: &mut GucState,
         responder: &mut Responder,
+        capture: Option<&'capture mut ReturningCapture<'capture>>,
     ) -> Result<Result<(), SqlError>, WireFull> {
         let sequence = sequence::SeqEval::new(storage, guc.seq_session(), txn.txid);
         let expanded = match query::expand_dml_ctes(
@@ -9017,6 +9081,7 @@ impl Engine {
             params,
             guc.seq_session(),
             responder,
+            capture,
         )
     }
 
@@ -9383,6 +9448,7 @@ impl Engine {
                         params,
                         guc,
                         responder,
+                        None,
                     )?,
                     Stmt::With { ctes, statement } => self.execute_with_data_modification(
                         ctes, statement, arena, params, txn, guc, responder, None,
@@ -10273,6 +10339,7 @@ impl Engine {
                 params,
                 guc,
                 responder,
+                None,
             ),
             Stmt::With { ctes, statement } => self.execute_with_data_modification(
                 ctes, statement, arena, params, txn, guc, responder, None,
@@ -10340,6 +10407,7 @@ impl Engine {
                 params,
                 guc,
                 responder,
+                capture,
             ),
             _ => Ok(Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -12707,6 +12775,7 @@ impl Engine {
                 params,
                 guc,
                 responder,
+                capture,
             ),
             Stmt::Comment { target, text } => exec::comment(
                 &mut self.storage,

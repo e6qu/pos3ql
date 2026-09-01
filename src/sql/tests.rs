@@ -27685,6 +27685,77 @@ fn merge_statement() {
 }
 
 #[test]
+fn merge_returning_streams_actions_and_materializes_ctes() {
+    let (mut engine, mut budget) = test_engine();
+    let direct = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE merge_return_target (id integer PRIMARY KEY, value text); \
+         CREATE TABLE merge_return_source (id integer, value text); \
+         INSERT INTO merge_return_target VALUES (1, 'old'); \
+         INSERT INTO merge_return_source VALUES (1, 'new'), (2, 'inserted'); \
+         MERGE INTO merge_return_target AS target USING merge_return_source AS source \
+           ON target.id = source.id \
+           WHEN MATCHED THEN UPDATE SET value = source.value \
+           WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value) \
+           RETURNING merge_action() AS action, target.id, target.value, source.value AS source_value",
+    );
+    assert_eq!(
+        data_rows(&direct),
+        ["UPDATE|1|new|new", "INSERT|2|inserted|inserted"],
+        "{}",
+        String::from_utf8_lossy(&direct)
+    );
+    let described = describe_with(
+        &mut engine,
+        &mut budget,
+        "MERGE INTO merge_return_target AS target USING merge_return_source AS source \
+           ON target.id = source.id \
+           WHEN MATCHED THEN UPDATE SET value = source.value \
+           WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value) \
+           RETURNING merge_action() AS action, target.id, source.value",
+    );
+    assert_eq!(
+        row_description_names(&described),
+        ["action", "id", "value"],
+        "{}",
+        String::from_utf8_lossy(&described)
+    );
+    assert_eq!(
+        row_description_type_oids(&described),
+        [
+            crate::sql::types::oid::TEXT,
+            crate::sql::types::oid::INT4,
+            crate::sql::types::oid::TEXT
+        ]
+    );
+    let cte = run_with(
+        &mut engine,
+        &mut budget,
+        "WITH changed AS ( \
+           MERGE INTO merge_return_target AS target \
+           USING (VALUES (1, 'again'), (3, 'third')) AS source(id, value) \
+           ON target.id = source.id \
+           WHEN MATCHED THEN UPDATE SET value = source.value \
+           WHEN NOT MATCHED THEN INSERT (id, value) VALUES (source.id, source.value) \
+           RETURNING merge_action() AS action, target.id, target.value \
+         ) SELECT action, id, value FROM changed ORDER BY id",
+    );
+    assert_eq!(
+        data_rows(&cte),
+        ["UPDATE|1|again", "INSERT|3|third"],
+        "{}",
+        String::from_utf8_lossy(&cte)
+    );
+    let invalid_context = run_with(&mut engine, &mut budget, "SELECT merge_action()");
+    assert!(
+        String::from_utf8_lossy(&invalid_context).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&invalid_context)
+    );
+}
+
+#[test]
 fn merge_by_source_survives_object_only_recovery() {
     let mut config = test_config("merge-by-source-cold-recovery");
     config.object_store_on = true;

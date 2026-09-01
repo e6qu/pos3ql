@@ -2107,6 +2107,7 @@ fn statement_references(statement: &Stmt<'_>, name: &str) -> usize {
                             }
                     })
                     .sum::<usize>()
+                + returning_references(merge.returning, name)
         }
         _ => 0,
     }
@@ -4297,6 +4298,7 @@ fn subst_merge<'a>(
         whens: arena
             .alloc_slice_copy(&whens[..statement.whens.len()])
             .map_err(|_| arena_full())?,
+        returning: subst_select_items(statement.returning, context, arena)?,
     })
 }
 

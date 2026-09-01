@@ -2161,6 +2161,7 @@ impl Checkpointer {
                             matches!(
                                 class,
                                 crate::storage::AccessClass::Table
+                                    | crate::storage::AccessClass::View
                                     | crate::storage::AccessClass::MaterializedView
                             )
                         })
@@ -2197,6 +2198,7 @@ impl Checkpointer {
                         crate::storage::AccessClass::MaterializedView => storage
                             .find_table(&schema, &name)
                             .map(|table| storage.table_def(table, 0).n_columns),
+                        crate::storage::AccessClass::View => Some(crate::sql::exec::MAX_PROJ),
                         _ => unreachable!("cacl class was restricted above"),
                     };
                     if column_count.is_some_and(|count| column as usize >= count) {
@@ -4212,9 +4214,10 @@ impl Checkpointer {
                     seq.log_count.set(log_count);
                     seq.dirty.set(false);
                 }
-                tag @ (Some("dom") | Some("dom2") | Some("dom3")) => {
-                    let has_parent = matches!(tag, Some("dom2") | Some("dom3"));
-                    let has_base_identity = tag == Some("dom3");
+                tag @ (Some("dom") | Some("dom2") | Some("dom3") | Some("dom4")) => {
+                    let has_parent = matches!(tag, Some("dom2") | Some("dom3") | Some("dom4"));
+                    let has_base_identity = matches!(tag, Some("dom3") | Some("dom4"));
+                    let has_validation = tag == Some("dom4");
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     // A `0` field is the empty-string sentinel; anything else is
                     // even-length hex.
@@ -4259,10 +4262,18 @@ impl Checkpointer {
                     for check in checks.iter_mut().take(n_checks) {
                         let cname = hexstr(words.next(), "dom check name missing")?;
                         let cexpr = hexstr(words.next(), "dom check expr missing")?;
+                        let validation = if has_validation {
+                            let code: u8 = parse_field(words.next(), "dom check validation")?;
+                            crate::storage::ConstraintValidation::from_code(code).ok_or(
+                                CheckpointSetupError::Corrupt("bad domain check validation"),
+                            )?
+                        } else {
+                            crate::storage::ConstraintValidation::EnforcedValidated
+                        };
                         *check = crate::storage::CheckConstraint {
                             name: sql_name(&cname)?,
                             expression: crate::util::StackStr::from_str(&cexpr),
-                            validation: crate::storage::ConstraintValidation::EnforcedValidated,
+                            validation,
                         };
                     }
                     let base_domain = match (base_domain.is_empty(), base_domain_schema.is_empty())
@@ -5834,10 +5845,10 @@ impl Checkpointer {
                 format_args!("lob {} {}", object.oid.get(), object.created_at),
             )?;
         }
-        // Domains: `dom3 <base-code> <base-typmod> <not-null> <n-checks>
+        // Domains: `dom4 <base-code> <base-typmod> <not-null> <n-checks>
         // <hex-schema> <hex-name> <hex-base-domain> <hex-base-domain-schema>
         // <hex-base-type> <hex-base-type-schema> <hex-default>
-        // [<hex-cname> <hex-cexpr>]...`. Like enums, domains precede tables
+        // [<hex-cname> <hex-cexpr> <validation>]...`. Like enums, domains precede tables
         // because generated domain-array columns bind their runtime slot while
         // the table definition is rebuilt.
         for (_, d) in storage.checkpoint_domains() {
@@ -5855,7 +5866,7 @@ impl Checkpointer {
             };
             let _ = write!(
                 line,
-                "dom3 {} {} {} {} ",
+                "dom4 {} {} {} {} ",
                 d.base.code(),
                 d.base_type_mod,
                 u8::from(d.not_null),
@@ -5906,6 +5917,7 @@ impl Checkpointer {
                 hex(&mut line, c.name.as_str());
                 let _ = write!(line, " ");
                 hex(&mut line, c.expression.as_str());
+                let _ = write!(line, " {}", c.validation.code());
             }
             write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
         }
@@ -8385,6 +8397,12 @@ impl Checkpointer {
         for (slot, _) in storage.checkpoint_enums() {
             write_owner(crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Enum,
+                slot: slot as u16,
+            })?;
+        }
+        for (slot, _) in storage.checkpoint_composites() {
+            write_owner(crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Composite,
                 slot: slot as u16,
             })?;
         }

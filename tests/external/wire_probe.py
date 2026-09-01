@@ -339,6 +339,45 @@ def test_aclitem_array_wire_identity():
     s.close()
 
 
+def test_view_column_acl_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE ROLE wire_view_column_reader; "
+        "CREATE TABLE wire_view_column_base (visible text, hidden text); "
+        "INSERT INTO wire_view_column_base VALUES ('shown', 'private'); "
+        "CREATE VIEW wire_view_column_acl AS "
+        "SELECT visible, hidden FROM wire_view_column_base; "
+        "GRANT SELECT (visible) ON wire_view_column_acl TO wire_view_column_reader",
+    )
+    check(
+        "view column ACL wire: setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    visible = simple_query(
+        s,
+        "SET ROLE wire_view_column_reader; "
+        "SELECT visible FROM wire_view_column_acl",
+    )
+    hidden = simple_query(s, "SELECT hidden FROM wire_view_column_acl")
+    reset = simple_query(
+        s,
+        "RESET ROLE; DROP VIEW wire_view_column_acl; "
+        "DROP TABLE wire_view_column_base; DROP ROLE wire_view_column_reader",
+    )
+    check(
+        "view column ACL wire: projected grant admits only its named output",
+        first_text_row(visible) == "shown"
+        and has_sqlstate(hidden, "42501")
+        and not any(kind == b"E" for kind, _ in reset),
+        (visible, hidden, reset),
+    )
+    s.close()
+
+
 def test_unknown_minor_negotiates():
     s = connect()
     s.sendall(startup_payload(7))  # 3.7 does not exist
@@ -3145,6 +3184,67 @@ def test_catalog_aware_text_bind_parameters():
     s.close()
 
 
+def test_domain_constraint_lifecycle_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE DOMAIN wire_domain_lifecycle AS integer; "
+        "CREATE TABLE wire_domain_lifecycle_values (value wire_domain_lifecycle); "
+        "INSERT INTO wire_domain_lifecycle_values VALUES (8); "
+        "ALTER DOMAIN wire_domain_lifecycle ADD CONSTRAINT wire_domain_small "
+        "CHECK (VALUE < 5) NOT VALID; "
+        "ALTER DOMAIN wire_domain_lifecycle ADD CONSTRAINT wire_domain_wide "
+        "CHECK (VALUE < 10); "
+        "ALTER DOMAIN wire_domain_lifecycle ADD CONSTRAINT wire_domain_positive "
+        "CHECK (VALUE > 0) NOT VALID; "
+        "ALTER DOMAIN wire_domain_lifecycle VALIDATE CONSTRAINT wire_domain_positive",
+    )
+    check(
+        "raw wire: domain lifecycle setup preserves independent validation",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    domain_oid = int(
+        first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_domain_lifecycle'"))
+    )
+    rejected = extended_binary_parameter(
+        s, "SELECT $1::wire_domain_lifecycle", domain_oid, struct.pack("!i", 9)
+    )
+    check(
+        "raw wire: binary Bind applies a NOT VALID domain CHECK to new values",
+        has_sqlstate(rejected, "23514"),
+        rejected,
+    )
+    catalog = extended_binary_result(
+        s,
+        "SELECT convalidated FROM pg_constraint "
+        "WHERE conname = 'wire_domain_positive' AND contypid = 'wire_domain_lifecycle'::regtype",
+    )
+    description = next((payload for kind, payload in catalog if kind == b"T"), None)
+    row = next((payload for kind, payload in catalog if kind == b"D"), None)
+    check(
+        "raw wire: Describe and binary Result expose the validated domain constraint",
+        description is not None
+        and row_description_type_oids(description) == [16]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01\x00\x00\x00\x01\x01",
+        catalog,
+    )
+    validated = simple_query(
+        s,
+        "UPDATE wire_domain_lifecycle_values SET value = 4; "
+        "ALTER DOMAIN wire_domain_lifecycle VALIDATE CONSTRAINT wire_domain_small",
+    )
+    check(
+        "raw wire: domain validation completes after stored values are repaired",
+        not any(kind == b"E" for kind, _ in validated),
+        validated,
+    )
+    s.close()
+
+
 def test_transition_tables_over_raw_simple_query():
     s = connect()
     s.sendall(startup_payload(0))
@@ -3413,8 +3513,12 @@ def test_type_schema_moves_over_raw_wire():
         "CREATE SCHEMA wire_moved_types; "
         "CREATE TYPE wire_moved_state AS ENUM ('ready', 'blocked'); "
         "CREATE TYPE wire_moved_point AS (x integer, y integer); "
-        "CREATE TABLE wire_moved_values (state wire_moved_state, point wire_moved_point); "
-        "INSERT INTO wire_moved_values VALUES ('ready', ROW(3,4)::wire_moved_point); "
+        "CREATE TYPE wire_alterable_point AS (value integer); "
+        "ALTER TYPE wire_alterable_point ALTER ATTRIBUTE value TYPE bigint; "
+        "CREATE ROLE wire_composite_type_owner; "
+        "ALTER TYPE wire_alterable_point OWNER TO wire_composite_type_owner; "
+        "CREATE TABLE wire_moved_values (state wire_moved_state, point wire_moved_point, points wire_moved_point[]); "
+        "INSERT INTO wire_moved_values VALUES ('ready', ROW(3,4)::wire_moved_point, ARRAY[ROW(5,6)::wire_moved_point]); "
         "ALTER TYPE wire_moved_state SET SCHEMA wire_moved_types; "
         "ALTER TYPE wire_moved_point SET SCHEMA wire_moved_types",
     )
@@ -3423,6 +3527,40 @@ def test_type_schema_moves_over_raw_wire():
         "raw wire: moved types retain existing values",
         first_text_row(simple_query(s, "SELECT state::text || ':' || (point).x || ':' || (point).y FROM wire_moved_values"))
         == "ready:3:4",
+    )
+    check(
+        "raw wire: moved composite arrays and backing catalog relation retain type identity",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT pg_typeof(points)::text || ':' || "
+                "(SELECT atttypid::regtype::text FROM pg_attribute "
+                "WHERE attrelid = 'wire_alterable_point'::regclass AND attname = 'value') "
+                "FROM wire_moved_values",
+            )
+        )
+        == "wire_moved_types.wire_moved_point[]:bigint",
+    )
+    check(
+        "raw wire: ALTER TYPE OWNER resolves a named composite",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT pg_get_userbyid(typowner) FROM pg_type "
+                "WHERE typname = 'wire_alterable_point'",
+            )
+        )
+        == "wire_composite_type_owner",
+    )
+    cleanup = simple_query(
+        s,
+        "ALTER TYPE wire_alterable_point OWNER TO postgres; "
+        "DROP ROLE wire_composite_type_owner",
+    )
+    check(
+        "raw wire: named-composite owner cleanup succeeds",
+        not any(kind == b"E" for kind, _ in cleanup),
+        cleanup,
     )
     s.close()
 

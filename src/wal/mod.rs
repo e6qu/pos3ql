@@ -176,6 +176,7 @@ const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
 const LAST_KIND: u8 = KIND_RENAME_VIEW;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
+const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
 
 fn access_class_has_oid(class: u8) -> bool {
@@ -2733,7 +2734,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + de
                 + 1;
             for c in def.checks() {
-                n += 1 + c.name.as_str().len() + 2 + c.expression.as_str().len();
+                n += 1 + c.name.as_str().len() + 2 + c.expression.as_str().len() + 1;
             }
             n
         }
@@ -4465,7 +4466,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             let de = def.default_expr.as_ref().map(|e| e.as_str()).unwrap_or("");
             let mut ok = name_bytes(buffer, def.name.as_str())
                 && name_bytes(buffer, def.schema.as_str())
-                && buffer.append(&[DOMAIN_PAYLOAD_WITH_BASE_SLOT])
+                && buffer.append(&[DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION])
                 && name_bytes(
                     buffer,
                     def.base_domain
@@ -4504,7 +4505,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             for c in def.checks() {
                 ok &= name_bytes(buffer, c.name.as_str())
                     && buffer.append(&(c.expression.as_str().len() as u16).to_le_bytes())
-                    && buffer.append(c.expression.as_str().as_bytes());
+                    && buffer.append(c.expression.as_str().as_bytes())
+                    && buffer.append(&[c.validation.code()]);
             }
             ok
         }
@@ -7620,7 +7622,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_CREATE_DOMAIN => {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
-            if *payload.get(at)? != DOMAIN_PAYLOAD_WITH_BASE_SLOT {
+            let payload_version = *payload.get(at)?;
+            if !matches!(
+                payload_version,
+                DOMAIN_PAYLOAD_WITH_BASE_SLOT | DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION
+            ) {
                 return None;
             }
             at += 1;
@@ -7692,10 +7698,18 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += 2;
                 let expr = core::str::from_utf8(payload.get(at..at + elen)?).ok()?;
                 at += elen;
+                let validation = if payload_version == DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION {
+                    let validation =
+                        crate::storage::ConstraintValidation::from_code(*payload.get(at)?)?;
+                    at += 1;
+                    validation
+                } else {
+                    crate::storage::ConstraintValidation::EnforcedValidated
+                };
                 *check = crate::storage::CheckConstraint {
                     name: SqlName::parse(cname).ok()?,
                     expression: crate::util::StackStr::from_str(expr),
-                    validation: crate::storage::ConstraintValidation::EnforcedValidated,
+                    validation,
                 };
             }
             (at == payload.len()).then_some(WalOp::CreateDomain(crate::storage::DomainDef {
@@ -9150,7 +9164,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let class = crate::storage::AccessClass::from_u8(class)?;
             if !matches!(
                 class,
-                crate::storage::AccessClass::Table | crate::storage::AccessClass::MaterializedView
+                crate::storage::AccessClass::Table
+                    | crate::storage::AccessClass::View
+                    | crate::storage::AccessClass::MaterializedView
             ) {
                 return None;
             }
@@ -10336,7 +10352,7 @@ mod tests {
     }
 
     #[test]
-    fn column_acl_codec_rejects_unexecutable_relation_classes() {
+    fn column_acl_codec_accepts_view_relation_classes() {
         let mut budget = Budget::new(1024);
         let mut payload = FixedBuf::new(&mut budget, "view column acl wal", 1024).unwrap();
         assert!(append_payload(
@@ -10352,7 +10368,14 @@ mod tests {
                 grant_options: crate::storage::PrivilegeSet::NONE,
             }
         ));
-        assert!(decode_op(KIND_SET_COLUMN_ACL, payload.readable()).is_none());
+        assert!(matches!(
+            decode_op(KIND_SET_COLUMN_ACL, payload.readable()),
+            Some(WalOp::SetColumnAcl {
+                class,
+                column: 0,
+                ..
+            }) if class == crate::storage::AccessClass::View as u8
+        ));
     }
 
     #[test]

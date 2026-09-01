@@ -898,6 +898,7 @@ fn dml_dependency_scope<'a>(
         with_ordinality: false,
         lateral: false,
         authorization_role: None,
+        view_access: None,
     };
     let joins = match extra {
         None => &[][..],

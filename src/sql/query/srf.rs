@@ -558,6 +558,7 @@ pub(super) fn prepare_project_set<'a, R: ColumnLookup<'a>>(
                 with_ordinality: false,
                 lateral: false,
                 authorization_role: None,
+                view_access: None,
             })
             .map_err(|_| arena_full())?;
         let Some((_, routine)) =

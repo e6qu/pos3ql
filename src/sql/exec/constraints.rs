@@ -92,14 +92,46 @@ fn validate_domain_value(
     arena: &Arena,
     params: &[Datum],
 ) -> Result<(), SqlError> {
+    validate_domain_not_null(domain, value)?;
     if value.is_null() {
-        if domain.not_null {
-            return Err(sql_err!(
-                sqlstate::NOT_NULL_VIOLATION,
-                "domain {} does not allow null values",
-                domain.name.as_str()
-            ));
-        }
+        return Ok(());
+    }
+    for check in domain.checks() {
+        validate_domain_check(storage, txid, domain, check, value, arena, params)?;
+    }
+    Ok(())
+}
+
+/// Enforces only a domain's `NOT NULL` rule. Domain DDL uses this for the
+/// validation scan of `ALTER DOMAIN ... SET NOT NULL`; unrelated CHECK rules
+/// must not make that transition fail.
+pub(crate) fn validate_domain_not_null(
+    domain: &crate::storage::DomainDef,
+    value: Datum,
+) -> Result<(), SqlError> {
+    if value.is_null() && domain.not_null {
+        return Err(sql_err!(
+            sqlstate::NOT_NULL_VIOLATION,
+            "domain {} does not allow null values",
+            domain.name.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// Enforces one named domain CHECK. This is deliberately separate from the
+/// full write-time domain coercion path: `VALIDATE CONSTRAINT` scans exactly
+/// the named constraint and does not validate unrelated `NOT VALID` checks.
+pub(crate) fn validate_domain_check<'a>(
+    storage: &Storage,
+    txid: u32,
+    domain: &crate::storage::DomainDef,
+    check: &crate::storage::CheckConstraint,
+    value: Datum<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+) -> Result<(), SqlError> {
+    if value.is_null() {
         return Ok(());
     }
     let context = ValueLookup { value };
@@ -108,19 +140,17 @@ fn validate_domain_value(
         catalog: Some(&catalog),
         ..crate::sql::eval::NO_HOOKS
     };
-    for check in domain.checks() {
-        let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
-        if matches!(
-            eval_full(expression, arena, params, &context, &hooks)?,
-            Datum::Bool(false)
-        ) {
-            return Err(sql_err!(
-                sqlstate::CHECK_VIOLATION,
-                "value for domain {} violates check constraint \"{}\"",
-                domain.name.as_str(),
-                check.name.as_str()
-            ));
-        }
+    let expression = crate::sql::parser::parse_expr(check.expression.as_str(), arena)?;
+    if matches!(
+        eval_full(expression, arena, params, &context, &hooks)?,
+        Datum::Bool(false)
+    ) {
+        return Err(sql_err!(
+            sqlstate::CHECK_VIOLATION,
+            "value for domain {} violates check constraint \"{}\"",
+            domain.name.as_str(),
+            check.name.as_str()
+        ));
     }
     Ok(())
 }

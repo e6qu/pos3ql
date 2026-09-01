@@ -5150,14 +5150,9 @@ pub fn alter_owner(
                 class: AccessClass::Schema,
                 slot: slot as u16,
             }),
-        AlterOwnerKind::Type => (match name.schema {
-            Some(schema) => storage.enum_slot(schema, name.name, txn.txid),
-            None => storage.resolve_enum_slot(name.name, txn.txid),
-        })
-        .map(|slot| AccessObject {
-            class: AccessClass::Enum,
-            slot: slot as u16,
-        }),
+        AlterOwnerKind::Type => storage
+            .resolve_alter_type_target(name.schema, name.name, txn.txid)
+            .map(crate::storage::AlterTypeTarget::access_object),
         AlterOwnerKind::Domain => (match name.schema {
             Some(schema) => storage.domain_slot(schema, name.name, txn.txid),
             None => storage.resolve_domain_slot(name.name, txn.txid),
@@ -8865,6 +8860,7 @@ fn column_privilege_target(
     relation: crate::storage::AccessObject,
     name: &str,
     txid: u32,
+    arena: &crate::mem::arena::Arena,
 ) -> Result<crate::storage::ColumnPrivilegeTarget, SqlError> {
     let column = match relation.class {
         crate::storage::AccessClass::Table => relation.slot as usize,
@@ -8881,10 +8877,22 @@ fn column_privilege_target(
                 })?
         }
         crate::storage::AccessClass::View => {
-            return Err(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "column privileges on views are not supported"
-            ));
+            let view = storage.view(relation.slot as usize);
+            let mut descriptions = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
+            let count =
+                super::catalog::describe_view(storage, txid, view, arena, &mut descriptions)?;
+            let column = descriptions[..count]
+                .iter()
+                .position(|description| description.name == name)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        view.name_for(txid).as_str()
+                    )
+                })?;
+            return crate::storage::ColumnPrivilegeTarget::new(relation, column as u16);
         }
         _ => {
             return Err(sql_err!(
@@ -9044,6 +9052,7 @@ fn revoke_dependent_column_privileges(
 pub fn grant_privileges(
     storage: &mut Storage,
     txn: &mut TxnState,
+    arena: &crate::mem::arena::Arena,
     privileges: &[crate::sql::ast::PrivilegeSpec<'_>],
     target: crate::sql::ast::PrivilegeTarget<'_>,
     grantees: &[&str],
@@ -9156,10 +9165,11 @@ pub fn grant_privileges(
                     Err(error) => return sql_fail(error),
                 };
                 for column in specification.columns {
-                    let target = match column_privilege_target(storage, *object, column, txn.txid) {
-                        Ok(target) => target,
-                        Err(error) => return sql_fail(error),
-                    };
+                    let target =
+                        match column_privilege_target(storage, *object, column, txn.txid, arena) {
+                            Ok(target) => target,
+                            Err(error) => return sql_fail(error),
+                        };
                     if !storage.has_column_grant_option(target, grantor, requested, txn.txid) {
                         return sql_fail(sql_err!(
                             sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -9204,6 +9214,7 @@ pub fn grant_privileges(
 pub fn revoke_privileges(
     storage: &mut Storage,
     txn: &mut TxnState,
+    arena: &crate::mem::arena::Arena,
     grant_option_only: bool,
     privileges: &[crate::sql::ast::PrivilegeSpec<'_>],
     target: crate::sql::ast::PrivilegeTarget<'_>,
@@ -9282,30 +9293,29 @@ pub fn revoke_privileges(
                         .union(crate::storage::PrivilegeSet::REFERENCES)
                         .0,
             );
-            if grantee != PUBLIC_ROLE && removed_column_options.0 != 0 {
-                let table = match object.class {
-                    crate::storage::AccessClass::Table => Some(object.slot as usize),
-                    crate::storage::AccessClass::MaterializedView => {
-                        let (schema, name) = storage.access_object_name_to(*object, txn.txid);
-                        storage.find_table(schema.as_str(), name.as_str())
-                    }
-                    _ => None,
-                };
-                if let Some(table) = table {
-                    for column in 0..storage.table_def(table, txn.txid).n_columns {
-                        let target =
-                            crate::storage::ColumnPrivilegeTarget::new(*object, column as u16)
-                                .expect("table-like access objects accept column privileges");
-                        if let Err(error) = revoke_dependent_column_privileges(
-                            storage,
-                            txn,
-                            target,
-                            grantee,
-                            removed_column_options,
-                            cascade,
-                        ) {
-                            return sql_fail(error);
-                        }
+            if grantee != PUBLIC_ROLE
+                && removed_column_options.0 != 0
+                && matches!(
+                    object.class,
+                    crate::storage::AccessClass::Table
+                        | crate::storage::AccessClass::View
+                        | crate::storage::AccessClass::MaterializedView
+                )
+            {
+                let mut targets = [crate::storage::ColumnPrivilegeTarget::new(*object, 0)
+                    .expect("table-like access objects accept column privileges");
+                    crate::storage::MAX_COLUMN_ACL_ENTRIES];
+                let target_count = storage.column_acl_targets(*object, txn.txid, &mut targets);
+                for target in &targets[..target_count] {
+                    if let Err(error) = revoke_dependent_column_privileges(
+                        storage,
+                        txn,
+                        *target,
+                        grantee,
+                        removed_column_options,
+                        cascade,
+                    ) {
+                        return sql_fail(error);
                     }
                 }
             }
@@ -9425,10 +9435,11 @@ pub fn revoke_privileges(
                     Err(error) => return sql_fail(error),
                 };
                 for column in specification.columns {
-                    let target = match column_privilege_target(storage, *object, column, txn.txid) {
-                        Ok(target) => target,
-                        Err(error) => return sql_fail(error),
-                    };
+                    let target =
+                        match column_privilege_target(storage, *object, column, txn.txid, arena) {
+                            Ok(target) => target,
+                            Err(error) => return sql_fail(error),
+                        };
                     if !storage.has_column_grant_option(target, grantor, requested, txn.txid) {
                         return sql_fail(sql_err!(
                             sqlstate::INSUFFICIENT_PRIVILEGE,
@@ -29454,6 +29465,7 @@ pub fn comment(
         } => {
             let domain_slot = storage.resolve_domain_slot(type_name, txid);
             let enum_slot = storage.resolve_enum_slot(type_name, txid);
+            let named_composite_slot = storage.resolve_composite_slot(type_name, txid);
             let (qualifier, bare_name) = type_name
                 .split_once('.')
                 .map_or((None, type_name), |(schema, name)| (Some(schema), name));
@@ -29486,7 +29498,7 @@ pub fn comment(
                         type_name
                     ));
                 }
-                if composite.is_some() {
+                if named_composite_slot.is_some() || composite.is_some() {
                     return sql_fail(sql_err!(
                         sqlstate::WRONG_OBJECT_TYPE,
                         "\"{}\" is not a domain",
@@ -29500,6 +29512,9 @@ pub fn comment(
                 ));
             } else if let Some(slot) = enum_slot {
                 let definition = storage.enum_for(slot, txn.txid);
+                (definition.schema, definition.name)
+            } else if let Some(slot) = named_composite_slot {
+                let definition = storage.composite_for(slot, txn.txid);
                 (definition.schema, definition.name)
             } else if let Some((schema, _)) = composite {
                 let stored = match SqlName::parse(bare_name) {
@@ -31060,10 +31075,29 @@ fn build_domain_spec(
             Some(nm) => SqlName::parse(nm)?,
             None => generate_check_name(domain, &checks[..n])?,
         };
+        if checks[..n].iter().any(|check| check.name == name) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "constraint \"{}\" for domain \"{}\" already exists",
+                name.as_str(),
+                domain
+            ));
+        }
         checks[n] = crate::storage::CheckConstraint {
             name,
             expression: domain_text::<{ crate::storage::CHECK_SQL_MAX }>(c.expression)?,
-            validation: crate::storage::ConstraintValidation::EnforcedValidated,
+            validation: match c.validation {
+                crate::sql::ast::ConstraintValidation::EnforcedValidated => {
+                    crate::storage::ConstraintValidation::EnforcedValidated
+                }
+                crate::sql::ast::ConstraintValidation::EnforcedNotValid
+                | crate::sql::ast::ConstraintValidation::NotEnforced => {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "CREATE DOMAIN constraints must be valid"
+                    ));
+                }
+            },
         };
         n += 1;
     }
@@ -32000,18 +32034,18 @@ pub fn alter_domain(
         checks: current.checks,
         n_checks: current.n_checks,
     };
-    let revalidate;
+    let revalidation;
     match action {
         A::SetNotNull => {
             spec.not_null = true;
-            revalidate = true;
+            revalidation = Some(DomainValidation::NotNull { target: slot });
         }
         A::DropNotNull => {
             spec.not_null = false;
-            revalidate = false;
+            revalidation = None;
         }
         A::SetDefault(text) => {
-            revalidate = false;
+            revalidation = None;
             if let Err(e) = validate_domain_expr(text, false, arena) {
                 return sql_fail(e);
             }
@@ -32021,11 +32055,10 @@ pub fn alter_domain(
             }
         }
         A::DropDefault => {
-            revalidate = false;
+            revalidation = None;
             spec.default_expr = None;
         }
         A::AddCheck(check) => {
-            revalidate = true;
             if spec.n_checks == crate::storage::MAX_DOMAIN_CHECKS {
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -32049,6 +32082,17 @@ pub fn alter_domain(
                     }
                 }
             };
+            if spec.checks[..spec.n_checks]
+                .iter()
+                .any(|candidate| candidate.name == cname)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "constraint \"{}\" for domain \"{}\" already exists",
+                    cname.as_str(),
+                    name.name
+                ));
+            }
             let expression =
                 match domain_text::<{ crate::storage::CHECK_SQL_MAX }>(check.expression) {
                     Ok(t) => t,
@@ -32057,15 +32101,37 @@ pub fn alter_domain(
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint {
                 name: cname,
                 expression,
-                validation: crate::storage::ConstraintValidation::EnforcedValidated,
+                validation: match check.validation {
+                    crate::sql::ast::ConstraintValidation::EnforcedValidated => {
+                        crate::storage::ConstraintValidation::EnforcedValidated
+                    }
+                    crate::sql::ast::ConstraintValidation::EnforcedNotValid => {
+                        crate::storage::ConstraintValidation::EnforcedNotValid
+                    }
+                    crate::sql::ast::ConstraintValidation::NotEnforced => {
+                        return sql_fail(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "domain constraints cannot be NOT ENFORCED"
+                        ));
+                    }
+                },
             };
+            revalidation = matches!(
+                check.validation,
+                crate::sql::ast::ConstraintValidation::EnforcedValidated
+            )
+            .then_some(DomainValidation::Check {
+                target: slot,
+                index: spec.n_checks,
+            });
             spec.n_checks += 1;
         }
         A::DropConstraint {
             name: cname,
             if_exists,
+            cascade: _,
         } => {
-            revalidate = false;
+            revalidation = None;
             let Some(pos) = spec.checks[..spec.n_checks]
                 .iter()
                 .position(|c| c.name.as_str() == *cname)
@@ -32097,13 +32163,80 @@ pub fn alter_domain(
             spec.n_checks -= 1;
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint::EMPTY;
         }
+        A::RenameConstraint { from, to } => {
+            revalidation = None;
+            let Some(index) = spec.checks[..spec.n_checks]
+                .iter_mut()
+                .position(|check| check.name.as_str() == *from)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "constraint \"{}\" of domain \"{}\" does not exist",
+                    from,
+                    name.name
+                ));
+            };
+            let to = match SqlName::parse(to) {
+                Ok(to) => to,
+                Err(error) => return sql_fail(error),
+            };
+            if spec.checks[..spec.n_checks]
+                .iter()
+                .any(|candidate| candidate.name == to)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "constraint \"{}\" for domain \"{}\" already exists",
+                    to.as_str(),
+                    name.name
+                ));
+            }
+            spec.checks[index].name = to;
+        }
+        A::ValidateConstraint(cname) => {
+            revalidation = None;
+            let Some(index) = spec.checks[..spec.n_checks]
+                .iter()
+                .position(|check| check.name.as_str() == *cname)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "constraint \"{}\" of domain \"{}\" does not exist",
+                    cname,
+                    name.name
+                ));
+            };
+            if spec.checks[index].validation.validated() {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "constraint \"{}\" of domain \"{}\" is already validated",
+                    cname,
+                    name.name
+                ));
+            }
+            if let Err(error) = validate_domain_rows(
+                storage,
+                slot,
+                DomainValidation::Check {
+                    target: slot,
+                    index,
+                },
+                txn.txid,
+                arena,
+            ) {
+                return sql_fail(error);
+            }
+            spec.checks[index].validation = crate::storage::ConstraintValidation::EnforcedValidated;
+        }
         A::Rename(_) | A::SetSchema(_) => unreachable!(),
     }
     let prior = match storage.stage_domain_alter(slot, spec, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
-    if revalidate && let Err(e) = validate_domain_rows(storage, slot, txn.txid, arena) {
+    if let Some(validation) = revalidation
+        && let Err(e) = validate_domain_rows(storage, slot, validation, txn.txid, arena)
+    {
         storage.rollback_domain_alter(slot, prior);
         return sql_fail(e);
     }
@@ -32127,12 +32260,21 @@ pub fn alter_domain(
     sql_ok()
 }
 
-/// Re-validates every stored value whose declared domain is `target` or a
-/// descendant of it. Array domains validate each element, not the array
-/// container: a NULL array has no element value to validate.
+/// The domain property selected by one DDL action. `All` is used only by a
+/// stored-expression rewrite that must prove the complete rewritten domain.
+#[derive(Clone, Copy)]
+enum DomainValidation {
+    All,
+    NotNull { target: usize },
+    Check { target: usize, index: usize },
+}
+
+/// Validates the selected domain property for every stored value declared as
+/// `target` or a descendant. Array domains validate elements, not containers.
 fn validate_domain_rows(
     storage: &Storage,
     target: usize,
+    validation: DomainValidation,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -32181,6 +32323,7 @@ fn validate_domain_rows(
                 validate_stored_domain_value(
                     storage,
                     leaf,
+                    validation,
                     def.columns()[column_index].ctype,
                     values[column_index],
                     txid,
@@ -32193,18 +32336,20 @@ fn validate_domain_rows(
     Ok(())
 }
 
-/// Validates a scalar domain value or every element of a domain-array value
-/// through the same catalog coercion boundary used by writes and Bind.
+/// Validates a scalar domain value or every element of a domain-array value.
+/// A full revalidation shares write-time coercion; a DDL operation selects
+/// only the rule PostgreSQL says that operation must scan.
 fn validate_stored_domain_value(
     storage: &Storage,
     leaf: usize,
+    validation: DomainValidation,
     ctype: ColType,
     value: Datum,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    let validate = |value| {
-        coerce_domain_value(
+    let validate = |value| match validation {
+        DomainValidation::All => coerce_domain_value(
             storage,
             leaf,
             value,
@@ -32212,7 +32357,29 @@ fn validate_stored_domain_value(
             arena,
             crate::sql::eval::NO_PARAMS,
         )
-        .map(|_| ())
+        .map(|_| ()),
+        DomainValidation::NotNull { target } => {
+            let target_domain = storage.domain_for(target, txid);
+            crate::sql::exec::constraints::validate_domain_not_null(&target_domain, value)
+        }
+        DomainValidation::Check { target, index } => {
+            let target_domain = storage.domain_for(target, txid);
+            let check = target_domain.checks().get(index).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "domain validation refers to a missing check constraint"
+                )
+            })?;
+            crate::sql::exec::constraints::validate_domain_check(
+                storage,
+                txid,
+                &target_domain,
+                check,
+                value,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+            )
+        }
     };
     let ColType::Array(element @ crate::sql::types::ArrElem::Domain { .. }) = ctype else {
         return validate(value);
@@ -33261,6 +33428,45 @@ fn composite_column_in_use(
         }
     }
     None
+}
+
+/// Existing uses would require rewriting durable composite values. PostgreSQL
+/// rejects that operation even when the statement spells `CASCADE`.
+fn reject_composite_attribute_type_with_dependents(
+    storage: &Storage,
+    composite_slot: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let root = CompositeTypeDependencyRoot {
+        slot: composite_slot,
+        name: storage.composite_for(composite_slot, txid).name,
+    };
+    let direct_column = composite_column_in_use(storage, composite_slot, txid).is_some();
+    let nested_field = composite_field_uses_composite(storage, root, txid)?.is_some();
+    let domain = (0..storage.domain_count()).any(|slot| {
+        storage.domain_for(slot, txid).visible_to(txid)
+            && domain_composite_base(storage, slot, txid) == Some(composite_slot as u16)
+    });
+    let StoredDependencyClosure {
+        views,
+        matviews,
+        routines,
+        rules,
+    } = stored_query_dependent_closure(storage, txid, |dependency| {
+        dependency.class == crate::storage::DependencyClass::Composite
+            && dependency.slot as usize == composite_slot
+    })?;
+    let stored_query = views.iter().any(|selected| *selected)
+        || matviews.iter().any(|selected| *selected)
+        || routines.iter().any(|selected| *selected)
+        || rules.iter().any(|selected| *selected);
+    if direct_column || nested_field || domain || stored_query {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot alter type of a composite attribute with dependent objects"
+        ));
+    }
+    Ok(())
 }
 
 fn apply_type_drop_to_stored_queries(
@@ -34873,6 +35079,9 @@ pub fn alter_type(
                 || storage
                     .domain_slot(current.schema.as_str(), new_name, txn.txid)
                     .is_some()
+                || storage
+                    .composite_slot(current.schema.as_str(), new_name, txn.txid)
+                    .is_some()
             {
                 return sql_fail(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
@@ -35034,9 +35243,7 @@ pub fn alter_type(
         A::AddAttribute(_)
         | A::DropAttribute { .. }
         | A::RenameAttribute { .. }
-        | A::AlterAttributeType { .. }
-        | A::SetAttributeNotNull(_)
-        | A::DropAttributeNotNull(_) => {
+        | A::AlterAttributeType { .. } => {
             return sql_fail(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
                 "type \"{}\" is not a composite type",
@@ -35242,6 +35449,7 @@ fn alter_composite_type(
             type_name,
             type_mod,
             collation,
+            cascade: _,
         } => {
             let Some(index) = altered.active_field_index(name) else {
                 return sql_fail(sql_err!(
@@ -35266,41 +35474,12 @@ fn alter_composite_type(
             replacement.attribute_number = altered.fields[index].attribute_number;
             replacement.name = altered.fields[index].name;
             replacement.not_null = altered.fields[index].not_null;
-            if let Err(error) = verify_composite_attribute_type(
-                storage,
-                slot as u16,
-                replacement.attribute_number,
-                replacement,
-                txn.txid,
-                arena,
-            ) {
-                return sql_fail(error);
-            }
-            altered.fields[index] = replacement;
-        }
-        A::SetAttributeNotNull(name) | A::DropAttributeNotNull(name) => {
-            let Some(index) = altered.active_field_index(name) else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of type \"{}\" does not exist",
-                    name,
-                    altered.name.as_str()
-                ));
-            };
-            let set = matches!(action, A::SetAttributeNotNull(_));
-            if set
-                && !altered.fields[index].not_null
-                && let Err(error) = verify_composite_attribute_not_null(
-                    storage,
-                    slot as u16,
-                    altered.fields[index].attribute_number,
-                    txn.txid,
-                    arena,
-                )
+            if let Err(error) =
+                reject_composite_attribute_type_with_dependents(storage, slot, txn.txid)
             {
                 return sql_fail(error);
             }
-            altered.fields[index].not_null = set;
+            altered.fields[index] = replacement;
         }
     }
     let prior = match storage.stage_composite_alter(slot, altered, txn.txid) {
@@ -35691,7 +35870,9 @@ fn rewrite_composite_dependent_domains(
             continue;
         }
         let prior = storage.stage_domain_alter(domain_slot, spec, txn.txid)?;
-        if let Err(error) = validate_domain_rows(storage, domain_slot, txn.txid, arena) {
+        if let Err(error) =
+            validate_domain_rows(storage, domain_slot, DomainValidation::All, txn.txid, arena)
+        {
             storage.rollback_domain_alter(domain_slot, prior);
             return Err(error);
         }
@@ -36288,292 +36469,6 @@ fn write_identifier<const N: usize>(output: &mut crate::util::StackStr<N>, ident
         let _ = output.write_char(character);
     }
     let _ = output.write_char('"');
-}
-
-/// Proves a newly-added composite NOT NULL constraint before publishing its
-/// catalog definition. Values are decoded structurally through every direct
-/// and nested composite or composite-array column, so a later query cannot be
-/// the first place an already-invalid durable value is discovered.
-fn verify_composite_attribute_not_null(
-    storage: &Storage,
-    target_slot: u16,
-    attribute_number: u16,
-    txid: u32,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    fn contains_null(
-        value: Datum<'_>,
-        ctype: ColType,
-        target_slot: u16,
-        attribute_number: u16,
-        storage: &Storage,
-        txid: u32,
-        arena: &Arena,
-    ) -> Result<bool, SqlError> {
-        if value.is_null() {
-            return Ok(false);
-        }
-        match ctype {
-            ColType::Composite(_slot) => {
-                let value = match value {
-                    Datum::CompositeText {
-                        slot,
-                        physical_fields,
-                        text,
-                    } => decode_stored_composite_text(
-                        text,
-                        slot,
-                        physical_fields,
-                        storage,
-                        txid,
-                        arena,
-                    )?,
-                    value => value,
-                };
-                let Datum::Composite { slot, fields } = value else {
-                    return Ok(false);
-                };
-                let definition = storage.composite_for(slot as usize, txid);
-                for (field, definition) in fields.iter().zip(definition.active_fields()) {
-                    if slot == target_slot
-                        && definition.attribute_number == attribute_number
-                        && field.value.is_null()
-                    {
-                        return Ok(true);
-                    }
-                    if contains_null(
-                        field.value,
-                        definition.ctype,
-                        target_slot,
-                        attribute_number,
-                        storage,
-                        txid,
-                        arena,
-                    )? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            ColType::Array(crate::sql::types::ArrElem::Composite(_)) => {
-                let Datum::Array { element, raw } = value else {
-                    return Ok(false);
-                };
-                let count = crate::sql::array::len(raw);
-                for index in 0..count {
-                    let item = crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null);
-                    if contains_null(
-                        item,
-                        element.to_coltype(),
-                        target_slot,
-                        attribute_number,
-                        storage,
-                        txid,
-                        arena,
-                    )? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    for table_index in 0..storage.table_count() {
-        if !storage.table(table_index).visible_to(txid) {
-            continue;
-        }
-        let definition = *storage.table_def(table_index, txid);
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        definition.schema(&mut schema);
-        let mut failure = false;
-        storage.for_each_row_state(table_index, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = storage.visible_row_home(table_index, rowid, state, txid)? else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            storage.with_row_bytes(table_index, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, &schema[..definition.n_columns], &mut values)?;
-                for (value, column) in values[..definition.n_columns]
-                    .iter()
-                    .zip(definition.columns())
-                {
-                    if contains_null(
-                        *value,
-                        column.ctype,
-                        target_slot,
-                        attribute_number,
-                        storage,
-                        txid,
-                        arena,
-                    )? {
-                        failure = true;
-                        break;
-                    }
-                }
-                Ok(())
-            })?;
-            Ok(if failure {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            })
-        })?;
-        if failure {
-            return Err(sql_err!(
-                sqlstate::NOT_NULL_VIOLATION,
-                "composite attribute contains null values"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Validates every existing occurrence before replacing an attribute type.
-/// The conversion itself uses the normal typed column coercion boundary, so
-/// ALTER TYPE cannot publish a layout that will fail only when a historical
-/// row is later read through a nested composite or array.
-struct CompositeTypeChange<'a> {
-    target_slot: u16,
-    attribute_number: u16,
-    replacement: crate::storage::CompositeFieldDef,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-}
-
-fn verify_composite_attribute_type(
-    storage: &Storage,
-    target_slot: u16,
-    attribute_number: u16,
-    replacement: crate::storage::CompositeFieldDef,
-    txid: u32,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    fn validate(
-        value: Datum<'_>,
-        ctype: ColType,
-        change: &CompositeTypeChange<'_>,
-    ) -> Result<(), SqlError> {
-        if value.is_null() {
-            return Ok(());
-        }
-        match ctype {
-            ColType::Composite(_slot) => {
-                let value = match value {
-                    Datum::CompositeText {
-                        slot,
-                        physical_fields,
-                        text,
-                    } => decode_stored_composite_text(
-                        text,
-                        slot,
-                        physical_fields,
-                        change.storage,
-                        change.txid,
-                        change.arena,
-                    )?,
-                    value => value,
-                };
-                let Datum::Composite { slot, fields } = value else {
-                    return Ok(());
-                };
-                let definition = change.storage.composite_for(slot as usize, change.txid);
-                for (field, definition) in fields.iter().zip(definition.active_fields()) {
-                    if slot == change.target_slot
-                        && definition.attribute_number == change.attribute_number
-                    {
-                        let column = ColumnMeta {
-                            name: change.replacement.name,
-                            ctype: change.replacement.ctype,
-                            type_mod: change.replacement.type_mod,
-                            collation: crate::sql::ast::Collation::None,
-                            not_null: crate::storage::NotNullOrigin::local(
-                                change.replacement.not_null,
-                            ),
-                            unique: false,
-                            primary: false,
-                            auto_increment: false,
-                            default: crate::storage::ColumnDefault::NONE,
-                            is_identity: false,
-                            identity_always: false,
-                            auto_increment_step: 1,
-                            user_type: change.replacement.user_type,
-                            statistics_target: -1,
-                        };
-                        let converted = coerce(
-                            field.value,
-                            &column,
-                            change.storage,
-                            change.txid,
-                            change.arena,
-                        )?;
-                        if change.replacement.not_null && converted.is_null() {
-                            return Err(sql_err!(
-                                sqlstate::NOT_NULL_VIOLATION,
-                                "composite attribute contains null values"
-                            ));
-                        }
-                    } else {
-                        validate(field.value, definition.ctype, change)?;
-                    }
-                }
-                Ok(())
-            }
-            ColType::Array(crate::sql::types::ArrElem::Composite(_)) => {
-                let Datum::Array { element, raw } = value else {
-                    return Ok(());
-                };
-                for index in 0..crate::sql::array::len(raw) {
-                    validate(
-                        crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null),
-                        element.to_coltype(),
-                        change,
-                    )?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    let change = CompositeTypeChange {
-        target_slot,
-        attribute_number,
-        replacement,
-        storage,
-        txid,
-        arena,
-    };
-    for table_index in 0..storage.table_count() {
-        if !storage.table(table_index).visible_to(txid) {
-            continue;
-        }
-        let definition = *storage.table_def(table_index, txid);
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        definition.schema(&mut schema);
-        storage.for_each_row_state(table_index, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = storage.visible_row_home(table_index, rowid, state, txid)? else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            storage.with_row_bytes(table_index, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, &schema[..definition.n_columns], &mut values)?;
-                for (value, column) in values[..definition.n_columns]
-                    .iter()
-                    .zip(definition.columns())
-                {
-                    validate(*value, column.ctype, &change)?;
-                }
-                Ok(())
-            })?;
-            Ok(ControlFlow::Continue(()))
-        })?;
-    }
-    Ok(())
 }
 
 /// Rewrites the inline label carried by every stored value of one enum. The
@@ -44115,6 +44010,7 @@ pub fn describe_merge_returning<'a>(
         with_ordinality: false,
         lateral: false,
         authorization_role: None,
+        view_access: None,
     };
     let joins = arena
         .alloc_slice_copy(&[Join {
@@ -55398,16 +55294,10 @@ pub(crate) fn require_rewrite_input_privileges(
     arena: &Arena,
 ) -> Result<(), SqlError> {
     let role = authorization.role(storage, txid)?;
-    let (relation, privilege) = match statement {
-        crate::sql::ast::Stmt::Insert(insert) => {
-            (insert.table, crate::storage::PrivilegeSet::INSERT)
-        }
-        crate::sql::ast::Stmt::Update(update) => {
-            (update.table, crate::storage::PrivilegeSet::UPDATE)
-        }
-        crate::sql::ast::Stmt::Delete(delete) => {
-            (delete.table, crate::storage::PrivilegeSet::DELETE)
-        }
+    let relation = match statement {
+        crate::sql::ast::Stmt::Insert(insert) => insert.table,
+        crate::sql::ast::Stmt::Update(update) => update.table,
+        crate::sql::ast::Stmt::Delete(delete) => delete.table,
         _ => {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -55449,10 +55339,10 @@ pub(crate) fn require_rewrite_input_privileges(
                 role,
                 txid,
             )?,
-            crate::storage::DependencyClass::View => require_view_privilege_as(
+            crate::storage::DependencyClass::View => require_view_read_privilege_as(
                 storage,
                 slot,
-                crate::storage::PrivilegeSet::SELECT,
+                dependency.referenced_columns,
                 role,
                 txid,
             )?,
@@ -55460,7 +55350,8 @@ pub(crate) fn require_rewrite_input_privileges(
         }
     }
     if let Some(crate::storage::ResolvedRelation::View(view)) = resolved {
-        return require_view_privilege_as(storage, view, privilege, role, txid);
+        let _ = require_view_dml_privileges(storage, statement, authorization, view, txid, arena)?;
+        return Ok(());
     }
     match statement {
         crate::sql::ast::Stmt::Insert(insert) => {
@@ -55802,6 +55693,271 @@ fn require_view_privilege_as(
         "permission denied for view {}",
         definition.name.as_str()
     ))
+}
+
+fn require_view_column_privilege_as(
+    storage: &Storage,
+    view: usize,
+    privilege: crate::storage::PrivilegeSet,
+    columns: u64,
+    role: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let definition = storage.view(view);
+    storage.require_schema_usage_as(definition.schema.as_str(), role, txid)?;
+    let object = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::View,
+        slot: view as u16,
+    };
+    if storage.has_object_privilege(object, role, privilege, txid) {
+        return Ok(());
+    }
+    let allowed = columns != 0
+        && (0..u64::BITS as usize)
+            .filter(|column| columns & (1u64 << column) != 0)
+            .all(|column| {
+                crate::storage::ColumnPrivilegeTarget::new(object, column as u16)
+                    .is_ok_and(|target| storage.has_column_privilege(target, role, privilege, txid))
+            });
+    if allowed {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::INSUFFICIENT_PRIVILEGE,
+        "permission denied for view {}",
+        definition.name.as_str()
+    ))
+}
+
+fn require_view_read_privilege_as(
+    storage: &Storage,
+    view: usize,
+    columns: u64,
+    role: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let definition = storage.view(view);
+    storage.require_schema_usage_as(definition.schema.as_str(), role, txid)?;
+    let object = crate::storage::AccessObject {
+        class: crate::storage::AccessClass::View,
+        slot: view as u16,
+    };
+    if storage.has_object_privilege(object, role, crate::storage::PrivilegeSet::SELECT, txid) {
+        return Ok(());
+    }
+    if columns == 0
+        && storage.has_any_column_privilege(
+            object,
+            role,
+            crate::storage::PrivilegeSet::SELECT,
+            txid,
+        )
+    {
+        return Ok(());
+    }
+    require_view_column_privilege_as(
+        storage,
+        view,
+        crate::storage::PrivilegeSet::SELECT,
+        columns,
+        role,
+        txid,
+    )
+}
+
+fn view_privilege_definition(
+    storage: &Storage,
+    view: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<TableDef, SqlError> {
+    let definition = storage.view(view);
+    let mut descriptions = [super::types::ColDesc::new("", 0, 0); MAX_PROJ];
+    let count = super::catalog::describe_view(storage, txid, definition, arena, &mut descriptions)?;
+    let mut columns = [crate::storage::ColumnMeta::EMPTY; crate::storage::MAX_COLUMNS];
+    if count > columns.len() {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "too many view columns"
+        ));
+    }
+    for (column, description) in columns.iter_mut().zip(&descriptions[..count]) {
+        column.name = crate::storage::SqlName::parse(description.name)?;
+    }
+    Ok(TableDef {
+        schema: definition.schema_for(txid),
+        name: definition.name_for(txid),
+        columns,
+        n_columns: count,
+        ..TableDef::empty()
+    })
+}
+
+/// Checks the invoker's visible view privileges before its DML target is
+/// rewritten to a base relation. The rewrite then runs as the view owner for
+/// a definer view, matching the already-established SELECT boundary.
+pub(crate) fn require_view_dml_privileges(
+    storage: &Storage,
+    statement: &crate::sql::ast::Stmt<'_>,
+    authorization: DmlAuthorization,
+    view: usize,
+    txid: u32,
+    arena: &Arena,
+) -> Result<DmlAuthorization, SqlError> {
+    let role = authorization.role(storage, txid)?;
+    let definition = view_privilege_definition(storage, view, txid, arena)?;
+    let target_mask = |names: &[&str]| -> Result<u64, SqlError> {
+        if names.is_empty() {
+            return Ok(all_columns_mask(&definition));
+        }
+        names.iter().try_fold(0u64, |mask, name| {
+            definition.column_index(name).map_or_else(
+                || {
+                    Err(sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" of relation \"{}\" does not exist",
+                        name,
+                        definition.name.as_str()
+                    ))
+                },
+                |column| Ok(mask | (1u64 << column)),
+            )
+        })
+    };
+    match statement {
+        crate::sql::ast::Stmt::Insert(insert) => {
+            require_view_column_privilege_as(
+                storage,
+                view,
+                crate::storage::PrivilegeSet::INSERT,
+                target_mask(insert.columns)?,
+                role,
+                txid,
+            )?;
+            let reads = returning_dml_target_columns(
+                insert.returning,
+                &definition,
+                None,
+                storage,
+                txid,
+                arena,
+            )?;
+            if reads != 0 {
+                require_view_column_privilege_as(
+                    storage,
+                    view,
+                    crate::storage::PrivilegeSet::SELECT,
+                    reads,
+                    role,
+                    txid,
+                )?;
+            }
+        }
+        crate::sql::ast::Stmt::Update(update) => {
+            let mut writes = 0u64;
+            let mut reads = 0u64;
+            for (name, expression) in update.assignments {
+                writes |= target_mask(core::slice::from_ref(name))?;
+                reads |= expression_dml_target_columns(
+                    expression,
+                    &definition,
+                    update.alias,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
+            if let Some(expression) = update.where_clause {
+                reads |= expression_dml_target_columns(
+                    expression,
+                    &definition,
+                    update.alias,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
+            reads |= returning_dml_target_columns(
+                update.returning,
+                &definition,
+                update.alias,
+                storage,
+                txid,
+                arena,
+            )?;
+            require_view_column_privilege_as(
+                storage,
+                view,
+                crate::storage::PrivilegeSet::UPDATE,
+                writes,
+                role,
+                txid,
+            )?;
+            if reads != 0 {
+                require_view_column_privilege_as(
+                    storage,
+                    view,
+                    crate::storage::PrivilegeSet::SELECT,
+                    reads,
+                    role,
+                    txid,
+                )?;
+            }
+        }
+        crate::sql::ast::Stmt::Delete(delete) => {
+            require_view_privilege_as(
+                storage,
+                view,
+                crate::storage::PrivilegeSet::DELETE,
+                role,
+                txid,
+            )?;
+            let mut reads = returning_dml_target_columns(
+                delete.returning,
+                &definition,
+                delete.alias,
+                storage,
+                txid,
+                arena,
+            )?;
+            if let Some(expression) = delete.where_clause {
+                reads |= expression_dml_target_columns(
+                    expression,
+                    &definition,
+                    delete.alias,
+                    storage,
+                    txid,
+                    arena,
+                )?;
+            }
+            if reads != 0 {
+                require_view_column_privilege_as(
+                    storage,
+                    view,
+                    crate::storage::PrivilegeSet::SELECT,
+                    reads,
+                    role,
+                    txid,
+                )?;
+            }
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view privilege target is not data-modifying"
+            ));
+        }
+    }
+    Ok(match storage.view(view).security_for(txid) {
+        crate::storage::ViewSecurity::Definer => DmlAuthorization::RuleOwner(storage.object_owner(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::View,
+                slot: view as u16,
+            },
+            txid,
+        ) as u16),
+        crate::storage::ViewSecurity::Invoker => authorization,
+    })
 }
 
 /// Public view of the OID-to-ColType mapping for value-level renderers

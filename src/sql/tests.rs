@@ -7169,6 +7169,7 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
          CREATE ROLE column_reader; \
          CREATE ROLE column_leaf; \
          CREATE ROLE column_owner; \
+         CREATE ROLE view_column_reader; \
          GRANT CREATE ON SCHEMA public TO column_writer, column_owner; \
          CREATE TABLE column_acl_target ( \
            id integer PRIMARY KEY, visible text, mutable text, secret text \
@@ -7453,7 +7454,8 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
         &mut engine,
         &mut budget,
         "CREATE VIEW column_acl_view AS SELECT visible, secret FROM column_acl_target; \
-         GRANT SELECT ON column_acl_view TO column_writer",
+         GRANT SELECT ON column_acl_view TO column_writer; \
+         GRANT SELECT (visible) ON column_acl_view TO view_column_reader",
     );
     assert_eq!(
         data_rows(&run_with(
@@ -7464,12 +7466,46 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
         )),
         ["t"]
     );
-    let view_column_grant = run_with(
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT has_column_privilege( \
+               'view_column_reader', 'column_acl_view', 'visible', 'SELECT'), \
+                    has_column_privilege( \
+               'view_column_reader', 'column_acl_view', 'secret', 'SELECT'); \
+             SET ROLE view_column_reader; \
+             SELECT visible FROM column_acl_view; \
+             RESET ROLE"
+        )),
+        ["t|f", "shown", "second"]
+    );
+    let denied_view_column = run_with(
         &mut engine,
         &mut budget,
-        "GRANT SELECT (visible) ON column_acl_view TO column_writer",
+        "SET ROLE view_column_reader; SELECT secret FROM column_acl_view",
     );
-    assert!(String::from_utf8_lossy(&view_column_grant).contains("0A000"));
+    assert!(String::from_utf8_lossy(&denied_view_column).contains("42501"));
+    run_with(&mut engine, &mut budget, "RESET ROLE");
+    run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT SELECT (visible) ON column_acl_view TO column_reader WITH GRANT OPTION; \
+         SET ROLE column_reader; \
+         GRANT SELECT (visible) ON column_acl_view TO column_leaf; \
+         RESET ROLE; \
+         REVOKE GRANT OPTION FOR SELECT (visible) ON column_acl_view \
+           FROM column_reader CASCADE",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT has_column_privilege( \
+               'column_leaf', 'column_acl_view', 'visible', 'SELECT')"
+        )),
+        ["f"]
+    );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
@@ -7486,9 +7522,19 @@ fn column_privileges_enforce_dml_dependencies_catalogs_and_cold_recovery() {
                'column_writer', 'column_acl_target', 'secret', 'SELECT'); \
              SELECT attacl::text FROM pg_attribute \
               WHERE attrelid = 'column_owned_target'::regclass AND attname = 'visible'; \
+             SELECT has_column_privilege( \
+               'view_column_reader', 'column_acl_view', 'visible', 'SELECT'), \
+                    has_column_privilege( \
+               'view_column_reader', 'column_acl_view', 'secret', 'SELECT'); \
              SET ROLE column_writer; SELECT visible FROM column_acl_target; RESET ROLE"
         )),
-        ["t|f", "{column_writer=r/column_reader}", "shown", "second"]
+        [
+            "t|f",
+            "{column_writer=r/column_reader}",
+            "t|f",
+            "shown",
+            "second"
+        ]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -31825,7 +31871,11 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         for statement in [
             "CREATE SCHEMA durable_types",
+            "CREATE ROLE durable_type_owner",
             "CREATE TYPE coordinate AS (x integer, y integer)",
+            "CREATE TYPE altered_coordinate AS (value integer)",
+            "ALTER TYPE altered_coordinate ALTER ATTRIBUTE value TYPE bigint",
+            "ALTER TYPE altered_coordinate OWNER TO durable_type_owner",
             "CREATE TYPE place AS (name varchar(7) COLLATE \"C\", point coordinate)",
             "CREATE TABLE durable_places (value place)",
             "INSERT INTO durable_places VALUES (ROW('Station', ROW(4, 8)::coordinate)::place)",
@@ -31886,6 +31936,23 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         "{}",
         String::from_utf8_lossy(&metadata)
     );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT atttypid::regtype FROM pg_attribute \
+             WHERE attrelid = 'altered_coordinate'::regclass AND attname = 'value'",
+        )),
+        ["bigint"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_userbyid(typowner) FROM pg_type WHERE typname = 'altered_coordinate'",
+        )),
+        ["durable_type_owner"]
+    );
     let bytes = run_with(
         &mut engine,
         &mut budget,
@@ -31905,6 +31972,16 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
             .contains("column point of composite type place depends on type coordinate_renamed"),
         "{}",
         String::from_utf8_lossy(&bytes)
+    );
+    let restored = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TYPE altered_coordinate OWNER TO postgres; DROP ROLE durable_type_owner",
+    );
+    assert!(
+        !String::from_utf8_lossy(&restored).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&restored)
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
@@ -32252,60 +32329,48 @@ fn composite_array_attribute_evolution_preserves_old_values() {
 }
 
 #[test]
-fn composite_attribute_not_null_is_enforced_on_alter_and_new_values() {
+fn composite_attribute_not_null_is_rejected_at_the_parse_boundary() {
     let (mut engine, mut budget) = test_engine();
-    run_with(
+    let set = run_with(
         &mut engine,
         &mut budget,
         "CREATE TYPE required_part AS (value integer); \
-         CREATE TABLE required_parts (part required_part); \
-         INSERT INTO required_parts VALUES (ROW(NULL)::required_part)",
-    );
-    let existing = run_with(
-        &mut engine,
-        &mut budget,
-        "ALTER TYPE required_part ALTER ATTRIBUTE value SET NOT NULL",
+         ALTER TYPE required_part ALTER ATTRIBUTE value SET NOT NULL",
     );
     assert!(
-        String::from_utf8_lossy(&existing).contains("23502"),
+        String::from_utf8_lossy(&set).contains("42601"),
         "{}",
-        String::from_utf8_lossy(&existing)
+        String::from_utf8_lossy(&set)
     );
-    run_with(
+    let drop = run_with(
         &mut engine,
         &mut budget,
-        "DELETE FROM required_parts; ALTER TYPE required_part ALTER ATTRIBUTE value SET NOT NULL",
-    );
-    let inserted = run_with(
-        &mut engine,
-        &mut budget,
-        "INSERT INTO required_parts VALUES (ROW(NULL)::required_part)",
+        "ALTER TYPE required_part ALTER ATTRIBUTE value DROP NOT NULL",
     );
     assert!(
-        String::from_utf8_lossy(&inserted).contains("23502"),
+        String::from_utf8_lossy(&drop).contains("42601"),
         "{}",
-        String::from_utf8_lossy(&inserted)
+        String::from_utf8_lossy(&drop)
     );
 }
 
 #[test]
-fn composite_attribute_type_changes_validate_old_values_before_publication() {
+fn composite_attribute_type_changes_reject_dependent_values() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
         &mut budget,
         "CREATE TYPE converted_part AS (value integer); \
-         CREATE TABLE converted_parts (part converted_part); \
-         INSERT INTO converted_parts VALUES (ROW(42)::converted_part); \
          ALTER TYPE converted_part ALTER ATTRIBUTE value TYPE text",
     );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT (part).value, pg_typeof((part).value) FROM converted_parts",
+            "SELECT atttypid::regtype FROM pg_attribute \
+             WHERE attrelid = 'converted_part'::regclass AND attname = 'value'",
         )),
-        ["42|text"]
+        ["text"]
     );
     run_with(
         &mut engine,
@@ -32314,16 +32379,17 @@ fn composite_attribute_type_changes_validate_old_values_before_publication() {
          CREATE TABLE invalid_conversions (part invalid_conversion); \
          INSERT INTO invalid_conversions VALUES (ROW('not-a-number')::invalid_conversion)",
     );
-    let invalid = run_with(
-        &mut engine,
-        &mut budget,
+    for statement in [
         "ALTER TYPE invalid_conversion ALTER ATTRIBUTE value TYPE integer",
-    );
-    assert!(
-        String::from_utf8_lossy(&invalid).contains("22P02"),
-        "{}",
-        String::from_utf8_lossy(&invalid)
-    );
+        "ALTER TYPE invalid_conversion ALTER ATTRIBUTE value TYPE integer CASCADE",
+    ] {
+        let invalid = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&invalid).contains("0A000"),
+            "{}",
+            String::from_utf8_lossy(&invalid)
+        );
+    }
 }
 
 #[test]
@@ -33563,8 +33629,16 @@ fn domain_identity_changes_survive_wal_and_checkpoint_recovery() {
         "CREATE SCHEMA recovered_domain; \
          CREATE DOMAIN recover_old AS integer CHECK (VALUE > 0); \
          CREATE DOMAIN recover_child AS recover_old; \
+         CREATE DOMAIN recover_not_valid AS integer; \
          CREATE TABLE recover_values (value recover_old, values recover_old[]); \
+         CREATE TABLE recover_not_valid_values (value recover_not_valid); \
          INSERT INTO recover_values VALUES (3, ARRAY[4]::recover_old[]); \
+         INSERT INTO recover_not_valid_values VALUES (8); \
+         ALTER DOMAIN recover_not_valid ADD CONSTRAINT recover_not_valid_wide \
+           CHECK (VALUE < 10) NOT VALID; \
+         ALTER DOMAIN recover_not_valid ADD CONSTRAINT recover_not_valid_small \
+           CHECK (VALUE < 5) NOT VALID; \
+         ALTER DOMAIN recover_not_valid VALIDATE CONSTRAINT recover_not_valid_wide; \
          ALTER DOMAIN recover_old RENAME TO recover_new; \
          ALTER DOMAIN recover_new SET SCHEMA recovered_domain; \
          INSERT INTO recover_values VALUES (5, ARRAY[6]::recovered_domain.recover_new[])",
@@ -33577,13 +33651,26 @@ fn domain_identity_changes_survive_wal_and_checkpoint_recovery() {
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "SELECT value FROM recover_values ORDER BY value; SELECT 7::recover_child; SELECT 8::recovered_domain.recover_new",
+        "SELECT value FROM recover_values ORDER BY value; SELECT 7::recover_child; \
+         SELECT 8::recovered_domain.recover_new; \
+         SELECT convalidated FROM pg_constraint WHERE contypid = 'recover_not_valid'::regtype \
+           ORDER BY conname",
     );
     assert_eq!(
         data_rows(&output),
-        ["3", "5", "7", "8"],
+        ["3", "5", "7", "8", "f", "t"],
         "{}",
         String::from_utf8_lossy(&output)
+    );
+    let rejected = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO recover_not_valid_values VALUES (9)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
     );
     assert!(restarted.checkpoint().unwrap());
     drop(restarted);
@@ -33593,11 +33680,14 @@ fn domain_identity_changes_survive_wal_and_checkpoint_recovery() {
     let output = run_with(
         &mut checkpoint_restarted,
         &mut checkpoint_budget,
-        "SELECT value FROM recover_values ORDER BY value; SELECT 9::recover_child; SELECT 10::recovered_domain.recover_new",
+        "SELECT value FROM recover_values ORDER BY value; SELECT 9::recover_child; \
+         SELECT 10::recovered_domain.recover_new; \
+         SELECT convalidated FROM pg_constraint WHERE contypid = 'recover_not_valid'::regtype \
+           ORDER BY conname",
     );
     assert_eq!(
         data_rows(&output),
-        ["3", "5", "9", "10"],
+        ["3", "5", "9", "10", "f", "t"],
         "{}",
         String::from_utf8_lossy(&output)
     );
@@ -36859,6 +36949,39 @@ fn updatable_view_dml() {
         data_rows(&run_with(&mut e, &mut b, "SELECT x FROM v ORDER BY x")),
         ["3", "5", "9"]
     );
+}
+
+#[test]
+fn updatable_view_column_privileges_authorize_definer_rewrites() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE view_column_writer; \
+         CREATE TABLE view_column_write_base (id integer, hidden text); \
+         CREATE VIEW view_column_write AS SELECT id FROM view_column_write_base; \
+         GRANT INSERT (id), UPDATE (id), SELECT (id) ON view_column_write \
+           TO view_column_writer; \
+         GRANT DELETE ON view_column_write TO view_column_writer",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE view_column_writer; \
+         INSERT INTO view_column_write (id) VALUES (1) RETURNING id; \
+         UPDATE view_column_write SET id = 2 WHERE id = 1 RETURNING id; \
+         DELETE FROM view_column_write WHERE id = 2; \
+         RESET ROLE; \
+         SELECT count(*) FROM view_column_write_base",
+    );
+    assert_eq!(data_rows(&output), ["1", "2", "0"]);
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE view_column_writer; \
+         INSERT INTO view_column_write_base (id) VALUES (3)",
+    );
+    assert!(String::from_utf8_lossy(&denied).contains("42501"));
 }
 
 #[test]

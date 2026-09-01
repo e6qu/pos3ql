@@ -520,6 +520,7 @@ fn rule_relation_ref<'a>(
         with_ordinality: false,
         lateral: false,
         authorization_role: None,
+        view_access: None,
     }
 }
 
@@ -902,6 +903,7 @@ pub(crate) fn rule_transition_source<'a>(
                 with_ordinality: false,
                 lateral: false,
                 authorization_role: None,
+                view_access: None,
             };
             for (column, name) in columns.iter().copied().enumerate() {
                 let expression = input_columns
@@ -967,6 +969,7 @@ pub(crate) fn rule_transition_source<'a>(
         with_ordinality: false,
         lateral: false,
         authorization_role: None,
+        view_access: None,
     };
     Ok(RuleTransitionSource {
         source,
@@ -4516,6 +4519,7 @@ fn subst_tableref<'a>(
             with_ordinality: false,
             lateral: false,
             authorization_role: None,
+            view_access: None,
         });
     }
     // An unqualified name matching a CTE becomes a derived table over the
@@ -4546,6 +4550,7 @@ fn subst_tableref<'a>(
             with_ordinality: false,
             lateral: false,
             authorization_role: None,
+            view_access: None,
         });
     }
     // A name resolving to a view (not shadowed by a CTE, and not out-resolved
@@ -4609,6 +4614,11 @@ fn subst_tableref<'a>(
             slot: slot as u16,
         };
         if !context.storage.has_object_privilege(
+            view_object,
+            requester,
+            crate::storage::PrivilegeSet::SELECT,
+            context.txid,
+        ) && !context.storage.has_any_column_privilege(
             view_object,
             requester,
             crate::storage::PrivilegeSet::SELECT,
@@ -4687,6 +4697,7 @@ fn subst_tableref<'a>(
             with_ordinality: false,
             lateral: false,
             authorization_role: None,
+            view_access: Some(slot as u16),
         });
     }
     // Inside a view body, pin a table reference to the schema it resolved to

@@ -8781,6 +8781,32 @@ pub(crate) struct AccessObject {
     pub slot: u16,
 }
 
+/// A PostgreSQL `ALTER TYPE` target that can own a type independently.
+///
+/// Domains have their own `ALTER DOMAIN` grammar. Keeping the accepted
+/// alternatives closed here prevents an owner command from accidentally
+/// treating a domain or a backing relation as a named type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AlterTypeTarget {
+    Enum(u16),
+    Composite(u16),
+}
+
+impl AlterTypeTarget {
+    pub(crate) const fn access_object(self) -> AccessObject {
+        match self {
+            Self::Enum(slot) => AccessObject {
+                class: AccessClass::Enum,
+                slot,
+            },
+            Self::Composite(slot) => AccessObject {
+                class: AccessClass::Composite,
+                slot,
+            },
+        }
+    }
+}
+
 /// PostgreSQL object privileges represented as a compact set. Unsupported
 /// object/privilege combinations are rejected before they reach storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15718,6 +15744,50 @@ impl Storage {
 
     pub(crate) fn column_acl_entry_count(&self) -> usize {
         self.column_acl_entries.len()
+    }
+
+    /// Enumerate the durable column-ACL targets attached to one relation.
+    /// Object-level grant-option revocation must visit only targets that can
+    /// actually have downstream grants; a view has no backing `TableDef` to
+    /// use as a surrogate column list.
+    pub(crate) fn column_acl_targets(
+        &self,
+        relation: AccessObject,
+        txid: u32,
+        output: &mut [ColumnPrivilegeTarget; MAX_COLUMN_ACL_ENTRIES],
+    ) -> usize {
+        let mut count = 0usize;
+        for entry in self.column_acl_entries.iter() {
+            let (visible, _, _, _, _) = Self::column_acl_visible(entry, txid);
+            if !visible
+                || entry.target.relation != relation
+                || output[..count].contains(&entry.target)
+            {
+                continue;
+            }
+            output[count] = entry.target;
+            count += 1;
+        }
+        count
+    }
+
+    /// Whether a role has a privilege on at least one explicitly-granted
+    /// column. This is the only legal relation-level admission for a view
+    /// without an object-level grant; exact projected-column checks still run
+    /// at the query-scope boundary.
+    pub(crate) fn has_any_column_privilege(
+        &self,
+        relation: AccessObject,
+        role: usize,
+        privilege: PrivilegeSet,
+        txid: u32,
+    ) -> bool {
+        self.column_acl_entries.iter().any(|entry| {
+            let (visible, _, _, _, _) = Self::column_acl_visible(entry, txid);
+            visible
+                && entry.target.relation == relation
+                && self.has_column_privilege(entry.target, role, privilege, txid)
+        })
     }
 
     pub(crate) fn dependent_column_acl_slots(
@@ -25835,13 +25905,23 @@ impl Storage {
         let (qualifier, name) = type_name
             .split_once('.')
             .map_or((None, type_name), |(s, n)| (Some(s), n));
-        self.composites.iter().enumerate().find_map(|(slot, definition)| {
-            (definition.database == self.current_database
-                && definition.visible_to(txid)
-                && definition.definition_for(txid).name.as_str() == name
-                && qualifier.map_or_else(|| self.path.entries().iter().any(|entry| matches!(entry, PathEntry::Schema(schema_slot) if self.schemas[*schema_slot as usize].name == definition.definition_for(txid).schema)), |schema| definition.definition_for(txid).schema.as_str() == schema))
-                .then_some(slot)
-        })
+        self.find_composite_slot(qualifier, name, txid)
+    }
+
+    fn find_composite_slot(&self, qualifier: Option<&str>, name: &str, txid: u32) -> Option<usize> {
+        if let Some(schema) = qualifier {
+            return self.composite_slot(schema, name, txid);
+        }
+        for entry in self.path.entries() {
+            let PathEntry::Schema(schema_slot) = entry else {
+                continue;
+            };
+            let schema = self.schemas[*schema_slot as usize].name;
+            if let Some(slot) = self.composite_slot(schema.as_str(), name, txid) {
+                return Some(slot);
+            }
+        }
+        None
     }
 
     pub fn composite_slot(&self, schema: &str, name: &str, txid: u32) -> Option<usize> {
@@ -25851,6 +25931,51 @@ impl Storage {
                 && definition.definition_for(txid).schema.as_str() == schema
                 && definition.definition_for(txid).name.as_str() == name
         })
+    }
+
+    /// Resolve the closed PostgreSQL `ALTER TYPE ... OWNER` target set.
+    ///
+    /// Search-path resolution is performed once across the shared named-type
+    /// namespace, so an enum in a later schema cannot shadow a composite in an
+    /// earlier schema (or vice versa).
+    pub(crate) fn resolve_alter_type_target(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+        txid: u32,
+    ) -> Option<AlterTypeTarget> {
+        if let Some(schema) = qualifier {
+            return self.alter_type_target_in_schema(schema, name, txid);
+        }
+        for entry in self.path.entries() {
+            let PathEntry::Schema(schema_slot) = entry else {
+                continue;
+            };
+            let schema = self.schemas[*schema_slot as usize].name;
+            if let Some(target) = self.alter_type_target_in_schema(schema.as_str(), name, txid) {
+                return Some(target);
+            }
+        }
+        None
+    }
+
+    fn alter_type_target_in_schema(
+        &self,
+        schema: &str,
+        name: &str,
+        txid: u32,
+    ) -> Option<AlterTypeTarget> {
+        match (
+            self.enum_slot(schema, name, txid),
+            self.composite_slot(schema, name, txid),
+        ) {
+            (Some(enum_slot), None) => Some(AlterTypeTarget::Enum(enum_slot as u16)),
+            (None, Some(composite_slot)) => Some(AlterTypeTarget::Composite(composite_slot as u16)),
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                unreachable!("the shared named-type namespace admitted a duplicate")
+            }
+        }
     }
 
     pub fn composite(&self, slot: usize) -> &CompositeDef {

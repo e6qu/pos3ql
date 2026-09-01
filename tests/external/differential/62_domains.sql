@@ -8,10 +8,16 @@ DROP TABLE IF EXISTS dom_t;
 DROP TABLE IF EXISTS dom_t2;
 DROP TABLE IF EXISTS dom_nested;
 DROP TABLE IF EXISTS dom_invalid;
+DROP TABLE IF EXISTS dom_not_valid_t;
 DROP DOMAIN IF EXISTS dom_small;
 DROP DOMAIN IF EXISTS dom_pos;
 DROP DOMAIN IF EXISTS dom_email;
 DROP DOMAIN IF EXISTS dom_def;
+DROP DOMAIN IF EXISTS dom_not_valid;
+DROP DOMAIN IF EXISTS dom_moved_schema.dom_moved;
+DROP DOMAIN IF EXISTS dom_move;
+DROP SCHEMA IF EXISTS dom_moved_schema CASCADE;
+DROP ROLE IF EXISTS dom_move_owner;
 DROP TYPE IF EXISTS dom_shared_name;
 
 CREATE TYPE dom_shared_name AS ENUM ('one');
@@ -19,6 +25,8 @@ CREATE DOMAIN dom_shared_name AS int;
 DROP TYPE dom_shared_name;
 
 CREATE DOMAIN dom_pos AS int CONSTRAINT gt0 CHECK (VALUE > 0) CONSTRAINT lt100 CHECK (VALUE < 100);
+CREATE DOMAIN dom_duplicate AS int CONSTRAINT duplicate_check CHECK (VALUE > 0)
+  CONSTRAINT duplicate_check CHECK (VALUE < 10);
 CREATE DOMAIN dom_email AS text NOT NULL CHECK (VALUE LIKE '%@%');
 CREATE DOMAIN dom_def AS int DEFAULT 42 CHECK (VALUE >= 0);
 
@@ -141,6 +149,50 @@ SELECT x FROM dom_invalid_t ORDER BY x;
 -- ALTER DOMAIN DROP CONSTRAINT on a missing constraint is 42704.
 ALTER DOMAIN dom_pos DROP CONSTRAINT nope;
 
+-- NOT VALID domain CHECKs immediately constrain future values without scanning
+-- existing rows. Other lifecycle commands scan only their named new rule:
+-- one old row can violate an unrelated NOT VALID constraint without blocking a
+-- validated add, validation, or a NOT NULL transition.
+CREATE DOMAIN dom_not_valid AS int;
+CREATE TABLE dom_not_valid_t (x dom_not_valid);
+INSERT INTO dom_not_valid_t VALUES (8);
+ALTER DOMAIN dom_not_valid ADD CONSTRAINT dom_not_valid_lt5 CHECK (VALUE < 5) NOT VALID;
+ALTER DOMAIN dom_not_valid ADD CONSTRAINT dom_not_valid_lt10 CHECK (VALUE < 10);
+ALTER DOMAIN dom_not_valid ADD CONSTRAINT dom_not_valid_positive CHECK (VALUE > 0) NOT VALID;
+ALTER DOMAIN dom_not_valid ADD CONSTRAINT dom_not_valid_positive CHECK (VALUE <> 0) NOT VALID;
+SELECT conname, conenforced, convalidated
+  FROM pg_constraint WHERE contypid = 'dom_not_valid'::regtype;
+INSERT INTO dom_not_valid_t VALUES (9);
+ALTER DOMAIN dom_not_valid VALIDATE CONSTRAINT dom_not_valid_positive;
+ALTER DOMAIN dom_not_valid SET NOT NULL;
+ALTER DOMAIN dom_not_valid DROP NOT NULL;
+SELECT conname, convalidated
+  FROM pg_constraint WHERE contypid = 'dom_not_valid'::regtype
+ ORDER BY conname;
+ALTER DOMAIN dom_not_valid VALIDATE CONSTRAINT dom_not_valid_lt5;
+UPDATE dom_not_valid_t SET x = 4;
+ALTER DOMAIN dom_not_valid VALIDATE CONSTRAINT dom_not_valid_lt5;
+ALTER DOMAIN dom_not_valid RENAME CONSTRAINT dom_not_valid_lt5 TO dom_not_valid_small;
+SELECT conname, convalidated, pg_get_constraintdef(oid)
+  FROM pg_constraint WHERE contypid = 'dom_not_valid'::regtype
+ ORDER BY conname;
+ALTER DOMAIN dom_not_valid DROP CONSTRAINT dom_not_valid_small RESTRICT;
+ALTER DOMAIN dom_not_valid DROP CONSTRAINT dom_not_valid_lt10 CASCADE;
+
+-- Schema/name/owner mutations retain the stable type identity and expose the
+-- resulting catalog definition.
+CREATE SCHEMA dom_moved_schema;
+CREATE ROLE dom_move_owner;
+CREATE DOMAIN dom_move AS integer;
+ALTER DOMAIN dom_move SET SCHEMA dom_moved_schema;
+ALTER DOMAIN dom_moved_schema.dom_move RENAME TO dom_moved;
+ALTER DOMAIN dom_moved_schema.dom_moved OWNER TO dom_move_owner;
+SELECT typname, nspname, rolname
+  FROM pg_type
+  JOIN pg_namespace ON pg_namespace.oid = typnamespace
+  JOIN pg_roles ON pg_roles.oid = typowner
+ WHERE typname = 'dom_moved';
+
 -- An unknown type name is 42704.
 CREATE TABLE dom_bad (a nonesuch);
 
@@ -148,8 +200,13 @@ DROP TABLE dom_t;
 DROP TABLE dom_t2;
 DROP TABLE dom_nested;
 DROP TABLE dom_invalid_t;
+DROP TABLE dom_not_valid_t;
 DROP DOMAIN dom_small;
 DROP DOMAIN dom_pos;
 DROP DOMAIN dom_email;
 DROP DOMAIN dom_def;
 DROP DOMAIN dom_invalid;
+DROP DOMAIN dom_not_valid;
+DROP DOMAIN dom_moved_schema.dom_moved;
+DROP SCHEMA dom_moved_schema;
+DROP ROLE dom_move_owner;

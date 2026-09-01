@@ -2852,6 +2852,9 @@ pub struct TableRef<'a> {
     /// Set only by stored-view expansion; ordinary parsed references use the
     /// current effective role.
     pub authorization_role: Option<u16>,
+    /// Source view retained across expansion so projected column privileges
+    /// remain enforceable after its body becomes a derived table.
+    pub view_access: Option<u16>,
 }
 
 impl TableRef<'_> {
@@ -3631,13 +3634,25 @@ pub struct RoutineIdentity<'a> {
 pub struct DomainCheck<'a> {
     pub name: Option<&'a str>,
     pub expression: &'a str,
+    /// PostgreSQL validates existing rows separately from enforcement of new
+    /// values; the closed constraint state carries both facts.
+    pub validation: ConstraintValidation,
 }
 
 /// One `ALTER DOMAIN` action.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlterDomainAction<'a> {
     AddCheck(DomainCheck<'a>),
-    DropConstraint { name: &'a str, if_exists: bool },
+    DropConstraint {
+        name: &'a str,
+        if_exists: bool,
+        cascade: bool,
+    },
+    RenameConstraint {
+        from: &'a str,
+        to: &'a str,
+    },
+    ValidateConstraint(&'a str),
     SetNotNull,
     DropNotNull,
     SetDefault(&'a str),
@@ -3661,7 +3676,7 @@ pub enum AlterTypeAction<'a> {
     RenameTo(&'a str),
     /// SET SCHEMA new_schema. The durable type identity remains its catalog slot.
     SetSchema(&'a str),
-    /// RENAME VALUE 'old' TO 'new' — rejected (values are stored inline).
+    /// RENAME VALUE 'old' TO 'new'.
     RenameValue { from: &'a str, to: &'a str },
     /// ADD ATTRIBUTE name type.
     AddAttribute(CompositeField<'a>),
@@ -3675,11 +3690,8 @@ pub enum AlterTypeAction<'a> {
         type_name: &'a str,
         type_mod: i32,
         collation: ParsedCollation<'a>,
+        cascade: bool,
     },
-    /// ALTER ATTRIBUTE name SET NOT NULL.
-    SetAttributeNotNull(&'a str),
-    /// ALTER ATTRIBUTE name DROP NOT NULL.
-    DropAttributeNotNull(&'a str),
 }
 
 /// Referential action for a foreign key's ON DELETE / ON UPDATE.

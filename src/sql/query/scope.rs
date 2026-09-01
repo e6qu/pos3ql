@@ -138,6 +138,10 @@ pub struct QueryScope<'d> {
     /// populate this with their owner; ordinary references leave it empty and
     /// execute as the session's current role.
     pub authorization_roles: &'d mut [Option<u16>],
+    /// Original view identity for an expanded derived source. The underlying
+    /// body has its own authorization role; this identity checks the caller's
+    /// projected-column authority at the outer query boundary.
+    pub view_accesses: &'d mut [Option<u16>],
     /// Derived tables (`FROM (SELECT ...) alias`): the materialized rows,
     /// self-describing-encoded. `None` marks a physical table (scanned from
     /// storage by `slots`).
@@ -253,6 +257,9 @@ impl<'d> QueryScope<'d> {
         let authorization_roles = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
+        let view_accesses = arena
+            .alloc_slice_with(table_count, |_| None)
+            .map_err(|_| arena_full())?;
         let derived = arena
             .alloc_slice_with(table_count, |_| None)
             .map_err(|_| arena_full())?;
@@ -297,6 +304,7 @@ impl<'d> QueryScope<'d> {
             defs,
             slots,
             authorization_roles,
+            view_accesses,
             derived,
             external_runs,
             lateral,
@@ -515,6 +523,7 @@ impl<'d> QueryScope<'d> {
             self.derived[self.n] = Some(&[]);
             self.lateral[self.n] = true;
             self.slots[self.n] = usize::MAX;
+            self.view_accesses[self.n] = tref.view_access;
             self.n += 1;
             return Ok(());
         }
@@ -598,6 +607,7 @@ impl<'d> QueryScope<'d> {
         self.derived[self.n] = Some(rows);
         self.external_runs[self.n] = external_run;
         self.slots[self.n] = usize::MAX;
+        self.view_accesses[self.n] = tref.view_access;
         self.n += 1;
         Ok(())
     }

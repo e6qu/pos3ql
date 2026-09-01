@@ -4070,6 +4070,7 @@ impl<'a> Parser<'a> {
         let mut checks = [DomainCheck {
             name: None,
             expression: "",
+            validation: ConstraintValidation::EnforcedValidated,
         }; MAX_LIST];
         let mut n_checks = 0;
         loop {
@@ -4090,6 +4091,7 @@ impl<'a> Parser<'a> {
                 checks[n_checks] = DomainCheck {
                     name: cname,
                     expression: self.check_text()?,
+                    validation: ConstraintValidation::EnforcedValidated,
                 };
                 n_checks += 1;
             } else if cname.is_none() && self.eat_ident("default")? {
@@ -4137,10 +4139,21 @@ impl<'a> Parser<'a> {
                 None
             };
             self.expect_ident("check")?;
+            let expression = self.check_text()?;
+            let validation = if self.eat_ident("not")? {
+                self.expect_ident("valid")?;
+                ConstraintValidation::EnforcedNotValid
+            } else {
+                ConstraintValidation::EnforcedValidated
+            };
             AlterDomainAction::AddCheck(DomainCheck {
                 name: cname,
-                expression: self.check_text()?,
+                expression,
+                validation,
             })
+        } else if self.eat_ident("validate")? {
+            self.expect_ident("constraint")?;
+            AlterDomainAction::ValidateConstraint(self.col_ident("constraint name")?)
         } else if self.eat_ident("drop")? {
             if self.eat_ident("constraint")? {
                 let if_exists = if self.eat_ident("if")? {
@@ -4149,9 +4162,17 @@ impl<'a> Parser<'a> {
                 } else {
                     false
                 };
+                let name = self.col_ident("constraint name")?;
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
                 AlterDomainAction::DropConstraint {
-                    name: self.col_ident("constraint name")?,
+                    name,
                     if_exists,
+                    cascade,
                 }
             } else if self.eat_ident("not")? {
                 self.expect_ident("null")?;
@@ -4175,10 +4196,21 @@ impl<'a> Parser<'a> {
                 )
             }
         } else if self.eat_ident("rename")? {
-            self.expect_ident("to")?;
-            AlterDomainAction::Rename(self.col_ident("new domain name")?)
+            if self.eat_ident("constraint")? {
+                let from = self.col_ident("constraint name")?;
+                self.expect_ident("to")?;
+                AlterDomainAction::RenameConstraint {
+                    from,
+                    to: self.col_ident("new constraint name")?,
+                }
+            } else {
+                self.expect_ident("to")?;
+                AlterDomainAction::Rename(self.col_ident("new domain name")?)
+            }
         } else {
-            return Err(self.err_here("expected ADD, DROP, RENAME or SET after ALTER DOMAIN"));
+            return Err(
+                self.err_here("expected ADD, DROP, RENAME, SET or VALIDATE after ALTER DOMAIN")
+            );
         };
         Ok(Stmt::AlterDomain { name, action })
     }
@@ -4346,24 +4378,26 @@ impl<'a> Parser<'a> {
             self.expect_ident("attribute")?;
             let field = self.any_ident("composite field name")?;
             if self.eat_ident("set")? {
-                if self.eat_ident("data")? {
-                    self.expect_ident("type")?;
-                    let (type_name, type_mod) = self.type_name_mod()?;
-                    let collation = if self.eat_ident("collate")? {
-                        self.collation_name()?
-                    } else {
-                        crate::sql::ast::ParsedCollation::DEFAULT
-                    };
-                    AlterTypeAction::AlterAttributeType {
-                        name: field,
-                        type_name,
-                        type_mod,
-                        collation,
-                    }
+                self.expect_ident("data")?;
+                self.expect_ident("type")?;
+                let (type_name, type_mod) = self.type_name_mod()?;
+                let collation = if self.eat_ident("collate")? {
+                    self.collation_name()?
                 } else {
-                    self.expect_ident("not")?;
-                    self.expect_ident("null")?;
-                    AlterTypeAction::SetAttributeNotNull(field)
+                    crate::sql::ast::ParsedCollation::DEFAULT
+                };
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
+                AlterTypeAction::AlterAttributeType {
+                    name: field,
+                    type_name,
+                    type_mod,
+                    collation,
+                    cascade,
                 }
             } else if self.eat_ident("type")? {
                 let (type_name, type_mod) = self.type_name_mod()?;
@@ -4372,20 +4406,21 @@ impl<'a> Parser<'a> {
                 } else {
                     crate::sql::ast::ParsedCollation::DEFAULT
                 };
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
                 AlterTypeAction::AlterAttributeType {
                     name: field,
                     type_name,
                     type_mod,
                     collation,
+                    cascade,
                 }
-            } else if self.eat_ident("drop")? {
-                self.expect_ident("not")?;
-                self.expect_ident("null")?;
-                AlterTypeAction::DropAttributeNotNull(field)
             } else {
-                return Err(self.err_here(
-                    "expected SET DATA TYPE, SET NOT NULL, or DROP NOT NULL after ALTER ATTRIBUTE",
-                ));
+                return Err(self.err_here("expected SET DATA TYPE after ALTER ATTRIBUTE"));
             }
         } else {
             return Err(

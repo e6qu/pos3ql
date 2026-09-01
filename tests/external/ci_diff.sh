@@ -1062,13 +1062,21 @@ reset_user_extensions() { # host port
 reset_user_relations() { # host port
   psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -A -t -q \
     -F $'\t' \
-    -c "SELECT n.nspname, c.relname FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p')" |
-  while IFS=$'\t' read -r schema relation; do
+    -c "SELECT n.nspname, c.relname, c.relkind FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND c.relkind IN ('r', 'p', 'm')" |
+  while IFS=$'\t' read -r schema relation relkind; do
     [[ -z "$relation" ]] && continue
     schema=${schema//\"/\"\"}
     relation=${relation//\"/\"\"}
+    case "$relkind" in
+    m) drop='DROP MATERIALIZED VIEW' ;;
+    r | p) drop='DROP TABLE' ;;
+    *)
+      printf 'FAIL: unexpected reset relation kind %q\n' "$relkind"
+      return 1
+      ;;
+    esac
     psql -h "$1" -p "$2" -U "$PGUSER" -d postgres -X -q \
-      -c "DROP TABLE \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
+      -c "$drop \"$schema\".\"$relation\" CASCADE" >/dev/null 2>&1
   done
 }
 reset_corpus_pair() {

@@ -4881,6 +4881,87 @@ pub fn alter_materialized_view_extension_dependency(
     sql_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn alter_materialized_view(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    scratch: &mut DmlScratch,
+    name: QualName<'_>,
+    if_exists: bool,
+    action: crate::sql::ast::AlterMaterializedViewAction<'_>,
+    arena: &Arena,
+    seq_session: &crate::sql::guc::SeqSession,
+    responder: &mut Responder,
+) -> Outcome {
+    let table = match storage.resolve_relation(name.schema, name.name, txn.txid) {
+        Some(crate::storage::ResolvedRelation::Table(table))
+            if storage.matview_slot_for_table(table, txn.txid).is_some() =>
+        {
+            table
+        }
+        Some(_) => {
+            return sql_fail(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not a materialized view",
+                name.name
+            ));
+        }
+        None if if_exists => {
+            responder.notice(
+                sqlstate::SUCCESSFUL_COMPLETION,
+                stack_format!(
+                    160,
+                    "materialized view \"{}\" does not exist, skipping",
+                    name.name
+                )
+                .as_str(),
+            )?;
+            responder.command_complete("ALTER MATERIALIZED VIEW")?;
+            return sql_ok();
+        }
+        None => return sql_fail(undefined_qual(&name)),
+    };
+    let action = match action {
+        crate::sql::ast::AlterMaterializedViewAction::RenameTo(name) => {
+            crate::sql::ast::AlterAction::RenameTable(name)
+        }
+        crate::sql::ast::AlterMaterializedViewAction::SetSchema(schema) => {
+            crate::sql::ast::AlterAction::SetSchema(schema)
+        }
+        crate::sql::ast::AlterMaterializedViewAction::SetTablespace(tablespace) => {
+            crate::sql::ast::AlterAction::SetTablespace(tablespace)
+        }
+    };
+    let statement = crate::sql::ast::AlterTable {
+        table: name,
+        if_exists: false,
+        only: false,
+        actions: core::slice::from_ref(&action),
+    };
+    debug_assert_eq!(
+        storage.matview_table(
+            storage
+                .matview_slot_for_table(table, txn.txid)
+                .expect("checked materialized view"),
+        ),
+        table
+    );
+    alter_table_inner(
+        storage,
+        wal,
+        txn,
+        scratch,
+        &statement,
+        arena,
+        seq_session,
+        responder,
+        true,
+        Some(crate::storage::TableKind::Local),
+        "ALTER MATERIALIZED VIEW",
+    )
+}
+
 pub fn alter_owner(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -5085,6 +5166,26 @@ pub fn alter_owner(
     if let Err(error) = rewrite_object_acl_owner(storage, txn, object, old_owner, new_owner as u16)
     {
         return sql_fail(error);
+    }
+    if object.class == AccessClass::MaterializedView {
+        let backing = AccessObject {
+            class: AccessClass::Table,
+            slot: storage.matview_table(usize::from(object.slot)) as u16,
+        };
+        let backing_old_owner = storage.object_owner(backing, txn.txid) as u16;
+        let backing_prior = storage.set_object_owner(backing, new_owner, txn.txid);
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ObjectOwnerChanged {
+            object: backing,
+            prior: backing_prior,
+        }) {
+            storage.restore_object_owner(backing, backing_prior);
+            return sql_fail(error);
+        }
+        if let Err(error) =
+            rewrite_object_acl_owner(storage, txn, backing, backing_old_owner, new_owner as u16)
+        {
+            return sql_fail(error);
+        }
     }
     responder.command_complete(tag)?;
     sql_ok()
@@ -9658,18 +9759,14 @@ pub fn drop_schema(
                 .enumerate()
                 .take(storage.matview_count())
             {
-                let matview = storage.matview(matview_slot);
-                if !is_dependent
-                    || !matview.visible_to(txn.txid)
-                    || in_listed(storage, matview.schema.as_str())
-                {
+                if !is_dependent || !storage.matview(matview_slot).visible_to(txn.txid) {
                     continue;
                 }
-                let Some(table) =
-                    storage.find_visible(matview.schema.as_str(), matview.name.as_str(), txn.txid)
-                else {
-                    return sql_fail(undefined_kind("materialized view", matview.name.as_str()));
-                };
+                let table = storage.matview_table(matview_slot);
+                let definition = storage.table_def(table, txn.txid);
+                if in_listed(storage, definition.schema.as_str()) {
+                    continue;
+                }
                 if let Err(error) = push(
                     SchemaObject::Matview {
                         table,
@@ -29555,8 +29652,7 @@ pub fn create_table_as(
         let mut cpath = crate::util::StackStr::<128>::new();
         let _ = write!(cpath, "{raw_path}");
         match storage.create_matview(
-            def.schema,
-            def.name,
+            table_index,
             crate::storage::StoredQueryDefinition {
                 sql: buffer,
                 creation_path: cpath,
@@ -32866,18 +32962,18 @@ fn report_composite_type_dependents(
         if !*selected {
             continue;
         }
-        let matview = storage.matview(matview_slot);
+        let definition = storage.table_def(storage.matview_table(matview_slot), txid);
         let line = if cascade {
             stack_format!(
                 192,
                 "drop cascades to materialized view {}",
-                matview.name.as_str()
+                definition.name.as_str()
             )
         } else {
             stack_format!(
                 192,
                 "materialized view {} depends on type {}",
-                matview.name.as_str(),
+                definition.name.as_str(),
                 type_name.as_str()
             )
         };
@@ -33253,8 +33349,7 @@ fn stored_query_dependent_closure(
         }
         let mut slot = 0;
         while slot < storage.matview_count() {
-            let matview = storage.matview(slot);
-            if matviews[slot] || !matview.visible_to(txid) {
+            if matviews[slot] || !storage.matview(slot).visible_to(txid) {
                 slot += 1;
                 continue;
             }
@@ -33273,15 +33368,7 @@ fn stored_query_dependent_closure(
                 });
             if hit {
                 matviews[slot] = true;
-                let table = storage
-                    .find_visible(matview.schema.as_str(), matview.name.as_str(), txid)
-                    .ok_or_else(|| {
-                        sql_err!(
-                            sqlstate::UNDEFINED_TABLE,
-                            "materialized view \"{}\" has no backing table",
-                            matview.name.as_str()
-                        )
-                    })?;
+                let table = storage.matview_table(slot);
                 matview_tables[table] = true;
                 changed = true;
             }
@@ -33336,11 +33423,7 @@ fn policy_depends_on_selected_stored_query(
                 .any(|(slot, selected)| {
                     *selected
                         && storage.matview(slot).visible_to(txid)
-                        && storage.find_visible(
-                            storage.matview(slot).schema.as_str(),
-                            storage.matview(slot).name.as_str(),
-                            txid,
-                        ) == Some(usize::from(dependency.slot))
+                        && storage.matview_table(slot) == usize::from(dependency.slot)
                 }),
             _ => false,
         })
@@ -33813,13 +33896,7 @@ fn report_stored_query_dependents(
                             if !matviews[matview_slot] || matview_depth[matview_slot] == 0 {
                                 continue;
                             }
-                            let matview = storage.matview(matview_slot);
-                            if storage.find_visible(
-                                matview.schema.as_str(),
-                                matview.name.as_str(),
-                                txid,
-                            ) == Some(dependency.slot as usize)
-                            {
+                            if storage.matview_table(matview_slot) == dependency.slot as usize {
                                 found = matview_depth[matview_slot].saturating_add(1);
                                 break;
                             }
@@ -33875,13 +33952,7 @@ fn report_stored_query_dependents(
                             if !matviews[matview_slot] || matview_depth[matview_slot] == 0 {
                                 continue;
                             }
-                            let matview = storage.matview(matview_slot);
-                            if storage.find_visible(
-                                matview.schema.as_str(),
-                                matview.name.as_str(),
-                                txid,
-                            ) == Some(dependency.slot as usize)
-                            {
+                            if storage.matview_table(matview_slot) == dependency.slot as usize {
                                 found = matview_depth[matview_slot].saturating_add(1);
                                 break;
                             }
@@ -33955,7 +34026,7 @@ fn report_stored_query_dependents(
         write_name(out, &view.schema, &view.name);
     };
     let describe_matview = |slot: usize, out: &mut crate::util::StackStr<192>| {
-        let matview = storage.matview(slot);
+        let matview = storage.table_def(storage.matview_table(slot), txid);
         let _ = write!(out, "materialized view ");
         write_name(out, &matview.schema, &matview.name);
     };
@@ -34186,13 +34257,9 @@ fn report_stored_query_dependents(
                                     .enumerate()
                                     .take(storage.matview_count())
                                 {
-                                    let matview = storage.matview(matview_slot);
                                     if parent_depth == depth - 1
-                                        && storage.find_visible(
-                                            matview.schema.as_str(),
-                                            matview.name.as_str(),
-                                            txid,
-                                        ) == Some(dependency.slot as usize)
+                                        && storage.matview_table(matview_slot)
+                                            == dependency.slot as usize
                                     {
                                         describe_matview(matview_slot, &mut parent);
                                         break;
@@ -34476,13 +34543,9 @@ fn drop_matview_slot(
     txn: &mut TxnState,
     slot: usize,
 ) -> Result<(), SqlError> {
-    let (schema, name) = {
-        let matview = storage.matview(slot);
-        (matview.schema, matview.name)
-    };
-    let table = storage
-        .find_visible(schema.as_str(), name.as_str(), txn.txid)
-        .ok_or_else(|| undefined_kind("materialized view", name.as_str()))?;
+    let table = storage.matview_table(slot);
+    let definition = *storage.table_def(table, txn.txid);
+    let (schema, name) = (definition.schema, definition.name);
     let lsn = storage.bump_lsn();
     wal.stage(
         txn.txid,

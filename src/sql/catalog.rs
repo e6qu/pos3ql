@@ -8867,12 +8867,10 @@ fn extension_dependency_catalog_identity(
         AccessClass::Table => (PG_CLASS_OID, table_oid(storage, slot)),
         AccessClass::View => (PG_CLASS_OID, view_oid(slot)),
         AccessClass::MaterializedView => {
-            let materialized = storage.matview(slot);
-            let table = storage.find_visible(
-                materialized.schema.as_str(),
-                materialized.name.as_str(),
-                txid,
-            )?;
+            let table = storage.matview_table(slot);
+            if !storage.table_slot_visible_to(table, txid) {
+                return None;
+            }
             (PG_CLASS_OID, table_oid(storage, table))
         }
         AccessClass::Sequence => (PG_CLASS_OID, sequence_oid(slot)),
@@ -9402,14 +9400,8 @@ fn pg_depend<'a>(
             }
         }
     }
-    for (materialized_slot, materialized_view) in storage.matviews_visible_to(txid) {
-        let Some(table_slot) = storage.find_visible(
-            materialized_view.schema.as_str(),
-            materialized_view.name.as_str(),
-            txid,
-        ) else {
-            continue;
-        };
+    for (materialized_slot, _) in storage.matviews_visible_to(txid) {
+        let table_slot = storage.matview_table(materialized_slot);
         for dependency in storage.matview_dependencies(materialized_slot).entries() {
             let Some((referenced_class, referenced_object)) = referenced_oid(dependency) else {
                 continue;
@@ -13408,8 +13400,14 @@ fn pg_tables<'a>(
             ("schemaname", ColType::Text),
             ("tablename", ColType::Text),
             ("tableowner", ColType::Text),
+            ("tablespace", ColType::Text),
+            ("hasindexes", ColType::Bool),
+            ("hasrules", ColType::Bool),
+            ("hastriggers", ColType::Bool),
+            ("rowsecurity", ColType::Bool),
         ],
     );
+    let indexes = collect_indexes(storage, txid, arena)?;
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut n = 0;
     for slot in 0..storage.table_count() {
@@ -13417,6 +13415,11 @@ fn pg_tables<'a>(
             continue;
         }
         let table = storage.table_def(slot, txid);
+        if table.kind == crate::storage::TableKind::Foreign
+            || storage.matview_slot_for_table(slot, txid).is_some()
+        {
+            continue;
+        }
         if n == out.len() {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -13432,28 +13435,26 @@ fn pg_tables<'a>(
                     arena,
                 )?,
                 text(table.name.as_str(), arena)?,
-                storage
-                    .matview_slot(table.schema.as_str(), table.name.as_str(), txid)
-                    .map_or_else(
-                        || {
-                            owner_name(
-                                storage,
-                                crate::storage::AccessClass::Table,
-                                slot,
-                                txid,
-                                arena,
-                            )
-                        },
-                        |matview| {
-                            owner_name(
-                                storage,
-                                crate::storage::AccessClass::MaterializedView,
-                                matview,
-                                txid,
-                                arena,
-                            )
-                        },
-                    )?,
+                owner_name(
+                    storage,
+                    crate::storage::AccessClass::Table,
+                    slot,
+                    txid,
+                    arena,
+                )?,
+                match table.tablespace {
+                    0 => Datum::Null,
+                    tablespace => storage
+                        .tablespace_name(tablespace, txid)
+                        .map_or(Ok(Datum::Null), |name| text(name.as_str(), arena))?,
+                },
+                Datum::Bool(indexes.iter().any(|index| index.table_slot == slot)),
+                Datum::Bool(storage.table_has_rules(slot, txid)),
+                Datum::Bool(
+                    storage.triggers_for_table(slot, txid).next().is_some()
+                        || !table.fkeys().is_empty(),
+                ),
+                Datum::Bool(table.row_level_security.enabled),
             ],
             arena,
         )?;
@@ -14198,23 +14199,25 @@ fn pg_matviews<'a>(
             ("definition", ColType::Text),
         ],
     );
+    let indexes = collect_indexes(storage, txid, arena)?;
     let mut out: [&[Datum]; 256] = [&[]; 256];
     let mut n = 0;
     for (slot, mv) in storage.matviews_visible_to(txid) {
         if n == out.len() {
             continue;
         }
+        let backing = storage.table_def(storage.matview_table(slot), txid);
         out[n] = row(
             &[
                 text(
                     arena
-                        .alloc_str(mv.schema.as_str())
+                        .alloc_str(backing.schema.as_str())
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
                 text(
                     arena
-                        .alloc_str(mv.name.as_str())
+                        .alloc_str(backing.name.as_str())
                         .map_err(|_| crate::sql::eval::arena_full())?,
                     arena,
                 )?,
@@ -14225,8 +14228,17 @@ fn pg_matviews<'a>(
                     txid,
                     arena,
                 )?,
-                Datum::Null,
-                Datum::Bool(false),
+                match backing.tablespace {
+                    0 => Datum::Null,
+                    tablespace => storage
+                        .tablespace_name(tablespace, txid)
+                        .map_or(Ok(Datum::Null), |name| text(name.as_str(), arena))?,
+                },
+                Datum::Bool(
+                    indexes
+                        .iter()
+                        .any(|index| index.table_slot == storage.matview_table(slot)),
+                ),
                 Datum::Bool(mv.populated),
                 text(
                     arena

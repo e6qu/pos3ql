@@ -4162,9 +4162,17 @@ impl<'a> Parser<'a> {
                 } else {
                     false
                 };
+                let name = self.col_ident("constraint name")?;
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
                 AlterDomainAction::DropConstraint {
-                    name: self.col_ident("constraint name")?,
+                    name,
                     if_exists,
+                    cascade,
                 }
             } else if self.eat_ident("not")? {
                 self.expect_ident("null")?;

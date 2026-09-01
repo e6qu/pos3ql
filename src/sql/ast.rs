@@ -3640,8 +3640,15 @@ pub struct DomainCheck<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlterDomainAction<'a> {
     AddCheck(DomainCheck<'a>),
-    DropConstraint { name: &'a str, if_exists: bool },
-    RenameConstraint { from: &'a str, to: &'a str },
+    DropConstraint {
+        name: &'a str,
+        if_exists: bool,
+        cascade: bool,
+    },
+    RenameConstraint {
+        from: &'a str,
+        to: &'a str,
+    },
     ValidateConstraint(&'a str),
     SetNotNull,
     DropNotNull,

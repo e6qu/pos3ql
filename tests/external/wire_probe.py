@@ -3145,6 +3145,67 @@ def test_catalog_aware_text_bind_parameters():
     s.close()
 
 
+def test_domain_constraint_lifecycle_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE DOMAIN wire_domain_lifecycle AS integer; "
+        "CREATE TABLE wire_domain_lifecycle_values (value wire_domain_lifecycle); "
+        "INSERT INTO wire_domain_lifecycle_values VALUES (8); "
+        "ALTER DOMAIN wire_domain_lifecycle ADD CONSTRAINT wire_domain_small "
+        "CHECK (VALUE < 5) NOT VALID; "
+        "ALTER DOMAIN wire_domain_lifecycle ADD CONSTRAINT wire_domain_wide "
+        "CHECK (VALUE < 10); "
+        "ALTER DOMAIN wire_domain_lifecycle ADD CONSTRAINT wire_domain_positive "
+        "CHECK (VALUE > 0) NOT VALID; "
+        "ALTER DOMAIN wire_domain_lifecycle VALIDATE CONSTRAINT wire_domain_positive",
+    )
+    check(
+        "raw wire: domain lifecycle setup preserves independent validation",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    domain_oid = int(
+        first_text_row(simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_domain_lifecycle'"))
+    )
+    rejected = extended_binary_parameter(
+        s, "SELECT $1::wire_domain_lifecycle", domain_oid, struct.pack("!i", 9)
+    )
+    check(
+        "raw wire: binary Bind applies a NOT VALID domain CHECK to new values",
+        has_sqlstate(rejected, "23514"),
+        rejected,
+    )
+    catalog = extended_binary_result(
+        s,
+        "SELECT convalidated FROM pg_constraint "
+        "WHERE conname = 'wire_domain_positive' AND contypid = 'wire_domain_lifecycle'::regtype",
+    )
+    description = next((payload for kind, payload in catalog if kind == b"T"), None)
+    row = next((payload for kind, payload in catalog if kind == b"D"), None)
+    check(
+        "raw wire: Describe and binary Result expose the validated domain constraint",
+        description is not None
+        and row_description_type_oids(description) == [16]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01\x00\x00\x00\x01\x01",
+        catalog,
+    )
+    validated = simple_query(
+        s,
+        "UPDATE wire_domain_lifecycle_values SET value = 4; "
+        "ALTER DOMAIN wire_domain_lifecycle VALIDATE CONSTRAINT wire_domain_small",
+    )
+    check(
+        "raw wire: domain validation completes after stored values are repaired",
+        not any(kind == b"E" for kind, _ in validated),
+        validated,
+    )
+    s.close()
+
+
 def test_transition_tables_over_raw_simple_query():
     s = connect()
     s.sendall(startup_payload(0))

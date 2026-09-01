@@ -31060,6 +31060,14 @@ fn build_domain_spec(
             Some(nm) => SqlName::parse(nm)?,
             None => generate_check_name(domain, &checks[..n])?,
         };
+        if checks[..n].iter().any(|check| check.name == name) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "constraint \"{}\" for domain \"{}\" already exists",
+                name.as_str(),
+                domain
+            ));
+        }
         checks[n] = crate::storage::CheckConstraint {
             name,
             expression: domain_text::<{ crate::storage::CHECK_SQL_MAX }>(c.expression)?,
@@ -32011,18 +32019,18 @@ pub fn alter_domain(
         checks: current.checks,
         n_checks: current.n_checks,
     };
-    let revalidate;
+    let revalidation;
     match action {
         A::SetNotNull => {
             spec.not_null = true;
-            revalidate = true;
+            revalidation = Some(DomainValidation::NotNull { target: slot });
         }
         A::DropNotNull => {
             spec.not_null = false;
-            revalidate = false;
+            revalidation = None;
         }
         A::SetDefault(text) => {
-            revalidate = false;
+            revalidation = None;
             if let Err(e) = validate_domain_expr(text, false, arena) {
                 return sql_fail(e);
             }
@@ -32032,14 +32040,10 @@ pub fn alter_domain(
             }
         }
         A::DropDefault => {
-            revalidate = false;
+            revalidation = None;
             spec.default_expr = None;
         }
         A::AddCheck(check) => {
-            revalidate = matches!(
-                check.validation,
-                crate::sql::ast::ConstraintValidation::EnforcedValidated
-            );
             if spec.n_checks == crate::storage::MAX_DOMAIN_CHECKS {
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -32063,6 +32067,17 @@ pub fn alter_domain(
                     }
                 }
             };
+            if spec.checks[..spec.n_checks]
+                .iter()
+                .any(|candidate| candidate.name == cname)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "constraint \"{}\" for domain \"{}\" already exists",
+                    cname.as_str(),
+                    name.name
+                ));
+            }
             let expression =
                 match domain_text::<{ crate::storage::CHECK_SQL_MAX }>(check.expression) {
                     Ok(t) => t,
@@ -32086,13 +32101,22 @@ pub fn alter_domain(
                     }
                 },
             };
+            revalidation = matches!(
+                check.validation,
+                crate::sql::ast::ConstraintValidation::EnforcedValidated
+            )
+            .then_some(DomainValidation::Check {
+                target: slot,
+                index: spec.n_checks,
+            });
             spec.n_checks += 1;
         }
         A::DropConstraint {
             name: cname,
             if_exists,
+            cascade: _,
         } => {
-            revalidate = false;
+            revalidation = None;
             let Some(pos) = spec.checks[..spec.n_checks]
                 .iter()
                 .position(|c| c.name.as_str() == *cname)
@@ -32125,7 +32149,7 @@ pub fn alter_domain(
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint::EMPTY;
         }
         A::RenameConstraint { from, to } => {
-            revalidate = false;
+            revalidation = None;
             let Some(index) = spec.checks[..spec.n_checks]
                 .iter_mut()
                 .position(|check| check.name.as_str() == *from)
@@ -32155,7 +32179,7 @@ pub fn alter_domain(
             spec.checks[index].name = to;
         }
         A::ValidateConstraint(cname) => {
-            revalidate = false;
+            revalidation = None;
             let Some(index) = spec.checks[..spec.n_checks]
                 .iter()
                 .position(|check| check.name.as_str() == *cname)
@@ -32175,7 +32199,16 @@ pub fn alter_domain(
                     name.name
                 ));
             }
-            if let Err(error) = validate_domain_rows(storage, slot, txn.txid, arena) {
+            if let Err(error) = validate_domain_rows(
+                storage,
+                slot,
+                DomainValidation::Check {
+                    target: slot,
+                    index,
+                },
+                txn.txid,
+                arena,
+            ) {
                 return sql_fail(error);
             }
             spec.checks[index].validation = crate::storage::ConstraintValidation::EnforcedValidated;
@@ -32186,7 +32219,9 @@ pub fn alter_domain(
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
-    if revalidate && let Err(e) = validate_domain_rows(storage, slot, txn.txid, arena) {
+    if let Some(validation) = revalidation
+        && let Err(e) = validate_domain_rows(storage, slot, validation, txn.txid, arena)
+    {
         storage.rollback_domain_alter(slot, prior);
         return sql_fail(e);
     }
@@ -32210,12 +32245,21 @@ pub fn alter_domain(
     sql_ok()
 }
 
-/// Re-validates every stored value whose declared domain is `target` or a
-/// descendant of it. Array domains validate each element, not the array
-/// container: a NULL array has no element value to validate.
+/// The domain property selected by one DDL action. `All` is used only by a
+/// stored-expression rewrite that must prove the complete rewritten domain.
+#[derive(Clone, Copy)]
+enum DomainValidation {
+    All,
+    NotNull { target: usize },
+    Check { target: usize, index: usize },
+}
+
+/// Validates the selected domain property for every stored value declared as
+/// `target` or a descendant. Array domains validate elements, not containers.
 fn validate_domain_rows(
     storage: &Storage,
     target: usize,
+    validation: DomainValidation,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
@@ -32264,6 +32308,7 @@ fn validate_domain_rows(
                 validate_stored_domain_value(
                     storage,
                     leaf,
+                    validation,
                     def.columns()[column_index].ctype,
                     values[column_index],
                     txid,
@@ -32276,18 +32321,20 @@ fn validate_domain_rows(
     Ok(())
 }
 
-/// Validates a scalar domain value or every element of a domain-array value
-/// through the same catalog coercion boundary used by writes and Bind.
+/// Validates a scalar domain value or every element of a domain-array value.
+/// A full revalidation shares write-time coercion; a DDL operation selects
+/// only the rule PostgreSQL says that operation must scan.
 fn validate_stored_domain_value(
     storage: &Storage,
     leaf: usize,
+    validation: DomainValidation,
     ctype: ColType,
     value: Datum,
     txid: u32,
     arena: &Arena,
 ) -> Result<(), SqlError> {
-    let validate = |value| {
-        coerce_domain_value(
+    let validate = |value| match validation {
+        DomainValidation::All => coerce_domain_value(
             storage,
             leaf,
             value,
@@ -32295,7 +32342,29 @@ fn validate_stored_domain_value(
             arena,
             crate::sql::eval::NO_PARAMS,
         )
-        .map(|_| ())
+        .map(|_| ()),
+        DomainValidation::NotNull { target } => {
+            let target_domain = storage.domain_for(target, txid);
+            crate::sql::exec::constraints::validate_domain_not_null(&target_domain, value)
+        }
+        DomainValidation::Check { target, index } => {
+            let target_domain = storage.domain_for(target, txid);
+            let check = target_domain.checks().get(index).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "domain validation refers to a missing check constraint"
+                )
+            })?;
+            crate::sql::exec::constraints::validate_domain_check(
+                storage,
+                txid,
+                &target_domain,
+                check,
+                value,
+                arena,
+                crate::sql::eval::NO_PARAMS,
+            )
+        }
     };
     let ColType::Array(element @ crate::sql::types::ArrElem::Domain { .. }) = ctype else {
         return validate(value);
@@ -35774,7 +35843,9 @@ fn rewrite_composite_dependent_domains(
             continue;
         }
         let prior = storage.stage_domain_alter(domain_slot, spec, txn.txid)?;
-        if let Err(error) = validate_domain_rows(storage, domain_slot, txn.txid, arena) {
+        if let Err(error) =
+            validate_domain_rows(storage, domain_slot, DomainValidation::All, txn.txid, arena)
+        {
             storage.rollback_domain_alter(domain_slot, prior);
             return Err(error);
         }

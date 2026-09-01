@@ -20,7 +20,7 @@ ALTER COLLATION	complete	120_collation_conversion.sql
 ALTER CONVERSION	complete	120_collation_conversion.sql
 ALTER DATABASE	complete	118_database_configuration.sql
 ALTER DEFAULT PRIVILEGES	complete	83_roles_acl.sql
-ALTER DOMAIN	partial	62_domains.sql
+ALTER DOMAIN	complete	62_domains.sql
 ALTER EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
 ALTER EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native-library update execution is outside the architecture
 ALTER FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh (native handlers are rejected)

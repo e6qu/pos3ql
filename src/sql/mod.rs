@@ -18186,6 +18186,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.install_role(crate::storage::SqlName::parse(name)?, attributes)?;
         }
         WalOp::DropRole { name } => storage.remove_role(name),
+        WalOp::RenameRole { name, new_name } => storage.replay_rename_role(name, new_name)?,
         WalOp::UpsertRoleMembership {
             role,
             member,

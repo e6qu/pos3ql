@@ -16,6 +16,9 @@ CREATE PUBLICATION publication_changes
   WITH (publish = 'insert, update, delete');
 CREATE PUBLICATION publication_all FOR ALL TABLES;
 CREATE PUBLICATION publication_empty;
+COMMENT ON PUBLICATION publication_empty IS 'empty publication';
+SELECT obj_description(oid, 'pg_publication') FROM pg_publication
+ WHERE pubname = 'publication_empty';
 CREATE PUBLICATION publication_generated_changes FOR TABLE publication_generated
   WITH (publish_generated_columns = 'stored');
 SELECT pubgencols FROM pg_publication WHERE pubname = 'publication_generated_changes';
@@ -28,6 +31,8 @@ SELECT role.rolname FROM pg_publication publication
  WHERE publication.pubname = 'publication_empty';
 ALTER PUBLICATION publication_empty RENAME TO publication_empty_renamed;
 SELECT pubname FROM pg_publication WHERE pubname = 'publication_empty_renamed';
+SELECT obj_description(oid, 'pg_publication') FROM pg_publication
+ WHERE pubname = 'publication_empty_renamed';
 CREATE PUBLICATION publication_schema_changes FOR TABLES IN SCHEMA publication_schema;
 SELECT count(*) FROM pg_publication_namespace publication_namespace
   JOIN pg_publication publication ON publication.oid = publication_namespace.pnpubid

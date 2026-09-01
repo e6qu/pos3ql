@@ -6179,29 +6179,17 @@ pub fn rename_role(
         Err(error) => return sql_fail(error),
     };
     let old_name = storage.role(slot).name_to(txn.txid);
-    let attributes = storage.role(slot).attributes_to(txn.txid);
     let prior = match storage.rename_role(slot, new_name, txn.txid) {
         Ok(prior) => prior,
         Err(error) => return sql_fail(error),
     };
-    let first_lsn = storage.bump_lsn();
+    let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage(
         txn.txid,
-        first_lsn,
-        &WalOp::DropRole {
+        lsn,
+        &WalOp::RenameRole {
             name: old_name.as_str(),
-        },
-    ) {
-        storage.rollback_role_change(slot, prior);
-        return sql_fail(error);
-    }
-    let second_lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
-        txn.txid,
-        second_lsn,
-        &WalOp::UpsertRole {
-            name: new_name.as_str(),
-            attributes,
+            new_name: new_name.as_str(),
         },
     ) {
         storage.rollback_role_change(slot, prior);
@@ -29235,6 +29223,10 @@ pub fn comment(
                         super::ast::CommentRelKind::Sequence,
                         StoredRelKind::Sequence
                     )
+                    | (
+                        super::ast::CommentRelKind::ForeignTable,
+                        StoredRelKind::ForeignTable
+                    )
             );
             if !ok {
                 return sql_fail(sql_err!(
@@ -29591,6 +29583,278 @@ pub fn comment(
                 target.comment_subid(),
             )
         }
+        CommentTarget::Policy(identity) => {
+            let table = match policy_table(storage, &identity.table, txid) {
+                Ok(table) => table,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) =
+                storage.require_owner(storage.table_access_object(table, txid), txid, "table")
+            {
+                return sql_fail(error);
+            }
+            let Some(slot) = storage.policy_slot_on(table, identity.name, txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "policy \"{}\" for table \"{}\" does not exist",
+                    identity.name,
+                    identity.table.name
+                ));
+            };
+            let policy = storage.policy(slot);
+            (
+                CommentClass::Policy,
+                SqlName::EMPTY,
+                policy.name,
+                crate::storage::policy_oid(policy) as u32,
+            )
+        }
+        CommentTarget::Statistics(statistics_name) => {
+            let Some(slot) = storage.extended_statistics_slot_on_path(
+                statistics_name.schema,
+                statistics_name.name,
+                txid,
+            ) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "statistics object \"{}\" does not exist",
+                    statistics_name.name
+                ));
+            };
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Statistics,
+                slot: slot as u16,
+            };
+            if let Err(error) = storage.require_owner(object, txid, "statistics object") {
+                return sql_fail(error);
+            }
+            let definition = storage.extended_statistics(slot).definition_for(txid);
+            (
+                CommentClass::Statistics,
+                definition.schema,
+                definition.name,
+                slot as u32,
+            )
+        }
+        CommentTarget::Role(role_name) => {
+            let Some(role) = storage.find_role_visible(role_name, txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "role \"{}\" does not exist",
+                    role_name
+                ));
+            };
+            let current_name = super::eval::funcs::system::current_user_owned();
+            let current = storage
+                .find_role_visible(current_name.as_str(), txid)
+                .expect("current SQL role exists");
+            let current_attributes = storage.role(current).attributes_to(txid);
+            let target_attributes = storage.role(role).attributes_to(txid);
+            if target_attributes.superuser && !current_attributes.superuser {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "must be superuser to comment on superuser role \"{}\"",
+                    role_name
+                ));
+            }
+            if !current_attributes.superuser
+                && (!current_attributes.create_role || !storage.role_can_admin(current, role, txid))
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied to comment on role \"{}\"",
+                    role_name
+                ));
+            }
+            let stored = match SqlName::parse(role_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            (
+                CommentClass::Role,
+                SqlName::EMPTY,
+                stored,
+                Storage::role_oid(role) as u32,
+            )
+        }
+        CommentTarget::Cast {
+            source_type,
+            target_type,
+        } => {
+            let source = match resolve_routine_type(storage, txid, source_type) {
+                Ok(source) => source,
+                Err(error) => return sql_fail(error),
+            };
+            let target = match resolve_routine_type(storage, txid, target_type) {
+                Ok(target) => target,
+                Err(error) => return sql_fail(error),
+            };
+            let Some(slot) = storage.cast_slot(source, target, txid) else {
+                return sql_fail(sql_err!(sqlstate::UNDEFINED_OBJECT, "cast does not exist"));
+            };
+            if !current_role_owns_type(storage, txid, source)
+                && !current_role_owns_type(storage, txid, target)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "must be owner of source or target data type"
+                ));
+            }
+            (
+                CommentClass::Cast,
+                SqlName::EMPTY,
+                SqlName::EMPTY,
+                storage.cast(slot).oid() as u32,
+            )
+        }
+        CommentTarget::Operator(identity) => {
+            let slot = match resolve_operator_identity(storage, txid, identity) {
+                Ok((slot, _)) => slot,
+                Err(error) => return sql_fail(error),
+            };
+            let definition = storage.operator_for(slot, txid);
+            if let Err(error) =
+                require_definition_owner(storage, txid, definition.owner, "operator")
+            {
+                return sql_fail(error);
+            }
+            (
+                CommentClass::Operator,
+                definition.schema,
+                definition.name,
+                storage.operator(slot).oid() as u32,
+            )
+        }
+        CommentTarget::OperatorFamily {
+            name: family_name,
+            method,
+        } => {
+            match method {
+                crate::sql::ast::IndexAccessMethod::Btree => {}
+            }
+            let Some(slot) =
+                storage.operator_family_slot_on_path(family_name.schema, family_name.name, txid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "operator family \"{}\" does not exist for access method \"btree\"",
+                    family_name.name
+                ));
+            };
+            let definition = storage.operator_family_for(slot, txid);
+            if let Err(error) =
+                require_definition_owner(storage, txid, definition.owner, "operator family")
+            {
+                return sql_fail(error);
+            }
+            (
+                CommentClass::OperatorFamily,
+                definition.schema,
+                definition.name,
+                storage.operator_family(slot).oid() as u32,
+            )
+        }
+        CommentTarget::OperatorClass {
+            name: class_name,
+            method,
+        } => {
+            match method {
+                crate::sql::ast::IndexAccessMethod::Btree => {}
+            }
+            let Some(slot) =
+                storage.operator_class_slot_on_path(class_name.schema, class_name.name, txid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "operator class \"{}\" does not exist for access method \"btree\"",
+                    class_name.name
+                ));
+            };
+            let definition = storage.operator_class_for(slot, txid);
+            if let Err(error) =
+                require_definition_owner(storage, txid, definition.owner, "operator class")
+            {
+                return sql_fail(error);
+            }
+            (
+                CommentClass::OperatorClass,
+                definition.schema,
+                definition.name,
+                storage.operator_class(slot).oid() as u32,
+            )
+        }
+        CommentTarget::ForeignDataWrapper(wrapper_name) => {
+            if storage.foreign_wrapper(wrapper_name, txid).is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "foreign-data wrapper \"{}\" does not exist",
+                    wrapper_name
+                ));
+            }
+            return sql_fail(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "COMMENT ON FOREIGN DATA WRAPPER is not supported"
+            ));
+        }
+        CommentTarget::ForeignServer(server_name) => {
+            let Some((slot, server)) = storage.foreign_server(server_name, txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "server \"{}\" does not exist",
+                    server_name
+                ));
+            };
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::ForeignServer,
+                slot: slot as u16,
+            };
+            if let Err(error) = storage.require_owner(object, txid, "server") {
+                return sql_fail(error);
+            }
+            (
+                CommentClass::ForeignServer,
+                SqlName::EMPTY,
+                server.name,
+                slot as u32,
+            )
+        }
+        CommentTarget::Publication(publication_name) => {
+            let Some((slot, _)) = storage.publication_definition(publication_name, txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "publication \"{}\" does not exist",
+                    publication_name
+                ));
+            };
+            if let Err(error) = storage.require_publication_owner(slot, txid) {
+                return sql_fail(error);
+            }
+            let publication = storage.publication_for_event_trigger(slot);
+            (
+                CommentClass::Publication,
+                SqlName::EMPTY,
+                publication.name_for(txid),
+                slot as u32,
+            )
+        }
+        CommentTarget::Subscription(subscription_name) => {
+            let Some((slot, subscription)) = storage.subscription(subscription_name, txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "subscription \"{}\" does not exist",
+                    subscription_name
+                ));
+            };
+            if let Err(error) = storage.require_subscription_owner(slot, txid) {
+                return sql_fail(error);
+            }
+            (
+                CommentClass::Subscription,
+                SqlName::EMPTY,
+                subscription.name_for(txid),
+                subscription.created_at as u32,
+            )
+        }
         CommentTarget::Routine { kind, identity } => {
             let slot = match resolve_routine_identity(storage, txid, &identity, kind) {
                 Ok(slot) => slot,
@@ -29695,11 +29959,11 @@ pub fn comment(
     };
 
     let stored_text = match text {
+        Some("") | None => None,
         Some(t) => match crate::storage::comment_stackstr(t) {
             Ok(s) => Some(s),
             Err(e) => return sql_fail(e),
         },
-        None => None,
     };
 
     let (slot, prior) = match storage.set_comment(class, schema, name, subid, stored_text, txid) {

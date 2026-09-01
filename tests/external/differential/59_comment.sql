@@ -17,6 +17,8 @@ DROP AGGREGATE IF EXISTS cmt_sum(integer);
 DROP FUNCTION IF EXISTS cmt_sum_state(bigint, integer);
 DROP TYPE IF EXISTS cmt_enum;
 DROP DOMAIN IF EXISTS cmt_domain;
+DROP SERVER IF EXISTS cmt_server;
+DROP FOREIGN DATA WRAPPER IF EXISTS cmt_fdw;
 DROP SCHEMA IF EXISTS cmt_ns CASCADE;
 
 CREATE TABLE cmt_t (id int PRIMARY KEY, a text);
@@ -27,6 +29,9 @@ CREATE SEQUENCE cmt_s;
 CREATE SCHEMA cmt_ns;
 CREATE TYPE cmt_enum AS ENUM ('a', 'b');
 CREATE DOMAIN cmt_domain AS int CHECK (VALUE > 0);
+CREATE FOREIGN DATA WRAPPER cmt_fdw NO HANDLER NO VALIDATOR;
+CREATE SERVER cmt_server FOREIGN DATA WRAPPER cmt_fdw;
+CREATE FOREIGN TABLE cmt_foreign_table (id integer) SERVER cmt_server;
 CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1';
 CREATE PROCEDURE cmt_proc(value integer) LANGUAGE SQL AS 'SELECT value';
 CREATE FUNCTION cmt_sum_state(state bigint, value integer) RETURNS bigint LANGUAGE SQL
@@ -54,6 +59,8 @@ COMMENT ON FUNCTION cmt_fn(integer) IS 'cmttest function';
 COMMENT ON PROCEDURE cmt_proc(integer) IS 'cmttest procedure';
 COMMENT ON AGGREGATE cmt_sum(integer) IS 'cmttest aggregate';
 COMMENT ON ROUTINE cmt_fn(integer) IS 'cmttest routine';
+COMMENT ON SERVER cmt_server IS 'cmttest server';
+COMMENT ON FOREIGN TABLE cmt_foreign_table IS 'cmttest foreign table';
 
 -- Read them back through the standard helpers.
 SELECT obj_description('cmt_t'::regclass) AS table_comment;
@@ -76,6 +83,9 @@ SELECT proname, obj_description(oid, 'pg_proc') AS routine_comment
   FROM pg_proc
  WHERE proname IN ('cmt_fn', 'cmt_proc', 'cmt_sum')
  ORDER BY proname;
+SELECT obj_description(oid, 'pg_foreign_server') AS server_comment
+  FROM pg_foreign_server WHERE srvname = 'cmt_server';
+SELECT obj_description('cmt_foreign_table'::regclass) AS foreign_table_comment;
 
 -- CREATE OR REPLACE preserves the view object's relation, column, and
 -- composite-type comments.
@@ -118,6 +128,8 @@ COMMENT ON TYPE pg_catalog.integer IS 'x';
 COMMENT ON TYPE serial IS 'x';
 COMMENT ON DOMAIN cmt_enum IS 'x';
 COMMENT ON DOMAIN cmt_t IS 'x';
+COMMENT ON FOREIGN DATA WRAPPER cmt_missing_fdw IS 'x';
+COMMENT ON FOREIGN SERVER cmt_missing_server IS 'x';
 
 -- Transactional: a rolled-back COMMENT restores the prior committed comment.
 SELECT col_description('cmt_t'::regclass, 2) AS column_before_txn;
@@ -168,4 +180,7 @@ DROP MATERIALIZED VIEW cmt_mv;
 DROP VIEW cmt_v;
 DROP TABLE cmt_t;
 DROP SEQUENCE cmt_s;
+DROP FOREIGN TABLE cmt_foreign_table;
+DROP SERVER cmt_server;
+DROP FOREIGN DATA WRAPPER cmt_fdw;
 DROP SCHEMA cmt_ns CASCADE;

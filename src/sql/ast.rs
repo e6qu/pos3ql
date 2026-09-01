@@ -2448,6 +2448,7 @@ pub enum CommentRelKind {
     MaterializedView,
     Index,
     Sequence,
+    ForeignTable,
 }
 
 impl CommentRelKind {
@@ -2459,6 +2460,7 @@ impl CommentRelKind {
             CommentRelKind::MaterializedView => "materialized view",
             CommentRelKind::Index => "index",
             CommentRelKind::Sequence => "sequence",
+            CommentRelKind::ForeignTable => "foreign table",
         }
     }
 }
@@ -2466,7 +2468,7 @@ impl CommentRelKind {
 /// The object a COMMENT applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentTarget<'a> {
-    /// TABLE / VIEW / MATERIALIZED VIEW / INDEX / SEQUENCE name.
+    /// TABLE / VIEW / MATERIALIZED VIEW / INDEX / SEQUENCE / FOREIGN TABLE name.
     Relation {
         kind: CommentRelKind,
         name: QualName<'a>,
@@ -2495,6 +2497,33 @@ pub enum CommentTarget<'a> {
     Trigger(TriggerIdentity<'a>),
     /// RULE name ON relation; rewrite-rule names are relation-local.
     Rule(TriggerIdentity<'a>),
+    /// POLICY name ON table; policy names are relation-local.
+    Policy(PolicyIdentity<'a>),
+    Statistics(QualName<'a>),
+    /// ROLE name; roles are cluster-wide catalog objects.
+    Role(&'a str),
+    /// CAST (source AS target).
+    Cast {
+        source_type: &'a str,
+        target_type: &'a str,
+    },
+    /// OPERATOR name (left, right), including PostgreSQL's `NONE` prefix form.
+    Operator(OperatorIdentity<'a>),
+    /// OPERATOR FAMILY name USING access method.
+    OperatorFamily {
+        name: QualName<'a>,
+        method: IndexAccessMethod,
+    },
+    /// OPERATOR CLASS name USING access method.
+    OperatorClass {
+        name: QualName<'a>,
+        method: IndexAccessMethod,
+    },
+    /// PostgreSQL resolves this name before rejecting the form.
+    ForeignDataWrapper(&'a str),
+    ForeignServer(&'a str),
+    Publication(&'a str),
+    Subscription(&'a str),
     /// FUNCTION / PROCEDURE / ROUTINE identity, including its PostgreSQL
     /// overload signature.
     Routine {

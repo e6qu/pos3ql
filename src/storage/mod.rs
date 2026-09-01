@@ -9350,6 +9350,16 @@ pub enum CommentClass {
     TextSearchConfiguration,
     LargeObject,
     Routine,
+    Policy,
+    Statistics,
+    Publication,
+    Subscription,
+    Role,
+    ForeignServer,
+    Cast,
+    Operator,
+    OperatorFamily,
+    OperatorClass,
 }
 
 impl CommentClass {
@@ -9372,6 +9382,16 @@ impl CommentClass {
             CommentClass::TextSearchConfiguration => 14,
             CommentClass::LargeObject => 15,
             CommentClass::Routine => 16,
+            CommentClass::Policy => 17,
+            CommentClass::Statistics => 18,
+            CommentClass::Publication => 19,
+            CommentClass::Subscription => 20,
+            CommentClass::Role => 21,
+            CommentClass::ForeignServer => 22,
+            CommentClass::Cast => 23,
+            CommentClass::Operator => 24,
+            CommentClass::OperatorFamily => 25,
+            CommentClass::OperatorClass => 26,
         }
     }
 
@@ -9394,6 +9414,16 @@ impl CommentClass {
             14 => CommentClass::TextSearchConfiguration,
             15 => CommentClass::LargeObject,
             16 => CommentClass::Routine,
+            17 => CommentClass::Policy,
+            18 => CommentClass::Statistics,
+            19 => CommentClass::Publication,
+            20 => CommentClass::Subscription,
+            21 => CommentClass::Role,
+            22 => CommentClass::ForeignServer,
+            23 => CommentClass::Cast,
+            24 => CommentClass::Operator,
+            25 => CommentClass::OperatorFamily,
+            26 => CommentClass::OperatorClass,
             _ => return None,
         })
     }
@@ -9418,6 +9448,7 @@ pub enum StoredRelKind {
     Matview,
     Index,
     Sequence,
+    ForeignTable,
 }
 
 /// A transaction's uncommitted comment write overlaying the committed `live`
@@ -10613,6 +10644,9 @@ impl Storage {
                 class,
                 slot: slot as u16,
             });
+        }
+        if class == foreign::ForeignObjectClass::Server {
+            self.drop_comments_by_subid(CommentClass::ForeignServer, slot as u32);
         }
     }
 
@@ -16480,6 +16514,7 @@ impl Storage {
         self.roles[slot].name = pending.name;
         self.roles[slot].attributes = pending.attributes;
         if !pending.exists {
+            self.drop_comments_by_subid(CommentClass::Role, Self::role_oid(slot) as u32);
             self.roles[slot].name = SqlName::EMPTY;
         }
     }
@@ -16524,6 +16559,7 @@ impl Storage {
 
     pub fn remove_role(&mut self, name: &str) {
         if let Some(slot) = self.find_role(name) {
+            self.drop_comments_by_subid(CommentClass::Role, Self::role_oid(slot) as u32);
             for entry in self.acl_entries.iter_mut() {
                 if entry.grantee == slot as u16 || entry.grantor == slot as u16 {
                     entry.object.slot = u16::MAX;
@@ -16549,6 +16585,31 @@ impl Storage {
                 pending: None,
             };
         }
+    }
+
+    /// WAL replay keeps the catalog slot, and therefore its shared-object
+    /// comment identity, when a role is renamed.
+    pub fn replay_rename_role(&mut self, name: &str, new_name: &str) -> Result<(), SqlError> {
+        let Some(slot) = self.find_role(name) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "journal renames unknown role \"{}\"",
+                name
+            ));
+        };
+        let new_name = SqlName::parse(new_name)?;
+        if self
+            .find_role(new_name.as_str())
+            .is_some_and(|existing| existing != slot)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "journal renames role to existing role \"{}\"",
+                new_name.as_str()
+            ));
+        }
+        self.roles[slot].name = new_name;
+        Ok(())
     }
 
     pub fn role_membership_count(&self) -> usize {
@@ -17066,8 +17127,23 @@ impl Storage {
     // --- Object comments (`COMMENT ON ...`) ---
 
     fn comment_database(&self, class: CommentClass) -> Option<DatabaseOid> {
-        (!matches!(class, CommentClass::Tablespace | CommentClass::Database))
-            .then_some(self.current_database)
+        (!matches!(
+            class,
+            CommentClass::Tablespace | CommentClass::Database | CommentClass::Role
+        ))
+        .then_some(self.current_database)
+    }
+
+    fn comment_identity_uses_subid(class: CommentClass) -> bool {
+        matches!(
+            class,
+            CommentClass::Role
+                | CommentClass::ForeignServer
+                | CommentClass::Cast
+                | CommentClass::Operator
+                | CommentClass::OperatorFamily
+                | CommentClass::OperatorClass
+        )
     }
 
     /// The comment text `txid` sees on this object, or `None` for none. Reads
@@ -17275,7 +17351,11 @@ impl Storage {
     ) -> Result<(usize, Option<PendingComment>), SqlError> {
         let database = self.comment_database(class);
         if let Some(slot) = self.comments.iter().position(|c| {
-            c.matches_to(database, class, schema.as_str(), name.as_str(), subid, txid)
+            c.database == database
+                && c.class == class
+                && c.subid == subid
+                && (Self::comment_identity_uses_subid(class)
+                    || c.matches_to(database, class, schema.as_str(), name.as_str(), subid, txid))
         }) {
             let prior = self.comments[slot].pending.take();
             self.comments[slot].pending = Some(PendingComment { txid, text });
@@ -17360,11 +17440,13 @@ impl Storage {
         text: Option<StackStr<COMMENT_MAX>>,
     ) -> Result<(), SqlError> {
         let database = self.comment_database(class);
-        if let Some(slot) = self
-            .comments
-            .iter()
-            .position(|c| c.matches(database, class, schema.as_str(), name.as_str(), subid))
-        {
+        if let Some(slot) = self.comments.iter().position(|c| {
+            c.database == database
+                && c.class == class
+                && c.subid == subid
+                && (Self::comment_identity_uses_subid(class)
+                    || c.matches(database, class, schema.as_str(), name.as_str(), subid))
+        }) {
             self.comments[slot].live = text;
             self.reap_comment(slot);
             return Ok(());
@@ -18326,8 +18408,12 @@ impl Storage {
         if self.find_matview(schema, name, txid).is_some() {
             return Some(StoredRelKind::Matview);
         }
-        if self.find_visible(schema, name, txid).is_some() {
-            return Some(StoredRelKind::Table);
+        if let Some(slot) = self.find_visible(schema, name, txid) {
+            return Some(if self.table_def(slot, txid).kind == TableKind::Foreign {
+                StoredRelKind::ForeignTable
+            } else {
+                StoredRelKind::Table
+            });
         }
         if self.find_view(schema, name, txid).is_some() {
             return Some(StoredRelKind::View);
@@ -22933,6 +23019,7 @@ impl Storage {
             SubscriptionSlot::Absent | SubscriptionSlot::External(_) => SubscriptionCleanup::None,
         };
         self.subscriptions[slot].ddl_state = self.subscriptions[slot].ddl_state.commit_drop();
+        self.drop_comments_by_subid(CommentClass::Subscription, created_at as u32);
     }
 
     pub(crate) fn subscription_cleanup(
@@ -23611,6 +23698,7 @@ impl Storage {
     }
     pub fn commit_publication_drop(&mut self, slot: usize) {
         self.publications[slot].ddl_state = self.publications[slot].ddl_state.commit_drop();
+        self.drop_comments_by_subid(CommentClass::Publication, slot as u32);
     }
 
     pub(crate) fn alter_publication(
@@ -29328,8 +29416,10 @@ impl Storage {
     }
 
     pub(crate) fn commit_policy_drop(&mut self, slot: usize) {
+        let oid = policy_oid(&self.policies[slot]) as u32;
         self.policies[slot].ddl_state = self.policies[slot].ddl_state.commit_drop();
         self.policies[slot].pending_definition = None;
+        self.drop_comments_by_subid(CommentClass::Policy, oid);
     }
 
     pub(crate) fn rollback_policy_drop(&mut self, slot: usize, txid: u32) {
@@ -29337,10 +29427,12 @@ impl Storage {
     }
 
     pub(crate) fn commit_policies_for_table(&mut self, table: usize) {
-        for policy in self.policies.iter_mut() {
+        for slot in 0..self.policies.len() {
+            let policy = self.policies[slot];
             if policy.ddl_state != CatalogDdlState::Absent && usize::from(policy.table) == table {
-                policy.ddl_state = CatalogDdlState::Absent;
-                policy.pending_definition = None;
+                self.policies[slot].ddl_state = CatalogDdlState::Absent;
+                self.policies[slot].pending_definition = None;
+                self.drop_comments_by_subid(CommentClass::Policy, policy_oid(&policy) as u32);
             }
         }
     }
@@ -30262,6 +30354,7 @@ impl Storage {
     }
 
     pub(crate) fn commit_extended_statistics_drop(&mut self, slot: usize) {
+        self.drop_comments_by_subid(CommentClass::Statistics, slot as u32);
         self.clear_pending_extended_statistics_data(slot);
         self.extended_statistics[slot].data = ExtendedStatisticsData::EMPTY;
         self.extended_statistics[slot].pending_definition = None;
@@ -32438,6 +32531,7 @@ impl Storage {
     }
 
     pub(crate) fn commit_cast_drop(&mut self, slot: usize) {
+        self.drop_comments_by_subid(CommentClass::Cast, self.casts[slot].oid() as u32);
         self.casts[slot].ddl_state = self.casts[slot].ddl_state.commit_drop();
     }
 
@@ -34433,6 +34527,7 @@ impl Storage {
     }
 
     pub(crate) fn commit_operator_drop(&mut self, slot: usize) {
+        self.drop_comments_by_subid(CommentClass::Operator, self.operators[slot].oid() as u32);
         self.operators[slot].ddl_state = self.operators[slot].ddl_state.commit_drop();
         self.operators[slot].pending = None;
     }
@@ -34757,6 +34852,10 @@ impl Storage {
     }
 
     pub(crate) fn commit_operator_family_drop(&mut self, slot: usize) {
+        self.drop_comments_by_subid(
+            CommentClass::OperatorFamily,
+            self.operator_families[slot].oid() as u32,
+        );
         self.operator_families[slot].ddl_state =
             self.operator_families[slot].ddl_state.commit_drop();
         self.operator_families[slot].pending = None;
@@ -35172,6 +35271,10 @@ impl Storage {
     }
 
     pub(crate) fn commit_operator_class_drop(&mut self, slot: usize) {
+        self.drop_comments_by_subid(
+            CommentClass::OperatorClass,
+            self.operator_classes[slot].oid() as u32,
+        );
         self.operator_classes[slot].ddl_state = self.operator_classes[slot].ddl_state.commit_drop();
         self.operator_classes[slot].pending = None;
     }
@@ -35256,10 +35359,20 @@ mod tests {
             CommentClass::TextSearchConfiguration,
             CommentClass::LargeObject,
             CommentClass::Routine,
+            CommentClass::Policy,
+            CommentClass::Statistics,
+            CommentClass::Publication,
+            CommentClass::Subscription,
+            CommentClass::Role,
+            CommentClass::ForeignServer,
+            CommentClass::Cast,
+            CommentClass::Operator,
+            CommentClass::OperatorFamily,
+            CommentClass::OperatorClass,
         ] {
             assert_eq!(CommentClass::from_u8(class.to_u8()), Some(class));
         }
-        assert_eq!(CommentClass::from_u8(17), None);
+        assert_eq!(CommentClass::from_u8(27), None);
         assert_eq!(CommentClass::from_u8(u8::MAX), None);
     }
 

@@ -1430,7 +1430,7 @@ const fn foreign_data_wrapper_oid(slot: usize) -> i32 {
     FIRST_FOREIGN_DATA_WRAPPER_OID + slot as i32
 }
 
-const fn foreign_server_oid(slot: usize) -> i32 {
+pub(crate) const fn foreign_server_oid(slot: usize) -> i32 {
     FIRST_FOREIGN_SERVER_OID + slot as i32
 }
 
@@ -4742,8 +4742,58 @@ fn pg_description<'a>(
                 Some(oid) => (oid, PG_TYPE_OID),
                 None => continue,
             },
-            crate::storage::CommentClass::Tablespace | crate::storage::CommentClass::Database => {
+            crate::storage::CommentClass::Tablespace
+            | crate::storage::CommentClass::Database
+            | crate::storage::CommentClass::Role => {
                 continue;
+            }
+            crate::storage::CommentClass::ForeignServer => {
+                let Ok(slot) = usize::try_from(subid) else {
+                    continue;
+                };
+                let Some(_) = storage.foreign_server_by_slot(slot, txid) else {
+                    continue;
+                };
+                (foreign_server_oid(slot), 1417)
+            }
+            crate::storage::CommentClass::Cast => {
+                let Some((_, cast)) = storage
+                    .casts_visible_to(txid)
+                    .find(|(_, cast)| cast.oid() as u32 == subid)
+                else {
+                    continue;
+                };
+                (cast.oid(), PG_CAST_OID)
+            }
+            crate::storage::CommentClass::Operator => {
+                let Ok(oid) = i32::try_from(subid) else {
+                    continue;
+                };
+                let Some(slot) = storage.operator_slot_by_oid(oid, txid) else {
+                    continue;
+                };
+                (storage.operator(slot).oid(), PG_OPERATOR_OID)
+            }
+            crate::storage::CommentClass::OperatorFamily => {
+                let Ok(oid) = i32::try_from(subid) else {
+                    continue;
+                };
+                let Some(slot) = storage.operator_family_slot_by_oid(oid, txid) else {
+                    continue;
+                };
+                (storage.operator_family(slot).oid(), PG_OPFAMILY_OID)
+            }
+            crate::storage::CommentClass::OperatorClass => {
+                let Ok(oid) = i32::try_from(subid) else {
+                    continue;
+                };
+                let Some(oid) = crate::storage::OperatorClassOid::parse(oid) else {
+                    continue;
+                };
+                let Some(slot) = storage.operator_class_slot_by_oid(oid, txid) else {
+                    continue;
+                };
+                (storage.operator_class(slot).oid(), PG_OPCLASS_OID)
             }
             crate::storage::CommentClass::Extension => {
                 let Some(slot) = storage.extension_slot(name, txid) else {
@@ -4804,6 +4854,45 @@ fn pg_description<'a>(
                     PG_PROC_OID,
                 )
             }
+            crate::storage::CommentClass::Policy => {
+                let Ok(oid) = i32::try_from(subid) else {
+                    continue;
+                };
+                let Some((_, policy)) = storage
+                    .policies_with_slots_visible_to(txid)
+                    .find(|(_, policy)| crate::storage::policy_oid(policy) == oid)
+                else {
+                    continue;
+                };
+                (crate::storage::policy_oid(policy), PG_POLICY_OID)
+            }
+            crate::storage::CommentClass::Statistics => {
+                let Some((slot, _)) = storage
+                    .extended_statistics_visible(txid)
+                    .find(|(slot, _)| *slot as u32 == subid)
+                else {
+                    continue;
+                };
+                (extended_statistics_oid(slot), PG_STATISTIC_EXT_OID)
+            }
+            crate::storage::CommentClass::Publication => {
+                let Some((slot, _)) = storage
+                    .publications_with_slots_visible_to(txid)
+                    .find(|(slot, _)| *slot as u32 == subid)
+                else {
+                    continue;
+                };
+                (publication_oid(slot), PG_PUBLICATION_OID)
+            }
+            crate::storage::CommentClass::Subscription => {
+                let Some((_, subscription)) = storage
+                    .subscriptions_with_slots_visible_to(txid)
+                    .find(|(_, subscription)| subscription.created_at as u32 == subid)
+                else {
+                    continue;
+                };
+                (subscription_oid(subscription), PG_SUBSCRIPTION_OID)
+            }
             crate::storage::CommentClass::Rule => {
                 let rule = storage
                     .rules_visible_to(txid)
@@ -4853,6 +4942,15 @@ fn pg_description<'a>(
             crate::storage::CommentClass::Trigger
                 | crate::storage::CommentClass::Rule
                 | crate::storage::CommentClass::Routine
+                | crate::storage::CommentClass::Policy
+                | crate::storage::CommentClass::Statistics
+                | crate::storage::CommentClass::Publication
+                | crate::storage::CommentClass::Subscription
+                | crate::storage::CommentClass::ForeignServer
+                | crate::storage::CommentClass::Cast
+                | crate::storage::CommentClass::Operator
+                | crate::storage::CommentClass::OperatorFamily
+                | crate::storage::CommentClass::OperatorClass
         ) {
             0
         } else {
@@ -4890,7 +4988,9 @@ fn pg_shdescription<'a>(
     for (class, _, name, subid, description) in storage.comments_visible(txid) {
         if !matches!(
             class,
-            crate::storage::CommentClass::Tablespace | crate::storage::CommentClass::Database
+            crate::storage::CommentClass::Tablespace
+                | crate::storage::CommentClass::Database
+                | crate::storage::CommentClass::Role
         ) || subid != 0
         {
             continue;
@@ -4903,6 +5003,24 @@ fn pg_shdescription<'a>(
                 &[
                     Datum::Int4(storage.database(slot).oid.get()),
                     Datum::Int4(1262),
+                    text(description, arena)?,
+                ],
+                arena,
+            )?;
+            count += 1;
+            continue;
+        }
+        if class == crate::storage::CommentClass::Role {
+            let Ok(oid) = i32::try_from(subid) else {
+                continue;
+            };
+            if storage.role_slot_by_oid(oid, txid).is_none() {
+                continue;
+            }
+            rows[count] = row(
+                &[
+                    Datum::Int4(oid),
+                    Datum::Int4(1260),
                     text(description, arena)?,
                 ],
                 arena,
@@ -5195,6 +5313,58 @@ pub fn comment_text_for<'a>(
                         u32::try_from(storage.database(slot).oid.get()).ok() == Some(oid)
                     })
             }
+            "pg_authid" => {
+                class == crate::storage::CommentClass::Role
+                    && subid == 0
+                    && signed_oid.is_some_and(|role_oid| {
+                        i32::try_from(csub) == Ok(role_oid)
+                            && storage.role_slot_by_oid(role_oid, txid).is_some()
+                    })
+            }
+            "pg_foreign_server" => {
+                class == crate::storage::CommentClass::ForeignServer
+                    && subid == 0
+                    && signed_oid.is_some_and(|server_oid| {
+                        usize::try_from(csub).ok().is_some_and(|slot| {
+                            foreign_server_oid(slot) == server_oid
+                                && storage.foreign_server_by_slot(slot, txid).is_some()
+                        })
+                    })
+            }
+            "pg_cast" => {
+                class == crate::storage::CommentClass::Cast
+                    && subid == 0
+                    && signed_oid.is_some_and(|oid| {
+                        storage
+                            .casts_visible_to(txid)
+                            .any(|(_, cast)| cast.oid() == oid && csub == oid as u32)
+                    })
+            }
+            "pg_operator" => {
+                class == crate::storage::CommentClass::Operator
+                    && subid == 0
+                    && signed_oid.is_some_and(|oid| {
+                        storage.operator_slot_by_oid(oid, txid).is_some() && csub == oid as u32
+                    })
+            }
+            "pg_opfamily" => {
+                class == crate::storage::CommentClass::OperatorFamily
+                    && subid == 0
+                    && signed_oid.is_some_and(|oid| {
+                        storage.operator_family_slot_by_oid(oid, txid).is_some()
+                            && csub == oid as u32
+                    })
+            }
+            "pg_opclass" => {
+                class == crate::storage::CommentClass::OperatorClass
+                    && subid == 0
+                    && signed_oid
+                        .and_then(crate::storage::OperatorClassOid::parse)
+                        .is_some_and(|oid| {
+                            storage.operator_class_slot_by_oid(oid, txid).is_some()
+                                && csub == oid.get() as u32
+                        })
+            }
             "pg_trigger" => {
                 class == crate::storage::CommentClass::Trigger
                     && subid == 0
@@ -5309,6 +5479,46 @@ pub fn comment_text_for<'a>(
                     && signed_oid.is_some_and(|oid| {
                         i32::try_from(csub) == Ok(oid)
                             && storage.routine_slot_by_oid(oid, txid).is_some()
+                    })
+            }
+            "pg_policy" => {
+                class == crate::storage::CommentClass::Policy
+                    && subid == 0
+                    && signed_oid.is_some_and(|oid| {
+                        i32::try_from(csub) == Ok(oid)
+                            && storage
+                                .policies_with_slots_visible_to(txid)
+                                .any(|(_, policy)| crate::storage::policy_oid(policy) == oid)
+                    })
+            }
+            "pg_statistic_ext" => {
+                class == crate::storage::CommentClass::Statistics
+                    && subid == 0
+                    && signed_oid.is_some_and(|oid| {
+                        storage.extended_statistics_visible(txid).any(|(slot, _)| {
+                            extended_statistics_oid(slot) == oid && csub == slot as u32
+                        })
+                    })
+            }
+            "pg_publication" => {
+                class == crate::storage::CommentClass::Publication
+                    && subid == 0
+                    && signed_oid.is_some_and(|oid| {
+                        storage
+                            .publications_with_slots_visible_to(txid)
+                            .any(|(slot, _)| publication_oid(slot) == oid && csub == slot as u32)
+                    })
+            }
+            "pg_subscription" => {
+                class == crate::storage::CommentClass::Subscription
+                    && subid == 0
+                    && signed_oid.is_some_and(|oid| {
+                        storage.subscriptions_with_slots_visible_to(txid).any(
+                            |(_, subscription)| {
+                                subscription_oid(subscription) == oid
+                                    && csub == subscription.created_at as u32
+                            },
+                        )
                     })
             }
             _ => {
@@ -6182,6 +6392,10 @@ fn pg_stats<'a>(
 
 pub(crate) fn publication_oid(slot: usize) -> i32 {
     FIRST_USER_OID + 80_000 + slot as i32
+}
+
+pub(crate) fn subscription_oid(subscription: &crate::storage::SubscriptionDef) -> i32 {
+    FIRST_USER_OID + 95_000 + subscription.created_at as i32
 }
 
 fn policy_command_name(command: PolicyCommandKind) -> &'static str {
@@ -7206,7 +7420,7 @@ fn pg_subscription<'a>(
         rows[count] = row(
             &[
                 Datum::Int4(6107),
-                Datum::Int4(FIRST_USER_OID + 95_000 + subscription.created_at as i32),
+                Datum::Int4(subscription_oid(subscription)),
                 Datum::Int4(storage.current_database_oid().get()),
                 skip_lsn,
                 text(subscription.name.as_str(), arena)?,
@@ -7283,7 +7497,7 @@ fn pg_subscription_rel<'a>(
             let rendered_lsn = stack_format!(32, "0/{lsn:X}");
             rows[index] = row(
                 &[
-                    Datum::Int4(FIRST_USER_OID + 95_000 + subscription.created_at as i32),
+                    Datum::Int4(subscription_oid(subscription)),
                     Datum::Int4(table_oid(storage, relation.table_slot())),
                     text(relation.state().pg_code(), arena)?,
                     if lsn == 0 {

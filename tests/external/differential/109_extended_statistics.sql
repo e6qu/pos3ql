@@ -8,6 +8,9 @@ CREATE STATISTICS extended_statistics_ab (ndistinct, dependencies, mcv)
     ON a, b FROM extended_statistics_source;
 CREATE STATISTICS extended_statistics_label
     ON (lower(label)) FROM extended_statistics_source;
+COMMENT ON STATISTICS extended_statistics_ab IS 'multivariate statistics';
+SELECT obj_description(oid, 'pg_statistic_ext')
+FROM pg_statistic_ext WHERE stxname = 'extended_statistics_ab';
 
 SELECT stxname, stxstattarget, stxkeys,
        pg_get_statisticsobjdef_columns(oid)
@@ -28,6 +31,8 @@ ORDER BY e.stxname;
 
 ALTER STATISTICS extended_statistics_ab SET STATISTICS 12;
 ALTER STATISTICS extended_statistics_ab RENAME TO extended_statistics_ab_renamed;
+SELECT obj_description(oid, 'pg_statistic_ext')
+FROM pg_statistic_ext WHERE stxname = 'extended_statistics_ab_renamed';
 CREATE SCHEMA extended_statistics_archive;
 ALTER STATISTICS extended_statistics_ab_renamed SET SCHEMA extended_statistics_archive;
 CREATE STATISTICS extended_statistics_bl ON b, label FROM extended_statistics_source;

@@ -4557,6 +4557,101 @@ def test_transport_eof_releases_transaction_locks():
     observer.close()
 
 
+def test_catalog_comments_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE TABLE wire_catalog_comment (id integer, category integer); "
+        "CREATE POLICY wire_catalog_policy ON wire_catalog_comment FOR SELECT USING (true); "
+        "CREATE STATISTICS wire_catalog_statistics (ndistinct) "
+        "ON id, category FROM wire_catalog_comment; "
+        "CREATE ROLE wire_catalog_comment_role; "
+        "CREATE FOREIGN DATA WRAPPER wire_catalog_comment_fdw NO HANDLER NO VALIDATOR; "
+        "CREATE SERVER wire_catalog_comment_server "
+        "FOREIGN DATA WRAPPER wire_catalog_comment_fdw; "
+        "CREATE FOREIGN TABLE wire_catalog_comment_foreign (id integer) "
+        "SERVER wire_catalog_comment_server; "
+        "CREATE TYPE wire_catalog_comment_mood AS ENUM ('low', 'high'); "
+        "CREATE FUNCTION wire_catalog_comment_mood_text(wire_catalog_comment_mood) "
+        "RETURNS text LANGUAGE SQL RETURN 'mood'; "
+        "CREATE FUNCTION wire_catalog_comment_same(integer, integer) "
+        "RETURNS boolean LANGUAGE SQL RETURN $1 = $2; "
+        "CREATE FUNCTION wire_catalog_comment_compare(integer, integer) "
+        "RETURNS integer LANGUAGE SQL RETURN 0; "
+        "CREATE CAST (wire_catalog_comment_mood AS text) "
+        "WITH FUNCTION wire_catalog_comment_mood_text(wire_catalog_comment_mood); "
+        "CREATE OPERATOR === (FUNCTION = wire_catalog_comment_same, "
+        "LEFTARG = integer, RIGHTARG = integer); "
+        "CREATE OPERATOR FAMILY wire_catalog_comment_family USING btree; "
+        "CREATE OPERATOR CLASS wire_catalog_comment_class FOR TYPE integer USING btree "
+        "FAMILY wire_catalog_comment_family AS OPERATOR 3 ===, "
+        "FUNCTION 1 wire_catalog_comment_compare(integer, integer); "
+        "COMMENT ON POLICY wire_catalog_policy ON wire_catalog_comment IS 'wire policy'; "
+        "COMMENT ON STATISTICS wire_catalog_statistics IS 'wire statistics'; "
+        "COMMENT ON ROLE wire_catalog_comment_role IS 'wire role'; "
+        "COMMENT ON SERVER wire_catalog_comment_server IS 'wire server'; "
+        "COMMENT ON FOREIGN TABLE wire_catalog_comment_foreign IS 'wire foreign table'; "
+        "COMMENT ON CAST (wire_catalog_comment_mood AS text) IS 'wire cast'; "
+        "COMMENT ON OPERATOR === (integer, integer) IS 'wire operator'; "
+        "COMMENT ON OPERATOR FAMILY wire_catalog_comment_family USING btree "
+        "IS 'wire operator family'; "
+        "COMMENT ON OPERATOR CLASS wire_catalog_comment_class USING btree "
+        "IS 'wire operator class'; "
+        "SELECT obj_description(oid, 'pg_policy') FROM pg_policy "
+        "WHERE polname = 'wire_catalog_policy'; "
+        "SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext "
+        "WHERE stxname = 'wire_catalog_statistics'; "
+        "SELECT shobj_description(oid, 'pg_authid') FROM pg_roles "
+        "WHERE rolname = 'wire_catalog_comment_role'; "
+        "SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server "
+        "WHERE srvname = 'wire_catalog_comment_server'; "
+        "SELECT obj_description('wire_catalog_comment_foreign'::regclass); "
+        "SELECT obj_description(oid, 'pg_cast') FROM pg_cast "
+        "WHERE castsource = 'wire_catalog_comment_mood'::regtype "
+        "AND casttarget = 'text'::regtype; "
+        "SELECT obj_description(oid, 'pg_operator') FROM pg_operator "
+        "WHERE oprname = '===' AND oprleft = 'integer'::regtype; "
+        "SELECT obj_description(oid, 'pg_opfamily') FROM pg_opfamily "
+        "WHERE opfname = 'wire_catalog_comment_family'; "
+        "SELECT obj_description(oid, 'pg_opclass') FROM pg_opclass "
+        "WHERE opcname = 'wire_catalog_comment_class'; "
+        "DROP OPERATOR CLASS wire_catalog_comment_class USING btree; "
+        "DROP OPERATOR FAMILY wire_catalog_comment_family USING btree; "
+        "DROP OPERATOR === (integer, integer); "
+        "DROP CAST (wire_catalog_comment_mood AS text); "
+        "DROP FUNCTION wire_catalog_comment_compare(integer, integer); "
+        "DROP FUNCTION wire_catalog_comment_same(integer, integer); "
+        "DROP FUNCTION wire_catalog_comment_mood_text(wire_catalog_comment_mood); "
+        "DROP TYPE wire_catalog_comment_mood; "
+        "DROP TABLE wire_catalog_comment CASCADE; "
+        "DROP FOREIGN TABLE wire_catalog_comment_foreign; "
+        "DROP SERVER wire_catalog_comment_server; "
+        "DROP FOREIGN DATA WRAPPER wire_catalog_comment_fdw; "
+        "DROP ROLE wire_catalog_comment_role",
+    )
+    rows = [text_row_fields(payload)[0] for kind, payload in result if kind == b"D"]
+    check(
+        "catalog comments: raw simple-query wire path preserves typed catalog comments",
+        not any(kind == b"E" for kind, _ in result)
+        and rows
+        == [
+            "wire policy",
+            "wire statistics",
+            "wire role",
+            "wire server",
+            "wire foreign table",
+            "wire cast",
+            "wire operator",
+            "wire operator family",
+            "wire operator class",
+        ],
+        result,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

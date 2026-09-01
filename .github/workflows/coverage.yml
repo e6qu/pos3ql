@@ -154,9 +154,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: a, corpus_shard: "0-of-3", auxiliary: all }
-          - { name: b, corpus_shard: "1-of-3", auxiliary: none }
-          - { name: c, corpus_shard: "2-of-3", auxiliary: none }
+          - { name: a, corpus_shard: "0-of-4", auxiliary: all }
+          - { name: b, corpus_shard: "1-of-4", auxiliary: none }
+          - { name: c, corpus_shard: "2-of-4", auxiliary: none }
+          - { name: d, corpus_shard: "3-of-4", auxiliary: none }
     services:
       postgres:
         image: postgres:18

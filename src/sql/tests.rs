@@ -30044,7 +30044,10 @@ fn routine_comments_are_typed_durable_and_do_not_survive_drop() {
         &mut e,
         &mut b,
         "CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1'; \
-         CREATE PROCEDURE cmt_proc(value integer) LANGUAGE SQL AS 'SELECT value'",
+         CREATE PROCEDURE cmt_proc(value integer) LANGUAGE SQL AS 'SELECT value'; \
+         CREATE FUNCTION cmt_sum_state(state bigint, value integer) RETURNS bigint LANGUAGE SQL \
+           AS 'SELECT coalesce(state, 0) + coalesce(value, 0)'; \
+         CREATE AGGREGATE cmt_sum(integer) (SFUNC = cmt_sum_state, STYPE = bigint)",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -30056,17 +30059,22 @@ fn routine_comments_are_typed_durable_and_do_not_survive_drop() {
         &mut b,
         "COMMENT ON FUNCTION cmt_fn(integer) IS 'the function'; \
          COMMENT ON PROCEDURE cmt_proc(integer) IS 'the procedure'; \
+         COMMENT ON AGGREGATE cmt_sum(integer) IS 'the aggregate'; \
          COMMENT ON ROUTINE cmt_fn(integer) IS 'the routine'",
     );
     let bytes = run_with(
         &mut e,
         &mut b,
         "SELECT proname, obj_description(oid, 'pg_proc') FROM pg_proc \
-         WHERE proname IN ('cmt_fn', 'cmt_proc') ORDER BY proname",
+         WHERE proname IN ('cmt_fn', 'cmt_proc', 'cmt_sum') ORDER BY proname",
     );
     assert_eq!(
         data_rows(&bytes),
-        ["cmt_fn|the routine", "cmt_proc|the procedure"]
+        [
+            "cmt_fn|the routine",
+            "cmt_proc|the procedure",
+            "cmt_sum|the aggregate",
+        ]
     );
     run_with(&mut e, &mut b, "DROP FUNCTION cmt_fn(integer)");
     run_with(

@@ -13,6 +13,8 @@ DROP TABLE IF EXISTS cmt_t;
 DROP SEQUENCE IF EXISTS cmt_s;
 DROP FUNCTION IF EXISTS cmt_fn(integer);
 DROP PROCEDURE IF EXISTS cmt_proc(integer);
+DROP AGGREGATE IF EXISTS cmt_sum(integer);
+DROP FUNCTION IF EXISTS cmt_sum_state(bigint, integer);
 DROP TYPE IF EXISTS cmt_enum;
 DROP DOMAIN IF EXISTS cmt_domain;
 DROP SCHEMA IF EXISTS cmt_ns CASCADE;
@@ -27,6 +29,9 @@ CREATE TYPE cmt_enum AS ENUM ('a', 'b');
 CREATE DOMAIN cmt_domain AS int CHECK (VALUE > 0);
 CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1';
 CREATE PROCEDURE cmt_proc(value integer) LANGUAGE SQL AS 'SELECT value';
+CREATE FUNCTION cmt_sum_state(state bigint, value integer) RETURNS bigint LANGUAGE SQL
+  AS 'SELECT coalesce(state, 0) + coalesce(value, 0)';
+CREATE AGGREGATE cmt_sum(integer) (SFUNC = cmt_sum_state, STYPE = bigint);
 
 -- Set comments on every object kind that carries an OID here.
 COMMENT ON TABLE cmt_t IS 'cmttest table';
@@ -47,6 +52,7 @@ COMMENT ON TYPE regclass IS 'cmttest regclass type';
 COMMENT ON TYPE integer[] IS 'cmttest array type';
 COMMENT ON FUNCTION cmt_fn(integer) IS 'cmttest function';
 COMMENT ON PROCEDURE cmt_proc(integer) IS 'cmttest procedure';
+COMMENT ON AGGREGATE cmt_sum(integer) IS 'cmttest aggregate';
 COMMENT ON ROUTINE cmt_fn(integer) IS 'cmttest routine';
 
 -- Read them back through the standard helpers.
@@ -68,7 +74,7 @@ SELECT obj_description(2205, 'pg_type') AS regclass_type_comment,
        obj_description(1007, 'pg_type') AS array_type_comment;
 SELECT proname, obj_description(oid, 'pg_proc') AS routine_comment
   FROM pg_proc
- WHERE proname IN ('cmt_fn', 'cmt_proc')
+ WHERE proname IN ('cmt_fn', 'cmt_proc', 'cmt_sum')
  ORDER BY proname;
 
 -- CREATE OR REPLACE preserves the view object's relation, column, and
@@ -154,6 +160,8 @@ SELECT obj_description(oid, 'pg_proc') AS recreated_function_comment
   FROM pg_proc WHERE proname = 'cmt_fn';
 DROP FUNCTION cmt_fn(integer);
 DROP PROCEDURE cmt_proc(integer);
+DROP AGGREGATE cmt_sum(integer);
+DROP FUNCTION cmt_sum_state(bigint, integer);
 DROP TYPE cmt_enum;
 DROP DOMAIN cmt_domain;
 DROP MATERIALIZED VIEW cmt_mv;

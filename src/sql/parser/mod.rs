@@ -6243,6 +6243,11 @@ impl<'a> Parser<'a> {
                 kind: RoutineTargetKind::Function,
                 identity: self.routine_identity()?,
             }
+        } else if self.eat_ident("aggregate")? {
+            CommentTarget::Routine {
+                kind: RoutineTargetKind::Aggregate,
+                identity: self.routine_identity()?,
+            }
         } else if self.eat_ident("procedure")? {
             CommentTarget::Routine {
                 kind: RoutineTargetKind::Procedure,

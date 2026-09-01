@@ -5,6 +5,9 @@ CREATE ROLE acl_owner;
 CREATE ROLE acl_reader;
 CREATE ROLE acl_administrator CREATEROLE;
 CREATE ROLE acl_managed;
+COMMENT ON ROLE acl_owner IS 'acl owner comment';
+SELECT shobj_description(oid, 'pg_authid')
+  FROM pg_roles WHERE rolname = 'acl_owner';
 GRANT acl_managed TO acl_administrator WITH ADMIN OPTION;
 GRANT CREATE ON SCHEMA public TO acl_owner;
 
@@ -58,6 +61,8 @@ ALTER ROLE acl_owner RENAME TO acl_renamed_owner;
 SELECT pg_get_userbyid(c.relowner)
   FROM pg_class c
  WHERE c.relname = 'acl_private';
+SELECT shobj_description(oid, 'pg_authid')
+  FROM pg_roles WHERE rolname = 'acl_renamed_owner';
 
 DROP VIEW acl_exposed;
 DROP TABLE acl_private;

@@ -10,6 +10,9 @@ CREATE SUBSCRIPTION archived_changes
         synchronous_commit = remote_apply, two_phase = false,
         disable_on_error = true, password_required = false,
         run_as_owner = true, origin = none, failover = true);
+COMMENT ON SUBSCRIPTION archived_changes IS 'archived stream';
+SELECT obj_description(oid, 'pg_subscription') FROM pg_subscription
+ WHERE subname = 'archived_changes';
 SELECT subname, subenabled, subconninfo, subslotname, subpublications,
        subbinary, substream, subsynccommit, subdisableonerr,
        subpasswordrequired, subrunasowner, suborigin, subfailover
@@ -29,6 +32,8 @@ SELECT subname, subenabled, subconninfo, subslotname, subpublications,
        subpasswordrequired, subrunasowner, suborigin, subfailover
   FROM pg_subscription
   WHERE subname = 'archived_changes_renamed';
+SELECT obj_description(oid, 'pg_subscription') FROM pg_subscription
+ WHERE subname = 'archived_changes_renamed';
 ALTER SUBSCRIPTION archived_changes_renamed SKIP (lsn = NONE);
 DROP SUBSCRIPTION archived_changes_renamed;
 SELECT count(*) FROM pg_subscription WHERE subname = 'archived_changes_renamed';

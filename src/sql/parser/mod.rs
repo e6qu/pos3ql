@@ -6238,6 +6238,75 @@ impl<'a> Parser<'a> {
                 name,
                 table: self.qual_name("rule relation")?,
             })
+        } else if self.eat_ident("policy")? {
+            let name = self.col_ident("policy name")?;
+            self.expect_ident("on")?;
+            CommentTarget::Policy(crate::sql::ast::PolicyIdentity {
+                name,
+                table: self.qual_name("policy relation")?,
+            })
+        } else if self.eat_ident("constraint")? {
+            let name = self.col_ident("constraint name")?;
+            self.expect_ident("on")?;
+            CommentTarget::Constraint {
+                name,
+                table: self.qual_name("constraint table")?,
+            }
+        } else if self.eat_ident("statistics")? {
+            CommentTarget::Statistics(self.qual_name("statistics name")?)
+        } else if self.eat_ident("role")? {
+            CommentTarget::Role(self.col_ident("role name")?)
+        } else if self.eat_ident("access")? {
+            self.expect_ident("method")?;
+            CommentTarget::AccessMethod(self.col_ident("access method name")?)
+        } else if self.eat_ident("procedural")? {
+            self.expect_ident("language")?;
+            CommentTarget::ProceduralLanguage(self.col_ident("procedural language name")?)
+        } else if self.eat_ident("cast")? {
+            self.expect_op("(")?;
+            let source_type = self.unmodified_type_name()?;
+            self.expect_ident("as")?;
+            let target_type = self.unmodified_type_name()?;
+            self.expect_op(")")?;
+            CommentTarget::Cast {
+                source_type,
+                target_type,
+            }
+        } else if self.eat_ident("operator")? {
+            if self.eat_ident("family")? {
+                let name = self.qual_name("operator family name")?;
+                self.expect_ident("using")?;
+                CommentTarget::OperatorFamily {
+                    name,
+                    method: self.access_method()?,
+                }
+            } else if self.eat_ident("class")? {
+                let name = self.qual_name("operator class name")?;
+                self.expect_ident("using")?;
+                CommentTarget::OperatorClass {
+                    name,
+                    method: self.access_method()?,
+                }
+            } else {
+                CommentTarget::Operator(self.operator_identity()?)
+            }
+        } else if self.eat_ident("server")? {
+            CommentTarget::ForeignServer(self.col_ident("foreign server name")?)
+        } else if self.eat_ident("foreign")? {
+            if self.eat_ident("data")? {
+                self.expect_ident("wrapper")?;
+                CommentTarget::ForeignDataWrapper(self.col_ident("foreign-data wrapper name")?)
+            } else {
+                self.expect_ident("table")?;
+                CommentTarget::Relation {
+                    kind: CommentRelKind::ForeignTable,
+                    name: self.qual_name("foreign table name")?,
+                }
+            }
+        } else if self.eat_ident("publication")? {
+            CommentTarget::Publication(self.col_ident("publication name")?)
+        } else if self.eat_ident("subscription")? {
+            CommentTarget::Subscription(self.col_ident("subscription name")?)
         } else if self.eat_ident("function")? {
             CommentTarget::Routine {
                 kind: RoutineTargetKind::Function,
@@ -8693,6 +8762,82 @@ mod tests {
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Commit));
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Rollback));
             },
+        );
+    }
+
+    #[test]
+    fn comment_catalog_identities_are_closed_parse_states() {
+        with_parser(
+            "COMMENT ON CAST (public.mood AS text) IS 'cast'; \
+             COMMENT ON OPERATOR public.=== (integer, integer) IS 'operator'; \
+             COMMENT ON OPERATOR FAMILY public.int_family USING btree IS 'family'; \
+             COMMENT ON OPERATOR CLASS public.int_class USING btree IS 'class'; \
+             COMMENT ON CONSTRAINT int_checked ON public.items IS 'constraint'; \
+             COMMENT ON FOREIGN DATA WRAPPER app_fdw IS 'wrapper'; \
+             COMMENT ON ACCESS METHOD btree IS 'access method'; \
+             COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'language'",
+            |parser| {
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::Cast { .. },
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::Operator(_),
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::OperatorFamily { .. },
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::OperatorClass { .. },
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::Constraint { .. },
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::ForeignDataWrapper("app_fdw"),
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::AccessMethod("btree"),
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap(),
+                    Some(Stmt::Comment {
+                        target: crate::sql::ast::CommentTarget::ProceduralLanguage("plpgsql"),
+                        ..
+                    })
+                ));
+            },
+        );
+        with_parser(
+            "COMMENT ON OPERATOR FAMILY public.int_family USING hash IS 'family'",
+            |parser| assert!(parser.next_stmt().is_err()),
         );
     }
 

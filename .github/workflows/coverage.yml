@@ -216,9 +216,18 @@ jobs:
   # bounded; differential.sh enters this mode only when all reference settings
   # are explicitly supplied.
   reference-diff:
-    name: shard diff
+    name: shard diff-${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The instrumented complete corpus outgrew the five-minute worker
+          # ceiling. Split its existing deterministic shard contract; only one
+          # worker owns the auxiliary probes.
+          - { name: corpus-a, corpus_shard: "0-of-2", auxiliary: all }
+          - { name: corpus-b, corpus_shard: "1-of-2", auxiliary: none }
     services:
       postgres:
         image: postgres:18
@@ -267,6 +276,8 @@ jobs:
           POS3QL_REFERENCE_PG_PORT: "5432"
           POS3QL_EXTENSION_CONTROL_PATH: ${{ github.workspace }}/tests/external/extensions
           POS3QL_REFERENCE_EXTENSION_CONTROL_PATH: /tmp/pos3ql-extensions
+          POS3QL_DIFF_CORPUS_SHARD: ${{ matrix.corpus_shard }}
+          POS3QL_DIFF_AUXILIARY: ${{ matrix.auxiliary }}
           COVERAGE_SHARDS: "run:diff"
         run: |
           COVERAGE_SHARD="$COVERAGE_SHARDS" \
@@ -274,7 +285,7 @@ jobs:
           sh tools/coverage.sh
       - uses: actions/upload-artifact@v6
         with:
-          name: lcov-diff
+          name: lcov-diff-${{ matrix.name }}
           path: coverage-run-diff.lcov
 
   merge-and-gate:

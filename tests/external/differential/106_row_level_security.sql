@@ -25,6 +25,9 @@ CREATE POLICY rls_diff_bad_set ON rls_diff_target
   USING (generate_series(1, 2) > 0);
 CREATE POLICY rls_diff_rows ON rls_diff_target FOR ALL TO rls_diff_client
   USING (tenant = 'rls_diff_client') WITH CHECK (tenant = 'rls_diff_client');
+COMMENT ON POLICY rls_diff_rows ON rls_diff_target IS 'tenant boundary';
+SELECT obj_description(oid, 'pg_policy') FROM pg_policy
+ WHERE polname = 'rls_diff_rows';
 GRANT SELECT, INSERT, UPDATE, DELETE ON rls_diff_target TO rls_diff_client;
 GRANT SELECT ON rls_diff_source TO rls_diff_client;
 CREATE VIEW rls_diff_definer AS SELECT id, tenant, payload FROM rls_diff_target;

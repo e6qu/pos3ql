@@ -168,6 +168,7 @@ const KIND_SET_FOREIGN_TABLE: u8 = 118;
 const KIND_SET_VIEW_SECURITY: u8 = 119;
 const KIND_RENAME_VIEW: u8 = 120;
 const KIND_SET_VIEW_CHECK_OPTION: u8 = 121;
+const KIND_RENAME_ROLE: u8 = 122;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -175,7 +176,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_SET_VIEW_CHECK_OPTION;
+const LAST_KIND: u8 = KIND_RENAME_ROLE;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -1162,6 +1163,11 @@ pub(crate) enum WalOp<'a> {
     DropRole {
         name: &'a str,
     },
+    /// Preserve a role's durable slot identity across a rename.
+    RenameRole {
+        name: &'a str,
+        new_name: &'a str,
+    },
     UpsertRoleMembership {
         role: &'a str,
         member: &'a str,
@@ -2072,6 +2078,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::AnalyzeExtendedStatistics { .. } => KIND_ANALYZE_EXTENDED_STATISTICS,
         WalOp::UpsertRole { .. } => KIND_UPSERT_ROLE,
         WalOp::DropRole { .. } => KIND_DROP_ROLE,
+        WalOp::RenameRole { .. } => KIND_RENAME_ROLE,
         WalOp::UpsertRoleMembership { .. } => KIND_UPSERT_ROLE_MEMBERSHIP,
         WalOp::DropRoleMembership { .. } => KIND_DROP_ROLE_MEMBERSHIP,
         WalOp::SetRoleSetting { .. } => KIND_SET_ROLE_SETTING,
@@ -3111,6 +3118,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                     .map_or(0, |value| value.as_str().len())
         }
         WalOp::DropRole { name } => 1 + name.len(),
+        WalOp::RenameRole { name, new_name } => 1 + name.len() + 1 + new_name.len(),
         WalOp::UpsertRoleMembership {
             role,
             member,
@@ -5007,6 +5015,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 )
         }
         WalOp::DropRole { name } => name_bytes(buffer, name),
+        WalOp::RenameRole { name, new_name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, new_name)
+        }
         WalOp::UpsertRoleMembership {
             role,
             member,
@@ -9062,6 +9073,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_DROP_ROLE => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropRole { name })
+        }
+        KIND_RENAME_ROLE => {
+            let name = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RenameRole { name, new_name })
         }
         KIND_UPSERT_ROLE_MEMBERSHIP => {
             let role = take_name(&mut at)?;

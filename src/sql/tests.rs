@@ -2965,6 +2965,123 @@ fn event_trigger_comment_identities_include_builtin_types_and_view_columns() {
 }
 
 #[test]
+fn event_trigger_comment_targets_cover_cast_and_operator_catalogs() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE comment_catalog_events(kind text); \
+         CREATE FUNCTION capture_comment_catalog_event() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO comment_catalog_events \
+              SELECT object_type FROM pg_event_trigger_ddl_commands(); RETURN; END'; \
+         CREATE EVENT TRIGGER capture_comment_catalog_event_end ON ddl_command_end \
+           WHEN TAG IN ('COMMENT') EXECUTE FUNCTION capture_comment_catalog_event(); \
+         CREATE FOREIGN DATA WRAPPER comment_event_fdw NO HANDLER NO VALIDATOR; \
+         CREATE TABLE comment_event_constraints (value integer, \
+           CONSTRAINT comment_event_checked CHECK (value > 0)); \
+         CREATE TYPE comment_event_mood AS ENUM ('low', 'high'); \
+         CREATE FUNCTION comment_event_mood_text(comment_event_mood) RETURNS text \
+           LANGUAGE SQL RETURN 'mood'; \
+         CREATE FUNCTION comment_event_same(integer, integer) RETURNS boolean \
+           LANGUAGE SQL RETURN $1 = $2; \
+         CREATE FUNCTION comment_event_compare(integer, integer) RETURNS integer \
+           LANGUAGE SQL RETURN 0; \
+         CREATE CAST (comment_event_mood AS text) \
+           WITH FUNCTION comment_event_mood_text(comment_event_mood); \
+         CREATE OPERATOR === (FUNCTION = comment_event_same, LEFTARG = integer, RIGHTARG = integer); \
+         CREATE OPERATOR FAMILY comment_event_family USING btree; \
+         CREATE OPERATOR CLASS comment_event_class FOR TYPE integer USING btree \
+           FAMILY comment_event_family AS OPERATOR 3 ===, \
+           FUNCTION 1 comment_event_compare(integer, integer)",
+    );
+    let setup = String::from_utf8_lossy(&setup);
+    assert!(!setup.contains("ERROR"), "{setup}");
+    let output = run_with_arena_bytes(
+        &mut engine,
+        &mut budget,
+        "COMMENT ON CAST (comment_event_mood AS text) IS 'cast'; \
+         COMMENT ON OPERATOR === (integer, integer) IS 'operator'; \
+         COMMENT ON OPERATOR FAMILY comment_event_family USING btree IS 'family'; \
+         COMMENT ON OPERATOR CLASS comment_event_class USING btree IS 'class'; \
+         COMMENT ON CONSTRAINT comment_event_checked ON comment_event_constraints IS 'constraint'; \
+         COMMENT ON FOREIGN DATA WRAPPER comment_event_fdw IS 'wrapper'; \
+         COMMENT ON ACCESS METHOD btree IS 'access method'; \
+         COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'language'; \
+         SELECT kind FROM comment_catalog_events ORDER BY kind",
+        1 << 20,
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "access method",
+            "cast",
+            "foreign data wrapper",
+            "language",
+            "operator",
+            "operator class",
+            "operator family",
+            "table constraint",
+        ]
+    );
+}
+
+#[test]
+fn constraint_comments_keep_identity_through_catalog_churn_and_lifecycle() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE comment_constraint_target (value integer, \
+           CONSTRAINT comment_constraint_first CHECK (value > 0), \
+           CONSTRAINT comment_constraint_second CHECK (value < 100)); \
+         COMMENT ON CONSTRAINT comment_constraint_second ON comment_constraint_target \
+           IS 'stable constraint comment'; \
+         ALTER TABLE comment_constraint_target DROP CONSTRAINT comment_constraint_first; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'comment_constraint_target'::regclass \
+             AND conname = 'comment_constraint_second'; \
+         ALTER TABLE comment_constraint_target \
+           RENAME CONSTRAINT comment_constraint_second TO comment_constraint_renamed; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'comment_constraint_target'::regclass \
+             AND conname = 'comment_constraint_renamed'; \
+         ALTER TABLE comment_constraint_target DROP CONSTRAINT comment_constraint_renamed; \
+         ALTER TABLE comment_constraint_target \
+           ADD CONSTRAINT comment_constraint_renamed CHECK (value < 100); \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'comment_constraint_target'::regclass \
+             AND conname = 'comment_constraint_renamed'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        [
+            "stable constraint comment",
+            "stable constraint comment",
+            "NULL"
+        ]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE comment_constraint_parent (id integer PRIMARY KEY); \
+         CREATE TABLE comment_constraint_child (parent_id integer, \
+           CONSTRAINT comment_constraint_fk \
+             FOREIGN KEY (parent_id) REFERENCES comment_constraint_parent(id)); \
+         COMMENT ON CONSTRAINT comment_constraint_fk ON comment_constraint_child \
+           IS 'cascade cleanup'; \
+         ALTER TABLE comment_constraint_parent \
+           DROP CONSTRAINT comment_constraint_parent_pkey CASCADE",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(engine.storage.checkpoint_comments().count(), 0);
+}
+
+#[test]
 fn event_trigger_extension_commands_mark_script_members() {
     let mut config = test_config("event-trigger-extension-commands");
     config.extension_control_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3929,6 +4046,12 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
         CREATE OPERATOR CLASS public.int_class FOR TYPE integer USING btree \
           FAMILY public.int_family AS OPERATOR 3 public.===, \
           FUNCTION 1 public.int_compare(integer, integer); \
+        COMMENT ON CAST (public.mood AS text) IS 'durable cast comment'; \
+        COMMENT ON OPERATOR public.=== (integer, integer) IS 'durable operator comment'; \
+        COMMENT ON OPERATOR FAMILY public.int_family USING btree \
+          IS 'durable operator family comment'; \
+        COMMENT ON OPERATOR CLASS public.int_class USING btree \
+          IS 'durable operator class comment'; \
         CREATE TABLE public.catalog_index_values(value integer); \
         CREATE UNIQUE INDEX catalog_index_values_mod10 ON public.catalog_index_values \
           (value public.int_class); \
@@ -3947,7 +4070,11 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
         SELECT count(*) FROM pg_amop WHERE amopstrategy=3; \
         SELECT count(*) FROM pg_amproc WHERE amprocnum=1; \
         SELECT count(*) FROM pg_depend WHERE classid='pg_class'::regclass AND objid='catalog_index_values_mod10'::regclass AND refclassid='pg_opclass'::regclass; \
-        SELECT castmethod, castcontext, castfunc <> 0 FROM pg_cast";
+        SELECT castmethod, castcontext, castfunc <> 0 FROM pg_cast; \
+        SELECT obj_description(oid, 'pg_cast') FROM pg_cast WHERE castsource = 'public.mood'::regtype AND casttarget = 'text'::regtype; \
+        SELECT obj_description(oid, 'pg_operator') FROM pg_operator WHERE oprname = '===' AND oprleft = 'integer'::regtype; \
+        SELECT obj_description(oid, 'pg_opfamily') FROM pg_opfamily WHERE opfname = 'int_family'; \
+        SELECT obj_description(oid, 'pg_opclass') FROM pg_opclass WHERE opcname = 'int_class'";
 
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -3977,7 +4104,11 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
             "1",
             "1",
             "1",
-            "f|i|t"
+            "f|i|t",
+            "durable cast comment",
+            "durable operator comment",
+            "durable operator family comment",
+            "durable operator class comment"
         ]
     );
     assert!(wal_recovered.checkpoint().unwrap());
@@ -4000,9 +4131,27 @@ fn user_cast_operator_catalog_survives_wal_checkpoint_and_cold_recovery() {
             "1",
             "1",
             "1",
-            "f|i|t"
+            "f|i|t",
+            "durable cast comment",
+            "durable operator comment",
+            "durable operator family comment",
+            "durable operator class comment"
         ]
     );
+    let dropped = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "DROP VIEW public.catalog_operator_view; \
+         DROP VIEW public.catalog_prefix_view; \
+         DROP INDEX public.catalog_index_values_mod10; \
+         DROP OPERATOR CLASS public.int_class USING btree; \
+         DROP OPERATOR FAMILY public.int_family USING btree; \
+         DROP OPERATOR public.===(integer, integer); \
+         DROP CAST (public.mood AS text)",
+    );
+    let dropped = String::from_utf8_lossy(&dropped);
+    assert!(!dropped.contains("ERROR"), "{dropped}");
+    assert_eq!(cold.storage.checkpoint_comments().count(), 0);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
@@ -5783,8 +5932,10 @@ fn role_catalog_replays_from_wal() {
         "CREATE ROLE durable LOGIN CREATEROLE CONNECTION LIMIT 7 \
            PASSWORD 'never-store-this' VALID UNTIL 'infinity';
          ALTER ROLE durable NOINHERIT CREATEDB;
+         COMMENT ON ROLE durable IS 'durable role comment';
+         ALTER ROLE durable RENAME TO durable_renamed;
          CREATE ROLE durable_member;
-         GRANT durable TO durable_member WITH ADMIN OPTION;
+         GRANT durable_renamed TO durable_member WITH ADMIN OPTION;
          CREATE TABLE durable_column_acl (id integer, visible text, secret text);
          GRANT SELECT (visible) ON durable_column_acl TO durable_member;",
     );
@@ -5805,13 +5956,14 @@ fn role_catalog_replays_from_wal() {
         &mut restarted,
         &mut restarted_budget,
         "SELECT rolname, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolconnlimit
-           FROM pg_roles WHERE rolname = 'durable';
+           FROM pg_roles WHERE rolname = 'durable_renamed';
          SELECT parent.rolname, child.rolname, membership.admin_option
            FROM pg_auth_members membership
            JOIN pg_roles parent ON parent.oid = membership.roleid
            JOIN pg_roles child ON child.oid = membership.member;
-         SELECT rolpassword LIKE 'SCRAM-SHA-256$%', rolvaliduntil IS NULL
-           FROM pg_authid WHERE rolname = 'durable';
+         SELECT rolpassword LIKE 'SCRAM-SHA-256$%', rolvaliduntil IS NULL,
+                shobj_description(oid, 'pg_authid')
+           FROM pg_authid WHERE rolname = 'durable_renamed';
          SELECT has_column_privilege(
                   'durable_member', 'durable_column_acl', 'visible', 'SELECT'),
                 has_column_privilege(
@@ -5820,9 +5972,9 @@ fn role_catalog_replays_from_wal() {
     assert_eq!(
         data_rows(&output),
         [
-            "durable|f|t|t|t|7",
-            "durable|durable_member|t",
-            "t|t",
+            "durable_renamed|f|t|t|t|7",
+            "durable_renamed|durable_member|t",
+            "t|t|durable role comment",
             "t|f"
         ],
         "{}",
@@ -7839,9 +7991,11 @@ fn dropped_role_memberships_do_not_reappear_after_wal_replay() {
         &mut budget,
         "CREATE ROLE replay_parent; \
          CREATE ROLE replay_member; \
+         COMMENT ON ROLE replay_parent IS 'must be removed'; \
          GRANT replay_parent TO replay_member; \
          DROP ROLE replay_member; \
-         DROP ROLE replay_parent",
+         DROP ROLE replay_parent; \
+         CREATE ROLE replay_replacement",
     );
     drop(engine);
     let mut restarted_budget = Budget::new(1 << 28);
@@ -7852,9 +8006,11 @@ fn dropped_role_memberships_do_not_reappear_after_wal_replay() {
             &mut restarted_budget,
             "SELECT count(*) FROM pg_auth_members; \
              SELECT count(*) FROM pg_roles \
-              WHERE rolname IN ('replay_parent', 'replay_member')",
+             WHERE rolname IN ('replay_parent', 'replay_member'); \
+             SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
+              WHERE rolname = 'replay_replacement'",
         )),
-        ["0", "0"]
+        ["0", "0", "NULL"]
     );
 }
 
@@ -30028,11 +30184,11 @@ fn comment_roundtrip_and_removal() {
         ]
     );
 
-    // Overwrite is last-write-wins; IS NULL removes.
+    // Overwrite is last-write-wins; an empty string removes like PostgreSQL.
     run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS 'renamed'");
     let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
     assert_eq!(data_rows(&bytes), ["renamed"]);
-    run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS NULL");
+    run_with(&mut e, &mut b, "COMMENT ON TABLE ct IS ''");
     let bytes = run_with(&mut e, &mut b, "SELECT obj_description('ct'::regclass)");
     assert_eq!(data_rows(&bytes), ["NULL"]);
 }
@@ -30091,6 +30247,313 @@ fn routine_comments_are_typed_durable_and_do_not_survive_drop() {
 }
 
 #[test]
+fn policy_statistics_publication_and_subscription_comments_keep_object_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE comment_catalog_target (id integer, category integer); \
+         CREATE POLICY comment_catalog_policy ON comment_catalog_target FOR SELECT USING (true); \
+         CREATE STATISTICS comment_catalog_statistics (ndistinct) ON id, category FROM comment_catalog_target; \
+         CREATE PUBLICATION comment_catalog_publication FOR TABLE comment_catalog_target; \
+         CREATE SUBSCRIPTION comment_catalog_subscription \
+           CONNECTION 'host=publisher port=5432' \
+           PUBLICATION comment_catalog_publication \
+           WITH (connect = false, slot_name = NONE); \
+         COMMENT ON POLICY comment_catalog_policy ON comment_catalog_target IS 'policy comment'; \
+         COMMENT ON STATISTICS comment_catalog_statistics IS 'statistics comment'; \
+         COMMENT ON PUBLICATION comment_catalog_publication IS 'publication comment'; \
+         COMMENT ON SUBSCRIPTION comment_catalog_subscription IS 'subscription comment'; \
+         SELECT obj_description(oid, 'pg_policy') FROM pg_policy \
+           WHERE polname = 'comment_catalog_policy'; \
+         SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext \
+           WHERE stxname = 'comment_catalog_statistics'; \
+         SELECT obj_description(oid, 'pg_publication') FROM pg_publication \
+           WHERE pubname = 'comment_catalog_publication'; \
+         SELECT obj_description(oid, 'pg_subscription') FROM pg_subscription \
+           WHERE subname = 'comment_catalog_subscription'; \
+         ALTER STATISTICS comment_catalog_statistics RENAME TO comment_catalog_statistics_renamed; \
+         ALTER PUBLICATION comment_catalog_publication RENAME TO comment_catalog_publication_renamed; \
+         ALTER SUBSCRIPTION comment_catalog_subscription RENAME TO comment_catalog_subscription_renamed; \
+         SELECT description FROM pg_description WHERE classoid IN (3256, 3381, 6104, 6107) \
+           ORDER BY description",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "policy comment",
+            "statistics comment",
+            "publication comment",
+            "subscription comment",
+            "policy comment",
+            "publication comment",
+            "statistics comment",
+            "subscription comment",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    run_with(
+        &mut engine,
+        &mut budget,
+        "DROP POLICY comment_catalog_policy ON comment_catalog_target; \
+         DROP STATISTICS comment_catalog_statistics_renamed; \
+         DROP PUBLICATION comment_catalog_publication_renamed; \
+         DROP SUBSCRIPTION comment_catalog_subscription_renamed; \
+         CREATE POLICY comment_catalog_policy ON comment_catalog_target FOR SELECT USING (true); \
+         CREATE STATISTICS comment_catalog_statistics (ndistinct) ON id, category FROM comment_catalog_target; \
+         CREATE PUBLICATION comment_catalog_publication FOR TABLE comment_catalog_target; \
+         CREATE SUBSCRIPTION comment_catalog_subscription \
+           CONNECTION 'host=publisher port=5432' \
+           PUBLICATION comment_catalog_publication \
+           WITH (connect = false, slot_name = NONE); \
+         SELECT obj_description(oid, 'pg_policy') FROM pg_policy \
+           WHERE polname = 'comment_catalog_policy'; \
+         SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext \
+           WHERE stxname = 'comment_catalog_statistics'; \
+         SELECT obj_description(oid, 'pg_publication') FROM pg_publication \
+           WHERE pubname = 'comment_catalog_publication'; \
+         SELECT obj_description(oid, 'pg_subscription') FROM pg_subscription \
+           WHERE subname = 'comment_catalog_subscription'",
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT obj_description(oid, 'pg_policy') FROM pg_policy \
+           WHERE polname = 'comment_catalog_policy'; \
+         SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext \
+           WHERE stxname = 'comment_catalog_statistics'; \
+         SELECT obj_description(oid, 'pg_publication') FROM pg_publication \
+           WHERE pubname = 'comment_catalog_publication'; \
+         SELECT obj_description(oid, 'pg_subscription') FROM pg_subscription \
+           WHERE subname = 'comment_catalog_subscription'",
+    );
+    assert_eq!(data_rows(&output), ["NULL", "NULL", "NULL", "NULL"]);
+}
+
+#[test]
+fn role_and_foreign_server_comments_keep_stable_catalog_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE comment_role; \
+         CREATE FOREIGN DATA WRAPPER comment_fdw NO HANDLER NO VALIDATOR; \
+         CREATE SERVER comment_server FOREIGN DATA WRAPPER comment_fdw; \
+         CREATE FOREIGN TABLE comment_foreign_table (id integer) SERVER comment_server; \
+         COMMENT ON ROLE comment_role IS 'role comment'; \
+         COMMENT ON FOREIGN DATA WRAPPER comment_fdw IS 'wrapper comment'; \
+         COMMENT ON SERVER comment_server IS 'server comment'; \
+         COMMENT ON FOREIGN TABLE comment_foreign_table IS 'foreign table comment'; \
+         SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
+           WHERE rolname = 'comment_role'; \
+         SELECT obj_description(oid, 'pg_foreign_data_wrapper') \
+           FROM pg_foreign_data_wrapper WHERE fdwname = 'comment_fdw'; \
+         SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server \
+           WHERE srvname = 'comment_server'; \
+         SELECT obj_description('comment_foreign_table'::regclass); \
+         ALTER ROLE comment_role RENAME TO comment_role_renamed; \
+         ALTER FOREIGN DATA WRAPPER comment_fdw RENAME TO comment_fdw_renamed; \
+         ALTER SERVER comment_server RENAME TO comment_server_renamed; \
+         SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
+           WHERE rolname = 'comment_role_renamed'; \
+         SELECT obj_description(oid, 'pg_foreign_data_wrapper') \
+           FROM pg_foreign_data_wrapper WHERE fdwname = 'comment_fdw_renamed'; \
+         SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server \
+           WHERE srvname = 'comment_server_renamed'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "role comment",
+            "wrapper comment",
+            "server comment",
+            "foreign table comment",
+            "role comment",
+            "wrapper comment",
+            "server comment"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP ROLE comment_role_renamed; \
+         DROP FOREIGN TABLE comment_foreign_table; \
+         DROP SERVER comment_server_renamed; \
+         DROP FOREIGN DATA WRAPPER comment_fdw_renamed; \
+         CREATE ROLE comment_role_renamed; \
+         CREATE FOREIGN DATA WRAPPER comment_fdw_renamed NO HANDLER NO VALIDATOR; \
+         CREATE SERVER comment_server_renamed FOREIGN DATA WRAPPER comment_fdw_renamed; \
+         SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
+           WHERE rolname = 'comment_role_renamed'; \
+         SELECT obj_description(oid, 'pg_foreign_data_wrapper') \
+           FROM pg_foreign_data_wrapper WHERE fdwname = 'comment_fdw_renamed'; \
+         SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server \
+           WHERE srvname = 'comment_server_renamed'; \
+         DROP SERVER comment_server_renamed; \
+         DROP FOREIGN DATA WRAPPER comment_fdw_renamed; \
+         DROP ROLE comment_role_renamed",
+    );
+    assert_eq!(data_rows(&output), ["NULL", "NULL", "NULL"]);
+}
+
+#[test]
+fn static_catalog_comments_are_typed_and_durable() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "COMMENT ON ACCESS METHOD btree IS 'access method comment'; \
+         COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'language comment'; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'btree'; \
+         SELECT obj_description(oid, 'pg_language') FROM pg_language \
+           WHERE lanname = 'plpgsql'; \
+         SELECT classoid, objsubid, description FROM pg_description \
+           WHERE description IN ('access method comment', 'language comment') \
+           ORDER BY description",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "access method comment",
+            "language comment",
+            "2601|0|access method comment",
+            "2612|0|language comment",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         COMMENT ON ACCESS METHOD btree IS 'discarded access comment'; \
+         COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'discarded language comment'; \
+         ROLLBACK; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'btree'; \
+         SELECT obj_description(oid, 'pg_language') FROM pg_language \
+           WHERE lanname = 'plpgsql'; \
+         COMMENT ON ACCESS METHOD btree IS NULL; \
+         COMMENT ON PROCEDURAL LANGUAGE plpgsql IS NULL; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'btree'; \
+         SELECT obj_description(oid, 'pg_language') FROM pg_language \
+           WHERE lanname = 'plpgsql'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["access method comment", "language comment", "NULL", "NULL",],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn catalog_comments_survive_object_store_checkpoint_and_cold_recovery() {
+    let mut config = test_config("catalog-comment-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("catalog-comment-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE recovered_comment_target (id integer, category integer); \
+         ALTER TABLE recovered_comment_target ADD CONSTRAINT recovered_comment_checked \
+           CHECK (id > 0); \
+         CREATE POLICY recovered_comment_policy ON recovered_comment_target FOR SELECT USING (true); \
+         CREATE STATISTICS recovered_comment_statistics (ndistinct) \
+           ON id, category FROM recovered_comment_target; \
+         CREATE PUBLICATION recovered_comment_publication FOR TABLE recovered_comment_target; \
+         CREATE SUBSCRIPTION recovered_comment_subscription \
+           CONNECTION 'host=publisher port=5432' \
+           PUBLICATION recovered_comment_publication \
+           WITH (connect = false, slot_name = NONE); \
+         CREATE ROLE recovered_comment_role; \
+         CREATE FOREIGN DATA WRAPPER recovered_comment_fdw NO HANDLER NO VALIDATOR; \
+         CREATE SERVER recovered_comment_server \
+           FOREIGN DATA WRAPPER recovered_comment_fdw; \
+         COMMENT ON POLICY recovered_comment_policy ON recovered_comment_target IS 'policy durable'; \
+         COMMENT ON STATISTICS recovered_comment_statistics IS 'statistics durable'; \
+         COMMENT ON PUBLICATION recovered_comment_publication IS 'publication durable'; \
+         COMMENT ON SUBSCRIPTION recovered_comment_subscription IS 'subscription durable'; \
+         COMMENT ON ROLE recovered_comment_role IS 'role durable'; \
+         COMMENT ON FOREIGN DATA WRAPPER recovered_comment_fdw IS 'wrapper durable'; \
+         COMMENT ON SERVER recovered_comment_server IS 'server durable'; \
+         COMMENT ON ACCESS METHOD btree IS 'access method durable'; \
+         COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'language durable'; \
+         COMMENT ON CONSTRAINT recovered_comment_checked ON recovered_comment_target \
+           IS 'constraint durable'; \
+         ALTER TABLE recovered_comment_target \
+           RENAME CONSTRAINT recovered_comment_checked TO recovered_comment_checked_renamed; \
+         ALTER ROLE recovered_comment_role RENAME TO recovered_comment_role_renamed; \
+         ALTER FOREIGN DATA WRAPPER recovered_comment_fdw \
+           RENAME TO recovered_comment_fdw_renamed; \
+         ALTER SERVER recovered_comment_server RENAME TO recovered_comment_server_renamed",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let output = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT obj_description(oid, 'pg_policy') FROM pg_policy \
+           WHERE polname = 'recovered_comment_policy'; \
+         SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext \
+           WHERE stxname = 'recovered_comment_statistics'; \
+         SELECT obj_description(oid, 'pg_publication') FROM pg_publication \
+           WHERE pubname = 'recovered_comment_publication'; \
+         SELECT obj_description(oid, 'pg_subscription') FROM pg_subscription \
+           WHERE subname = 'recovered_comment_subscription'; \
+         SELECT shobj_description(oid, 'pg_authid') FROM pg_roles \
+           WHERE rolname = 'recovered_comment_role_renamed'; \
+         SELECT obj_description(oid, 'pg_foreign_data_wrapper') \
+           FROM pg_foreign_data_wrapper WHERE fdwname = 'recovered_comment_fdw_renamed'; \
+         SELECT obj_description(oid, 'pg_foreign_server') FROM pg_foreign_server \
+           WHERE srvname = 'recovered_comment_server_renamed'; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'btree'; \
+         SELECT obj_description(oid, 'pg_language') FROM pg_language \
+           WHERE lanname = 'plpgsql'; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'recovered_comment_target'::regclass \
+             AND conname = 'recovered_comment_checked_renamed'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "policy durable",
+            "statistics durable",
+            "publication durable",
+            "subscription durable",
+            "role durable",
+            "wrapper durable",
+            "server durable",
+            "access method durable",
+            "language durable",
+            "constraint durable",
+        ]
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn comment_errors_match_postgres() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE ct (a int)");
@@ -30098,6 +30561,11 @@ fn comment_errors_match_postgres() {
     run_with(&mut e, &mut b, "CREATE INDEX ci ON ct (a)");
     run_with(&mut e, &mut b, "CREATE SEQUENCE cs");
     run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('low', 'high')");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE FOREIGN DATA WRAPPER cmt_comment_fdw NO HANDLER NO VALIDATOR",
+    );
     run_with(
         &mut e,
         &mut b,
@@ -30146,6 +30614,14 @@ fn comment_errors_match_postgres() {
         .contains("42809")
     );
     assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON CONSTRAINT missing_comment_constraint ON ct IS 'x'"
+        ))
+        .contains("42704")
+    );
+    assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON SCHEMA nope IS 'x'"))
             .contains("3F000")
     );
@@ -30172,6 +30648,65 @@ fn comment_errors_match_postgres() {
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON DOMAIN ct IS 'x'"))
             .contains("42809")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON FOREIGN DATA WRAPPER missing_comment_fdw IS 'x'"
+        ))
+        .contains("42704")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON ACCESS METHOD missing_comment_access_method IS 'x'"
+        ))
+        .contains("42704")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON PROCEDURAL LANGUAGE missing_comment_language IS 'x'"
+        ))
+        .contains("42704")
+    );
+    let denied = run_with(
+        &mut e,
+        &mut b,
+        "CREATE ROLE comment_static_catalog_regular; \
+         GRANT comment_static_catalog_regular TO postgres; \
+         SET ROLE comment_static_catalog_regular; \
+         COMMENT ON ACCESS METHOD btree IS 'denied'",
+    );
+    let denied = String::from_utf8_lossy(&denied);
+    assert!(
+        denied.contains("42501") && denied.contains("must be superuser"),
+        "{denied}"
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "REVOKE comment_static_catalog_regular FROM postgres; \
+         DROP ROLE comment_static_catalog_regular",
+    );
+    assert!(
+        !String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON FOREIGN DATA WRAPPER cmt_comment_fdw IS 'x'"
+        ))
+        .contains("ERROR")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON FOREIGN SERVER missing_comment_server IS 'x'"
+        ))
+        .contains("42601")
     );
     assert!(
         String::from_utf8_lossy(&run_with(

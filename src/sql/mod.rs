@@ -5181,6 +5181,7 @@ impl Engine {
                 DdlUndo::CommentSet { slot, .. } => {
                     self.storage.commit_comment(*slot as usize, txn.txid);
                 }
+                DdlUndo::ConstraintCommentRenamed { .. } => {}
             }
         }
         for &advance in txn.subscription_advances() {
@@ -5910,6 +5911,10 @@ impl Engine {
             }
             DdlUndo::CommentSet { slot, prior } => {
                 self.storage.restore_comment_pending(slot as usize, prior);
+            }
+            DdlUndo::ConstraintCommentRenamed { slot, prior } => {
+                self.storage
+                    .restore_comment_identity_pending(slot as usize, prior);
             }
         }
     }
@@ -18186,6 +18191,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.install_role(crate::storage::SqlName::parse(name)?, attributes)?;
         }
         WalOp::DropRole { name } => storage.remove_role(name),
+        WalOp::RenameRole { name, new_name } => storage.replay_rename_role(name, new_name)?,
         WalOp::UpsertRoleMembership {
             role,
             member,

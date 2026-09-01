@@ -1531,7 +1531,7 @@ impl<'a> Parser<'a> {
         self.create_table(false, persistence)
     }
 
-    fn access_method(&mut self) -> Result<IndexAccessMethod, ParseError> {
+    pub(super) fn access_method(&mut self) -> Result<IndexAccessMethod, ParseError> {
         let method = self.col_ident("index access method")?;
         if method.eq_ignore_ascii_case("btree") {
             Ok(IndexAccessMethod::Btree)
@@ -1548,7 +1548,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn unmodified_type_name(&mut self) -> Result<&'a str, ParseError> {
+    pub(super) fn unmodified_type_name(&mut self) -> Result<&'a str, ParseError> {
         let (name, modifier) = self.type_name_mod()?;
         if modifier != -1 {
             return Err(self.err_here("type modifiers are not allowed in this definition"));
@@ -1613,7 +1613,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn operator_identity(&mut self) -> Result<OperatorIdentity<'a>, ParseError> {
+    pub(super) fn operator_identity(&mut self) -> Result<OperatorIdentity<'a>, ParseError> {
         let name = self.operator_qual_name("operator name is invalid")?;
         self.expect_op("(")?;
         let left_type = self.operator_operand_type()?;

@@ -334,6 +334,11 @@ enum ObjectRef {
     Subscription(usize),
     Extension(usize),
     LargeObject(usize),
+    ForeignDataWrapper(usize),
+    ForeignServer(usize),
+    Role(usize),
+    AccessMethod(i32),
+    ProceduralLanguage(i32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1096,6 +1101,75 @@ fn comment_reference(
         CommentClass::Tablespace | CommentClass::Database | CommentClass::EventTrigger => {
             return Err(graph_full());
         }
+        CommentClass::Cast => {
+            let oid = i32::try_from(subid).map_err(|_| graph_full())?;
+            EventObjectRef::Primary(ObjectRef::Cast(
+                storage
+                    .casts_visible_to(txid)
+                    .find_map(|(slot, cast)| (cast.oid() == oid).then_some(slot))
+                    .ok_or_else(graph_full)?,
+            ))
+        }
+        CommentClass::Operator => {
+            let oid = i32::try_from(subid).map_err(|_| graph_full())?;
+            EventObjectRef::Primary(ObjectRef::Operator(
+                storage
+                    .operator_slot_by_oid(oid, txid)
+                    .ok_or_else(graph_full)?,
+            ))
+        }
+        CommentClass::OperatorFamily => {
+            let oid = i32::try_from(subid).map_err(|_| graph_full())?;
+            EventObjectRef::Primary(ObjectRef::OperatorFamily(
+                storage
+                    .operator_family_slot_by_oid(oid, txid)
+                    .ok_or_else(graph_full)?,
+            ))
+        }
+        CommentClass::OperatorClass => {
+            let oid = crate::storage::OperatorClassOid::parse(
+                i32::try_from(subid).map_err(|_| graph_full())?,
+            )
+            .ok_or_else(graph_full)?;
+            EventObjectRef::Primary(ObjectRef::OperatorClass(
+                storage
+                    .operator_class_slot_by_oid(oid, txid)
+                    .ok_or_else(graph_full)?,
+            ))
+        }
+        CommentClass::Constraint => {
+            let table = usize::try_from(subid).map_err(|_| graph_full())?;
+            let oid = catalog::table_constraint_oid(storage, txid, table, name.as_str())
+                .ok_or_else(graph_full)?;
+            EventObjectRef::TableConstraint {
+                table: u16::try_from(table).map_err(|_| graph_full())?,
+                oid,
+                name: StackStr::from_str(name.as_str()),
+            }
+        }
+        CommentClass::Role => EventObjectRef::Primary(ObjectRef::Role(
+            storage
+                .role_slot_by_oid(i32::try_from(subid).map_err(|_| graph_full())?, txid)
+                .ok_or_else(graph_full)?,
+        )),
+        CommentClass::ForeignServer => EventObjectRef::Primary(ObjectRef::ForeignServer(
+            usize::try_from(subid).map_err(|_| graph_full())?,
+        )),
+        CommentClass::ForeignDataWrapper => EventObjectRef::Primary(ObjectRef::ForeignDataWrapper(
+            usize::try_from(subid).map_err(|_| graph_full())?,
+        )),
+        CommentClass::AccessMethod => {
+            let oid = i32::try_from(subid).map_err(|_| graph_full())?;
+            (catalog::access_method_name(oid) == Some(name.as_str()))
+                .then_some(EventObjectRef::Primary(ObjectRef::AccessMethod(oid)))
+                .ok_or_else(graph_full)?
+        }
+        CommentClass::ProceduralLanguage => {
+            let oid = i32::try_from(subid).map_err(|_| graph_full())?;
+            (catalog::procedural_language_name(oid) == Some(name.as_str()))
+                .then_some(EventObjectRef::Primary(ObjectRef::ProceduralLanguage(oid)))
+                .ok_or_else(graph_full)?
+        }
         CommentClass::LargeObject => {
             let oid = name
                 .as_str()
@@ -1117,6 +1191,37 @@ fn comment_reference(
                     .ok_or_else(graph_full)?,
             ))
         }
+        CommentClass::Policy => {
+            let oid = i32::try_from(subid).map_err(|_| graph_full())?;
+            EventObjectRef::Primary(ObjectRef::Policy(
+                storage
+                    .policies_with_slots_visible_to(txid)
+                    .find_map(|(slot, policy)| {
+                        (crate::storage::policy_oid(policy) == oid).then_some(slot)
+                    })
+                    .ok_or_else(graph_full)?,
+            ))
+        }
+        CommentClass::Statistics => EventObjectRef::Primary(ObjectRef::Statistics(
+            storage
+                .extended_statistics_visible(txid)
+                .find_map(|(slot, _)| (slot as u32 == subid).then_some(slot))
+                .ok_or_else(graph_full)?,
+        )),
+        CommentClass::Publication => EventObjectRef::Primary(ObjectRef::Publication(
+            storage
+                .publications_with_slots_visible_to(txid)
+                .find_map(|(slot, _)| (slot as u32 == subid).then_some(slot))
+                .ok_or_else(graph_full)?,
+        )),
+        CommentClass::Subscription => EventObjectRef::Primary(ObjectRef::Subscription(
+            storage
+                .subscriptions_with_slots_visible_to(txid)
+                .find_map(|(slot, subscription)| {
+                    (subscription.created_at as u32 == subid).then_some(slot)
+                })
+                .ok_or_else(graph_full)?,
+        )),
     })
 }
 
@@ -1795,7 +1900,7 @@ fn primary_object(
             let name = subscription.name_for(txid);
             base_object(
                 catalog::PG_SUBSCRIPTION_OID,
-                111_384 + i32::try_from(subscription.created_at).map_err(|_| graph_full())?,
+                catalog::subscription_oid(subscription),
                 "subscription",
                 None,
                 Some(name.as_str()),
@@ -1825,6 +1930,70 @@ fn primary_object(
                 None,
                 None,
                 identity,
+                false,
+            )
+        }
+        ObjectRef::ForeignServer(slot) => {
+            let server = storage
+                .foreign_server_by_slot(slot, txid)
+                .ok_or_else(graph_full)?;
+            base_object(
+                1417,
+                catalog::foreign_server_oid(slot),
+                "foreign server",
+                None,
+                Some(server.name.as_str()),
+                StackStr::from_str(identifier(server.name.as_str()).as_str()),
+                false,
+            )
+        }
+        ObjectRef::ForeignDataWrapper(slot) => {
+            let wrapper = storage
+                .foreign_wrapper_by_slot(slot, txid)
+                .ok_or_else(graph_full)?;
+            base_object(
+                2328,
+                catalog::foreign_data_wrapper_oid(slot),
+                "foreign data wrapper",
+                None,
+                Some(wrapper.name.as_str()),
+                StackStr::from_str(identifier(wrapper.name.as_str()).as_str()),
+                false,
+            )
+        }
+        ObjectRef::Role(slot) => {
+            let role = storage.role(slot);
+            base_object(
+                1260,
+                Storage::role_oid(slot),
+                "role",
+                None,
+                Some(role.name_to(txid).as_str()),
+                StackStr::from_str(identifier(role.name_to(txid).as_str()).as_str()),
+                false,
+            )
+        }
+        ObjectRef::AccessMethod(oid) => {
+            let name = catalog::access_method_name(oid).ok_or_else(graph_full)?;
+            base_object(
+                catalog::PG_AM_OID,
+                oid,
+                "access method",
+                None,
+                Some(name),
+                StackStr::from_str(identifier(name).as_str()),
+                false,
+            )
+        }
+        ObjectRef::ProceduralLanguage(oid) => {
+            let name = catalog::procedural_language_name(oid).ok_or_else(graph_full)?;
+            base_object(
+                catalog::PG_LANGUAGE_OID,
+                oid,
+                "language",
+                None,
+                Some(name),
+                StackStr::from_str(identifier(name).as_str()),
                 false,
             )
         }

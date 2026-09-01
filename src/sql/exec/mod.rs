@@ -595,15 +595,6 @@ fn create_table_kind(
     } else {
         "CREATE TABLE"
     };
-    match statement.membership {
-        crate::sql::ast::TableMembership::None | crate::sql::ast::TableMembership::Inherits(_) => {}
-        crate::sql::ast::TableMembership::OfType(_) => {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "typed tables require durable row-type membership"
-            ));
-        }
-    }
     if !statement.storage_options.is_empty() {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -2459,7 +2450,7 @@ fn build_inherited_table_def(
     txid: u32,
     arena: &Arena,
 ) -> Result<TableDef, SqlError> {
-    let own = build_def_with_likes(storage, statement, txid, arena)?;
+    let own = build_declared_table_def(storage, statement, txid, arena)?;
     let crate::sql::ast::TableMembership::Inherits(parents) = statement.membership else {
         return Ok(own);
     };
@@ -2547,6 +2538,68 @@ fn build_inherited_table_def(
             definition.n_columns = count;
         }
     }
+    Ok(definition)
+}
+
+/// Resolves `CREATE TABLE ... OF type` before table creation. The table stores
+/// the resolved composite identity and copies its active attributes into the
+/// physical row shape; later execution never reinterprets the type spelling.
+fn build_declared_table_def(
+    storage: &Storage,
+    statement: &CreateTable,
+    txid: u32,
+    arena: &Arena,
+) -> Result<TableDef, SqlError> {
+    let crate::sql::ast::TableMembership::OfType(type_name) = statement.membership else {
+        return build_def_with_likes(storage, statement, txid, arena);
+    };
+    if !statement.columns.is_empty() || !statement.likes.is_empty() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "typed-table column options require a typed attribute alteration protocol"
+        ));
+    }
+    let slot = storage
+        .resolve_composite_slot(type_name.name, txid)
+        .filter(|slot| {
+            type_name
+                .schema
+                .is_none_or(|schema| storage.composite_for(*slot, txid).schema.as_str() == schema)
+        })
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "type \"{}\" does not exist",
+                type_name.name
+            )
+        })?;
+    let composite = storage.composite_for(slot, txid);
+    let mut definition = TableDef {
+        name: SqlName::parse(statement.name.name)?,
+        type_membership: crate::storage::TableTypeMembership::Composite(
+            u16::try_from(slot).map_err(|_| {
+                sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "too many composite types")
+            })?,
+        ),
+        ..TableDef::empty()
+    };
+    let mut count = 0;
+    for field in composite.active_fields_for(txid) {
+        push_column(
+            &mut definition,
+            &mut count,
+            ColumnMeta {
+                name: field.name,
+                ctype: field.ctype,
+                type_mod: field.type_mod,
+                collation: field.collation,
+                not_null: crate::storage::NotNullOrigin::local(field.not_null),
+                user_type: field.user_type,
+                ..ColumnMeta::EMPTY
+            },
+        )?;
+    }
+    definition.n_columns = count;
     Ok(definition)
 }
 
@@ -33733,6 +33786,41 @@ fn drop_composite_type(
         })?;
     }
 
+    // A typed table owns a durable `pg_class.reloftype` edge to its composite.
+    // Remove that dependent relation through the ordinary table-drop path so
+    // indexes, policies, rows, WAL, and transaction undo remain one protocol.
+    while let Some(table_slot) = typed_table_member(storage, slot, txn.txid) {
+        if !cascade {
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop type {} because other objects depend on it",
+                definition.name.as_str()
+            ));
+        }
+        let table = *storage.table_def(table_slot, txn.txid);
+        let name = QualName {
+            schema: Some(table.schema.as_str()),
+            name: table.name.as_str(),
+        };
+        let statement = DropTable {
+            names: core::slice::from_ref(&name),
+            if_exists: false,
+            cascade: true,
+        };
+        match responder.without_command_complete(|responder| {
+            drop_table_kind(storage, wal, txn, &statement, None, "DROP TABLE", responder)
+        }) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "DROP TYPE cascade notice exceeds the send buffer"
+                ));
+            }
+        }
+    }
+
     while let Some((table_schema, table_name, _)) = composite_column_in_use(storage, slot, txn.txid)
     {
         if !cascade {
@@ -33832,6 +33920,17 @@ fn drop_composite_type(
     Ok(())
 }
 
+fn typed_table_member(storage: &Storage, composite_slot: usize, txid: u32) -> Option<usize> {
+    (0..storage.table_count()).find(|&table_slot| {
+        storage.table(table_slot).visible_to(txid)
+            && storage
+                .table_def(table_slot, txid)
+                .type_membership
+                .composite_slot()
+                == Some(composite_slot)
+    })
+}
+
 #[derive(Clone, Copy)]
 struct CompositeTypeDependencyRoot {
     slot: usize,
@@ -33903,6 +34002,21 @@ fn report_composite_type_dependents(
             continue;
         }
         let definition = storage.table_def(table_slot, txid);
+        if definition.type_membership.composite_slot() == Some(slot) {
+            let line = stack_format!(
+                192,
+                "typed table {}{}",
+                definition.name.as_str(),
+                if cascade { "" } else { " depends on type" }
+            );
+            if cascade {
+                let cascade_line = stack_format!(192, "drop cascades to {}", line.as_str());
+                push(cascade_line.as_str());
+            } else {
+                let line = stack_format!(192, "{} {}", line.as_str(), type_name.as_str());
+                push(line.as_str());
+            }
+        }
         for column in definition.columns() {
             if matches!(column.ctype, ColType::Composite(found) if found as usize == slot) {
                 let line = stack_format!(
@@ -34097,7 +34211,8 @@ fn reject_composite_attribute_type_with_dependents(
         slot: composite_slot,
         name: storage.composite_for(composite_slot, txid).name,
     };
-    let direct_column = composite_column_in_use(storage, composite_slot, txid).is_some();
+    let direct_column = composite_column_in_use(storage, composite_slot, txid).is_some()
+        || typed_table_member(storage, composite_slot, txid).is_some();
     let nested_field = composite_field_uses_composite(storage, root, txid)?.is_some();
     let domain = (0..storage.domain_count()).any(|slot| {
         storage.domain_for(slot, txid).visible_to(txid)
@@ -35927,6 +36042,20 @@ fn alter_composite_type(
     };
     if let Err(error) = storage.require_owner(object, txn.txid, "type") {
         return sql_fail(error);
+    }
+    if matches!(
+        action,
+        A::AddAttribute(_)
+            | A::DropAttribute { .. }
+            | A::RenameAttribute { .. }
+            | A::AlterAttributeType { .. }
+    ) && typed_table_member(storage, slot, txn.txid).is_some()
+    {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot alter attributes of composite type \"{}\" while typed tables depend on it",
+            storage.composite_for(slot, txn.txid).name.as_str()
+        ));
     }
     let mut altered = storage.composite_for(slot, txn.txid);
     let mut renamed_attribute = None;
@@ -52215,6 +52344,28 @@ fn alter_table_inner(
         )
     {
         return sql_fail(error);
+    }
+
+    // The composite owns the physical attribute list of a typed table. Letting
+    // an ordinary ALTER TABLE mutate that list would leave `reloftype` pointing
+    // at a different row shape.
+    if def.type_membership.composite_slot().is_some()
+        && statement.actions.iter().any(|action| {
+            matches!(
+                action,
+                AlterAction::AddColumn(_)
+                    | AlterAction::DropColumn { .. }
+                    | AlterAction::RenameColumn { .. }
+                    | AlterAction::AlterColumnType { .. }
+                    | AlterAction::SetNotNull { .. }
+                    | AlterAction::DropNotNull { .. }
+            )
+        })
+    {
+        return sql_fail(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "typed-table attributes must be altered through their composite type"
+        ));
     }
 
     let has_ordinary_child = (0..storage.table_count()).any(|candidate| {

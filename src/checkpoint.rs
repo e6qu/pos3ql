@@ -27,7 +27,7 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v6";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v7";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -1217,7 +1217,21 @@ impl Checkpointer {
                             CheckpointSetupError::Corrupt("invalid table inheritance")
                         })?;
                     }
-                    let name = rest_of(line, 9 + inheritance_count)?;
+                    let membership: i32 = parse_field(words.next(), "typed-table membership")?;
+                    let type_membership = if membership == -1 {
+                        crate::storage::TableTypeMembership::None
+                    } else {
+                        let slot = u16::try_from(membership).map_err(|_| {
+                            CheckpointSetupError::Corrupt("invalid typed-table membership")
+                        })?;
+                        if usize::from(slot) >= crate::storage::MAX_COMPOSITES {
+                            return Err(CheckpointSetupError::Corrupt(
+                                "typed-table membership out of range",
+                            ));
+                        }
+                        crate::storage::TableTypeMembership::Composite(slot)
+                    };
+                    let name = rest_of(line, 10 + inheritance_count)?;
                     let def = TableDef {
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
@@ -1230,6 +1244,7 @@ impl Checkpointer {
                         tablespace,
                         access_method,
                         inheritance,
+                        type_membership,
                         ..TableDef::empty()
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
@@ -6068,6 +6083,17 @@ impl Checkpointer {
                     )
                 })?;
             }
+            let membership = table
+                .def
+                .type_membership
+                .composite_slot()
+                .map_or(-1, |slot| slot as i32);
+            write!(table_line, " {membership}").map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table manifest line exceeds fixed capacity"
+                )
+            })?;
             write!(table_line, " {}", table.def.name.as_str()).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,

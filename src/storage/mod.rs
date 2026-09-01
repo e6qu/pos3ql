@@ -1334,7 +1334,30 @@ pub struct TableDef {
     /// Direct PostgreSQL table-inheritance parents. Slots are durable catalog
     /// identities; a parent cannot be dropped or reused while this edge exists.
     pub inheritance: TableInheritance,
+    /// A typed table retains the composite type identity it was declared `OF`.
+    /// The table's own row type remains distinct, as PostgreSQL requires.
+    pub type_membership: TableTypeMembership,
     pub partition: PartitionDef,
+}
+
+/// Durable typed-table membership. A resolved composite slot, rather than a
+/// spelling, keeps type rename, schema move, recovery, and dependency checks
+/// on one identity boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableTypeMembership {
+    None,
+    Composite(u16),
+}
+
+impl TableTypeMembership {
+    pub const NONE: Self = Self::None;
+
+    pub const fn composite_slot(self) -> Option<usize> {
+        match self {
+            Self::None => None,
+            Self::Composite(slot) => Some(slot as usize),
+        }
+    }
 }
 
 /// The durable table modes of PostgreSQL logical replica identity. The index
@@ -1612,6 +1635,7 @@ impl TableDef {
             row_level_security: RowLevelSecurityState::DISABLED,
             replica_identity: ReplicaIdentityMode::DEFAULT,
             inheritance: TableInheritance::NONE,
+            type_membership: TableTypeMembership::NONE,
             partition: PartitionDef::NONE,
         }
     }

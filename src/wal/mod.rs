@@ -2235,6 +2235,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             n += def.n_columns;
             n += encoded_partition_len(def.partition);
             n += 1 + def.inheritance.parents_ref().len() * 2;
+            n += match def.type_membership {
+                crate::storage::TableTypeMembership::None => 1,
+                crate::storage::TableTypeMembership::Composite(_) => 3,
+            };
             n += 3;
             n
         }
@@ -3751,6 +3755,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok &= buffer.append(&[def.inheritance.parents_ref().len() as u8]);
             for parent in def.inheritance.parents_ref() {
                 ok &= buffer.append(&parent.to_le_bytes());
+            }
+            match def.type_membership {
+                crate::storage::TableTypeMembership::None => ok &= buffer.append(&[0]),
+                crate::storage::TableTypeMembership::Composite(slot) => {
+                    ok &= buffer.append(&[1]) && buffer.append(&slot.to_le_bytes());
+                }
             }
             ok &= buffer.append(&[
                 u8::from(def.row_level_security.enabled),
@@ -6299,6 +6309,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += 2;
                 def.inheritance.append(usize::from(parent)).ok()?;
             }
+            let membership_tag = *payload.get(at)?;
+            at += 1;
+            def.type_membership = match membership_tag {
+                0 => crate::storage::TableTypeMembership::None,
+                1 => {
+                    let slot = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
+                    at += 2;
+                    if usize::from(slot) >= crate::storage::MAX_COMPOSITES {
+                        return None;
+                    }
+                    crate::storage::TableTypeMembership::Composite(slot)
+                }
+                _ => return None,
+            };
             def.row_level_security = crate::storage::RowLevelSecurityState {
                 enabled: match *payload.get(at)? {
                     0 => false,
@@ -10712,6 +10736,7 @@ mod tests {
         definition.columns[0].not_null = crate::storage::NotNullOrigin::LocalAndInherited;
         definition.inheritance.append(3).unwrap();
         definition.inheritance.append(7).unwrap();
+        definition.type_membership = crate::storage::TableTypeMembership::Composite(11);
         definition.partition = PartitionDef::child(
             4,
             PartitionBound::Range {
@@ -10732,6 +10757,10 @@ mod tests {
             panic!("partition table definition did not decode")
         };
         assert_eq!(restored.inheritance.parents_ref(), &[3, 7]);
+        assert_eq!(
+            restored.type_membership,
+            crate::storage::TableTypeMembership::Composite(11)
+        );
         let Some(crate::storage::PartitionAttachment {
             parent,
             bound:

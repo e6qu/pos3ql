@@ -38541,8 +38541,6 @@ fn unimplemented_table_lifecycle_forms_are_typed_and_loud() {
     let (mut engine, mut budget) = test_engine();
     for statement in [
         "CREATE TABLE table_storage_option_rows (id integer) WITH (fillfactor = 80)",
-        "CREATE TYPE typed_table_row AS (id integer); \
-         CREATE TABLE typed_table_rows OF typed_table_row",
         "CREATE TABLE alter_storage_option_rows (id integer); \
          ALTER TABLE alter_storage_option_rows SET (fillfactor = 80)",
         "CREATE TABLE reset_storage_option_rows (id integer); \
@@ -38566,10 +38564,155 @@ fn unimplemented_table_lifecycle_forms_are_typed_and_loud() {
             &mut engine,
             &mut budget,
             "SELECT count(*) FROM pg_class \
-              WHERE relname IN ('table_storage_option_rows', 'typed_table_rows')",
+              WHERE relname = 'table_storage_option_rows'",
         )),
         ["0"],
         "rejected metadata must not leave inert durable relations behind"
+    );
+}
+
+#[test]
+fn typed_table_membership_uses_the_resolved_composite_identity() {
+    let (mut engine, mut budget) = test_engine();
+    for statement in [
+        "CREATE TYPE typed_table_row AS (id integer, label text)",
+        "CREATE TABLE typed_table_rows OF typed_table_row",
+        "INSERT INTO typed_table_rows VALUES (7, 'typed')",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, label FROM typed_table_rows",
+        )),
+        ["7|typed"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT c.reloftype = t.oid \
+             FROM pg_class c JOIN pg_type t ON t.typname = 'typed_table_row' \
+             WHERE c.relname = 'typed_table_rows'",
+        )),
+        ["t"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE typed_table_enum AS ENUM ('x'); \
+         CREATE TABLE invalid_typed_table OF typed_table_enum",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42704"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn typed_table_membership_controls_composite_attribute_and_drop_lifecycle() {
+    let (mut engine, mut budget) = test_engine();
+    for statement in [
+        "CREATE TYPE typed_lifecycle_row AS (id integer, label text)",
+        "CREATE TABLE typed_lifecycle_rows OF typed_lifecycle_row",
+        "INSERT INTO typed_lifecycle_rows VALUES (1, 'retained')",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TYPE typed_lifecycle_row ADD ATTRIBUTE extra integer",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, label FROM typed_lifecycle_rows",
+        )),
+        ["1|retained"]
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE typed_lifecycle_rows ADD COLUMN forbidden integer",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TYPE typed_lifecycle_row RENAME TO typed_lifecycle_row_renamed",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT c.reloftype = t.oid \
+             FROM pg_class c JOIN pg_type t ON t.typname = 'typed_lifecycle_row_renamed' \
+             WHERE c.relname = 'typed_lifecycle_rows'",
+        )),
+        ["t"]
+    );
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TYPE typed_lifecycle_row_renamed",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP TYPE typed_lifecycle_row_renamed CASCADE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT * FROM typed_lifecycle_rows",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P01"),
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 
@@ -38704,7 +38847,10 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
         "CREATE TABLESPACE table_definition_recovery_space LOCATION '/object/table-definition-recovery'",
         "CREATE TABLE table_definition_recovery_rows (id integer NOT NULL CHECK (id > 0)) USING heap TABLESPACE table_definition_recovery_space",
         "CREATE TABLE table_definition_recovery_child (extra text) INHERITS (table_definition_recovery_rows)",
+        "CREATE TYPE table_definition_recovery_type AS (id integer, label text)",
+        "CREATE TABLE table_definition_typed_rows OF table_definition_recovery_type",
         "INSERT INTO table_definition_recovery_child VALUES (1, 'child')",
+        "INSERT INTO table_definition_typed_rows VALUES (2, 'typed')",
         "ALTER TABLE table_definition_recovery_rows ALTER COLUMN id SET STATISTICS 91",
     ] {
         let output = run_with(&mut engine, &mut budget, statement);
@@ -38744,6 +38890,18 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
         "SELECT id FROM table_definition_recovery_rows",
     );
     assert_eq!(data_rows(&inherited_recovery_rows), ["1"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT c.reloftype = t.oid, r.label \
+             FROM pg_class c \
+             JOIN pg_type t ON t.typname = 'table_definition_recovery_type' \
+             JOIN table_definition_typed_rows r ON true \
+             WHERE c.relname = 'table_definition_typed_rows'",
+        )),
+        ["t|typed"]
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut restarted,

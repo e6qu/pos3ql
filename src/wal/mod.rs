@@ -2239,6 +2239,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 crate::storage::TableTypeMembership::None => 1,
                 crate::storage::TableTypeMembership::Composite(_) => 3,
             };
+            n += 1;
             n += 3;
             n
         }
@@ -3217,7 +3218,7 @@ fn encoded_partition_len(partition: PartitionDef) -> usize {
         .scheme
         .map_or(0, |scheme| 2 + usize::from(scheme.n_keys) * 2);
     let attachment = partition.attachment.map_or(0, |attachment| {
-        2 + match attachment.bound {
+        3 + match attachment.bound {
             PartitionBound::Default => 1,
             PartitionBound::Hash { .. } => 1 + 8,
             PartitionBound::List { n_values, values } => {
@@ -3264,6 +3265,10 @@ fn append_partition(buffer: &mut FixedBuf, partition: PartitionDef) -> bool {
     }
     if let Some(attachment) = partition.attachment {
         ok &= buffer.append(&attachment.parent.to_le_bytes());
+        ok &= buffer.append(&[match attachment.state {
+            crate::storage::PartitionAttachmentState::Attached => 0,
+            crate::storage::PartitionAttachmentState::DetachPending => 1,
+        }]);
         match attachment.bound {
             PartitionBound::Default => ok &= buffer.append(&[0]),
             PartitionBound::Range {
@@ -3762,6 +3767,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     ok &= buffer.append(&[1]) && buffer.append(&slot.to_le_bytes());
                 }
             }
+            ok &= buffer.append(&[def.storage_options.fillfactor.unwrap_or(0)]);
             ok &= buffer.append(&[
                 u8::from(def.row_level_security.enabled),
                 u8::from(def.row_level_security.forced),
@@ -6323,6 +6329,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 }
                 _ => return None,
             };
+            let fillfactor = *payload.get(at)?;
+            at += 1;
+            if fillfactor != 0 && !(10..=100).contains(&fillfactor) {
+                return None;
+            }
+            def.storage_options.fillfactor = (fillfactor != 0).then_some(fillfactor);
             def.row_level_security = crate::storage::RowLevelSecurityState {
                 enabled: match *payload.get(at)? {
                     0 => false,
@@ -9897,6 +9909,12 @@ fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
     let attachment = if flags & 2 != 0 {
         let parent = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?);
         *at += 2;
+        let state = match *payload.get(*at)? {
+            0 => crate::storage::PartitionAttachmentState::Attached,
+            1 => crate::storage::PartitionAttachmentState::DetachPending,
+            _ => return None,
+        };
+        *at += 1;
         let tag = *payload.get(*at)?;
         *at += 1;
         let bound = match tag {
@@ -9940,7 +9958,11 @@ fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
             }
             _ => return None,
         };
-        Some(crate::storage::PartitionAttachment { parent, bound })
+        Some(crate::storage::PartitionAttachment {
+            parent,
+            bound,
+            state,
+        })
     } else {
         None
     };
@@ -10747,6 +10769,8 @@ mod tests {
                 n_keys: 1,
             },
         );
+        definition.partition.attachment.as_mut().unwrap().state =
+            crate::storage::PartitionAttachmentState::DetachPending;
         let mut budget = Budget::new(4096);
         let mut payload = FixedBuf::new(&mut budget, "partition table payload", 4096).unwrap();
         assert!(append_payload(
@@ -10763,17 +10787,23 @@ mod tests {
         );
         let Some(crate::storage::PartitionAttachment {
             parent,
+            state,
             bound:
                 PartitionBound::Range {
                     lower,
                     upper,
                     n_keys,
                 },
+            ..
         }) = restored.partition.attachment
         else {
             panic!("partition metadata lost")
         };
         assert_eq!((parent, n_keys), (4, 1));
+        assert_eq!(
+            state,
+            crate::storage::PartitionAttachmentState::DetachPending
+        );
         assert_eq!(
             restored.columns[0].not_null,
             crate::storage::NotNullOrigin::LocalAndInherited

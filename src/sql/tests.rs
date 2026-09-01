@@ -38540,17 +38540,10 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
 fn unimplemented_table_lifecycle_forms_are_typed_and_loud() {
     let (mut engine, mut budget) = test_engine();
     for statement in [
-        "CREATE TABLE table_storage_option_rows (id integer) WITH (fillfactor = 80)",
         "CREATE TABLE alter_storage_option_rows (id integer); \
-         ALTER TABLE alter_storage_option_rows SET (fillfactor = 80)",
+         ALTER TABLE alter_storage_option_rows ALTER COLUMN id SET STORAGE EXTERNAL",
         "CREATE TABLE reset_storage_option_rows (id integer); \
-         ALTER TABLE reset_storage_option_rows RESET (fillfactor)",
-        "CREATE TABLE detach_parent_rows (id integer) PARTITION BY RANGE (id); \
-         CREATE TABLE detach_child_rows PARTITION OF detach_parent_rows FOR VALUES FROM (0) TO (10); \
-         ALTER TABLE detach_parent_rows DETACH PARTITION detach_child_rows CONCURRENTLY",
-        "CREATE TABLE finalize_parent_rows (id integer) PARTITION BY RANGE (id); \
-         CREATE TABLE finalize_child_rows PARTITION OF finalize_parent_rows FOR VALUES FROM (0) TO (10); \
-         ALTER TABLE finalize_parent_rows DETACH PARTITION finalize_child_rows FINALIZE",
+         ALTER TABLE reset_storage_option_rows ALTER COLUMN id SET COMPRESSION lz4",
     ] {
         let output = run_with(&mut engine, &mut budget, statement);
         let text = String::from_utf8_lossy(&output);
@@ -38559,16 +38552,260 @@ fn unimplemented_table_lifecycle_forms_are_typed_and_loud() {
             "{statement} must fail as a typed architecture boundary: {text}"
         );
     }
+}
+
+#[test]
+fn table_fillfactor_is_durable_catalog_and_object_layout_state() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE table_storage_option_rows (id integer) WITH (fillfactor = 80); \
+         INSERT INTO table_storage_option_rows VALUES (1), (2); \
+         ALTER TABLE table_storage_option_rows SET (fillfactor = 70)",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT count(*) FROM pg_class \
-              WHERE relname = 'table_storage_option_rows'",
+            "SELECT reloptions FROM pg_class WHERE relname = 'table_storage_option_rows'",
         )),
-        ["0"],
-        "rejected metadata must not leave inert durable relations behind"
+        ["{fillfactor=70}"]
     );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TABLE table_storage_option_rows RESET (fillfactor); \
+             SELECT reloptions FROM pg_class WHERE relname = 'table_storage_option_rows'",
+        )),
+        ["NULL"]
+    );
+}
+
+#[test]
+fn concurrent_partition_detach_routes_through_durable_attachment_state() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE detach_parent_rows (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE detach_child_rows PARTITION OF detach_parent_rows FOR VALUES FROM (0) TO (10); \
+         INSERT INTO detach_parent_rows VALUES (4); \
+         ALTER TABLE detach_parent_rows DETACH PARTITION detach_child_rows CONCURRENTLY; \
+         SELECT count(*) FROM detach_parent_rows; \
+         SELECT count(*) FROM detach_child_rows; \
+         SELECT relispartition FROM pg_class WHERE relname = 'detach_child_rows'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["0", "1", "f"], "{text}");
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE detach_default_parent (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE detach_default_child PARTITION OF detach_default_parent DEFAULT; \
+         CREATE TABLE detach_range_child PARTITION OF detach_default_parent FOR VALUES FROM (0) TO (10); \
+         ALTER TABLE detach_default_parent DETACH PARTITION detach_range_child CONCURRENTLY",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("55000"));
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE detach_txn_parent (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE detach_txn_child PARTITION OF detach_txn_parent FOR VALUES FROM (0) TO (10); \
+         BEGIN; \
+         ALTER TABLE detach_txn_parent DETACH PARTITION detach_txn_child CONCURRENTLY",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("25001"));
+}
+
+#[test]
+fn concurrent_partition_detach_commits_pending_phase_before_waiting() {
+    let (mut engine, mut budget) = test_engine();
+    let mut reader = TxnState::new(&mut budget, 256).unwrap();
+    let mut detacher = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "CREATE TABLE pending_detach_parent (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE pending_detach_child PARTITION OF pending_detach_parent FOR VALUES FROM (0) TO (10); \
+         INSERT INTO pending_detach_parent VALUES (4)",
+    );
+    run_txn(&mut engine, &mut budget, &mut reader, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "SELECT * FROM pending_detach_parent",
+    );
+
+    let mut send = crate::mem::FixedBuf::new(&mut budget, "detach wait send", 1 << 18).unwrap();
+    let arena = Arena::new(&mut budget, "detach wait sql", 1 << 18).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut guc = GucState::new();
+    let mut cursors = test_cursors(&mut budget);
+    let sql =
+        "ALTER TABLE pending_detach_parent DETACH PARTITION pending_detach_child CONCURRENTLY";
+    let status = engine
+        .execute_simple(
+            sql,
+            &arena,
+            &mut detacher,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut Responder::new(&mut send),
+            11,
+        )
+        .unwrap();
+    assert!(matches!(
+        status,
+        ExecutionStatus::Blocked { io_wait: false, .. }
+    ));
+    assert!(send.is_empty());
+    let child = engine
+        .storage
+        .find_visible("public", "pending_detach_child", 0)
+        .unwrap();
+    assert!(matches!(
+        engine.storage.table_def(child, 0).partition.attachment,
+        Some(crate::storage::PartitionAttachment {
+            state: crate::storage::PartitionAttachmentState::DetachPending,
+            ..
+        })
+    ));
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pending_detach_parent; \
+             SELECT count(*) FROM pending_detach_child; \
+             SELECT inhdetachpending FROM pg_inherits \
+              WHERE inhrelid = 'pending_detach_child'::regclass",
+        )),
+        ["0", "1", "t"]
+    );
+
+    run_txn(&mut engine, &mut budget, &mut reader, "COMMIT");
+    let status = engine
+        .execute_simple_from(
+            sql,
+            0,
+            &arena,
+            &mut detacher,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut Responder::new(&mut send),
+            11,
+            false,
+        )
+        .unwrap();
+    assert_eq!(status, ExecutionStatus::Complete);
+    assert!(String::from_utf8_lossy(send.readable()).contains("ALTER TABLE"));
+    assert!(
+        engine
+            .storage
+            .table_def(child, 0)
+            .partition
+            .attachment
+            .is_none()
+    );
+}
+
+#[test]
+fn pending_partition_detach_survives_object_cold_recovery_and_finalizes() {
+    let mut config = test_config("pending-partition-detach-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("pending-partition-detach-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut reader = TxnState::new(&mut budget, 256).unwrap();
+    let mut detacher = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "CREATE TABLE pending_recovery_parent (id integer) PARTITION BY RANGE (id); \
+         CREATE TABLE pending_recovery_child PARTITION OF pending_recovery_parent FOR VALUES FROM (0) TO (10); \
+         INSERT INTO pending_recovery_parent VALUES (4)",
+    );
+    run_txn(&mut engine, &mut budget, &mut reader, "BEGIN");
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut reader,
+        "SELECT * FROM pending_recovery_parent",
+    );
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "pending recovery send", 1 << 18).unwrap();
+    let arena = Arena::new(&mut budget, "pending recovery sql", 1 << 18).unwrap();
+    let mut pool = test_pool(&mut budget);
+    let mut guc = GucState::new();
+    let mut cursors = test_cursors(&mut budget);
+    let status = engine
+        .execute_simple(
+            "ALTER TABLE pending_recovery_parent DETACH PARTITION pending_recovery_child CONCURRENTLY",
+            &arena,
+            &mut detacher,
+            &mut pool,
+            &mut cursors,
+            &mut guc,
+            &mut Responder::new(&mut send),
+            12,
+        )
+        .unwrap();
+    assert!(matches!(
+        status,
+        ExecutionStatus::Blocked { io_wait: false, .. }
+    ));
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT count(*) FROM pending_recovery_parent; \
+             SELECT count(*) FROM pending_recovery_child; \
+             SELECT inhdetachpending FROM pg_inherits \
+              WHERE inhrelid = 'pending_recovery_child'::regclass",
+        )),
+        ["0", "1", "t"]
+    );
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "ALTER TABLE pending_recovery_parent DETACH PARTITION pending_recovery_child FINALIZE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT relispartition FROM pg_class WHERE relname = 'pending_recovery_child'",
+        )),
+        ["f"]
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]
@@ -38845,13 +39082,17 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for statement in [
         "CREATE TABLESPACE table_definition_recovery_space LOCATION '/object/table-definition-recovery'",
-        "CREATE TABLE table_definition_recovery_rows (id integer NOT NULL CHECK (id > 0)) USING heap TABLESPACE table_definition_recovery_space",
+        "CREATE TABLE table_definition_recovery_rows (id integer NOT NULL CHECK (id > 0)) USING heap WITH (fillfactor = 70) TABLESPACE table_definition_recovery_space",
         "CREATE TABLE table_definition_recovery_child (extra text) INHERITS (table_definition_recovery_rows)",
         "CREATE TYPE table_definition_recovery_type AS (id integer, label text)",
         "CREATE TABLE table_definition_typed_rows OF table_definition_recovery_type",
+        "CREATE TABLE table_definition_detach_parent (id integer) PARTITION BY RANGE (id)",
+        "CREATE TABLE table_definition_detach_child PARTITION OF table_definition_detach_parent FOR VALUES FROM (0) TO (10)",
         "INSERT INTO table_definition_recovery_child VALUES (1, 'child')",
         "INSERT INTO table_definition_typed_rows VALUES (2, 'typed')",
+        "INSERT INTO table_definition_detach_parent VALUES (4)",
         "ALTER TABLE table_definition_recovery_rows ALTER COLUMN id SET STATISTICS 91",
+        "ALTER TABLE table_definition_detach_parent DETACH PARTITION table_definition_detach_child CONCURRENTLY",
     ] {
         let output = run_with(&mut engine, &mut budget, statement);
         assert!(
@@ -38879,6 +39120,14 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
         data_rows(&run_with(
             &mut restarted,
             &mut restarted_budget,
+            "SELECT reloptions FROM pg_class WHERE relname = 'table_definition_recovery_rows'",
+        )),
+        ["{fillfactor=70}"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
             "SELECT attstattarget FROM pg_attribute \
               WHERE attrelid = 'table_definition_recovery_rows'::regclass AND attname = 'id'",
         )),
@@ -38890,6 +39139,16 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
         "SELECT id FROM table_definition_recovery_rows",
     );
     assert_eq!(data_rows(&inherited_recovery_rows), ["1"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT count(*) FROM table_definition_detach_parent; \
+             SELECT count(*) FROM table_definition_detach_child; \
+             SELECT relispartition FROM pg_class WHERE relname = 'table_definition_detach_child'",
+        )),
+        ["0", "1", "f"]
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut restarted,

@@ -595,12 +595,6 @@ fn create_table_kind(
     } else {
         "CREATE TABLE"
     };
-    if !statement.storage_options.is_empty() {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "table storage options require an object-native row layout implementation"
-        ));
-    }
     if statement.persistence != crate::sql::ast::RelationPersistence::Permanent {
         return sql_fail(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
@@ -635,6 +629,9 @@ fn create_table_kind(
                 name
             ));
         }
+    };
+    def.storage_options = crate::storage::TableStorageOptions {
+        fillfactor: statement.storage_options.fillfactor,
     };
     def.tablespace = match resolve_relation_tablespace(storage, statement.tablespace, txn.txid) {
         Ok(tablespace) => tablespace,
@@ -2710,6 +2707,7 @@ fn validate_partition_bound(
         let Some(crate::storage::PartitionAttachment {
             parent: sibling_parent,
             bound,
+            ..
         }) = storage.table_def(slot, txid).partition.attachment
         else {
             continue;
@@ -51870,26 +51868,9 @@ fn alter_partition_attachment(
             parent_def.name.as_str()
         ));
     };
-    let (child_name, parsed_bound) = match action {
-        AlterAction::AttachPartition { child, bound } => (child, Some(bound)),
-        AlterAction::DetachPartition { child, mode } => {
-            match mode {
-                crate::sql::ast::PartitionDetachMode::Immediate => {}
-                crate::sql::ast::PartitionDetachMode::Concurrent => {
-                    return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "concurrent partition detach requires an object-native concurrent DDL protocol"
-                    ));
-                }
-                crate::sql::ast::PartitionDetachMode::Finalize => {
-                    return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "partition detach finalization requires an object-native concurrent DDL protocol"
-                    ));
-                }
-            }
-            (child, None)
-        }
+    let (child_name, parsed_bound, detach_mode) = match action {
+        AlterAction::AttachPartition { child, bound } => (child, Some(bound), None),
+        AlterAction::DetachPartition { child, mode } => (child, None, Some(mode)),
         _ => unreachable!("partition attachment action was classified by the caller"),
     };
     let Some(crate::storage::ResolvedRelation::Table(child)) =
@@ -51912,6 +51893,19 @@ fn alter_partition_attachment(
         return sql_fail(error);
     }
     let child_def = *storage.table_def(child, txn.txid);
+    let child_lock_mode = match (detach_mode, child_def.partition.attachment) {
+        (
+            Some(crate::sql::ast::PartitionDetachMode::Concurrent),
+            Some(crate::storage::PartitionAttachment {
+                state: crate::storage::PartitionAttachmentState::Attached,
+                ..
+            }),
+        ) => crate::sql::ast::TableLockMode::ShareUpdateExclusive,
+        _ => crate::sql::ast::TableLockMode::AccessExclusive,
+    };
+    if let Err(error) = storage.lock_table(txn.txid, child, child_lock_mode, false) {
+        return sql_fail(error);
+    }
     let mut new_def = child_def;
     let attaching = parsed_bound.is_some();
     if let Some(bound) = parsed_bound {
@@ -52085,6 +52079,7 @@ fn alter_partition_attachment(
                 }
             },
             bound: resolved,
+            state: crate::storage::PartitionAttachmentState::Attached,
         });
     } else {
         let Some(attachment) = child_def.partition.attachment else {
@@ -52102,9 +52097,117 @@ fn alter_partition_attachment(
                 parent_def.name.as_str()
             ));
         }
-        new_def.partition.attachment = None;
-        for column in new_def.columns.iter_mut().take(new_def.n_columns) {
-            column.not_null = column.not_null.localize();
+        let detach_mode = detach_mode.expect("detach has a mode");
+        let finish_detach = |definition: &mut crate::storage::TableDef| {
+            definition.partition.attachment = None;
+            for column in definition.columns.iter_mut().take(definition.n_columns) {
+                column.not_null = column.not_null.localize();
+            }
+        };
+        match (detach_mode, attachment.state) {
+            (
+                crate::sql::ast::PartitionDetachMode::Immediate,
+                crate::storage::PartitionAttachmentState::Attached,
+            ) => finish_detach(&mut new_def),
+            (
+                crate::sql::ast::PartitionDetachMode::Immediate,
+                crate::storage::PartitionAttachmentState::DetachPending,
+            ) => {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "partition \"{}\" is pending detach",
+                    child_def.name.as_str()
+                ));
+            }
+            (
+                crate::sql::ast::PartitionDetachMode::Concurrent,
+                crate::storage::PartitionAttachmentState::Attached,
+            ) => {
+                if txn.is_explicit() {
+                    return sql_fail(sql_err!(
+                        sqlstate::ACTIVE_SQL_TRANSACTION,
+                        "ALTER TABLE ... DETACH PARTITION CONCURRENTLY cannot run inside a transaction block"
+                    ));
+                }
+                if (0..storage.table_count()).any(|slot| {
+                    storage.table(slot).visible_to(txn.txid)
+                        && storage
+                            .table_def(slot, txn.txid)
+                            .partition
+                            .attachment
+                            .is_some_and(|candidate| {
+                                usize::from(candidate.parent) == parent
+                                    && matches!(
+                                        candidate.state,
+                                        crate::storage::PartitionAttachmentState::DetachPending
+                                    )
+                            })
+                }) {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "another partition is already pending detach from relation \"{}\"",
+                        parent_def.name.as_str()
+                    ));
+                }
+                if (0..storage.table_count()).any(|slot| {
+                    storage.table(slot).visible_to(txn.txid)
+                        && storage
+                            .table_def(slot, txn.txid)
+                            .partition
+                            .attachment
+                            .is_some_and(|candidate| {
+                                usize::from(candidate.parent) == parent
+                                    && candidate.state.routable()
+                                    && matches!(
+                                        candidate.bound,
+                                        crate::storage::PartitionBound::Default
+                                    )
+                            })
+                }) {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "cannot detach partitions concurrently when a default partition exists"
+                    ));
+                }
+                if storage.schema_lock_blocker(txn.txid).is_some() {
+                    new_def.partition.attachment = Some(crate::storage::PartitionAttachment {
+                        state: crate::storage::PartitionAttachmentState::DetachPending,
+                        ..attachment
+                    });
+                    txn.begin_concurrent_partition_detach();
+                } else {
+                    finish_detach(&mut new_def);
+                }
+            }
+            (
+                crate::sql::ast::PartitionDetachMode::Concurrent,
+                crate::storage::PartitionAttachmentState::DetachPending,
+            )
+            | (
+                crate::sql::ast::PartitionDetachMode::Finalize,
+                crate::storage::PartitionAttachmentState::DetachPending,
+            ) => {
+                if let Some(blocker) = storage.schema_lock_blocker(txn.txid) {
+                    if let Err(error) = storage.wait_for_transaction(txn.txid, blocker) {
+                        return sql_fail(error);
+                    }
+                    return sql_fail(sql_err!(
+                        sqlstate::INTERNAL_LOCK_WAIT,
+                        "partition detach is waiting for concurrent transactions"
+                    ));
+                }
+                finish_detach(&mut new_def);
+            }
+            (
+                crate::sql::ast::PartitionDetachMode::Finalize,
+                crate::storage::PartitionAttachmentState::Attached,
+            ) => {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "partition \"{}\" is not pending detach",
+                    child_def.name.as_str()
+                ));
+            }
         }
     }
     let mut mapping = [None; MAX_COLUMNS];
@@ -52239,7 +52342,9 @@ fn alter_partition_attachment(
             }
         }
     }
-    responder.command_complete("ALTER TABLE")?;
+    if !txn.concurrent_partition_detach_pending() {
+        responder.command_complete("ALTER TABLE")?;
+    }
     sql_ok()
 }
 
@@ -52315,12 +52420,19 @@ fn alter_table_inner(
             }
             _ => return sql_fail(undefined_qual(&statement.table)),
         };
-    if let Err(error) = storage.lock_table(
-        txn.txid,
-        table_index,
-        crate::sql::ast::TableLockMode::AccessExclusive,
-        false,
+    let lock_mode = if matches!(
+        statement.actions,
+        [AlterAction::DetachPartition {
+            mode: crate::sql::ast::PartitionDetachMode::Concurrent
+                | crate::sql::ast::PartitionDetachMode::Finalize,
+            ..
+        }]
     ) {
+        crate::sql::ast::TableLockMode::ShareUpdateExclusive
+    } else {
+        crate::sql::ast::TableLockMode::AccessExclusive
+    };
+    if let Err(error) = storage.lock_table(txn.txid, table_index, lock_mode, false) {
         return sql_fail(error);
     }
     let def = *storage.table_def(table_index, txn.txid);
@@ -52629,6 +52741,8 @@ fn alter_table_inner(
                 | AlterAction::SetStatistics { .. }
                 | AlterAction::SetIdentityMode { .. }
                 | AlterAction::AlterIdentitySequence { .. }
+                | AlterAction::SetStorageOptions(_)
+                | AlterAction::ResetStorageOptions(_)
         )
     }) {
         let mut new_def = def;
@@ -52679,6 +52793,16 @@ fn alter_table_inner(
                         ));
                     }
                     new_def.columns[column].identity_always = *always;
+                }
+                AlterAction::SetStorageOptions(options) => {
+                    if let Some(fillfactor) = options.fillfactor {
+                        new_def.storage_options.fillfactor = Some(fillfactor);
+                    }
+                }
+                AlterAction::ResetStorageOptions(options) => {
+                    if options.fillfactor {
+                        new_def.storage_options.fillfactor = None;
+                    }
                 }
                 AlterAction::AlterIdentitySequence { column, options } => {
                     let Some(column) = new_def.column_index(column) else {
@@ -52922,10 +53046,7 @@ fn alter_table_inner(
                 }
             }
             AlterAction::SetStorageOptions(_) | AlterAction::ResetStorageOptions(_) => {
-                return sql_fail(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "table storage options require an object-native row layout implementation"
-                ));
+                unreachable!("storage options are handled by the metadata-only path")
             }
             AlterAction::SetInheritance { .. } => {
                 return sql_fail(sql_err!(

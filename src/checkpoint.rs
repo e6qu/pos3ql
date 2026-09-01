@@ -27,7 +27,7 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v7";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v8";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -332,6 +332,9 @@ impl Checkpointer {
                 let columns = storage.table(job.slot).def.schema(&mut schema);
                 self.merge_writer
                     .set_pax_schema(&schema[..columns])
+                    .map_err(sst_to_sql)?;
+                self.merge_writer
+                    .set_pax_fillfactor(storage.table(job.slot).def.storage_options.fillfactor)
                     .map_err(sst_to_sql)?;
                 self.merge_job = Some(job);
             }
@@ -1231,7 +1234,11 @@ impl Checkpointer {
                         }
                         crate::storage::TableTypeMembership::Composite(slot)
                     };
-                    let name = rest_of(line, 10 + inheritance_count)?;
+                    let fillfactor: u8 = parse_field(words.next(), "table fillfactor")?;
+                    if fillfactor != 0 && !(10..=100).contains(&fillfactor) {
+                        return Err(CheckpointSetupError::Corrupt("invalid table fillfactor"));
+                    }
+                    let name = rest_of(line, 11 + inheritance_count)?;
                     let def = TableDef {
                         // The current format omits `tsch` for the public schema.
                         schema: sql_name("public")?,
@@ -1245,6 +1252,9 @@ impl Checkpointer {
                         access_method,
                         inheritance,
                         type_membership,
+                        storage_options: crate::storage::TableStorageOptions {
+                            fillfactor: (fillfactor != 0).then_some(fillfactor),
+                        },
                         ..TableDef::empty()
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
@@ -6094,6 +6104,17 @@ impl Checkpointer {
                     "table manifest line exceeds fixed capacity"
                 )
             })?;
+            write!(
+                table_line,
+                " {}",
+                table.def.storage_options.fillfactor.unwrap_or(0)
+            )
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "table manifest line exceeds fixed capacity"
+                )
+            })?;
             write!(table_line, " {}", table.def.name.as_str()).map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -8857,6 +8878,9 @@ impl Checkpointer {
             self.slice_writer
                 .set_pax_schema(&schema[..columns])
                 .map_err(sst_to_sql)?;
+            self.slice_writer
+                .set_pax_fillfactor(storage.table(slot).def.storage_options.fillfactor)
+                .map_err(sst_to_sql)?;
             let writer = &mut self.slice_writer;
             let blocks = &self.blocks;
             let mut count = 0u64;
@@ -10973,7 +10997,7 @@ fn write_partition_manifest(
 ) -> Result<(), SqlError> {
     let mut line = StackStr::<4096>::new();
     use core::fmt::Write;
-    let _ = write!(line, "part 2");
+    let _ = write!(line, "part 3");
     if let Some(scheme) = partition.scheme {
         let strategy = match scheme.strategy {
             PartitionStrategy::Range => "r",
@@ -10988,7 +11012,11 @@ fn write_partition_manifest(
         let _ = write!(line, " n");
     }
     if let Some(attachment) = partition.attachment {
-        let _ = write!(line, " c {}", attachment.parent);
+        let state = match attachment.state {
+            crate::storage::PartitionAttachmentState::Attached => "a",
+            crate::storage::PartitionAttachmentState::DetachPending => "d",
+        };
+        let _ = write!(line, " c {} {state}", attachment.parent);
         match attachment.bound {
             PartitionBound::Default => {
                 let _ = write!(line, " d");
@@ -11050,7 +11078,7 @@ fn parse_partition_manifest(
     words: &mut core::str::Split<'_, char>,
 ) -> Result<PartitionDef, CheckpointSetupError> {
     let corrupt = || CheckpointSetupError::Corrupt("bad partition metadata");
-    if words.next().ok_or_else(corrupt)? != "2" {
+    if words.next().ok_or_else(corrupt)? != "3" {
         return Err(corrupt());
     }
     let scheme = match words.next().ok_or_else(corrupt)? {
@@ -11082,6 +11110,11 @@ fn parse_partition_manifest(
         "n" => None,
         "c" => {
             let parent: u16 = parse_field(words.next(), "partition parent")?;
+            let state = match words.next().ok_or_else(corrupt)? {
+                "a" => crate::storage::PartitionAttachmentState::Attached,
+                "d" => crate::storage::PartitionAttachmentState::DetachPending,
+                _ => return Err(corrupt()),
+            };
             let bound = match words.next().ok_or_else(corrupt)? {
                 "d" => PartitionBound::Default,
                 "h" => PartitionBound::Hash {
@@ -11122,7 +11155,11 @@ fn parse_partition_manifest(
                 }
                 _ => return Err(corrupt()),
             };
-            Some(crate::storage::PartitionAttachment { parent, bound })
+            Some(crate::storage::PartitionAttachment {
+                parent,
+                bound,
+                state,
+            })
         }
         _ => return Err(corrupt()),
     };

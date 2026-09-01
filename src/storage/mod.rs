@@ -1309,6 +1309,8 @@ pub struct TableDef {
     /// The durable PostgreSQL-visible table access method. The object-native
     /// row representation implements the ordinary heap relation contract.
     pub access_method: TableAccessMethod,
+    /// PostgreSQL heap options with an executable object-native effect.
+    pub storage_options: TableStorageOptions,
     /// Stable tablespace identity; zero is the database default.
     pub tablespace: u16,
     pub columns: [ColumnMeta; MAX_COLUMNS],
@@ -1338,6 +1340,15 @@ pub struct TableDef {
     /// The table's own row type remains distinct, as PostgreSQL requires.
     pub type_membership: TableTypeMembership,
     pub partition: PartitionDef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableStorageOptions {
+    pub fillfactor: Option<u8>,
+}
+
+impl TableStorageOptions {
+    pub const DEFAULT: Self = Self { fillfactor: None };
 }
 
 /// Durable typed-table membership. A resolved composite slot, rather than a
@@ -1533,6 +1544,19 @@ pub struct PartitionScheme {
 pub struct PartitionAttachment {
     pub parent: u16,
     pub bound: PartitionBound,
+    pub state: PartitionAttachmentState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionAttachmentState {
+    Attached,
+    DetachPending,
+}
+
+impl PartitionAttachmentState {
+    pub const fn routable(self) -> bool {
+        matches!(self, Self::Attached)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1593,7 +1617,11 @@ impl PartitionDef {
     pub const fn child(parent: u16, bound: PartitionBound) -> Self {
         Self {
             scheme: None,
-            attachment: Some(PartitionAttachment { parent, bound }),
+            attachment: Some(PartitionAttachment {
+                parent,
+                bound,
+                state: PartitionAttachmentState::Attached,
+            }),
         }
     }
 
@@ -1619,6 +1647,7 @@ impl TableDef {
             name: SqlName::EMPTY,
             kind: TableKind::Local,
             access_method: TableAccessMethod::Heap,
+            storage_options: TableStorageOptions::DEFAULT,
             tablespace: 0,
             columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: 0,
@@ -13746,6 +13775,7 @@ impl Storage {
                 self.tables[target_slot].def.partition.attachment = Some(PartitionAttachment {
                     parent: target_parent as u16,
                     bound: attachment.bound,
+                    state: attachment.state,
                 });
             }
             self.rebind_domain_base_types_to(txid)?;
@@ -20445,7 +20475,8 @@ impl Storage {
                 n_keys,
             }) = definition.partition.scheme
             else {
-                if let Some(PartitionAttachment { parent, bound }) = definition.partition.attachment
+                if let Some(PartitionAttachment { parent, bound, .. }) =
+                    definition.partition.attachment
                     && !self.partition_attachment_accepts(
                         usize::from(parent),
                         current,
@@ -20475,7 +20506,7 @@ impl Storage {
         txid: u32,
     ) -> Result<(), SqlError> {
         let mut child = leaf;
-        while let Some(PartitionAttachment { parent, bound }) =
+        while let Some(PartitionAttachment { parent, bound, .. }) =
             self.table_def(child, txid).partition.attachment
         {
             if !self.partition_attachment_accepts(
@@ -20511,12 +20542,15 @@ impl Storage {
             if !self.table(child).visible_to(txid) {
                 continue;
             }
-            let Some(PartitionAttachment { parent, bound }) =
-                self.table_def(child, txid).partition.attachment
+            let Some(PartitionAttachment {
+                parent,
+                bound,
+                state,
+            }) = self.table_def(child, txid).partition.attachment
             else {
                 continue;
             };
-            if usize::from(parent) != parent_slot {
+            if usize::from(parent) != parent_slot || !state.routable() {
                 continue;
             }
             if matches!(bound, PartitionBound::Default) {
@@ -20569,6 +20603,7 @@ impl Storage {
             let Some(PartitionAttachment {
                 parent: sibling_parent,
                 bound,
+                ..
             }) = self.table_def(sibling, txid).partition.attachment
             else {
                 continue;
@@ -20619,10 +20654,9 @@ impl Storage {
                     continue;
                 }
                 let child_def = storage.table_def(child, txid);
-                let partition_child = child_def
-                    .partition
-                    .attachment
-                    .is_some_and(|attachment| usize::from(attachment.parent) == root);
+                let partition_child = child_def.partition.attachment.is_some_and(|attachment| {
+                    usize::from(attachment.parent) == root && attachment.state.routable()
+                });
                 if !partition_child && !child_def.inheritance.contains(root) {
                     continue;
                 }
@@ -20654,12 +20688,12 @@ impl Storage {
                 if !storage.table(child).visible_to(txid) {
                     continue;
                 }
-                let Some(PartitionAttachment { parent, .. }) =
+                let Some(PartitionAttachment { parent, state, .. }) =
                     storage.table_def(child, txid).partition.attachment
                 else {
                     continue;
                 };
-                if usize::from(parent) != root {
+                if usize::from(parent) != root || !state.routable() {
                     continue;
                 }
                 found = true;
@@ -20780,11 +20814,14 @@ impl Storage {
                 if current == root {
                     return Ok(Some(candidate));
                 }
-                let Some(PartitionAttachment { parent, .. }) =
+                let Some(PartitionAttachment { parent, state, .. }) =
                     self.table_def(current, txid).partition.attachment
                 else {
                     break;
                 };
+                if !state.routable() {
+                    break;
+                }
                 current = usize::from(parent);
             }
         }
@@ -31971,6 +32008,9 @@ impl Storage {
             return;
         };
         self.active_snapshots.swap_remove(index);
+        // Schema waits can be blocked by a historical snapshot even when the
+        // reader holds no row lock. Wake the shared wait graph when it ends.
+        self.row_locks.borrow_mut().resource_released(txid);
         let oldest = self.oldest_snapshot();
         for table in self.tables.iter_mut() {
             for (_, state) in table.rows.iter_mut() {
@@ -32359,13 +32399,19 @@ impl Storage {
 
     pub fn release_table_locks(&self, txid: u32) {
         let mut table_locks = self.table_locks.borrow_mut();
+        let mut changed = false;
         let mut index = 0usize;
         while index < table_locks.len() {
             if table_locks[index].owner == txid {
                 table_locks.swap_remove(index);
+                changed = true;
             } else {
                 index += 1;
             }
+        }
+        drop(table_locks);
+        if changed {
+            self.row_locks.borrow_mut().resource_released(txid);
         }
     }
 

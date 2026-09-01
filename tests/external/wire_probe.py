@@ -3474,8 +3474,10 @@ def test_type_schema_moves_over_raw_wire():
         "CREATE SCHEMA wire_moved_types; "
         "CREATE TYPE wire_moved_state AS ENUM ('ready', 'blocked'); "
         "CREATE TYPE wire_moved_point AS (x integer, y integer); "
-        "CREATE TABLE wire_moved_values (state wire_moved_state, point wire_moved_point); "
-        "INSERT INTO wire_moved_values VALUES ('ready', ROW(3,4)::wire_moved_point); "
+        "CREATE TYPE wire_alterable_point AS (value integer); "
+        "ALTER TYPE wire_alterable_point ALTER ATTRIBUTE value TYPE bigint; "
+        "CREATE TABLE wire_moved_values (state wire_moved_state, point wire_moved_point, points wire_moved_point[]); "
+        "INSERT INTO wire_moved_values VALUES ('ready', ROW(3,4)::wire_moved_point, ARRAY[ROW(5,6)::wire_moved_point]); "
         "ALTER TYPE wire_moved_state SET SCHEMA wire_moved_types; "
         "ALTER TYPE wire_moved_point SET SCHEMA wire_moved_types",
     )
@@ -3484,6 +3486,19 @@ def test_type_schema_moves_over_raw_wire():
         "raw wire: moved types retain existing values",
         first_text_row(simple_query(s, "SELECT state::text || ':' || (point).x || ':' || (point).y FROM wire_moved_values"))
         == "ready:3:4",
+    )
+    check(
+        "raw wire: moved composite arrays and backing catalog relation retain type identity",
+        first_text_row(
+            simple_query(
+                s,
+                "SELECT pg_typeof(points)::text || ':' || "
+                "(SELECT atttypid::regtype::text FROM pg_attribute "
+                "WHERE attrelid = 'wire_alterable_point'::regclass AND attname = 'value') "
+                "FROM wire_moved_values",
+            )
+        )
+        == "wire_moved_types.wire_moved_point[]:bigint",
     )
     s.close()
 

@@ -66,6 +66,10 @@ impl ObjectOid {
         match value {
             Datum::Null => Ok(None),
             Datum::Oid(oid) => Ok(Some(Self(oid))),
+            Datum::Regtype { referenced_oid, .. } => u32::try_from(referenced_oid)
+                .map(Self)
+                .map(Some)
+                .map_err(|_| sql_err!(sqlstate::NUMERIC_OUT_OF_RANGE, "OID must be nonnegative")),
             Datum::Int4(oid) => u32::try_from(oid)
                 .map(Self)
                 .map(Some)

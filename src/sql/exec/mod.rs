@@ -29454,6 +29454,7 @@ pub fn comment(
         } => {
             let domain_slot = storage.resolve_domain_slot(type_name, txid);
             let enum_slot = storage.resolve_enum_slot(type_name, txid);
+            let named_composite_slot = storage.resolve_composite_slot(type_name, txid);
             let (qualifier, bare_name) = type_name
                 .split_once('.')
                 .map_or((None, type_name), |(schema, name)| (Some(schema), name));
@@ -29486,7 +29487,7 @@ pub fn comment(
                         type_name
                     ));
                 }
-                if composite.is_some() {
+                if named_composite_slot.is_some() || composite.is_some() {
                     return sql_fail(sql_err!(
                         sqlstate::WRONG_OBJECT_TYPE,
                         "\"{}\" is not a domain",
@@ -29500,6 +29501,9 @@ pub fn comment(
                 ));
             } else if let Some(slot) = enum_slot {
                 let definition = storage.enum_for(slot, txn.txid);
+                (definition.schema, definition.name)
+            } else if let Some(slot) = named_composite_slot {
+                let definition = storage.composite_for(slot, txn.txid);
                 (definition.schema, definition.name)
             } else if let Some((schema, _)) = composite {
                 let stored = match SqlName::parse(bare_name) {
@@ -33415,6 +33419,45 @@ fn composite_column_in_use(
     None
 }
 
+/// Existing uses would require rewriting durable composite values. PostgreSQL
+/// rejects that operation even when the statement spells `CASCADE`.
+fn reject_composite_attribute_type_with_dependents(
+    storage: &Storage,
+    composite_slot: usize,
+    txid: u32,
+) -> Result<(), SqlError> {
+    let root = CompositeTypeDependencyRoot {
+        slot: composite_slot,
+        name: storage.composite_for(composite_slot, txid).name,
+    };
+    let direct_column = composite_column_in_use(storage, composite_slot, txid).is_some();
+    let nested_field = composite_field_uses_composite(storage, root, txid)?.is_some();
+    let domain = (0..storage.domain_count()).any(|slot| {
+        storage.domain_for(slot, txid).visible_to(txid)
+            && domain_composite_base(storage, slot, txid) == Some(composite_slot as u16)
+    });
+    let StoredDependencyClosure {
+        views,
+        matviews,
+        routines,
+        rules,
+    } = stored_query_dependent_closure(storage, txid, |dependency| {
+        dependency.class == crate::storage::DependencyClass::Composite
+            && dependency.slot as usize == composite_slot
+    })?;
+    let stored_query = views.iter().any(|selected| *selected)
+        || matviews.iter().any(|selected| *selected)
+        || routines.iter().any(|selected| *selected)
+        || rules.iter().any(|selected| *selected);
+    if direct_column || nested_field || domain || stored_query {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot alter type of a composite attribute with dependent objects"
+        ));
+    }
+    Ok(())
+}
+
 fn apply_type_drop_to_stored_queries(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -35025,6 +35068,9 @@ pub fn alter_type(
                 || storage
                     .domain_slot(current.schema.as_str(), new_name, txn.txid)
                     .is_some()
+                || storage
+                    .composite_slot(current.schema.as_str(), new_name, txn.txid)
+                    .is_some()
             {
                 return sql_fail(sql_err!(
                     sqlstate::DUPLICATE_OBJECT,
@@ -35186,9 +35232,7 @@ pub fn alter_type(
         A::AddAttribute(_)
         | A::DropAttribute { .. }
         | A::RenameAttribute { .. }
-        | A::AlterAttributeType { .. }
-        | A::SetAttributeNotNull(_)
-        | A::DropAttributeNotNull(_) => {
+        | A::AlterAttributeType { .. } => {
             return sql_fail(sql_err!(
                 sqlstate::WRONG_OBJECT_TYPE,
                 "type \"{}\" is not a composite type",
@@ -35394,6 +35438,7 @@ fn alter_composite_type(
             type_name,
             type_mod,
             collation,
+            cascade: _,
         } => {
             let Some(index) = altered.active_field_index(name) else {
                 return sql_fail(sql_err!(
@@ -35418,41 +35463,12 @@ fn alter_composite_type(
             replacement.attribute_number = altered.fields[index].attribute_number;
             replacement.name = altered.fields[index].name;
             replacement.not_null = altered.fields[index].not_null;
-            if let Err(error) = verify_composite_attribute_type(
-                storage,
-                slot as u16,
-                replacement.attribute_number,
-                replacement,
-                txn.txid,
-                arena,
-            ) {
-                return sql_fail(error);
-            }
-            altered.fields[index] = replacement;
-        }
-        A::SetAttributeNotNull(name) | A::DropAttributeNotNull(name) => {
-            let Some(index) = altered.active_field_index(name) else {
-                return sql_fail(sql_err!(
-                    sqlstate::UNDEFINED_COLUMN,
-                    "column \"{}\" of type \"{}\" does not exist",
-                    name,
-                    altered.name.as_str()
-                ));
-            };
-            let set = matches!(action, A::SetAttributeNotNull(_));
-            if set
-                && !altered.fields[index].not_null
-                && let Err(error) = verify_composite_attribute_not_null(
-                    storage,
-                    slot as u16,
-                    altered.fields[index].attribute_number,
-                    txn.txid,
-                    arena,
-                )
+            if let Err(error) =
+                reject_composite_attribute_type_with_dependents(storage, slot, txn.txid)
             {
                 return sql_fail(error);
             }
-            altered.fields[index].not_null = set;
+            altered.fields[index] = replacement;
         }
     }
     let prior = match storage.stage_composite_alter(slot, altered, txn.txid) {
@@ -36442,292 +36458,6 @@ fn write_identifier<const N: usize>(output: &mut crate::util::StackStr<N>, ident
         let _ = output.write_char(character);
     }
     let _ = output.write_char('"');
-}
-
-/// Proves a newly-added composite NOT NULL constraint before publishing its
-/// catalog definition. Values are decoded structurally through every direct
-/// and nested composite or composite-array column, so a later query cannot be
-/// the first place an already-invalid durable value is discovered.
-fn verify_composite_attribute_not_null(
-    storage: &Storage,
-    target_slot: u16,
-    attribute_number: u16,
-    txid: u32,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    fn contains_null(
-        value: Datum<'_>,
-        ctype: ColType,
-        target_slot: u16,
-        attribute_number: u16,
-        storage: &Storage,
-        txid: u32,
-        arena: &Arena,
-    ) -> Result<bool, SqlError> {
-        if value.is_null() {
-            return Ok(false);
-        }
-        match ctype {
-            ColType::Composite(_slot) => {
-                let value = match value {
-                    Datum::CompositeText {
-                        slot,
-                        physical_fields,
-                        text,
-                    } => decode_stored_composite_text(
-                        text,
-                        slot,
-                        physical_fields,
-                        storage,
-                        txid,
-                        arena,
-                    )?,
-                    value => value,
-                };
-                let Datum::Composite { slot, fields } = value else {
-                    return Ok(false);
-                };
-                let definition = storage.composite_for(slot as usize, txid);
-                for (field, definition) in fields.iter().zip(definition.active_fields()) {
-                    if slot == target_slot
-                        && definition.attribute_number == attribute_number
-                        && field.value.is_null()
-                    {
-                        return Ok(true);
-                    }
-                    if contains_null(
-                        field.value,
-                        definition.ctype,
-                        target_slot,
-                        attribute_number,
-                        storage,
-                        txid,
-                        arena,
-                    )? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            ColType::Array(crate::sql::types::ArrElem::Composite(_)) => {
-                let Datum::Array { element, raw } = value else {
-                    return Ok(false);
-                };
-                let count = crate::sql::array::len(raw);
-                for index in 0..count {
-                    let item = crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null);
-                    if contains_null(
-                        item,
-                        element.to_coltype(),
-                        target_slot,
-                        attribute_number,
-                        storage,
-                        txid,
-                        arena,
-                    )? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    for table_index in 0..storage.table_count() {
-        if !storage.table(table_index).visible_to(txid) {
-            continue;
-        }
-        let definition = *storage.table_def(table_index, txid);
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        definition.schema(&mut schema);
-        let mut failure = false;
-        storage.for_each_row_state(table_index, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = storage.visible_row_home(table_index, rowid, state, txid)? else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            storage.with_row_bytes(table_index, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, &schema[..definition.n_columns], &mut values)?;
-                for (value, column) in values[..definition.n_columns]
-                    .iter()
-                    .zip(definition.columns())
-                {
-                    if contains_null(
-                        *value,
-                        column.ctype,
-                        target_slot,
-                        attribute_number,
-                        storage,
-                        txid,
-                        arena,
-                    )? {
-                        failure = true;
-                        break;
-                    }
-                }
-                Ok(())
-            })?;
-            Ok(if failure {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            })
-        })?;
-        if failure {
-            return Err(sql_err!(
-                sqlstate::NOT_NULL_VIOLATION,
-                "composite attribute contains null values"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Validates every existing occurrence before replacing an attribute type.
-/// The conversion itself uses the normal typed column coercion boundary, so
-/// ALTER TYPE cannot publish a layout that will fail only when a historical
-/// row is later read through a nested composite or array.
-struct CompositeTypeChange<'a> {
-    target_slot: u16,
-    attribute_number: u16,
-    replacement: crate::storage::CompositeFieldDef,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-}
-
-fn verify_composite_attribute_type(
-    storage: &Storage,
-    target_slot: u16,
-    attribute_number: u16,
-    replacement: crate::storage::CompositeFieldDef,
-    txid: u32,
-    arena: &Arena,
-) -> Result<(), SqlError> {
-    fn validate(
-        value: Datum<'_>,
-        ctype: ColType,
-        change: &CompositeTypeChange<'_>,
-    ) -> Result<(), SqlError> {
-        if value.is_null() {
-            return Ok(());
-        }
-        match ctype {
-            ColType::Composite(_slot) => {
-                let value = match value {
-                    Datum::CompositeText {
-                        slot,
-                        physical_fields,
-                        text,
-                    } => decode_stored_composite_text(
-                        text,
-                        slot,
-                        physical_fields,
-                        change.storage,
-                        change.txid,
-                        change.arena,
-                    )?,
-                    value => value,
-                };
-                let Datum::Composite { slot, fields } = value else {
-                    return Ok(());
-                };
-                let definition = change.storage.composite_for(slot as usize, change.txid);
-                for (field, definition) in fields.iter().zip(definition.active_fields()) {
-                    if slot == change.target_slot
-                        && definition.attribute_number == change.attribute_number
-                    {
-                        let column = ColumnMeta {
-                            name: change.replacement.name,
-                            ctype: change.replacement.ctype,
-                            type_mod: change.replacement.type_mod,
-                            collation: crate::sql::ast::Collation::None,
-                            not_null: crate::storage::NotNullOrigin::local(
-                                change.replacement.not_null,
-                            ),
-                            unique: false,
-                            primary: false,
-                            auto_increment: false,
-                            default: crate::storage::ColumnDefault::NONE,
-                            is_identity: false,
-                            identity_always: false,
-                            auto_increment_step: 1,
-                            user_type: change.replacement.user_type,
-                            statistics_target: -1,
-                        };
-                        let converted = coerce(
-                            field.value,
-                            &column,
-                            change.storage,
-                            change.txid,
-                            change.arena,
-                        )?;
-                        if change.replacement.not_null && converted.is_null() {
-                            return Err(sql_err!(
-                                sqlstate::NOT_NULL_VIOLATION,
-                                "composite attribute contains null values"
-                            ));
-                        }
-                    } else {
-                        validate(field.value, definition.ctype, change)?;
-                    }
-                }
-                Ok(())
-            }
-            ColType::Array(crate::sql::types::ArrElem::Composite(_)) => {
-                let Datum::Array { element, raw } = value else {
-                    return Ok(());
-                };
-                for index in 0..crate::sql::array::len(raw) {
-                    validate(
-                        crate::sql::array::get(raw, element, index).unwrap_or(Datum::Null),
-                        element.to_coltype(),
-                        change,
-                    )?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    let change = CompositeTypeChange {
-        target_slot,
-        attribute_number,
-        replacement,
-        storage,
-        txid,
-        arena,
-    };
-    for table_index in 0..storage.table_count() {
-        if !storage.table(table_index).visible_to(txid) {
-            continue;
-        }
-        let definition = *storage.table_def(table_index, txid);
-        let mut schema = [ColType::Bool; MAX_COLUMNS];
-        definition.schema(&mut schema);
-        storage.for_each_row_state(table_index, &mut |rowid, state| {
-            use core::ops::ControlFlow;
-            let Some(home) = storage.visible_row_home(table_index, rowid, state, txid)? else {
-                return Ok(ControlFlow::Continue(()));
-            };
-            storage.with_row_bytes(table_index, rowid, home, |bytes| {
-                let mut values = [Datum::Null; MAX_COLUMNS];
-                rowenc::decode(bytes, &schema[..definition.n_columns], &mut values)?;
-                for (value, column) in values[..definition.n_columns]
-                    .iter()
-                    .zip(definition.columns())
-                {
-                    validate(*value, column.ctype, &change)?;
-                }
-                Ok(())
-            })?;
-            Ok(ControlFlow::Continue(()))
-        })?;
-    }
-    Ok(())
 }
 
 /// Rewrites the inline label carried by every stored value of one enum. The

@@ -3013,28 +3013,7 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         element: super::types::ArrElem,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
-        let name = match element {
-            super::types::ArrElem::Enum(slot) => {
-                let definition = self.storage.enum_for(slot as usize, self.txid);
-                definition.visible_to(self.txid).then_some(definition.name)
-            }
-            super::types::ArrElem::Domain { slot, .. } => {
-                let def = self.storage.domain(slot as usize);
-                def.visible_to(self.txid).then_some(def.name)
-            }
-            super::types::ArrElem::Composite(slot) => {
-                let def = self.storage.composite_for(slot as usize, self.txid);
-                def.visible_to(self.txid).then_some(def.name)
-            }
-            _ => None,
-        };
-        let Some(name) = name else { return Ok(None) };
-        let rendered = crate::stack_format!(128, "{}[]", name.as_str());
-        Ok(Some(
-            arena
-                .alloc_str(rendered.as_str())
-                .map_err(|_| arena_full())?,
-        ))
+        super::catalog::user_type_name_text(self.storage, self.txid, element.array_oid(), arena)
     }
 
     fn user_type_name<'a>(
@@ -3042,29 +3021,9 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         type_name: &str,
         arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
-        let (base, array) = match type_name.strip_suffix("[]") {
-            Some(base) => (base, true),
-            None => (type_name, false),
-        };
-        let visible = self.storage.resolve_domain_slot(base, self.txid).is_some()
-            || self.storage.resolve_enum_slot(base, self.txid).is_some()
-            || self
-                .storage
-                .resolve_composite_slot(base, self.txid)
-                .is_some();
-        if !visible {
-            return Ok(None);
-        }
-        let rendered = if array {
-            crate::stack_format!(128, "{}[]", base)
-        } else {
-            crate::stack_format!(128, "{}", base)
-        };
-        Ok(Some(
-            arena
-                .alloc_str(rendered.as_str())
-                .map_err(|_| arena_full())?,
-        ))
+        self.user_type_oid(type_name).map_or(Ok(None), |oid| {
+            super::catalog::user_type_name_text(self.storage, self.txid, oid, arena)
+        })
     }
 
     fn user_type_oid(&self, type_name: &str) -> Option<i32> {

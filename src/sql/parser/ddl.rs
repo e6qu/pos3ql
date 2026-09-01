@@ -4378,24 +4378,26 @@ impl<'a> Parser<'a> {
             self.expect_ident("attribute")?;
             let field = self.any_ident("composite field name")?;
             if self.eat_ident("set")? {
-                if self.eat_ident("data")? {
-                    self.expect_ident("type")?;
-                    let (type_name, type_mod) = self.type_name_mod()?;
-                    let collation = if self.eat_ident("collate")? {
-                        self.collation_name()?
-                    } else {
-                        crate::sql::ast::ParsedCollation::DEFAULT
-                    };
-                    AlterTypeAction::AlterAttributeType {
-                        name: field,
-                        type_name,
-                        type_mod,
-                        collation,
-                    }
+                self.expect_ident("data")?;
+                self.expect_ident("type")?;
+                let (type_name, type_mod) = self.type_name_mod()?;
+                let collation = if self.eat_ident("collate")? {
+                    self.collation_name()?
                 } else {
-                    self.expect_ident("not")?;
-                    self.expect_ident("null")?;
-                    AlterTypeAction::SetAttributeNotNull(field)
+                    crate::sql::ast::ParsedCollation::DEFAULT
+                };
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
+                AlterTypeAction::AlterAttributeType {
+                    name: field,
+                    type_name,
+                    type_mod,
+                    collation,
+                    cascade,
                 }
             } else if self.eat_ident("type")? {
                 let (type_name, type_mod) = self.type_name_mod()?;
@@ -4404,20 +4406,21 @@ impl<'a> Parser<'a> {
                 } else {
                     crate::sql::ast::ParsedCollation::DEFAULT
                 };
+                let cascade = if self.eat_ident("cascade")? {
+                    true
+                } else {
+                    let _ = self.eat_ident("restrict")?;
+                    false
+                };
                 AlterTypeAction::AlterAttributeType {
                     name: field,
                     type_name,
                     type_mod,
                     collation,
+                    cascade,
                 }
-            } else if self.eat_ident("drop")? {
-                self.expect_ident("not")?;
-                self.expect_ident("null")?;
-                AlterTypeAction::DropAttributeNotNull(field)
             } else {
-                return Err(self.err_here(
-                    "expected SET DATA TYPE, SET NOT NULL, or DROP NOT NULL after ALTER ATTRIBUTE",
-                ));
+                return Err(self.err_here("expected SET DATA TYPE after ALTER ATTRIBUTE"));
             }
         } else {
             return Err(

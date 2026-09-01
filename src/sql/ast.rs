@@ -3673,7 +3673,7 @@ pub enum AlterTypeAction<'a> {
     RenameTo(&'a str),
     /// SET SCHEMA new_schema. The durable type identity remains its catalog slot.
     SetSchema(&'a str),
-    /// RENAME VALUE 'old' TO 'new' — rejected (values are stored inline).
+    /// RENAME VALUE 'old' TO 'new'.
     RenameValue { from: &'a str, to: &'a str },
     /// ADD ATTRIBUTE name type.
     AddAttribute(CompositeField<'a>),
@@ -3687,11 +3687,8 @@ pub enum AlterTypeAction<'a> {
         type_name: &'a str,
         type_mod: i32,
         collation: ParsedCollation<'a>,
+        cascade: bool,
     },
-    /// ALTER ATTRIBUTE name SET NOT NULL.
-    SetAttributeNotNull(&'a str),
-    /// ALTER ATTRIBUTE name DROP NOT NULL.
-    DropAttributeNotNull(&'a str),
 }
 
 /// Referential action for a foreign key's ON DELETE / ON UPDATE.

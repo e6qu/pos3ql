@@ -5,8 +5,14 @@
 --
 -- Distinctive names + drop up front (the differential corpora share a database).
 DROP TABLE IF EXISTS enum_t;
+DROP TABLE IF EXISTS composite_type_values;
 DROP TYPE IF EXISTS mood;
 DROP TYPE IF EXISTS rainbow;
+DROP TYPE IF EXISTS enum_composite_name;
+DROP TYPE IF EXISTS composite_lifecycle;
+DROP TYPE IF EXISTS composite_alterable;
+DROP TYPE IF EXISTS composite_lifecycle_schema.composite_moved;
+DROP SCHEMA IF EXISTS composite_lifecycle_schema CASCADE;
 
 CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
 CREATE TABLE enum_t (id int, m mood, moods mood[]);
@@ -86,6 +92,54 @@ SELECT 'green'::rainbow AS pick, 'red'::rainbow < 'blue'::rainbow AS ordered;
 DROP TYPE rainbow;
 SELECT typname FROM pg_type WHERE typname IN ('mood', 'rainbow') ORDER BY typname;
 
+-- The type namespace is shared by enums, domains, and named composites.
+CREATE TYPE enum_composite_name AS (id integer);
+ALTER TYPE feeling RENAME TO enum_composite_name;
+DROP TYPE enum_composite_name;
+
+CREATE TYPE composite_alterable AS (value integer);
+ALTER TYPE composite_alterable ALTER ATTRIBUTE value TYPE bigint;
+COMMENT ON TYPE composite_alterable IS 'standalone composite';
+SELECT atttypid::regtype
+  FROM pg_attribute
+ WHERE attrelid = 'composite_alterable'::regclass AND attname = 'value';
+SELECT 'composite_alterable'::regclass::text;
+SELECT obj_description('composite_alterable'::regtype, 'pg_type');
+DROP TYPE composite_alterable;
+
+-- A named composite evolves through typed field identity. Existing scalar and
+-- array values, nullability, type changes, schema moves, and renames retain
+-- the current layout without reinterpreting historical fields by name.
+CREATE TYPE composite_lifecycle AS (id integer, note text, retired integer);
+CREATE TABLE composite_type_values (
+  value composite_lifecycle,
+  values composite_lifecycle[]
+);
+INSERT INTO composite_type_values VALUES
+  (ROW(1, 'first', 7)::composite_lifecycle,
+   ARRAY[ROW(2, 'array', 8)::composite_lifecycle]);
+ALTER TYPE composite_lifecycle ADD ATTRIBUTE active boolean;
+ALTER TYPE composite_lifecycle RENAME ATTRIBUTE note TO label;
+ALTER TYPE composite_lifecycle DROP ATTRIBUTE retired;
+ALTER TYPE composite_lifecycle ALTER ATTRIBUTE id TYPE bigint;
+ALTER TYPE composite_lifecycle ALTER ATTRIBUTE id TYPE bigint CASCADE;
+SELECT (value).id, (value).label, (value).active,
+       pg_typeof(value), pg_typeof(values)
+  FROM composite_type_values;
+SELECT (values[1]).id, (values[1]).label, (values[1]).active
+  FROM composite_type_values;
+ALTER TYPE composite_lifecycle ALTER ATTRIBUTE active SET NOT NULL;
+ALTER TYPE composite_lifecycle ALTER ATTRIBUTE active DROP NOT NULL;
+CREATE SCHEMA composite_lifecycle_schema;
+ALTER TYPE composite_lifecycle SET SCHEMA composite_lifecycle_schema;
+ALTER TYPE composite_lifecycle_schema.composite_lifecycle RENAME TO composite_moved;
+SELECT (value).id, (value).label, (value).active,
+       (values[1]).id, pg_typeof(value), pg_typeof(values)
+  FROM composite_type_values;
+
 -- Cleanup.
 DROP TABLE enum_t;
 DROP TYPE feeling;
+DROP TABLE composite_type_values;
+DROP TYPE composite_lifecycle_schema.composite_moved;
+DROP SCHEMA composite_lifecycle_schema;

@@ -3040,7 +3040,8 @@ fn stack_str_64(s: &str) -> StackStr<64> {
 }
 
 /// The relation name for an OID, used to render `oid::regclass`. Resolves
-/// ordinary tables, synthesized index relations, sequences and plain views.
+/// ordinary tables, synthesized index relations, sequences, plain views, and
+/// named composite backing relations.
 pub fn relname_text<'a>(
     storage: &Storage,
     txid: u32,
@@ -3094,12 +3095,20 @@ pub fn relname_text<'a>(
             return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
         }
     }
+    for (slot, composite) in storage.composites_with_slots_visible_to(txid) {
+        if named_composite_relation_oid(slot) == oid {
+            let bytes = arena
+                .alloc_slice_copy(composite.name.as_str().as_bytes())
+                .map_err(|_| arena_full())?;
+            return Ok(Some(unsafe { core::str::from_utf8_unchecked(bytes) }));
+        }
+    }
     Ok(None)
 }
 
 /// The OID of the relation named `name`, for `'relname'::regclass`. Resolves
-/// ordinary tables, synthesized index relations and sequences; `None` if no
-/// such relation.
+/// ordinary tables, synthesized index relations, sequences, plain views, and
+/// named composite backing relations; `None` if no such relation.
 pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
     let (schema, relation) = name
         .split_once('.')
@@ -3129,6 +3138,13 @@ pub fn reloid_of_name(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
             return Some(sequence_oid(slot));
         }
     }
+    let composite_slot = schema.map_or_else(
+        || storage.resolve_composite_slot(relation, txid),
+        |schema| storage.composite_slot(schema, relation, txid),
+    );
+    if let Some(slot) = composite_slot {
+        return Some(named_composite_relation_oid(slot));
+    }
     (0..storage.view_count())
         .find(|&slot| {
             storage.view_slot_visible_to(slot, txid)
@@ -3153,6 +3169,9 @@ pub fn relation_oid_is_visible(storage: &Storage, txid: u32, oid: i32) -> bool {
             .any(|slot| storage.sequence_slot_visible_to(slot, txid) && sequence_oid(slot) == oid)
         || (0..storage.view_count())
             .any(|slot| storage.view_slot_visible_to(slot, txid) && view_oid(slot) == oid)
+        || storage
+            .composites_with_slots_visible_to(txid)
+            .any(|(slot, _)| named_composite_relation_oid(slot) == oid)
 }
 
 fn catalog_relation_oid_by_oid(oid: i32) -> bool {
@@ -4975,6 +4994,9 @@ fn type_oid_of(storage: &Storage, schema: &str, name: &str, txid: u32) -> Option
     }
     if let Some(slot) = storage.enum_slot(schema, name, txid) {
         return Some(crate::sql::types::oid::enum_oid(slot as u16));
+    }
+    if let Some(slot) = storage.composite_slot(schema, name, txid) {
+        return Some(crate::sql::types::oid::composite_oid(slot as u16));
     }
     if let Some(oid) = composite_type_oid(storage, schema, name, txid) {
         return Some(oid);

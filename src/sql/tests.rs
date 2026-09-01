@@ -31826,6 +31826,8 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         for statement in [
             "CREATE SCHEMA durable_types",
             "CREATE TYPE coordinate AS (x integer, y integer)",
+            "CREATE TYPE altered_coordinate AS (value integer)",
+            "ALTER TYPE altered_coordinate ALTER ATTRIBUTE value TYPE bigint",
             "CREATE TYPE place AS (name varchar(7) COLLATE \"C\", point coordinate)",
             "CREATE TABLE durable_places (value place)",
             "INSERT INTO durable_places VALUES (ROW('Station', ROW(4, 8)::coordinate)::place)",
@@ -31885,6 +31887,15 @@ fn named_composites_survive_wal_and_checkpoint_recovery() {
         ["coordinate_renamed|label|7|951", "place|name|11|950"],
         "{}",
         String::from_utf8_lossy(&metadata)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT atttypid::regtype FROM pg_attribute \
+             WHERE attrelid = 'altered_coordinate'::regclass AND attname = 'value'",
+        )),
+        ["bigint"]
     );
     let bytes = run_with(
         &mut engine,
@@ -32252,60 +32263,48 @@ fn composite_array_attribute_evolution_preserves_old_values() {
 }
 
 #[test]
-fn composite_attribute_not_null_is_enforced_on_alter_and_new_values() {
+fn composite_attribute_not_null_is_rejected_at_the_parse_boundary() {
     let (mut engine, mut budget) = test_engine();
-    run_with(
+    let set = run_with(
         &mut engine,
         &mut budget,
         "CREATE TYPE required_part AS (value integer); \
-         CREATE TABLE required_parts (part required_part); \
-         INSERT INTO required_parts VALUES (ROW(NULL)::required_part)",
-    );
-    let existing = run_with(
-        &mut engine,
-        &mut budget,
-        "ALTER TYPE required_part ALTER ATTRIBUTE value SET NOT NULL",
+         ALTER TYPE required_part ALTER ATTRIBUTE value SET NOT NULL",
     );
     assert!(
-        String::from_utf8_lossy(&existing).contains("23502"),
+        String::from_utf8_lossy(&set).contains("42601"),
         "{}",
-        String::from_utf8_lossy(&existing)
+        String::from_utf8_lossy(&set)
     );
-    run_with(
+    let drop = run_with(
         &mut engine,
         &mut budget,
-        "DELETE FROM required_parts; ALTER TYPE required_part ALTER ATTRIBUTE value SET NOT NULL",
-    );
-    let inserted = run_with(
-        &mut engine,
-        &mut budget,
-        "INSERT INTO required_parts VALUES (ROW(NULL)::required_part)",
+        "ALTER TYPE required_part ALTER ATTRIBUTE value DROP NOT NULL",
     );
     assert!(
-        String::from_utf8_lossy(&inserted).contains("23502"),
+        String::from_utf8_lossy(&drop).contains("42601"),
         "{}",
-        String::from_utf8_lossy(&inserted)
+        String::from_utf8_lossy(&drop)
     );
 }
 
 #[test]
-fn composite_attribute_type_changes_validate_old_values_before_publication() {
+fn composite_attribute_type_changes_reject_dependent_values() {
     let (mut engine, mut budget) = test_engine();
     run_with(
         &mut engine,
         &mut budget,
         "CREATE TYPE converted_part AS (value integer); \
-         CREATE TABLE converted_parts (part converted_part); \
-         INSERT INTO converted_parts VALUES (ROW(42)::converted_part); \
          ALTER TYPE converted_part ALTER ATTRIBUTE value TYPE text",
     );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT (part).value, pg_typeof((part).value) FROM converted_parts",
+            "SELECT atttypid::regtype FROM pg_attribute \
+             WHERE attrelid = 'converted_part'::regclass AND attname = 'value'",
         )),
-        ["42|text"]
+        ["text"]
     );
     run_with(
         &mut engine,
@@ -32314,16 +32313,17 @@ fn composite_attribute_type_changes_validate_old_values_before_publication() {
          CREATE TABLE invalid_conversions (part invalid_conversion); \
          INSERT INTO invalid_conversions VALUES (ROW('not-a-number')::invalid_conversion)",
     );
-    let invalid = run_with(
-        &mut engine,
-        &mut budget,
+    for statement in [
         "ALTER TYPE invalid_conversion ALTER ATTRIBUTE value TYPE integer",
-    );
-    assert!(
-        String::from_utf8_lossy(&invalid).contains("22P02"),
-        "{}",
-        String::from_utf8_lossy(&invalid)
-    );
+        "ALTER TYPE invalid_conversion ALTER ATTRIBUTE value TYPE integer CASCADE",
+    ] {
+        let invalid = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&invalid).contains("0A000"),
+            "{}",
+            String::from_utf8_lossy(&invalid)
+        );
+    }
 }
 
 #[test]

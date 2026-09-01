@@ -378,6 +378,42 @@ def test_view_column_acl_over_raw_wire():
     s.close()
 
 
+def test_view_check_option_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_check_option_base (value integer); "
+        "CREATE VIEW wire_check_option WITH (check_option = local) AS "
+        "SELECT value FROM wire_check_option_base WHERE value > 0; "
+        "INSERT INTO wire_check_option VALUES (1)",
+    )
+    rejected_insert = simple_query(s, "INSERT INTO wire_check_option VALUES (-1)")
+    rejected_update = simple_query(s, "UPDATE wire_check_option SET value = -1")
+    catalog = simple_query(
+        s,
+        "SELECT check_option FROM information_schema.views "
+        "WHERE table_name = 'wire_check_option'",
+    )
+    altered = simple_query(s, "ALTER VIEW wire_check_option SET (check_option = cascaded)")
+    reset = simple_query(
+        s,
+        "DROP VIEW wire_check_option; DROP TABLE wire_check_option_base",
+    )
+    check(
+        "view check-option wire: typed option rejects rows hidden by its predicate",
+        not any(kind == b"E" for kind, _ in setup)
+        and has_sqlstate(rejected_insert, "44000")
+        and has_sqlstate(rejected_update, "44000")
+        and first_text_row(catalog) == "LOCAL"
+        and not any(kind == b"E" for kind, _ in altered)
+        and not any(kind == b"E" for kind, _ in reset),
+        (setup, rejected_insert, rejected_update, catalog, altered, reset),
+    )
+    s.close()
+
+
 def test_unknown_minor_negotiates():
     s = connect()
     s.sendall(startup_payload(7))  # 3.7 does not exist

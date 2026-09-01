@@ -109,6 +109,23 @@ pub struct RowCtx<'s, 'v, 'd> {
     pub alias: Option<&'d str>,
 }
 
+/// A view predicate that must remain true after an auto-updatable rewrite.
+/// The predicate is retained as a parsed expression, so the write boundary
+/// never reparses catalog text while rows are being changed.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewCheck<'a> {
+    pub predicate: Option<&'a Expr<'a>>,
+    pub view_name: &'a str,
+}
+
+struct ViewCheckContext<'storage, 'arena, 'params, 'sequence> {
+    storage: &'storage Storage,
+    txid: u32,
+    arena: &'arena Arena,
+    params: &'params [Datum<'arena>],
+    seq_session: &'sequence crate::sql::guc::SeqSession,
+}
+
 impl<'v> ColumnLookup<'v> for RowCtx<'_, 'v, '_> {
     fn lookup(&self, qualifier: Option<&str>, name: &str) -> Result<Datum<'v>, SqlError> {
         if let Some(q) = qualifier
@@ -3893,6 +3910,7 @@ fn handle_conflict<'a, 'outer, 'snapshot>(
     on_conflict: &Option<super::ast::OnConflict<'a>>,
     arbiter: &Arbiter,
     checks: &ParsedChecks,
+    view_check: Option<ViewCheck<'a>>,
     row_security_using: Option<super::query::RowSecurityPlan<'a>>,
     row_security_check: Option<super::query::RowSecurityPlan<'a>>,
     arena: &'a Arena,
@@ -4081,6 +4099,18 @@ where
             ));
         }
     }
+    enforce_view_check(
+        view_check,
+        def,
+        &new_values[..def.n_columns],
+        ViewCheckContext {
+            storage,
+            txid: txn.txid,
+            arena,
+            params,
+            seq_session,
+        },
+    )?;
     let mut logical_table = table_index;
     while let Some(attachment) = storage
         .table_def(logical_table, txn.txid)
@@ -12631,8 +12661,15 @@ pub struct CreateViewCommand<'a> {
     pub name: &'a QualName<'a>,
     pub or_replace: bool,
     pub security: super::ast::ViewSecurity,
+    pub check_option: Option<super::ast::ViewCheckOption>,
     pub sql: &'a str,
     pub raw_path: &'a str,
+}
+
+pub struct AlterViewCommand<'a> {
+    pub name: QualName<'a>,
+    pub if_exists: bool,
+    pub action: crate::sql::ast::AlterViewAction<'a>,
 }
 
 #[derive(Clone, Copy)]
@@ -17646,6 +17683,7 @@ fn execute_trigger_block<'a>(
                         scratch,
                         &statement,
                         DmlAuthorization::Invoker,
+                        None,
                         arena,
                         params,
                         seq_session,
@@ -17738,6 +17776,7 @@ fn execute_trigger_block<'a>(
                         scratch,
                         &statement,
                         DmlAuthorization::Invoker,
+                        None,
                         arena,
                         params,
                         seq_session,
@@ -26633,6 +26672,72 @@ fn remove_extension_config(
     Ok(())
 }
 
+pub(crate) fn resolve_routine_identity(
+    storage: &Storage,
+    txid: u32,
+    identity: &super::ast::RoutineIdentity<'_>,
+    expected: crate::sql::ast::RoutineTargetKind,
+) -> Result<usize, SqlError> {
+    use crate::sql::ast::RoutineTargetKind;
+    let arguments = resolve_routine_signature(storage, txid, identity.argument_types)?;
+    let find_in = |schema: &str| -> Result<Option<usize>, SqlError> {
+        if identity.signature_is_explicit {
+            Ok(storage.routine_slot_by_declared_signature(
+                schema,
+                identity.name.name,
+                &arguments[..identity.argument_types.len()],
+                txid,
+            ))
+        } else {
+            storage
+                .routine_slot_by_name_unambiguous(schema, identity.name.name, txid)
+                .map_err(|()| {
+                    sql_err!(
+                        sqlstate::AMBIGUOUS_FUNCTION,
+                        "routine \"{}\" is not unique",
+                        identity.name.name
+                    )
+                })
+        }
+    };
+    let slot = if let Some(schema) = identity.name.schema {
+        find_in(schema)?
+    } else {
+        let mut found = None;
+        for entry in storage.path().entries() {
+            let crate::storage::PathEntry::Schema(slot) = entry else {
+                continue;
+            };
+            if let Some(slot) = find_in(storage.schema_def(*slot as usize).name.as_str())? {
+                found = Some(slot);
+                break;
+            }
+        }
+        found
+    }
+    .ok_or_else(|| {
+        sql_err!(
+            sqlstate::UNDEFINED_FUNCTION,
+            "routine \"{}\" does not exist",
+            identity.name.name
+        )
+    })?;
+    let actual = match storage.routine_for(slot, txid).kind {
+        crate::storage::RoutineKind::Procedure => RoutineTargetKind::Procedure,
+        crate::storage::RoutineKind::Aggregate(_) => RoutineTargetKind::Aggregate,
+        _ => RoutineTargetKind::Function,
+    };
+    if expected != RoutineTargetKind::Either && expected != actual {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "{} \"{}\" does not exist",
+            expected.noun(),
+            identity.name.name
+        ));
+    }
+    Ok(slot)
+}
+
 pub(crate) fn resolve_extension_member(
     storage: &Storage,
     txid: u32,
@@ -26643,56 +26748,7 @@ pub(crate) fn resolve_extension_member(
     let routine_object = |identity: &super::ast::RoutineIdentity<'_>,
                           expected: RoutineTargetKind|
      -> Result<AccessObject, SqlError> {
-        let arguments = resolve_routine_signature(storage, txid, identity.argument_types)?;
-        let find_in = |schema: &str| {
-            if identity.signature_is_explicit {
-                storage.routine_slot_by_declared_signature(
-                    schema,
-                    identity.name.name,
-                    &arguments[..identity.argument_types.len()],
-                    txid,
-                )
-            } else {
-                storage
-                    .routine_slot_by_name_unambiguous(schema, identity.name.name, txid)
-                    .ok()
-                    .flatten()
-            }
-        };
-        let slot = if let Some(schema) = identity.name.schema {
-            find_in(schema)
-        } else {
-            storage
-                .path()
-                .entries()
-                .iter()
-                .find_map(|entry| match entry {
-                    crate::storage::PathEntry::Schema(slot) => {
-                        find_in(storage.schema_def(*slot as usize).name.as_str())
-                    }
-                    crate::storage::PathEntry::Catalog => None,
-                })
-        }
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_FUNCTION,
-                "routine \"{}\" does not exist",
-                identity.name.name
-            )
-        })?;
-        let actual = match storage.routine_for(slot, txid).kind {
-            crate::storage::RoutineKind::Procedure => RoutineTargetKind::Procedure,
-            crate::storage::RoutineKind::Aggregate(_) => RoutineTargetKind::Aggregate,
-            _ => RoutineTargetKind::Function,
-        };
-        if expected != RoutineTargetKind::Either && expected != actual {
-            return Err(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "{} \"{}\" does not exist",
-                expected.noun(),
-                identity.name.name
-            ));
-        }
+        let slot = resolve_routine_identity(storage, txid, identity, expected)?;
         Ok(AccessObject {
             class: AccessClass::Routine,
             slot: slot as u16,
@@ -27974,6 +28030,7 @@ pub fn create_view(
         name,
         or_replace,
         security,
+        check_option,
         sql,
         raw_path,
     } = command;
@@ -28028,14 +28085,42 @@ pub fn create_view(
             creation_path,
             dependencies,
         },
-        match security {
-            super::ast::ViewSecurity::Definer => crate::storage::ViewSecurity::Definer,
-            super::ast::ViewSecurity::Invoker => crate::storage::ViewSecurity::Invoker,
+        crate::storage::ViewOptions {
+            security: match security {
+                super::ast::ViewSecurity::Definer => crate::storage::ViewSecurity::Definer,
+                super::ast::ViewSecurity::Invoker => crate::storage::ViewSecurity::Invoker,
+            },
+            check_option: check_option.map(|option| match option {
+                super::ast::ViewCheckOption::Local => crate::storage::ViewCheckOption::Local,
+                super::ast::ViewCheckOption::Cascaded => crate::storage::ViewCheckOption::Cascaded,
+            }),
         },
         or_replace,
         txn.txid,
     ) {
         Ok((new_slot, old_slot)) => {
+            if check_option.is_some() {
+                match super::query::resolve_view_for_dml(storage, *name, txn.txid, arena) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        storage.rollback_view_create(new_slot);
+                        if let Some(old_slot) = old_slot {
+                            storage.rollback_view_drop(old_slot, txn.txid);
+                        }
+                        return sql_fail(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "newly created view is absent during check option validation"
+                        ));
+                    }
+                    Err(error) => {
+                        storage.rollback_view_create(new_slot);
+                        if let Some(old_slot) = old_slot {
+                            storage.rollback_view_drop(old_slot, txn.txid);
+                        }
+                        return sql_fail(error);
+                    }
+                }
+            }
             let lsn = storage.bump_lsn();
             if let Err(e) = wal.stage(
                 txn.txid,
@@ -28046,6 +28131,10 @@ pub fn create_view(
                     sql,
                     path: raw_path,
                     security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
+                    check_option: check_option.map_or(0, |option| match option {
+                        super::ast::ViewCheckOption::Local => 1,
+                        super::ast::ViewCheckOption::Cascaded => 2,
+                    }),
                     dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
                 },
             ) {
@@ -28099,12 +28188,16 @@ pub fn alter_view(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    name: QualName<'_>,
-    if_exists: bool,
-    action: crate::sql::ast::AlterViewAction<'_>,
+    command: AlterViewCommand<'_>,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     use crate::sql::ast::{AlterViewAction, ViewOption, ViewOptionName};
+    let AlterViewCommand {
+        name,
+        if_exists,
+        action,
+    } = command;
     let Some(slot) = storage
         .resolve_relation(name.schema, name.name, txn.txid)
         .and_then(|relation| match relation {
@@ -28204,6 +28297,7 @@ pub fn alter_view(
         return sql_ok();
     }
     let mut security = storage.view(slot).security_for(txn.txid);
+    let mut check_option = storage.view(slot).check_option_for(txn.txid);
     match action {
         AlterViewAction::SetOptions(options) => {
             for option in options {
@@ -28222,11 +28316,25 @@ pub fn alter_view(
                         ));
                     }
                     ViewOption::SecurityBarrier(false) => {}
-                    ViewOption::CheckOption(_) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "view check_option requires automatically updatable view enforcement"
-                        ));
+                    ViewOption::CheckOption(option) => {
+                        match super::query::resolve_view_for_dml(storage, name, txn.txid, arena) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                return sql_fail(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "resolved view is absent during check option validation"
+                                ));
+                            }
+                            Err(error) => return sql_fail(error),
+                        }
+                        check_option = Some(match option {
+                            crate::sql::ast::ViewCheckOption::Local => {
+                                crate::storage::ViewCheckOption::Local
+                            }
+                            crate::sql::ast::ViewCheckOption::Cascaded => {
+                                crate::storage::ViewCheckOption::Cascaded
+                            }
+                        });
                     }
                 }
             }
@@ -28238,12 +28346,7 @@ pub fn alter_view(
                         security = crate::storage::ViewSecurity::Definer;
                     }
                     ViewOptionName::SecurityBarrier => {}
-                    ViewOptionName::CheckOption => {
-                        return sql_fail(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "view check_option requires automatically updatable view enforcement"
-                        ));
-                    }
+                    ViewOptionName::CheckOption => check_option = None,
                 }
             }
         }
@@ -28308,8 +28411,9 @@ pub fn alter_view(
         }
         AlterViewAction::SetSchema(_) => unreachable!("handled before option staging"),
     }
-    let current = storage.view(slot).security_for(txn.txid);
-    if security == current {
+    let current_security = storage.view(slot).security_for(txn.txid);
+    let current_check_option = storage.view(slot).check_option_for(txn.txid);
+    if security == current_security && check_option == current_check_option {
         responder.command_complete("ALTER VIEW")?;
         return sql_ok();
     }
@@ -28317,29 +28421,57 @@ pub fn alter_view(
         let view = storage.view(slot);
         (view.schema, view.name)
     };
-    let prior = match storage.stage_view_security(slot, security, txn.txid) {
-        Ok(prior) => prior,
-        Err(error) => return sql_fail(error),
-    };
-    let lsn = storage.bump_lsn();
-    if let Err(error) = wal.stage(
-        txn.txid,
-        lsn,
-        &WalOp::SetViewSecurity {
-            schema: schema.as_str(),
-            name: view_name.as_str(),
-            security_invoker: matches!(security, crate::storage::ViewSecurity::Invoker),
-        },
-    ) {
-        storage.rollback_view_security(slot, prior);
-        return sql_fail(error);
+    if security != current_security {
+        let prior = match storage.stage_view_security(slot, security, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::SetViewSecurity {
+                schema: schema.as_str(),
+                name: view_name.as_str(),
+                security_invoker: matches!(security, crate::storage::ViewSecurity::Invoker),
+            },
+        ) {
+            storage.rollback_view_security(slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewSecurityChanged {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_view_security(slot, prior);
+            return sql_fail(error);
+        }
     }
-    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewSecurityChanged {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.rollback_view_security(slot, prior);
-        return sql_fail(error);
+    if check_option != current_check_option {
+        let prior = match storage.stage_view_check_option(slot, check_option, txn.txid) {
+            Ok(prior) => prior,
+            Err(error) => return sql_fail(error),
+        };
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::SetViewCheckOption {
+                schema: schema.as_str(),
+                name: view_name.as_str(),
+                check_option: check_option.map_or(0, crate::storage::ViewCheckOption::code),
+            },
+        ) {
+            storage.rollback_view_check_option(slot, prior);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewCheckOptionChanged {
+            slot: slot as u32,
+            prior,
+        }) {
+            storage.rollback_view_check_option(slot, prior);
+            return sql_fail(error);
+        }
     }
     responder.command_complete("ALTER VIEW")?;
     sql_ok()
@@ -29457,6 +29589,22 @@ pub fn comment(
                 SqlName::EMPTY,
                 name,
                 target.comment_subid(),
+            )
+        }
+        CommentTarget::Routine { kind, identity } => {
+            let slot = match resolve_routine_identity(storage, txid, &identity, kind) {
+                Ok(slot) => slot,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = storage.require_routine_owner(slot, txid) {
+                return sql_fail(error);
+            }
+            let routine = storage.routine_for(slot, txid);
+            (
+                CommentClass::Routine,
+                routine.schema_for(txid),
+                routine.name_for(txid),
+                crate::storage::routine_oid(&routine) as u32,
             )
         }
         CommentTarget::Type {
@@ -36075,7 +36223,10 @@ fn rewrite_composite_dependent_views(
                 creation_path,
                 dependencies,
             },
-            view.security_for(txn.txid),
+            crate::storage::ViewOptions {
+                security: view.security_for(txn.txid),
+                check_option: view.check_option_for(txn.txid),
+            },
             true,
             txn.txid,
         )?;
@@ -36092,6 +36243,9 @@ fn rewrite_composite_dependent_views(
                     view.security_for(txn.txid),
                     crate::storage::ViewSecurity::Invoker
                 ),
+                check_option: view
+                    .check_option_for(txn.txid)
+                    .map_or(0, |option| option.code()),
                 dependencies: crate::wal::WalStoredQueryDependencies::Captured(&dependencies),
             },
         ) {
@@ -45729,6 +45883,7 @@ fn finish_insert_row<'a, 'outer, 'snapshot>(
     arbiter: &Arbiter,
     checks: &ParsedChecks<'a>,
     insert_check: Option<super::query::RowSecurityPlan<'a>>,
+    view_check: Option<ViewCheck<'a>>,
     conflict_using: Option<super::query::RowSecurityPlan<'a>>,
     conflict_check: Option<super::query::RowSecurityPlan<'a>>,
     arena: &'a Arena,
@@ -45811,6 +45966,20 @@ where
             Err(error) => return Ok(Err(error)),
         }
     }
+    if let Err(error) = enforce_view_check(
+        view_check,
+        definition,
+        &values[..definition.n_columns],
+        ViewCheckContext {
+            storage,
+            txid: txn.txid,
+            arena,
+            params,
+            seq_session,
+        },
+    ) {
+        return Ok(Err(error));
+    }
     if let Err(error) = check_not_null(definition, values) {
         return Ok(Err(error));
     }
@@ -45826,6 +45995,7 @@ where
         &statement.on_conflict,
         arbiter,
         checks,
+        view_check,
         conflict_using,
         conflict_check,
         arena,
@@ -46740,6 +46910,7 @@ pub(crate) fn insert<'a, 'scope, 'outer, 'snapshot>(
     scratch: &mut DmlScratch,
     statement: &Insert<'a>,
     authorization: DmlAuthorization,
+    view_check: Option<ViewCheck<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
@@ -47228,6 +47399,7 @@ where
                 &arbiter,
                 &checks,
                 insert_check,
+                view_check,
                 conflict_using,
                 conflict_check,
                 arena,
@@ -47462,6 +47634,7 @@ where
             &arbiter,
             &checks,
             insert_check,
+            view_check,
             conflict_using,
             conflict_check,
             arena,
@@ -48007,6 +48180,7 @@ pub(crate) fn update<'a>(
     scratch: &mut DmlScratch,
     statement: &Update<'a>,
     authorization: DmlAuthorization,
+    view_check: Option<ViewCheck<'a>>,
     arena: &'a Arena,
     params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
@@ -48593,6 +48767,20 @@ pub(crate) fn update<'a>(
                     }
                     Err(error) => return sql_fail(error),
                 }
+            }
+            if let Err(error) = enforce_view_check(
+                view_check,
+                &def,
+                &new_values[..def.n_columns],
+                ViewCheckContext {
+                    storage,
+                    txid: txn.txid,
+                    arena,
+                    params,
+                    seq_session,
+                },
+            ) {
+                return sql_fail(error);
             }
             if let Err(e) = check_not_null(&def, new_values) {
                 return sql_fail(e);
@@ -55670,6 +55858,58 @@ fn require_view_privilege(
         )
     })?;
     require_view_privilege_as(storage, view, privilege, role, txid)
+}
+
+fn enforce_view_check<'a>(
+    check: Option<ViewCheck<'a>>,
+    definition: &TableDef,
+    values: &[Datum<'a>],
+    check_context: ViewCheckContext<'_, 'a, '_, '_>,
+) -> Result<(), SqlError> {
+    let Some(ViewCheck {
+        predicate: Some(predicate),
+        view_name,
+    }) = check
+    else {
+        return Ok(());
+    };
+    let row = RowCtx {
+        def: definition,
+        values,
+        alias: None,
+    };
+    let catalog = super::query::storage_catalog(
+        check_context.storage,
+        check_context.arena,
+        check_context.txid,
+    );
+    let sequences = crate::sql::sequence::SeqEval::new(
+        check_context.storage,
+        check_context.seq_session,
+        check_context.txid,
+    );
+    let hooks = EvalHooks {
+        catalog: Some(&catalog),
+        sequences: Some(&sequences),
+        ..NO_HOOKS
+    };
+    if matches!(
+        eval_full(
+            predicate,
+            check_context.arena,
+            check_context.params,
+            &row,
+            &hooks,
+        )?,
+        Datum::Bool(true)
+    ) {
+        return Ok(());
+    }
+    Err(sql_err!(
+        sqlstate::WITH_CHECK_OPTION_VIOLATION,
+        "new row violates check option for view \"{}\"",
+        view_name
+    ))
 }
 
 fn require_view_privilege_as(

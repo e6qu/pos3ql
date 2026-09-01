@@ -4792,6 +4792,18 @@ fn pg_description<'a>(
                 }
                 (raw_oid as i32, PG_LARGEOBJECT_OID)
             }
+            crate::storage::CommentClass::Routine => {
+                let Ok(oid) = i32::try_from(subid) else {
+                    continue;
+                };
+                let Some(slot) = storage.routine_slot_by_oid(oid, txid) else {
+                    continue;
+                };
+                (
+                    crate::storage::routine_oid(&storage.routine_for(slot, txid)),
+                    PG_PROC_OID,
+                )
+            }
             crate::storage::CommentClass::Rule => {
                 let rule = storage
                     .rules_visible_to(txid)
@@ -4838,7 +4850,9 @@ fn pg_description<'a>(
         };
         let catalog_subid = if matches!(
             class,
-            crate::storage::CommentClass::Trigger | crate::storage::CommentClass::Rule
+            crate::storage::CommentClass::Trigger
+                | crate::storage::CommentClass::Rule
+                | crate::storage::CommentClass::Routine
         ) {
             0
         } else {
@@ -5287,6 +5301,14 @@ pub fn comment_text_for<'a>(
                         definition.name.as_str() == name
                             && definition.target.comment_subid() == csub
                             && Some(rule.oid()) == signed_oid
+                    })
+            }
+            "pg_proc" => {
+                class == crate::storage::CommentClass::Routine
+                    && subid == 0
+                    && signed_oid.is_some_and(|oid| {
+                        i32::try_from(csub) == Ok(oid)
+                            && storage.routine_slot_by_oid(oid, txid).is_some()
                     })
             }
             _ => {
@@ -7854,14 +7876,29 @@ fn pg_class<'a>(
         }
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
         let n_columns = describe_view(storage, txid, view, arena, &mut columns)?;
-        let reloptions = if matches!(
+        let mut option_values = [Datum::Null; 2];
+        let mut option_count = 0;
+        if matches!(
             view.security_for(txid),
             crate::storage::ViewSecurity::Invoker
         ) {
-            let values = [text("security_invoker=true", arena)?];
+            option_values[option_count] = text("security_invoker=true", arena)?;
+            option_count += 1;
+        }
+        if let Some(option) = view.check_option_for(txid) {
+            option_values[option_count] = text(
+                match option {
+                    crate::storage::ViewCheckOption::Local => "check_option=local",
+                    crate::storage::ViewCheckOption::Cascaded => "check_option=cascaded",
+                },
+                arena,
+            )?;
+            option_count += 1;
+        }
+        let reloptions = if option_count != 0 {
             Datum::Array {
                 element: super::types::ArrElem::Text,
-                raw: super::array::build(&values, arena)?,
+                raw: super::array::build(&option_values[..option_count], arena)?,
             }
         } else {
             Datum::Null
@@ -15268,7 +15305,14 @@ fn info_views<'a>(
                 text(view.schema_for(txid).as_str(), arena)?,
                 text(view.name_for(txid).as_str(), arena)?,
                 text(storage.view_sql_for(view), arena)?,
-                text("NONE", arena)?,
+                text(
+                    match view.check_option_for(txid) {
+                        None => "NONE",
+                        Some(crate::storage::ViewCheckOption::Local) => "LOCAL",
+                        Some(crate::storage::ViewCheckOption::Cascaded) => "CASCADED",
+                    },
+                    arena,
+                )?,
                 text(writable, arena)?,
                 text(writable, arena)?,
                 text("NO", arena)?,

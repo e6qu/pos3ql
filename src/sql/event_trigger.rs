@@ -1109,6 +1109,14 @@ fn comment_reference(
                     .ok_or_else(graph_full)?,
             ))
         }
+        CommentClass::Routine => {
+            let oid = i32::try_from(subid).map_err(|_| graph_full())?;
+            EventObjectRef::Primary(ObjectRef::Routine(
+                storage
+                    .routine_slot_by_oid(oid, txid)
+                    .ok_or_else(graph_full)?,
+            ))
+        }
     })
 }
 

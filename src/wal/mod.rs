@@ -167,6 +167,7 @@ const KIND_SET_USER_MAPPING: u8 = 117;
 const KIND_SET_FOREIGN_TABLE: u8 = 118;
 const KIND_SET_VIEW_SECURITY: u8 = 119;
 const KIND_RENAME_VIEW: u8 = 120;
+const KIND_SET_VIEW_CHECK_OPTION: u8 = 121;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -174,7 +175,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_RENAME_VIEW;
+const LAST_KIND: u8 = KIND_SET_VIEW_CHECK_OPTION;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -543,6 +544,7 @@ pub(crate) enum WalOp<'a> {
         /// The creator's search_path, under which the body re-resolves.
         path: &'a str,
         security_invoker: bool,
+        check_option: u8,
         dependencies: WalStoredQueryDependencies<'a>,
     },
     DropView {
@@ -553,6 +555,11 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
         security_invoker: bool,
+    },
+    SetViewCheckOption {
+        schema: &'a str,
+        name: &'a str,
+        check_option: u8,
     },
     RenameView {
         schema: &'a str,
@@ -1968,6 +1975,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateView { .. } => KIND_CREATE_VIEW,
         WalOp::DropView { .. } => KIND_DROP_VIEW,
         WalOp::SetViewSecurity { .. } => KIND_SET_VIEW_SECURITY,
+        WalOp::SetViewCheckOption { .. } => KIND_SET_VIEW_CHECK_OPTION,
         WalOp::RenameView { .. } => KIND_RENAME_VIEW,
         WalOp::SetRule { .. } => KIND_SET_RULE,
         WalOp::DropRule { .. } => KIND_DROP_RULE,
@@ -2260,6 +2268,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             sql,
             path,
             security_invoker: _,
+            check_option: _,
             dependencies,
         } => {
             1 + name.len()
@@ -2269,11 +2278,12 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + schema.len()
                 + 2
                 + path.len()
-                + 1
+                + 2
                 + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
         WalOp::SetViewSecurity { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 1,
+        WalOp::SetViewCheckOption { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 1,
         WalOp::RenameView {
             schema,
             name,
@@ -3807,6 +3817,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             sql,
             path,
             security_invoker,
+            check_option,
             dependencies,
         } => {
             name_bytes(buffer, name)
@@ -3815,7 +3826,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, schema)
                 && buffer.append(&(path.len() as u16).to_le_bytes())
                 && buffer.append(path.as_bytes())
-                && buffer.append(&[u8::from(*security_invoker)])
+                && buffer.append(&[u8::from(*security_invoker), *check_option])
                 && dependencies.append(buffer)
         }
         WalOp::DropView { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
@@ -3827,6 +3838,15 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
                 && buffer.append(&[u8::from(*security_invoker)])
+        }
+        WalOp::SetViewCheckOption {
+            schema,
+            name,
+            check_option,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && buffer.append(&[*check_option])
         }
         WalOp::RenameView {
             schema,
@@ -6417,6 +6437,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 _ => return None,
             };
             at += 1;
+            let check_option = match *payload.get(at)? {
+                0..=2 => *payload.get(at)?,
+                _ => return None,
+            };
+            at += 1;
             let encoded = payload.get(at..)?;
             if !validate_stored_query_dependencies(encoded) {
                 return None;
@@ -6429,6 +6454,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 sql,
                 path,
                 security_invoker,
+                check_option,
                 dependencies,
             })
         }
@@ -6450,6 +6476,20 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 name,
                 security_invoker,
+            })
+        }
+        KIND_SET_VIEW_CHECK_OPTION => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let check_option = *payload.get(at)?;
+            if check_option > 2 {
+                return None;
+            }
+            at += 1;
+            (at == payload.len()).then_some(WalOp::SetViewCheckOption {
+                schema,
+                name,
+                check_option,
             })
         }
         KIND_RENAME_VIEW => {
@@ -10878,6 +10918,7 @@ mod tests {
                 sql: "SELECT * FROM protected",
                 path: "public",
                 security_invoker: true,
+                check_option: 2,
                 dependencies: WalStoredQueryDependencies::Captured(&dependencies),
             },
         ));
@@ -10885,6 +10926,23 @@ mod tests {
             decode_op(KIND_CREATE_VIEW, payload.readable()),
             Some(WalOp::CreateView {
                 security_invoker: true,
+                check_option: 2,
+                ..
+            })
+        ));
+        payload.clear();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::SetViewCheckOption {
+                schema: "public",
+                name: "reader_view",
+                check_option: 1,
+            },
+        ));
+        assert!(matches!(
+            decode_op(KIND_SET_VIEW_CHECK_OPTION, payload.readable()),
+            Some(WalOp::SetViewCheckOption {
+                check_option: 1,
                 ..
             })
         ));

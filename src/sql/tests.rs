@@ -6229,6 +6229,137 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
 }
 
 #[test]
+fn view_check_option_is_typed_enforced_transactional_and_durable() {
+    let mut config = test_config("view-check-option");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("view-check-option-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE check_option_rows (value integer);
+         CREATE VIEW positive_rows WITH (check_option = local) AS
+           SELECT value FROM check_option_rows WHERE value > 0;
+         INSERT INTO positive_rows VALUES (1);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let unsupported = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE VIEW grouped_check_option WITH (check_option = local) AS \
+         SELECT count(*) AS value FROM check_option_rows",
+    );
+    assert!(
+        String::from_utf8_lossy(&unsupported).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&unsupported)
+    );
+    let rejected_insert = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO positive_rows VALUES (-1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected_insert).contains("44000"),
+        "{}",
+        String::from_utf8_lossy(&rejected_insert)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM check_option_rows",
+        )),
+        ["1"]
+    );
+    let rejected_update = run_with(
+        &mut engine,
+        &mut budget,
+        "UPDATE positive_rows SET value = -1",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected_update).contains("44000"),
+        "{}",
+        String::from_utf8_lossy(&rejected_update)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT value FROM check_option_rows",
+        )),
+        ["1"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT check_option FROM information_schema.views WHERE table_name = 'positive_rows'; \
+             SELECT reloptions FROM pg_class WHERE relname = 'positive_rows'",
+        )),
+        ["LOCAL", "{check_option=local}"]
+    );
+    let rolled_back = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN;
+         ALTER VIEW positive_rows SET (check_option = cascaded);
+         SELECT check_option FROM information_schema.views WHERE table_name = 'positive_rows';
+         ROLLBACK;
+         BEGIN;
+         ALTER VIEW positive_rows RESET (check_option);
+         SELECT check_option FROM information_schema.views WHERE table_name = 'positive_rows';
+         ROLLBACK;
+         SELECT check_option FROM information_schema.views WHERE table_name = 'positive_rows'",
+    );
+    assert_eq!(data_rows(&rolled_back), ["CASCADED", "NONE", "LOCAL"]);
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER VIEW positive_rows SET (check_option = cascaded)",
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT check_option FROM information_schema.views WHERE table_name = 'positive_rows'",
+        )),
+        ["CASCADED"]
+    );
+    let rejected_after_recovery = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "INSERT INTO positive_rows VALUES (-1)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected_after_recovery).contains("44000"),
+        "{}",
+        String::from_utf8_lossy(&rejected_after_recovery)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT value FROM check_option_rows",
+        )),
+        ["1"]
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn alter_view_set_schema_preserves_identity_dependencies_and_comments() {
     let config = test_config("alter-view-set-schema");
     let mut budget = Budget::new(1 << 29);
@@ -25648,6 +25779,7 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
              CREATE FUNCTION recovered_pair_echo(value recovered_pair) RETURNS recovered_pair LANGUAGE SQL AS 'SELECT $1'; \
              CREATE FUNCTION recovered_overload(value integer) RETURNS text LANGUAGE SQL AS 'SELECT ''integer'''; \
              CREATE FUNCTION recovered_overload(value recovered_count) RETURNS text LANGUAGE SQL AS 'SELECT ''domain'''; \
+             COMMENT ON FUNCTION recovered_state_echo(recovered_state) IS 'recovered routine comment'; \
              ALTER FUNCTION recovered_overload(recovered_count) RENAME TO recovered_domain_overload; \
              DROP FUNCTION recovered_overload(integer)",
         );
@@ -25667,6 +25799,8 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
                 recovered_counts_echo(ARRAY[3::recovered_count]::recovered_count[])::text, \
                 recovered_pair_echo(ROW(9, 'nine')::recovered_pair)::text, \
                 recovered_domain_overload(1::recovered_count); \
+         SELECT obj_description(oid, 'pg_proc') FROM pg_proc \
+          WHERE proname = 'recovered_state_echo'; \
          SELECT pg_typeof(recovered_state_echo('ready'::recovered_state)), \
                 pg_typeof(recovered_counts_echo(ARRAY[1::recovered_count]::recovered_count[])), \
                 pg_typeof(recovered_pair_echo(ROW(1, 'one')::recovered_pair))",
@@ -25675,6 +25809,7 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
         data_rows(&output),
         [
             "done|{3}|(9,nine)|domain",
+            "recovered routine comment",
             "recovered_state|recovered_count[]|recovered_pair",
         ],
         "{}",
@@ -25689,11 +25824,13 @@ fn catalog_defined_routine_types_survive_wal_checkpoint_and_recovery() {
         &mut checkpoint_budget,
         "SELECT recovered_state_echo('ready'::recovered_state)::text, \
                 recovered_counts_echo(ARRAY[4::recovered_count]::recovered_count[])::text, \
-                recovered_pair_echo(ROW(2, 'two')::recovered_pair)::text",
+                recovered_pair_echo(ROW(2, 'two')::recovered_pair)::text; \
+         SELECT obj_description(oid, 'pg_proc') FROM pg_proc \
+          WHERE proname = 'recovered_state_echo'",
     );
     assert_eq!(
         data_rows(&checkpoint_output),
-        ["ready|{4}|(2,two)"],
+        ["ready|{4}|(2,two)", "recovered routine comment"],
         "{}",
         String::from_utf8_lossy(&checkpoint_output)
     );
@@ -29901,6 +30038,59 @@ fn comment_roundtrip_and_removal() {
 }
 
 #[test]
+fn routine_comments_are_typed_durable_and_do_not_survive_drop() {
+    let (mut e, mut b) = test_engine_with_budget(1 << 28);
+    let created = run_with(
+        &mut e,
+        &mut b,
+        "CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE PROCEDURE cmt_proc(value integer) LANGUAGE SQL AS 'SELECT value'; \
+         CREATE FUNCTION cmt_sum_state(state bigint, value integer) RETURNS bigint LANGUAGE SQL \
+           AS 'SELECT coalesce(state, 0) + coalesce(value, 0)'; \
+         CREATE AGGREGATE cmt_sum(integer) (SFUNC = cmt_sum_state, STYPE = bigint)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&created).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "COMMENT ON FUNCTION cmt_fn(integer) IS 'the function'; \
+         COMMENT ON PROCEDURE cmt_proc(integer) IS 'the procedure'; \
+         COMMENT ON AGGREGATE cmt_sum(integer) IS 'the aggregate'; \
+         COMMENT ON ROUTINE cmt_fn(integer) IS 'the routine'",
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT proname, obj_description(oid, 'pg_proc') FROM pg_proc \
+         WHERE proname IN ('cmt_fn', 'cmt_proc', 'cmt_sum') ORDER BY proname",
+    );
+    assert_eq!(
+        data_rows(&bytes),
+        [
+            "cmt_fn|the routine",
+            "cmt_proc|the procedure",
+            "cmt_sum|the aggregate",
+        ]
+    );
+    run_with(&mut e, &mut b, "DROP FUNCTION cmt_fn(integer)");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE FUNCTION cmt_fn(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1'",
+    );
+    let bytes = run_with(
+        &mut e,
+        &mut b,
+        "SELECT obj_description(oid, 'pg_proc') FROM pg_proc WHERE proname = 'cmt_fn'",
+    );
+    assert_eq!(data_rows(&bytes), ["NULL"]);
+}
+
+#[test]
 fn comment_errors_match_postgres() {
     let (mut e, mut b) = test_engine();
     run_with(&mut e, &mut b, "CREATE TABLE ct (a int)");
@@ -29908,6 +30098,12 @@ fn comment_errors_match_postgres() {
     run_with(&mut e, &mut b, "CREATE INDEX ci ON ct (a)");
     run_with(&mut e, &mut b, "CREATE SEQUENCE cs");
     run_with(&mut e, &mut b, "CREATE TYPE mood AS ENUM ('low', 'high')");
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE FUNCTION cmt_overload(value integer) RETURNS integer LANGUAGE SQL AS 'SELECT $1'; \
+         CREATE FUNCTION cmt_overload(value text) RETURNS text LANGUAGE SQL AS 'SELECT $1'",
+    );
     // Missing relation, wrong kind, missing column, missing schema.
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON TABLE nope IS 'x'"))
@@ -29976,6 +30172,14 @@ fn comment_errors_match_postgres() {
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "COMMENT ON DOMAIN ct IS 'x'"))
             .contains("42809")
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut e,
+            &mut b,
+            "COMMENT ON FUNCTION cmt_overload IS 'x'"
+        ))
+        .contains("42725")
     );
 }
 

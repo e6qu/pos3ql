@@ -3694,6 +3694,7 @@ pub struct UpdatableView<'a> {
     pub base: QualName<'a>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub columns: &'a [&'a str],
+    pub check_option: Option<crate::storage::ViewCheckOption>,
 }
 
 /// If `name` is a view, resolve it for DML: `Ok(Some(..))` when auto-updatable,
@@ -3709,6 +3710,7 @@ pub fn resolve_view_for_dml<'a>(
         Some(crate::storage::ResolvedRelation::View(slot)) => slot,
         _ => return Ok(None),
     };
+    let check_option = storage.view(view_slot).check_option_for(txid);
     // The body re-resolves under the view creator's search path.
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let view_path =
@@ -3805,6 +3807,7 @@ pub fn resolve_view_for_dml<'a>(
         base,
         where_clause: sel.where_clause,
         columns,
+        check_option,
     }))
 }
 

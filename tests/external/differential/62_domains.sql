@@ -8,10 +8,12 @@ DROP TABLE IF EXISTS dom_t;
 DROP TABLE IF EXISTS dom_t2;
 DROP TABLE IF EXISTS dom_nested;
 DROP TABLE IF EXISTS dom_invalid;
+DROP TABLE IF EXISTS dom_not_valid_t;
 DROP DOMAIN IF EXISTS dom_small;
 DROP DOMAIN IF EXISTS dom_pos;
 DROP DOMAIN IF EXISTS dom_email;
 DROP DOMAIN IF EXISTS dom_def;
+DROP DOMAIN IF EXISTS dom_not_valid;
 DROP TYPE IF EXISTS dom_shared_name;
 
 CREATE TYPE dom_shared_name AS ENUM ('one');
@@ -141,6 +143,22 @@ SELECT x FROM dom_invalid_t ORDER BY x;
 -- ALTER DOMAIN DROP CONSTRAINT on a missing constraint is 42704.
 ALTER DOMAIN dom_pos DROP CONSTRAINT nope;
 
+-- A NOT VALID domain CHECK immediately constrains future values without
+-- scanning existing rows. Validation is a separate typed catalog transition.
+CREATE DOMAIN dom_not_valid AS int;
+CREATE TABLE dom_not_valid_t (x dom_not_valid);
+INSERT INTO dom_not_valid_t VALUES (8);
+ALTER DOMAIN dom_not_valid ADD CONSTRAINT dom_not_valid_lt5 CHECK (VALUE < 5) NOT VALID;
+SELECT conname, conenforced, convalidated
+  FROM pg_constraint WHERE contypid = 'dom_not_valid'::regtype;
+INSERT INTO dom_not_valid_t VALUES (9);
+ALTER DOMAIN dom_not_valid VALIDATE CONSTRAINT dom_not_valid_lt5;
+UPDATE dom_not_valid_t SET x = 4;
+ALTER DOMAIN dom_not_valid VALIDATE CONSTRAINT dom_not_valid_lt5;
+ALTER DOMAIN dom_not_valid RENAME CONSTRAINT dom_not_valid_lt5 TO dom_not_valid_small;
+SELECT conname, convalidated, pg_get_constraintdef(oid)
+  FROM pg_constraint WHERE contypid = 'dom_not_valid'::regtype;
+
 -- An unknown type name is 42704.
 CREATE TABLE dom_bad (a nonesuch);
 
@@ -148,8 +166,10 @@ DROP TABLE dom_t;
 DROP TABLE dom_t2;
 DROP TABLE dom_nested;
 DROP TABLE dom_invalid_t;
+DROP TABLE dom_not_valid_t;
 DROP DOMAIN dom_small;
 DROP DOMAIN dom_pos;
 DROP DOMAIN dom_email;
 DROP DOMAIN dom_def;
 DROP DOMAIN dom_invalid;
+DROP DOMAIN dom_not_valid;

@@ -4070,6 +4070,7 @@ impl<'a> Parser<'a> {
         let mut checks = [DomainCheck {
             name: None,
             expression: "",
+            validation: ConstraintValidation::EnforcedValidated,
         }; MAX_LIST];
         let mut n_checks = 0;
         loop {
@@ -4090,6 +4091,7 @@ impl<'a> Parser<'a> {
                 checks[n_checks] = DomainCheck {
                     name: cname,
                     expression: self.check_text()?,
+                    validation: ConstraintValidation::EnforcedValidated,
                 };
                 n_checks += 1;
             } else if cname.is_none() && self.eat_ident("default")? {
@@ -4137,10 +4139,21 @@ impl<'a> Parser<'a> {
                 None
             };
             self.expect_ident("check")?;
+            let expression = self.check_text()?;
+            let validation = if self.eat_ident("not")? {
+                self.expect_ident("valid")?;
+                ConstraintValidation::EnforcedNotValid
+            } else {
+                ConstraintValidation::EnforcedValidated
+            };
             AlterDomainAction::AddCheck(DomainCheck {
                 name: cname,
-                expression: self.check_text()?,
+                expression,
+                validation,
             })
+        } else if self.eat_ident("validate")? {
+            self.expect_ident("constraint")?;
+            AlterDomainAction::ValidateConstraint(self.col_ident("constraint name")?)
         } else if self.eat_ident("drop")? {
             if self.eat_ident("constraint")? {
                 let if_exists = if self.eat_ident("if")? {
@@ -4175,10 +4188,21 @@ impl<'a> Parser<'a> {
                 )
             }
         } else if self.eat_ident("rename")? {
-            self.expect_ident("to")?;
-            AlterDomainAction::Rename(self.col_ident("new domain name")?)
+            if self.eat_ident("constraint")? {
+                let from = self.col_ident("constraint name")?;
+                self.expect_ident("to")?;
+                AlterDomainAction::RenameConstraint {
+                    from,
+                    to: self.col_ident("new constraint name")?,
+                }
+            } else {
+                self.expect_ident("to")?;
+                AlterDomainAction::Rename(self.col_ident("new domain name")?)
+            }
         } else {
-            return Err(self.err_here("expected ADD, DROP, RENAME or SET after ALTER DOMAIN"));
+            return Err(
+                self.err_here("expected ADD, DROP, RENAME, SET or VALIDATE after ALTER DOMAIN")
+            );
         };
         Ok(Stmt::AlterDomain { name, action })
     }

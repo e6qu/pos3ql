@@ -31063,7 +31063,18 @@ fn build_domain_spec(
         checks[n] = crate::storage::CheckConstraint {
             name,
             expression: domain_text::<{ crate::storage::CHECK_SQL_MAX }>(c.expression)?,
-            validation: crate::storage::ConstraintValidation::EnforcedValidated,
+            validation: match c.validation {
+                crate::sql::ast::ConstraintValidation::EnforcedValidated => {
+                    crate::storage::ConstraintValidation::EnforcedValidated
+                }
+                crate::sql::ast::ConstraintValidation::EnforcedNotValid
+                | crate::sql::ast::ConstraintValidation::NotEnforced => {
+                    return Err(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "CREATE DOMAIN constraints must be valid"
+                    ));
+                }
+            },
         };
         n += 1;
     }
@@ -32025,7 +32036,10 @@ pub fn alter_domain(
             spec.default_expr = None;
         }
         A::AddCheck(check) => {
-            revalidate = true;
+            revalidate = matches!(
+                check.validation,
+                crate::sql::ast::ConstraintValidation::EnforcedValidated
+            );
             if spec.n_checks == crate::storage::MAX_DOMAIN_CHECKS {
                 return sql_fail(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -32057,7 +32071,20 @@ pub fn alter_domain(
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint {
                 name: cname,
                 expression,
-                validation: crate::storage::ConstraintValidation::EnforcedValidated,
+                validation: match check.validation {
+                    crate::sql::ast::ConstraintValidation::EnforcedValidated => {
+                        crate::storage::ConstraintValidation::EnforcedValidated
+                    }
+                    crate::sql::ast::ConstraintValidation::EnforcedNotValid => {
+                        crate::storage::ConstraintValidation::EnforcedNotValid
+                    }
+                    crate::sql::ast::ConstraintValidation::NotEnforced => {
+                        return sql_fail(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "domain constraints cannot be NOT ENFORCED"
+                        ));
+                    }
+                },
             };
             spec.n_checks += 1;
         }
@@ -32096,6 +32123,62 @@ pub fn alter_domain(
             }
             spec.n_checks -= 1;
             spec.checks[spec.n_checks] = crate::storage::CheckConstraint::EMPTY;
+        }
+        A::RenameConstraint { from, to } => {
+            revalidate = false;
+            let Some(index) = spec.checks[..spec.n_checks]
+                .iter_mut()
+                .position(|check| check.name.as_str() == *from)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "constraint \"{}\" of domain \"{}\" does not exist",
+                    from,
+                    name.name
+                ));
+            };
+            let to = match SqlName::parse(to) {
+                Ok(to) => to,
+                Err(error) => return sql_fail(error),
+            };
+            if spec.checks[..spec.n_checks]
+                .iter()
+                .any(|candidate| candidate.name == to)
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_OBJECT,
+                    "constraint \"{}\" for domain \"{}\" already exists",
+                    to.as_str(),
+                    name.name
+                ));
+            }
+            spec.checks[index].name = to;
+        }
+        A::ValidateConstraint(cname) => {
+            revalidate = false;
+            let Some(index) = spec.checks[..spec.n_checks]
+                .iter()
+                .position(|check| check.name.as_str() == *cname)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "constraint \"{}\" of domain \"{}\" does not exist",
+                    cname,
+                    name.name
+                ));
+            };
+            if spec.checks[index].validation.validated() {
+                return sql_fail(sql_err!(
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "constraint \"{}\" of domain \"{}\" is already validated",
+                    cname,
+                    name.name
+                ));
+            }
+            if let Err(error) = validate_domain_rows(storage, slot, txn.txid, arena) {
+                return sql_fail(error);
+            }
+            spec.checks[index].validation = crate::storage::ConstraintValidation::EnforcedValidated;
         }
         A::Rename(_) | A::SetSchema(_) => unreachable!(),
     }

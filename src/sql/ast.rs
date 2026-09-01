@@ -3631,6 +3631,9 @@ pub struct RoutineIdentity<'a> {
 pub struct DomainCheck<'a> {
     pub name: Option<&'a str>,
     pub expression: &'a str,
+    /// PostgreSQL validates existing rows separately from enforcement of new
+    /// values; the closed constraint state carries both facts.
+    pub validation: ConstraintValidation,
 }
 
 /// One `ALTER DOMAIN` action.
@@ -3638,6 +3641,8 @@ pub struct DomainCheck<'a> {
 pub enum AlterDomainAction<'a> {
     AddCheck(DomainCheck<'a>),
     DropConstraint { name: &'a str, if_exists: bool },
+    RenameConstraint { from: &'a str, to: &'a str },
+    ValidateConstraint(&'a str),
     SetNotNull,
     DropNotNull,
     SetDefault(&'a str),

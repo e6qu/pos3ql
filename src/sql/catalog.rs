@@ -5516,6 +5516,11 @@ pub fn constraint_def_text<'a>(
             let mut rendered = StackStr::<1024>::new();
             use core::fmt::Write as _;
             let _ = write!(rendered, "CHECK (({}))", check.expression.as_str());
+            append_constraint_attributes(
+                &mut rendered,
+                crate::storage::ConstraintTiming::NotDeferrable,
+                check.validation,
+            );
             return Ok(Some(alloc_rendered(
                 &rendered,
                 "domain constraint definition is too long",
@@ -8561,8 +8566,8 @@ fn pg_constraint<'a>(
                     Datum::Int4(0),
                     Datum::Bool(false),
                     Datum::Bool(false),
-                    Datum::Bool(true),
-                    Datum::Bool(true),
+                    Datum::Bool(check.validation.enforced()),
+                    Datum::Bool(check.validation.validated()),
                     Datum::Bool(false),
                     text(" ", arena)?,
                     text(" ", arena)?,

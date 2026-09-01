@@ -33563,8 +33563,13 @@ fn domain_identity_changes_survive_wal_and_checkpoint_recovery() {
         "CREATE SCHEMA recovered_domain; \
          CREATE DOMAIN recover_old AS integer CHECK (VALUE > 0); \
          CREATE DOMAIN recover_child AS recover_old; \
+         CREATE DOMAIN recover_not_valid AS integer; \
          CREATE TABLE recover_values (value recover_old, values recover_old[]); \
+         CREATE TABLE recover_not_valid_values (value recover_not_valid); \
          INSERT INTO recover_values VALUES (3, ARRAY[4]::recover_old[]); \
+         INSERT INTO recover_not_valid_values VALUES (8); \
+         ALTER DOMAIN recover_not_valid ADD CONSTRAINT recover_not_valid_small \
+           CHECK (VALUE < 5) NOT VALID; \
          ALTER DOMAIN recover_old RENAME TO recover_new; \
          ALTER DOMAIN recover_new SET SCHEMA recovered_domain; \
          INSERT INTO recover_values VALUES (5, ARRAY[6]::recovered_domain.recover_new[])",
@@ -33577,13 +33582,25 @@ fn domain_identity_changes_survive_wal_and_checkpoint_recovery() {
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "SELECT value FROM recover_values ORDER BY value; SELECT 7::recover_child; SELECT 8::recovered_domain.recover_new",
+        "SELECT value FROM recover_values ORDER BY value; SELECT 7::recover_child; \
+         SELECT 8::recovered_domain.recover_new; \
+         SELECT convalidated FROM pg_constraint WHERE contypid = 'recover_not_valid'::regtype",
     );
     assert_eq!(
         data_rows(&output),
-        ["3", "5", "7", "8"],
+        ["3", "5", "7", "8", "f"],
         "{}",
         String::from_utf8_lossy(&output)
+    );
+    let rejected = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "INSERT INTO recover_not_valid_values VALUES (9)",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
     );
     assert!(restarted.checkpoint().unwrap());
     drop(restarted);
@@ -33593,11 +33610,13 @@ fn domain_identity_changes_survive_wal_and_checkpoint_recovery() {
     let output = run_with(
         &mut checkpoint_restarted,
         &mut checkpoint_budget,
-        "SELECT value FROM recover_values ORDER BY value; SELECT 9::recover_child; SELECT 10::recovered_domain.recover_new",
+        "SELECT value FROM recover_values ORDER BY value; SELECT 9::recover_child; \
+         SELECT 10::recovered_domain.recover_new; \
+         SELECT convalidated FROM pg_constraint WHERE contypid = 'recover_not_valid'::regtype",
     );
     assert_eq!(
         data_rows(&output),
-        ["3", "5", "9", "10"],
+        ["3", "5", "9", "10", "f"],
         "{}",
         String::from_utf8_lossy(&output)
     );

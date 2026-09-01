@@ -40,10 +40,11 @@ fi
 # fixed five-minute ceiling.
 spill_matrix=.github/workflows/coverage.yml
 for spill_entry in \
-    '- { name: a, corpus_shard: "0-of-4", auxiliary: all }' \
+    '- { name: a, corpus_shard: "0-of-4", auxiliary: none }' \
     '- { name: b, corpus_shard: "1-of-4", auxiliary: none }' \
     '- { name: c, corpus_shard: "2-of-4", auxiliary: none }' \
-    '- { name: d, corpus_shard: "3-of-4", auxiliary: none }'; do
+    '- { name: d, corpus_shard: "3-of-4", auxiliary: none }' \
+    '- { name: auxiliary, corpus_shard: "none", auxiliary: all }'; do
     if ! grep -Fq -- "$spill_entry" "$spill_matrix"; then
         printf 'CI timeout guard: missing forced-spill shard definition %s\n' "$spill_entry" >&2
         failed=1

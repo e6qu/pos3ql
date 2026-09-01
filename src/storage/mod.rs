@@ -20611,9 +20611,7 @@ impl Storage {
         Ok(n)
     }
 
-    /// The partition-only spelling retained for callers that route writes by
-    /// partition bounds. Read paths use `relation_leaf_slots` so ordinary
-    /// inheritance cannot be silently skipped.
+    /// Routes writes by partition bounds; scans use `relation_leaf_slots`.
     pub fn partition_leaf_slots(
         &self,
         root: usize,

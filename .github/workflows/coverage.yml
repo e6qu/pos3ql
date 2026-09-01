@@ -154,14 +154,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Auxiliary probes use the same expensive startup as a corpus shard.
-          # Run them as their own bounded worker so corpus growth cannot leave
-          # a marginal timeout that only appears under normal runner variance.
           - { name: a, corpus_shard: "0-of-4", auxiliary: none }
           - { name: b, corpus_shard: "1-of-4", auxiliary: none }
           - { name: c, corpus_shard: "2-of-4", auxiliary: none }
           - { name: d, corpus_shard: "3-of-4", auxiliary: none }
-          - { name: auxiliary, corpus_shard: "none", auxiliary: all }
+          - { name: exact, corpus_shard: "none", auxiliary: exact }
+          - { name: copy, corpus_shard: "none", auxiliary: copy }
+          - { name: types, corpus_shard: "none", auxiliary: types }
+          - { name: slt, corpus_shard: "none", auxiliary: slt }
     services:
       postgres:
         image: postgres:18

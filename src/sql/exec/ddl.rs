@@ -671,6 +671,17 @@ pub(super) fn attach_constraints(
                     def.columns[indices[0] as usize].primary = true;
                     def.columns[indices[0] as usize].unique = true;
                 } else {
+                    if !merge_equivalent
+                        && let Some(name) = name
+                        && constraint_name_taken(def, name)
+                    {
+                        return Err(sql_err!(
+                            sqlstate::DUPLICATE_OBJECT,
+                            "constraint \"{}\" for relation \"{}\" already exists",
+                            name,
+                            def.name.as_str()
+                        ));
+                    }
                     add_unique_key(def, *name, "pkey", &indices, n, true, *timing)?;
                 }
             }
@@ -694,6 +705,17 @@ pub(super) fn attach_constraints(
                 if n == 1 && name.is_none() && !stored_timing.is_deferrable() {
                     def.columns[indices[0] as usize].unique = true;
                 } else {
+                    if !merge_equivalent
+                        && let Some(name) = name
+                        && constraint_name_taken(def, name)
+                    {
+                        return Err(sql_err!(
+                            sqlstate::DUPLICATE_OBJECT,
+                            "constraint \"{}\" for relation \"{}\" already exists",
+                            name,
+                            def.name.as_str()
+                        ));
+                    }
                     add_unique_key(def, *name, "key", &indices, n, false, *timing)?;
                 }
             }
@@ -722,6 +744,14 @@ pub(super) fn attach_constraints(
                     Some(n) => SqlName::parse(n)?,
                     None => auto_check_name(def, referenced_cols)?,
                 };
+                if constraint_name_taken(def, constraint_name.as_str()) {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "constraint \"{}\" for relation \"{}\" already exists",
+                        constraint_name.as_str(),
+                        def.name.as_str()
+                    ));
+                }
                 let mut c = CheckConstraint {
                     name: constraint_name,
                     expression: crate::util::StackStr::new(),
@@ -747,6 +777,17 @@ pub(super) fn attach_constraints(
                 timing,
                 validation,
             } => {
+                if !merge_equivalent
+                    && let Some(name) = name
+                    && constraint_name_taken(def, name)
+                {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "constraint \"{}\" for relation \"{}\" already exists",
+                        name,
+                        def.name.as_str()
+                    ));
+                }
                 attach_fkey(
                     storage,
                     def,
@@ -798,6 +839,14 @@ pub(super) fn attach_constraints(
                     Some(name) => SqlName::parse(name)?,
                     None => auto_key_name(def, &indices[..count], "excl", true)?,
                 };
+                if !merge_equivalent && constraint_name_taken(def, exclusion.name.as_str()) {
+                    return Err(sql_err!(
+                        sqlstate::DUPLICATE_OBJECT,
+                        "constraint \"{}\" for relation \"{}\" already exists",
+                        exclusion.name.as_str(),
+                        def.name.as_str()
+                    ));
+                }
                 exclusion.columns[..count].copy_from_slice(&indices[..count]);
                 for (index, operator) in operators.iter().copied().enumerate() {
                     exclusion.operators[index] = match operator {
@@ -866,7 +915,7 @@ pub(super) fn auto_key_name(
 /// predicate references exactly one column, `<table>_check` when it references
 /// zero or several — with the smallest numeric suffix (`_check1`, `_check2`, …)
 /// that avoids colliding with a constraint the table already carries.
-fn auto_check_name(def: &TableDef, referenced_cols: u64) -> Result<SqlName, SqlError> {
+pub(super) fn auto_check_name(def: &TableDef, referenced_cols: u64) -> Result<SqlName, SqlError> {
     use core::fmt::Write as _;
     let mut base = crate::util::StackStr::<64>::new();
     let _ = write!(base, "{}", def.name.as_str());
@@ -933,6 +982,10 @@ pub(super) fn constraint_name_taken(def: &TableDef, name: &str) -> bool {
         || def.exclusions[..def.n_exclusions]
             .iter()
             .any(|exclusion| exclusion.name.as_str() == name)
+        || def
+            .partition
+            .detached_bound
+            .is_some_and(|constraint| constraint.name.as_str() == name)
     {
         return true;
     }

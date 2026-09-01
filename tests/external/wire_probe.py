@@ -3777,6 +3777,14 @@ def test_table_lifecycle_over_raw_wire():
         "ALTER TABLE wire_lifecycle_parent DETACH PARTITION wire_lifecycle_child CONCURRENTLY; "
         "SELECT count(*) FROM wire_lifecycle_parent",
     )
+    detached_constraint = simple_query(
+        s,
+        "SELECT conname, contype, convalidated FROM pg_constraint "
+        "WHERE conrelid = 'wire_lifecycle_child'::regclass",
+    )
+    detached_constraint_row = next(
+        (payload for kind, payload in detached_constraint if kind == b"D"), None
+    )
     inherited = simple_query(
         s,
         "CREATE TABLE wire_lifecycle_inherited (extra text) INHERITS (wire_lifecycle_plain); "
@@ -3796,6 +3804,10 @@ def test_table_lifecycle_over_raw_wire():
         and not any(kind == b"E" for kind, _ in typed)
         and not any(kind == b"E" for kind, _ in detach)
         and first_text_row(detach) == "0"
+        and not any(kind == b"E" for kind, _ in detached_constraint)
+        and detached_constraint_row is not None
+        and text_row_fields(detached_constraint_row)
+        == ["wire_lifecycle_child_id_check", "c", "t"]
         and not any(kind == b"E" for kind, _ in inherited)
         and first_text_row(inherited_row) == "2"
         and first_text_row(inherited_catalog) == "1",
@@ -3803,6 +3815,7 @@ def test_table_lifecycle_over_raw_wire():
         + storage
         + typed
         + detach
+        + detached_constraint
         + inherited
         + inherited_row
         + inherited_catalog,

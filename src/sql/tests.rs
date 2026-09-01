@@ -4901,11 +4901,7 @@ fn extended_statistics_cover_partition_inheritance_and_owned_object_lifecycle() 
          SELECT count(*) FROM pg_statistic_ext \
            WHERE stxname LIKE 'statistics_partition_%';",
     );
-    assert!(
-        !String::from_utf8_lossy(&output).contains("ERROR"),
-        "{}",
-        String::from_utf8_lossy(&output)
-    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
     assert_eq!(
         data_rows(&output),
         [
@@ -13738,12 +13734,13 @@ fn transactional_alter_table_savepoint_and_rename_visibility() {
     );
     run_txn(&mut engine, &mut budget, &mut owner, "COMMIT");
     run_txn(&mut engine, &mut budget, &mut owner, "BEGIN");
-    run_txn(
+    let renamed = run_txn(
         &mut engine,
         &mut budget,
         &mut owner,
         "ALTER TABLE original RENAME TO renamed",
     );
+    assert!(renamed.contains("ALTER TABLE"), "{renamed}");
     assert_eq!(
         data_rows(&run_with_txn_bytes(
             &mut engine,
@@ -38316,7 +38313,11 @@ fn database_configuration_and_tablespace_lifecycle_is_typed_and_transactional() 
         "{}",
         String::from_utf8_lossy(&output)
     );
-    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
     let output = run_with(
         &mut engine,
         &mut budget,
@@ -38616,6 +38617,61 @@ fn concurrent_partition_detach_routes_through_durable_attachment_state() {
         )),
         ["1"]
     );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE detach_child_rows \
+           ADD CONSTRAINT detach_child_rows_id_check CHECK (id < 20)",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("42710"));
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT conname, contype, pg_get_constraintdef(oid, true) \
+           FROM pg_constraint \
+          WHERE conrelid = 'detach_child_rows'::regclass \
+            AND conname = 'detach_child_rows_id_check'; \
+         COMMENT ON CONSTRAINT detach_child_rows_id_check ON detach_child_rows \
+           IS 'generated detach bound'; \
+         ALTER TABLE detach_child_rows \
+           RENAME CONSTRAINT detach_child_rows_id_check TO detached_rows_bound; \
+         SELECT obj_description(oid, 'pg_constraint') \
+           FROM pg_constraint \
+          WHERE conrelid = 'detach_child_rows'::regclass \
+            AND conname = 'detached_rows_bound'; \
+         ALTER TABLE detach_child_rows DROP CONSTRAINT detached_rows_bound; \
+         INSERT INTO detach_child_rows VALUES (10); \
+         SELECT count(*) FROM detach_child_rows",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    let rows = data_rows(&output);
+    assert_eq!(
+        rows[0].split('|').next(),
+        Some("detach_child_rows_id_check")
+    );
+    assert_eq!(rows[1], "generated detach bound");
+    assert_eq!(rows[2], "2");
+    let definition = rows[0]
+        .splitn(3, '|')
+        .nth(2)
+        .expect("generated constraint definition has a third column");
+    let restore = run_with(
+        &mut engine,
+        &mut budget,
+        &format!(
+            "CREATE TABLE detach_dump_restore_rows (id integer); \
+             ALTER TABLE detach_dump_restore_rows \
+               ADD CONSTRAINT restored_detach_bound {definition}; \
+             INSERT INTO detach_dump_restore_rows VALUES (10)"
+        ),
+    );
+    assert!(
+        String::from_utf8_lossy(&restore).contains("23514"),
+        "{}",
+        String::from_utf8_lossy(&restore)
+    );
 
     let output = run_with(
         &mut engine,
@@ -38636,6 +38692,97 @@ fn concurrent_partition_detach_routes_through_durable_attachment_state() {
          ALTER TABLE detach_txn_parent DETACH PARTITION detach_txn_child CONCURRENTLY",
     );
     assert!(String::from_utf8_lossy(&output).contains("25001"));
+}
+
+#[test]
+fn concurrent_partition_detach_uses_postgresql_generated_check_rules() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE list_detach_parent (id integer) PARTITION BY LIST (id); \
+         CREATE TABLE list_detach_child PARTITION OF list_detach_parent FOR VALUES IN (1, 2); \
+         ALTER TABLE list_detach_parent DETACH PARTITION list_detach_child CONCURRENTLY; \
+         SELECT pg_get_constraintdef(oid, true) FROM pg_constraint \
+          WHERE conrelid = 'list_detach_child'::regclass",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert!(data_rows(&output)[0].contains("CHECK"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO list_detach_child VALUES (3)",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("23514"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE list_detach_parent ATTACH PARTITION list_detach_child FOR VALUES IN (1, 2); \
+         SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'list_detach_child'::regclass AND contype = 'c'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["0"]);
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE null_list_detach_parent (id integer) PARTITION BY LIST (id); \
+         CREATE TABLE null_list_detach_child PARTITION OF null_list_detach_parent \
+           FOR VALUES IN (NULL, 1); \
+         ALTER TABLE null_list_detach_parent \
+           DETACH PARTITION null_list_detach_child CONCURRENTLY; \
+         SELECT pg_get_constraintdef(oid, true) FROM pg_constraint \
+          WHERE conrelid = 'null_list_detach_child'::regclass; \
+         INSERT INTO null_list_detach_child VALUES (NULL), (1)",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert!(data_rows(&output)[0].contains("id IS NULL OR id IN (1)"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO null_list_detach_child VALUES (2)",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("23514"));
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE hash_detach_parent (id integer) PARTITION BY HASH (id); \
+         CREATE TABLE hash_detach_child PARTITION OF hash_detach_parent \
+           FOR VALUES WITH (modulus 2, remainder 0); \
+         ALTER TABLE hash_detach_parent DETACH PARTITION hash_detach_child CONCURRENTLY; \
+         SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'hash_detach_child'::regclass AND contype = 'c'; \
+         INSERT INTO hash_detach_child VALUES (1); \
+         SELECT count(*) FROM hash_detach_child",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["0", "1"]);
+
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE range_detach_parent (a integer, b integer) PARTITION BY RANGE (a, b); \
+         CREATE TABLE range_detach_child PARTITION OF range_detach_parent \
+           FOR VALUES FROM (0, 0) TO (10, 10); \
+         ALTER TABLE range_detach_parent DETACH PARTITION range_detach_child CONCURRENTLY; \
+         SELECT pg_get_constraintdef(oid, true) FROM pg_constraint \
+          WHERE conrelid = 'range_detach_child'::regclass",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert!(data_rows(&output)[0].contains("a IS NOT NULL"), "{text}");
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO range_detach_child VALUES (10, 10)",
+    );
+    assert!(String::from_utf8_lossy(&output).contains("23514"));
 }
 
 #[test]
@@ -38694,6 +38841,14 @@ fn concurrent_partition_detach_commits_pending_phase_before_waiting() {
             ..
         })
     ));
+    assert!(
+        engine
+            .storage
+            .table_def(child, 0)
+            .partition
+            .detached_bound
+            .is_some_and(|constraint| constraint.name.as_str() == "pending_detach_child_id_check")
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
@@ -39179,6 +39334,17 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
         )),
         ["0", "1", "f"]
     );
+    let detached_constraint = data_rows(&run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT conname, pg_get_constraintdef(oid, true) FROM pg_constraint \
+          WHERE conrelid = 'table_definition_detach_child'::regclass",
+    ));
+    assert_eq!(
+        detached_constraint[0].split('|').next(),
+        Some("table_definition_detach_child_id_check")
+    );
+    assert!(detached_constraint[0].contains("CHECK (id IS NOT NULL"));
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,

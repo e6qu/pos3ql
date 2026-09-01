@@ -27,7 +27,7 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v9";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v10";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -10997,7 +10997,7 @@ fn write_partition_manifest(
 ) -> Result<(), SqlError> {
     let mut line = StackStr::<4096>::new();
     use core::fmt::Write;
-    let _ = write!(line, "part 4");
+    let _ = write!(line, "part 5");
     if let Some(scheme) = partition.scheme {
         let strategy = match scheme.strategy {
             PartitionStrategy::Range => "r",
@@ -11055,7 +11055,16 @@ fn write_partition_manifest(
             PartitionStrategy::List => "l",
             PartitionStrategy::Hash => "h",
         };
-        let _ = write!(line, " d {strategy} {}", detached.scheme.n_keys);
+        let mut name_hex = StackStr::<130>::new();
+        for byte in detached.name.as_str().as_bytes() {
+            let _ = write!(name_hex, "{byte:02x}");
+        }
+        let _ = write!(
+            line,
+            " d {} {strategy} {}",
+            name_hex.as_str(),
+            detached.scheme.n_keys
+        );
         for key in &detached.scheme.keys[..usize::from(detached.scheme.n_keys)] {
             let _ = write!(line, " {key}");
         }
@@ -11125,7 +11134,7 @@ fn parse_partition_manifest(
     words: &mut core::str::Split<'_, char>,
 ) -> Result<PartitionDef, CheckpointSetupError> {
     let corrupt = || CheckpointSetupError::Corrupt("bad partition metadata");
-    if words.next().ok_or_else(corrupt)? != "4" {
+    if words.next().ok_or_else(corrupt)? != "5" {
         return Err(corrupt());
     }
     let scheme = match words.next().ok_or_else(corrupt)? {
@@ -11213,6 +11222,7 @@ fn parse_partition_manifest(
     let detached_bound = match words.next().ok_or_else(corrupt)? {
         "n" => None,
         "d" => {
+            let name = sql_name(&decode_hex_name(words.next().ok_or_else(corrupt)?)?)?;
             let strategy = match words.next().ok_or_else(corrupt)? {
                 "r" => PartitionStrategy::Range,
                 "l" => PartitionStrategy::List,
@@ -11228,6 +11238,7 @@ fn parse_partition_manifest(
                 *key = parse_field(words.next(), "detached partition key")?;
             }
             Some(crate::storage::DetachedPartitionBound {
+                name,
                 scheme: crate::storage::PartitionScheme {
                     strategy,
                     keys,

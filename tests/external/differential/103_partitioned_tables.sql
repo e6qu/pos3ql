@@ -116,3 +116,32 @@ SELECT relation.relname, constraint_catalog.conname
  WHERE relation.relname LIKE 'partition_provenance_%'
    AND constraint_catalog.contype IN ('c', 'u')
  ORDER BY relation.relname, constraint_catalog.conname;
+
+CREATE TABLE partition_detach_range (id integer) PARTITION BY RANGE (id);
+CREATE TABLE partition_detach_range_child PARTITION OF partition_detach_range
+  FOR VALUES FROM (0) TO (10);
+ALTER TABLE partition_detach_range DETACH PARTITION partition_detach_range_child CONCURRENTLY;
+SELECT conname, contype, convalidated
+  FROM pg_constraint
+ WHERE conrelid = 'partition_detach_range_child'::regclass;
+CREATE TABLE partition_detach_list (id integer) PARTITION BY LIST (id);
+CREATE TABLE partition_detach_list_child PARTITION OF partition_detach_list FOR VALUES IN (1, 2);
+ALTER TABLE partition_detach_list DETACH PARTITION partition_detach_list_child CONCURRENTLY;
+SELECT conname, contype, convalidated
+  FROM pg_constraint
+ WHERE conrelid = 'partition_detach_list_child'::regclass;
+CREATE TABLE partition_detach_list_null (id integer) PARTITION BY LIST (id);
+CREATE TABLE partition_detach_list_null_child PARTITION OF partition_detach_list_null
+  FOR VALUES IN (NULL, 1);
+INSERT INTO partition_detach_list_null VALUES (NULL), (1);
+ALTER TABLE partition_detach_list_null
+  DETACH PARTITION partition_detach_list_null_child CONCURRENTLY;
+INSERT INTO partition_detach_list_null_child VALUES (NULL);
+SELECT count(*) FROM partition_detach_list_null_child;
+CREATE TABLE partition_detach_hash (id integer) PARTITION BY HASH (id);
+CREATE TABLE partition_detach_hash_child PARTITION OF partition_detach_hash
+  FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+ALTER TABLE partition_detach_hash DETACH PARTITION partition_detach_hash_child CONCURRENTLY;
+SELECT count(*)
+  FROM pg_constraint
+ WHERE conrelid = 'partition_detach_hash_child'::regclass AND contype = 'c';

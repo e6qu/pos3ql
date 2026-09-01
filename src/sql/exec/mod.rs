@@ -50513,6 +50513,14 @@ fn validate_all_rows(
 /// the generated names of a single-column primary key (`<table>_pkey`) or
 /// unique column (`<table>_<column>_key`). Returns whether one was found.
 fn drop_named_constraint(def: &mut TableDef, name: &str) -> bool {
+    if def
+        .partition
+        .detached_bound
+        .is_some_and(|constraint| constraint.name.as_str() == name)
+    {
+        def.partition.detached_bound = None;
+        return true;
+    }
     for i in 0..def.n_checks {
         if def.checks[i].name.as_str() == name {
             for j in i..def.n_checks - 1 {
@@ -50911,6 +50919,12 @@ fn drop_dependent_foreign_keys(
 }
 
 fn rename_stored_constraint(def: &mut TableDef, from: &str, to: SqlName) -> bool {
+    if let Some(constraint) = def.partition.detached_bound.as_mut()
+        && constraint.name.as_str() == from
+    {
+        constraint.name = to;
+        return true;
+    }
     if let Some(constraint) = def.checks[..def.n_checks]
         .iter_mut()
         .find(|constraint| constraint.name.as_str() == from)
@@ -51038,6 +51052,20 @@ fn drop_column_constraints(
         write += 1;
     }
     definition.n_fkeys = write;
+
+    if let Some(mut detached) = definition.partition.detached_bound {
+        if detached.scheme.keys[..usize::from(detached.scheme.n_keys)].contains(&(column as u16)) {
+            remember(detached.name)?;
+            definition.partition.detached_bound = None;
+        } else {
+            for key in &mut detached.scheme.keys[..usize::from(detached.scheme.n_keys)] {
+                if usize::from(*key) > column {
+                    *key -= 1;
+                }
+            }
+            definition.partition.detached_bound = Some(detached);
+        }
+    }
     Ok(removed_count)
 }
 
@@ -52099,13 +52127,29 @@ fn alter_partition_attachment(
             ));
         }
         let detach_mode = detach_mode.expect("detach has a mode");
+        let generated_constraint_name = match scheme.strategy {
+            crate::storage::PartitionStrategy::Hash => None,
+            crate::storage::PartitionStrategy::Range | crate::storage::PartitionStrategy::List => {
+                match child_def.partition.detached_bound {
+                    Some(constraint) => Some(constraint.name),
+                    None => match detached_partition_constraint_name(&child_def, scheme) {
+                        Ok(name) => Some(name),
+                        Err(error) => return sql_fail(error),
+                    },
+                }
+            }
+        };
         let finish_detach = |definition: &mut crate::storage::TableDef, retain_bound: bool| {
             definition.partition.attachment = None;
-            definition.partition.detached_bound =
-                retain_bound.then_some(crate::storage::DetachedPartitionBound {
-                    scheme,
-                    bound: attachment.bound,
-                });
+            definition.partition.detached_bound = retain_bound
+                .then(|| {
+                    generated_constraint_name.map(|name| crate::storage::DetachedPartitionBound {
+                        name,
+                        scheme,
+                        bound: attachment.bound,
+                    })
+                })
+                .flatten();
             for column in definition.columns.iter_mut().take(definition.n_columns) {
                 column.not_null = column.not_null.localize();
             }
@@ -52179,6 +52223,13 @@ fn alter_partition_attachment(
                     new_def.partition.attachment = Some(crate::storage::PartitionAttachment {
                         state: crate::storage::PartitionAttachmentState::DetachPending,
                         ..attachment
+                    });
+                    new_def.partition.detached_bound = generated_constraint_name.map(|name| {
+                        crate::storage::DetachedPartitionBound {
+                            name,
+                            scheme,
+                            bound: attachment.bound,
+                        }
                     });
                     txn.begin_concurrent_partition_detach();
                 } else {
@@ -52352,6 +52403,17 @@ fn alter_partition_attachment(
         responder.command_complete("ALTER TABLE")?;
     }
     sql_ok()
+}
+
+fn detached_partition_constraint_name(
+    child: &TableDef,
+    scheme: crate::storage::PartitionScheme,
+) -> Result<SqlName, SqlError> {
+    let mut referenced = 0u64;
+    for key in &scheme.keys[..usize::from(scheme.n_keys)] {
+        referenced |= 1u64 << key;
+    }
+    ddl::auto_check_name(child, referenced)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -53725,6 +53787,10 @@ fn alter_table_inner(
                 } else if new_def.checks[..new_def.n_checks]
                     .iter()
                     .any(|check| check.name.as_str() == *name)
+                    || new_def
+                        .partition
+                        .detached_bound
+                        .is_some_and(|constraint| constraint.name.as_str() == *name)
                     || new_def.exclusions[..new_def.n_exclusions]
                         .iter()
                         .any(|exclusion| exclusion.name.as_str() == *name)
@@ -53746,7 +53812,17 @@ fn alter_table_inner(
                 }
             }
             AlterAction::ValidateConstraint(name) => {
-                if let Some(index) = new_def.checks[..new_def.n_checks]
+                if new_def
+                    .partition
+                    .detached_bound
+                    .is_some_and(|constraint| constraint.name.as_str() == *name)
+                {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "constraint \"{}\" is already validated",
+                        name
+                    ));
+                } else if let Some(index) = new_def.checks[..new_def.n_checks]
                     .iter()
                     .position(|check| check.name.as_str() == *name)
                 {
@@ -53868,6 +53944,10 @@ fn alter_table_inner(
                 let taken = new_def.checks[..new_def.n_checks]
                     .iter()
                     .any(|c| c.name.as_str() == *to)
+                    || new_def
+                        .partition
+                        .detached_bound
+                        .is_some_and(|constraint| constraint.name.as_str() == *to)
                     || new_def.uniques[..new_def.n_uniques]
                         .iter()
                         .any(|k| k.name.as_str() == *to)

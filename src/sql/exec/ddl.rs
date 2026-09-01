@@ -397,6 +397,7 @@ pub(super) fn resolve_default(
             srf_index: None,
             project_sets: None,
             sequences: None,
+            merge_action: None,
         };
         let v = eval_full(
             expression,

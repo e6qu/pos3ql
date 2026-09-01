@@ -2000,11 +2000,14 @@ impl<'a> Parser<'a> {
                 crate::sql::ast::CteMaterialization::Default
             };
             self.expect_op("(")?;
-            // A data-modifying CTE body is an INSERT/UPDATE/DELETE (run once,
+            // A data-modifying CTE body is an INSERT/UPDATE/DELETE/MERGE (run once,
             // its RETURNING becomes the relation); anything else is a query.
             let (boxed, dml) = if matches!(
                 self.peeked,
-                Tok::Ident("insert") | Tok::Ident("update") | Tok::Ident("delete")
+                Tok::Ident("insert")
+                    | Tok::Ident("update")
+                    | Tok::Ident("delete")
+                    | Tok::Ident("merge")
             ) {
                 let stmt = self.statement()?;
                 let boxed_stmt = self
@@ -5928,9 +5931,9 @@ impl<'a> Parser<'a> {
     }
 
     /// `MERGE INTO target [AS alias] USING source [AS alias] ON cond
-    /// { WHEN [NOT] MATCHED [AND cond] THEN action }...`.
+    /// { WHEN MATCHED | WHEN NOT MATCHED [BY SOURCE | BY TARGET] ... }...`.
     fn merge(&mut self) -> Result<Stmt<'a>, ParseError> {
-        use crate::sql::ast::{Merge, MergeWhen};
+        use crate::sql::ast::{Merge, MergeMatchKind, MergeTargetAction, MergeWhen};
         self.expect_ident("merge")?;
         self.expect_ident("into")?;
         let target = self.qual_name("target table")?;
@@ -5944,23 +5947,32 @@ impl<'a> Parser<'a> {
         let source = self.table_ref()?;
         self.expect_ident("on")?;
         let on = self.expression(0)?;
-        let dummy = MergeWhen {
-            matched: true,
+        let dummy = MergeWhen::Matched {
             cond: None,
-            action: crate::sql::ast::MergeAction::Delete,
+            action: MergeTargetAction::Delete,
         };
         let mut whens = [dummy; MAX_LIST];
+        let mut unconditional = [false; 3];
         let mut n = 0;
         while self.eat_ident("when")? {
             if n == MAX_LIST {
                 return Err(self.limit("WHEN clauses", MAX_LIST));
             }
-            let matched = if self.eat_ident("not")? {
+            let kind = if self.eat_ident("not")? {
                 self.expect_ident("matched")?;
-                false
+                if self.eat_ident("by")? {
+                    if self.eat_ident("source")? {
+                        MergeMatchKind::NotMatchedBySource
+                    } else {
+                        self.expect_ident("target")?;
+                        MergeMatchKind::NotMatchedByTarget
+                    }
+                } else {
+                    MergeMatchKind::NotMatchedByTarget
+                }
             } else {
                 self.expect_ident("matched")?;
-                true
+                MergeMatchKind::Matched
             };
             let cond = if self.eat_ident("and")? {
                 Some(self.expression(0)?)
@@ -5968,110 +5980,137 @@ impl<'a> Parser<'a> {
                 None
             };
             self.expect_ident("then")?;
-            let action = self.merge_action(matched)?;
-            whens[n] = MergeWhen {
-                matched,
-                cond,
-                action,
+            let when = match kind {
+                MergeMatchKind::Matched => MergeWhen::Matched {
+                    cond,
+                    action: self.merge_target_action()?,
+                },
+                MergeMatchKind::NotMatchedBySource => MergeWhen::NotMatchedBySource {
+                    cond,
+                    action: self.merge_target_action()?,
+                },
+                MergeMatchKind::NotMatchedByTarget => MergeWhen::NotMatchedByTarget {
+                    cond,
+                    action: self.merge_source_action()?,
+                },
             };
+            if unconditional[kind.index()] {
+                return Err(self.err_here(
+                    "unreachable WHEN clause specified after unconditional WHEN clause",
+                ));
+            }
+            if when.condition().is_none() {
+                unconditional[kind.index()] = true;
+            }
+            whens[n] = when;
             n += 1;
         }
         if n == 0 {
             return Err(self.err_here("MERGE requires at least one WHEN clause"));
         }
+        let returning = self.returning()?;
         Ok(Stmt::Merge(Merge {
             target,
             target_alias,
             source,
             on,
             whens: self.arena_slice(&whens[..n])?,
+            returning,
         }))
     }
 
-    /// One MERGE action after `THEN`. `matched` selects the allowed set.
-    fn merge_action(
+    /// An action for a candidate that has a target row.
+    fn merge_target_action(
         &mut self,
-        matched: bool,
-    ) -> Result<crate::sql::ast::MergeAction<'a>, ParseError> {
-        use crate::sql::ast::MergeAction;
+    ) -> Result<crate::sql::ast::MergeTargetAction<'a>, ParseError> {
+        use crate::sql::ast::MergeTargetAction;
         if self.eat_ident("do")? {
             self.expect_ident("nothing")?;
-            return Ok(MergeAction::DoNothing);
+            return Ok(MergeTargetAction::DoNothing);
         }
-        if matched {
-            if self.eat_ident("update")? {
-                self.expect_ident("set")?;
-                let dummy: (&'a str, &'a Expr<'a>) = ("", &Expr::Null);
-                let mut assignments = [dummy; MAX_LIST];
-                let mut n = 0;
-                loop {
-                    if n == MAX_LIST {
-                        return Err(self.limit("SET list", MAX_LIST));
-                    }
-                    let col = self.col_ident("column name")?;
-                    self.expect_op("=")?;
-                    assignments[n] = (col, self.expression(0)?);
-                    n += 1;
-                    if !self.eat_op(",")? {
-                        break;
-                    }
-                }
-                Ok(MergeAction::Update(self.arena_slice(&assignments[..n])?))
-            } else {
-                self.expect_ident("delete")?;
-                Ok(MergeAction::Delete)
-            }
-        } else {
-            self.expect_ident("insert")?;
-            // INSERT [(cols)] { VALUES (exprs) | DEFAULT VALUES }.
-            let mut columns: &'a [&'a str] = &[];
-            if self.peeked == Tok::Op("(") {
-                self.advance()?;
-                let mut names = [""; MAX_LIST];
-                let mut c = 0;
-                loop {
-                    if c == MAX_LIST {
-                        return Err(self.limit("column list", MAX_LIST));
-                    }
-                    names[c] = self.col_ident("column name")?;
-                    c += 1;
-                    if !self.eat_op(",")? {
-                        break;
-                    }
-                }
-                self.expect_op(")")?;
-                columns = self.arena_slice(&names[..c])?;
-            }
-            if self.eat_ident("default")? {
-                self.expect_ident("values")?;
-                return Ok(MergeAction::Insert {
-                    columns,
-                    values: &[],
-                    default_values: true,
-                });
-            }
-            self.expect_ident("values")?;
-            self.expect_op("(")?;
-            let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
-            let mut vals = [null_expr; MAX_LIST];
-            let mut v = 0;
+        if self.eat_ident("update")? {
+            self.expect_ident("set")?;
+            let dummy: (&'a str, &'a Expr<'a>) = ("", &Expr::Null);
+            let mut assignments = [dummy; MAX_LIST];
+            let mut n = 0;
             loop {
-                if v == MAX_LIST {
-                    return Err(self.limit("VALUES list", MAX_LIST));
+                if n == MAX_LIST {
+                    return Err(self.limit("SET list", MAX_LIST));
                 }
-                vals[v] = self.expression(0)?;
-                v += 1;
+                let col = self.col_ident("column name")?;
+                self.expect_op("=")?;
+                assignments[n] = (col, self.expression(0)?);
+                n += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            Ok(MergeTargetAction::Update(
+                self.arena_slice(&assignments[..n])?,
+            ))
+        } else {
+            self.expect_ident("delete")?;
+            Ok(MergeTargetAction::Delete)
+        }
+    }
+
+    /// An action for a candidate that has a source row but no target row.
+    fn merge_source_action(
+        &mut self,
+    ) -> Result<crate::sql::ast::MergeSourceAction<'a>, ParseError> {
+        use crate::sql::ast::MergeSourceAction;
+        if self.eat_ident("do")? {
+            self.expect_ident("nothing")?;
+            return Ok(MergeSourceAction::DoNothing);
+        }
+        self.expect_ident("insert")?;
+        let mut columns: &'a [&'a str] = &[];
+        if self.peeked == Tok::Op("(") {
+            self.advance()?;
+            let mut names = [""; MAX_LIST];
+            let mut c = 0;
+            loop {
+                if c == MAX_LIST {
+                    return Err(self.limit("column list", MAX_LIST));
+                }
+                names[c] = self.col_ident("column name")?;
+                c += 1;
                 if !self.eat_op(",")? {
                     break;
                 }
             }
             self.expect_op(")")?;
-            Ok(MergeAction::Insert {
-                columns,
-                values: self.arena_slice(&vals[..v])?,
-                default_values: false,
-            })
+            columns = self.arena_slice(&names[..c])?;
         }
+        if self.eat_ident("default")? {
+            self.expect_ident("values")?;
+            return Ok(MergeSourceAction::Insert {
+                columns,
+                values: &[],
+                default_values: true,
+            });
+        }
+        self.expect_ident("values")?;
+        self.expect_op("(")?;
+        let null_expr: &'a Expr<'a> = self.arena_expr(Expr::Null)?;
+        let mut vals = [null_expr; MAX_LIST];
+        let mut v = 0;
+        loop {
+            if v == MAX_LIST {
+                return Err(self.limit("VALUES list", MAX_LIST));
+            }
+            vals[v] = self.expression(0)?;
+            v += 1;
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(MergeSourceAction::Insert {
+            columns,
+            values: self.arena_slice(&vals[..v])?,
+            default_values: false,
+        })
     }
 
     /// `COMMENT ON <object> IS { 'text' | NULL }`.

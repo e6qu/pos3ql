@@ -1579,6 +1579,7 @@ pub(crate) fn project_window_rows<'a>(
             srf_index: hooks.srf_index,
             project_sets: hooks.project_sets,
             sequences: hooks.sequences,
+            merge_action: hooks.merge_action,
         };
         let mut projected = [Datum::Null; MAX_PROJ];
         let np = project_row(
@@ -2122,6 +2123,7 @@ pub(crate) fn external_window_into<'a>(
                 srf_index: hooks.srf_index,
                 project_sets: hooks.project_sets,
                 sequences: hooks.sequences,
+                merge_action: hooks.merge_action,
             };
             let mut projected = [Datum::Null; MAX_PROJ];
             let np = project_row(

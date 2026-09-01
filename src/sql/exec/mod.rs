@@ -43685,7 +43685,10 @@ struct MergeLookup<'d, 'v> {
     target: &'v [Datum<'v>],
     source_def: &'d TableDef,
     source_alias: &'d str,
-    source: &'v [Datum<'v>],
+    /// A target-only candidate deliberately has no source namespace. This is
+    /// PostgreSQL-visible: referring to the source there is a missing
+    /// FROM-clause entry, not a NULL-valued row.
+    source: Option<&'v [Datum<'v>]>,
 }
 
 impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
@@ -43696,11 +43699,18 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
                 .column_index(name)
                 .map(|i| self.target[i])
                 .ok_or_else(|| undefined_column(name)),
-            Some(q) if q == self.source_alias => self
-                .source_def
-                .column_index(name)
-                .map(|i| self.source[i])
-                .ok_or_else(|| undefined_column(name)),
+            Some(q) if q == self.source_alias => match self.source {
+                Some(source) => self
+                    .source_def
+                    .column_index(name)
+                    .map(|i| source[i])
+                    .ok_or_else(|| undefined_column(name)),
+                None => Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    q
+                )),
+            },
             Some(q) => Err(sql_err!(
                 sqlstate::UNDEFINED_TABLE,
                 "missing FROM-clause entry for table \"{}\"",
@@ -43708,7 +43718,7 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
             )),
             None => match (
                 self.target_def.column_index(name),
-                self.source_def.column_index(name),
+                self.source.and_then(|_| self.source_def.column_index(name)),
             ) {
                 (Some(_), Some(_)) => Err(sql_err!(
                     sqlstate::AMBIGUOUS_COLUMN,
@@ -43716,7 +43726,10 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
                     name
                 )),
                 (Some(i), None) => Ok(self.target[i]),
-                (None, Some(i)) => Ok(self.source[i]),
+                (None, Some(i)) => match self.source {
+                    Some(source) => Ok(source[i]),
+                    None => Err(undefined_column(name)),
+                },
                 (None, None) => Err(undefined_column(name)),
             },
         }
@@ -43753,14 +43766,15 @@ impl<'d> MergeLookup<'d, '_> {
                 .target_def
                 .column_index(name)
                 .map(|index| &self.target_def.columns()[index]),
-            Some(qualifier) if qualifier == self.source_alias => self
-                .source_def
-                .column_index(name)
-                .map(|index| &self.source_def.columns()[index]),
+            Some(qualifier) if qualifier == self.source_alias => self.source.and_then(|_| {
+                self.source_def
+                    .column_index(name)
+                    .map(|index| &self.source_def.columns()[index])
+            }),
             Some(_) => None,
             None => match (
                 self.target_def.column_index(name),
-                self.source_def.column_index(name),
+                self.source.and_then(|_| self.source_def.column_index(name)),
             ) {
                 (Some(index), None) => Some(&self.target_def.columns()[index]),
                 (None, Some(index)) => Some(&self.source_def.columns()[index]),
@@ -43850,48 +43864,133 @@ fn merge_source_columns(
         return None;
     }
     for when in statement.whens {
-        if let Some(condition) = when.cond
+        if let Some(condition) = when.condition()
             && !merge_source_demand(condition, source_alias, source, &mut columns)
         {
             return None;
         }
-        match when.action {
-            crate::sql::ast::MergeAction::Update(assignments) => {
+        match when.action() {
+            crate::sql::ast::MergeActionRef::Update(assignments) => {
                 for (_, value) in assignments {
                     if !merge_source_demand(value, source_alias, source, &mut columns) {
                         return None;
                     }
                 }
             }
-            crate::sql::ast::MergeAction::Insert { values, .. } => {
+            crate::sql::ast::MergeActionRef::Insert { values, .. } => {
                 for value in values {
                     if !merge_source_demand(value, source_alias, source, &mut columns) {
                         return None;
                     }
                 }
             }
-            crate::sql::ast::MergeAction::Delete | crate::sql::ast::MergeAction::DoNothing => {}
+            crate::sql::ast::MergeActionRef::Delete
+            | crate::sql::ast::MergeActionRef::DoNothing => {}
+        }
+    }
+    for item in statement.returning {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item
+            && !merge_source_demand(expression, source_alias, source, &mut columns)
+        {
+            return None;
         }
     }
     Some(columns)
 }
 
-/// `MERGE INTO target USING source ON cond WHEN ...`. Source-driven: each source
-/// row is matched against the target on `cond`; a match applies the first
-/// satisfied WHEN MATCHED clause, a miss the first WHEN NOT MATCHED clause. A
-/// target row affected twice is a cardinality error (21000).
-#[allow(clippy::too_many_arguments)]
-pub fn merge(
+/// Describes `MERGE RETURNING` in its target-and-source scope. An unqualified
+/// star follows DML `RETURNING` and expands only the target relation; qualified
+/// stars and expressions retain both namespaces.
+pub fn describe_merge_returning<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a crate::sql::ast::Merge<'a>,
+    arena: &'a Arena,
+    out: &mut [ColDesc<'a>],
+) -> Result<usize, SqlError> {
+    use crate::sql::ast::{FromClause, Join, JoinKind, RelationInheritance, TableRef};
+
+    let target = TableRef {
+        schema: statement.target.schema,
+        table: statement.target.name,
+        alias: statement.target_alias,
+        subquery: None,
+        func_args: None,
+        func_argument_names: &[],
+        func_variadic: false,
+        rows_from: None,
+        col_alias: None,
+        inheritance: RelationInheritance::Descendants,
+        sample: None,
+        cte: None,
+        with_ordinality: false,
+        lateral: false,
+        authorization_role: None,
+    };
+    let joins = arena
+        .alloc_slice_copy(&[Join {
+            table: statement.source,
+            kind: JoinKind::Cross,
+            on: None,
+            using: None,
+            natural: false,
+        }])
+        .map_err(|_| super::query::arena_full_pub())?;
+    let from = arena
+        .alloc(FromClause {
+            base: target,
+            joins,
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let scope = super::query::QueryScope::resolve_schema(storage, from, txid, arena)?;
+    let mut count = 0usize;
+    for item in statement.returning {
+        if matches!(item, SelectItem::Wildcard) {
+            let target_star =
+                SelectItem::TableWildcard(statement.target_alias.unwrap_or(statement.target.name));
+            let width = super::query::describe_scope_items(
+                core::slice::from_ref(&target_star),
+                &scope,
+                None,
+                storage,
+                txid,
+                arena,
+                &mut out[count..],
+            )?;
+            count += width;
+        } else {
+            let width = super::query::describe_scope_items(
+                core::slice::from_ref(item),
+                &scope,
+                None,
+                storage,
+                txid,
+                arena,
+                &mut out[count..],
+            )?;
+            count += width;
+        }
+    }
+    Ok(count)
+}
+
+/// `MERGE INTO target USING source ON cond WHEN ...`. Candidate rows are the
+/// source/target join plus unmatched rows from either side requested by the
+/// `WHEN` clauses. A target row affected twice is a cardinality error (21000).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn merge<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     scratch: &mut DmlScratch,
-    statement: &crate::sql::ast::Merge,
-    arena: &Arena,
-    params: &[Datum],
+    statement: &'a crate::sql::ast::Merge<'a>,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
     seq_session: &crate::sql::guc::SeqSession,
     responder: &mut Responder,
+    mut capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
 ) -> Outcome {
-    use crate::sql::ast::MergeAction;
+    use crate::sql::ast::MergeActionRef as MergeAction;
+    let capturing = capture.is_some();
     let target_qual = crate::sql::ast::QualName {
         schema: statement.target.schema,
         name: statement.target.name,
@@ -43904,7 +44003,7 @@ pub fn merge(
     let mut has_update = false;
     let mut has_delete = false;
     for clause in statement.whens {
-        match clause.action {
+        match clause.action() {
             MergeAction::Insert { .. } => has_insert = true,
             MergeAction::Update(_) => has_update = true,
             MergeAction::Delete => has_delete = true,
@@ -43922,7 +44021,7 @@ pub fn merge(
     let mut update_columns = 0u64;
     let mut insert_columns = 0u64;
     for when in statement.whens {
-        match when.action {
+        match when.action() {
             MergeAction::Update(assignments) => {
                 for (name, _) in assignments {
                     let Some(column) = def.column_index(name) else {
@@ -43960,7 +44059,7 @@ pub fn merge(
             arena,
         )?;
         for when in statement.whens {
-            if let Some(expression) = when.cond {
+            if let Some(expression) = when.condition() {
                 columns |= expression_dml_target_columns(
                     expression,
                     &def,
@@ -43970,7 +44069,7 @@ pub fn merge(
                     arena,
                 )?;
             }
-            match when.action {
+            match when.action() {
                 MergeAction::Update(assignments) => {
                     for (_, expression) in assignments {
                         columns |= expression_dml_target_columns(
@@ -43998,6 +44097,14 @@ pub fn merge(
                 MergeAction::Delete | MergeAction::DoNothing => {}
             }
         }
+        columns |= returning_dml_target_columns(
+            statement.returning,
+            &def,
+            statement.target_alias,
+            storage,
+            txn.txid,
+            arena,
+        )?;
         Ok(columns)
     })() {
         Ok(reads) => reads,
@@ -44146,7 +44253,7 @@ pub fn merge(
     };
     let mut merge_update_columns = 0u64;
     for when in statement.whens {
-        if let MergeAction::Update(assignments) = when.action {
+        if let MergeAction::Update(assignments) = when.action() {
             for (name, _) in assignments {
                 let Some(column) = def.column_index(name) else {
                     return sql_fail(undefined_column(name));
@@ -44157,7 +44264,7 @@ pub fn merge(
     }
     let merge_events = statement.whens.iter().fold(0u8, |events, when| {
         events
-            | match when.action {
+            | match when.action() {
                 MergeAction::Insert { .. } => TriggerEvents::INSERT,
                 MergeAction::Update(_) => TriggerEvents::UPDATE,
                 MergeAction::Delete => TriggerEvents::DELETE,
@@ -44302,6 +44409,15 @@ pub fn merge(
         Err(error) => return sql_fail(error),
     };
     let source_def = &source_def;
+    if !statement.returning.is_empty() && !capturing {
+        let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let count =
+            match describe_merge_returning(storage, txn.txid, statement, arena, &mut columns) {
+                Ok(count) => count,
+                Err(error) => return sql_fail(error),
+            };
+        responder.row_description(&columns[..count])?;
+    }
     // Pass 1: count source rows. Pass 2: encode each to arena bytes.
     let mut n_source = 0usize;
     if let Err(e) = super::query::select_into_rows(
@@ -44390,6 +44506,13 @@ pub fn merge(
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
     let affected: &mut [bool] = match arena.alloc_slice_with(n_target, |_| false) {
+        Ok(s) => s,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    // Candidate classification is defined by the original join result, before
+    // a later action changes a target row. Keep that state separately from the
+    // cardinality marker used for writes.
+    let matched_by_source: &mut [bool] = match arena.alloc_slice_with(n_target, |_| false) {
         Ok(s) => s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
@@ -44523,40 +44646,69 @@ pub fn merge(
     };
 
     let mut affected_count = 0u64;
-    for sbytes in source_rows.iter() {
-        let n_src_cols = projected_row_width(sbytes);
-        let mut sv = [Datum::Null; MAX_COLUMNS];
-        for (c, slot) in sv.iter_mut().enumerate().take(n_src_cols) {
-            *slot = decode_projected_pub(sbytes, c);
+    let has_not_matched_by_source = statement.whens.iter().any(|when| {
+        matches!(
+            when.kind(),
+            crate::sql::ast::MergeMatchKind::NotMatchedBySource
+        )
+    });
+    let mut source_index = 0usize;
+    loop {
+        let by_source = source_index == source_rows.len();
+        if by_source && !has_not_matched_by_source {
+            break;
         }
+        let mut sv = [Datum::Null; MAX_COLUMNS];
+        let n_src_cols = if by_source {
+            source_def.n_columns
+        } else {
+            let sbytes = source_rows[source_index];
+            let width = projected_row_width(sbytes);
+            for (c, slot) in sv.iter_mut().enumerate().take(width) {
+                *slot = decode_projected_pub(sbytes, c);
+            }
+            width
+        };
         let sv = &sv[..source_def.n_columns.min(n_src_cols)];
-        let mut matched = false;
+        let mut matched = by_source;
         for j in 0..n_target {
+            if by_source && matched_by_source[j] {
+                continue;
+            }
             let lookup = MergeLookup {
                 target_def: &def,
                 target_alias,
                 target: target_vals[j],
                 source_def,
                 source_alias,
-                source: sv,
+                source: (!by_source).then_some(sv),
             };
-            match eval_merge_expression(
-                statement.on,
-                storage,
-                txn.txid,
-                seq_session,
-                arena,
-                params,
-                &lookup,
-            ) {
-                Ok(Datum::Bool(true)) => {}
-                Ok(_) => continue,
-                Err(e) => return sql_fail(e),
+            if !by_source {
+                match eval_merge_expression(
+                    statement.on,
+                    storage,
+                    txn.txid,
+                    seq_session,
+                    arena,
+                    params,
+                    &lookup,
+                ) {
+                    Ok(Datum::Bool(true)) => {}
+                    Ok(_) => continue,
+                    Err(e) => return sql_fail(e),
+                }
+                matched_by_source[j] = true;
+                matched = true;
             }
-            matched = true;
-            // First satisfied WHEN MATCHED clause.
-            for when in statement.whens.iter().filter(|w| w.matched) {
-                let action_security = match when.action {
+            // First satisfied clause for this candidate state.
+            for when in statement.whens.iter().filter(|when| {
+                matches!(
+                    (by_source, when.kind()),
+                    (false, crate::sql::ast::MergeMatchKind::Matched)
+                        | (true, crate::sql::ast::MergeMatchKind::NotMatchedBySource)
+                )
+            }) {
+                let action_security = match when.action() {
                     MergeAction::Update(_) => update_security,
                     MergeAction::Delete => delete_security,
                     MergeAction::DoNothing | MergeAction::Insert { .. } => None,
@@ -44589,7 +44741,7 @@ pub fn merge(
                         Err(error) => return sql_fail(error),
                     }
                 }
-                if let Some(cond) = when.cond {
+                if let Some(cond) = when.condition() {
                     match eval_merge_expression(
                         cond,
                         storage,
@@ -44604,7 +44756,7 @@ pub fn merge(
                         Err(e) => return sql_fail(e),
                     }
                 }
-                match &when.action {
+                match when.action() {
                     MergeAction::DoNothing => {}
                     MergeAction::Delete => {
                         if affected[j] {
@@ -44670,6 +44822,28 @@ pub fn merge(
                             && let Err(error) = transitions.push_old(target_vals[j], arena)
                         {
                             return sql_fail(error);
+                        }
+                        if !statement.returning.is_empty() {
+                            match emit_merge_returning(
+                                storage,
+                                txn.txid,
+                                &def,
+                                target_alias,
+                                target_vals[j],
+                                source_def,
+                                source_alias,
+                                (!by_source).then_some(sv),
+                                statement.returning,
+                                "DELETE",
+                                arena,
+                                params,
+                                responder,
+                                &mut capture,
+                            ) {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => return sql_fail(error),
+                                Err(wire) => return Err(wire),
+                            }
                         }
                         affected_count += 1;
                     }
@@ -44910,13 +45084,35 @@ pub fn merge(
                                 return sql_fail(error);
                             }
                         }
+                        if !statement.returning.is_empty() {
+                            match emit_merge_returning(
+                                storage,
+                                txn.txid,
+                                &def,
+                                target_alias,
+                                &new_values[..def.n_columns],
+                                source_def,
+                                source_alias,
+                                (!by_source).then_some(sv),
+                                statement.returning,
+                                "UPDATE",
+                                arena,
+                                params,
+                                responder,
+                                &mut capture,
+                            ) {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => return sql_fail(error),
+                                Err(wire) => return Err(wire),
+                            }
+                        }
                         affected[j] = true;
                         affected_count += 1;
                     }
                     MergeAction::Insert { .. } => {
                         return sql_fail(sql_err!(
                             sqlstate::SYNTAX_ERROR,
-                            "INSERT is not allowed in a WHEN MATCHED clause"
+                            "INSERT is not allowed in a target-backed MERGE candidate"
                         ));
                     }
                 }
@@ -44930,8 +45126,13 @@ pub fn merge(
                 values: sv,
                 alias: None,
             };
-            for when in statement.whens.iter().filter(|w| !w.matched) {
-                if let Some(cond) = when.cond {
+            for when in statement.whens.iter().filter(|w| {
+                matches!(
+                    w.kind(),
+                    crate::sql::ast::MergeMatchKind::NotMatchedByTarget
+                )
+            }) {
+                if let Some(cond) = when.condition() {
                     match eval_merge_expression(
                         cond,
                         storage,
@@ -44946,7 +45147,7 @@ pub fn merge(
                         Err(e) => return sql_fail(e),
                     }
                 }
-                match &when.action {
+                match when.action() {
                     MergeAction::DoNothing => {}
                     MergeAction::Insert {
                         columns,
@@ -44960,7 +45161,7 @@ pub fn merge(
                             &def,
                             columns,
                             values,
-                            *default_values,
+                            default_values,
                             &source_ctx,
                             &generated,
                             &defaults,
@@ -44973,8 +45174,32 @@ pub fn merge(
                             scratch,
                             insert_transitions.as_mut(),
                         ) {
-                            Ok(true) => affected_count += 1,
-                            Ok(false) => {}
+                            Ok(Some(inserted)) => {
+                                if !statement.returning.is_empty() {
+                                    match emit_merge_returning(
+                                        storage,
+                                        txn.txid,
+                                        &def,
+                                        target_alias,
+                                        inserted,
+                                        source_def,
+                                        source_alias,
+                                        Some(sv),
+                                        statement.returning,
+                                        "INSERT",
+                                        arena,
+                                        params,
+                                        responder,
+                                        &mut capture,
+                                    ) {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(error)) => return sql_fail(error),
+                                        Err(wire) => return Err(wire),
+                                    }
+                                }
+                                affected_count += 1;
+                            }
+                            Ok(None) => {}
                             Err(error) => return sql_fail(error),
                         }
                     }
@@ -44988,6 +45213,10 @@ pub fn merge(
                 break;
             }
         }
+        if by_source {
+            break;
+        }
+        source_index += 1;
     }
     for event in [
         TriggerEvents::INSERT,
@@ -45032,7 +45261,14 @@ pub fn merge(
             return sql_fail(error);
         }
     }
-    responder.command_complete(stack_format!(32, "MERGE {}", affected_count).as_str())?;
+    if capturing {
+        responder.set_affected_rows(affected_count);
+    } else {
+        responder.command_complete_rows(
+            stack_format!(32, "MERGE {}", affected_count).as_str(),
+            affected_count,
+        )?;
+    }
     sql_ok()
 }
 
@@ -45053,13 +45289,13 @@ fn merge_insert<'a>(
     storage: &mut Storage,
     txn: &mut TxnState,
     table_index: usize,
-    def: &TableDef,
+    def: &'a TableDef,
     columns: &[&str],
-    values: &[&Expr],
+    values: &[&'a Expr<'a>],
     default_values: bool,
-    source_ctx: &RowCtx,
-    generated: &constraints::ParsedDefaults,
-    defaults: &constraints::ParsedDefaults,
+    source_ctx: &RowCtx<'_, 'a, '_>,
+    generated: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
+    defaults: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
     seq_session: &crate::sql::guc::SeqSession,
     arena: &'a Arena,
     params: &[Datum<'a>],
@@ -45068,7 +45304,7 @@ fn merge_insert<'a>(
     responder: &mut Responder,
     scratch: &mut DmlScratch,
     transition_capture: Option<&mut TransitionCapture<'a>>,
-) -> Result<bool, SqlError> {
+) -> Result<Option<&'a [Datum<'a>]>, SqlError> {
     // Target columns for the supplied values: the named list, or all columns.
     let mut targets = [0usize; MAX_COLUMNS];
     let n_targets = if columns.is_empty() {
@@ -45166,7 +45402,7 @@ fn merge_insert<'a>(
         None,
         Some(&mut row_arr[..def.n_columns]),
     )? {
-        return Ok(false);
+        return Ok(None);
     }
     compute_generated(def, generated, &mut row_arr, storage, txn.txid, arena)?;
     storage.validate_partition_target(initial_target, &row_arr[..def.n_columns], txn.txid)?;
@@ -45236,7 +45472,10 @@ fn merge_insert<'a>(
     if let Some(transition_capture) = transition_capture {
         transition_capture.push_new(&row_arr[..def.n_columns], arena)?;
     }
-    Ok(true)
+    let returned = arena
+        .alloc_slice_copy(&row_arr[..def.n_columns])
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(Some(&*returned))
 }
 
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
@@ -47197,6 +47436,151 @@ fn emit_projected(
     Ok(Ok(()))
 }
 
+/// Emits one MERGE `RETURNING` row. The candidate lookup keeps the source
+/// namespace absent for target-only candidates, exactly as it was while the
+/// action expression was evaluated.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn emit_merge_returning<'a>(
+    storage: &Storage,
+    txid: u32,
+    target_def: &TableDef,
+    target_alias: &str,
+    target: &[Datum<'a>],
+    source_def: &TableDef,
+    source_alias: &str,
+    source: Option<&[Datum<'a>]>,
+    items: &[SelectItem<'a>],
+    action: &str,
+    arena: &'a Arena,
+    params: &[Datum<'a>],
+    responder: &mut Responder,
+    capture: &mut Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+) -> Result<Result<(), SqlError>, WireFull> {
+    let lookup = MergeLookup {
+        target_def,
+        target_alias,
+        target,
+        source_def,
+        source_alias,
+        source,
+    };
+    let mut expressions: [Option<&Expr>; MAX_PROJ] = [None; MAX_PROJ];
+    let mut expression_count = 0usize;
+    for item in items {
+        if let SelectItem::Expr { expression, .. } | SelectItem::RecordStar(expression) = item {
+            expressions[expression_count] = Some(*expression);
+            expression_count += 1;
+        }
+    }
+    let subqueries = match super::query::subquery_hooks(
+        &expressions[..expression_count],
+        storage,
+        txid,
+        arena,
+        params,
+    ) {
+        Ok(subqueries) => subqueries,
+        Err(error) => return Ok(Err(error)),
+    };
+    let catalog = super::query::storage_catalog(storage, arena, txid);
+    let hooks = EvalHooks {
+        subs: Some(&subqueries),
+        catalog: Some(&catalog),
+        merge_action: Some(action),
+        ..NO_HOOKS
+    };
+    let mut projected = [Datum::Null; MAX_PROJ];
+    let mut n = 0usize;
+    for item in items {
+        match item {
+            SelectItem::Wildcard => {
+                for value in target {
+                    projected[n] = *value;
+                    n += 1;
+                }
+            }
+            SelectItem::TableWildcard(qualifier) if *qualifier == target_alias => {
+                for value in target {
+                    projected[n] = *value;
+                    n += 1;
+                }
+            }
+            SelectItem::TableWildcard(qualifier) if *qualifier == source_alias => {
+                let Some(source) = source else {
+                    return Ok(Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "missing FROM-clause entry for table \"{}\"",
+                        qualifier
+                    )));
+                };
+                for value in source {
+                    projected[n] = *value;
+                    n += 1;
+                }
+            }
+            SelectItem::TableWildcard(qualifier) => {
+                return Ok(Err(sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "missing FROM-clause entry for table \"{}\"",
+                    qualifier
+                )));
+            }
+            SelectItem::RecordStar(expression) => {
+                match super::eval::record_star_expand(expression, arena, params, &lookup, &hooks) {
+                    Ok(fields) => {
+                        for field in fields {
+                            projected[n] = field.value;
+                            n += 1;
+                        }
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+            SelectItem::Expr { expression, .. } => {
+                match eval_full(expression, arena, params, &lookup, &hooks) {
+                    Ok(value) => {
+                        projected[n] = value;
+                        n += 1;
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+        }
+    }
+    for value in projected.iter_mut().take(n) {
+        if let Datum::CompositeText {
+            slot,
+            physical_fields,
+            text,
+        } = *value
+        {
+            *value = match decode_stored_composite_text(
+                text,
+                slot,
+                physical_fields,
+                storage,
+                txid,
+                arena,
+            ) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+        }
+    }
+    if let Some(sink) = capture.as_deref_mut() {
+        match sink(&projected[..n]) {
+            Ok(()) => Ok(Ok(())),
+            Err(error) => Ok(Err(error)),
+        }
+    } else {
+        match crate::sql::query::emit_data_row(storage, txid, arena, responder, &projected[..n]) {
+            Ok(Ok(())) => Ok(Ok(())),
+            Ok(Err(error)) => Ok(Err(error)),
+            Err(wire) => Err(wire),
+        }
+    }
+}
+
 fn all_columns_mask(definition: &TableDef) -> u64 {
     if definition.n_columns == u64::BITS as usize {
         u64::MAX
@@ -47468,6 +47852,7 @@ pub(crate) fn update<'a>(
         srf_index: None,
         project_sets: None,
         sequences: None,
+        merge_action: None,
     };
     let current_role = authorization_role;
     let update_security = match super::query::plan_row_security(
@@ -48216,6 +48601,7 @@ pub(crate) fn delete<'a>(
         srf_index: None,
         project_sets: None,
         sequences: None,
+        merge_action: None,
     };
     let current_role = authorization_role;
     let delete_security = match super::query::plan_row_security(

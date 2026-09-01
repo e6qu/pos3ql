@@ -85,12 +85,16 @@ DIFF_OBJECT_PREFIX=${POS3QL_DIFF_OBJECT_STORE_PREFIX:-}
 CORPUS_SHARD=${POS3QL_DIFF_CORPUS_SHARD:-}
 CORPUS_SHARD_INDEX=0
 CORPUS_SHARD_COUNT=1
+CORPUS_SHARD_MODE=full
 
-if [[ -n "$CORPUS_SHARD" ]]; then
+if [[ "$CORPUS_SHARD" == none ]]; then
+  CORPUS_SHARD_MODE=none
+elif [[ -n "$CORPUS_SHARD" ]]; then
   if [[ ! "$CORPUS_SHARD" =~ ^([0-9]+)-of-([1-9][0-9]*)$ ]]; then
-    printf 'FAIL: POS3QL_DIFF_CORPUS_SHARD must be INDEX-of-COUNT\n'
+    printf 'FAIL: POS3QL_DIFF_CORPUS_SHARD must be INDEX-of-COUNT or none\n'
     exit 1
   fi
+  CORPUS_SHARD_MODE=split
   CORPUS_SHARD_INDEX=${BASH_REMATCH[1]}
   CORPUS_SHARD_COUNT=${BASH_REMATCH[2]}
   if (( CORPUS_SHARD_INDEX >= CORPUS_SHARD_COUNT )); then
@@ -101,11 +105,11 @@ fi
 
 # A sharded run has one explicitly assigned owner for the non-corpus probes.
 # Repeating them in every shard needlessly consumes the fixed CI time budget.
-if [[ -n "$CORPUS_SHARD" && -z "${POS3QL_DIFF_AUXILIARY+x}" ]]; then
+if [[ "$CORPUS_SHARD_MODE" != full && -z "${POS3QL_DIFF_AUXILIARY+x}" ]]; then
   printf '%s\n' 'FAIL: sharded differential runs require POS3QL_DIFF_AUXILIARY=all or none'
   exit 1
 fi
-if [[ -n "$CORPUS_SHARD" ]]; then
+if [[ "$CORPUS_SHARD_MODE" != full ]]; then
   DIFF_AUXILIARY=$POS3QL_DIFF_AUXILIARY
 else
   DIFF_AUXILIARY=all
@@ -123,7 +127,7 @@ for corpus_file in "$EXT"/differential/*.sql; do
   [[ -f "$corpus_file" ]] || continue
   corpus_file_count=$((corpus_file_count + 1))
 done
-if (( CORPUS_SHARD_COUNT > corpus_file_count )); then
+if [[ "$CORPUS_SHARD_MODE" == split ]] && (( CORPUS_SHARD_COUNT > corpus_file_count )); then
   printf 'FAIL: POS3QL_DIFF_CORPUS_SHARD count exceeds the corpus count\n'
   exit 1
 fi
@@ -336,23 +340,25 @@ restart_pos3ql_clean() {
 printf '%s\n' '=== corpus diffs (real PostgreSQL vs pos3ql) ==='
 reset_pair
 corpus_ordinal=0
-for f in $EXT/differential/*.sql; do
-  if (( corpus_ordinal % CORPUS_SHARD_COUNT != CORPUS_SHARD_INDEX )); then
+if [[ "$CORPUS_SHARD_MODE" != none ]]; then
+  for f in $EXT/differential/*.sql; do
+    if (( corpus_ordinal % CORPUS_SHARD_COUNT != CORPUS_SHARD_INDEX )); then
+      corpus_ordinal=$((corpus_ordinal + 1))
+      continue
+    fi
+    name=$(basename "$f" .sql)
+    run_corpus "$PG_PORT" "$name.pg" "$f"
+    run_corpus "$P3_PORT" "$name.p3" "$f"
+    if diff -u "$WORK/$name.pg" "$WORK/$name.p3" > "$WORK/$name.diff"; then
+      ok "differential: $name"
+    else
+      bad "differential: $name"
+      head -30 "$WORK/$name.diff"
+    fi
+    reset_pair
     corpus_ordinal=$((corpus_ordinal + 1))
-    continue
-  fi
-  name=$(basename "$f" .sql)
-  run_corpus "$PG_PORT" "$name.pg" "$f"
-  run_corpus "$P3_PORT" "$name.p3" "$f"
-  if diff -u "$WORK/$name.pg" "$WORK/$name.p3" > "$WORK/$name.diff"; then
-    ok "differential: $name"
-  else
-    bad "differential: $name"
-    head -30 "$WORK/$name.diff"
-  fi
-  reset_pair
-  corpus_ordinal=$((corpus_ordinal + 1))
-done
+  done
+fi
 
 if [[ "$DIFF_AUXILIARY" == "all" ]]; then
 # Exact-error corpora: the SQLSTATE normalizer above makes wording invisible,

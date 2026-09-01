@@ -2977,6 +2977,7 @@ pub fn infer_type_res(
             order_by,
             ..
         } => match *name {
+            "merge_action" => of(ColType::Text),
             "to_tsvector" | "json_to_tsvector" | "jsonb_to_tsvector" | "strip" | "setweight"
             | "ts_delete" | "ts_filter" | "array_to_tsvector" => of(ColType::TsVector),
             "to_tsquery"

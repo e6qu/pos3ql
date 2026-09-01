@@ -41,6 +41,31 @@ MERGE INTO mg_tgt t USING mg_src s ON t.id = s.id AND s.v <> t.v
   WHEN MATCHED THEN UPDATE SET v = 'merged';
 SELECT id, v FROM mg_tgt WHERE v = 'merged' ORDER BY id;
 
+-- PostgreSQL 18's target-only candidates are evaluated after the joined and
+-- source-only candidates. The source relation is not in scope in this state.
+MERGE INTO mg_tgt t USING mg_src s ON t.id = s.id
+  WHEN NOT MATCHED BY SOURCE AND t.id > 10 THEN UPDATE SET n = t.n + 100;
+SELECT id, n FROM mg_tgt ORDER BY id;
+
+-- `BY TARGET` is the explicit spelling of the legacy `NOT MATCHED` state.
+MERGE INTO mg_tgt t USING (VALUES (21, 'twenty-one')) s(id, v) ON t.id = s.id
+  WHEN NOT MATCHED BY TARGET THEN INSERT (id, v, n) VALUES (s.id, s.v, 210);
+SELECT id, v, n FROM mg_tgt WHERE id = 21;
+
+-- PostgreSQL 18 exposes the selected action and both candidate namespaces to
+-- RETURNING; a data-modifying CTE materializes that output once.
+MERGE INTO mg_tgt t USING (VALUES (2, 'returned'), (22, 'new returned')) s(id, v) ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v, n) VALUES (s.id, s.v, 220)
+  RETURNING merge_action(), t.id, t.v, s.v;
+WITH changed AS (
+  MERGE INTO mg_tgt t USING (VALUES (2, 'cte returned'), (23, 'cte inserted')) s(id, v) ON t.id = s.id
+    WHEN MATCHED THEN UPDATE SET v = s.v
+    WHEN NOT MATCHED THEN INSERT (id, v, n) VALUES (s.id, s.v, 230)
+    RETURNING merge_action() AS action, t.id, t.v
+)
+SELECT action, id, v FROM changed ORDER BY id;
+
 DROP TABLE mg_tgt;
 DROP TABLE mg_src;
 

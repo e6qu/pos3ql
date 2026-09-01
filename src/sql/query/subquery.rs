@@ -1399,6 +1399,7 @@ fn subquery_exists<'a>(
         srf_index: None,
         project_sets: None,
         sequences: None,
+        merge_action: None,
     };
 
     let Some(from) = &select.from else {
@@ -2450,6 +2451,7 @@ fn run_subquery<'a>(
         srf_index: None,
         project_sets: None,
         sequences: None,
+        merge_action: None,
     };
 
     let Some(from) = &select.from else {
@@ -2589,6 +2591,7 @@ fn run_subquery<'a>(
             srf_index: None,
             project_sets: None,
             sequences: hooks.sequences,
+            merge_action: hooks.merge_action,
         };
         let schema = ScopeSchema(&scope);
         let base = Chained {

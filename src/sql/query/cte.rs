@@ -9,9 +9,9 @@
 use crate::mem::arena::Arena;
 use crate::sql::ast::{
     Collation, Cte, CteCycleMark, CteMaterialization, CteSearchOrder, Delete, Expr, FromClause,
-    GroupingSetQuantifier, Insert, Join, JoinKind, MaterializedCte, Merge, MergeAction, MergeWhen,
-    OnConflict, OnConflictTarget, OrderBy, Select, SelectItem, SetOp, SetQuery, SetTree, Stmt,
-    TableRef, Update,
+    GroupingSetQuantifier, Insert, Join, JoinKind, MaterializedCte, Merge, MergeSourceAction,
+    MergeTargetAction, MergeWhen, OnConflict, OnConflictTarget, OrderBy, Select, SelectItem, SetOp,
+    SetQuery, SetTree, Stmt, TableRef, Update,
 };
 use crate::sql::eval::{SequenceAccess, SqlError, sqlstate};
 use crate::sql::exec::MAX_PROJ;
@@ -2091,21 +2091,23 @@ fn statement_references(statement: &Stmt<'_>, name: &str) -> usize {
                     .whens
                     .iter()
                     .map(|when| {
-                        when.cond
+                        when.condition()
                             .map_or(0, |condition| expr_references(condition, name))
-                            + match when.action {
-                                MergeAction::Update(assignments) => assignments
+                            + match when.action() {
+                                crate::sql::ast::MergeActionRef::Update(assignments) => assignments
                                     .iter()
                                     .map(|(_, expression)| expr_references(expression, name))
                                     .sum(),
-                                MergeAction::Insert { values, .. } => values
+                                crate::sql::ast::MergeActionRef::Insert { values, .. } => values
                                     .iter()
                                     .map(|expression| expr_references(expression, name))
                                     .sum(),
-                                MergeAction::Delete | MergeAction::DoNothing => 0,
+                                crate::sql::ast::MergeActionRef::Delete
+                                | crate::sql::ast::MergeActionRef::DoNothing => 0,
                             }
                     })
                     .sum::<usize>()
+                + returning_references(merge.returning, name)
         }
         _ => 0,
     }
@@ -4244,32 +4246,48 @@ fn subst_merge<'a>(
             "MERGE action list too long"
         ));
     }
-    let mut whens = [MergeWhen {
-        matched: false,
+    let mut whens = [MergeWhen::NotMatchedByTarget {
         cond: None,
-        action: MergeAction::DoNothing,
+        action: MergeSourceAction::DoNothing,
     }; crate::sql::parser::MAX_LIST];
     for (index, when) in statement.whens.iter().enumerate() {
-        let action = match when.action {
-            MergeAction::Update(assignments) => {
-                MergeAction::Update(subst_assignments(assignments, context, arena)?)
-            }
-            MergeAction::Delete => MergeAction::Delete,
-            MergeAction::Insert {
-                columns,
-                values,
-                default_values,
-            } => MergeAction::Insert {
-                columns,
-                values: subst_expr_slice(values, context, arena)?,
-                default_values,
+        let cond = opt_subst(when.condition(), context, arena)?;
+        whens[index] = match *when {
+            MergeWhen::Matched { action, .. } => MergeWhen::Matched {
+                cond,
+                action: match action {
+                    MergeTargetAction::Update(assignments) => {
+                        MergeTargetAction::Update(subst_assignments(assignments, context, arena)?)
+                    }
+                    MergeTargetAction::Delete => MergeTargetAction::Delete,
+                    MergeTargetAction::DoNothing => MergeTargetAction::DoNothing,
+                },
             },
-            MergeAction::DoNothing => MergeAction::DoNothing,
-        };
-        whens[index] = MergeWhen {
-            matched: when.matched,
-            cond: opt_subst(when.cond, context, arena)?,
-            action,
+            MergeWhen::NotMatchedBySource { action, .. } => MergeWhen::NotMatchedBySource {
+                cond,
+                action: match action {
+                    MergeTargetAction::Update(assignments) => {
+                        MergeTargetAction::Update(subst_assignments(assignments, context, arena)?)
+                    }
+                    MergeTargetAction::Delete => MergeTargetAction::Delete,
+                    MergeTargetAction::DoNothing => MergeTargetAction::DoNothing,
+                },
+            },
+            MergeWhen::NotMatchedByTarget { action, .. } => MergeWhen::NotMatchedByTarget {
+                cond,
+                action: match action {
+                    MergeSourceAction::Insert {
+                        columns,
+                        values,
+                        default_values,
+                    } => MergeSourceAction::Insert {
+                        columns,
+                        values: subst_expr_slice(values, context, arena)?,
+                        default_values,
+                    },
+                    MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
+                },
+            },
         };
     }
     Ok(Merge {
@@ -4280,6 +4298,7 @@ fn subst_merge<'a>(
         whens: arena
             .alloc_slice_copy(&whens[..statement.whens.len()])
             .map_err(|_| arena_full())?,
+        returning: subst_select_items(statement.returning, context, arena)?,
     })
 }
 

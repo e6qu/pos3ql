@@ -714,6 +714,8 @@ pub struct EvalHooks<'h, 'a> {
     /// without it. A trait object with interior mutability so evaluation stays
     /// `&`-only while advancing the generator.
     pub sequences: Option<&'h dyn SequenceAccess>,
+    /// Action selected for a MERGE `RETURNING` row.
+    pub merge_action: Option<&'a str>,
 }
 
 #[derive(Clone, Copy)]
@@ -1317,6 +1319,7 @@ pub const NO_HOOKS: EvalHooks<'static, 'static> = EvalHooks {
     srf_index: None,
     project_sets: None,
     sequences: None,
+    merge_action: None,
 };
 
 pub fn eval<'a>(
@@ -3528,6 +3531,15 @@ fn call<'a>(
         && let Some(result) = funcs::misc::dispatch(name, args, star, arena, params, row, hooks)
     {
         return result;
+    }
+    if name.eq_ignore_ascii_case("merge_action") {
+        arity(0)?;
+        return hooks.merge_action.map(Datum::Text).ok_or_else(|| {
+            sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "merge_action() can only be used in MERGE RETURNING"
+            )
+        });
     }
     if !star && let Some(catalog) = hooks.catalog {
         let mut arguments = [Datum::Null; crate::sql::parser::MAX_LIST];

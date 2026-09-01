@@ -620,6 +620,7 @@ pub(super) fn groups_for_mask<'a>(
             srf_index: None,
             project_sets: None,
             sequences: hooks.sequences,
+            merge_action: hooks.merge_action,
         };
         let schema = ScopeSchema(scope);
         if let Some(h) = statement.having {

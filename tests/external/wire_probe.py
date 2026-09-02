@@ -2509,7 +2509,8 @@ def test_subscription_definition_lifecycle_over_raw_wire():
     )
     altered = simple_query(
         s,
-        "ALTER SUBSCRIPTION wire_subscription CONNECTION 'host=publisher-two port=5433'; "
+        "ALTER SUBSCRIPTION wire_subscription CONNECTION "
+        "'host=127.0.0.2 port=5433 user=repl dbname=publisher sslmode=disable'; "
         "ALTER SUBSCRIPTION wire_subscription SET PUBLICATION inventory, sales WITH (refresh = false)",
     )
     check(
@@ -2524,8 +2525,32 @@ def test_subscription_definition_lifecycle_over_raw_wire():
     )
     check(
         "raw wire: ALTER subscription changes catalog definition",
-        first_text_row(catalog) == "host=publisher-two port=5433|{inventory,sales}",
+        first_text_row(catalog)
+        == "host=127.0.0.2 port=5433 user=repl dbname=publisher sslmode=disable|{inventory,sales}",
         catalog,
+    )
+    lifecycle = simple_query(
+        s,
+        "BEGIN; "
+        "ALTER SUBSCRIPTION wire_subscription SET (slot_name = wire_publisher_slot); "
+        "ALTER SUBSCRIPTION wire_subscription ENABLE; "
+        "ALTER SUBSCRIPTION wire_subscription REFRESH PUBLICATION WITH (copy_data = false); "
+        "COMMIT",
+    )
+    check(
+        "raw wire: one transaction publishes the complete subscription lifecycle",
+        sum(kind == b"C" for kind, _payload in lifecycle) == 5,
+        lifecycle,
+    )
+    lifecycle_catalog = simple_query(
+        s,
+        "SELECT subenabled::text || '|' || subslotname FROM pg_subscription "
+        "WHERE subname = 'wire_subscription'",
+    )
+    check(
+        "raw wire: lifecycle commands use the transaction-visible publisher slot",
+        first_text_row(lifecycle_catalog) == "true|wire_publisher_slot",
+        lifecycle_catalog,
     )
     s.close()
 

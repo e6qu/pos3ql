@@ -4103,6 +4103,64 @@ pub(crate) struct SubscriptionDef {
     pub ddl_state: CatalogDdlState,
 }
 
+/// The connection, publisher slot, and publication set for one subscription
+/// stream.  A transaction reads and replaces this value as one unit, so an
+/// apply worker can never combine an old slot with a new connection or
+/// publication set.
+#[derive(Clone, Copy)]
+pub(crate) struct SubscriptionDefinition {
+    pub(crate) connection: SubscriptionConnInfo,
+    publications: [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
+    publication_count: usize,
+    pub(crate) slot: SubscriptionSlot,
+    pub(crate) behavior: SubscriptionBehavior,
+}
+
+impl SubscriptionDefinition {
+    pub(crate) fn from_parts(
+        connection: SubscriptionConnInfo,
+        publications: &[SqlName],
+        slot: SubscriptionSlot,
+        behavior: SubscriptionBehavior,
+    ) -> Result<Self, SqlError> {
+        if publications.is_empty() || publications.len() > MAX_SUBSCRIPTION_PUBLICATIONS {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "subscription publication list exceeds its fixed capacity"
+            ));
+        }
+        let mut names = [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS];
+        names[..publications.len()].copy_from_slice(publications);
+        Ok(Self {
+            connection,
+            publications: names,
+            publication_count: publications.len(),
+            slot,
+            behavior,
+        })
+    }
+
+    pub(crate) fn publications(&self) -> &[SqlName] {
+        &self.publications[..self.publication_count]
+    }
+
+    pub(crate) fn publication_array(&self) -> [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS] {
+        self.publications
+    }
+
+    pub(crate) fn publication_count(&self) -> usize {
+        self.publication_count
+    }
+
+    pub(crate) fn replace_publications(
+        &mut self,
+        publications: &[SqlName],
+    ) -> Result<(), SqlError> {
+        *self = Self::from_parts(self.connection, publications, self.slot, self.behavior)?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SubscriptionRelationState {
     Initializing,
@@ -4575,34 +4633,23 @@ impl SubscriptionDef {
             .map_or(self.bootstrap, |pending| pending.bootstrap)
     }
 
-    pub(crate) fn definition_to(
-        &self,
-        txid: u32,
-    ) -> (
-        SubscriptionConnInfo,
-        [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
-        usize,
-        SubscriptionSlot,
-        SubscriptionBehavior,
-    ) {
+    pub(crate) fn definition_to(&self, txid: u32) -> SubscriptionDefinition {
         self.pending_definition
             .filter(|pending| pending.txid == txid)
             .map_or(
-                (
-                    self.connection,
-                    self.publications,
-                    self.publication_count,
-                    self.slot,
-                    self.behavior,
-                ),
-                |pending| {
-                    (
-                        pending.connection,
-                        pending.publications,
-                        pending.publication_count,
-                        pending.slot,
-                        pending.behavior,
-                    )
+                SubscriptionDefinition {
+                    connection: self.connection,
+                    publications: self.publications,
+                    publication_count: self.publication_count,
+                    slot: self.slot,
+                    behavior: self.behavior,
+                },
+                |pending| SubscriptionDefinition {
+                    connection: pending.connection,
+                    publications: pending.publications,
+                    publication_count: pending.publication_count,
+                    slot: pending.slot,
+                    behavior: pending.behavior,
                 },
             )
     }
@@ -23537,58 +23584,30 @@ impl Storage {
     pub(crate) fn set_subscription_definition(
         &mut self,
         slot: usize,
-        connection: SubscriptionConnInfo,
-        publications: &[SqlName],
-        publisher_slot: SubscriptionSlot,
-        behavior: SubscriptionBehavior,
+        definition: SubscriptionDefinition,
         txid: u32,
     ) -> Result<SubscriptionDefinitionChange, SqlError> {
         self.ensure_subscription_changeable(slot, txid)?;
-        if publications.is_empty() || publications.len() > MAX_SUBSCRIPTION_PUBLICATIONS {
-            return Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "subscription publication list exceeds its fixed capacity"
-            ));
-        }
         let subscription = &mut self.subscriptions[slot];
-        let current_connection = subscription
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-            .map_or(subscription.connection, |pending| pending.connection);
-        let (current_publications, current_count) = subscription
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-            .map_or(
-                (subscription.publications, subscription.publication_count),
-                |pending| (pending.publications, pending.publication_count),
-            );
-        let (current_slot, current_behavior) = subscription
-            .pending_definition
-            .filter(|pending| pending.txid == txid)
-            .map_or((subscription.slot, subscription.behavior), |pending| {
-                (pending.slot, pending.behavior)
-            });
-        if current_connection.as_str() == connection.as_str()
-            && current_count == publications.len()
-            && current_publications[..current_count] == *publications
-            && current_slot == publisher_slot
-            && current_behavior == behavior
+        let current = subscription.definition_to(txid);
+        if current.connection.as_str() == definition.connection.as_str()
+            && current.publications() == definition.publications()
+            && current.slot == definition.slot
+            && current.behavior == definition.behavior
         {
             return Ok(SubscriptionDefinitionChange {
                 changed: false,
                 prior: subscription.pending_definition,
             });
         }
-        let mut names = [SqlName::EMPTY; MAX_SUBSCRIPTION_PUBLICATIONS];
-        names[..publications.len()].copy_from_slice(publications);
         let prior = subscription.pending_definition;
         subscription.pending_definition = Some(PendingSubscriptionDefinition {
             txid,
-            connection,
-            publications: names,
-            publication_count: publications.len(),
-            slot: publisher_slot,
-            behavior,
+            connection: definition.connection,
+            publications: definition.publication_array(),
+            publication_count: definition.publication_count(),
+            slot: definition.slot,
+            behavior: definition.behavior,
         });
         Ok(SubscriptionDefinitionChange {
             changed: true,
@@ -23603,13 +23622,7 @@ impl Storage {
         &self,
         slot: usize,
         txid: u32,
-    ) -> (
-        SubscriptionConnInfo,
-        [SqlName; MAX_SUBSCRIPTION_PUBLICATIONS],
-        usize,
-        SubscriptionSlot,
-        SubscriptionBehavior,
-    ) {
+    ) -> SubscriptionDefinition {
         self.subscriptions[slot].definition_to(txid)
     }
 

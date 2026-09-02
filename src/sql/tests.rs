@@ -40613,6 +40613,129 @@ fn alter_subscription_definition_is_transactional_durable_and_visible_to_its_own
 }
 
 #[test]
+fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
+    let mut config = test_config("subscription-effective-definition");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("subscription-effective-definition-{}", std::process::id());
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION staged_changes CONNECTION \
+         'host=127.0.0.1 port=5432 user=repl dbname=publisher application_name=staged_changes sslmode=disable' \
+         PUBLICATION changes WITH (connect = false, slot_name = NONE)",
+    );
+    let completed = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         ALTER SUBSCRIPTION staged_changes SET (slot_name = publisher_slot); \
+         ALTER SUBSCRIPTION staged_changes ENABLE; \
+         ALTER SUBSCRIPTION staged_changes REFRESH PUBLICATION WITH (copy_data = false); \
+         SELECT subenabled, subslotname FROM pg_subscription WHERE subname = 'staged_changes'; \
+         COMMIT",
+    );
+    assert_eq!(data_rows(&completed), ["t|publisher_slot"]);
+    let runtime = engine
+        .subscription_runtime(0)
+        .expect("the committed transaction has one complete worker definition");
+    assert_eq!(runtime.slot.unwrap().as_str(), "publisher_slot");
+    assert_eq!(
+        runtime.bootstrap,
+        crate::storage::SubscriptionBootstrap::Refresh { copy_data: false }
+    );
+    let mut lifecycle_guc = GucState::new();
+    let mut lifecycle_txn = TxnState::new(&mut budget, config.txn_rows).unwrap();
+    let mut lifecycle_pool = test_pool(&mut budget);
+    let mut lifecycle_cursors = test_cursors(&mut budget);
+    run_with_session(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER SUBSCRIPTION staged_changes DISABLE; ALTER SUBSCRIPTION staged_changes SET (slot_name = NONE)",
+        &mut lifecycle_guc,
+        &mut lifecycle_txn,
+        &mut lifecycle_pool,
+        &mut lifecycle_cursors,
+    );
+    let rejected = run_with_session(
+        &mut engine,
+        &mut budget,
+        "ALTER SUBSCRIPTION staged_changes REFRESH PUBLICATION WITH (copy_data = false)",
+        &mut lifecycle_guc,
+        &mut lifecycle_txn,
+        &mut lifecycle_pool,
+        &mut lifecycle_cursors,
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected)
+            .contains("cannot refresh a subscription without a replication slot"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    run_with_session(
+        &mut engine,
+        &mut budget,
+        "ROLLBACK",
+        &mut lifecycle_guc,
+        &mut lifecycle_txn,
+        &mut lifecycle_pool,
+        &mut lifecycle_cursors,
+    );
+    run_with_session(
+        &mut engine,
+        &mut budget,
+        "BEGIN; ALTER SUBSCRIPTION staged_changes DISABLE; ALTER SUBSCRIPTION staged_changes SET (slot_name = NONE)",
+        &mut lifecycle_guc,
+        &mut lifecycle_txn,
+        &mut lifecycle_pool,
+        &mut lifecycle_cursors,
+    );
+    let rejected = run_with_session(
+        &mut engine,
+        &mut budget,
+        "ALTER SUBSCRIPTION staged_changes ENABLE",
+        &mut lifecycle_guc,
+        &mut lifecycle_txn,
+        &mut lifecycle_pool,
+        &mut lifecycle_cursors,
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected)
+            .contains("cannot enable a subscription without an existing publisher slot"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    run_with_session(
+        &mut engine,
+        &mut budget,
+        "ROLLBACK",
+        &mut lifecycle_guc,
+        &mut lifecycle_txn,
+        &mut lifecycle_pool,
+        &mut lifecycle_cursors,
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new((1 << 29) + (96 << 20));
+    let replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    let runtime = replayed
+        .subscription_runtime(0)
+        .expect("object-cold recovery retains the committed worker definition");
+    assert_eq!(runtime.slot.unwrap().as_str(), "publisher_slot");
+    assert_eq!(
+        runtime.bootstrap,
+        crate::storage::SubscriptionBootstrap::Refresh { copy_data: false }
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn subscription_behavior_owner_and_name_are_one_durable_typed_state() {
     let config = test_config("subscription-complete-options");
     let mut budget = Budget::new(1 << 27);

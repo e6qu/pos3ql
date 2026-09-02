@@ -2115,35 +2115,30 @@ impl Engine {
                     "subscription SKIP targets a replaced stream definition"
                 )
             })?;
-        let (connection, publications, publication_count, publisher_slot, mut behavior) = self
+        let mut definition = self
             .storage
             .subscription_definition_to(current.slot(), txn.txid);
-        if behavior.skip_lsn != Some(final_lsn) {
+        if definition.behavior.skip_lsn != Some(final_lsn) {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                 "subscription SKIP does not match the remote transaction finish LSN"
             ));
         }
-        behavior.skip_lsn = None;
-        let change = self.storage.set_subscription_definition(
-            current.slot(),
-            connection,
-            &publications[..publication_count],
-            publisher_slot,
-            behavior,
-            txn.txid,
-        )?;
+        definition.behavior.skip_lsn = None;
+        let change =
+            self.storage
+                .set_subscription_definition(current.slot(), definition, txn.txid)?;
         let lsn = self.storage.bump_lsn();
         if let Err(error) = self.wal.stage(
             txn.txid,
             lsn,
             &WalOp::AlterSubscription {
                 name: current.name().as_str(),
-                connection: connection.as_str(),
-                publications,
-                publication_count,
-                slot: publisher_slot,
-                behavior,
+                connection: definition.connection.as_str(),
+                publications: definition.publication_array(),
+                publication_count: definition.publication_count(),
+                slot: definition.slot,
+                behavior: definition.behavior,
             },
         ) {
             self.storage
@@ -17449,15 +17444,14 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             if subscription.enabled_to(0) {
                 validate_recovered_enabled_subscription(connection)?;
             }
+            let definition = crate::storage::SubscriptionDefinition::from_parts(
+                connection,
+                &publications[..publication_count],
+                publisher_slot,
+                behavior,
+            )?;
             if storage
-                .set_subscription_definition(
-                    slot,
-                    connection,
-                    &publications[..publication_count],
-                    publisher_slot,
-                    behavior,
-                    0,
-                )?
+                .set_subscription_definition(slot, definition, 0)?
                 .changed
             {
                 storage.commit_subscription_definition(slot, 0);

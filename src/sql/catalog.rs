@@ -7739,20 +7739,16 @@ fn pg_subscription<'a>(
                 rows.len()
             ));
         }
-        let (connection, subscription_publications, publication_count, publisher_slot, behavior) =
-            subscription.definition_to(txid);
+        let definition = subscription.definition_to(txid);
         let mut publications = [Datum::Null; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS];
-        for (index, publication) in subscription_publications[..publication_count]
-            .iter()
-            .enumerate()
-        {
+        for (index, publication) in definition.publications().iter().enumerate() {
             publications[index] = text(publication.as_str(), arena)?;
         }
         let publications = Datum::Array {
             element: super::types::ArrElem::Text,
-            raw: super::array::build(&publications[..publication_count], arena)?,
+            raw: super::array::build(&publications[..definition.publication_count()], arena)?,
         };
-        let skip_lsn = match behavior.skip_lsn {
+        let skip_lsn = match definition.behavior.skip_lsn {
             Some(lsn) => {
                 let value = stack_format!(32, "0/{lsn:X}");
                 text(value.as_str(), arena)?
@@ -7770,10 +7766,10 @@ fn pg_subscription<'a>(
                     subscription.ownership.owner_to(txid) as usize
                 )),
                 Datum::Bool(subscription.enabled_to(txid)),
-                Datum::Bool(behavior.binary),
-                text(behavior.streaming.pg_code(), arena)?,
+                Datum::Bool(definition.behavior.binary),
+                text(definition.behavior.streaming.pg_code(), arena)?,
                 text(
-                    if behavior.two_phase {
+                    if definition.behavior.two_phase {
                         if matches!(
                             subscription.bootstrap_to(txid),
                             crate::storage::SubscriptionBootstrap::Ready
@@ -7787,18 +7783,18 @@ fn pg_subscription<'a>(
                     },
                     arena,
                 )?,
-                Datum::Bool(behavior.disable_on_error),
-                Datum::Bool(behavior.password_required),
-                Datum::Bool(behavior.run_as_owner),
-                Datum::Bool(behavior.failover),
-                text(connection.as_str(), arena)?,
-                match publisher_slot.name() {
+                Datum::Bool(definition.behavior.disable_on_error),
+                Datum::Bool(definition.behavior.password_required),
+                Datum::Bool(definition.behavior.run_as_owner),
+                Datum::Bool(definition.behavior.failover),
+                text(definition.connection.as_str(), arena)?,
+                match definition.slot.name() {
                     Some(slot) => text(slot.as_str(), arena)?,
                     None => Datum::Null,
                 },
-                text(behavior.synchronous_commit.as_str(), arena)?,
+                text(definition.behavior.synchronous_commit.as_str(), arena)?,
                 publications,
-                text(behavior.origin.as_str(), arena)?,
+                text(definition.behavior.origin.as_str(), arena)?,
             ],
             arena,
         )?;

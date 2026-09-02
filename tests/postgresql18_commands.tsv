@@ -44,7 +44,7 @@ ALTER SCHEMA	partial	37_schemas.sql
 ALTER SEQUENCE	partial	54_sequence.sql
 ALTER SERVER	complete	tests/external/ci_diff.sh
 ALTER STATISTICS	complete	109_extended_statistics.sql
-ALTER SUBSCRIPTION	partial	98_subscription.sql and subscription shard (definition, refresh, initial synchronization)
+ALTER SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard
 ALTER SYSTEM	complete	118_database_configuration.sql
 ALTER TABLE	partial	45_alter_column.sql and 125_replica_identity.sql
 ALTER TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
@@ -95,7 +95,7 @@ CREATE SCHEMA	partial	37_schemas.sql
 CREATE SEQUENCE	complete	54_sequence.sql
 CREATE SERVER	complete	tests/external/ci_diff.sh
 CREATE STATISTICS	complete	109_extended_statistics.sql
-CREATE SUBSCRIPTION	partial	98_subscription.sql and subscription shard (disabled and managed initial synchronization)
+CREATE SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard
 CREATE TABLE	partial	14_surface.sql
 CREATE TABLE AS	complete	52_create_table_as.sql
 CREATE TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
@@ -144,7 +144,7 @@ DROP SCHEMA	complete	37_schemas.sql
 DROP SEQUENCE	complete	54_sequence.sql
 DROP SERVER	complete	tests/external/ci_diff.sh
 DROP STATISTICS	complete	109_extended_statistics.sql
-DROP SUBSCRIPTION	partial	98_subscription.sql (durable disabled lifecycle)
+DROP SUBSCRIPTION	complete	98_subscription.sql and subscription recovery shard
 DROP TABLE	complete	14_surface.sql
 DROP TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 DROP TEXT SEARCH CONFIGURATION	complete	tests/external/differential/123_full_text_search.sql

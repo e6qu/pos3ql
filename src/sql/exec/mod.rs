@@ -11730,7 +11730,8 @@ pub fn alter_subscription(
     let actor_superuser = storage
         .current_role_slot(txn.txid)
         .is_some_and(|role| storage.role(role).attributes_to(txn.txid).superuser);
-    if !actor_superuser && !subscription.behavior.password_required {
+    let definition = storage.subscription_definition_to(slot, txn.txid);
+    if !actor_superuser && !definition.behavior.password_required {
         return sql_fail(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "only superusers may modify subscriptions with password_required = false"
@@ -11741,14 +11742,13 @@ pub fn alter_subscription(
         | crate::sql::ast::AlterSubscriptionAction::Disable => {
             let enabled = matches!(action, crate::sql::ast::AlterSubscriptionAction::Enable);
             if enabled {
-                if subscription.slot.name().is_none() {
+                if definition.slot.name().is_none() {
                     return sql_fail(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                         "cannot enable a subscription without an existing publisher slot"
                     ));
                 }
-                let (connection, _, _, _, _) = storage.subscription_definition_to(slot, txn.txid);
-                if let Err(error) = validate_enabled_subscription(connection) {
+                if let Err(error) = validate_enabled_subscription(definition.connection) {
                     return sql_fail(error);
                 }
             }
@@ -11786,8 +11786,8 @@ pub fn alter_subscription(
             {
                 return sql_fail(error);
             }
-            let (_, publications, publication_count, publisher_slot, behavior) =
-                storage.subscription_definition_to(slot, txn.txid);
+            let mut definition = storage.subscription_definition_to(slot, txn.txid);
+            definition.connection = connection;
             if let Err(error) = alter_subscription_definition(
                 storage,
                 wal,
@@ -11795,10 +11795,7 @@ pub fn alter_subscription(
                 SubscriptionDefinitionUpdate {
                     slot,
                     name,
-                    connection,
-                    publications: &publications[..publication_count],
-                    publisher_slot,
-                    behavior,
+                    definition,
                 },
             ) {
                 return sql_fail(error);
@@ -11822,16 +11819,18 @@ pub fn alter_subscription(
                 } => (publications, refresh, SubscriptionPublicationChange::Drop),
                 _ => unreachable!(),
             };
-            let (connection, current, current_count, publisher_slot, behavior) =
-                storage.subscription_definition_to(slot, txn.txid);
+            let mut definition = storage.subscription_definition_to(slot, txn.txid);
             let (names, count) = match subscription_publication_change(
-                &current[..current_count],
+                definition.publications(),
                 requested,
                 operation,
             ) {
                 Ok(value) => value,
                 Err(error) => return sql_fail(error),
             };
+            if let Err(error) = definition.replace_publications(&names[..count]) {
+                return sql_fail(error);
+            }
             if let Err(error) = alter_subscription_definition(
                 storage,
                 wal,
@@ -11839,10 +11838,7 @@ pub fn alter_subscription(
                 SubscriptionDefinitionUpdate {
                     slot,
                     name,
-                    connection,
-                    publications: &names[..count],
-                    publisher_slot,
-                    behavior,
+                    definition,
                 },
             ) {
                 return sql_fail(error);
@@ -11862,8 +11858,7 @@ pub fn alter_subscription(
         }
         crate::sql::ast::AlterSubscriptionAction::SetOptions(patch) => {
             let alters_remote_slot = patch.failover.is_some() || patch.two_phase == Some(false);
-            let (connection, publications, publication_count, mut publisher_slot, mut behavior) =
-                storage.subscription_definition_to(slot, txn.txid);
+            let mut definition = storage.subscription_definition_to(slot, txn.txid);
             if (patch.failover.is_some() || patch.two_phase.is_some())
                 && subscription.enabled_to(txn.txid)
             {
@@ -11873,7 +11868,7 @@ pub fn alter_subscription(
                 ));
             }
             if let Some(setting) = patch.slot {
-                publisher_slot = match setting {
+                definition.slot = match setting {
                     crate::sql::ast::SubscriptionSlotSetting::Named(value) => {
                         match crate::storage::ReplicationSlotName::parse(value) {
                             Ok(name) => crate::storage::SubscriptionSlot::External(name),
@@ -11885,26 +11880,26 @@ pub fn alter_subscription(
                     }
                 };
             }
-            if alters_remote_slot && publisher_slot.name().is_none() {
+            if alters_remote_slot && definition.slot.name().is_none() {
                 return sql_fail(sql_err!(
                     sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                     "cannot alter failover or two_phase without an associated replication slot"
                 ));
             }
-            if publisher_slot.name().is_none() && subscription.enabled_to(txn.txid) {
+            if definition.slot.name().is_none() && subscription.enabled_to(txn.txid) {
                 return sql_fail(sql_err!(
                     sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                     "cannot set slot_name = NONE for an enabled subscription"
                 ));
             }
             if let Some(value) = patch.binary {
-                behavior.binary = value;
+                definition.behavior.binary = value;
             }
             if let Some(value) = patch.streaming {
-                behavior.streaming = value.into();
+                definition.behavior.streaming = value.into();
             }
             if let Some(value) = patch.synchronous_commit {
-                behavior.synchronous_commit = value.into();
+                definition.behavior.synchronous_commit = value.into();
             }
             if let Some(value) = patch.two_phase {
                 if value {
@@ -11913,10 +11908,10 @@ pub fn alter_subscription(
                         "two_phase subscriptions require durable prepared transactions, which are not supported by the object-native transaction model"
                     ));
                 }
-                behavior.two_phase = value;
+                definition.behavior.two_phase = value;
             }
             if let Some(value) = patch.disable_on_error {
-                behavior.disable_on_error = value;
+                definition.behavior.disable_on_error = value;
             }
             if let Some(value) = patch.password_required {
                 if !value && !actor_superuser {
@@ -11925,16 +11920,16 @@ pub fn alter_subscription(
                         "only superusers may set password_required = false"
                     ));
                 }
-                behavior.password_required = value;
+                definition.behavior.password_required = value;
             }
             if let Some(value) = patch.run_as_owner {
-                behavior.run_as_owner = value;
+                definition.behavior.run_as_owner = value;
             }
             if let Some(value) = patch.origin {
-                behavior.origin = value.into();
+                definition.behavior.origin = value.into();
             }
             if let Some(value) = patch.failover {
-                behavior.failover = value;
+                definition.behavior.failover = value;
             }
             if let Err(error) = alter_subscription_definition(
                 storage,
@@ -11943,19 +11938,15 @@ pub fn alter_subscription(
                 SubscriptionDefinitionUpdate {
                     slot,
                     name,
-                    connection,
-                    publications: &publications[..publication_count],
-                    publisher_slot,
-                    behavior,
+                    definition,
                 },
             ) {
                 return sql_fail(error);
             }
         }
         crate::sql::ast::AlterSubscriptionAction::Skip { lsn } => {
-            let (connection, publications, publication_count, publisher_slot, mut behavior) =
-                storage.subscription_definition_to(slot, txn.txid);
-            behavior.skip_lsn = lsn;
+            let mut definition = storage.subscription_definition_to(slot, txn.txid);
+            definition.behavior.skip_lsn = lsn;
             if let Err(error) = alter_subscription_definition(
                 storage,
                 wal,
@@ -11963,10 +11954,7 @@ pub fn alter_subscription(
                 SubscriptionDefinitionUpdate {
                     slot,
                     name,
-                    connection,
-                    publications: &publications[..publication_count],
-                    publisher_slot,
-                    behavior,
+                    definition,
                 },
             ) {
                 return sql_fail(error);
@@ -12148,23 +12136,14 @@ fn stage_subscription_refresh(
     name: &str,
     copy_data: bool,
 ) -> Result<(), SqlError> {
-    let subscription = storage
-        .subscription(name, txn.txid)
-        .map(|(_, subscription)| *subscription)
-        .ok_or_else(|| {
-            sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "subscription \"{}\" does not exist",
-                name
-            )
-        })?;
-    if subscription.slot.name().is_none() {
+    let definition = storage.subscription_definition_to(slot, txn.txid);
+    if definition.slot.name().is_none() {
         return Err(sql_err!(
             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
             "cannot refresh a subscription without a replication slot"
         ));
     }
-    validate_enabled_subscription(subscription.connection)?;
+    validate_enabled_subscription(definition.connection)?;
     let bootstrap = crate::storage::SubscriptionBootstrap::Refresh { copy_data };
     let prior = match storage.set_subscription_bootstrap(slot, bootstrap, txn.txid)? {
         crate::storage::SubscriptionBootstrapChange::Unchanged => return Ok(()),
@@ -12198,10 +12177,7 @@ fn validate_enabled_subscription(
 struct SubscriptionDefinitionUpdate<'a> {
     slot: usize,
     name: &'a str,
-    connection: crate::storage::SubscriptionConnInfo,
-    publications: &'a [SqlName],
-    publisher_slot: crate::storage::SubscriptionSlot,
-    behavior: crate::storage::SubscriptionBehavior,
+    definition: crate::storage::SubscriptionDefinition,
 }
 
 fn alter_subscription_definition(
@@ -12213,36 +12189,25 @@ fn alter_subscription_definition(
     let SubscriptionDefinitionUpdate {
         slot,
         name,
-        connection,
-        publications,
-        publisher_slot,
-        behavior,
+        definition,
     } = update;
-    let change = storage.set_subscription_definition(
-        slot,
-        connection,
-        publications,
-        publisher_slot,
-        behavior,
-        txn.txid,
-    )?;
+    let change = storage.set_subscription_definition(slot, definition, txn.txid)?;
     if !change.changed {
         return Ok(());
     }
     let prior = change.prior;
-    let (connection, publications, publication_count, publisher_slot, behavior) =
-        storage.subscription_definition_to(slot, txn.txid);
+    let definition = storage.subscription_definition_to(slot, txn.txid);
     let lsn = storage.bump_lsn();
     if let Err(error) = wal.stage(
         txn.txid,
         lsn,
         &WalOp::AlterSubscription {
             name,
-            connection: connection.as_str(),
-            publications,
-            publication_count,
-            slot: publisher_slot,
-            behavior,
+            connection: definition.connection.as_str(),
+            publications: definition.publication_array(),
+            publication_count: definition.publication_count(),
+            slot: definition.slot,
+            behavior: definition.behavior,
         },
     ) {
         storage.restore_subscription_definition(slot, prior);

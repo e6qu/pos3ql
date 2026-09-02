@@ -7459,6 +7459,12 @@ fn pg_publication_rel<'a>(
             .enumerate()
         {
             let filter = definition.table_filters.get(index);
+            let prqual = if filter.is_empty() {
+                Datum::Null
+            } else {
+                let rendered = stack_format!(66, "({filter})");
+                text(rendered.as_str(), arena)?
+            };
             if count == rows.len() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -7485,11 +7491,7 @@ fn pg_publication_rel<'a>(
                     Datum::Int4(FIRST_USER_OID + 90_000 + count as i32),
                     Datum::Int4(publication_oid(publication_slot)),
                     Datum::Int4(table_oid(storage, *member as usize)),
-                    if filter.is_empty() {
-                        Datum::Null
-                    } else {
-                        text(filter, arena)?
-                    },
+                    prqual,
                     prattrs,
                 ],
                 arena,

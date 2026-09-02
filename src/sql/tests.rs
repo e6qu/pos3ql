@@ -40104,7 +40104,7 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
             &mut budget,
             "SELECT pg_get_expr(prqual, prrelid) FROM pg_publication_rel"
         )),
-        ["id > 0"],
+        ["(id > 0)"],
     );
     assert!(engine.checkpoint().unwrap());
     drop(engine);
@@ -40125,8 +40125,144 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
             &mut replay_budget,
             "SELECT pg_get_expr(prqual, prrelid) FROM pg_publication_rel"
         )),
-        ["id > 0"],
+        ["(id > 0)"],
         "publication filters survive checkpoint recovery"
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn publication_row_filters_follow_column_renames_through_replication_and_recovery() {
+    let mut config = test_config("publication-filter-column-rename");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("publication-filter-column-rename-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE publication_filter_rename (id int PRIMARY KEY); \
+         CREATE PUBLICATION publication_filter_rename_changes \
+           FOR TABLE publication_filter_rename WHERE (id > 0); \
+         ALTER TABLE publication_filter_rename RENAME COLUMN id TO event_id",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_get_expr(prqual, prrelid) FROM pg_publication_rel"
+        )),
+        ["(event_id > 0)"],
+        "a publication predicate tracks column identity instead of retaining stale source text"
+    );
+    let floor = engine.storage.lsn();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO publication_filter_rename VALUES (1)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "publication rename scratch", 1 << 16).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "publication rename send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("publication_filter_rename_changes").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("renamed publication filter transaction is retained");
+    assert!(emitted);
+    assert!(send.readable().contains(&b'I'));
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 30);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT pg_get_expr(prqual, prrelid) FROM pg_publication_rel"
+        )),
+        ["(event_id > 0)"],
+        "the rebased predicate survives object-store checkpoint recovery"
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn publication_column_dependencies_restrict_cascade_and_remap_durably() {
+    let mut config = test_config("publication-projection-column-drop");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("publication-projection-column-drop-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_projection_drop (id int PRIMARY KEY, discarded text, retained text); \
+         CREATE PUBLICATION publication_projection_drop_changes \
+           FOR TABLE publication_projection_drop (id, retained) WITH (publish = 'insert'); \
+         ALTER TABLE publication_projection_drop DROP COLUMN discarded",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT prattrs::text FROM pg_publication_rel"
+        )),
+        ["1 2"],
+        "a retained publication projection follows the compact table layout"
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE publication_projection_drop DROP COLUMN retained",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE publication_projection_drop DROP COLUMN retained CASCADE",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_publication_rel"
+        )),
+        ["0"],
+        "CASCADE removes the dependent relation membership instead of keeping a stale mask"
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new(1 << 30);
+    let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT count(*) FROM pg_publication_rel"
+        )),
+        ["0"],
+        "the cascaded publication membership removal survives object-store recovery"
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

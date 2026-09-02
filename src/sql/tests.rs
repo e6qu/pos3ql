@@ -39835,9 +39835,17 @@ fn table_inheritance_is_durable_typed_and_visible_to_parent_dml() {
         "ALTER TABLE inheritance_parent_rows ADD COLUMN unsafe_change integer",
     );
     assert!(
-        String::from_utf8_lossy(&output).contains("0A000"),
+        !String::from_utf8_lossy(&output).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT unsafe_change FROM inheritance_child_rows",
+        )),
+        ["NULL"]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -39916,6 +39924,166 @@ fn table_inheritance_is_durable_typed_and_visible_to_parent_dml() {
 }
 
 #[test]
+fn ordinary_inheritance_parent_alter_rewrites_every_descendant() {
+    let (mut engine, mut budget) = test_engine();
+    for statement in [
+        "CREATE TABLE inheritance_alter_parent (id integer, label text)",
+        "CREATE TABLE inheritance_alter_child (extra text) INHERITS (inheritance_alter_parent)",
+        "CREATE TABLE inheritance_alter_grandchild (flag boolean) INHERITS (inheritance_alter_child)",
+        "INSERT INTO inheritance_alter_child (id, label, extra) VALUES (1, 'child', 'c')",
+        "INSERT INTO inheritance_alter_grandchild (id, label, extra, flag) VALUES (2, 'grandchild', 'g', true)",
+        "ALTER TABLE inheritance_alter_parent ADD COLUMN amount integer DEFAULT 7 NOT NULL",
+        "ALTER TABLE inheritance_alter_parent ALTER COLUMN label SET DEFAULT 'parent-default'",
+        "ALTER TABLE inheritance_alter_parent RENAME COLUMN label TO title",
+        "ALTER TABLE inheritance_alter_parent ALTER COLUMN amount TYPE bigint",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, title, amount, extra FROM ONLY inheritance_alter_child",
+        )),
+        ["1|child|7|c"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, title, amount, extra, flag FROM inheritance_alter_grandchild",
+        )),
+        ["2|grandchild|7|g|t"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE ONLY inheritance_alter_parent ALTER COLUMN amount SET DEFAULT 99",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE inheritance_alter_parent ADD CONSTRAINT inheritance_alter_amount_check CHECK (amount > 0)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT conislocal, coninhcount FROM pg_constraint \
+             WHERE conrelid = 'inheritance_alter_grandchild'::regclass \
+               AND conname = 'inheritance_alter_amount_check'",
+        )),
+        ["f|1"]
+    );
+    for statement in [
+        "INSERT INTO inheritance_alter_child (id, extra) VALUES (3, 'defaulted')",
+        "ALTER TABLE inheritance_alter_parent ALTER COLUMN amount DROP NOT NULL",
+        "ALTER TABLE inheritance_alter_parent DROP CONSTRAINT inheritance_alter_amount_check",
+        "ALTER TABLE ONLY inheritance_alter_parent ALTER COLUMN amount SET NOT NULL",
+        "INSERT INTO inheritance_alter_child (id, amount, extra) VALUES (4, NULL, 'parent-local-null')",
+        "ALTER TABLE inheritance_alter_parent ADD COLUMN propagated_tail integer DEFAULT 4, ADD CONSTRAINT inheritance_alter_parent_id_unique UNIQUE (id)",
+        "INSERT INTO inheritance_alter_child (id, extra) VALUES (3, 'duplicate-child-key')",
+        "ALTER TABLE inheritance_alter_parent ADD CONSTRAINT inheritance_alter_parent_id_unique_again UNIQUE (id)",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let child_rows = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT id, title, amount, extra, propagated_tail \
+         FROM ONLY inheritance_alter_child ORDER BY id, extra",
+    );
+    assert!(
+        !String::from_utf8_lossy(&child_rows).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&child_rows)
+    );
+    assert_eq!(
+        data_rows(&child_rows),
+        [
+            "1|child|7|c|4",
+            "3|parent-default|7|defaulted|4",
+            "3|parent-default|7|duplicate-child-key|4",
+            "4|parent-default|NULL|parent-local-null|4",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_constraint \
+             WHERE conrelid = 'inheritance_alter_child'::regclass \
+               AND conname = 'inheritance_alter_parent_id_unique'",
+        )),
+        ["0"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE inheritance_alter_parent DROP COLUMN title",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT id, amount, extra, propagated_tail \
+             FROM ONLY inheritance_alter_child ORDER BY id, extra",
+        )),
+        [
+            "1|7|c|4",
+            "3|7|defaulted|4",
+            "3|7|duplicate-child-key|4",
+            "4|NULL|parent-local-null|4",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_constraint \
+             WHERE conrelid = 'inheritance_alter_grandchild'::regclass \
+               AND conname = 'inheritance_alter_amount_check'",
+        )),
+        ["0"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE ONLY inheritance_alter_parent ADD COLUMN split integer",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42P16"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery() {
     let mut config = test_config("table-definition-metadata-recovery");
     config.object_store_on = true;
@@ -39937,6 +40105,11 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
         "INSERT INTO table_definition_recovery_child VALUES (1, 'child')",
         "INSERT INTO table_definition_typed_rows VALUES (2, 'typed')",
         "INSERT INTO table_definition_detach_parent VALUES (4)",
+        "ALTER TABLE table_definition_recovery_rows ADD COLUMN inherited_amount integer DEFAULT 7 NOT NULL",
+        "ALTER TABLE table_definition_recovery_rows ALTER COLUMN inherited_amount TYPE bigint",
+        "ALTER TABLE table_definition_recovery_rows RENAME COLUMN inherited_amount TO inherited_total",
+        "ALTER TABLE table_definition_recovery_rows ADD CONSTRAINT table_definition_recovery_total_check CHECK (inherited_total > 0)",
+        "INSERT INTO table_definition_recovery_child (id, extra) VALUES (2, 'defaulted')",
         "ALTER TABLE table_definition_recovery_rows ALTER COLUMN id SET STATISTICS 91",
         "ALTER TABLE table_definition_detach_parent DETACH PARTITION table_definition_detach_child CONCURRENTLY",
     ] {
@@ -39984,7 +40157,25 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
         &mut restarted_budget,
         "SELECT id FROM table_definition_recovery_rows",
     );
-    assert_eq!(data_rows(&inherited_recovery_rows), ["1"]);
+    assert_eq!(data_rows(&inherited_recovery_rows), ["1", "2"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT id, inherited_total, extra FROM ONLY table_definition_recovery_child ORDER BY id",
+        )),
+        ["1|7|child", "2|7|defaulted"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT conislocal, coninhcount FROM pg_constraint \
+             WHERE conrelid = 'table_definition_recovery_child'::regclass \
+               AND conname = 'table_definition_recovery_total_check'",
+        )),
+        ["f|1"]
+    );
     assert_eq!(
         data_rows(&run_with(
             &mut restarted,

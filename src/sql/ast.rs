@@ -4286,7 +4286,7 @@ pub struct AlterTable<'a> {
     pub table: QualName<'a>,
     /// ALTER TABLE IF EXISTS: a missing target emits a notice and succeeds.
     pub if_exists: bool,
-    /// `ONLY` suppresses partition recursion.
+    /// `ONLY` suppresses permitted descendant propagation.
     pub only: bool,
     /// One or more subcommands. PostgreSQL applies a comma-separated list in a
     /// fixed pass order (drops, then type changes, then adds, then constraints,

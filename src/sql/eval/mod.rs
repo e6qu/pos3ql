@@ -215,6 +215,7 @@ pub mod sqlstate {
     pub const COLLATION_MISMATCH: &str = "42P21";
     pub const INDETERMINATE_COLLATION: &str = "42P22";
     pub const INVALID_FUNCTION_DEFINITION: &str = "42P13";
+    pub const FUNCTION_EXECUTED_NO_RETURN_STATEMENT: &str = "2F005";
     pub const WINDOWING_ERROR: &str = "42P20";
     pub const OUT_OF_MEMORY: &str = "53200";
     pub const STATEMENT_TOO_COMPLEX: &str = "54001";

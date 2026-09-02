@@ -60,6 +60,154 @@ fn foreign_data_catalogs_are_typed_transactional_and_visible() {
 }
 
 #[test]
+fn plpgsql_scalar_functions_are_typed_transactional_and_durable() {
+    let mut config = test_config("plpgsql_scalar_functions");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("plpgsql-scalar-functions-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE plpgsql_function_log(value integer); \
+         CREATE FUNCTION plpgsql_increment(value integer) RETURNS integer
+           LANGUAGE plpgsql AS 'DECLARE adjusted integer := value + 1;
+             BEGIN IF adjusted > 41 THEN RETURN adjusted; END IF; RETURN 0; END'; \
+         CREATE FUNCTION plpgsql_record(value integer) RETURNS integer
+           LANGUAGE plpgsql AS 'BEGIN
+             INSERT INTO plpgsql_function_log VALUES (value);
+             RETURN value * 2;
+           END'; \
+         CREATE FUNCTION plpgsql_divide(value integer) RETURNS integer
+           LANGUAGE plpgsql AS 'BEGIN
+             BEGIN
+               RETURN 10 / value;
+             EXCEPTION WHEN division_by_zero THEN
+               RETURN -1;
+             END;
+           END'; \
+         CREATE FUNCTION plpgsql_last_record() RETURNS integer
+           LANGUAGE plpgsql AS 'DECLARE observed integer;
+             BEGIN
+               SELECT value INTO observed FROM plpgsql_function_log;
+               RETURN observed;
+             END'; \
+         CREATE FUNCTION plpgsql_output(value integer, OUT result integer)
+           LANGUAGE plpgsql AS 'BEGIN result := value + 1; RETURN; END'; \
+         CREATE FUNCTION plpgsql_output_implicit(value integer, OUT result integer)
+           LANGUAGE plpgsql AS 'BEGIN result := value * 2; END'; \
+         CREATE FUNCTION plpgsql_no_return() RETURNS integer
+           LANGUAGE plpgsql AS 'BEGIN NULL; END'; \
+         CREATE FUNCTION plpgsql_void_return() RETURNS void
+           LANGUAGE plpgsql AS 'BEGIN RETURN; END'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT language.lanname \
+               FROM pg_proc proc JOIN pg_language language ON language.oid = proc.prolang \
+              WHERE proc.proname = 'plpgsql_increment'",
+        )),
+        ["plpgsql"]
+    );
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT plpgsql_increment(41), plpgsql_increment(1); \
+         SELECT plpgsql_divide(2), plpgsql_divide(0); \
+         SELECT plpgsql_output(41), plpgsql_output_implicit(41); \
+         BEGIN; SELECT plpgsql_record(21); ROLLBACK; \
+         SELECT count(*) FROM plpgsql_function_log; \
+         SELECT plpgsql_void_return(); \
+         SELECT plpgsql_no_return()",
+    );
+    assert_eq!(
+        data_rows(&setup),
+        ["42|0", "5|-1", "42|82", "42", "0", "NULL"],
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(
+        String::from_utf8_lossy(&setup).contains("2F005"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT plpgsql_increment(value => 41); SELECT plpgsql_record(7); \
+         SELECT plpgsql_last_record(); SELECT plpgsql_output(7); \
+         SELECT value FROM plpgsql_function_log",
+    );
+    assert_eq!(data_rows(&recovered), ["42", "14", "7", "8", "7"]);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn plpgsql_scalar_functions_honor_acl_security_and_configuration_scopes() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE plpgsql_function_owner; \
+         CREATE ROLE plpgsql_function_caller; \
+         CREATE ROLE plpgsql_function_denied; \
+         CREATE FUNCTION plpgsql_security_actor() RETURNS text \
+           LANGUAGE plpgsql SECURITY DEFINER AS 'BEGIN RETURN current_user; END'; \
+         ALTER FUNCTION plpgsql_security_actor() OWNER TO plpgsql_function_owner; \
+         REVOKE ALL ON FUNCTION plpgsql_security_actor() FROM PUBLIC; \
+         GRANT EXECUTE ON FUNCTION plpgsql_security_actor() TO plpgsql_function_caller; \
+         CREATE FUNCTION plpgsql_configured_actor() RETURNS text \
+           LANGUAGE plpgsql SET application_name TO 'inside-plpgsql' \
+           AS 'BEGIN RETURN current_setting(''application_name''); END'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let called = run_with(
+        &mut engine,
+        &mut budget,
+        "SET application_name TO 'outside'; SET ROLE plpgsql_function_caller; \
+         SELECT plpgsql_security_actor(), plpgsql_configured_actor(), current_setting('application_name'); \
+         RESET ROLE; SELECT current_setting('application_name')",
+    );
+    assert_eq!(
+        data_rows(&called),
+        ["plpgsql_function_owner|inside-plpgsql|outside", "outside"],
+        "{}",
+        String::from_utf8_lossy(&called)
+    );
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE plpgsql_function_denied; SELECT plpgsql_security_actor()",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+}
+
+#[test]
 fn foreign_data_privileges_and_savepoints_share_typed_catalog_state() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
@@ -23187,7 +23335,7 @@ fn trigger_exception_diagnostic_surface_is_typed_and_scoped() {
             BEGIN RETURN NEW; END';",
     );
     assert!(
-        String::from_utf8_lossy(&invalid).contains("conflicts with a trigger runtime variable"),
+        String::from_utf8_lossy(&invalid).contains("conflicts with a runtime variable"),
         "{}",
         String::from_utf8_lossy(&invalid)
     );

@@ -1387,6 +1387,24 @@ impl StorageCatalog<'_, '_, '_, '_> {
             _ => unreachable!("routine call resolution returns functions only"),
         };
         let result_type = result_contract.map_or(ColType::Record, |result| result.ctype);
+        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+            if let Some(invocations) = self.invocations {
+                return invocations.resolve(
+                    slot,
+                    arguments,
+                    self.statement_arena
+                        .expect("routine invocation state has statement arena"),
+                    arena,
+                );
+            }
+            if let Some((invocations, statement_arena)) = active_routine_invocations() {
+                return invocations.resolve(slot, arguments, statement_arena, arena);
+            }
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "PL/pgSQL functions require a resumable query executor"
+            ));
+        }
         let _formal_scope = super::exec::enter_routine_parameter_types(routine.arguments());
         let function_program = parse_stored_routine_function_program(
             routine.body_kind,

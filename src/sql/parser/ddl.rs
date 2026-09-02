@@ -3820,7 +3820,13 @@ impl<'a> Parser<'a> {
         if language == crate::sql::ast::RoutineLanguage::PlPgSql
             && !matches!(
                 kind,
-                RoutineCreateKind::Trigger
+                RoutineCreateKind::Function {
+                    set_returning: false,
+                    ..
+                } | RoutineCreateKind::OutputFunction {
+                    set_returning: false,
+                    ..
+                } | RoutineCreateKind::Trigger
                     | RoutineCreateKind::EventTrigger
                     | RoutineCreateKind::Procedure
             )

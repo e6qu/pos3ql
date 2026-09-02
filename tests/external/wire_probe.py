@@ -2306,6 +2306,57 @@ def test_plpgsql_scalar_function_bind_and_result_over_raw_wire():
     s.close()
 
 
+def test_plpgsql_set_function_bind_and_portal_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE FUNCTION wire_plpgsql_series(limit_value integer) RETURNS SETOF integer "
+        "LANGUAGE plpgsql AS 'DECLARE item integer; BEGIN "
+        "FOR item IN 1..limit_value LOOP RETURN NEXT item * 2; END LOOP; RETURN; END'",
+    )
+    check(
+        "raw wire: PL/pgSQL set function setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_plpgsql_series_statement\x00SELECT * FROM wire_plpgsql_series($1)\x00"
+        + struct.pack("!hi", 1, 23),
+    )
+    bind = frontend_message(
+        b"B",
+        b"wire_plpgsql_series_portal\x00wire_plpgsql_series_statement\x00"
+        + struct.pack("!hhh", 1, 0, 1)
+        + struct.pack("!i", 1)
+        + b"3"
+        + struct.pack("!h", 1)
+        + struct.pack("!h", 0),
+    )
+    describe = frontend_message(b"D", b"Pwire_plpgsql_series_portal\x00")
+    execute = frontend_message(b"E", b"wire_plpgsql_series_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    out = []
+    while True:
+        item = read_message(s)
+        out.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in out if kind == b"T"), None)
+    rows = [text_row_fields(payload) for kind, payload in out if kind == b"D"]
+    check(
+        "raw wire: Bind and portal execution preserve PL/pgSQL set rows",
+        not any(kind == b"E" for kind, _ in out)
+        and description is not None
+        and row_description_type_oids(description) == [23]
+        and rows == [["2"], ["4"], ["6"]],
+        out,
+    )
+    s.close()
+
+
 def test_plpgsql_transaction_boundaries_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

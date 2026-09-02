@@ -10033,8 +10033,8 @@ impl Engine {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
-            let value = match exec::encode_projected_pub(&[value], arena) {
-                Ok(encoded) => exec::decode_projected_pub(encoded, 0),
+            let value = match exec::detach_routine_datum(value, arena) {
+                Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
             return Ok(eval::cast_to(value, result_type, arena));
@@ -10115,6 +10115,35 @@ impl Engine {
             Ok(scope) => scope,
             Err(error) => return Ok(Err(error)),
         };
+        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+            let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+            if pending.argument_count > arguments.len() {
+                return Ok(Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "too many function arguments"
+                )));
+            }
+            for (index, argument) in arguments
+                .iter_mut()
+                .enumerate()
+                .take(pending.argument_count)
+            {
+                *argument = exec::decode_projected_pub(pending.arguments, index);
+            }
+            let inputs = match arena.alloc_slice_copy(&arguments[..pending.argument_count]) {
+                Ok(inputs) => inputs,
+                Err(_) => {
+                    return Ok(Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "statement arena exhausted while invoking PL/pgSQL table function"
+                    )));
+                }
+            };
+            let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
+            return Ok(exec::execute_plpgsql_table_function(
+                self, txn, cursors, guc, &routine, &*inputs, arena, responder,
+            ));
+        }
         let body = match arena.alloc_str(routine.body.as_str()) {
             Ok(body) => body,
             Err(_) => {

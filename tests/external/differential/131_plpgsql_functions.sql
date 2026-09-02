@@ -7,6 +7,9 @@ DROP FUNCTION IF EXISTS plpgsql_function_last();
 DROP FUNCTION IF EXISTS plpgsql_function_divide(integer);
 DROP FUNCTION IF EXISTS plpgsql_function_output(integer);
 DROP FUNCTION IF EXISTS plpgsql_function_output_implicit(integer);
+DROP FUNCTION IF EXISTS plpgsql_function_pair(integer);
+DROP FUNCTION IF EXISTS plpgsql_function_series(integer);
+DROP FUNCTION IF EXISTS plpgsql_function_table_series(integer);
 DROP FUNCTION IF EXISTS plpgsql_function_configured_actor();
 DROP FUNCTION IF EXISTS plpgsql_function_security_actor();
 DROP FUNCTION IF EXISTS plpgsql_function_write(integer);
@@ -58,6 +61,36 @@ CREATE FUNCTION plpgsql_function_output(value integer, OUT result integer)
   LANGUAGE plpgsql AS $$ BEGIN result := value + 1; RETURN; END $$;
 CREATE FUNCTION plpgsql_function_output_implicit(value integer, OUT result integer)
   LANGUAGE plpgsql AS $$ BEGIN result := value * 2; END $$;
+CREATE FUNCTION plpgsql_function_pair(value integer, OUT next_value integer, OUT label text)
+  LANGUAGE plpgsql AS $$
+BEGIN
+  next_value := value + 1;
+  label := 'value:' || value;
+  RETURN;
+END
+$$;
+CREATE FUNCTION plpgsql_function_series(limit_value integer) RETURNS SETOF integer
+  LANGUAGE plpgsql AS $$
+DECLARE
+  item integer;
+BEGIN
+  FOR item IN 1..limit_value LOOP
+    RETURN NEXT item * 2;
+  END LOOP;
+  RETURN;
+END
+$$;
+CREATE FUNCTION plpgsql_function_table_series(limit_value integer)
+  RETURNS TABLE (value integer, label text)
+  LANGUAGE plpgsql AS $$
+BEGIN
+  FOR value IN 1..limit_value LOOP
+    label := 'item:' || value;
+    RETURN NEXT;
+  END LOOP;
+  RETURN QUERY SELECT limit_value + 1, 'tail';
+END
+$$;
 CREATE FUNCTION plpgsql_function_no_return() RETURNS integer
   LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
 CREATE FUNCTION plpgsql_function_void_return() RETURNS void
@@ -79,6 +112,9 @@ CREATE FUNCTION plpgsql_function_configured_actor() RETURNS text
 SELECT plpgsql_function_increment(41), plpgsql_function_increment(1);
 SELECT plpgsql_function_divide(2), plpgsql_function_divide(0);
 SELECT plpgsql_function_output(41), plpgsql_function_output_implicit(41);
+SELECT (plpgsql_function_pair(7)).next_value, (plpgsql_function_pair(7)).label;
+SELECT * FROM plpgsql_function_series(3);
+SELECT * FROM plpgsql_function_table_series(2);
 BEGIN;
 SELECT plpgsql_function_write(21);
 ROLLBACK;
@@ -104,6 +140,9 @@ DROP FUNCTION plpgsql_function_last();
 DROP FUNCTION plpgsql_function_divide(integer);
 DROP FUNCTION plpgsql_function_output(integer);
 DROP FUNCTION plpgsql_function_output_implicit(integer);
+DROP FUNCTION plpgsql_function_table_series(integer);
+DROP FUNCTION plpgsql_function_series(integer);
+DROP FUNCTION plpgsql_function_pair(integer);
 DROP FUNCTION plpgsql_function_configured_actor();
 DROP FUNCTION plpgsql_function_security_actor();
 DROP FUNCTION plpgsql_function_write(integer);

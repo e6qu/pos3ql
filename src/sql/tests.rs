@@ -284,6 +284,184 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
 }
 
 #[test]
+fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
+    let mut config = test_config("plpgsql_dynamic_catalog_utilities");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("plpgsql-dynamic-catalog-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION plpgsql_dynamic_catalog_utility() RETURNS void
+           LANGUAGE plpgsql AS 'BEGIN
+             EXECUTE ''CREATE TABLE plpgsql_dynamic_catalog_rows (id integer PRIMARY KEY, value text)'';
+             EXECUTE ''CREATE INDEX plpgsql_dynamic_catalog_value_idx ON plpgsql_dynamic_catalog_rows (value)'';
+             EXECUTE ''CLUSTER plpgsql_dynamic_catalog_rows USING plpgsql_dynamic_catalog_value_idx'';
+             EXECUTE ''CREATE SEQUENCE plpgsql_dynamic_catalog_sequence START WITH 4'';
+             EXECUTE ''ALTER SEQUENCE plpgsql_dynamic_catalog_sequence RESTART WITH 9'';
+             EXECUTE ''CREATE VIEW plpgsql_dynamic_catalog_view AS SELECT id, value FROM plpgsql_dynamic_catalog_rows'';
+             EXECUTE ''COMMENT ON TABLE plpgsql_dynamic_catalog_rows IS ''''dynamic catalog table'''''';
+             EXECUTE ''CREATE TYPE plpgsql_dynamic_catalog_state AS ENUM (''''ready'''', ''''blocked'''')'';
+             EXECUTE ''ALTER TYPE plpgsql_dynamic_catalog_state ADD VALUE ''''done'''''';
+             EXECUTE ''CREATE DOMAIN plpgsql_dynamic_catalog_positive AS integer CHECK (VALUE > 0)'';
+             EXECUTE ''CREATE FUNCTION plpgsql_dynamic_catalog_answer() RETURNS integer LANGUAGE sql AS ''''SELECT 43'''''';
+             EXECUTE ''ALTER FUNCTION plpgsql_dynamic_catalog_answer() COST 7'';
+           END'; \
+         CREATE FUNCTION plpgsql_dynamic_catalog_acl() RETURNS void
+           LANGUAGE plpgsql AS 'BEGIN
+             EXECUTE ''CREATE ROLE plpgsql_dynamic_catalog_reader'';
+             EXECUTE ''GRANT SELECT ON plpgsql_dynamic_catalog_rows TO plpgsql_dynamic_catalog_reader'';
+           END'; \
+         CREATE FUNCTION plpgsql_dynamic_catalog_publication() RETURNS void
+           LANGUAGE plpgsql AS 'BEGIN
+             EXECUTE ''CREATE PUBLICATION plpgsql_dynamic_catalog_publication \
+               FOR TABLE plpgsql_dynamic_catalog_rows'';
+           END'; \
+         CREATE FUNCTION plpgsql_dynamic_catalog_schema() RETURNS void
+           LANGUAGE plpgsql AS 'BEGIN
+             EXECUTE ''CREATE SCHEMA plpgsql_dynamic_catalog_ns \
+               CREATE TABLE schema_rows (value integer) \
+               CREATE VIEW schema_view AS SELECT value FROM schema_rows'';
+           END'; \
+         CREATE FUNCTION plpgsql_dynamic_catalog_drop_schema() RETURNS void
+           LANGUAGE plpgsql AS 'BEGIN
+             EXECUTE ''DROP SCHEMA plpgsql_dynamic_catalog_ns CASCADE'';
+           END'; \
+         CREATE FUNCTION plpgsql_dynamic_catalog_lifecycle() RETURNS void
+           LANGUAGE plpgsql AS 'BEGIN
+             EXECUTE ''ALTER TABLE plpgsql_dynamic_catalog_rows ENABLE ROW LEVEL SECURITY'';
+             EXECUTE ''CREATE POLICY plpgsql_dynamic_catalog_policy ON plpgsql_dynamic_catalog_rows FOR SELECT USING (true)'';
+             EXECUTE ''CREATE STATISTICS plpgsql_dynamic_catalog_stats ON id, value FROM plpgsql_dynamic_catalog_rows'';
+             EXECUTE ''CREATE MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized AS SELECT id, value FROM plpgsql_dynamic_catalog_rows'';
+             EXECUTE ''REFRESH MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized'';
+           END'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT plpgsql_dynamic_catalog_utility(); \
+         SELECT plpgsql_dynamic_catalog_acl(); \
+         SELECT plpgsql_dynamic_catalog_publication(); \
+         SELECT plpgsql_dynamic_catalog_schema(); \
+         INSERT INTO plpgsql_dynamic_catalog_ns.schema_rows VALUES (11); \
+         SELECT * FROM plpgsql_dynamic_catalog_ns.schema_view; \
+         INSERT INTO plpgsql_dynamic_catalog_rows VALUES \
+           (nextval('plpgsql_dynamic_catalog_sequence'), 'nine'); \
+         SELECT plpgsql_dynamic_catalog_lifecycle(); \
+         SELECT * FROM plpgsql_dynamic_catalog_view; \
+         SELECT * FROM plpgsql_dynamic_catalog_materialized; \
+         SELECT obj_description('plpgsql_dynamic_catalog_rows'::regclass, 'pg_class'); \
+         SELECT enumlabel FROM pg_enum \
+           WHERE enumtypid = 'plpgsql_dynamic_catalog_state'::regtype \
+           ORDER BY enumsortorder; \
+         SELECT 7::plpgsql_dynamic_catalog_positive; \
+         SELECT plpgsql_dynamic_catalog_answer(); \
+         SELECT has_table_privilege('plpgsql_dynamic_catalog_reader', \
+           'plpgsql_dynamic_catalog_rows', 'SELECT'); \
+         SELECT pubname FROM pg_publication \
+           WHERE pubname = 'plpgsql_dynamic_catalog_publication'",
+    );
+    assert_eq!(
+        data_rows(&created),
+        [
+            "NULL",
+            "NULL",
+            "NULL",
+            "NULL",
+            "11",
+            "NULL",
+            "9|nine",
+            "9|nine",
+            "dynamic catalog table",
+            "ready",
+            "blocked",
+            "done",
+            "7",
+            "43",
+            "t",
+            "plpgsql_dynamic_catalog_publication",
+        ],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT * FROM plpgsql_dynamic_catalog_view; \
+         SELECT * FROM plpgsql_dynamic_catalog_materialized; \
+         SELECT * FROM plpgsql_dynamic_catalog_ns.schema_view; \
+         SELECT obj_description('plpgsql_dynamic_catalog_rows'::regclass, 'pg_class'); \
+         SELECT enumlabel FROM pg_enum \
+           WHERE enumtypid = 'plpgsql_dynamic_catalog_state'::regtype \
+           ORDER BY enumsortorder; \
+         SELECT 7::plpgsql_dynamic_catalog_positive; \
+         SELECT plpgsql_dynamic_catalog_answer(); \
+         SELECT has_table_privilege('plpgsql_dynamic_catalog_reader', \
+           'plpgsql_dynamic_catalog_rows', 'SELECT'); \
+         SELECT pubname FROM pg_publication \
+           WHERE pubname = 'plpgsql_dynamic_catalog_publication'",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "9|nine",
+            "9|nine",
+            "11",
+            "dynamic catalog table",
+            "ready",
+            "blocked",
+            "done",
+            "7",
+            "43",
+            "t",
+            "plpgsql_dynamic_catalog_publication",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    let cleanup = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT plpgsql_dynamic_catalog_drop_schema(); \
+         DROP FUNCTION plpgsql_dynamic_catalog_drop_schema(); \
+         DROP FUNCTION plpgsql_dynamic_catalog_schema(); \
+         DROP FUNCTION plpgsql_dynamic_catalog_lifecycle(); \
+         DROP MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized; \
+         DROP STATISTICS plpgsql_dynamic_catalog_stats; \
+         DROP POLICY plpgsql_dynamic_catalog_policy ON plpgsql_dynamic_catalog_rows; \
+         DROP FUNCTION plpgsql_dynamic_catalog_publication(); \
+         DROP PUBLICATION plpgsql_dynamic_catalog_publication; \
+         DROP FUNCTION plpgsql_dynamic_catalog_acl(); \
+         DROP FUNCTION plpgsql_dynamic_catalog_answer(); \
+         DROP FUNCTION plpgsql_dynamic_catalog_utility(); \
+         REVOKE SELECT ON plpgsql_dynamic_catalog_rows FROM plpgsql_dynamic_catalog_reader; \
+         DROP ROLE plpgsql_dynamic_catalog_reader",
+    );
+    assert!(
+        !String::from_utf8_lossy(&cleanup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&cleanup)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn plpgsql_scalar_functions_honor_acl_security_and_configuration_scopes() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
@@ -3205,6 +3383,27 @@ fn event_trigger_catalog_dependents_and_toast_state_survive_recovery() {
     assert_eq!(data_rows(&output), ["index|t", "toast table|t"]);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn plpgsql_dynamic_utilities_share_static_ddl_event_boundaries() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE dynamic_ddl_audit(event text, tag text); \
+         CREATE FUNCTION capture_dynamic_ddl() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO dynamic_ddl_audit VALUES (TG_EVENT, TG_TAG); RETURN; END'; \
+         CREATE EVENT TRIGGER capture_dynamic_ddl_end ON ddl_command_end \
+           WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION capture_dynamic_ddl(); \
+         CREATE FUNCTION dynamic_create_table() RETURNS void LANGUAGE plpgsql AS \
+           'BEGIN EXECUTE ''CREATE TABLE dynamic_ddl_target(value integer)''; END'; \
+         SELECT dynamic_create_table(); \
+         SELECT event, tag FROM dynamic_ddl_audit",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["NULL", "ddl_command_end|CREATE TABLE"]);
 }
 
 #[test]

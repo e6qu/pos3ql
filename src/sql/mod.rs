@@ -11349,6 +11349,188 @@ impl Engine {
         result
     }
 
+    /// Runs a typed dynamic utility through the same command boundary as
+    /// static DDL while its executor remains in the procedural module.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_dynamic_utility<F>(
+        &mut self,
+        statement: &Stmt,
+        txn: &mut TxnState,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        transaction_context: exec::PlpgsqlTransactionContext,
+        arena: &Arena,
+        responder: &mut Responder,
+        execute: F,
+    ) -> Result<Result<(), SqlError>, WireFull>
+    where
+        F: FnOnce(
+            &mut Self,
+            &mut TxnState,
+            &mut Responder,
+        ) -> Result<Result<(), SqlError>, WireFull>,
+    {
+        if txn.failed {
+            return Ok(Err(SqlError {
+                sqlstate: SqlState::known(sqlstate::IN_FAILED_SQL_TRANSACTION),
+                message: stack_format!(
+                    192,
+                    "current transaction is aborted, commands ignored until end of transaction block"
+                ),
+            }));
+        }
+        if transaction_context == exec::PlpgsqlTransactionContext::Atomic
+            && let Some(command) = top_level_only_command(statement)
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "{} cannot run inside a transaction block",
+                command
+            )));
+        }
+        if txn.read_only && statement_writes(statement) {
+            return Ok(Err(sql_err!(
+                sqlstate::READ_ONLY_SQL_TRANSACTION,
+                "cannot execute {} in a read-only transaction block",
+                statement_tag(statement)
+            )));
+        }
+        if statement_changes_schema(statement)
+            && let Some(blocker) = self.storage.schema_lock_blocker(txn.txid)
+        {
+            if let Err(error) = self.storage.wait_for_transaction(txn.txid, blocker) {
+                return Ok(Err(error));
+            }
+            return Ok(Err(sql_err!(
+                sqlstate::INTERNAL_LOCK_WAIT,
+                "statement is waiting for a schema lock"
+            )));
+        }
+        if let Err(error) = self.begin_command_snapshot(txn, true) {
+            return Ok(Err(error));
+        }
+        let event_tag = event_trigger_tag(statement);
+        if let Some(tag) = event_tag
+            && let Err(error) = self.fire_event_triggers(
+                EventTriggerInvocation::DdlCommandStart { tag },
+                EventTriggerExecution {
+                    txn,
+                    cursors,
+                    guc,
+                    arena,
+                    responder,
+                },
+            )
+        {
+            return Ok(Err(error));
+        }
+        if let Some((slot, reason)) = table_rewrite_target(statement, &self.storage, txn.txid)
+            && let Err(error) = self.fire_event_triggers(
+                EventTriggerInvocation::TableRewrite {
+                    relation_oid: catalog::user_table_oid(slot),
+                    reason,
+                },
+                EventTriggerExecution {
+                    txn,
+                    cursors,
+                    guc,
+                    arena,
+                    responder,
+                },
+            )
+        {
+            return Ok(Err(error));
+        }
+        let event_ddl_mark = txn.ddl().len();
+        let event_ddl_origin = txn.ddl_origin();
+        let event_drop = event_tag.is_some_and(|tag| {
+            event_trigger_drop_command(statement)
+                && has_event_trigger(
+                    &self.storage,
+                    txn,
+                    guc,
+                    ast::EventTriggerEvent::SqlDrop,
+                    tag,
+                )
+        });
+        let event_end = event_tag.is_some_and(|tag| {
+            has_event_trigger(
+                &self.storage,
+                txn,
+                guc,
+                ast::EventTriggerEvent::DdlCommandEnd,
+                tag,
+            )
+        });
+        let event_before = if event_drop || event_end {
+            match event_trigger::capture_before(&self.storage, txn.txid, statement, arena) {
+                Ok(before) => before,
+                Err(error) => return Ok(Err(error)),
+            }
+        } else {
+            event_trigger::BeforeDdl::EMPTY
+        };
+        let outcome = execute(self, txn, responder);
+        if matches!(outcome, Ok(Ok(())))
+            && (event_drop || event_end)
+            && let Some(tag) = event_tag
+        {
+            let mut commands = [event_trigger::DdlCommand::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
+            let mut drops = [event_trigger::DroppedObject::EMPTY; event_trigger::MAX_EVENT_OBJECTS];
+            let (command_count, drop_count) = match event_trigger::collect(
+                &self.storage,
+                txn.txid,
+                statement,
+                tag,
+                event_trigger::CollectChanges {
+                    before: event_before,
+                    undo: &txn.ddl()[event_ddl_mark..],
+                    undo_origins: &txn.ddl_origins()[event_ddl_mark..],
+                    origin: event_ddl_origin,
+                    in_extension: txn.in_extension_script(),
+                },
+                event_trigger::EventGraphs {
+                    commands: &mut commands,
+                    drops: &mut drops,
+                },
+            ) {
+                Ok(counts) => counts,
+                Err(error) => return Ok(Err(error)),
+            };
+            if event_drop {
+                let _scope = event_trigger::enter_dropped_objects(&drops[..drop_count]);
+                if let Err(error) = self.fire_event_triggers(
+                    EventTriggerInvocation::SqlDrop { tag },
+                    EventTriggerExecution {
+                        txn,
+                        cursors,
+                        guc,
+                        arena,
+                        responder,
+                    },
+                ) {
+                    return Ok(Err(error));
+                }
+            }
+            if event_end {
+                let _scope = event_trigger::enter_ddl_commands(&commands[..command_count]);
+                if let Err(error) = self.fire_event_triggers(
+                    EventTriggerInvocation::DdlCommandEnd { tag },
+                    EventTriggerExecution {
+                        txn,
+                        cursors,
+                        guc,
+                        arena,
+                        responder,
+                    },
+                ) {
+                    return Ok(Err(error));
+                }
+            }
+        }
+        outcome
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn execute_stmt_with_workspace<'capture>(
         &mut self,
@@ -15777,7 +15959,7 @@ pub(crate) fn parse_error_to_sql(error: &ParseError) -> SqlError {
 /// Rewrites a CREATE SCHEMA element to create inside the new schema. An
 /// element that already names that schema passes through; one naming another
 /// schema is PostgreSQL's 42P15.
-fn requalify_schema_element<'a>(
+pub(crate) fn requalify_schema_element<'a>(
     element: &'a ast::CreateSchemaElement<'a>,
     schema: &'a str,
     arena: &'a Arena,

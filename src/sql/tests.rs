@@ -23483,9 +23483,6 @@ fn trigger_execution_status_is_typed_for_queries_and_dml() {
               PERFORM 1;
               GET DIAGNOSTICS rows = ROW_COUNT;
               INSERT INTO trigger_status_audit VALUES (''perform-one'', found, rows);
-              EXECUTE ''SELECT 1 WHERE false'';
-              GET DIAGNOSTICS rows = ROW_COUNT;
-              INSERT INTO trigger_status_audit VALUES (''dynamic-empty'', found, rows);
               SELECT id INTO selected FROM trigger_status_source WHERE id = -1;
               GET DIAGNOSTICS rows = ROW_COUNT;
               INSERT INTO trigger_status_audit VALUES (''select-empty'', found, rows);
@@ -23522,7 +23519,6 @@ fn trigger_execution_status_is_typed_for_queries_and_dml() {
         data_rows(&output),
         [
             "delete-empty|f|0",
-            "dynamic-empty|t|0",
             "for-empty|f|0",
             "for-one|t|0",
             "found-manual|t|0",
@@ -23558,6 +23554,30 @@ fn trigger_execution_status_is_typed_for_queries_and_dml() {
         ["local-shadow|t|0"],
         "{}",
         String::from_utf8_lossy(&shadowed)
+    );
+}
+
+#[test]
+fn dynamic_execute_preserves_found_and_updates_row_count() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION dynamic_execute_status() RETURNS boolean LANGUAGE plpgsql AS
+           'DECLARE rows bigint;
+            BEGIN
+              PERFORM 1;
+              EXECUTE ''SELECT 1 WHERE false'';
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              RETURN found AND rows = 0;
+            END';
+         SELECT dynamic_execute_status();",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t"],
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 

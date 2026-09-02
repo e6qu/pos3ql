@@ -6290,7 +6290,19 @@ pub fn alter_system(
     let current = storage
         .current_role_slot(txn.txid)
         .expect("current role exists");
-    if !storage.role(current).attributes_to(txn.txid).superuser {
+    let superuser = storage.role(current).attributes_to(txn.txid).superuser;
+    if !superuser
+        && name
+            .and_then(crate::sql::ast::ParameterName::parse)
+            .is_none_or(|parameter| {
+                !storage.has_parameter_privilege(
+                    parameter,
+                    current,
+                    crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM,
+                    txn.txid,
+                )
+            })
+    {
         return sql_fail(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "permission denied to alter system configuration"
@@ -7137,6 +7149,7 @@ fn privilege_mask(
             Privilege::Maintain => PrivilegeSet::MAINTAIN,
             Privilege::Connect => PrivilegeSet::CONNECT,
             Privilege::Temporary => PrivilegeSet::TEMPORARY,
+            Privilege::Set | Privilege::AlterSystem => PrivilegeSet::NONE,
         };
         if !allowed.contains(bit) {
             return Err(sql_err!(
@@ -7187,6 +7200,7 @@ fn default_privilege_mask(
             Privilege::Maintain => PrivilegeSet::MAINTAIN,
             Privilege::Connect => PrivilegeSet::CONNECT,
             Privilege::Temporary => PrivilegeSet::TEMPORARY,
+            Privilege::Set | Privilege::AlterSystem => PrivilegeSet::NONE,
         };
         if !allowed.contains(bit) {
             return Err(sql_err!(
@@ -7206,6 +7220,8 @@ fn default_privilege_mask(
                     Privilege::Maintain => "MAINTAIN",
                     Privilege::Connect => "CONNECT",
                     Privilege::Temporary => "TEMPORARY",
+                    Privilege::Set => "SET",
+                    Privilege::AlterSystem => "ALTER SYSTEM",
                     Privilege::All => "ALL",
                 }
             ));
@@ -8750,6 +8766,9 @@ fn resolve_privilege_objects(
     use crate::storage::{AccessClass, AccessObject};
     let mut count = 0usize;
     match target {
+        PrivilegeTarget::Parameters(_) => {
+            unreachable!("parameter privileges use their typed executor")
+        }
         PrivilegeTarget::LargeObjects(oids) => {
             for oid in oids {
                 let Some(slot) = storage.large_object_slot(*oid, txid) else {
@@ -9700,6 +9719,372 @@ pub fn revoke_privileges(
                         return sql_fail(error);
                     }
                 }
+            }
+        }
+    }
+    responder.command_complete("REVOKE")?;
+    sql_ok()
+}
+
+fn parameter_acl_grantee(storage: &Storage, written: &str, txid: u32) -> Result<u16, SqlError> {
+    if written.eq_ignore_ascii_case("public") {
+        return Ok(crate::storage::PUBLIC_ROLE);
+    }
+    storage
+        .find_role_visible(written, txid)
+        .map(|slot| slot as u16)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                written
+            )
+        })
+}
+
+fn parameter_acl_grantor(
+    storage: &Storage,
+    txn: &TxnState,
+    written: Option<&str>,
+) -> Result<usize, SqlError> {
+    let current = super::eval::funcs::system::current_user_owned();
+    let grantor = storage
+        .find_role_visible(current.as_str(), txn.txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                current.as_str()
+            )
+        })?;
+    if let Some(written) = written {
+        let resolved = resolve_role_name(written);
+        if resolved.as_str() != current.as_str() {
+            return Err(sql_err!(
+                sqlstate::INVALID_GRANT_OPERATION,
+                "GRANTED BY must specify the current user"
+            ));
+        }
+    }
+    Ok(grantor)
+}
+
+fn ensure_parameter_acl_target(parameter: crate::sql::ast::ParameterName) -> Result<(), SqlError> {
+    if crate::sql::guc::knows_parameter(parameter.as_str()) {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "unrecognized configuration parameter \"{}\"",
+            parameter.as_str()
+        ))
+    }
+}
+
+/// PostgreSQL records the bootstrap role's `SET, ALTER SYSTEM` ACL whenever a
+/// parameter first gains explicit ACL state.  Materializing it with the first
+/// mutation keeps catalog output, WAL, and checkpoint recovery identical.
+fn materialize_parameter_acl_default(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    parameter: crate::sql::ast::ParameterName,
+) -> Result<(), SqlError> {
+    let (privileges, _) = storage.parameter_acl_from(
+        parameter,
+        crate::storage::BOOTSTRAP_ROLE,
+        crate::storage::BOOTSTRAP_ROLE,
+        txn.txid,
+    );
+    if privileges == crate::sql::ast::ParameterPrivileges::ALL {
+        return Ok(());
+    }
+    let (slot, prior) = storage.change_parameter_acl(
+        parameter,
+        crate::storage::BOOTSTRAP_ROLE,
+        crate::storage::BOOTSTRAP_ROLE,
+        crate::sql::ast::ParameterPrivileges::ALL,
+        crate::sql::ast::ParameterPrivileges::NONE,
+        txn.txid,
+    )?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.restore_parameter_acl_pending(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub struct ParameterPrivilegeTarget<'a> {
+    pub privileges: crate::sql::ast::ParameterPrivileges,
+    pub names: &'a [crate::sql::ast::ParameterName],
+    pub grantees: &'a [&'a str],
+    pub grantor: Option<&'a str>,
+}
+
+pub struct ParameterGrantCommand<'a> {
+    pub target: ParameterPrivilegeTarget<'a>,
+    pub grant_option: bool,
+}
+
+pub struct ParameterRevokeCommand<'a> {
+    pub target: ParameterPrivilegeTarget<'a>,
+    pub grant_option_only: bool,
+    pub cascade: bool,
+}
+
+pub fn grant_parameter_privileges(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    command: ParameterGrantCommand<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let grantor = match parameter_acl_grantor(storage, txn, command.target.grantor) {
+        Ok(grantor) => grantor,
+        Err(error) => return sql_fail(error),
+    };
+    if command
+        .target
+        .names
+        .len()
+        .saturating_mul(command.target.grantees.len())
+        > super::txn::MAX_TXN_DDL
+    {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many parameter privilege changes in one statement"
+        ));
+    }
+    for parameter in command.target.names {
+        if let Err(error) = ensure_parameter_acl_target(*parameter) {
+            return sql_fail(error);
+        }
+        if let Err(error) = materialize_parameter_acl_default(storage, txn, *parameter) {
+            return sql_fail(error);
+        }
+        let can_grant = storage.role(grantor).attributes_to(txn.txid).superuser
+            || storage.has_parameter_grant_option(
+                *parameter,
+                grantor,
+                command.target.privileges,
+                txn.txid,
+            );
+        if !can_grant {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for parameter \"{}\"",
+                parameter.as_str()
+            ));
+        }
+        for written in command.target.grantees {
+            let grantee = match parameter_acl_grantee(storage, written, txn.txid) {
+                Ok(grantee) => grantee,
+                Err(error) => return sql_fail(error),
+            };
+            let (old_privileges, old_options) =
+                storage.parameter_acl_from(*parameter, grantee, grantor as u16, txn.txid);
+            let (slot, prior) = match storage.change_parameter_acl(
+                *parameter,
+                grantee,
+                grantor as u16,
+                old_privileges.union(command.target.privileges),
+                if command.grant_option {
+                    old_options.union(command.target.privileges)
+                } else {
+                    old_options
+                },
+                txn.txid,
+            ) {
+                Ok(change) => change,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.restore_parameter_acl_pending(slot, prior);
+                return sql_fail(error);
+            }
+        }
+    }
+    responder.command_complete("GRANT")?;
+    sql_ok()
+}
+
+fn cascade_parameter_acl_grants(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    parameter: crate::sql::ast::ParameterName,
+    source_role: u16,
+    lost: crate::sql::ast::ParameterPrivileges,
+    cascade: bool,
+) -> Result<(), SqlError> {
+    let mut roles = [0u16; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
+    let mut privileges =
+        [crate::sql::ast::ParameterPrivileges::NONE; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
+    let mut count = 1usize;
+    let mut at = 0usize;
+    roles[0] = source_role;
+    privileges[0] = lost;
+    while at < count {
+        let grantor = roles[at];
+        let lost = privileges[at];
+        at += 1;
+        let mut dependent = [usize::MAX; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
+        let dependent_count = storage.dependent_parameter_acl_slots(
+            parameter,
+            grantor,
+            lost,
+            txn.txid,
+            &mut dependent,
+        );
+        if dependent_count != 0 && !cascade {
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "dependent parameter privileges exist"
+            ));
+        }
+        for slot in &dependent[..dependent_count] {
+            let entry = *storage.parameter_acl_entry(*slot);
+            let (grantee, grantor) = storage.parameter_acl_identity(*slot, txn.txid);
+            let (old_privileges, old_options) = storage.parameter_acl_state(*slot, txn.txid);
+            let removed = crate::sql::ast::ParameterPrivileges::from_bits(
+                old_privileges.bits() & lost.bits(),
+            )
+            .expect("intersection of parameter privilege bits is valid");
+            let (changed, prior) = storage.change_parameter_acl(
+                entry.parameter,
+                grantee,
+                grantor,
+                old_privileges.without(removed),
+                old_options.without(removed),
+                txn.txid,
+            )?;
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
+                slot: changed as u32,
+                prior,
+            }) {
+                storage.restore_parameter_acl_pending(changed, prior);
+                return Err(error);
+            }
+            if grantee != crate::storage::PUBLIC_ROLE
+                && !storage.has_parameter_grant_option(
+                    entry.parameter,
+                    grantee as usize,
+                    removed,
+                    txn.txid,
+                )
+            {
+                if count == roles.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "parameter privilege dependency graph exceeds {} entries",
+                        roles.len()
+                    ));
+                }
+                roles[count] = grantee;
+                privileges[count] = removed;
+                count += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn revoke_parameter_privileges(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    command: ParameterRevokeCommand<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let grantor = match parameter_acl_grantor(storage, txn, command.target.grantor) {
+        Ok(grantor) => grantor,
+        Err(error) => return sql_fail(error),
+    };
+    for parameter in command.target.names {
+        if let Err(error) = ensure_parameter_acl_target(*parameter) {
+            return sql_fail(error);
+        }
+        if let Err(error) = materialize_parameter_acl_default(storage, txn, *parameter) {
+            return sql_fail(error);
+        }
+        let can_revoke = storage.role(grantor).attributes_to(txn.txid).superuser
+            || storage.has_parameter_grant_option(
+                *parameter,
+                grantor,
+                command.target.privileges,
+                txn.txid,
+            );
+        if !can_revoke {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for parameter \"{}\"",
+                parameter.as_str()
+            ));
+        }
+        for written in command.target.grantees {
+            let grantee = match parameter_acl_grantee(storage, written, txn.txid) {
+                Ok(grantee) => grantee,
+                Err(error) => return sql_fail(error),
+            };
+            let (old_privileges, old_options) =
+                storage.parameter_acl_from(*parameter, grantee, grantor as u16, txn.txid);
+            if old_privileges.bits() == 0 && old_options.bits() == 0 {
+                continue;
+            }
+            let (new_privileges, new_options) = if command.grant_option_only {
+                (
+                    old_privileges,
+                    old_options.without(command.target.privileges),
+                )
+            } else {
+                (
+                    old_privileges.without(command.target.privileges),
+                    old_options.without(command.target.privileges),
+                )
+            };
+            let (slot, prior) = match storage.change_parameter_acl(
+                *parameter,
+                grantee,
+                grantor as u16,
+                new_privileges,
+                new_options,
+                txn.txid,
+            ) {
+                Ok(change) => change,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.restore_parameter_acl_pending(slot, prior);
+                return sql_fail(error);
+            }
+            let removed_options = crate::sql::ast::ParameterPrivileges::from_bits(
+                old_options.bits() & command.target.privileges.bits(),
+            )
+            .expect("intersection of parameter privilege bits is valid");
+            if removed_options.bits() != 0
+                && grantee != crate::storage::PUBLIC_ROLE
+                && !storage.has_parameter_grant_option(
+                    *parameter,
+                    grantee as usize,
+                    removed_options,
+                    txn.txid,
+                )
+                && let Err(error) = cascade_parameter_acl_grants(
+                    storage,
+                    txn,
+                    *parameter,
+                    grantee,
+                    removed_options,
+                    command.cascade,
+                )
+            {
+                storage.restore_parameter_acl_pending(slot, prior);
+                return sql_fail(error);
             }
         }
     }

@@ -3112,6 +3112,7 @@ pub fn infer_type_res(
             | "has_schema_privilege"
             | "has_type_privilege"
             | "has_database_privilege"
+            | "has_parameter_privilege"
             | "pg_relation_is_publishable" => of(ColType::Bool),
             "array_length" | "cardinality" | "array_upper" | "array_lower" | "array_ndims" => {
                 of(ColType::Int4)

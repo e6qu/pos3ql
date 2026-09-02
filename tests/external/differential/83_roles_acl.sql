@@ -10,6 +10,17 @@ SELECT shobj_description(oid, 'pg_authid')
   FROM pg_roles WHERE rolname = 'acl_owner';
 GRANT acl_managed TO acl_administrator WITH ADMIN OPTION;
 GRANT CREATE ON SCHEMA public TO acl_owner;
+CREATE ROLE parameter_actor;
+GRANT SET ON PARAMETER event_triggers TO parameter_actor;
+SELECT has_parameter_privilege('parameter_actor', 'event_triggers', 'SET'),
+       has_parameter_privilege('parameter_actor', 'event_triggers', 'ALTER SYSTEM');
+SELECT 'pg_parameter_acl'::regclass::oid;
+SELECT parname, paracl::text FROM pg_parameter_acl;
+SET ROLE parameter_actor;
+SET event_triggers = off;
+RESET ROLE;
+REVOKE SET ON PARAMETER event_triggers FROM parameter_actor;
+DROP ROLE parameter_actor;
 
 SELECT acldefault('F', oid)::text, acldefault('L', oid)::text,
        acldefault('S', oid)::text, acldefault('T', oid)::text,

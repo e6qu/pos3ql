@@ -460,6 +460,8 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::RevokeRole { .. }
         | Stmt::GrantPrivileges { .. }
         | Stmt::RevokePrivileges { .. }
+        | Stmt::GrantParameterPrivileges { .. }
+        | Stmt::RevokeParameterPrivileges { .. }
         | Stmt::AlterDefaultPrivileges { .. }
         | Stmt::ReassignOwned { .. }
         | Stmt::DropOwned { .. } => true,
@@ -4553,6 +4555,58 @@ impl Engine {
             self.storage.set_lsn(lsn);
         }
         for (position, undo) in txn.ddl().iter().enumerate() {
+            let DdlUndo::ParameterAclChanged { slot, .. } = *undo else {
+                continue;
+            };
+            if txn.ddl()[position + 1..].iter().any(
+                |later| matches!(later, DdlUndo::ParameterAclChanged { slot: later, .. } if *later == slot),
+            ) {
+                continue;
+            }
+            let entry = *self.storage.parameter_acl_entry(slot as usize);
+            let (grantee, grantor) = self.storage.parameter_acl_identity(slot as usize, txn.txid);
+            if txn.ddl()[..position].iter().any(|earlier| {
+                let DdlUndo::ParameterAclChanged {
+                    slot: earlier_slot, ..
+                } = *earlier
+                else {
+                    return false;
+                };
+                if earlier_slot == slot {
+                    return false;
+                }
+                let earlier_entry = self.storage.parameter_acl_entry(earlier_slot as usize);
+                earlier_entry.parameter == entry.parameter
+                    && self
+                        .storage
+                        .parameter_acl_identity(earlier_slot as usize, txn.txid)
+                        == (grantee, grantor)
+            }) {
+                continue;
+            }
+            let (privileges, grant_options) =
+                self.storage.parameter_acl_state(slot as usize, txn.txid);
+            let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
+                .then(|| self.storage.role_name(grantee as usize, txn.txid));
+            let grantor_name = self.storage.role_name(grantor as usize, txn.txid);
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetParameterAcl {
+                    parameter: entry.parameter.as_str(),
+                    grantee: grantee_name.as_ref().map_or("PUBLIC", |role| role.as_str()),
+                    grantor: grantor_name.as_str(),
+                    privileges,
+                    grant_options,
+                },
+            ) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
+        for (position, undo) in txn.ddl().iter().enumerate() {
             let DdlUndo::DefaultAclChanged { slot, .. } = *undo else {
                 continue;
             };
@@ -5170,6 +5224,9 @@ impl Engine {
                 }
                 DdlUndo::DefaultAclChanged { slot, .. } => {
                     self.storage.commit_default_acl(*slot as usize, txn.txid);
+                }
+                DdlUndo::ParameterAclChanged { slot, .. } => {
+                    self.storage.commit_parameter_acl(*slot as usize, txn.txid);
                 }
                 // Promote the uncommitted comment overlay to committed; its WAL
                 // record was journaled at exec time (like other DDL).
@@ -5903,6 +5960,10 @@ impl Engine {
             DdlUndo::DefaultAclChanged { slot, prior } => {
                 self.storage
                     .restore_default_acl_pending(slot as usize, prior);
+            }
+            DdlUndo::ParameterAclChanged { slot, prior } => {
+                self.storage
+                    .restore_parameter_acl_pending(slot as usize, prior);
             }
             DdlUndo::CommentSet { slot, prior } => {
                 self.storage.restore_comment_pending(slot as usize, prior);
@@ -13401,6 +13462,48 @@ impl Engine {
                 *cascade,
                 responder,
             ),
+            Stmt::GrantParameterPrivileges {
+                privileges,
+                names,
+                grantees,
+                grant_option,
+                grantor,
+            } => exec::grant_parameter_privileges(
+                &mut self.storage,
+                txn,
+                exec::ParameterGrantCommand {
+                    target: exec::ParameterPrivilegeTarget {
+                        privileges: *privileges,
+                        names,
+                        grantees,
+                        grantor: *grantor,
+                    },
+                    grant_option: *grant_option,
+                },
+                responder,
+            ),
+            Stmt::RevokeParameterPrivileges {
+                grant_option_only,
+                privileges,
+                names,
+                grantees,
+                grantor,
+                cascade,
+            } => exec::revoke_parameter_privileges(
+                &mut self.storage,
+                txn,
+                exec::ParameterRevokeCommand {
+                    target: exec::ParameterPrivilegeTarget {
+                        privileges: *privileges,
+                        names,
+                        grantees,
+                        grantor: *grantor,
+                    },
+                    grant_option_only: *grant_option_only,
+                    cascade: *cascade,
+                },
+                responder,
+            ),
             Stmt::AlterDefaultPrivileges {
                 roles,
                 schemas,
@@ -13914,14 +14017,28 @@ impl Engine {
                 local,
                 syntax,
             } => {
-                if name.eq_ignore_ascii_case("event_triggers")
-                    && self.storage.current_role_slot(txn.txid).is_none_or(|role| {
-                        !self.storage.role(role).attributes_to(txn.txid).superuser
-                    })
+                if crate::sql::guc::requires_set_privilege(name)
+                    && self
+                        .storage
+                        .current_role_slot(txn.txid)
+                        .is_some_and(|role| {
+                            !self.storage.role(role).attributes_to(txn.txid).superuser
+                                && crate::sql::ast::ParameterName::parse(name).is_none_or(
+                                    |parameter| {
+                                        !self.storage.has_parameter_privilege(
+                                            parameter,
+                                            role,
+                                            crate::sql::ast::ParameterPrivileges::SET,
+                                            txn.txid,
+                                        )
+                                    },
+                                )
+                        })
                 {
                     return Ok(Err(sql_err!(
                         sqlstate::INSUFFICIENT_PRIVILEGE,
-                        "permission denied to set parameter \"event_triggers\""
+                        "permission denied to set parameter \"{}\"",
+                        name
                     )));
                 }
                 if *local && !txn.is_explicit() {
@@ -14026,14 +14143,28 @@ impl Engine {
                 responder,
             ),
             Stmt::Reset(name) => {
-                if name.is_some_and(|name| name.eq_ignore_ascii_case("event_triggers"))
-                    && self.storage.current_role_slot(txn.txid).is_none_or(|role| {
-                        !self.storage.role(role).attributes_to(txn.txid).superuser
-                    })
+                if name.is_some_and(crate::sql::guc::requires_set_privilege)
+                    && self
+                        .storage
+                        .current_role_slot(txn.txid)
+                        .is_some_and(|role| {
+                            !self.storage.role(role).attributes_to(txn.txid).superuser
+                                && name
+                                    .and_then(crate::sql::ast::ParameterName::parse)
+                                    .is_none_or(|parameter| {
+                                        !self.storage.has_parameter_privilege(
+                                            parameter,
+                                            role,
+                                            crate::sql::ast::ParameterPrivileges::SET,
+                                            txn.txid,
+                                        )
+                                    })
+                        })
                 {
                     return Ok(Err(sql_err!(
                         sqlstate::INSUFFICIENT_PRIVILEGE,
-                        "permission denied to set parameter \"event_triggers\""
+                        "permission denied to set parameter \"{}\"",
+                        name.unwrap_or("")
                     )));
                 }
                 if let Some(name) = name
@@ -18543,6 +18674,43 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 })
                 .transpose()?;
             storage.install_system_setting(crate::storage::SqlName::parse(name)?, value)?;
+        }
+        WalOp::SetParameterAcl {
+            parameter,
+            grantee,
+            grantor,
+            privileges,
+            grant_options,
+        } => {
+            let parameter = crate::sql::ast::ParameterName::parse(parameter).ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "corrupt WAL parameter ACL name")
+            })?;
+            let grantee = if grantee.eq_ignore_ascii_case("public") {
+                crate::storage::PUBLIC_ROLE
+            } else {
+                storage.find_role(grantee).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "journal configures unknown role \"{}\"",
+                        grantee
+                    )
+                })? as u16
+            };
+            let grantor = storage.find_role(grantor).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal configures unknown role \"{}\"",
+                    grantor
+                )
+            })? as u16;
+            storage.change_parameter_acl(
+                parameter,
+                grantee,
+                grantor,
+                privileges,
+                grant_options,
+                0,
+            )?;
         }
         WalOp::SetObjectOwner {
             class,

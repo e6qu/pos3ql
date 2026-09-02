@@ -2334,6 +2334,55 @@ impl Checkpointer {
                             ))
                         })?;
                 }
+                Some("pacl") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let decode = |word: Option<&str>, missing: &'static str| {
+                        word.ok_or(CheckpointSetupError::Corrupt(missing))
+                            .and_then(decode_hex_name)
+                    };
+                    let parameter = decode(words.next(), "pacl parameter missing")?;
+                    let parameter = crate::sql::ast::ParameterName::parse(&parameter)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid pacl parameter"))?;
+                    let grantee = decode(words.next(), "pacl grantee missing")?;
+                    let grantor = decode(words.next(), "pacl grantor missing")?;
+                    let privileges: u8 = parse_field(words.next(), "pacl privileges")?;
+                    let grant_options: u8 = parse_field(words.next(), "pacl grant options")?;
+                    let privileges = crate::sql::ast::ParameterPrivileges::from_bits(privileges)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid pacl privileges"))?;
+                    let grant_options =
+                        crate::sql::ast::ParameterPrivileges::from_bits(grant_options)
+                            .ok_or(CheckpointSetupError::Corrupt("invalid pacl grant options"))?;
+                    if words.next().is_some() || !privileges.contains(grant_options) {
+                        return Err(CheckpointSetupError::Corrupt("invalid pacl record"));
+                    }
+                    let grantee = if grantee == "PUBLIC" {
+                        crate::storage::PUBLIC_ROLE
+                    } else {
+                        storage
+                            .find_role(&grantee)
+                            .ok_or(CheckpointSetupError::Corrupt("pacl grantee does not exist"))?
+                            as u16
+                    };
+                    let grantor = storage
+                        .find_role(&grantor)
+                        .ok_or(CheckpointSetupError::Corrupt("pacl grantor does not exist"))?
+                        as u16;
+                    storage
+                        .change_parameter_acl(
+                            parameter,
+                            grantee,
+                            grantor,
+                            privileges,
+                            grant_options,
+                            0,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest parameter ACL rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                }
                 Some("seq") => {
                     let Some((_, _, _, serials)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("seq outside table"));
@@ -8657,6 +8706,38 @@ impl Checkpointer {
                     grantee_hex.as_str(),
                     acl.privileges.0,
                     acl.grant_options.0
+                ),
+            )?;
+        }
+        for (_, acl) in storage.checkpoint_parameter_acls() {
+            use core::fmt::Write;
+            let grantee = if acl.grantee == crate::storage::PUBLIC_ROLE {
+                crate::storage::SqlName::parse("PUBLIC").expect("PUBLIC fits")
+            } else {
+                storage.role(acl.grantee as usize).name
+            };
+            let grantor = storage.role(acl.grantor as usize).name;
+            let mut parameter_hex = StackStr::<130>::new();
+            let mut grantee_hex = StackStr::<130>::new();
+            let mut grantor_hex = StackStr::<130>::new();
+            for byte in acl.parameter.as_str().as_bytes() {
+                let _ = write!(parameter_hex, "{byte:02x}");
+            }
+            for byte in grantee.as_str().as_bytes() {
+                let _ = write!(grantee_hex, "{byte:02x}");
+            }
+            for byte in grantor.as_str().as_bytes() {
+                let _ = write!(grantor_hex, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "pacl {} {} {} {} {}",
+                    parameter_hex.as_str(),
+                    grantee_hex.as_str(),
+                    grantor_hex.as_str(),
+                    acl.privileges.bits(),
+                    acl.grant_options.bits()
                 ),
             )?;
         }

@@ -8591,6 +8591,172 @@ fn role_rename_view_owner_and_privilege_inquiry_are_enforced() {
 }
 
 #[test]
+fn parameter_acls_are_typed_enforced_and_visible() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE parameter_operator;
+         GRANT SET, ALTER SYSTEM ON PARAMETER event_triggers TO parameter_operator;
+         SELECT has_parameter_privilege('parameter_operator', 'event_triggers', 'SET'),
+                has_parameter_privilege('parameter_operator', 'event_triggers', 'ALTER SYSTEM'),
+                has_parameter_privilege('parameter_operator', 'event_triggers', 'SET WITH GRANT OPTION');
+         SELECT parname, paracl::text FROM pg_parameter_acl;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "t|t|f",
+            "event_triggers|{postgres=sA/postgres,parameter_operator=sA/postgres}"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let mut operator = GucState::new();
+    operator.set_role("parameter_operator", false);
+    let output = run_session(
+        &mut engine,
+        &mut budget,
+        &mut operator,
+        "SET event_triggers = off",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let output = run_session(
+        &mut engine,
+        &mut budget,
+        &mut operator,
+        "ALTER SYSTEM SET event_triggers = off",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE ALTER SYSTEM ON PARAMETER event_triggers FROM parameter_operator",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let output = run_session(
+        &mut engine,
+        &mut budget,
+        &mut operator,
+        "ALTER SYSTEM SET event_triggers = on",
+    );
+    assert!(
+        String::from_utf8_lossy(&output)
+            .contains("permission denied to alter system configuration"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn parameter_acls_survive_cold_object_store_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_BUCKET: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_BUCKET.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("parameter-acl-cold-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("sql-parameter-acl-{}-{sequence}", std::process::id());
+    config.object_store_response_bytes = 1 << 20;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE durable_parameter_operator;
+         GRANT SET ON PARAMETER event_triggers TO durable_parameter_operator;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+    let mut restarted_budget = Budget::new((1 << 29) + (96 << 20));
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    let output = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "SELECT parname, paracl::text FROM pg_parameter_acl;
+         SELECT has_parameter_privilege('durable_parameter_operator', 'event_triggers', 'SET');
+         SET ROLE durable_parameter_operator;
+         SET event_triggers = off;",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "event_triggers|{postgres=sA/postgres,durable_parameter_operator=s/postgres}",
+            "t"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn parameter_acl_grant_options_obey_restrict_and_cascade() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE parameter_delegate;
+         CREATE ROLE parameter_leaf;
+         GRANT SET ON PARAMETER event_triggers TO parameter_delegate WITH GRANT OPTION;",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let mut delegate = GucState::new();
+    delegate.set_role("parameter_delegate", false);
+    let output = run_session(
+        &mut engine,
+        &mut budget,
+        &mut delegate,
+        "GRANT SET ON PARAMETER event_triggers TO parameter_leaf",
+    );
+    assert!(!String::from_utf8_lossy(&output).contains("ERROR"));
+    let restricted = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE GRANT OPTION FOR SET ON PARAMETER event_triggers FROM parameter_delegate RESTRICT",
+    );
+    assert!(
+        String::from_utf8_lossy(&restricted).contains("dependent parameter privileges exist"),
+        "{}",
+        String::from_utf8_lossy(&restricted)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE GRANT OPTION FOR SET ON PARAMETER event_triggers FROM parameter_delegate CASCADE;
+         SELECT has_parameter_privilege('parameter_leaf', 'event_triggers', 'SET');",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["f"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn role_ownership_and_acl_survive_cold_object_store_recovery() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

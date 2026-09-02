@@ -2938,15 +2938,15 @@ fn execute_row_trigger_body<'a>(
         None,
     )? {
         Some(TriggerFlow::Return(result)) => match result {
-            TriggerReturn::Null if before => Ok(false),
-            TriggerReturn::Old if before => {
+            TriggerReturnValue::Null if before => Ok(false),
+            TriggerReturnValue::Old if before => {
                 let Some(old) = old else { return Ok(false) };
                 if let Some(new) = new.as_deref_mut() {
                     new.copy_from_slice(old);
                 }
                 Ok(true)
             }
-            TriggerReturn::New if before && new.is_none() => Ok(false),
+            TriggerReturnValue::New if before && new.is_none() => Ok(false),
             _ => Ok(true),
         },
         Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) | None => {
@@ -12824,11 +12824,21 @@ pub struct AlterViewCommand<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum TriggerReturn {
+enum TriggerReturn<'a> {
     New,
     Old,
     Null,
     Void,
+    Value(&'a Expr<'a>),
+}
+
+#[derive(Clone, Copy)]
+enum TriggerReturnValue<'a> {
+    New,
+    Old,
+    Null,
+    Void,
+    Value(Datum<'a>),
 }
 
 /// The PL/pgSQL execution boundary determines which runtime-only names and
@@ -12837,8 +12847,29 @@ enum TriggerReturn {
 enum PlpgsqlProgramKind {
     Trigger,
     EventTrigger,
+    Function,
+    VoidFunction,
+    OutputFunction,
     Procedure,
     Anonymous,
+}
+
+fn plpgsql_function_program_kind(routine: &crate::storage::RoutineDef) -> PlpgsqlProgramKind {
+    match routine.kind {
+        crate::storage::RoutineKind::Function { result } if result.ctype == ColType::Void => {
+            PlpgsqlProgramKind::VoidFunction
+        }
+        crate::storage::RoutineKind::Function { .. }
+            if routine
+                .parameters()
+                .iter()
+                .any(|parameter| parameter.mode.is_output()) =>
+        {
+            PlpgsqlProgramKind::OutputFunction
+        }
+        crate::storage::RoutineKind::Function { .. } => PlpgsqlProgramKind::Function,
+        _ => unreachable!("PL/pgSQL scalar execution requires a scalar function"),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -13093,6 +13124,36 @@ impl<'a> TriggerInvocation<'a> {
         })
     }
 
+    fn function(
+        routine: &crate::storage::RoutineDef,
+        program_kind: PlpgsqlProgramKind,
+        arena: &'a Arena,
+    ) -> Result<Self, SqlError> {
+        Ok(Self {
+            program_kind,
+            name: "",
+            routine_schema: arena
+                .alloc_str(routine.schema.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            routine_name: arena
+                .alloc_str(routine.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            table_schema: "",
+            table_name: "",
+            relid: 0,
+            routine_oid: crate::storage::routine_oid(routine),
+            nargs: i32::try_from(routine.arguments().len())
+                .expect("routine argument capacity fits int4"),
+            when: "",
+            level: "",
+            operation: "",
+            argv: Datum::Null,
+            event: "",
+            tag: "",
+            exception: None,
+        })
+    }
+
     fn event_trigger(
         routine: &crate::storage::RoutineDef,
         event: &'a str,
@@ -13137,6 +13198,14 @@ impl<'a> TriggerInvocation<'a> {
                 self.routine_name
             ),
             PlpgsqlProgramKind::EventTrigger => stack_format!(
+                192,
+                "PL/pgSQL function {}.{}()",
+                self.routine_schema,
+                self.routine_name
+            ),
+            PlpgsqlProgramKind::Function
+            | PlpgsqlProgramKind::VoidFunction
+            | PlpgsqlProgramKind::OutputFunction => stack_format!(
                 192,
                 "PL/pgSQL function {}.{}()",
                 self.routine_schema,
@@ -13319,7 +13388,7 @@ enum TriggerStatement<'a> {
     While(TriggerWhile<'a>),
     Loop(TriggerBlock<'a>),
     LoopControl(TriggerLoopControl<'a>),
-    Return(TriggerReturn),
+    Return(TriggerReturn<'a>),
 }
 
 #[derive(Clone, Copy)]
@@ -13437,8 +13506,8 @@ struct TriggerProgram<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum TriggerFlow {
-    Return(TriggerReturn),
+enum TriggerFlow<'a> {
+    Return(TriggerReturnValue<'a>),
     Exit(u8),
     Continue(u8),
 }
@@ -14186,7 +14255,7 @@ fn parse_trigger_local<'a>(
     {
         return Err(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
-            "trigger local \"{}\" conflicts with a trigger runtime variable",
+            "PL/pgSQL local \"{}\" conflicts with a runtime variable",
             name.as_str()
         ));
     }
@@ -14205,7 +14274,7 @@ fn parse_trigger_local<'a>(
     if ctype.is_pseudo() && ctype != ColType::Record {
         return Err(sql_err!(
             sqlstate::INVALID_FUNCTION_DEFINITION,
-            "trigger local \"{}\" has pseudo-type {}",
+            "PL/pgSQL local \"{}\" has pseudo-type {}",
             name.as_str(),
             type_name
         ));
@@ -14725,13 +14794,13 @@ fn parse_trigger_perform<'a>(
     if source.is_truncated() {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "trigger PERFORM exceeds the routine SQL limit"
+            "PL/pgSQL PERFORM exceeds the routine SQL limit"
         ));
     }
     let source = arena.alloc_str(source.as_str()).map_err(|_| {
         sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
-            "trigger PERFORM exceeds the statement arena"
+            "PL/pgSQL PERFORM exceeds the statement arena"
         )
     })?;
     Ok(Some(super::parser::parse_query(source, arena)?))
@@ -14764,10 +14833,11 @@ fn parse_trigger_dml<'a>(source: &'a str, arena: &'a Arena) -> Result<TriggerDml
     }
 }
 
-fn parse_trigger_return(
-    statement: &str,
+fn parse_trigger_return<'a>(
+    statement: &'a str,
+    arena: &'a Arena,
     program_kind: PlpgsqlProgramKind,
-) -> Result<Option<TriggerReturn>, SqlError> {
+) -> Result<Option<TriggerReturn<'a>>, SqlError> {
     let Some(value) = strip_trigger_keyword(statement, "return") else {
         return Ok(None);
     };
@@ -14783,6 +14853,11 @@ fn parse_trigger_return(
         {
             TriggerReturn::Void
         }
+        PlpgsqlProgramKind::Function if !value.is_empty() => {
+            TriggerReturn::Value(super::parser::parse_expression(value, arena)?)
+        }
+        PlpgsqlProgramKind::VoidFunction if value.is_empty() => TriggerReturn::Void,
+        PlpgsqlProgramKind::OutputFunction if value.is_empty() => TriggerReturn::Void,
         _ => return Err(unsupported_trigger_body()),
     };
     Ok(Some(result))
@@ -15093,7 +15168,7 @@ fn invalid_trigger_sqlstate(code: &str) -> SqlError {
 
 /// Maps the bounded language's named conditions to canonical PostgreSQL
 /// SQLSTATEs before execution; arbitrary identifier spellings cannot enter a
-/// compiled trigger program.
+/// compiled PL/pgSQL program.
 fn trigger_condition_sqlstate(text: &str) -> Option<crate::sql::eval::SqlState> {
     let state = if text.eq_ignore_ascii_case("unique_violation") {
         sqlstate::UNIQUE_VIOLATION
@@ -15196,7 +15271,7 @@ fn parse_trigger_statement<'a>(
         };
         return Ok(TriggerStatement::TransactionControl(make(next)));
     }
-    if let Some(result) = parse_trigger_return(segment, program_kind)? {
+    if let Some(result) = parse_trigger_return(segment, arena, program_kind)? {
         return Ok(TriggerStatement::Return(result));
     }
     if let Some(diagnostics) = parse_trigger_get_diagnostics(segment, arena)? {
@@ -15283,7 +15358,7 @@ fn parse_trigger_block<'a>(
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger program exceeds the statement arena"
+                        "PL/pgSQL program exceeds the statement arena"
                     )
                 })?;
             return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::End));
@@ -15297,7 +15372,7 @@ fn parse_trigger_block<'a>(
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger program exceeds the statement arena"
+                        "PL/pgSQL program exceeds the statement arena"
                     )
                 })?;
             return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::EndIf));
@@ -15311,7 +15386,7 @@ fn parse_trigger_block<'a>(
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger program exceeds the statement arena"
+                        "PL/pgSQL program exceeds the statement arena"
                     )
                 })?;
             return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::EndCase));
@@ -15325,7 +15400,7 @@ fn parse_trigger_block<'a>(
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger program exceeds the statement arena"
+                        "PL/pgSQL program exceeds the statement arena"
                     )
                 })?;
             return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::EndLoop));
@@ -15339,7 +15414,7 @@ fn parse_trigger_block<'a>(
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger program exceeds the statement arena"
+                        "PL/pgSQL program exceeds the statement arena"
                     )
                 })?;
             return Ok((TriggerBlock { statements: out }, TriggerBlockEnd::Else));
@@ -15356,7 +15431,7 @@ fn parse_trigger_block<'a>(
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger program exceeds the statement arena"
+                        "PL/pgSQL program exceeds the statement arena"
                     )
                 })?;
             return Ok((
@@ -15397,7 +15472,7 @@ fn parse_trigger_block<'a>(
         {
             return Err(sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "trigger program nesting exceeds the loop limit"
+                "PL/pgSQL program nesting exceeds the loop limit"
             ));
         }
         let statement = if let Some(condition) = strip_trigger_keyword(segment, "if") {
@@ -15454,7 +15529,7 @@ fn parse_trigger_block<'a>(
                 .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "trigger program exceeds the statement arena"
+                        "PL/pgSQL program exceeds the statement arena"
                     )
                 })?;
             TriggerStatement::If(TriggerIf { branches })
@@ -15716,14 +15791,14 @@ fn parse_plpgsql_program<'a>(
             {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_COLUMN,
-                    "duplicate declaration of trigger local \"{}\"",
+                    "duplicate declaration of PL/pgSQL local \"{}\"",
                     local.name.as_str()
                 ));
             }
             if local_count == locals.len() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "trigger program has too many local variables"
+                    "PL/pgSQL program has too many local variables"
                 ));
             }
             locals[local_count] = Some(local);
@@ -15736,7 +15811,7 @@ fn parse_plpgsql_program<'a>(
             .map_err(|_| {
                 sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "trigger locals exceed the statement arena"
+                    "PL/pgSQL locals exceed the statement arena"
                 )
             })?;
         (&*locals, declarations[begin_at + 5..].trim())
@@ -15785,19 +15860,29 @@ fn parse_event_trigger_program<'a>(
     parse_plpgsql_program(body, arena, PlpgsqlProgramKind::EventTrigger)
 }
 
-fn validate_plpgsql_procedure_namespace(
+fn validate_plpgsql_routine_namespace(
     program: &TriggerProgram<'_>,
     parameters: &[RoutineParameterDef],
 ) -> Result<(), SqlError> {
-    for parameter in parameters {
+    for (index, parameter) in parameters.iter().enumerate() {
         let name = parameter.name.as_str();
         if name.is_empty() {
             continue;
         }
+        if parameters[..index]
+            .iter()
+            .any(|prior| prior.name == parameter.name)
+        {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "parameter name \"{}\" used more than once",
+                name
+            ));
+        }
         if TriggerExceptionVariable::parse(name).is_some() {
             return Err(sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
-                "procedure parameter \"{}\" conflicts with a PL/pgSQL diagnostic variable",
+                "routine parameter \"{}\" conflicts with a PL/pgSQL diagnostic variable",
                 name
             ));
         }
@@ -15879,7 +15964,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         &mut status,
         None,
     )? {
-        None | Some(TriggerFlow::Return(TriggerReturn::Void)) => Ok(()),
+        None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(()),
         Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
             Err(unsupported_trigger_body())
         }
@@ -15949,7 +16034,7 @@ pub(crate) fn execute_event_trigger<'a>(
         &mut status,
         None,
     )? {
-        None | Some(TriggerFlow::Return(TriggerReturn::Void)) => Ok(()),
+        None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => Ok(()),
         Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
             Err(unsupported_trigger_body())
         }
@@ -16092,7 +16177,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         &mut status,
         None,
     )? {
-        None | Some(TriggerFlow::Return(TriggerReturn::Void)) => {}
+        None | Some(TriggerFlow::Return(TriggerReturnValue::Void)) => {}
         Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
             return Err(unsupported_trigger_body());
         }
@@ -16112,10 +16197,224 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     Ok(output_count)
 }
 
+/// Executes a scalar PL/pgSQL function through the same bounded interpreter
+/// as procedures and triggers. A function return is evaluated while its local
+/// scope is still live, so a local cannot escape as an untyped name.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stored function execution owns its complete typed call context"
+)]
+pub(crate) fn execute_plpgsql_function<'a>(
+    engine: &mut super::Engine,
+    txn: &mut TxnState,
+    cursors: &mut super::cursor::CursorPool,
+    guc: &super::guc::GucState,
+    routine: &crate::storage::RoutineDef,
+    inputs: &'a [Datum<'a>],
+    arena: &'a Arena,
+    responder: &mut Responder<'_>,
+) -> Result<Datum<'a>, SqlError> {
+    let source = arena
+        .alloc_str(routine.body.as_str())
+        .map_err(|_| super::query::arena_full_pub())?;
+    let program_kind = plpgsql_function_program_kind(routine);
+    let program = parse_plpgsql_program(source, arena, program_kind)?;
+    let mut declarations = [None; MAX_COLUMNS];
+    let mut seeded = [Datum::Null; MAX_COLUMNS];
+    let mut declaration_count = 0usize;
+    for (input_index, parameter) in routine.arguments().iter().copied().enumerate() {
+        if parameter.name.as_str().is_empty() {
+            continue;
+        }
+        if declaration_count == declarations.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL function has too many variables"
+            ));
+        }
+        declarations[declaration_count] = Some(TriggerLocalDecl {
+            name: parameter.name,
+            ctype: parameter.ctype,
+            type_mod: -1,
+            initial: None,
+        });
+        seeded[declaration_count] = inputs[input_index];
+        declaration_count += 1;
+    }
+    let seeded_count = declaration_count;
+    for parameter in routine
+        .parameters()
+        .iter()
+        .copied()
+        .filter(|parameter| parameter.mode.is_output() && !parameter.name.as_str().is_empty())
+    {
+        if declarations[..declaration_count]
+            .iter()
+            .flatten()
+            .any(|prior| prior.name == parameter.name)
+        {
+            continue;
+        }
+        if declaration_count == declarations.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL function has too many variables"
+            ));
+        }
+        declarations[declaration_count] = Some(TriggerLocalDecl {
+            name: parameter.name,
+            ctype: parameter.ctype,
+            type_mod: -1,
+            initial: None,
+        });
+        declaration_count += 1;
+    }
+    for local in program.locals {
+        if declaration_count == declarations.len() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "PL/pgSQL function has too many variables"
+            ));
+        }
+        if declarations[..declaration_count]
+            .iter()
+            .flatten()
+            .any(|prior| prior.name == local.name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "duplicate declaration of PL/pgSQL variable \"{}\"",
+                local.name.as_str()
+            ));
+        }
+        declarations[declaration_count] = Some(*local);
+        declaration_count += 1;
+    }
+    let locals = arena
+        .alloc_slice_with(declaration_count, |index| {
+            declarations[index].expect("function local initialized")
+        })
+        .map_err(|_| super::query::arena_full_pub())?;
+    let definition = TableDef::empty();
+    let invocation = TriggerInvocation::function(routine, program_kind, arena)?;
+    let mut context = TriggerExecContext {
+        host: PlpgsqlExecHost::Routine {
+            engine,
+            guc,
+            cursors,
+            transaction_context: PlpgsqlTransactionContext::Atomic,
+        },
+        txn,
+        arena,
+        params: inputs,
+        seq_session: guc.seq_session(),
+        responder,
+    };
+    let mut local_values = [Datum::Null; MAX_COLUMNS];
+    let mut status = TriggerExecutionStatus::default();
+    initialize_trigger_locals(
+        &context,
+        invocation,
+        TriggerTransition {
+            definition: &definition,
+            old: None,
+            new: None,
+        },
+        locals,
+        &seeded[..seeded_count],
+        &mut local_values,
+    )?;
+    let mut no_new = None;
+    let output_index = routine
+        .parameters()
+        .iter()
+        .find(|parameter| parameter.mode.is_output())
+        .and_then(|parameter| {
+            (!parameter.name.as_str().is_empty()).then(|| {
+                locals
+                    .iter()
+                    .position(|local| local.name == parameter.name)
+                    .expect("validated output parameter has a local slot")
+            })
+        });
+    match execute_trigger_block(
+        &mut context,
+        &definition,
+        invocation,
+        None,
+        &mut no_new,
+        false,
+        None,
+        locals,
+        &mut local_values,
+        program.body,
+        &mut status,
+        None,
+    )? {
+        Some(TriggerFlow::Return(TriggerReturnValue::Value(value))) => Ok(value),
+        None if program_kind == PlpgsqlProgramKind::VoidFunction => Ok(Datum::Null),
+        Some(TriggerFlow::Return(TriggerReturnValue::Void))
+            if program_kind == PlpgsqlProgramKind::VoidFunction =>
+        {
+            Ok(Datum::Null)
+        }
+        None | Some(TriggerFlow::Return(TriggerReturnValue::Void))
+            if program_kind == PlpgsqlProgramKind::OutputFunction =>
+        {
+            Ok(output_index.map_or(Datum::Null, |index| local_values[index]))
+        }
+        None => Err(sql_err!(
+            sqlstate::FUNCTION_EXECUTED_NO_RETURN_STATEMENT,
+            "control reached end of function without RETURN"
+        )),
+        Some(TriggerFlow::Return(_)) | Some(TriggerFlow::Exit(_) | TriggerFlow::Continue(_)) => {
+            Err(unsupported_trigger_body())
+        }
+    }
+}
+
 #[cfg(test)]
 mod trigger_program_tests {
     use super::*;
     use crate::mem::budget::Budget;
+
+    #[test]
+    fn scalar_function_returns_a_typed_expression() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "plpgsql function parser", 1 << 16).unwrap();
+        parse_plpgsql_program(
+            "DECLARE adjusted integer := value + 1; \
+             BEGIN IF adjusted > 41 THEN RETURN adjusted; END IF; RETURN 0; END",
+            &arena,
+            PlpgsqlProgramKind::Function,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn void_function_returns_or_reaches_its_end_without_a_value() {
+        let mut budget = Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "PL/pgSQL void function parser", 1 << 16).unwrap();
+        parse_plpgsql_program(
+            "BEGIN RETURN; END",
+            &arena,
+            PlpgsqlProgramKind::VoidFunction,
+        )
+        .unwrap();
+        parse_plpgsql_program("BEGIN NULL; END", &arena, PlpgsqlProgramKind::VoidFunction).unwrap();
+        assert!(
+            parse_plpgsql_program(
+                "BEGIN RETURN 1; END",
+                &arena,
+                PlpgsqlProgramKind::VoidFunction
+            )
+            .is_err()
+        );
+        assert!(
+            parse_plpgsql_program("BEGIN RETURN; END", &arena, PlpgsqlProgramKind::Function)
+                .is_err()
+        );
+    }
 
     #[test]
     fn control_headers_split_before_their_first_action() {
@@ -16924,7 +17223,7 @@ fn trigger_local_index(locals: &[TriggerLocalDecl<'_>], name: SqlName) -> Result
         .ok_or_else(|| {
             sql_err!(
                 sqlstate::UNDEFINED_COLUMN,
-                "trigger local \"{}\" does not exist",
+                "PL/pgSQL local \"{}\" does not exist",
                 name.as_str()
             )
         })
@@ -17231,7 +17530,7 @@ fn execute_trigger_block<'a>(
     block: TriggerBlock<'a>,
     status: &mut TriggerExecutionStatus,
     exception: Option<&TriggerExceptionDiagnostic<'_>>,
-) -> Result<Option<TriggerFlow>, SqlError> {
+) -> Result<Option<TriggerFlow<'a>>, SqlError> {
     for statement in block.statements {
         match *statement {
             TriggerStatement::Null => {}
@@ -17241,7 +17540,32 @@ fn execute_trigger_block<'a>(
                 context.arena,
                 context.responder,
             )?,
-            TriggerStatement::Return(result) => return Ok(Some(TriggerFlow::Return(result))),
+            TriggerStatement::Return(result) => {
+                let result = match result {
+                    TriggerReturn::New => TriggerReturnValue::New,
+                    TriggerReturn::Old => TriggerReturnValue::Old,
+                    TriggerReturn::Null => TriggerReturnValue::Null,
+                    TriggerReturn::Void => TriggerReturnValue::Void,
+                    TriggerReturn::Value(expression) => {
+                        let transition = TriggerTransition {
+                            definition,
+                            old,
+                            new: new.as_deref(),
+                        };
+                        let scope = TriggerLocalScope {
+                            locals,
+                            values: &local_values[..locals.len()],
+                            found: status.found,
+                            invocation,
+                            transition: &transition,
+                        };
+                        TriggerReturnValue::Value(eval_trigger_expression(
+                            context, expression, &scope,
+                        )?)
+                    }
+                };
+                return Ok(Some(TriggerFlow::Return(result)));
+            }
             TriggerStatement::Assign(assignment) => {
                 if !before || new.is_none() {
                     return Err(sql_err!(
@@ -17355,7 +17679,7 @@ fn execute_trigger_block<'a>(
                     let Some(local) = locals.iter().position(|local| local.name == *target) else {
                         return Err(sql_err!(
                             sqlstate::UNDEFINED_COLUMN,
-                            "trigger local \"{}\" does not exist",
+                            "PL/pgSQL local \"{}\" does not exist",
                             target.as_str()
                         ));
                     };
@@ -25270,39 +25594,82 @@ pub fn create_routine(
     let mut creation_path = StackStr::<128>::new();
     let _formal_scope = enter_routine_parameter_types(&arguments[..argument_count]);
     match kind {
-        crate::storage::RoutineKind::Function { .. } => {
-            let returns_void = matches!(
-                kind,
-                crate::storage::RoutineKind::Function { result }
-                    if result.ctype == ColType::Void
-            );
-            let program = match super::query::parse_stored_routine_function_program(
-                body_kind,
-                body_text,
-                arena,
-                returns_void,
-                routine.name.name,
-                &arguments[..argument_count],
-            ) {
-                Ok(program) => program,
-                Err(error) => return sql_fail(error),
-            };
-            if body_kind != crate::storage::RoutineBodyKind::String {
-                let raw_path = guc.search_path();
-                let user = super::eval::funcs::system::session_user_owned();
-                let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
-                dependencies = match super::query::stored_routine_dependencies(
-                    &program, storage, txn.txid, path, arena,
-                ) {
-                    Ok(dependencies) => dependencies,
+        crate::storage::RoutineKind::Function { result } => {
+            if routine.language == RoutineLanguage::PlPgSql {
+                if body_kind != crate::storage::RoutineBodyKind::String {
+                    return sql_fail(sql_err!(
+                        sqlstate::INVALID_FUNCTION_DEFINITION,
+                        "PL/pgSQL functions require a string-literal body"
+                    ));
+                }
+                let output_parameter_count = routine
+                    .arguments
+                    .iter()
+                    .filter(|argument| argument.mode.is_output())
+                    .count();
+                if output_parameter_count > 1 {
+                    return sql_fail(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "PL/pgSQL functions with multiple OUT parameters are not supported"
+                    ));
+                }
+                let program_kind = if result.ctype == ColType::Void {
+                    PlpgsqlProgramKind::VoidFunction
+                } else if output_parameter_count == 1 {
+                    PlpgsqlProgramKind::OutputFunction
+                } else {
+                    PlpgsqlProgramKind::Function
+                };
+                let program = match parse_plpgsql_program(body_text, arena, program_kind) {
+                    Ok(program) => program,
                     Err(error) => return sql_fail(error),
                 };
-                creation_path = StackStr::from_str(raw_path.as_str());
+                if let Err(error) = validate_plpgsql_routine_namespace(
+                    &program,
+                    &parameters[..routine.arguments.len()],
+                ) {
+                    return sql_fail(error);
+                }
+            } else {
+                let returns_void = matches!(
+                    kind,
+                    crate::storage::RoutineKind::Function { result }
+                        if result.ctype == ColType::Void
+                );
+                let program = match super::query::parse_stored_routine_function_program(
+                    body_kind,
+                    body_text,
+                    arena,
+                    returns_void,
+                    routine.name.name,
+                    &arguments[..argument_count],
+                ) {
+                    Ok(program) => program,
+                    Err(error) => return sql_fail(error),
+                };
+                if body_kind != crate::storage::RoutineBodyKind::String {
+                    let raw_path = guc.search_path();
+                    let user = super::eval::funcs::system::session_user_owned();
+                    let path = storage.compute_path(raw_path.as_str(), user.as_str(), txn.txid);
+                    dependencies = match super::query::stored_routine_dependencies(
+                        &program, storage, txn.txid, path, arena,
+                    ) {
+                        Ok(dependencies) => dependencies,
+                        Err(error) => return sql_fail(error),
+                    };
+                    creation_path = StackStr::from_str(raw_path.as_str());
+                }
             }
         }
         crate::storage::RoutineKind::SetFunction { .. }
         | crate::storage::RoutineKind::RecordFunction { .. }
         | crate::storage::RoutineKind::TableFunction => {
+            if routine.language == RoutineLanguage::PlPgSql {
+                return sql_fail(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "PL/pgSQL set-returning and multi-column functions are not supported"
+                ));
+            }
             let returns_void = matches!(
                 kind,
                 crate::storage::RoutineKind::SetFunction { result }
@@ -25373,7 +25740,7 @@ pub fn create_routine(
                         Ok(program) => program,
                         Err(error) => return sql_fail(error),
                     };
-                if let Err(error) = validate_plpgsql_procedure_namespace(
+                if let Err(error) = validate_plpgsql_routine_namespace(
                     &program,
                     &parameters[..routine.arguments.len()],
                 ) {

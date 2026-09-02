@@ -380,7 +380,7 @@ pub fn parse_expr<'a>(
 }
 
 /// Parses one complete PostgreSQL type spelling for a procedural local.
-/// Keeping this at the parser boundary prevents trigger programs from
+/// Keeping this at the parser boundary prevents PL/pgSQL programs from
 /// hand-normalizing aliases or silently losing a typmod.
 pub(crate) fn parse_type_name<'a>(
     sql: &'a str,

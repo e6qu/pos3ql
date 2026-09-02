@@ -9991,6 +9991,54 @@ impl Engine {
                 "scalar routine resolved to a set-returning function"
             )));
         }
+        let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
+        if pending.argument_count > arguments.len() {
+            return Ok(Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many function arguments"
+            )));
+        }
+        for (index, argument) in arguments
+            .iter_mut()
+            .enumerate()
+            .take(pending.argument_count)
+        {
+            *argument = exec::decode_projected_pub(pending.arguments, index);
+        }
+        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+            if let Err(error) = self.storage.require_routine_execute(pending.slot, txn.txid) {
+                return Ok(Err(error));
+            }
+            let owner = self
+                .storage
+                .role_name(routine.ownership.owner_to(txn.txid).into(), txn.txid);
+            let _security = routine
+                .attributes
+                .security_definer
+                .then(|| eval::funcs::system::enter_current_user(owner.as_str()));
+            let _config = match guc.enter_routine_configs(routine.configs()) {
+                Ok(scope) => scope,
+                Err(error) => return Ok(Err(error)),
+            };
+            let value = match exec::execute_plpgsql_function(
+                self,
+                txn,
+                cursors,
+                guc,
+                &routine,
+                &arguments[..pending.argument_count],
+                arena,
+                responder,
+            ) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            let value = match exec::encode_projected_pub(&[value], arena) {
+                Ok(encoded) => exec::decode_projected_pub(encoded, 0),
+                Err(error) => return Ok(Err(error)),
+            };
+            return Ok(eval::cast_to(value, result_type, arena));
+        }
         let body = match arena.alloc_str(routine.body.as_str()) {
             Ok(body) => body,
             Err(_) => {
@@ -10020,20 +10068,6 @@ impl Engine {
             Ok(program) => program,
             Err(error) => return Ok(Err(error)),
         };
-        let mut arguments = [Datum::Null; crate::storage::MAX_ROUTINE_ARGUMENTS];
-        if pending.argument_count > arguments.len() {
-            return Ok(Err(sql_err!(
-                sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                "too many function arguments"
-            )));
-        }
-        for (index, argument) in arguments
-            .iter_mut()
-            .enumerate()
-            .take(pending.argument_count)
-        {
-            *argument = exec::decode_projected_pub(pending.arguments, index);
-        }
         self.execute_scalar_routine_program(
             pending.slot,
             routine,

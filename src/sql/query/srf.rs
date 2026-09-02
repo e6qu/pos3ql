@@ -3064,6 +3064,35 @@ fn table_func_base_rows_outer<'a, C: ColumnLookup<'a>>(
         let _config = (!routine.configs().is_empty())
             .then(|| crate::sql::guc::enter_active_routine_configs(routine.configs()))
             .transpose()?;
+        if routine.language == crate::storage::RoutineLanguage::PlPgSql {
+            let (invocations, statement_arena) = match (invocations, statement_arena) {
+                (Some(invocations), Some(statement_arena)) => (invocations, statement_arena),
+                (None, None) => super::active_routine_invocations().ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "PL/pgSQL table functions require a resumable query executor"
+                    )
+                })?,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "routine invocation state is missing its statement arena"
+                    ));
+                }
+            };
+            return invocations
+                .resolve_rows(
+                    routine_slot,
+                    &routine_params[..routine.argument_count],
+                    statement_arena,
+                )?
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "pending PL/pgSQL table routine did not suspend query execution"
+                    )
+                });
+        }
         let program = super::parse_stored_routine_function_program(
             routine.body_kind,
             routine.body.as_str(),

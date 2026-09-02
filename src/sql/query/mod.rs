@@ -580,8 +580,7 @@ impl<'a> RoutineInvocationState<'a> {
                     "SQL routine invocation changed from a table source to a scalar expression"
                 ));
             };
-            let encoded = super::exec::encode_projected_pub(&[value], query_arena)?;
-            return Ok(Some(super::exec::decode_projected_pub(encoded, 0)));
+            return Ok(Some(super::exec::detach_routine_datum(value, query_arena)?));
         }
         self.pending.set(Some(PendingRoutineInvocation {
             slot,
@@ -618,8 +617,7 @@ impl<'a> RoutineInvocationState<'a> {
                     "intrinsic invocation changed result shape"
                 ));
             };
-            let encoded = super::exec::encode_projected_pub(&[value], query_arena)?;
-            return Ok(super::exec::decode_projected_pub(encoded, 0));
+            return super::exec::detach_routine_datum(value, query_arena);
         }
         self.pending.set(Some(PendingRoutineInvocation {
             slot: 0,

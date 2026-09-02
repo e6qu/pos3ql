@@ -160,6 +160,80 @@ fn plpgsql_scalar_functions_are_typed_transactional_and_durable() {
 }
 
 #[test]
+fn plpgsql_set_and_record_functions_are_typed_and_durable() {
+    let mut config = test_config("plpgsql_set_and_record_functions");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("plpgsql-set-functions-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION plpgsql_pair(value integer, OUT next_value integer, OUT label text)
+           LANGUAGE plpgsql AS 'BEGIN next_value := value + 1; label := ''value:'' || value; RETURN; END'; \
+         CREATE FUNCTION plpgsql_series(limit_value integer) RETURNS SETOF integer
+           LANGUAGE plpgsql AS 'DECLARE item integer; BEGIN
+             FOR item IN 1..limit_value LOOP RETURN NEXT item * 2; END LOOP;
+             RETURN;
+           END'; \
+         CREATE FUNCTION plpgsql_table_series(limit_value integer) RETURNS TABLE (value integer, label text)
+           LANGUAGE plpgsql AS 'BEGIN
+             FOR value IN 1..limit_value LOOP label := ''item:'' || value; RETURN NEXT; END LOOP;
+             RETURN QUERY SELECT limit_value + 1, ''tail'';
+           END'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let returned = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT (plpgsql_pair(7)).next_value, (plpgsql_pair(7)).label; \
+         SELECT * FROM plpgsql_series(3); \
+         SELECT * FROM plpgsql_table_series(2)",
+    );
+    assert_eq!(
+        data_rows(&returned),
+        [
+            "8|value:7",
+            "2",
+            "4",
+            "6",
+            "NULL|item:1",
+            "NULL|item:2",
+            "3|tail",
+        ],
+        "{}",
+        String::from_utf8_lossy(&returned)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT (plpgsql_pair(7)).label; SELECT * FROM plpgsql_series(2); \
+         SELECT * FROM plpgsql_table_series(1)",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        ["value:7", "2", "4", "NULL|item:1", "2|tail"],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn plpgsql_scalar_functions_honor_acl_security_and_configuration_scopes() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(

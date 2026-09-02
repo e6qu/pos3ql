@@ -182,6 +182,15 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
            LANGUAGE plpgsql AS 'BEGIN
              FOR value IN 1..limit_value LOOP label := ''item:'' || value; RETURN NEXT; END LOOP;
              RETURN QUERY SELECT limit_value + 1, ''tail'';
+           END'; \
+         CREATE FUNCTION plpgsql_dynamic_scalar(input_value integer) RETURNS integer
+           LANGUAGE plpgsql AS 'DECLARE result_value integer; BEGIN
+             EXECUTE ''SELECT $1::integer * 3'' INTO STRICT result_value USING input_value;
+             RETURN result_value;
+           END'; \
+         CREATE FUNCTION plpgsql_dynamic_series(input_value integer) RETURNS SETOF integer
+           LANGUAGE plpgsql AS 'BEGIN
+             RETURN QUERY EXECUTE ''VALUES ($1::integer), ($1::integer + 1)'' USING input_value;
            END'",
     );
     assert!(
@@ -194,7 +203,9 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
         &mut budget,
         "SELECT (plpgsql_pair(7)).next_value, (plpgsql_pair(7)).label; \
          SELECT * FROM plpgsql_series(3); \
-         SELECT * FROM plpgsql_table_series(2)",
+         SELECT * FROM plpgsql_table_series(2); \
+         SELECT plpgsql_dynamic_scalar(14); \
+         SELECT * FROM plpgsql_dynamic_series(14)",
     );
     assert_eq!(
         data_rows(&returned),
@@ -206,6 +217,9 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
             "NULL|item:1",
             "NULL|item:2",
             "3|tail",
+            "42",
+            "14",
+            "15",
         ],
         "{}",
         String::from_utf8_lossy(&returned)
@@ -220,11 +234,21 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
         &mut cold,
         &mut cold_budget,
         "SELECT (plpgsql_pair(7)).label; SELECT * FROM plpgsql_series(2); \
-         SELECT * FROM plpgsql_table_series(1)",
+         SELECT * FROM plpgsql_table_series(1); \
+         SELECT plpgsql_dynamic_scalar(14); SELECT * FROM plpgsql_dynamic_series(14)",
     );
     assert_eq!(
         data_rows(&recovered),
-        ["value:7", "2", "4", "NULL|item:1", "2|tail"],
+        [
+            "value:7",
+            "2",
+            "4",
+            "NULL|item:1",
+            "2|tail",
+            "42",
+            "14",
+            "15",
+        ],
         "{}",
         String::from_utf8_lossy(&recovered)
     );

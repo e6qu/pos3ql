@@ -31,6 +31,7 @@ use super::types::{ColDesc, ColType, Datum};
 mod setops;
 use setops::materialize_set_body;
 pub use setops::set_query;
+pub(crate) use setops::set_query_into_rows;
 
 mod materialize;
 use materialize::{

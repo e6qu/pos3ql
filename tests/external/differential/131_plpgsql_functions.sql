@@ -14,7 +14,15 @@ DROP FUNCTION IF EXISTS plpgsql_function_configured_actor();
 DROP FUNCTION IF EXISTS plpgsql_function_security_actor();
 DROP FUNCTION IF EXISTS plpgsql_function_write(integer);
 DROP FUNCTION IF EXISTS plpgsql_function_increment(integer);
+DROP FUNCTION IF EXISTS plpgsql_dynamic_scalar(integer);
+DROP FUNCTION IF EXISTS plpgsql_dynamic_series(integer);
+DROP FUNCTION IF EXISTS plpgsql_dynamic_loop(integer);
+DROP FUNCTION IF EXISTS plpgsql_dynamic_record_loop(integer);
+DROP FUNCTION IF EXISTS plpgsql_dynamic_command_once();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_trigger();
+DROP SEQUENCE IF EXISTS plpgsql_dynamic_command_sequence;
 DROP TABLE IF EXISTS plpgsql_function_rows;
+DROP TABLE IF EXISTS plpgsql_dynamic_rows;
 DROP ROLE IF EXISTS plpgsql_function_caller;
 DROP ROLE IF EXISTS plpgsql_function_denied;
 DROP ROLE IF EXISTS plpgsql_function_owner;
@@ -91,6 +99,69 @@ BEGIN
   RETURN QUERY SELECT limit_value + 1, 'tail';
 END
 $$;
+CREATE FUNCTION plpgsql_dynamic_scalar(input_value integer) RETURNS integer
+  LANGUAGE plpgsql AS $$
+DECLARE
+  result_value integer;
+BEGIN
+  EXECUTE 'SELECT $1::integer * 3' INTO STRICT result_value USING input_value;
+  RETURN result_value;
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_series(input_value integer) RETURNS SETOF integer
+  LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY EXECUTE 'VALUES ($1::integer), ($1::integer + 1)' USING input_value;
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_loop(input_value integer) RETURNS integer
+  LANGUAGE plpgsql AS $$
+DECLARE
+  item integer;
+  total integer := 0;
+BEGIN
+  FOR item IN EXECUTE 'VALUES ($1::integer), ($1::integer + 1)' USING input_value LOOP
+    total := total + item;
+  END LOOP;
+  RETURN total;
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_record_loop(input_value integer) RETURNS integer
+  LANGUAGE plpgsql AS $$
+DECLARE
+  item record;
+BEGIN
+  FOR item IN EXECUTE 'SELECT $1::integer AS value, $1::integer + 1 AS next_value' USING input_value LOOP
+    RETURN item.value + item.next_value;
+  END LOOP;
+  RETURN 0;
+END
+$$;
+CREATE SEQUENCE plpgsql_dynamic_command_sequence;
+CREATE FUNCTION plpgsql_dynamic_command_once() RETURNS integer
+  LANGUAGE plpgsql AS $$
+DECLARE
+  item integer;
+BEGIN
+  FOR item IN EXECUTE 'VALUES (' || nextval('plpgsql_dynamic_command_sequence') || ')' LOOP
+    RETURN item;
+  END LOOP;
+  RETURN 0;
+END
+$$;
+CREATE TABLE plpgsql_dynamic_rows (value integer);
+CREATE FUNCTION plpgsql_dynamic_trigger() RETURNS trigger
+  LANGUAGE plpgsql AS $$
+DECLARE
+  adjusted integer;
+BEGIN
+  EXECUTE 'SELECT $1::integer + 1' INTO adjusted USING NEW.value;
+  NEW.value := adjusted;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER plpgsql_dynamic_rows_before_insert
+  BEFORE INSERT ON plpgsql_dynamic_rows FOR EACH ROW EXECUTE FUNCTION plpgsql_dynamic_trigger();
 CREATE FUNCTION plpgsql_function_no_return() RETURNS integer
   LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
 CREATE FUNCTION plpgsql_function_void_return() RETURNS void
@@ -115,6 +186,11 @@ SELECT plpgsql_function_output(41), plpgsql_function_output_implicit(41);
 SELECT (plpgsql_function_pair(7)).next_value, (plpgsql_function_pair(7)).label;
 SELECT * FROM plpgsql_function_series(3);
 SELECT * FROM plpgsql_function_table_series(2);
+SELECT plpgsql_dynamic_scalar(14), plpgsql_dynamic_loop(14), plpgsql_dynamic_record_loop(14);
+SELECT * FROM plpgsql_dynamic_series(14);
+SELECT plpgsql_dynamic_command_once(), plpgsql_dynamic_command_once();
+INSERT INTO plpgsql_dynamic_rows VALUES (14);
+SELECT * FROM plpgsql_dynamic_rows;
 BEGIN;
 SELECT plpgsql_function_write(21);
 ROLLBACK;
@@ -147,7 +223,16 @@ DROP FUNCTION plpgsql_function_configured_actor();
 DROP FUNCTION plpgsql_function_security_actor();
 DROP FUNCTION plpgsql_function_write(integer);
 DROP FUNCTION plpgsql_function_increment(integer);
+DROP TRIGGER plpgsql_dynamic_rows_before_insert ON plpgsql_dynamic_rows;
+DROP FUNCTION plpgsql_dynamic_trigger();
+DROP FUNCTION plpgsql_dynamic_loop(integer);
+DROP FUNCTION plpgsql_dynamic_record_loop(integer);
+DROP FUNCTION plpgsql_dynamic_series(integer);
+DROP FUNCTION plpgsql_dynamic_scalar(integer);
+DROP FUNCTION plpgsql_dynamic_command_once();
+DROP SEQUENCE plpgsql_dynamic_command_sequence;
 DROP TABLE plpgsql_function_rows;
+DROP TABLE plpgsql_dynamic_rows;
 DROP ROLE plpgsql_function_caller;
 DROP ROLE plpgsql_function_denied;
 DROP ROLE plpgsql_function_owner;

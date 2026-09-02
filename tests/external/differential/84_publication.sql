@@ -88,6 +88,29 @@ SELECT relname
 
 ALTER PUBLICATION publication_schema_changes DROP TABLES IN SCHEMA publication_schema;
 ALTER PUBLICATION publication_schema_changes ADD TABLE publication_schema.schema_selected, TABLES IN SCHEMA publication_schema;
+
+CREATE TABLE publication_filter_rename (id integer PRIMARY KEY);
+CREATE PUBLICATION publication_filter_rename_changes
+  FOR TABLE publication_filter_rename WHERE (id > 0);
+ALTER TABLE publication_filter_rename RENAME COLUMN id TO event_id;
+SELECT pg_get_expr(prqual, prrelid) FROM pg_publication_rel rel
+  JOIN pg_publication pub ON pub.oid = rel.prpubid
+ WHERE pub.pubname = 'publication_filter_rename_changes';
+CREATE TABLE publication_projection_drop (
+  id integer PRIMARY KEY,
+  discarded text,
+  retained text
+);
+CREATE PUBLICATION publication_projection_drop_changes
+  FOR TABLE publication_projection_drop (id, retained);
+ALTER TABLE publication_projection_drop DROP COLUMN discarded;
+ALTER TABLE publication_projection_drop DROP COLUMN retained CASCADE;
+SELECT count(*) FROM pg_publication_rel rel
+  JOIN pg_publication pub ON pub.oid = rel.prpubid
+ WHERE pub.pubname = 'publication_projection_drop_changes';
+DROP PUBLICATION publication_filter_rename_changes, publication_projection_drop_changes;
+DROP TABLE publication_filter_rename, publication_projection_drop;
+
 DROP PUBLICATION publication_changes, publication_all, publication_empty_renamed,
   publication_schema_changes, publication_generated_changes;
 DROP TABLE publication_generated;

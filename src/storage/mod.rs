@@ -22668,6 +22668,10 @@ impl Storage {
         self.views.len()
     }
 
+    pub(crate) fn publication_count(&self) -> usize {
+        self.publications.len()
+    }
+
     /// Committed publications for catalog visibility and replication setup.
     pub fn live_publications(&self) -> impl Iterator<Item = &PublicationDef> {
         self.publications.iter().filter(|publication| {

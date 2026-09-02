@@ -34732,6 +34732,19 @@ fn apply_column_drop_dependencies(
         &dependent_routines,
     );
     let table_definition = *storage.table_def(table, txn.txid);
+    stage_publication_column_drop_dependencies(
+        storage,
+        wal,
+        txn,
+        PublicationColumnDrop {
+            table,
+            column,
+            column_name,
+            table_definition,
+        },
+        cascade,
+        arena,
+    )?;
 
     // An index's physical column numbers belong to the table definition that
     // existed when it was created. PostgreSQL treats indexes that mention a
@@ -34871,6 +34884,113 @@ fn apply_column_drop_dependencies(
         &dependent_routines,
         &dependent_rules,
     )
+}
+
+#[derive(Clone, Copy)]
+struct PublicationColumnDrop {
+    table: usize,
+    column: usize,
+    column_name: SqlName,
+    table_definition: TableDef,
+}
+
+fn stage_publication_column_drop_dependencies(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    dependency: PublicationColumnDrop,
+    cascade: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    let PublicationColumnDrop {
+        table,
+        column,
+        column_name,
+        table_definition,
+    } = dependency;
+    for slot in 0..storage.publication_count() {
+        let publication = *storage.publication_for_event_trigger(slot);
+        if !publication.visible_to(txn.txid) {
+            continue;
+        }
+        let mut definition = publication.definition_for(txn.txid);
+        let Some(member) = definition.tables[..definition.table_count]
+            .iter()
+            .position(|member| usize::from(*member) == table)
+        else {
+            continue;
+        };
+        let filter = definition.table_filters.get(member);
+        let filter_depends = if filter.is_empty() {
+            false
+        } else {
+            let expression = crate::sql::parser::parse_expr(filter, arena)?;
+            check_referenced_columns(expression, &table_definition)? & (1u64 << column) != 0
+        };
+        let projection_depends = definition.table_column_masks[member] & (1u64 << column) != 0;
+        if !filter_depends && !projection_depends {
+            continue;
+        }
+        if !cascade {
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "cannot drop column {} of table {} because other objects depend on it",
+                column_name.as_str(),
+                table_definition.name.as_str()
+            ));
+        }
+        let name = publication.name_for(txn.txid);
+        let mut filters = definition
+            .table_filters
+            .materialize_sql(definition.table_count);
+        definition
+            .tables
+            .copy_within(member + 1..definition.table_count, member);
+        definition
+            .table_column_masks
+            .copy_within(member + 1..definition.table_count, member);
+        filters.copy_within(member + 1..definition.table_count, member);
+        definition.table_count -= 1;
+        definition.tables[definition.table_count] = u16::MAX;
+        definition.table_column_masks[definition.table_count] = 0;
+        filters[definition.table_count] = StackStr::new();
+        definition.table_filters =
+            crate::storage::PublicationFilters::from_sql(&filters[..definition.table_count])?;
+        let (altered_slot, prior) =
+            storage.alter_publication(name.as_str(), definition, txn.txid)?;
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::AlterPublication {
+                name: name.as_str(),
+                all_tables: definition.all_tables,
+                tables: definition.tables,
+                table_column_masks: definition.table_column_masks,
+                table_filter_sql: filters,
+                table_count: definition.table_count,
+                schemas: definition.schemas,
+                schema_count: definition.schema_count,
+                publish_insert: definition.publish_insert,
+                publish_update: definition.publish_update,
+                publish_delete: definition.publish_delete,
+                publish_truncate: definition.publish_truncate,
+                publish_via_partition_root: definition.publish_via_partition_root,
+                publish_generated_columns: definition.publish_generated_columns,
+            },
+        ) {
+            storage.rollback_publication_alter(altered_slot, prior);
+            return Err(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationAltered {
+            slot: altered_slot as u32,
+            prior,
+        }) {
+            storage.rollback_publication_alter(altered_slot, prior);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -36522,6 +36642,175 @@ fn rewrite_table_statistics_column_references(
             prior,
         }) {
             storage.rollback_extended_statistics_keys(slot, prior);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn remap_publication_column_projections(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    column_mapping: &[u16; MAX_COLUMNS],
+) -> Result<(), SqlError> {
+    for slot in 0..storage.publication_count() {
+        let publication = *storage.publication_for_event_trigger(slot);
+        if !publication.visible_to(txn.txid) {
+            continue;
+        }
+        let mut definition = publication.definition_for(txn.txid);
+        let mut changed = false;
+        for member in 0..definition.table_count {
+            if usize::from(definition.tables[member]) != table
+                || definition.table_column_masks[member] == 0
+            {
+                continue;
+            }
+            let mut remapped = 0u64;
+            for (old, mapped) in column_mapping.iter().copied().enumerate() {
+                if definition.table_column_masks[member] & (1u64 << old) == 0 {
+                    continue;
+                }
+                let Some(new) = (mapped != u16::MAX).then_some(usize::from(mapped)) else {
+                    return Err(sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "publication projection retained a dropped column"
+                    ));
+                };
+                remapped |= 1u64 << new;
+            }
+            changed |= remapped != definition.table_column_masks[member];
+            definition.table_column_masks[member] = remapped;
+        }
+        if !changed {
+            continue;
+        }
+        let filters = definition
+            .table_filters
+            .materialize_sql(definition.table_count);
+        let name = publication.name_for(txn.txid);
+        let (altered_slot, prior) =
+            storage.alter_publication(name.as_str(), definition, txn.txid)?;
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::AlterPublication {
+                name: name.as_str(),
+                all_tables: definition.all_tables,
+                tables: definition.tables,
+                table_column_masks: definition.table_column_masks,
+                table_filter_sql: filters,
+                table_count: definition.table_count,
+                schemas: definition.schemas,
+                schema_count: definition.schema_count,
+                publish_insert: definition.publish_insert,
+                publish_update: definition.publish_update,
+                publish_delete: definition.publish_delete,
+                publish_truncate: definition.publish_truncate,
+                publish_via_partition_root: definition.publish_via_partition_root,
+                publish_generated_columns: definition.publish_generated_columns,
+            },
+        ) {
+            storage.rollback_publication_alter(altered_slot, prior);
+            return Err(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationAltered {
+            slot: altered_slot as u32,
+            prior,
+        }) {
+            storage.rollback_publication_alter(altered_slot, prior);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_table_publication_column_references(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    original: &TableDef,
+    renames: &[(SqlName, SqlName)],
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    if renames.is_empty() {
+        return Ok(());
+    }
+    for slot in 0..storage.publication_count() {
+        let publication = *storage.publication_for_event_trigger(slot);
+        if !publication.visible_to(txn.txid) {
+            continue;
+        }
+        let mut definition = publication.definition_for(txn.txid);
+        let mut filters = definition
+            .table_filters
+            .materialize_sql(definition.table_count);
+        let mut changed = false;
+        for (index, filter) in filters.iter_mut().enumerate().take(definition.table_count) {
+            if usize::from(definition.tables[index]) != table || filter.is_empty() {
+                continue;
+            }
+            let mut shape = *original;
+            for &(from, to) in renames {
+                let Some(column) = shape.column_index(from.as_str()) else {
+                    continue;
+                };
+                let mut renamed = shape;
+                renamed.columns[column].name = to;
+                let rewritten = rewrite_table_column_reference(
+                    filter.as_str(),
+                    &shape,
+                    &renamed,
+                    CompositeFieldRename { from, to },
+                    arena,
+                )?;
+                changed |= rewritten != *filter;
+                *filter = rewritten;
+                shape = renamed;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        definition.table_filters =
+            crate::storage::PublicationFilters::from_sql(&filters[..definition.table_count])?;
+        validate_publication_replica_identity(storage, &definition)?;
+        let name = publication.name_for(txn.txid);
+        let (altered_slot, prior) =
+            storage.alter_publication(name.as_str(), definition, txn.txid)?;
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::AlterPublication {
+                name: name.as_str(),
+                all_tables: definition.all_tables,
+                tables: definition.tables,
+                table_column_masks: definition.table_column_masks,
+                table_filter_sql: filters,
+                table_count: definition.table_count,
+                schemas: definition.schemas,
+                schema_count: definition.schema_count,
+                publish_insert: definition.publish_insert,
+                publish_update: definition.publish_update,
+                publish_delete: definition.publish_delete,
+                publish_truncate: definition.publish_truncate,
+                publish_via_partition_root: definition.publish_via_partition_root,
+                publish_generated_columns: definition.publish_generated_columns,
+            },
+        ) {
+            storage.rollback_publication_alter(altered_slot, prior);
+            return Err(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::PublicationAltered {
+            slot: altered_slot as u32,
+            prior,
+        }) {
+            storage.rollback_publication_alter(altered_slot, prior);
             return Err(error);
         }
     }
@@ -54689,6 +54978,28 @@ fn alter_table_inner(
         return sql_fail(error);
     }
     if let Err(error) = rewrite_table_statistics_column_references(
+        storage,
+        wal,
+        txn,
+        table_index,
+        &def,
+        &column_renames[..n_column_renames],
+        arena,
+    ) {
+        return sql_fail(error);
+    }
+    if dropped_any
+        && let Err(error) = remap_publication_column_projections(
+            storage,
+            wal,
+            txn,
+            table_index,
+            &wal_column_mapping,
+        )
+    {
+        return sql_fail(error);
+    }
+    if let Err(error) = rewrite_table_publication_column_references(
         storage,
         wal,
         txn,

@@ -18063,38 +18063,1414 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
             "PL/pgSQL dynamic utility commands do not accept USING parameters"
         ));
     }
-    let PlpgsqlExecHost::Routine { engine, .. } = &mut context.host else {
+    if let Stmt::CreateSchema {
+        name,
+        authorization,
+        if_not_exists,
+        elements,
+    } = query.statement
+    {
+        let outcome = {
+            let PlpgsqlExecHost::Routine {
+                engine,
+                guc,
+                cursors,
+                transaction_context,
+            } = &mut context.host
+            else {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "PL/pgSQL dynamic utility commands are not valid in trigger execution"
+                ));
+            };
+            context.responder.without_query_output(|responder| {
+                engine.execute_dynamic_utility(
+                    query.statement,
+                    context.txn,
+                    cursors,
+                    guc,
+                    *transaction_context,
+                    context.arena,
+                    responder,
+                    |engine, txn, responder| {
+                        super::exec::create_schema(
+                            &mut engine.storage,
+                            &mut engine.wal,
+                            txn,
+                            name,
+                            *authorization,
+                            *if_not_exists,
+                            responder,
+                        )
+                    },
+                )
+            })
+        };
+        dynamic_utility_outcome(outcome)?;
+
+        // CREATE SCHEMA elements retain their static, typed qualification and
+        // durable utility execution path instead of reconstructing SQL text.
+        for element in *elements {
+            let requalified = super::requalify_schema_element(element, name, context.arena)?;
+            if let Stmt::CreateView {
+                name: view_name,
+                or_replace,
+                security,
+                check_option,
+                sql,
+            } = requalified
+            {
+                let outcome = {
+                    let PlpgsqlExecHost::Routine {
+                        engine,
+                        guc,
+                        cursors,
+                        transaction_context,
+                    } = &mut context.host
+                    else {
+                        unreachable!("schema creation requires a routine execution host")
+                    };
+                    let schema_path = crate::sql::eval::quote_ident_str(name, context.arena)?;
+                    let role = guc.current_role();
+                    let path =
+                        engine
+                            .storage
+                            .compute_path(schema_path, role.as_str(), context.txn.txid);
+                    let old_path = engine.storage.swap_path(path);
+                    let outcome = context.responder.without_query_output(|responder| {
+                        engine.execute_dynamic_utility(
+                            requalified,
+                            context.txn,
+                            cursors,
+                            guc,
+                            *transaction_context,
+                            context.arena,
+                            responder,
+                            |engine, txn, responder| {
+                                super::exec::create_view(
+                                    &mut engine.storage,
+                                    &mut engine.wal,
+                                    txn,
+                                    super::exec::CreateViewCommand {
+                                        name: view_name,
+                                        or_replace: *or_replace,
+                                        security: *security,
+                                        check_option: *check_option,
+                                        sql,
+                                        raw_path: schema_path,
+                                    },
+                                    context.arena,
+                                    responder,
+                                )
+                            },
+                        )
+                    });
+                    engine.storage.swap_path(old_path);
+                    outcome
+                };
+                dynamic_utility_outcome(outcome)?;
+            } else {
+                execute_bound_plpgsql_dynamic_utility(
+                    context,
+                    BoundPlpgsqlDynamicQuery {
+                        statement: requalified,
+                        arguments: &[],
+                    },
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    let PlpgsqlExecHost::Routine {
+        engine,
+        guc,
+        cursors,
+        transaction_context,
+    } = &mut context.host
+    else {
         return Err(sql_err!(
             sqlstate::FEATURE_NOT_SUPPORTED,
             "PL/pgSQL dynamic utility commands are not valid in trigger execution"
         ));
     };
-    if !matches!(query.statement, Stmt::CreateTable(_) | Stmt::DropTable(_)) {
-        return Err(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "PL/pgSQL dynamic utility command is not implemented"
-        ));
-    }
-    let outcome = context
-        .responder
-        .without_query_output(|responder| match query.statement {
-            Stmt::CreateTable(command) => super::exec::create_table(
-                &mut engine.storage,
-                &mut engine.wal,
-                context.txn,
-                command,
-                context.arena,
-                responder,
-            ),
-            Stmt::DropTable(command) => super::exec::drop_table(
-                &mut engine.storage,
-                &mut engine.wal,
-                context.txn,
-                command,
-                responder,
-            ),
-            _ => unreachable!("validated dynamic utility command"),
-        });
+    let outcome = context.responder.without_query_output(|responder| {
+        engine.execute_dynamic_utility(
+            query.statement,
+            context.txn,
+            cursors,
+            guc,
+            *transaction_context,
+            context.arena,
+            responder,
+            |engine, txn, responder| match query.statement {
+                Stmt::CreateTable(command) => super::exec::create_table(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::DropTable(command) => super::exec::drop_table(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    responder,
+                ),
+                Stmt::DropSchema {
+                    names,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_schema(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    &mut engine.dml_scratch,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    context.arena,
+                    context.seq_session,
+                    responder,
+                ),
+                Stmt::AlterTable(command) => super::exec::alter_table(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    &mut engine.dml_scratch,
+                    command,
+                    context.arena,
+                    context.seq_session,
+                    responder,
+                ),
+                Stmt::CreateTablespace {
+                    name,
+                    owner,
+                    location,
+                    options,
+                } => super::exec::create_tablespace(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::CreateTablespaceCommand {
+                        name,
+                        owner: *owner,
+                        location,
+                        options: *options,
+                    },
+                    responder,
+                ),
+                Stmt::AlterTablespace { name, action } => super::exec::alter_tablespace(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropTablespace { name, if_exists } => super::exec::drop_tablespace(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *if_exists,
+                    responder,
+                ),
+                Stmt::CreateDatabase { name, options } => {
+                    let template = options.template.unwrap_or("template1");
+                    let mut connections = engine.database_connection_count(template, txn.txid);
+                    if engine
+                        .storage
+                        .database_slot(template, txn.txid)
+                        .is_some_and(|slot| {
+                            engine.storage.database(slot).oid
+                                == engine.storage.current_database_oid()
+                        })
+                    {
+                        connections = connections.saturating_sub(1);
+                    }
+                    super::exec::create_database(
+                        &mut engine.storage,
+                        &mut engine.wal,
+                        txn,
+                        name,
+                        *options,
+                        connections,
+                        responder,
+                    )
+                }
+                Stmt::AlterDatabase { name, action } => {
+                    let connections = engine.database_connection_count(name, txn.txid);
+                    super::exec::alter_database(
+                        &mut engine.storage,
+                        &mut engine.wal,
+                        txn,
+                        super::exec::AlterDatabaseCommand {
+                            name,
+                            action: *action,
+                            active_connections: connections,
+                            guc,
+                        },
+                        responder,
+                    )
+                }
+                Stmt::DropDatabase {
+                    name,
+                    if_exists,
+                    force,
+                } => {
+                    let connections = engine.database_connection_count(name, txn.txid);
+                    super::exec::drop_database(
+                        &mut engine.storage,
+                        &mut engine.wal,
+                        txn,
+                        super::exec::DropDatabaseCommand {
+                            name,
+                            if_exists: *if_exists,
+                            force: *force,
+                            active_connections: connections,
+                        },
+                        responder,
+                    )
+                }
+                Stmt::CreateView {
+                    name,
+                    or_replace,
+                    security,
+                    check_option,
+                    sql,
+                } => super::exec::create_view(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::CreateViewCommand {
+                        name,
+                        or_replace: *or_replace,
+                        security: *security,
+                        check_option: *check_option,
+                        sql,
+                        raw_path: guc.search_path().as_str(),
+                    },
+                    context.arena,
+                    responder,
+                ),
+                Stmt::AlterView {
+                    name,
+                    if_exists,
+                    action,
+                } => super::exec::alter_view(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::AlterViewCommand {
+                        name: *name,
+                        if_exists: *if_exists,
+                        action: *action,
+                    },
+                    context.arena,
+                    responder,
+                ),
+                Stmt::AlterMaterializedView {
+                    name,
+                    if_exists,
+                    action,
+                } => super::exec::alter_materialized_view(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    &mut engine.dml_scratch,
+                    *name,
+                    *if_exists,
+                    *action,
+                    context.arena,
+                    context.seq_session,
+                    responder,
+                ),
+                Stmt::CreateRule(rule) => super::exec::create_rule(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    rule,
+                    guc.search_path().as_str(),
+                    context.arena,
+                    responder,
+                ),
+                Stmt::AlterRule {
+                    name,
+                    table,
+                    new_name,
+                } => super::exec::alter_rule(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *table,
+                    new_name,
+                    responder,
+                ),
+                Stmt::DropRule(rule) => super::exec::drop_rule(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *rule,
+                    responder,
+                ),
+                Stmt::CreateCast(cast) => super::exec::create_cast(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    cast,
+                    responder,
+                ),
+                Stmt::DropCast(cast) => super::exec::drop_cast(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *cast,
+                    responder,
+                ),
+                Stmt::CreateOperator(operator) => super::exec::create_operator(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    operator,
+                    responder,
+                ),
+                Stmt::AlterOperator { identity, action } => super::exec::alter_operator(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *identity,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropOperator {
+                    identities,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_operators(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    identities,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateOperatorFamily { name, .. } => super::exec::create_operator_family(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *name,
+                    responder,
+                ),
+                Stmt::AlterOperatorFamily { name, action, .. } => {
+                    super::exec::alter_operator_family(
+                        &mut engine.storage,
+                        &mut engine.wal,
+                        txn,
+                        *name,
+                        *action,
+                        responder,
+                    )
+                }
+                Stmt::DropOperatorFamily {
+                    names,
+                    if_exists,
+                    cascade,
+                    ..
+                } => super::exec::drop_operator_families(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateOperatorClass(class) => super::exec::create_operator_class(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    class,
+                    responder,
+                ),
+                Stmt::AlterOperatorClass { name, action, .. } => super::exec::alter_operator_class(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *name,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropOperatorClass {
+                    names,
+                    if_exists,
+                    cascade,
+                    ..
+                } => super::exec::drop_operator_classes(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateRoutine(routine) => super::exec::create_routine(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    routine,
+                    guc,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::CreateAggregate(aggregate) => super::exec::create_aggregate(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    aggregate,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::AlterRoutine {
+                    kind,
+                    routine,
+                    actions,
+                } => super::exec::alter_routine(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::AlterRoutineCommand {
+                        kind: *kind,
+                        identity: routine,
+                        actions,
+                        guc: Some(guc),
+                    },
+                    responder,
+                ),
+                Stmt::AlterAggregate { aggregate, action } => super::exec::alter_aggregate(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    aggregate,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropFunction {
+                    functions,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_routine(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::DropRoutineCommand {
+                        targets: super::exec::DropRoutineTargets::Routines(functions),
+                        if_exists: *if_exists,
+                        cascade: *cascade,
+                        kind: crate::sql::ast::RoutineTargetKind::Function,
+                    },
+                    responder,
+                ),
+                Stmt::DropProcedure {
+                    procedures,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_routine(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::DropRoutineCommand {
+                        targets: super::exec::DropRoutineTargets::Routines(procedures),
+                        if_exists: *if_exists,
+                        cascade: *cascade,
+                        kind: crate::sql::ast::RoutineTargetKind::Procedure,
+                    },
+                    responder,
+                ),
+                Stmt::DropRoutine {
+                    routines,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_routine(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::DropRoutineCommand {
+                        targets: super::exec::DropRoutineTargets::Routines(routines),
+                        if_exists: *if_exists,
+                        cascade: *cascade,
+                        kind: crate::sql::ast::RoutineTargetKind::Either,
+                    },
+                    responder,
+                ),
+                Stmt::DropAggregate {
+                    aggregates,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_aggregate(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    aggregates,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateRole {
+                    name,
+                    options,
+                    memberships,
+                } => super::exec::create_role(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    options,
+                    memberships,
+                    responder,
+                ),
+                Stmt::AlterRole { name, options } => super::exec::alter_role(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    options,
+                    responder,
+                ),
+                Stmt::AlterRoleRename { name, new_name } => super::exec::rename_role(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    new_name,
+                    responder,
+                ),
+                Stmt::DropRole { names, if_exists } => super::exec::drop_role(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    responder,
+                ),
+                Stmt::GrantRole {
+                    roles,
+                    members,
+                    options,
+                    grantor,
+                } => super::exec::grant_role(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::GrantRoleRequest {
+                        roles,
+                        members,
+                        options: *options,
+                        grantor: *grantor,
+                    },
+                    responder,
+                ),
+                Stmt::RevokeRole {
+                    roles,
+                    members,
+                    option,
+                    grantor,
+                    cascade,
+                } => super::exec::revoke_role(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::RevokeRoleRequest {
+                        roles,
+                        members,
+                        option: *option,
+                        grantor: *grantor,
+                        cascade: *cascade,
+                    },
+                    responder,
+                ),
+                Stmt::GrantPrivileges {
+                    privileges,
+                    target,
+                    grantees,
+                    grant_option,
+                    grantor,
+                } => super::exec::grant_privileges(
+                    &mut engine.storage,
+                    txn,
+                    context.arena,
+                    privileges,
+                    *target,
+                    grantees,
+                    *grant_option,
+                    *grantor,
+                    responder,
+                ),
+                Stmt::RevokePrivileges {
+                    grant_option_only,
+                    privileges,
+                    target,
+                    grantees,
+                    grantor,
+                    cascade,
+                } => super::exec::revoke_privileges(
+                    &mut engine.storage,
+                    txn,
+                    context.arena,
+                    *grant_option_only,
+                    privileges,
+                    *target,
+                    grantees,
+                    *grantor,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::AlterDefaultPrivileges {
+                    roles,
+                    schemas,
+                    action,
+                } => super::exec::alter_default_privileges(
+                    &mut engine.storage,
+                    txn,
+                    roles,
+                    schemas,
+                    *action,
+                    responder,
+                ),
+                Stmt::ReassignOwned { roles, new_owner } => super::exec::reassign_owned(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    roles,
+                    new_owner,
+                    responder,
+                ),
+                Stmt::DropOwned { roles, cascade } => super::exec::drop_owned(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    &mut engine.dml_scratch,
+                    roles,
+                    *cascade,
+                    context.arena,
+                    context.seq_session,
+                    responder,
+                ),
+                Stmt::DropView {
+                    names,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_view(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateCollation(command) => super::exec::create_collation(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    responder,
+                ),
+                Stmt::AlterCollation { name, action } => super::exec::alter_collation(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropCollation {
+                    name,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_collation(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    &mut engine.dml_scratch,
+                    name,
+                    *if_exists,
+                    *cascade,
+                    context.arena,
+                    context.seq_session,
+                    responder,
+                ),
+                Stmt::CreateConversion(command) => super::exec::create_conversion(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    responder,
+                ),
+                Stmt::AlterConversion { name, action } => super::exec::alter_conversion(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropConversion {
+                    name,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_conversion(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateTrigger(trigger) => super::exec::create_trigger(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    trigger,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::AlterTrigger { trigger, action } => super::exec::alter_trigger(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    trigger,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropTrigger {
+                    trigger,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_trigger(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    trigger,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreatePolicy(policy) => super::exec::create_policy(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    policy,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::AlterPolicy(policy) => super::exec::alter_policy(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    policy,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::DropPolicy {
+                    policy,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_policy(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    policy,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateStatistics(statistics) => super::exec::create_statistics(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    statistics,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::AlterStatistics { name, action } => super::exec::alter_statistics(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropStatistics {
+                    names,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_statistics(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreatePublication {
+                    name,
+                    all_tables,
+                    tables,
+                    schemas,
+                    publish,
+                    publish_via_partition_root,
+                    publish_generated_columns,
+                } => super::exec::create_publication(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *all_tables,
+                    tables,
+                    schemas,
+                    *publish,
+                    *publish_via_partition_root,
+                    *publish_generated_columns,
+                    responder,
+                ),
+                Stmt::AlterPublication { name, action } => super::exec::alter_publication(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropPublication { names, if_exists } => super::exec::drop_publication(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    responder,
+                ),
+                Stmt::CreateSubscription {
+                    name,
+                    connection,
+                    publications,
+                    options,
+                } => super::exec::create_subscription(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::CreateSubscriptionCommand {
+                        name,
+                        connection,
+                        publications,
+                        options: *options,
+                    },
+                    responder,
+                ),
+                Stmt::AlterSubscription { name, action } => super::exec::alter_subscription(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropSubscription { names, if_exists } => super::exec::drop_subscription(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    responder,
+                ),
+                Stmt::CreateTextSearchParser(command) => super::exec::create_text_search_parser(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    responder,
+                ),
+                Stmt::CreateTextSearchTemplate(command) => {
+                    super::exec::create_text_search_template(
+                        &mut engine.storage,
+                        &mut engine.wal,
+                        txn,
+                        command,
+                        responder,
+                    )
+                }
+                Stmt::CreateTextSearchDictionary(command) => {
+                    super::exec::create_text_search_dictionary(
+                        &mut engine.storage,
+                        &mut engine.wal,
+                        txn,
+                        command,
+                        responder,
+                    )
+                }
+                Stmt::CreateTextSearchConfiguration(command) => {
+                    super::exec::create_text_search_configuration(
+                        &mut engine.storage,
+                        &mut engine.wal,
+                        txn,
+                        command,
+                        responder,
+                    )
+                }
+                Stmt::AlterTextSearch { kind, name, action } => super::exec::alter_text_search(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *kind,
+                    name,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropTextSearch {
+                    kind,
+                    name,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_text_search(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *kind,
+                    name,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateEventTrigger(command) => super::exec::create_event_trigger(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    responder,
+                ),
+                Stmt::AlterEventTrigger { name, action } => super::exec::alter_event_trigger(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropEventTrigger {
+                    name,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_event_trigger(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateForeignDataWrapper(command) => {
+                    super::exec::create_foreign_data_wrapper(
+                        &mut engine.storage,
+                        &mut engine.wal,
+                        txn,
+                        command,
+                        responder,
+                    )
+                }
+                Stmt::AlterForeignDataWrapper { name, action } => {
+                    super::exec::alter_foreign_data_wrapper(
+                        &mut engine.storage,
+                        &mut engine.wal,
+                        txn,
+                        name,
+                        *action,
+                        responder,
+                    )
+                }
+                Stmt::DropForeignDataWrapper {
+                    names,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_foreign_data_wrapper(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateForeignServer(command) => super::exec::create_foreign_server(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    responder,
+                ),
+                Stmt::AlterForeignServer { name, action } => super::exec::alter_foreign_server(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropForeignServer {
+                    names,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_foreign_server(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateUserMapping(command) => super::exec::create_user_mapping(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    responder,
+                ),
+                Stmt::AlterUserMapping(command) => super::exec::alter_user_mapping(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    responder,
+                ),
+                Stmt::DropUserMapping(command) => super::exec::drop_user_mapping(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    responder,
+                ),
+                Stmt::CreateForeignTable(command) => super::exec::create_foreign_table(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::DropForeignTable(command) => super::exec::drop_foreign_table(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    responder,
+                ),
+                Stmt::ImportForeignSchema(command) => super::exec::import_foreign_schema(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::CreateTableAs {
+                    name,
+                    columns,
+                    sql,
+                    with_data,
+                    if_not_exists,
+                    kind,
+                } => super::exec::create_table_as(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    columns,
+                    sql,
+                    *with_data,
+                    *if_not_exists,
+                    *kind == crate::sql::ast::CreateTableAsKind::MaterializedView,
+                    guc.search_path().as_str(),
+                    context.seq_session,
+                    context.arena,
+                    query.arguments,
+                    responder,
+                ),
+                Stmt::RefreshMaterializedView { name } => super::exec::refresh_materialized_view(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    context.seq_session,
+                    context.arena,
+                    query.arguments,
+                    responder,
+                ),
+                Stmt::DropMaterializedView {
+                    names,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_materialized_view(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateSequence {
+                    name,
+                    if_not_exists,
+                    options,
+                } => super::exec::create_sequence(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *if_not_exists,
+                    options,
+                    responder,
+                ),
+                Stmt::AlterSequence {
+                    name,
+                    if_exists,
+                    options,
+                    set_schema,
+                } => super::exec::alter_sequence(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::AlterSequenceCommand {
+                        name,
+                        if_exists: *if_exists,
+                        options,
+                        set_schema: *set_schema,
+                    },
+                    context.seq_session,
+                    responder,
+                ),
+                Stmt::DropSequence {
+                    names,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_sequence(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::CreateDomain(command) => super::exec::create_domain(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::AlterDomain { name, action } => super::exec::alter_domain(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    action,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::DropDomain {
+                    names,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_domain(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    &mut engine.dml_scratch,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    &engine.work,
+                    context.seq_session,
+                    responder,
+                ),
+                Stmt::CreateEnum { name, labels } => super::exec::create_enum(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    labels,
+                    responder,
+                ),
+                Stmt::CreateComposite { name, fields } => super::exec::create_composite(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    fields,
+                    responder,
+                ),
+                Stmt::AlterType { name, action } => super::exec::alter_type(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    action,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::DropType {
+                    names,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_type(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    &mut engine.dml_scratch,
+                    names,
+                    *if_exists,
+                    *cascade,
+                    &engine.work,
+                    context.seq_session,
+                    responder,
+                ),
+                Stmt::CreateIndex {
+                    name,
+                    table,
+                    build,
+                    scope,
+                    if_not_exists,
+                    columns,
+                    include_columns,
+                    nulls_not_distinct,
+                    predicate,
+                    predicate_text,
+                    options,
+                    tablespace,
+                    unique,
+                } => {
+                    let default_tablespace = guc.default_tablespace();
+                    super::exec::create_index(
+                        &mut engine.storage,
+                        &mut engine.wal,
+                        txn,
+                        super::exec::CreateIndexCommand {
+                            name: *name,
+                            table: *table,
+                            build: *build,
+                            scope: *scope,
+                            if_not_exists: *if_not_exists,
+                            columns,
+                            include_columns,
+                            nulls_not_distinct: *nulls_not_distinct,
+                            predicate: *predicate,
+                            predicate_text: *predicate_text,
+                            options: *options,
+                            tablespace: (*tablespace).or_else(|| {
+                                (!default_tablespace.as_str().is_empty())
+                                    .then_some(default_tablespace.as_str())
+                            }),
+                            unique: *unique,
+                        },
+                        context.arena,
+                        responder,
+                    )
+                }
+                Stmt::AlterIndex {
+                    name,
+                    if_exists,
+                    action,
+                } => super::exec::alter_index(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *if_exists,
+                    *action,
+                    responder,
+                ),
+                Stmt::DropIndex {
+                    names,
+                    if_exists,
+                    build,
+                    cascade,
+                } => super::exec::drop_index(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::DropIndexCommand {
+                        names,
+                        if_exists: *if_exists,
+                        build: *build,
+                        cascade: *cascade,
+                    },
+                    responder,
+                ),
+                Stmt::Reindex {
+                    target,
+                    name,
+                    options,
+                } => super::exec::reindex(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *target,
+                    *name,
+                    *options,
+                    responder,
+                ),
+                Stmt::Cluster { target, verbose } => super::exec::cluster(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *target,
+                    *verbose,
+                    responder,
+                ),
+                Stmt::Truncate {
+                    tables,
+                    restart_identity,
+                    cascade,
+                } => super::exec::truncate(
+                    &mut engine.storage,
+                    txn,
+                    &mut engine.dml_scratch,
+                    context.arena,
+                    context.seq_session,
+                    tables,
+                    *restart_identity,
+                    *cascade,
+                    responder,
+                ),
+                Stmt::Comment { target, text } => super::exec::comment(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    target,
+                    *text,
+                    context.arena,
+                    responder,
+                ),
+                _ => Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "PL/pgSQL dynamic utility command is not implemented"
+                ))),
+            },
+        )
+    });
+    dynamic_utility_outcome(outcome)
+}
+
+fn dynamic_utility_outcome(outcome: Outcome) -> Result<(), SqlError> {
     match outcome {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(error),

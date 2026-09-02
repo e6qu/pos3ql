@@ -24,7 +24,22 @@ DROP FUNCTION IF EXISTS plpgsql_dynamic_dml(integer);
 DROP PROCEDURE IF EXISTS plpgsql_dynamic_dml_procedure(integer);
 DROP FUNCTION IF EXISTS plpgsql_dynamic_dml_trigger();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_utility();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_catalog_utility();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_catalog_answer();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_catalog_publication();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_catalog_schema();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_catalog_drop_schema();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_catalog_lifecycle();
+DROP PUBLICATION IF EXISTS plpgsql_dynamic_catalog_publication;
+DROP MATERIALIZED VIEW IF EXISTS plpgsql_dynamic_catalog_materialized;
+DROP STATISTICS IF EXISTS plpgsql_dynamic_catalog_stats;
 DROP SEQUENCE IF EXISTS plpgsql_dynamic_command_sequence;
+DROP SEQUENCE IF EXISTS plpgsql_dynamic_catalog_sequence;
+DROP VIEW IF EXISTS plpgsql_dynamic_catalog_view;
+DROP TABLE IF EXISTS plpgsql_dynamic_catalog_rows;
+DROP SCHEMA IF EXISTS plpgsql_dynamic_catalog_ns CASCADE;
+DROP DOMAIN IF EXISTS plpgsql_dynamic_catalog_positive;
+DROP TYPE IF EXISTS plpgsql_dynamic_catalog_state;
 DROP TABLE IF EXISTS plpgsql_function_rows;
 DROP TABLE IF EXISTS plpgsql_dynamic_rows;
 DROP TABLE IF EXISTS plpgsql_dynamic_dml_rows;
@@ -215,6 +230,55 @@ BEGIN
   EXECUTE 'INSERT INTO plpgsql_dynamic_utility_rows VALUES (89)';
 END
 $$;
+CREATE FUNCTION plpgsql_dynamic_catalog_utility() RETURNS void
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'CREATE TABLE plpgsql_dynamic_catalog_rows (id integer PRIMARY KEY, value text)';
+  EXECUTE 'CREATE INDEX plpgsql_dynamic_catalog_value_idx ON plpgsql_dynamic_catalog_rows (value)';
+  EXECUTE 'CLUSTER plpgsql_dynamic_catalog_rows USING plpgsql_dynamic_catalog_value_idx';
+  EXECUTE 'CREATE SEQUENCE plpgsql_dynamic_catalog_sequence START WITH 4';
+  EXECUTE 'ALTER SEQUENCE plpgsql_dynamic_catalog_sequence RESTART WITH 9';
+  EXECUTE 'CREATE VIEW plpgsql_dynamic_catalog_view AS SELECT id, value FROM plpgsql_dynamic_catalog_rows';
+  EXECUTE 'COMMENT ON TABLE plpgsql_dynamic_catalog_rows IS ''dynamic catalog table''';
+  EXECUTE 'CREATE TYPE plpgsql_dynamic_catalog_state AS ENUM (''ready'', ''blocked'')';
+  EXECUTE 'ALTER TYPE plpgsql_dynamic_catalog_state ADD VALUE ''done''';
+  EXECUTE 'CREATE DOMAIN plpgsql_dynamic_catalog_positive AS integer CHECK (VALUE > 0)';
+  EXECUTE 'CREATE FUNCTION plpgsql_dynamic_catalog_answer() RETURNS integer LANGUAGE sql AS ''SELECT 43''';
+  EXECUTE 'ALTER FUNCTION plpgsql_dynamic_catalog_answer() COST 7';
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_catalog_publication() RETURNS void
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'CREATE PUBLICATION plpgsql_dynamic_catalog_publication
+    FOR TABLE plpgsql_dynamic_catalog_rows';
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_catalog_schema() RETURNS void
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'CREATE SCHEMA plpgsql_dynamic_catalog_ns
+    CREATE TABLE schema_rows (value integer)
+    CREATE VIEW schema_view AS SELECT value FROM schema_rows';
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_catalog_drop_schema() RETURNS void
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'DROP SCHEMA plpgsql_dynamic_catalog_ns CASCADE';
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_catalog_lifecycle() RETURNS void
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'ALTER TABLE plpgsql_dynamic_catalog_rows ENABLE ROW LEVEL SECURITY';
+  EXECUTE 'CREATE POLICY plpgsql_dynamic_catalog_policy ON plpgsql_dynamic_catalog_rows FOR SELECT USING (true)';
+  EXECUTE 'CREATE STATISTICS plpgsql_dynamic_catalog_stats ON id, value FROM plpgsql_dynamic_catalog_rows';
+  EXECUTE 'CREATE MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized AS
+    SELECT id, value FROM plpgsql_dynamic_catalog_rows';
+  EXECUTE 'REFRESH MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized';
+END
+$$;
 CREATE FUNCTION plpgsql_function_no_return() RETURNS integer
   LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
 CREATE FUNCTION plpgsql_function_void_return() RETURNS void
@@ -249,6 +313,23 @@ CALL plpgsql_dynamic_dml_procedure(21);
 INSERT INTO plpgsql_dynamic_dml_rows VALUES (34);
 DO $$ BEGIN EXECUTE 'INSERT INTO plpgsql_dynamic_dml_audit VALUES ($1)' USING 55; END $$;
 SELECT plpgsql_dynamic_utility();
+SELECT plpgsql_dynamic_catalog_utility();
+SELECT plpgsql_dynamic_catalog_publication();
+SELECT plpgsql_dynamic_catalog_schema();
+INSERT INTO plpgsql_dynamic_catalog_ns.schema_rows VALUES (11);
+SELECT * FROM plpgsql_dynamic_catalog_ns.schema_view;
+INSERT INTO plpgsql_dynamic_catalog_rows VALUES (nextval('plpgsql_dynamic_catalog_sequence'), 'nine');
+SELECT plpgsql_dynamic_catalog_lifecycle();
+SELECT * FROM plpgsql_dynamic_catalog_view;
+SELECT * FROM plpgsql_dynamic_catalog_materialized;
+SELECT obj_description('plpgsql_dynamic_catalog_rows'::regclass, 'pg_class');
+SELECT enumlabel FROM pg_enum
+ WHERE enumtypid = 'plpgsql_dynamic_catalog_state'::regtype
+ ORDER BY enumsortorder;
+SELECT 7::plpgsql_dynamic_catalog_positive;
+SELECT plpgsql_dynamic_catalog_answer();
+SELECT pubname FROM pg_publication
+ WHERE pubname = 'plpgsql_dynamic_catalog_publication';
 SELECT * FROM plpgsql_dynamic_dml_rows;
 SELECT * FROM plpgsql_dynamic_dml_audit ORDER BY value;
 SELECT * FROM plpgsql_dynamic_utility_rows;
@@ -292,16 +373,32 @@ DROP FUNCTION plpgsql_dynamic_series(integer);
 DROP FUNCTION plpgsql_dynamic_scalar(integer);
 DROP FUNCTION plpgsql_dynamic_command_once();
 DROP SEQUENCE plpgsql_dynamic_command_sequence;
+DROP SEQUENCE plpgsql_dynamic_catalog_sequence;
 DROP TRIGGER plpgsql_dynamic_dml_rows_before_insert ON plpgsql_dynamic_dml_rows;
 DROP FUNCTION plpgsql_dynamic_dml_trigger();
 DROP PROCEDURE plpgsql_dynamic_dml_procedure(integer);
 DROP FUNCTION plpgsql_dynamic_dml(integer);
 DROP FUNCTION plpgsql_dynamic_utility();
+DROP FUNCTION plpgsql_dynamic_catalog_utility();
+DROP FUNCTION plpgsql_dynamic_catalog_answer();
+DROP FUNCTION plpgsql_dynamic_catalog_publication();
+SELECT plpgsql_dynamic_catalog_drop_schema();
+DROP FUNCTION plpgsql_dynamic_catalog_drop_schema();
+DROP FUNCTION plpgsql_dynamic_catalog_schema();
+DROP FUNCTION plpgsql_dynamic_catalog_lifecycle();
+DROP PUBLICATION plpgsql_dynamic_catalog_publication;
+DROP MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized;
+DROP STATISTICS plpgsql_dynamic_catalog_stats;
+DROP POLICY plpgsql_dynamic_catalog_policy ON plpgsql_dynamic_catalog_rows;
 DROP TABLE plpgsql_function_rows;
 DROP TABLE plpgsql_dynamic_rows;
 DROP TABLE plpgsql_dynamic_dml_rows;
 DROP TABLE plpgsql_dynamic_dml_audit;
 DROP TABLE plpgsql_dynamic_utility_rows;
+DROP VIEW plpgsql_dynamic_catalog_view;
+DROP TABLE plpgsql_dynamic_catalog_rows;
+DROP DOMAIN plpgsql_dynamic_catalog_positive;
+DROP TYPE plpgsql_dynamic_catalog_state;
 DROP ROLE plpgsql_function_caller;
 DROP ROLE plpgsql_function_denied;
 DROP ROLE plpgsql_function_owner;

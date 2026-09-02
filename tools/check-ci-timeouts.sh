@@ -35,16 +35,18 @@ if grep -nE 'shards:.*[/\\]' .github/workflows/coverage.yml; then
     failed=1
 fi
 
-# The forced-spill suite must distribute corpus work while assigning its shared
-# probes once. Otherwise a growing corpus silently pushes one worker past the
-# fixed five-minute ceiling.
+# The forced-spill suite must distribute corpus work and its independent
+# auxiliary probes. Each worker has a fixed five-minute ceiling.
 spill_matrix=.github/workflows/coverage.yml
 for spill_entry in \
     '- { name: a, corpus_shard: "0-of-4", auxiliary: none }' \
     '- { name: b, corpus_shard: "1-of-4", auxiliary: none }' \
     '- { name: c, corpus_shard: "2-of-4", auxiliary: none }' \
     '- { name: d, corpus_shard: "3-of-4", auxiliary: none }' \
-    '- { name: auxiliary, corpus_shard: "none", auxiliary: all }'; do
+    '- { name: exact, corpus_shard: "none", auxiliary: exact }' \
+    '- { name: copy, corpus_shard: "none", auxiliary: copy }' \
+    '- { name: types, corpus_shard: "none", auxiliary: types }' \
+    '- { name: slt, corpus_shard: "none", auxiliary: slt }'; do
     if ! grep -Fq -- "$spill_entry" "$spill_matrix"; then
         printf 'CI timeout guard: missing forced-spill shard definition %s\n' "$spill_entry" >&2
         failed=1

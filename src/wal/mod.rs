@@ -3240,7 +3240,10 @@ fn encoded_partition_len(partition: PartitionDef) -> usize {
         .attachment
         .map_or(0, |attachment| 3 + bound_len(attachment.bound));
     let detached = partition.detached_bound.map_or(0, |detached| {
-        2 + usize::from(detached.scheme.n_keys) * 2 + bound_len(detached.bound)
+        1 + detached.name.as_str().len()
+            + 2
+            + usize::from(detached.scheme.n_keys) * 2
+            + bound_len(detached.bound)
     });
     1 + scheme + attachment + detached
 }
@@ -3282,6 +3285,7 @@ fn append_partition(buffer: &mut FixedBuf, partition: PartitionDef) -> bool {
             PartitionStrategy::List => 1,
             PartitionStrategy::Hash => 2,
         };
+        ok &= append_partition_name(buffer, detached.name.as_str());
         ok &= buffer.append(&[strategy, detached.scheme.n_keys]);
         for key in &detached.scheme.keys[..usize::from(detached.scheme.n_keys)] {
             ok &= buffer.append(&key.to_le_bytes());
@@ -3318,6 +3322,12 @@ fn append_partition_bound(buffer: &mut FixedBuf, bound: PartitionBound) -> bool 
                 && buffer.append(&remainder.to_le_bytes())
         }
     }
+}
+
+fn append_partition_name(buffer: &mut FixedBuf, name: &str) -> bool {
+    name.len() <= u8::MAX as usize
+        && buffer.append(&[name.len() as u8])
+        && buffer.append(name.as_bytes())
 }
 
 fn append_bound_value(buffer: &mut FixedBuf, value: PartitionBoundValue) -> bool {
@@ -9947,6 +9957,7 @@ fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
         None
     };
     let detached_bound = if flags & 4 != 0 {
+        let name = SqlName::parse(decode_partition_name(payload, at)?).ok()?;
         let strategy = match *payload.get(*at)? {
             0 => PartitionStrategy::Range,
             1 => PartitionStrategy::List,
@@ -9965,6 +9976,7 @@ fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
             *at += 2;
         }
         Some(crate::storage::DetachedPartitionBound {
+            name,
             scheme: crate::storage::PartitionScheme {
                 strategy,
                 keys,
@@ -9980,6 +9992,14 @@ fn decode_partition(payload: &[u8], at: &mut usize) -> Option<PartitionDef> {
         attachment,
         detached_bound,
     })
+}
+
+fn decode_partition_name<'a>(payload: &'a [u8], at: &mut usize) -> Option<&'a str> {
+    let len = usize::from(*payload.get(*at)?);
+    *at += 1;
+    let name = core::str::from_utf8(payload.get(*at..*at + len)?).ok()?;
+    *at += len;
+    Some(name)
 }
 
 fn decode_partition_bound(payload: &[u8], at: &mut usize) -> Option<PartitionBound> {
@@ -10831,6 +10851,7 @@ mod tests {
         definition.partition.attachment.as_mut().unwrap().state =
             crate::storage::PartitionAttachmentState::DetachPending;
         definition.partition.detached_bound = Some(crate::storage::DetachedPartitionBound {
+            name: SqlName::parse("detached_bound_check").unwrap(),
             scheme: crate::storage::PartitionScheme {
                 strategy: PartitionStrategy::Range,
                 keys: [0; crate::storage::MAX_PARTITION_KEYS],
@@ -10880,13 +10901,15 @@ mod tests {
         assert!(matches!(
             restored.partition.detached_bound,
             Some(crate::storage::DetachedPartitionBound {
+                name,
                 scheme: crate::storage::PartitionScheme {
                     strategy: PartitionStrategy::Range,
                     n_keys: 1,
                     ..
                 },
                 bound: PartitionBound::Range { n_keys: 1, .. },
-            })
+                ..
+            }) if name.as_str() == "detached_bound_check"
         ));
         assert_eq!(
             restored.columns[0].not_null,

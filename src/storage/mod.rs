@@ -1468,6 +1468,9 @@ pub struct PartitionDef {
 /// catalog expression on every row write.
 #[derive(Debug, Clone, Copy)]
 pub struct DetachedPartitionBound {
+    /// PostgreSQL-visible generated CHECK identity. It is absent for HASH,
+    /// whose concurrent detach does not create a constraint.
+    pub name: SqlName,
     pub scheme: PartitionScheme,
     pub bound: PartitionBound,
 }
@@ -1771,6 +1774,9 @@ pub(crate) fn partition_bound_matches(
             },
         ) => {
             let value = key(0)?;
+            if value.is_null() {
+                return Ok(list[..usize::from(n_values)].contains(&OwnedDatum::Null));
+            }
             Ok((0..usize::from(n_values))
                 .any(|i| compare_datums(&value, &list[i].as_datum()).is_ok_and(Ordering::is_eq)))
         }

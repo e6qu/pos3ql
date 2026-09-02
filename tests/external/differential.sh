@@ -106,7 +106,7 @@ fi
 # A sharded run has one explicitly assigned owner for the non-corpus probes.
 # Repeating them in every shard needlessly consumes the fixed CI time budget.
 if [[ "$CORPUS_SHARD_MODE" != full && -z "${POS3QL_DIFF_AUXILIARY+x}" ]]; then
-  printf '%s\n' 'FAIL: sharded differential runs require POS3QL_DIFF_AUXILIARY=all or none'
+  printf '%s\n' 'FAIL: sharded differential runs require POS3QL_DIFF_AUXILIARY'
   exit 1
 fi
 if [[ "$CORPUS_SHARD_MODE" != full ]]; then
@@ -115,12 +115,13 @@ else
   DIFF_AUXILIARY=all
 fi
 case "$DIFF_AUXILIARY" in
-all | none) ;;
+all | none | exact | copy | types | slt) ;;
 *)
-  printf 'FAIL: POS3QL_DIFF_AUXILIARY must be all or none (got %q)\n' "$DIFF_AUXILIARY"
+  printf 'FAIL: POS3QL_DIFF_AUXILIARY must be all, none, exact, copy, types, or slt (got %q)\n' "$DIFF_AUXILIARY"
   exit 1
   ;;
 esac
+want_auxiliary() { [[ "$DIFF_AUXILIARY" == all || "$DIFF_AUXILIARY" == "$1" ]]; }
 
 corpus_file_count=0
 for corpus_file in "$EXT"/differential/*.sql; do
@@ -360,7 +361,7 @@ if [[ "$CORPUS_SHARD_MODE" != none ]]; then
   done
 fi
 
-if [[ "$DIFF_AUXILIARY" == "all" ]]; then
+if want_auxiliary exact; then
 # Exact-error corpora: the SQLSTATE normalizer above makes wording invisible,
 # which let five message-fidelity fixes ship guarded only by unit tests. These
 # corpora compare the full ERROR line — SQLSTATE and message text — dropping
@@ -397,7 +398,9 @@ for f in $EXT/differential_exact/*.sql; do
   fi
   reset_pair
 done
+fi
 
+if want_auxiliary copy; then
 printf '%s\n' '' '=== binary COPY (wire bytes + cross-load) ==='
 restart_pos3ql_clean
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
@@ -412,7 +415,9 @@ else
   printf '%s\n' 'SKIP: COPY BINARY differential (need a psycopg venv at $POS3QL_VENV)'
 fi
 reset_pair
+fi
 
+if want_auxiliary types; then
 printf '%s\n' '' '=== accepted-type fidelity matrix ==='
 restart_pos3ql_clean
 if [[ -x "$ROOT_VENV/bin/python" ]]; then
@@ -427,7 +432,9 @@ else
   printf '%s\n' 'SKIP: accepted-type fidelity matrix (need a psycopg venv at $POS3QL_VENV)'
 fi
 reset_pair
+fi
 
+if want_auxiliary slt; then
 printf '%s\n' '' '=== vendored sqllogictest replay (real PostgreSQL is the oracle) ==='
 SLT_VENV=${POS3QL_VENV:-$ROOT_VENV}
 if [[ -x "$SLT_VENV/bin/python" ]] && [[ -d vendor/test/sqllogictest/test ]]; then
@@ -484,7 +491,9 @@ if (( FUZZ_COUNT > 0 )); then
     cat "$WORK/fuzz.out"
   fi
 fi
-else
+fi
+
+if [[ "$DIFF_AUXILIARY" == none ]]; then
   printf '%s\n' 'SKIP: shared exact-error, binary-COPY, type-fidelity, sqllogictest, and fuzz probes are assigned to another shard'
 fi
 

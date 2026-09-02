@@ -5640,6 +5640,7 @@ pub(crate) const FIRST_FK_OID: i32 = 200_000;
 pub(crate) const FIRST_CHECK_OID: i32 = 300_000;
 pub(crate) const FIRST_DOMAIN_CHECK_OID: i32 = 400_000;
 pub(crate) const FIRST_NOT_NULL_OID: i32 = 450_000;
+pub(crate) const FIRST_DETACHED_PARTITION_CHECK_OID: i32 = 475_000;
 
 /// The current catalog OID of a named table constraint. Constraint comments
 /// retain the table-slot/name identity because index and check positions are
@@ -5663,6 +5664,13 @@ pub(crate) fn table_constraint_oid(
         return index_constraint;
     }
     let table = storage.table_def(table_slot, txid);
+    if table
+        .partition
+        .detached_bound
+        .is_some_and(|constraint| constraint.name.as_str() == name)
+    {
+        return Some(FIRST_DETACHED_PARTITION_CHECK_OID + table_slot as i32);
+    }
     if let Some((index, _)) = table
         .checks()
         .iter()
@@ -5910,6 +5918,14 @@ pub fn constraint_def_text<'a>(
                 arena,
             )?));
         }
+        let table = storage.table_def(slot, txid);
+        if let Some(constraint) = table.partition.detached_bound
+            && oid == FIRST_DETACHED_PARTITION_CHECK_OID + slot as i32
+        {
+            return Ok(Some(detached_partition_constraint_def_text(
+                table, constraint, arena,
+            )?));
+        }
     }
     for slot in 0..storage.domain_count() {
         let domain = storage.domain_for(slot, txid);
@@ -6106,6 +6122,174 @@ fn partition_bound_def_text(bound: PartitionBound, arena: &Arena) -> Result<&str
         }
     }
     alloc_rendered(&rendered, "partition bound definition is too long", arena)
+}
+
+fn detached_partition_constraint_def_text<'a>(
+    definition: &TableDef,
+    constraint: crate::storage::DetachedPartitionBound,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    use core::fmt::Write as _;
+
+    let mut rendered = StackStr::<4096>::new();
+    let _ = rendered.write_str("CHECK (");
+    match (constraint.scheme.strategy, constraint.bound) {
+        (PartitionStrategy::List, PartitionBound::List { values, n_values }) => {
+            if constraint.scheme.n_keys != 1 {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "generated list partition constraint has multiple keys"
+                ));
+            }
+            let values = &values[..usize::from(n_values)];
+            if values.is_empty() {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "generated list partition constraint has no values"
+                ));
+            }
+            let has_null = values.contains(&OwnedDatum::Null);
+            let non_null_count = values
+                .iter()
+                .filter(|value| **value != OwnedDatum::Null)
+                .count();
+            write_partition_constraint_key(&mut rendered, definition, constraint.scheme, 0);
+            if has_null {
+                let _ = rendered.write_str(" IS NULL");
+                if non_null_count != 0 {
+                    let _ = rendered.write_str(" OR ");
+                    write_partition_constraint_key(&mut rendered, definition, constraint.scheme, 0);
+                    let _ = rendered.write_str(" IN (");
+                }
+            } else {
+                let _ = rendered.write_str(" IS NOT NULL AND ");
+                write_partition_constraint_key(&mut rendered, definition, constraint.scheme, 0);
+                let _ = rendered.write_str(" IN (");
+            }
+            if non_null_count != 0 {
+                for (index, value) in values
+                    .iter()
+                    .copied()
+                    .filter(|value| *value != OwnedDatum::Null)
+                    .enumerate()
+                {
+                    if index != 0 {
+                        let _ = rendered.write_str(", ");
+                    }
+                    write_partition_value(&mut rendered, value, arena)?;
+                }
+                let _ = rendered.write_char(')');
+            }
+        }
+        (
+            PartitionStrategy::Range,
+            PartitionBound::Range {
+                lower,
+                upper,
+                n_keys,
+            },
+        ) => {
+            if n_keys != constraint.scheme.n_keys {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "generated range partition constraint has inconsistent key count"
+                ));
+            }
+            for index in 0..usize::from(n_keys) {
+                if index != 0 {
+                    let _ = rendered.write_str(" AND ");
+                }
+                write_partition_constraint_key(&mut rendered, definition, constraint.scheme, index);
+                let _ = rendered.write_str(" IS NOT NULL");
+            }
+            let _ = rendered.write_str(" AND ");
+            write_range_partition_comparison(
+                &mut rendered,
+                definition,
+                constraint.scheme,
+                &lower[..usize::from(n_keys)],
+                true,
+                arena,
+            )?;
+            let _ = rendered.write_str(" AND ");
+            write_range_partition_comparison(
+                &mut rendered,
+                definition,
+                constraint.scheme,
+                &upper[..usize::from(n_keys)],
+                false,
+                arena,
+            )?;
+        }
+        _ => {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "unsupported generated partition constraint state"
+            ));
+        }
+    }
+    let _ = rendered.write_char(')');
+    alloc_rendered(
+        &rendered,
+        "partition constraint definition is too long",
+        arena,
+    )
+}
+
+fn write_partition_constraint_key(
+    out: &mut StackStr<4096>,
+    definition: &TableDef,
+    scheme: crate::storage::PartitionScheme,
+    index: usize,
+) {
+    write_identifier(
+        out,
+        definition.columns()[usize::from(scheme.keys[index])]
+            .name
+            .as_str(),
+    );
+}
+
+/// Emits the lexicographic half of a range partition check.  The explicit
+/// recursion preserves SQL NULL semantics once the caller has emitted the
+/// required non-NULL checks, including bounds containing MINVALUE/MAXVALUE.
+fn write_range_partition_comparison(
+    out: &mut StackStr<4096>,
+    definition: &TableDef,
+    scheme: crate::storage::PartitionScheme,
+    bound: &[PartitionBoundValue],
+    lower: bool,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+
+    let Some((head, tail)) = bound.split_first() else {
+        let _ = out.write_str(if lower { "TRUE" } else { "FALSE" });
+        return Ok(());
+    };
+    match head {
+        PartitionBoundValue::MinValue => {
+            let _ = out.write_str(if lower { "TRUE" } else { "FALSE" });
+        }
+        PartitionBoundValue::MaxValue => {
+            let _ = out.write_str(if lower { "FALSE" } else { "TRUE" });
+        }
+        PartitionBoundValue::Value(value) => {
+            let index = usize::from(scheme.n_keys) - bound.len();
+            let _ = out.write_char('(');
+            write_partition_constraint_key(out, definition, scheme, index);
+            let _ = out.write_str(if lower { " > " } else { " < " });
+            write_partition_value(out, *value, arena)?;
+            let _ = out.write_str(" OR (");
+            write_partition_constraint_key(out, definition, scheme, index);
+            let _ = out.write_str(" = ");
+            write_partition_value(out, *value, arena)?;
+            let _ = out.write_str(" AND ");
+            write_range_partition_comparison(out, definition, scheme, tail, lower, arena)?;
+            let _ = out.write_str("))");
+        }
+    }
+    Ok(())
 }
 
 fn write_partition_bound_value(
@@ -8946,6 +9130,53 @@ fn pg_constraint<'a>(
             )?;
             n += 1;
         }
+    }
+    for slot in 0..storage.table_count() {
+        if !storage.table_slot_visible_to(slot, txid) {
+            continue;
+        }
+        let table = storage.table_def(slot, txid);
+        let Some(constraint) = table.partition.detached_bound else {
+            continue;
+        };
+        if n == out.len() {
+            return Err(catalog_capacity_exceeded("pg_constraint"));
+        }
+        out[n] = row(
+            &[
+                Datum::Int4(FIRST_DETACHED_PARTITION_CHECK_OID + slot as i32),
+                text(constraint.name.as_str(), arena)?,
+                Datum::Int4(table_oid(storage, slot)),
+                Datum::Int4(0),
+                text("c", arena)?,
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                Datum::Bool(false),
+                Datum::Bool(true),
+                Datum::Bool(true),
+                Datum::Bool(false),
+                text(" ", arena)?,
+                text(" ", arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                Datum::Int4(2606),
+                Datum::Int4(namespace_oid(storage, table.schema.as_str())),
+                text(" ", arena)?,
+                Datum::Bool(true),
+                Datum::Int4(0),
+                Datum::Bool(false),
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                empty_int_array(arena)?,
+                Datum::Null,
+            ],
+            arena,
+        )?;
+        n += 1;
     }
     // PostgreSQL 18 represents NOT NULL constraints in pg_constraint as well
     // as pg_attribute. pg_dump uses these rows to preserve the constraint

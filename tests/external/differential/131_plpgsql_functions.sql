@@ -20,9 +20,16 @@ DROP FUNCTION IF EXISTS plpgsql_dynamic_loop(integer);
 DROP FUNCTION IF EXISTS plpgsql_dynamic_record_loop(integer);
 DROP FUNCTION IF EXISTS plpgsql_dynamic_command_once();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_trigger();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_dml(integer);
+DROP PROCEDURE IF EXISTS plpgsql_dynamic_dml_procedure(integer);
+DROP FUNCTION IF EXISTS plpgsql_dynamic_dml_trigger();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_utility();
 DROP SEQUENCE IF EXISTS plpgsql_dynamic_command_sequence;
 DROP TABLE IF EXISTS plpgsql_function_rows;
 DROP TABLE IF EXISTS plpgsql_dynamic_rows;
+DROP TABLE IF EXISTS plpgsql_dynamic_dml_rows;
+DROP TABLE IF EXISTS plpgsql_dynamic_dml_audit;
+DROP TABLE IF EXISTS plpgsql_dynamic_utility_rows;
 DROP ROLE IF EXISTS plpgsql_function_caller;
 DROP ROLE IF EXISTS plpgsql_function_denied;
 DROP ROLE IF EXISTS plpgsql_function_owner;
@@ -162,6 +169,52 @@ END
 $$;
 CREATE TRIGGER plpgsql_dynamic_rows_before_insert
   BEFORE INSERT ON plpgsql_dynamic_rows FOR EACH ROW EXECUTE FUNCTION plpgsql_dynamic_trigger();
+CREATE TABLE plpgsql_dynamic_dml_rows (value integer PRIMARY KEY);
+CREATE TABLE plpgsql_dynamic_dml_audit (value integer);
+CREATE FUNCTION plpgsql_dynamic_dml(input_value integer) RETURNS integer
+  LANGUAGE plpgsql AS $$
+DECLARE
+  returned_value integer;
+  changed bigint;
+BEGIN
+  EXECUTE 'INSERT INTO plpgsql_dynamic_dml_rows VALUES ($1) RETURNING value'
+    INTO STRICT returned_value USING input_value;
+  GET DIAGNOSTICS changed = ROW_COUNT;
+  IF changed <> 1 THEN RAISE EXCEPTION 'dynamic INSERT count mismatch'; END IF;
+  EXECUTE 'UPDATE plpgsql_dynamic_dml_rows SET value = $1 + 1 WHERE value = $1 RETURNING value'
+    INTO STRICT returned_value USING returned_value;
+  EXECUTE 'DELETE FROM plpgsql_dynamic_dml_rows WHERE value = $1 RETURNING value'
+    INTO STRICT returned_value USING returned_value;
+  EXECUTE 'UPDATE plpgsql_dynamic_dml_rows SET value = 0 WHERE value = $1' USING returned_value;
+  GET DIAGNOSTICS changed = ROW_COUNT;
+  IF changed <> 0 THEN
+    RAISE EXCEPTION 'dynamic no-row UPDATE count mismatch';
+  END IF;
+  RETURN returned_value;
+END
+$$;
+CREATE PROCEDURE plpgsql_dynamic_dml_procedure(input_value integer)
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'INSERT INTO plpgsql_dynamic_dml_audit VALUES ($1)' USING input_value;
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_dml_trigger() RETURNS trigger
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'INSERT INTO plpgsql_dynamic_dml_audit VALUES ($1)' USING NEW.value;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER plpgsql_dynamic_dml_rows_before_insert
+  BEFORE INSERT ON plpgsql_dynamic_dml_rows FOR EACH ROW EXECUTE FUNCTION plpgsql_dynamic_dml_trigger();
+CREATE FUNCTION plpgsql_dynamic_utility() RETURNS void
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'CREATE TABLE plpgsql_dynamic_utility_rows (value integer)';
+  EXECUTE 'INSERT INTO plpgsql_dynamic_utility_rows VALUES (89)';
+END
+$$;
 CREATE FUNCTION plpgsql_function_no_return() RETURNS integer
   LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
 CREATE FUNCTION plpgsql_function_void_return() RETURNS void
@@ -191,6 +244,14 @@ SELECT * FROM plpgsql_dynamic_series(14);
 SELECT plpgsql_dynamic_command_once(), plpgsql_dynamic_command_once();
 INSERT INTO plpgsql_dynamic_rows VALUES (14);
 SELECT * FROM plpgsql_dynamic_rows;
+SELECT plpgsql_dynamic_dml(14);
+CALL plpgsql_dynamic_dml_procedure(21);
+INSERT INTO plpgsql_dynamic_dml_rows VALUES (34);
+DO $$ BEGIN EXECUTE 'INSERT INTO plpgsql_dynamic_dml_audit VALUES ($1)' USING 55; END $$;
+SELECT plpgsql_dynamic_utility();
+SELECT * FROM plpgsql_dynamic_dml_rows;
+SELECT * FROM plpgsql_dynamic_dml_audit ORDER BY value;
+SELECT * FROM plpgsql_dynamic_utility_rows;
 BEGIN;
 SELECT plpgsql_function_write(21);
 ROLLBACK;
@@ -231,8 +292,16 @@ DROP FUNCTION plpgsql_dynamic_series(integer);
 DROP FUNCTION plpgsql_dynamic_scalar(integer);
 DROP FUNCTION plpgsql_dynamic_command_once();
 DROP SEQUENCE plpgsql_dynamic_command_sequence;
+DROP TRIGGER plpgsql_dynamic_dml_rows_before_insert ON plpgsql_dynamic_dml_rows;
+DROP FUNCTION plpgsql_dynamic_dml_trigger();
+DROP PROCEDURE plpgsql_dynamic_dml_procedure(integer);
+DROP FUNCTION plpgsql_dynamic_dml(integer);
+DROP FUNCTION plpgsql_dynamic_utility();
 DROP TABLE plpgsql_function_rows;
 DROP TABLE plpgsql_dynamic_rows;
+DROP TABLE plpgsql_dynamic_dml_rows;
+DROP TABLE plpgsql_dynamic_dml_audit;
+DROP TABLE plpgsql_dynamic_utility_rows;
 DROP ROLE plpgsql_function_caller;
 DROP ROLE plpgsql_function_denied;
 DROP ROLE plpgsql_function_owner;

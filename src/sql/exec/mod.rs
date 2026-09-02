@@ -13813,13 +13813,20 @@ impl<'a> TriggerExecutionStatus<'a> {
     }
 
     fn set_rows(&mut self, rows: u64) -> Result<(), SqlError> {
+        self.set_row_count(rows)?;
+        self.found = Some(rows != 0);
+        Ok(())
+    }
+
+    /// Dynamic `EXECUTE` updates diagnostics but, unlike a static SQL
+    /// statement, leaves PL/pgSQL's `FOUND` untouched.
+    fn set_row_count(&mut self, rows: u64) -> Result<(), SqlError> {
         self.row_count = i64::try_from(rows).map_err(|_| {
             sql_err!(
                 sqlstate::PROGRAM_LIMIT_EXCEEDED,
                 "trigger affected-row count exceeds bigint"
             )
         })?;
-        self.found = Some(rows != 0);
         Ok(())
     }
 
@@ -17865,6 +17872,261 @@ fn execute_plpgsql_dynamic_query<'a>(
     execute_bound_plpgsql_dynamic_query(context, query, scope, sequence, emit)
 }
 
+/// Executes a parsed dynamic data-modifying statement through the same
+/// trigger-aware primitives as a static PL/pgSQL statement. The command text
+/// has already crossed its parse boundary and `USING` values are its only SQL
+/// parameters.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn execute_bound_plpgsql_dynamic_dml<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    query: BoundPlpgsqlDynamicQuery<'a>,
+    scope: &TriggerLocalScope<'_, 'a>,
+    transition_relations: Option<&'a [(&'a str, &'a crate::sql::ast::MaterializedCte<'a>)]>,
+    capture: Option<&mut dyn FnMut(&[Datum]) -> Result<(), SqlError>>,
+) -> Result<u64, SqlError> {
+    let statement = match transition_relations {
+        Some(relations) => super::query::bind_dml_materialized_relations(
+            query.statement,
+            context.storage(),
+            context.txn.txid,
+            context.arena,
+            query.arguments,
+            relations,
+        )?,
+        None => query.statement,
+    };
+    match statement {
+        Stmt::Insert(statement) => {
+            let prepared_select = match statement.select {
+                Some(select) => Some(materialize_trigger_insert_source(
+                    context.storage(),
+                    select,
+                    context.arena,
+                    context.arena,
+                    context.txn.txid,
+                    TriggerQueryExecution {
+                        params: query.arguments,
+                        seq_session: context.seq_session,
+                    },
+                    scope,
+                )?),
+                None => None,
+            };
+            let conflict_scope = match statement.on_conflict {
+                Some(_) => Some(snapshot_trigger_dml_scope(
+                    scope.transition.definition,
+                    scope.locals,
+                    scope.values,
+                    scope.invocation,
+                    scope.transition.old,
+                    scope.transition.new,
+                    context.arena,
+                )?),
+                None => None,
+            };
+            let arena = context.arena;
+            let params = query.arguments;
+            let seq_session = context.seq_session;
+            let (storage, txn, scratch, responder) = context.dml_parts();
+            let scratch = unsafe { &mut *scratch };
+            txn.enter_trigger_sql()?;
+            responder.clear_affected_rows();
+            let outcome = responder.without_query_output(|responder| {
+                insert(
+                    storage,
+                    txn,
+                    scratch,
+                    statement,
+                    DmlAuthorization::Invoker,
+                    None,
+                    arena,
+                    params,
+                    seq_session,
+                    responder,
+                    capture,
+                    Some(scope),
+                    transition_relations,
+                    conflict_scope,
+                    prepared_select
+                        .map_or(InsertSource::Statement, InsertSource::MaterializedSelect),
+                )
+            });
+            txn.leave_trigger_sql();
+            dynamic_dml_outcome(responder, outcome, "INSERT")
+        }
+        Stmt::Update(statement) => {
+            let scratch = unsafe { &mut *context.scratch() };
+            let saved = context
+                .arena
+                .alloc_slice_copy(scratch.as_slice())
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "nested dynamic UPDATE exceeds the statement arena"
+                    )
+                })?;
+            let arena = context.arena;
+            let params = query.arguments;
+            let seq_session = context.seq_session;
+            let (storage, txn, _, responder) = context.dml_parts();
+            txn.enter_trigger_sql()?;
+            responder.clear_affected_rows();
+            let outcome = responder.without_query_output(|responder| {
+                update(
+                    storage,
+                    txn,
+                    scratch,
+                    statement,
+                    DmlAuthorization::Invoker,
+                    None,
+                    arena,
+                    params,
+                    seq_session,
+                    responder,
+                    capture,
+                    Some(scope),
+                )
+            });
+            txn.leave_trigger_sql();
+            scratch.clear();
+            for item in saved.iter().copied() {
+                scratch.push(item).map_err(|_| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "dynamic UPDATE workspace restore failed"
+                    )
+                })?;
+            }
+            dynamic_dml_outcome(responder, outcome, "UPDATE")
+        }
+        Stmt::Delete(statement) => {
+            let scratch = unsafe { &mut *context.scratch() };
+            let saved = context
+                .arena
+                .alloc_slice_copy(scratch.as_slice())
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "nested dynamic DELETE exceeds the statement arena"
+                    )
+                })?;
+            let arena = context.arena;
+            let params = query.arguments;
+            let seq_session = context.seq_session;
+            let (storage, txn, _, responder) = context.dml_parts();
+            txn.enter_trigger_sql()?;
+            responder.clear_affected_rows();
+            let outcome = responder.without_query_output(|responder| {
+                delete(
+                    storage,
+                    txn,
+                    scratch,
+                    statement,
+                    DmlAuthorization::Invoker,
+                    arena,
+                    params,
+                    seq_session,
+                    responder,
+                    capture,
+                    Some(scope),
+                )
+            });
+            txn.leave_trigger_sql();
+            scratch.clear();
+            for item in saved.iter().copied() {
+                scratch.push(item).map_err(|_| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "dynamic DELETE workspace restore failed"
+                    )
+                })?;
+            }
+            dynamic_dml_outcome(responder, outcome, "DELETE")
+        }
+        _ => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "PL/pgSQL dynamic command is not data-modifying"
+        )),
+    }
+}
+
+/// Dynamic utility commands use the routine's durable DDL executor. Atomic
+/// trigger hosts deliberately have no catalog/WAL owner, so they cannot make a
+/// utility command appear durable by bypassing that boundary.
+fn execute_bound_plpgsql_dynamic_utility<'a>(
+    context: &mut TriggerExecContext<'_, 'a, '_>,
+    query: BoundPlpgsqlDynamicQuery<'a>,
+) -> Result<(), SqlError> {
+    if !query.arguments.is_empty() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "PL/pgSQL dynamic utility commands do not accept USING parameters"
+        ));
+    }
+    let PlpgsqlExecHost::Routine { engine, .. } = &mut context.host else {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "PL/pgSQL dynamic utility commands are not valid in trigger execution"
+        ));
+    };
+    if !matches!(query.statement, Stmt::CreateTable(_) | Stmt::DropTable(_)) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "PL/pgSQL dynamic utility command is not implemented"
+        ));
+    }
+    let outcome = context
+        .responder
+        .without_query_output(|responder| match query.statement {
+            Stmt::CreateTable(command) => super::exec::create_table(
+                &mut engine.storage,
+                &mut engine.wal,
+                context.txn,
+                command,
+                context.arena,
+                responder,
+            ),
+            Stmt::DropTable(command) => super::exec::drop_table(
+                &mut engine.storage,
+                &mut engine.wal,
+                context.txn,
+                command,
+                responder,
+            ),
+            _ => unreachable!("validated dynamic utility command"),
+        });
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "dynamic utility command response exceeded the output buffer"
+        )),
+    }
+}
+
+fn dynamic_dml_outcome(
+    responder: &mut Responder,
+    outcome: Outcome,
+    command: &str,
+) -> Result<u64, SqlError> {
+    match outcome {
+        Ok(Ok(())) => responder.take_affected_rows().ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "dynamic {} did not publish an affected-row count",
+                command
+            )
+        }),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "dynamic {} response exceeded the output buffer",
+            command
+        )),
+    }
+}
+
 fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>, index: usize) {
     let savepoint = context.txn.savepoint_at(index);
     let txid = context.txn.txid;
@@ -18762,36 +19024,58 @@ fn execute_trigger_block<'a>(
                 let mut selected = [Datum::Null; MAX_COLUMNS];
                 let mut found = false;
                 let mut row_count = 0usize;
-                let sequence = crate::sql::sequence::SeqEval::new(
-                    context.storage(),
-                    context.seq_session,
-                    context.txn.txid,
-                );
-                execute_plpgsql_dynamic_query(
-                    context,
-                    statement.query,
-                    &scope,
-                    &sequence,
-                    &mut |values| {
-                        if values.len() != statement.targets.len() {
-                            return Err(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "query returned {} columns but EXECUTE INTO expects {}",
-                                values.len(),
-                                statement.targets.len()
-                            ));
+                let query = bind_plpgsql_dynamic_query(context, statement.query, &scope)?;
+                let mut capture = |values: &[Datum]| {
+                    if values.len() != statement.targets.len() {
+                        return Err(sql_err!(
+                            sqlstate::DATATYPE_MISMATCH,
+                            "query returned {} columns but EXECUTE INTO expects {}",
+                            values.len(),
+                            statement.targets.len()
+                        ));
+                    }
+                    if !found {
+                        for (index, value) in values.iter().copied().enumerate() {
+                            selected[index] = detached_trigger_datum(value, context.arena)?;
                         }
-                        if !found {
-                            for (index, value) in values.iter().copied().enumerate() {
-                                selected[index] = detached_trigger_datum(value, context.arena)?;
-                            }
-                            found = true;
-                        }
-                        row_count += 1;
-                        Ok(())
-                    },
-                )?;
-                status.set_rows(row_count as u64)?;
+                        found = true;
+                    }
+                    row_count += 1;
+                    Ok(())
+                };
+                match query.statement {
+                    Stmt::Select(_) | Stmt::SetQuery(_) => {
+                        let sequence = crate::sql::sequence::SeqEval::new(
+                            context.storage(),
+                            context.seq_session,
+                            context.txn.txid,
+                        );
+                        execute_bound_plpgsql_dynamic_query(
+                            context,
+                            query,
+                            &scope,
+                            &sequence,
+                            &mut capture,
+                        )?;
+                    }
+                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                        let affected = execute_bound_plpgsql_dynamic_dml(
+                            context,
+                            query,
+                            &scope,
+                            transition_relations,
+                            Some(&mut capture),
+                        )?;
+                        debug_assert_eq!(affected, row_count as u64);
+                    }
+                    _ => {
+                        return Err(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "EXECUTE of a utility command cannot have an INTO clause"
+                        ));
+                    }
+                }
+                status.set_row_count(row_count as u64)?;
                 if statement.strict {
                     match row_count {
                         0 => {
@@ -18832,17 +19116,47 @@ fn execute_trigger_block<'a>(
                     invocation,
                     transition: &transition,
                 };
-                let mut row_count = 0u64;
-                let sequence = crate::sql::sequence::SeqEval::new(
-                    context.storage(),
-                    context.seq_session,
-                    context.txn.txid,
-                );
-                execute_plpgsql_dynamic_query(context, query, &scope, &sequence, &mut |_| {
-                    row_count += 1;
-                    Ok(())
-                })?;
-                status.set_rows(row_count)?;
+                let query = bind_plpgsql_dynamic_query(context, query, &scope)?;
+                let row_count = match query.statement {
+                    Stmt::Select(_) | Stmt::SetQuery(_) => {
+                        let sequence = crate::sql::sequence::SeqEval::new(
+                            context.storage(),
+                            context.seq_session,
+                            context.txn.txid,
+                        );
+                        let mut rows = 0u64;
+                        execute_bound_plpgsql_dynamic_query(
+                            context,
+                            query,
+                            &scope,
+                            &sequence,
+                            &mut |_| {
+                                rows = rows.checked_add(1).ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "PL/pgSQL dynamic query returned too many rows"
+                                    )
+                                })?;
+                                Ok(())
+                            },
+                        )?;
+                        rows
+                    }
+                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) => {
+                        execute_bound_plpgsql_dynamic_dml(
+                            context,
+                            query,
+                            &scope,
+                            transition_relations,
+                            None,
+                        )?
+                    }
+                    _ => {
+                        execute_bound_plpgsql_dynamic_utility(context, query)?;
+                        0
+                    }
+                };
+                status.set_row_count(row_count)?;
             }
             TriggerStatement::Perform(query) => {
                 let query = match transition_relations {

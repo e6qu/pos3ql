@@ -191,6 +191,20 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
          CREATE FUNCTION plpgsql_dynamic_series(input_value integer) RETURNS SETOF integer
            LANGUAGE plpgsql AS 'BEGIN
              RETURN QUERY EXECUTE ''VALUES ($1::integer), ($1::integer + 1)'' USING input_value;
+           END'; \
+         CREATE TABLE plpgsql_dynamic_dml_rows (value integer PRIMARY KEY); \
+         CREATE FUNCTION plpgsql_dynamic_dml(input_value integer) RETURNS integer
+           LANGUAGE plpgsql AS 'DECLARE returned_value integer; BEGIN
+             EXECUTE ''INSERT INTO plpgsql_dynamic_dml_rows VALUES ($1) RETURNING value''
+               INTO STRICT returned_value USING input_value;
+             EXECUTE ''UPDATE plpgsql_dynamic_dml_rows SET value = $1 + 1 RETURNING value''
+               INTO STRICT returned_value USING returned_value;
+             RETURN returned_value;
+           END'; \
+         CREATE FUNCTION plpgsql_dynamic_utility() RETURNS void
+           LANGUAGE plpgsql AS 'BEGIN
+             EXECUTE ''CREATE TABLE plpgsql_dynamic_utility_rows (value integer)'';
+             EXECUTE ''INSERT INTO plpgsql_dynamic_utility_rows VALUES (89)'';
            END'",
     );
     assert!(
@@ -205,7 +219,11 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
          SELECT * FROM plpgsql_series(3); \
          SELECT * FROM plpgsql_table_series(2); \
          SELECT plpgsql_dynamic_scalar(14); \
-         SELECT * FROM plpgsql_dynamic_series(14)",
+         SELECT * FROM plpgsql_dynamic_series(14); \
+         SELECT plpgsql_dynamic_dml(41); \
+         SELECT * FROM plpgsql_dynamic_dml_rows; \
+         SELECT plpgsql_dynamic_utility(); \
+         SELECT * FROM plpgsql_dynamic_utility_rows",
     );
     assert_eq!(
         data_rows(&returned),
@@ -220,6 +238,10 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
             "42",
             "14",
             "15",
+            "42",
+            "42",
+            "NULL",
+            "89",
         ],
         "{}",
         String::from_utf8_lossy(&returned)
@@ -235,7 +257,9 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
         &mut cold_budget,
         "SELECT (plpgsql_pair(7)).label; SELECT * FROM plpgsql_series(2); \
          SELECT * FROM plpgsql_table_series(1); \
-         SELECT plpgsql_dynamic_scalar(14); SELECT * FROM plpgsql_dynamic_series(14)",
+         SELECT plpgsql_dynamic_scalar(14); SELECT * FROM plpgsql_dynamic_series(14); \
+         SELECT * FROM plpgsql_dynamic_dml_rows; \
+         SELECT * FROM plpgsql_dynamic_utility_rows",
     );
     assert_eq!(
         data_rows(&recovered),
@@ -248,6 +272,8 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
             "42",
             "14",
             "15",
+            "42",
+            "89",
         ],
         "{}",
         String::from_utf8_lossy(&recovered)
@@ -23528,6 +23554,30 @@ fn trigger_execution_status_is_typed_for_queries_and_dml() {
         ["local-shadow|t|0"],
         "{}",
         String::from_utf8_lossy(&shadowed)
+    );
+}
+
+#[test]
+fn dynamic_execute_preserves_found_and_updates_row_count() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE FUNCTION dynamic_execute_status() RETURNS boolean LANGUAGE plpgsql AS
+           'DECLARE rows bigint;
+            BEGIN
+              PERFORM 1;
+              EXECUTE ''SELECT 1 WHERE false'';
+              GET DIAGNOSTICS rows = ROW_COUNT;
+              RETURN found AND rows = 0;
+            END';
+         SELECT dynamic_execute_status();",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t"],
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 

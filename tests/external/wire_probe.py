@@ -2357,19 +2357,23 @@ def test_plpgsql_set_function_bind_and_portal_over_raw_wire():
     s.close()
 
 
-def test_plpgsql_dynamic_query_bind_and_portal_over_raw_wire():
+def test_plpgsql_dynamic_dml_bind_and_portal_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))
     drain_startup(s)
     setup = simple_query(
         s,
+        "CREATE TABLE wire_plpgsql_dynamic_rows (value integer PRIMARY KEY); "
         "CREATE FUNCTION wire_plpgsql_dynamic(value integer) RETURNS integer "
         "LANGUAGE plpgsql AS 'DECLARE result_value integer; BEGIN "
-        "EXECUTE ''SELECT $1::integer * 2'' INTO STRICT result_value USING value; "
+        "EXECUTE ''INSERT INTO wire_plpgsql_dynamic_rows VALUES ($1) RETURNING value'' "
+        "INTO STRICT result_value USING value; "
+        "EXECUTE ''UPDATE wire_plpgsql_dynamic_rows SET value = $1 * 2 RETURNING value'' "
+        "INTO STRICT result_value USING result_value; "
         "RETURN result_value; END'",
     )
     check(
-        "raw wire: PL/pgSQL dynamic query setup succeeds",
+        "raw wire: PL/pgSQL dynamic DML setup succeeds",
         not any(kind == b"E" for kind, _ in setup),
         setup,
     )
@@ -2399,7 +2403,7 @@ def test_plpgsql_dynamic_query_bind_and_portal_over_raw_wire():
     description = next((payload for kind, payload in out if kind == b"T"), None)
     row = next((payload for kind, payload in out if kind == b"D"), None)
     check(
-        "raw wire: dynamic PL/pgSQL query preserves Bind and portal result typing",
+        "raw wire: dynamic PL/pgSQL DML preserves Bind and portal result typing",
         not any(kind == b"E" for kind, _ in out)
         and description is not None
         and row_description_type_oids(description) == [23]

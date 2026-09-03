@@ -1501,6 +1501,15 @@ impl ArrElem {
         Self::Multirange(RangeKind::Tstz),
     ];
 
+    /// PostgreSQL uses `;` between `box` values because their text form
+    /// contains commas. Every other modeled array element uses `,`.
+    pub const fn delimiter(self) -> u8 {
+        match self {
+            Self::Geometry(GeometryKind::Box) => b';',
+            _ => b',',
+        }
+    }
+
     /// Whether text input for this element needs catalog identity resolution.
     pub const fn is_catalog_reference(self) -> bool {
         matches!(
@@ -3035,6 +3044,7 @@ pub(crate) fn write_record_field(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::
 struct QuoteScan {
     empty: bool,
     special: bool,
+    delimiter: char,
     text: [u8; 4],
     len: usize,
 }
@@ -3044,9 +3054,9 @@ impl fmt::Write for QuoteScan {
         if !s.is_empty() {
             self.empty = false;
         }
-        if s.chars()
-            .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace())
-        {
+        if s.chars().any(|c| {
+            c == self.delimiter || matches!(c, '{' | '}' | '"' | '\\') || c.is_whitespace()
+        }) {
             self.special = true;
         }
         // Only the first four bytes are kept, enough to recognize `null`.
@@ -3080,13 +3090,18 @@ impl fmt::Write for EscapeTo<'_, '_> {
 /// which is why a timestamp, a range and a json value all come out quoted, not
 /// only a string. The value is rendered twice rather than buffered, so nothing
 /// caps how long an element may be.
-pub(crate) fn write_array_elem(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::Result {
+pub(crate) fn write_array_elem(
+    f: &mut fmt::Formatter<'_>,
+    v: &Datum,
+    delimiter: u8,
+) -> fmt::Result {
     if matches!(v, Datum::Null) {
         return f.write_str("NULL");
     }
     let mut scan = QuoteScan {
         empty: true,
         special: false,
+        delimiter: delimiter as char,
         text: [0; 4],
         len: 0,
     };

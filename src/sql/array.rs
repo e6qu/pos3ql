@@ -550,7 +550,7 @@ impl<'a> LiteralParser<'a> {
                 width += 1;
                 self.space();
                 match self.text.as_bytes().get(self.at) {
-                    Some(b',') => self.at += 1,
+                    Some(delimiter) if *delimiter == self.element.delimiter() => self.at += 1,
                     Some(b'}') => break,
                     _ => return Err(self.bad()),
                 }
@@ -617,7 +617,7 @@ impl<'a> LiteralParser<'a> {
         } else {
             let start = self.at;
             while let Some(&byte) = bytes.get(self.at) {
-                if byte == b',' || byte == b'}' {
+                if byte == self.element.delimiter() || byte == b'}' {
                     break;
                 }
                 if byte == b'{' {
@@ -703,7 +703,7 @@ pub(crate) fn format_shaped<'a>(
                         f.write_str(",")?;
                     }
                     if depth + 1 == shaped.shape.dimension_count() {
-                        super::types::write_array_elem(f, &shaped.items[*index])?;
+                        super::types::write_array_elem(f, &shaped.items[*index], b',')?;
                         *index += 1;
                     } else {
                         level(f, shaped, depth + 1, index)?;
@@ -731,11 +731,15 @@ fn write_level(
     f.write_str("{")?;
     for member in 0..shape.dimension(depth).unwrap() {
         if member > 0 {
-            f.write_str(",")?;
+            f.write_str(match element.delimiter() {
+                b',' => ",",
+                b';' => ";",
+                _ => unreachable!("array delimiter is a closed ArrElem property"),
+            })?;
         }
         if depth + 1 == shape.dimension_count() {
             match get(raw, element, *index) {
-                Some(datum) => super::types::write_array_elem(f, &datum)?,
+                Some(datum) => super::types::write_array_elem(f, &datum, element.delimiter())?,
                 None => f.write_str("NULL")?,
             }
             *index += 1;

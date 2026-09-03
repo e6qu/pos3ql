@@ -34081,11 +34081,12 @@ fn geometric_types_keep_kind_identity_through_sql_arrays_and_storage() {
             &mut budget,
             "SELECT point_value::text, segment_value::text, path_value::text, box_value::text, \
                     polygon_value::text, line_value::text, circle_value::text, \
-                    point_values::text, pg_typeof(point_value), pg_typeof(point_values) \
+                    point_values::text, '{(3,4),(1,2);NULL;(7,8),(5,6)}'::box[]::text, \
+                    pg_typeof(point_value), pg_typeof(point_values) \
              FROM geometric_values",
         )),
         [
-            "(1,2)|[(1,2),(3,4)]|[(1,2),(3,4)]|(3,4),(1,2)|((1,2),(3,4),(5,6))|{1,2,3}|<(1,2),3>|{\"(1,2)\",\"(3,4)\"}|point|point[]"
+            "(1,2)|[(1,2),(3,4)]|[(1,2),(3,4)]|(3,4),(1,2)|((1,2),(3,4),(5,6))|{1,2,3}|<(1,2),3>|{\"(1,2)\",\"(3,4)\"}|{(3,4),(1,2);NULL;(7,8),(5,6)}|point|point[]"
         ]
     );
 }

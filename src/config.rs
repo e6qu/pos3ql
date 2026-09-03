@@ -352,7 +352,18 @@ impl Config {
                     }
                     config.auth = value.to_string();
                 }
-                "password" => config.password = value.to_string(),
+                "password" => {
+                    if value.len() > crate::storage::ROLE_PASSWORD_MAX {
+                        return Err(ConfigError::at(
+                            line_no,
+                            format!(
+                                "password exceeds {} bytes",
+                                crate::storage::ROLE_PASSWORD_MAX
+                            ),
+                        ));
+                    }
+                    config.password = value.to_string();
+                }
                 "conn_recv_buffer_bytes" => {
                     config.conn_recv_buffer_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
@@ -934,6 +945,13 @@ sql_arena_bytes = 4096
         assert!(Config::parse("collation_scratch_bytes = 0\n").is_err());
         assert!(Config::parse("auth = unknown\n").is_err());
         assert_eq!(Config::parse("auth = md5\n").unwrap().auth, "md5");
+        assert!(
+            Config::parse(&format!(
+                "password = {}\n",
+                "x".repeat(crate::storage::ROLE_PASSWORD_MAX + 1)
+            ))
+            .is_err()
+        );
     }
 
     #[test]

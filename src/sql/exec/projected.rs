@@ -157,6 +157,7 @@ pub fn projected_value_len(v: &Datum) -> usize {
         Datum::Range { text, .. } => 5 + text.len(),
         Datum::Bit { bits, .. } => 5 + bits.len(),
         Datum::Multirange { text, .. } => 5 + text.len(),
+        Datum::Geometry { text, .. } => 5 + text.len(),
         // Projected values are schema-less, so an enum carries its slot too:
         // slot(2) + sort(8) + 4-byte label length + label bytes.
         Datum::Enum { label, .. } => 14 + label.len(),
@@ -423,6 +424,13 @@ fn write_projected_value(v: &Datum, out: &mut [u8]) -> usize {
             out[6..6 + text.len()].copy_from_slice(text.as_bytes());
             6 + text.len()
         }
+        Datum::Geometry { kind, text } => {
+            out[0] = 39;
+            out[1] = *kind as u8;
+            out[2..6].copy_from_slice(&(text.len() as u32).to_le_bytes());
+            out[6..6 + text.len()].copy_from_slice(text.as_bytes());
+            6 + text.len()
+        }
         Datum::Enum { slot, sort, label } => {
             out[0] = 28;
             out[1..3].copy_from_slice(&slot.to_le_bytes());
@@ -669,6 +677,16 @@ pub fn decode_projected_value(bytes: &[u8], tag: u8, at: usize) -> (Datum<'_>, u
             let s = core::str::from_utf8(&bytes[at + 5..at + 5 + len])
                 .expect("projected multirange was encoded from valid UTF-8");
             (Datum::Multirange { text: s, kind }, 5 + len)
+        }
+        39 => {
+            let kind = crate::sql::types::GeometryKind::ALL
+                .into_iter()
+                .find(|kind| *kind as u8 == bytes[at])
+                .expect("projected geometry carries a valid kind code");
+            let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            let text = core::str::from_utf8(&bytes[at + 5..at + 5 + len])
+                .expect("projected geometry was encoded from valid UTF-8");
+            (Datum::Geometry { kind, text }, 5 + len)
         }
         19 => {
             // The arena-free decode returns a record's rendered text — right

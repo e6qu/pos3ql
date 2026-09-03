@@ -13229,6 +13229,13 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         ColType::Cidr,
         ColType::Macaddr,
         ColType::Macaddr8,
+        ColType::Geometry(super::types::GeometryKind::Point),
+        ColType::Geometry(super::types::GeometryKind::Lseg),
+        ColType::Geometry(super::types::GeometryKind::Path),
+        ColType::Geometry(super::types::GeometryKind::Box),
+        ColType::Geometry(super::types::GeometryKind::Polygon),
+        ColType::Geometry(super::types::GeometryKind::Line),
+        ColType::Geometry(super::types::GeometryKind::Circle),
         ColType::Record,
     ];
     let category = |t: &ColType| match t {
@@ -13249,6 +13256,7 @@ fn pg_type<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         | ColType::PgMcvList => "Z",
         // Network address types are PostgreSQL typcategory 'I'.
         ColType::Inet | ColType::Cidr | ColType::Macaddr | ColType::Macaddr8 => "I",
+        ColType::Geometry(_) => "G",
         _ => "S",
     };
     let mut out: [&[Datum];

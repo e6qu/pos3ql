@@ -678,6 +678,7 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
         Datum::Timetz(..) => hasher.write(&[22]),
         Datum::Range { .. } => hasher.write(&[23]),
         Datum::Multirange { .. } => hasher.write(&[24]),
+        Datum::Geometry { .. } => hasher.write(&[39]),
         Datum::Array { .. } => hasher.write(&[25]),
         Datum::Int2Vector(raw) => {
             hasher.write(&[32]);

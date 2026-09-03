@@ -3516,6 +3516,11 @@ fn call<'a>(
         return result;
     }
     if argument_names.is_empty()
+        && let Some(result) = funcs::geometry::dispatch(name, args, star, arena, params, row, hooks)
+    {
+        return result;
+    }
+    if argument_names.is_empty()
         && let Some(result) =
             funcs::full_text::dispatch(name, args, star, arena, params, row, hooks)
     {
@@ -6137,6 +6142,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Cidr(_) => "cidr",
         Datum::Macaddr(_) => "macaddr",
         Datum::Macaddr8(_) => "macaddr8",
+        Datum::Geometry { kind, .. } => kind.name(),
         Datum::Record(_) => "record",
         // The catalog-free diagnostic names the dynamic enum category.
         Datum::Enum { .. } => "enum",

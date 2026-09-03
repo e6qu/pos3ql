@@ -10285,7 +10285,7 @@ fn range_and_multirange_arrays_survive_wal_and_checkpoint_recovery() {
 fn oid_arrays_keep_catalog_identity_and_survive_recovery() {
     let config = test_config("oid-array-restart");
     {
-        let mut budget = Budget::new(1 << 26);
+        let mut budget = Budget::new(1 << 29);
         let mut engine = Engine::new(&config, &mut budget).unwrap();
         let created = run_with(
             &mut engine,
@@ -10351,7 +10351,7 @@ fn oid_arrays_keep_catalog_identity_and_survive_recovery() {
         );
         engine.commit_wal().unwrap();
     }
-    let mut budget = Budget::new(1 << 26);
+    let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     assert_eq!(
         data_rows(&run_with(
@@ -34054,6 +34054,131 @@ fn domains_over_named_composites_preserve_identity_and_array_elements() {
         ))
         .contains("23514")
     );
+}
+
+#[test]
+fn geometric_types_keep_kind_identity_through_sql_arrays_and_storage() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE geometric_values (\
+           point_value point, segment_value lseg, path_value path, box_value box, \
+           polygon_value polygon, line_value line, circle_value circle, point_values point[]); \
+         INSERT INTO geometric_values VALUES (\
+           '(1,2)'::point, '[(1,2),(3,4)]'::lseg, '[(1,2),(3,4)]'::path, \
+           '(1,2),(3,4)'::box, '((1,2),(3,4),(5,6))'::polygon, '{1,2,3}'::line, \
+           '<(1,2),3>'::circle, ARRAY['(1,2)'::point, '(3,4)'::point]);",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT point_value::text, segment_value::text, path_value::text, box_value::text, \
+                    polygon_value::text, line_value::text, circle_value::text, \
+                    point_values::text, '{(3,4),(1,2);NULL;(7,8),(5,6)}'::box[]::text, \
+                    pg_typeof(point_value), pg_typeof(point_values) \
+             FROM geometric_values",
+        )),
+        [
+            "(1,2)|[(1,2),(3,4)]|[(1,2),(3,4)]|(3,4),(1,2)|((1,2),(3,4),(5,6))|{1,2,3}|<(1,2),3>|{\"(1,2)\",\"(3,4)\"}|{(3,4),(1,2);NULL;(7,8),(5,6)}|point|point[]"
+        ]
+    );
+}
+
+#[test]
+fn geometric_constructors_and_inspectors_match_postgresql_forms() {
+    let (mut engine, mut budget) = test_engine();
+    let response = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT point(1, 2)::text, x(point(1, 2)), y(point(1, 2)), \
+                lseg(point(1, 2), point(3, 4))::text, \
+                box(point(1, 2), point(3, 4))::text, \
+                line(point(1, 2), point(3, 4))::text, \
+                circle(point(1, 2), 3)::text, center(box(point(1, 2), point(3, 4)))::text, \
+                length(lseg(point(1, 2), point(4, 6))), radius(circle(point(1, 2), 3)), \
+                pclose('[(1,2),(3,4)]'::path)::text, polygon('[(1,2),(3,4),(5,6)]'::path)::text, \
+                area('((0,0),(4,0),(0,3))'::path), area('[(0,0),(4,0),(0,3)]'::path) IS NULL",
+    );
+    assert_eq!(
+        data_rows(&response),
+        [
+            "(1,2)|1|2|[(1,2),(3,4)]|(3,4),(1,2)|{1,-1,1}|<(1,2),3>|(2,3)|5|3|((1,2),(3,4))|((1,2),(3,4),(5,6))|6|t"
+        ]
+    );
+}
+
+#[test]
+fn geometric_literals_preserve_postgresql_grammar_boundaries() {
+    let (mut engine, mut budget) = test_engine();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT '1,2'::point::text, ' ((1,2),(3,4)) '::box::text, \
+                    '((1,2),(3,4))'::lseg::text, '((1,2),(3,4))'::line::text",
+        )),
+        ["(1,2)|(3,4),(1,2)|[(1,2),(3,4)]|{1,-1,1}"]
+    );
+    for literal in [
+        "'[(1,2),(3,4))'::lseg",
+        "'(1,2)(3,4)'::box",
+        "'[(1,2),(3,4)]'::polygon",
+        "'{0,0,0}'::line",
+        "'<(1,2),-3>'::circle",
+    ] {
+        let result = run_with(&mut engine, &mut budget, &format!("SELECT {literal}"));
+        assert!(
+            String::from_utf8_lossy(&result).contains("22P02"),
+            "{}",
+            String::from_utf8_lossy(&result)
+        );
+    }
+}
+
+#[test]
+fn geometric_values_and_arrays_survive_wal_checkpoint_and_cold_recovery() {
+    let mut config = test_config("geometric-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("geometric-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_geometric_values (point_value point, line_value line, path_values path[], default_point point DEFAULT '(8,9)'); \
+             INSERT INTO durable_geometric_values (point_value, line_value, path_values) VALUES ('(1,2)', '((1,2),(3,4))', \
+               ARRAY['[(1,2),(3,4)]'::path, '((5,6),(7,8))'::path])",
+        );
+        assert!(
+            !String::from_utf8_lossy(&output).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT point_value::text, line_value::text, path_values::text, default_point::text FROM durable_geometric_values",
+        )),
+        ["(1,2)|{1,-1,1}|{\"[(1,2),(3,4)]\",\"((5,6),(7,8))\"}|(8,9)"]
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
 #[test]

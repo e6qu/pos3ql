@@ -382,6 +382,11 @@ pub enum OwnedDatum {
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
+    Geometry {
+        kind: crate::sql::types::GeometryKind,
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     TextSearch {
         query: bool,
         len: u8,
@@ -647,6 +652,14 @@ impl OwnedDatum {
                     bytes,
                 }
             }
+            Datum::Geometry { kind, text } => {
+                let (len, bytes) = Self::bytes(text.as_bytes(), "geometric")?;
+                Self::Geometry {
+                    kind: *kind,
+                    len,
+                    bytes,
+                }
+            }
         })
     }
 
@@ -689,6 +702,11 @@ impl OwnedDatum {
             Self::Text { len, bytes } => Datum::Text(
                 core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8"),
             ),
+            Self::Geometry { kind, len, bytes } => Datum::Geometry {
+                kind: *kind,
+                text: core::str::from_utf8(&bytes[..*len as usize])
+                    .expect("stored from valid UTF-8"),
+            },
             Self::TextSearch { query, len, bytes } => {
                 let text =
                     core::str::from_utf8(&bytes[..*len as usize]).expect("stored from valid UTF-8");

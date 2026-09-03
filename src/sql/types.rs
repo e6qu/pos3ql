@@ -8,6 +8,20 @@ use super::numeric::Numeric;
 
 /// OIDs from PostgreSQL's `pg_type` (stable, documented catalog values).
 pub mod oid {
+    pub const POINT: i32 = 600;
+    pub const LSEG: i32 = 601;
+    pub const PATH: i32 = 602;
+    pub const BOX: i32 = 603;
+    pub const POLYGON: i32 = 604;
+    pub const LINE: i32 = 628;
+    pub const CIRCLE: i32 = 718;
+    pub const POINT_ARRAY: i32 = 1017;
+    pub const LSEG_ARRAY: i32 = 1018;
+    pub const PATH_ARRAY: i32 = 1019;
+    pub const BOX_ARRAY: i32 = 1020;
+    pub const POLYGON_ARRAY: i32 = 1027;
+    pub const LINE_ARRAY: i32 = 629;
+    pub const CIRCLE_ARRAY: i32 = 719;
     pub const BOOL: i32 = 16;
     pub const BYTEA: i32 = 17;
     pub const CHAR: i32 = 18;
@@ -142,6 +156,103 @@ pub mod oid {
     }
     pub fn composite_array_oid(slot: u16) -> i32 {
         FIRST_COMPOSITE_ARRAY + slot as i32
+    }
+}
+
+/// PostgreSQL's built-in planar geometric types. The closed tag is carried at
+/// every value boundary, so text for one geometry can never be sent under a
+/// different type OID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum GeometryKind {
+    Point,
+    Lseg,
+    Path,
+    Box,
+    Polygon,
+    Line,
+    Circle,
+}
+
+impl GeometryKind {
+    pub const ALL: [Self; 7] = [
+        Self::Point,
+        Self::Lseg,
+        Self::Path,
+        Self::Box,
+        Self::Polygon,
+        Self::Line,
+        Self::Circle,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Point => "point",
+            Self::Lseg => "lseg",
+            Self::Path => "path",
+            Self::Box => "box",
+            Self::Polygon => "polygon",
+            Self::Line => "line",
+            Self::Circle => "circle",
+        }
+    }
+
+    pub const fn oid(self) -> i32 {
+        match self {
+            Self::Point => oid::POINT,
+            Self::Lseg => oid::LSEG,
+            Self::Path => oid::PATH,
+            Self::Box => oid::BOX,
+            Self::Polygon => oid::POLYGON,
+            Self::Line => oid::LINE,
+            Self::Circle => oid::CIRCLE,
+        }
+    }
+
+    pub const fn array_oid(self) -> i32 {
+        match self {
+            Self::Point => oid::POINT_ARRAY,
+            Self::Lseg => oid::LSEG_ARRAY,
+            Self::Path => oid::PATH_ARRAY,
+            Self::Box => oid::BOX_ARRAY,
+            Self::Polygon => oid::POLYGON_ARRAY,
+            Self::Line => oid::LINE_ARRAY,
+            Self::Circle => oid::CIRCLE_ARRAY,
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => Self::Point,
+            1 => Self::Lseg,
+            2 => Self::Path,
+            3 => Self::Box,
+            4 => Self::Polygon,
+            5 => Self::Line,
+            6 => Self::Circle,
+            _ => return None,
+        })
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "point" => Self::Point,
+            "lseg" => Self::Lseg,
+            "path" => Self::Path,
+            "box" => Self::Box,
+            "polygon" => Self::Polygon,
+            "line" => Self::Line,
+            "circle" => Self::Circle,
+            _ => return None,
+        })
+    }
+
+    pub fn from_oid(oid: i32) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.oid() == oid)
     }
 }
 
@@ -289,6 +400,9 @@ pub enum ColType {
     Macaddr,
     /// `macaddr8`: an eight-byte (EUI-64) MAC address.
     Macaddr8,
+    /// One of PostgreSQL's planar geometric types, retained as validated
+    /// canonical text for bounded durable storage.
+    Geometry(GeometryKind),
     /// An anonymous composite (`ROW(...)`, a whole-row reference, a record
     /// SRF) carried through a derived table's columns. Transient only: a real
     /// table column can never have this type (DDL refuses records), so it has
@@ -378,7 +492,7 @@ impl BtreeOperatorClass {
             | Regnamespace | Regrole | Regconfig | Regdictionary => Self::Oid,
             Record | Composite(_) => Self::Record,
             Text | Varchar => Self::Text,
-            Char => return None,
+            Char | Geometry(_) => return None,
             Time => Self::Time,
             Timestamp => Self::Timestamp,
             Timestamptz => Self::Timestamptz,
@@ -609,6 +723,9 @@ impl ColType {
         if let Some(k) = RangeKind::from_multirange_name(name) {
             return Some(Self::Multirange(k));
         }
+        if let Some(kind) = GeometryKind::from_name(name) {
+            return Some(Self::Geometry(kind));
+        }
         Some(match name {
             "void" => Self::Void,
             "internal" => Self::Internal,
@@ -717,6 +834,7 @@ impl ColType {
             Self::Cidr => oid::CIDR,
             Self::Macaddr => oid::MACADDR,
             Self::Macaddr8 => oid::MACADDR8,
+            Self::Geometry(kind) => kind.oid(),
             Self::Record => oid::RECORD,
             Self::Enum(slot) => oid::enum_oid(slot),
             Self::Composite(slot) => oid::composite_oid(slot),
@@ -786,6 +904,9 @@ impl ColType {
         };
         if scalar.is_some() {
             return scalar;
+        }
+        if let Some(kind) = GeometryKind::from_oid(type_oid) {
+            return Some(Self::Geometry(kind));
         }
         // Ranges and multiranges.
         for kind in [
@@ -874,6 +995,7 @@ impl ColType {
             Self::Uuid => 16,
             Self::Macaddr => 6,
             Self::Macaddr8 => 8,
+            Self::Geometry(_) => -1,
             Self::Name => 64,
             Self::Text
             | Self::Varchar
@@ -908,6 +1030,7 @@ impl ColType {
             | Self::PgMcvList
             | Self::PgStatisticArray => Self::Text,
             Self::Oid | Self::Xid => Self::Int4,
+            Self::Geometry(_) => self,
             Self::Regtype
             | Self::Regproc
             | Self::Regprocedure
@@ -980,6 +1103,7 @@ impl ColType {
             Self::Cidr => "cidr",
             Self::Macaddr => "macaddr",
             Self::Macaddr8 => "macaddr8",
+            Self::Geometry(kind) => kind.name(),
             Self::Record => "record",
             // The real enum name is dynamic (per catalog slot); callers that
             // must title a column after the enum resolve it via the catalog.
@@ -1054,6 +1178,7 @@ impl ColType {
             Self::Cidr => "cidr",
             Self::Macaddr => "macaddr",
             Self::Macaddr8 => "macaddr8",
+            Self::Geometry(kind) => kind.name(),
             Self::Record => "record",
             Self::Enum(_) => "enum",
             Self::Composite(_) => "record",
@@ -1120,6 +1245,13 @@ impl ColType {
             Self::Cidr => 44,
             Self::Macaddr => 45,
             Self::Macaddr8 => 47,
+            Self::Geometry(GeometryKind::Point) => 219,
+            Self::Geometry(GeometryKind::Lseg) => 220,
+            Self::Geometry(GeometryKind::Path) => 221,
+            Self::Geometry(GeometryKind::Box) => 222,
+            Self::Geometry(GeometryKind::Polygon) => 223,
+            Self::Geometry(GeometryKind::Line) => 224,
+            Self::Geometry(GeometryKind::Circle) => 225,
             Self::Multirange(k) => MULTIRANGE_CODE_BASE + k.code(),
             Self::Array(e) => ARRAY_CODE_BASE + e.code(),
             // Records are transient (never a stored column); the code is a
@@ -1192,6 +1324,13 @@ impl ColType {
             44 => Self::Cidr,
             45 => Self::Macaddr,
             47 => Self::Macaddr8,
+            219 => Self::Geometry(GeometryKind::Point),
+            220 => Self::Geometry(GeometryKind::Lseg),
+            221 => Self::Geometry(GeometryKind::Path),
+            222 => Self::Geometry(GeometryKind::Box),
+            223 => Self::Geometry(GeometryKind::Polygon),
+            224 => Self::Geometry(GeometryKind::Line),
+            225 => Self::Geometry(GeometryKind::Circle),
             // An enum column: the concrete slot is resolved from the persisted
             // type name after decode (see the column codec's name handling).
             54 => Self::Enum(Self::ENUM_SLOT_UNRESOLVED),
@@ -1247,6 +1386,7 @@ pub enum ArrElem {
     Cidr,
     Macaddr,
     Macaddr8,
+    Geometry(GeometryKind),
     /// A fixed-length `bit` array element. The element typmod supplies the
     /// declared width; this tag preserves the `_bit` catalog identity.
     Bit,
@@ -1297,7 +1437,7 @@ impl ArrElem {
     /// transmits as an array. This is the single inventory for OID decoding
     /// and catalog synthesis, so adding an accepted array cannot leave its
     /// `pg_type` identity behind.
-    pub const BUILTIN: [Self; 54] = [
+    pub const BUILTIN: [Self; 61] = [
         Self::Bool,
         Self::Char,
         Self::Int2,
@@ -1328,6 +1468,13 @@ impl ArrElem {
         Self::Cidr,
         Self::Macaddr,
         Self::Macaddr8,
+        Self::Geometry(GeometryKind::Point),
+        Self::Geometry(GeometryKind::Lseg),
+        Self::Geometry(GeometryKind::Path),
+        Self::Geometry(GeometryKind::Box),
+        Self::Geometry(GeometryKind::Polygon),
+        Self::Geometry(GeometryKind::Line),
+        Self::Geometry(GeometryKind::Circle),
         Self::Bit,
         Self::Varbit,
         Self::Regtype,
@@ -1353,6 +1500,15 @@ impl ArrElem {
         Self::Multirange(RangeKind::Ts),
         Self::Multirange(RangeKind::Tstz),
     ];
+
+    /// PostgreSQL uses `;` between `box` values because their text form
+    /// contains commas. Every other modeled array element uses `,`.
+    pub const fn delimiter(self) -> u8 {
+        match self {
+            Self::Geometry(GeometryKind::Box) => b';',
+            _ => b',',
+        }
+    }
 
     /// Whether text input for this element needs catalog identity resolution.
     pub const fn is_catalog_reference(self) -> bool {
@@ -1404,6 +1560,15 @@ impl ArrElem {
             ArrElem::Cidr => "_cidr",
             ArrElem::Macaddr => "_macaddr",
             ArrElem::Macaddr8 => "_macaddr8",
+            ArrElem::Geometry(kind) => match kind {
+                GeometryKind::Point => "_point",
+                GeometryKind::Lseg => "_lseg",
+                GeometryKind::Path => "_path",
+                GeometryKind::Box => "_box",
+                GeometryKind::Polygon => "_polygon",
+                GeometryKind::Line => "_line",
+                GeometryKind::Circle => "_circle",
+            },
             ArrElem::Bit => "_bit",
             ArrElem::Varbit => "_varbit",
             ArrElem::Regtype => "_regtype",
@@ -1474,6 +1639,15 @@ impl ArrElem {
             ArrElem::Cidr => "cidr[]",
             ArrElem::Macaddr => "macaddr[]",
             ArrElem::Macaddr8 => "macaddr8[]",
+            ArrElem::Geometry(kind) => match kind {
+                GeometryKind::Point => "point[]",
+                GeometryKind::Lseg => "lseg[]",
+                GeometryKind::Path => "path[]",
+                GeometryKind::Box => "box[]",
+                GeometryKind::Polygon => "polygon[]",
+                GeometryKind::Line => "line[]",
+                GeometryKind::Circle => "circle[]",
+            },
             ArrElem::Bit => "bit[]",
             ArrElem::Varbit => "bit varying[]",
             ArrElem::Regtype => "regtype[]",
@@ -1547,6 +1721,7 @@ impl ArrElem {
             Datum::Cidr(_) => ArrElem::Cidr,
             Datum::Macaddr(_) => ArrElem::Macaddr,
             Datum::Macaddr8(_) => ArrElem::Macaddr8,
+            Datum::Geometry { kind, .. } => ArrElem::Geometry(*kind),
             Datum::Bit { varying: false, .. } => ArrElem::Bit,
             Datum::Bit { varying: true, .. } => ArrElem::Varbit,
             Datum::Regtype { .. } => ArrElem::Regtype,
@@ -1604,6 +1779,7 @@ impl ArrElem {
             ColType::Record => return Some(ArrElem::Record),
             ColType::Range(kind) => return Some(ArrElem::Range(kind)),
             ColType::Multirange(kind) => return Some(ArrElem::Multirange(kind)),
+            ColType::Geometry(kind) => return Some(ArrElem::Geometry(kind)),
             _ => {}
         }
         Some(match c.storage() {
@@ -1630,6 +1806,7 @@ impl ArrElem {
             ColType::Cidr => ArrElem::Cidr,
             ColType::Macaddr => ArrElem::Macaddr,
             ColType::Macaddr8 => ArrElem::Macaddr8,
+            ColType::Geometry(kind) => ArrElem::Geometry(kind),
             _ => return None,
         })
     }
@@ -1666,6 +1843,7 @@ impl ArrElem {
             ArrElem::Cidr => ColType::Cidr,
             ArrElem::Macaddr => ColType::Macaddr,
             ArrElem::Macaddr8 => ColType::Macaddr8,
+            ArrElem::Geometry(kind) => ColType::Geometry(kind),
             ArrElem::Bit => ColType::Bit { varying: false },
             ArrElem::Varbit => ColType::Bit { varying: true },
             ArrElem::Regtype => ColType::Regtype,
@@ -1732,6 +1910,7 @@ impl ArrElem {
             ArrElem::Cidr => oid::CIDR_ARRAY,
             ArrElem::Macaddr => oid::MACADDR_ARRAY,
             ArrElem::Macaddr8 => oid::MACADDR8_ARRAY,
+            ArrElem::Geometry(kind) => kind.array_oid(),
             ArrElem::Bit => oid::BIT_ARRAY,
             ArrElem::Varbit => oid::VARBIT_ARRAY,
             ArrElem::Regtype => oid::REGTYPE_ARRAY,
@@ -1797,6 +1976,13 @@ impl ArrElem {
             ArrElem::Cidr => 22,
             ArrElem::Macaddr => 23,
             ArrElem::Macaddr8 => 24,
+            ArrElem::Geometry(GeometryKind::Point) => 132,
+            ArrElem::Geometry(GeometryKind::Lseg) => 133,
+            ArrElem::Geometry(GeometryKind::Path) => 134,
+            ArrElem::Geometry(GeometryKind::Box) => 135,
+            ArrElem::Geometry(GeometryKind::Polygon) => 136,
+            ArrElem::Geometry(GeometryKind::Line) => 137,
+            ArrElem::Geometry(GeometryKind::Circle) => 138,
             ArrElem::Bit => 25,
             ArrElem::Varbit => 26,
             ArrElem::Regtype => 27,
@@ -1850,6 +2036,13 @@ impl ArrElem {
             22 => ArrElem::Cidr,
             23 => ArrElem::Macaddr,
             24 => ArrElem::Macaddr8,
+            132 => ArrElem::Geometry(GeometryKind::Point),
+            133 => ArrElem::Geometry(GeometryKind::Lseg),
+            134 => ArrElem::Geometry(GeometryKind::Path),
+            135 => ArrElem::Geometry(GeometryKind::Box),
+            136 => ArrElem::Geometry(GeometryKind::Polygon),
+            137 => ArrElem::Geometry(GeometryKind::Line),
+            138 => ArrElem::Geometry(GeometryKind::Circle),
             25 => ArrElem::Bit,
             26 => ArrElem::Varbit,
             27 => ArrElem::Regtype,
@@ -2478,6 +2671,11 @@ pub enum Datum<'a> {
     Macaddr([u8; 6]),
     /// An eight-byte `macaddr8`.
     Macaddr8([u8; 8]),
+    /// A validated PostgreSQL geometric value in canonical text form.
+    Geometry {
+        kind: GeometryKind,
+        text: &'a str,
+    },
     /// A composite/record value: each field's name (for `row_to_json` etc.),
     /// its type OID (for JSON/typed output), and its value. Records are
     /// transient — produced by `t.*`, a bare table reference, or `ROW(...)` —
@@ -2570,6 +2768,7 @@ impl<'a> Datum<'a> {
             Datum::Cidr(_) => oid::CIDR,
             Datum::Macaddr(_) => oid::MACADDR,
             Datum::Macaddr8(_) => oid::MACADDR8,
+            Datum::Geometry { kind, .. } => kind.oid(),
             Datum::Enum { slot, .. } => oid::enum_oid(*slot),
         }
     }
@@ -2783,6 +2982,7 @@ impl fmt::Display for Datum<'_> {
             Datum::Cidr(net) => super::net::format_addr(net, true, f),
             Datum::Macaddr(bytes) => super::net::format_mac(bytes, f),
             Datum::Macaddr8(bytes) => super::net::format_mac(bytes, f),
+            Datum::Geometry { text, .. } => f.write_str(text),
             Datum::Record(fields) => {
                 f.write_char('(')?;
                 for (i, field) in fields.iter().enumerate() {
@@ -2844,6 +3044,7 @@ pub(crate) fn write_record_field(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::
 struct QuoteScan {
     empty: bool,
     special: bool,
+    delimiter: char,
     text: [u8; 4],
     len: usize,
 }
@@ -2853,9 +3054,9 @@ impl fmt::Write for QuoteScan {
         if !s.is_empty() {
             self.empty = false;
         }
-        if s.chars()
-            .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace())
-        {
+        if s.chars().any(|c| {
+            c == self.delimiter || matches!(c, '{' | '}' | '"' | '\\') || c.is_whitespace()
+        }) {
             self.special = true;
         }
         // Only the first four bytes are kept, enough to recognize `null`.
@@ -2889,13 +3090,18 @@ impl fmt::Write for EscapeTo<'_, '_> {
 /// which is why a timestamp, a range and a json value all come out quoted, not
 /// only a string. The value is rendered twice rather than buffered, so nothing
 /// caps how long an element may be.
-pub(crate) fn write_array_elem(f: &mut fmt::Formatter<'_>, v: &Datum) -> fmt::Result {
+pub(crate) fn write_array_elem(
+    f: &mut fmt::Formatter<'_>,
+    v: &Datum,
+    delimiter: u8,
+) -> fmt::Result {
     if matches!(v, Datum::Null) {
         return f.write_str("NULL");
     }
     let mut scan = QuoteScan {
         empty: true,
         special: false,
+        delimiter: delimiter as char,
         text: [0; 4],
         len: 0,
     };
@@ -3375,6 +3581,12 @@ mod code_roundtrip_tests {
             seen.push((c, t));
         }
         assert_eq!(ColType::from_code(ColType::Record.code()), None);
+        assert_eq!(ColType::Array(ArrElem::Bool).code(), 80);
+        assert_eq!(ColType::Geometry(GeometryKind::Point).code(), 219);
+        assert_eq!(
+            ColType::Array(ArrElem::Geometry(GeometryKind::Point)).code(),
+            212
+        );
         assert_eq!(
             ColType::from_code(ColType::Array(ArrElem::Record).code()),
             None

@@ -2065,6 +2065,18 @@ pub(crate) fn type_witness(ct: ColType) -> Datum<'static> {
         ColType::Cidr => Datum::Cidr(crate::sql::net::NetAddr::zero_v4()),
         ColType::Macaddr => Datum::Macaddr([0; 6]),
         ColType::Macaddr8 => Datum::Macaddr8([0; 8]),
+        ColType::Geometry(kind) => Datum::Geometry {
+            kind,
+            text: match kind {
+                crate::sql::types::GeometryKind::Point => "(0,0)",
+                crate::sql::types::GeometryKind::Lseg => "[(0,0),(0,0)]",
+                crate::sql::types::GeometryKind::Path => "[(0,0)]",
+                crate::sql::types::GeometryKind::Box => "(0,0),(0,0)",
+                crate::sql::types::GeometryKind::Polygon => "((0,0),(0,0),(0,0))",
+                crate::sql::types::GeometryKind::Line => "{0,0,0}",
+                crate::sql::types::GeometryKind::Circle => "<(0,0),0>",
+            },
+        },
         // A witness carries only the type; the empty label is never compared or
         // output (an empty/all-NULL set produces no rows).
         ColType::Enum(slot) => Datum::Enum {

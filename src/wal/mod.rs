@@ -9434,6 +9434,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Timetz(..)) => 12,
         Some(OwnedDatum::Interval(_)) | Some(OwnedDatum::Uuid(_)) => 16,
         Some(OwnedDatum::Text { len, .. }) => 1 + *len as usize,
+        Some(OwnedDatum::Geometry { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::TextSearch { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Numeric { nbytes, .. }) => 6 + *nbytes as usize,
         Some(OwnedDatum::Inet(_)) | Some(OwnedDatum::Cidr(_)) => 18,
@@ -9561,6 +9562,13 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[1] = *len;
             out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             2 + *len as usize
+        }
+        Some(OwnedDatum::Geometry { kind, len, bytes }) => {
+            out[0] = 29;
+            out[1] = kind.code();
+            out[2] = *len;
+            out[3..3 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            3 + *len as usize
         }
         Some(OwnedDatum::TextSearch { query, len, bytes }) => {
             out[0] = 28;
@@ -9949,6 +9957,18 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
                 bytes,
             })
         }
+        29 => {
+            let kind = crate::sql::types::GeometryKind::from_code(*payload.get(*at)?)?;
+            let len = *payload.get(*at + 1)? as usize;
+            *at += 2;
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            core::str::from_utf8(&bytes[..len]).ok()?;
+            Some(OwnedDatum::Geometry {
+                kind,
+                len: len as u8,
+                bytes,
+            })
+        }
         _ => return None,
     })
 }
@@ -10332,6 +10352,11 @@ mod tests {
             }),
             Some(OwnedDatum::Json {
                 jsonb: true,
+                len: 3,
+                bytes: text,
+            }),
+            Some(OwnedDatum::Geometry {
+                kind: crate::sql::types::GeometryKind::Point,
                 len: 3,
                 bytes: text,
             }),

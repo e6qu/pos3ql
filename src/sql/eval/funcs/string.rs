@@ -105,6 +105,28 @@ pub(crate) fn dispatch<'a>(
                         crate::sql::full_text::vector_length(vector.as_str(), arena)
                             .map(Datum::Int4)
                     }
+                    Datum::Geometry { kind, text }
+                        if name == "length"
+                            && matches!(
+                                kind,
+                                crate::sql::types::GeometryKind::Lseg
+                                    | crate::sql::types::GeometryKind::Path
+                            ) =>
+                    {
+                        let mut values = [0.0; 256];
+                        let (count, closed) =
+                            crate::sql::geometry::components(kind, text, &mut values)?;
+                        let mut total = 0.0;
+                        for index in (2..count).step_by(2) {
+                            total += (values[index] - values[index - 2])
+                                .hypot(values[index + 1] - values[index - 1]);
+                        }
+                        if closed && count >= 4 {
+                            total += (values[0] - values[count - 2])
+                                .hypot(values[1] - values[count - 1]);
+                        }
+                        Ok(Datum::Float8(total))
+                    }
                     other => Err(type_mismatch("length", &other)),
                 }
             }

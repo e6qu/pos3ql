@@ -50,7 +50,8 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::Text(s) | Datum::Bpchar(s) => 4 + s.len(),
             Datum::Json { text, .. }
             | Datum::Range { text, .. }
-            | Datum::Multirange { text, .. } => 4 + text.len(),
+            | Datum::Multirange { text, .. }
+            | Datum::Geometry { text, .. } => 4 + text.len(),
             Datum::TsVector(text) => 4 + text.len(),
             Datum::TsQuery(text) => 4 + text.len(),
             // 4-byte payload length, 1 flag byte (varying), then the bit chars.
@@ -155,7 +156,8 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
             }
             Datum::Json { text, .. }
             | Datum::Range { text, .. }
-            | Datum::Multirange { text, .. } => {
+            | Datum::Multirange { text, .. }
+            | Datum::Geometry { text, .. } => {
                 rest[..4].copy_from_slice(&(text.len() as u32).to_le_bytes());
                 rest[4..4 + text.len()].copy_from_slice(text.as_bytes());
                 take = 4 + text.len();
@@ -326,6 +328,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
         | ColType::TsQuery
         | ColType::Range(_)
         | ColType::Multirange(_)
+        | ColType::Geometry(_)
         | ColType::Bytea => {
             let length = bytes.get(..4).ok_or_else(corrupt)?;
             Some(4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
@@ -628,6 +631,15 @@ pub(crate) fn decode<'a>(
                 at += len;
                 let s = core::str::from_utf8(raw).map_err(|_| corrupt())?;
                 out[i] = Datum::Multirange { text: s, kind };
+            }
+            ColType::Geometry(kind) => {
+                let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
+                at += 4;
+                let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
+                at += len;
+                let text = core::str::from_utf8(raw).map_err(|_| corrupt())?;
+                out[i] = Datum::Geometry { kind, text };
             }
             // Records are transient (DDL refuses them as stored columns), so
             // a record column in the storage row schema is corruption.

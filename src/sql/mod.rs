@@ -15,6 +15,7 @@ mod explain;
 pub(crate) mod external;
 pub(crate) mod foreign;
 pub mod full_text;
+pub mod geometry;
 pub mod guc;
 pub mod json;
 pub(crate) mod large_object;

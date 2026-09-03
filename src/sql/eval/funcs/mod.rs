@@ -13,6 +13,7 @@ pub(crate) mod bytea;
 pub(super) mod conditional;
 pub(super) mod datetime;
 pub(super) mod full_text;
+pub(super) mod geometry;
 pub(super) mod json;
 pub(super) mod math;
 pub(super) mod misc;

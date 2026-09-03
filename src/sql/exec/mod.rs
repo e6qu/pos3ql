@@ -47220,6 +47220,8 @@ fn decode_binary_field_with_context<'a>(
         ColType::Cidr => via(oids::CIDR),
         ColType::Macaddr => via(oids::MACADDR),
         ColType::Macaddr8 => via(oids::MACADDR8),
+        ColType::Geometry(kind) => crate::sql::geometry::decode_binary(kind, bytes, arena)
+            .map(|text| Datum::Geometry { kind, text }),
         ColType::Array(element) => decode_binary_array(element, bytes, arena, context),
         ColType::Range(kind) => decode_binary_range(kind, bytes, arena),
         ColType::Multirange(kind) => decode_binary_multirange(kind, bytes, arena),

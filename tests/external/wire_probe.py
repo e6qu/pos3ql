@@ -5174,6 +5174,44 @@ def test_sequence_rename_lifecycle_over_raw_wire():
     s.close()
 
 
+def test_schema_rename_lifecycle_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE SCHEMA wire_schema_rename_source; "
+        "CREATE TYPE wire_schema_rename_source.mood AS ENUM ('calm', 'storm'); "
+        "CREATE SEQUENCE wire_schema_rename_source.ticket; "
+        "CREATE TABLE wire_schema_rename_source.items ("
+        "id bigint DEFAULT nextval('wire_schema_rename_source.ticket'), "
+        "state wire_schema_rename_source.mood); "
+        "CREATE VIEW wire_schema_rename_source.item_view AS "
+        "SELECT id, state FROM wire_schema_rename_source.items; "
+        "COMMENT ON SEQUENCE wire_schema_rename_source.ticket IS 'wire schema sequence'; "
+        "ALTER SCHEMA wire_schema_rename_source RENAME TO wire_schema_rename_target; "
+        "ALTER SCHEMA wire_schema_rename_target OWNER TO postgres; "
+        "INSERT INTO wire_schema_rename_target.items(state) VALUES ('calm') RETURNING id; "
+        "SELECT id, state FROM wire_schema_rename_target.item_view; "
+        "SELECT 'storm'::wire_schema_rename_target.mood; "
+        "SELECT obj_description('wire_schema_rename_target.ticket'::regclass); "
+        "BEGIN; "
+        "ALTER SCHEMA wire_schema_rename_target RENAME TO wire_schema_rename_rollback; "
+        "INSERT INTO wire_schema_rename_rollback.items(state) VALUES ('storm'); "
+        "ROLLBACK; "
+        "INSERT INTO wire_schema_rename_target.items(state) VALUES ('storm') RETURNING id; "
+        "DROP SCHEMA wire_schema_rename_target CASCADE",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "schema rename: raw wire preserves dependent catalog identities and rollback",
+        not any(kind == b"E" for kind, _ in result)
+        and rows == [["1"], ["1", "calm"], ["storm"], ["wire schema sequence"], ["3"]],
+        result,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

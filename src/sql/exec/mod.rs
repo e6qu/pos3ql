@@ -5014,6 +5014,111 @@ pub fn create_schema(
     sql_ok()
 }
 
+/// ALTER SCHEMA keeps the object identity at its catalog slot. Ownership uses
+/// the shared ACL transition; rename is journaled as a distinct namespace
+/// operation so recovery never expresses it as a drop/create pair.
+pub fn alter_schema(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    action: crate::sql::ast::AlterSchemaAction<'_>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    match action {
+        crate::sql::ast::AlterSchemaAction::OwnerTo(role) => alter_owner(
+            storage,
+            txn,
+            crate::sql::ast::AlterOwnerKind::Schema,
+            &QualName::bare(name),
+            role,
+            false,
+            responder,
+        ),
+        crate::sql::ast::AlterSchemaAction::RenameTo(new_name) => {
+            if new_name.starts_with("pg_") {
+                return sql_fail(sql_err!(
+                    sqlstate::RESERVED_NAME,
+                    "unacceptable schema name \"{}\"",
+                    new_name
+                ));
+            }
+            let Some(slot) = storage.find_schema_visible(name, txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    name
+                ));
+            };
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Schema,
+                slot: slot as u16,
+            };
+            if let Err(error) = storage.require_owner(object, txn.txid, "schema") {
+                return sql_fail(error);
+            }
+            let new_name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            let prior_name = storage.schema_def(slot).name;
+            // Sequence literals in column defaults are textual at the SQL
+            // boundary. Rebind them while the old namespace still resolves,
+            // then move the whole catalog identity as one WAL operation.
+            for sequence_slot in 0..storage.sequence_count() {
+                let (schema, sequence_name, visible) = {
+                    let sequence = storage.sequence_for(sequence_slot, txn.txid);
+                    (
+                        sequence.schema,
+                        sequence.name,
+                        sequence.visible_to(txn.txid),
+                    )
+                };
+                if schema != prior_name || !visible {
+                    continue;
+                }
+                if let Err(error) = rewrite_sequence_default_references(
+                    storage,
+                    wal,
+                    txn,
+                    sequence_slot,
+                    new_name,
+                    sequence_name,
+                    arena,
+                ) {
+                    return sql_fail(error);
+                }
+            }
+            let prior = match storage.rename_schema(slot, new_name) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::RenameSchema {
+                    name: prior.as_str(),
+                    new_name: new_name.as_str(),
+                },
+            ) {
+                let _ = storage.rename_schema(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SchemaRenamed {
+                slot: slot as u32,
+                prior,
+            }) {
+                let _ = storage.rename_schema(slot, prior);
+                return sql_fail(error);
+            }
+            responder.command_complete("ALTER SCHEMA")?;
+            sql_ok()
+        }
+    }
+}
+
 fn rewrite_object_acl_owner(
     storage: &mut Storage,
     txn: &mut TxnState,

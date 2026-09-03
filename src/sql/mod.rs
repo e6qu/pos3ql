@@ -446,6 +446,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterTable(_)
         | Stmt::CreateSchema { .. }
         | Stmt::DropSchema { .. }
+        | Stmt::AlterSchema { .. }
         | Stmt::Vacuum { .. }
         | Stmt::Notify { .. }
         | Stmt::Comment { .. }
@@ -824,6 +825,7 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::Reindex { .. } => "REINDEX",
         Stmt::CreateSchema { .. } => "CREATE SCHEMA",
         Stmt::DropSchema { .. } => "DROP SCHEMA",
+        Stmt::AlterSchema { .. } => "ALTER SCHEMA",
         Stmt::Comment { target, .. }
             if !matches!(
                 target,
@@ -5187,6 +5189,7 @@ impl Engine {
                     );
                 }
                 DdlUndo::SchemaDropped(slot) => self.storage.commit_schema_drop(*slot as usize),
+                DdlUndo::SchemaRenamed { .. } => {}
                 DdlUndo::ExtensionCreated(slot) => self
                     .storage
                     .commit_extension_create(*slot as usize, txn.txid),
@@ -5920,6 +5923,9 @@ impl Engine {
             }
             DdlUndo::SchemaCreated(slot) => self.storage.rollback_schema_create(slot as usize),
             DdlUndo::SchemaDropped(slot) => self.storage.rollback_schema_drop(slot as usize, txid),
+            DdlUndo::SchemaRenamed { slot, prior } => {
+                let _ = self.storage.rename_schema(slot as usize, prior);
+            }
             DdlUndo::ExtensionCreated(slot) => {
                 self.storage.rollback_extension_create(slot as usize)
             }
@@ -13318,6 +13324,15 @@ impl Engine {
                 guc.seq_session(),
                 responder,
             ),
+            Stmt::AlterSchema { name, action } => exec::alter_schema(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *action,
+                arena,
+                responder,
+            ),
             Stmt::AlterOwner {
                 kind,
                 name,
@@ -18394,6 +18409,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             if let Some(slot) = storage.find_schema(name) {
                 storage.drop_schema(slot);
             }
+        }
+        WalOp::RenameSchema { name, new_name } => {
+            let slot = storage.find_schema(name).ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "journal schema does not exist")
+            })?;
+            storage.rename_schema(slot, crate::storage::SqlName::parse(new_name)?)?;
         }
         WalOp::UpsertExtension {
             name,

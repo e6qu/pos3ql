@@ -1001,6 +1001,11 @@ pub enum Stmt<'a> {
         if_exists: bool,
         cascade: bool,
     },
+    /// ALTER SCHEMA has a closed identity or ownership transition.
+    AlterSchema {
+        name: &'a str,
+        action: AlterSchemaAction<'a>,
+    },
     CreateDatabase {
         name: &'a str,
         options: CreateDatabaseOptions<'a>,
@@ -2530,6 +2535,15 @@ pub enum AlterOwnerKind {
     MaterializedView,
     Sequence,
     Statistics,
+}
+
+/// `ALTER SCHEMA` accepts only these two transitions. Keeping ownership here
+/// rather than in the generic owner form prevents a schema rename from being
+/// represented as an unrelated relation operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterSchemaAction<'a> {
+    RenameTo(&'a str),
+    OwnerTo(&'a str),
 }
 
 /// Which kind of relation a `COMMENT ON` names — PostgreSQL rejects a comment

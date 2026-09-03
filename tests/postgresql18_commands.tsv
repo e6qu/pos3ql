@@ -40,7 +40,7 @@ ALTER PUBLICATION	partial	84_publication.sql
 ALTER ROLE	partial	83_roles_acl.sql
 ALTER ROUTINE	partial	90_routine_lifecycle.sql and aggregate extension dependencies in 111_extension_lifecycle.sql
 ALTER RULE	complete	tests/external/differential/122_rewrite_rules.sql
-ALTER SCHEMA	partial	37_schemas.sql
+ALTER SCHEMA	complete	37_schemas.sql, raw-wire lifecycle probe, and object-only WAL/checkpoint recovery
 ALTER SEQUENCE	partial	54_sequence.sql and 85_sequences.sql (options, ownership, rename/schema, dependent defaults, recovery; unlogged remains an object-native durability boundary)
 ALTER SERVER	complete	tests/external/ci_diff.sh
 ALTER STATISTICS	complete	109_extended_statistics.sql

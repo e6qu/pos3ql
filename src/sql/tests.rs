@@ -27670,6 +27670,123 @@ fn sequence_rename_preserves_value_comment_transaction_and_cold_recovery() {
 }
 
 #[test]
+fn schema_rename_moves_catalog_identity_and_replays_from_object_storage() {
+    let mut config = test_config("schema-rename-lifecycle");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("schema-rename-lifecycle-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE SCHEMA schema_rename_source; \
+             CREATE TYPE schema_rename_source.mood AS ENUM ('calm', 'storm'); \
+             CREATE SEQUENCE schema_rename_source.ticket; \
+             CREATE TABLE schema_rename_source.items (\
+                 id bigint DEFAULT nextval('schema_rename_source.ticket'), \
+                 state schema_rename_source.mood\
+             ); \
+             CREATE VIEW schema_rename_source.item_view AS \
+                 SELECT id, state FROM schema_rename_source.items; \
+             COMMENT ON SCHEMA schema_rename_source IS 'renamed namespace'; \
+             COMMENT ON TABLE schema_rename_source.items IS 'renamed relation'; \
+             COMMENT ON SEQUENCE schema_rename_source.ticket IS 'renamed sequence'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&setup).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+        assert!(
+            !String::from_utf8_lossy(&checkpoint).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&checkpoint)
+        );
+
+        let renamed = run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER SCHEMA schema_rename_source RENAME TO schema_rename_target; \
+             ALTER SCHEMA schema_rename_target OWNER TO postgres; \
+             INSERT INTO schema_rename_target.items(state) VALUES ('calm') RETURNING id; \
+             SELECT id, state FROM schema_rename_target.item_view; \
+             SELECT 'storm'::schema_rename_target.mood; \
+             SELECT obj_description('schema_rename_target.ticket'::regclass); \
+             SELECT obj_description('schema_rename_target.items'::regclass)",
+        );
+        assert_eq!(
+            data_rows(&renamed),
+            [
+                "1",
+                "1|calm",
+                "storm",
+                "renamed sequence",
+                "renamed relation"
+            ],
+            "{}",
+            String::from_utf8_lossy(&renamed)
+        );
+        let stale = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('schema_rename_source.ticket')",
+        );
+        assert!(String::from_utf8_lossy(&stale).contains("42P01"));
+
+        let rollback = run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; \
+             ALTER SCHEMA schema_rename_target RENAME TO schema_rename_rolled_back; \
+             INSERT INTO schema_rename_rolled_back.items(state) VALUES ('storm'); \
+             ROLLBACK; \
+             INSERT INTO schema_rename_target.items(state) VALUES ('storm') RETURNING id",
+        );
+        assert_eq!(
+            data_rows(&rollback),
+            ["3"],
+            "{}",
+            String::from_utf8_lossy(&rollback)
+        );
+        engine.commit_wal().unwrap();
+    }
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "INSERT INTO schema_rename_target.items(state) VALUES ('calm') RETURNING id; \
+         SELECT id, state FROM schema_rename_target.item_view ORDER BY id; \
+         SELECT 'storm'::schema_rename_target.mood; \
+         SELECT obj_description('schema_rename_target.ticket'::regclass)",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "4",
+            "1|calm",
+            "3|storm",
+            "4|calm",
+            "storm",
+            "renamed sequence"
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn simple_query_begin_commits_prior_sequence_rename() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

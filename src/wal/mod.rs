@@ -171,6 +171,7 @@ const KIND_RENAME_VIEW: u8 = 120;
 const KIND_SET_VIEW_CHECK_OPTION: u8 = 121;
 const KIND_RENAME_ROLE: u8 = 122;
 const KIND_RENAME_SEQUENCE: u8 = 124;
+const KIND_RENAME_SCHEMA: u8 = 125;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -884,6 +885,10 @@ pub(crate) enum WalOp<'a> {
     },
     CreateSchema(&'a str),
     DropSchema(&'a str),
+    RenameSchema {
+        name: &'a str,
+        new_name: &'a str,
+    },
     UpsertExtension {
         name: &'a str,
         schema: &'a str,
@@ -2043,6 +2048,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
         WalOp::CreateSchema(_) => KIND_CREATE_SCHEMA,
         WalOp::DropSchema(_) => KIND_DROP_SCHEMA,
+        WalOp::RenameSchema { .. } => KIND_RENAME_SCHEMA,
         WalOp::UpsertExtension { .. } => KIND_UPSERT_EXTENSION,
         WalOp::DropExtension { .. } => KIND_DROP_EXTENSION,
         WalOp::SetExtensionDependency { .. } => KIND_SET_EXTENSION_DEPENDENCY,
@@ -2622,6 +2628,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
         WalOp::SequenceSet { schema, table, .. } => 1 + table.len() + 2 + 8 + 1 + schema.len(),
         WalOp::CreateSchema(name) | WalOp::DropSchema(name) => 1 + name.len(),
+        WalOp::RenameSchema { name, new_name } => 1 + name.len() + 1 + new_name.len(),
         WalOp::UpsertExtension {
             name,
             schema,
@@ -4428,6 +4435,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::CreateSchema(name) | WalOp::DropSchema(name) => name_bytes(buffer, name),
+        WalOp::RenameSchema { name, new_name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, new_name)
+        }
         WalOp::UpsertExtension {
             name,
             schema,
@@ -8913,6 +8923,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_DROP_SCHEMA => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropSchema(name))
+        }
+        KIND_RENAME_SCHEMA => {
+            let name = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RenameSchema { name, new_name })
         }
         KIND_UPSERT_EXTENSION => {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);

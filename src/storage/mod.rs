@@ -3629,6 +3629,19 @@ impl StoredQueryDependencies {
             }
         }
     }
+
+    /// Namespace identity is part of both sides of a captured dependency:
+    /// the stored object may have moved, and so may the object it references.
+    pub(crate) fn rename_schema(&mut self, old: SqlName, new: SqlName) {
+        for entry in &mut self.entries[..self.len as usize] {
+            if entry.schema == old {
+                entry.schema = new;
+            }
+            if entry.referenced_schema == old {
+                entry.referenced_schema = new;
+            }
+        }
+    }
 }
 
 /// The durable, creation-time portion shared by views and materialized views.
@@ -10453,6 +10466,287 @@ fn stored_query_dependency_slots(
             .expect("sized to catalog slots");
     }
     Ok(slots)
+}
+
+fn rename_schema_name(value: &mut SqlName, old: SqlName, new: SqlName) {
+    if *value == old {
+        *value = new;
+    }
+}
+
+fn rename_user_type_schema(value: &mut Option<UserTypeName>, old: SqlName, new: SqlName) {
+    if let Some(identity) = value
+        && identity.schema == old
+    {
+        identity.schema = new;
+    }
+}
+
+fn rename_routine_result_schema(value: &mut RoutineResult, old: SqlName, new: SqlName) {
+    rename_user_type_schema(&mut value.user_type, old, new);
+}
+
+fn rename_routine_kind_schema(value: &mut RoutineKind, old: SqlName, new: SqlName) {
+    match value {
+        RoutineKind::Function { result } | RoutineKind::SetFunction { result } => {
+            rename_routine_result_schema(result, old, new);
+        }
+        RoutineKind::Aggregate(aggregate) => {
+            rename_routine_result_schema(&mut aggregate.state_type, old, new);
+            rename_routine_result_schema(&mut aggregate.result_type, old, new);
+            if let Some(moving) = &mut aggregate.moving {
+                rename_routine_result_schema(&mut moving.state_type, old, new);
+            }
+        }
+        RoutineKind::RecordFunction { .. }
+        | RoutineKind::TableFunction
+        | RoutineKind::Trigger
+        | RoutineKind::EventTrigger
+        | RoutineKind::Procedure => {}
+    }
+}
+
+fn rename_routine_arguments_schema(
+    arguments: &mut [RoutineArgumentDef],
+    count: usize,
+    old: SqlName,
+    new: SqlName,
+) {
+    for argument in arguments.iter_mut().take(count) {
+        rename_user_type_schema(&mut argument.user_type, old, new);
+    }
+}
+
+fn rename_routine_parameters_schema(
+    parameters: &mut [RoutineParameterDef],
+    count: usize,
+    old: SqlName,
+    new: SqlName,
+) {
+    for parameter in parameters.iter_mut().take(count) {
+        rename_user_type_schema(&mut parameter.user_type, old, new);
+    }
+}
+
+fn rename_schema_path(
+    path: &mut StackStr<128>,
+    old: SqlName,
+    new: SqlName,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+
+    let original = *path;
+    let mut rewritten = StackStr::<128>::new();
+    for (index, component) in original.as_str().split(',').enumerate() {
+        if index != 0 {
+            let _ = rewritten.write_char(',');
+        }
+        let component = component.trim();
+        let replacement = if component == old.as_str() {
+            new.as_str()
+        } else {
+            component
+        };
+        let _ = rewritten.write_str(replacement);
+    }
+    if rewritten.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "schema rename exceeds the stored search-path limit"
+        ));
+    }
+    *path = rewritten;
+    Ok(())
+}
+
+/// Rewrites only lexical namespace qualifiers, never strings or comments.
+/// Stored SQL has already passed the parser when it reaches the catalog; this
+/// bounded pass preserves its source spelling while changing a resolved
+/// namespace identity.
+fn rename_schema_qualified_sql<const N: usize>(
+    source: &mut StackStr<N>,
+    old: SqlName,
+    new: SqlName,
+) -> Result<(), SqlError> {
+    use core::fmt::Write as _;
+
+    fn is_identifier(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+    }
+
+    fn quoted_end(bytes: &[u8], mut at: usize, quote: u8) -> usize {
+        at += 1;
+        while at < bytes.len() {
+            if bytes[at] == quote {
+                if bytes.get(at + 1) == Some(&quote) {
+                    at += 2;
+                } else {
+                    return at + 1;
+                }
+            } else {
+                at += 1;
+            }
+        }
+        bytes.len()
+    }
+
+    fn write_schema_identifier<const N: usize>(out: &mut StackStr<N>, name: SqlName) {
+        let text = name.as_str();
+        let plain = text
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || *byte == b'_')
+            && text.as_bytes().iter().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'$')
+            });
+        if plain {
+            let _ = out.write_str(text);
+            return;
+        }
+        let _ = out.write_char('"');
+        for character in text.chars() {
+            let _ = out.write_char(character);
+            if character == '"' {
+                let _ = out.write_char('"');
+            }
+        }
+        let _ = out.write_char('"');
+    }
+
+    let text = source.as_str();
+    let bytes = text.as_bytes();
+    let mut rewritten = StackStr::<N>::new();
+    let mut copied = 0usize;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\'' => at = quoted_end(bytes, at, b'\''),
+            b'"' => {
+                let end = quoted_end(bytes, at, b'"');
+                let identifier = &text[at + 1..end.saturating_sub(1)];
+                let mut next = end;
+                while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
+                    next += 1;
+                }
+                if identifier == old.as_str() && bytes.get(next) == Some(&b'.') {
+                    let _ = rewritten.write_str(&text[copied..at]);
+                    write_schema_identifier(&mut rewritten, new);
+                    copied = end;
+                }
+                at = end;
+            }
+            b'-' if bytes.get(at + 1) == Some(&b'-') => {
+                at += 2;
+                while at < bytes.len() && bytes[at] != b'\n' {
+                    at += 1;
+                }
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                at += 2;
+                let mut depth = 1usize;
+                while at + 1 < bytes.len() && depth != 0 {
+                    match &bytes[at..at + 2] {
+                        b"/*" => {
+                            depth += 1;
+                            at += 2;
+                        }
+                        b"*/" => {
+                            depth -= 1;
+                            at += 2;
+                        }
+                        _ => at += 1,
+                    }
+                }
+            }
+            b'$' => {
+                let start = at;
+                at += 1;
+                while bytes.get(at).is_some_and(|byte| is_identifier(*byte)) {
+                    at += 1;
+                }
+                if bytes.get(at) != Some(&b'$') {
+                    continue;
+                }
+                let delimiter_end = at + 1;
+                let delimiter = &text[start..delimiter_end];
+                at = text[delimiter_end..]
+                    .find(delimiter)
+                    .map_or(bytes.len(), |offset| {
+                        delimiter_end + offset + delimiter.len()
+                    });
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = at;
+                at += 1;
+                while bytes.get(at).is_some_and(|byte| is_identifier(*byte)) {
+                    at += 1;
+                }
+                let mut next = at;
+                while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
+                    next += 1;
+                }
+                if text[start..at].eq_ignore_ascii_case(old.as_str())
+                    && bytes.get(next) == Some(&b'.')
+                {
+                    let _ = rewritten.write_str(&text[copied..start]);
+                    write_schema_identifier(&mut rewritten, new);
+                    copied = at;
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    if copied == 0 {
+        return Ok(());
+    }
+    let _ = rewritten.write_str(&text[copied..]);
+    if rewritten.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "schema rename exceeds a stored SQL definition limit"
+        ));
+    }
+    *source = rewritten;
+    Ok(())
+}
+
+fn rename_column_default_schema(
+    default: &mut ColumnDefault,
+    old: SqlName,
+    new: SqlName,
+) -> Result<(), SqlError> {
+    match default {
+        ColumnDefault::None => {}
+        ColumnDefault::Constant { expression, .. }
+        | ColumnDefault::Expression(expression)
+        | ColumnDefault::Generated(expression) => {
+            rename_schema_qualified_sql(expression, old, new)?;
+        }
+    }
+    Ok(())
+}
+
+fn rename_table_sql_identity(
+    definition: &mut TableDef,
+    old: SqlName,
+    new: SqlName,
+) -> Result<(), SqlError> {
+    for column in definition.columns.iter_mut().take(definition.n_columns) {
+        rename_column_default_schema(&mut column.default, old, new)?;
+    }
+    for constraint in definition.checks.iter_mut().take(definition.n_checks) {
+        rename_schema_qualified_sql(&mut constraint.expression, old, new)?;
+    }
+    for exclusion in definition
+        .exclusions
+        .iter_mut()
+        .take(definition.n_exclusions)
+    {
+        if let Some(predicate) = &mut exclusion.predicate {
+            rename_schema_qualified_sql(predicate, old, new)?;
+        }
+    }
+    Ok(())
 }
 
 impl Storage {
@@ -18338,6 +18632,413 @@ impl Storage {
     /// image unchanged.
     pub fn rollback_schema_drop(&mut self, slot: usize, txid: u32) {
         self.schemas[slot].ddl_state = self.schemas[slot].ddl_state.rollback_drop(txid);
+    }
+
+    /// Rename one namespace and every durable identity that names it. Catalog
+    /// slots remain stable; no old-name alias survives the transition.
+    pub(crate) fn rename_schema(
+        &mut self,
+        slot: usize,
+        name: SqlName,
+    ) -> Result<SqlName, SqlError> {
+        let prior = self.schemas[slot].name;
+        if prior == name {
+            return Ok(prior);
+        }
+        if self.schemas.iter().enumerate().any(|(other, schema)| {
+            other != slot
+                && schema.database == self.current_database
+                && schema.ddl_state != CatalogDdlState::Absent
+                && schema.name == name
+        }) {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_SCHEMA,
+                "schema \"{}\" already exists",
+                name.as_str()
+            ));
+        }
+
+        // A stored definition records the search path that bound its
+        // unqualified names. Check every replacement before changing any
+        // catalog identity, so a fixed-capacity path never leaves a partial
+        // rename behind.
+        for rule in self.rules.iter().filter(|rule| {
+            rule.database == self.current_database && rule.ddl_state != CatalogDdlState::Absent
+        }) {
+            let mut path = rule.definition.creation_path;
+            rename_schema_path(&mut path, prior, name)?;
+            let mut source = rule.definition.source;
+            rename_schema_qualified_sql(&mut source, prior, name)?;
+            if let Some(pending) = rule.pending {
+                let mut path = pending.definition.creation_path;
+                rename_schema_path(&mut path, prior, name)?;
+                let mut source = pending.definition.source;
+                rename_schema_qualified_sql(&mut source, prior, name)?;
+            }
+        }
+        for definition in self.routines.iter().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            let mut path = definition.creation_path;
+            rename_schema_path(&mut path, prior, name)?;
+            let mut body = definition.body;
+            rename_schema_qualified_sql(&mut body, prior, name)?;
+            if let Some(pending) = definition.pending_definition {
+                let mut path = pending.creation_path;
+                rename_schema_path(&mut path, prior, name)?;
+                let mut body = pending.body;
+                rename_schema_qualified_sql(&mut body, prior, name)?;
+            }
+        }
+        for definition in self.matviews.iter().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            let mut path = definition.creation_path;
+            rename_schema_path(&mut path, prior, name)?;
+            let mut sql = definition.sql;
+            rename_schema_qualified_sql(&mut sql, prior, name)?;
+        }
+        for table_slot in 0..self.tables.len() {
+            let table = &self.tables[table_slot];
+            if table.database != self.current_database
+                || (!table.live && table.pending_ddl.is_none())
+            {
+                continue;
+            }
+            let mut definition = table.def;
+            rename_table_sql_identity(&mut definition, prior, name)?;
+            for position in 0..table.n_pending_defs as usize {
+                let pending_slot = table.pending_def_slots[position] as usize;
+                let mut definition = self.pending_table_defs[pending_slot].version.def;
+                rename_table_sql_identity(&mut definition, prior, name)?;
+            }
+        }
+        for definition in self.domains.iter().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            if let Some(default) = definition.default_expr {
+                let mut default = default;
+                rename_schema_qualified_sql(&mut default, prior, name)?;
+            }
+            for check in definition.checks.iter().take(definition.n_checks) {
+                let mut expression = check.expression;
+                rename_schema_qualified_sql(&mut expression, prior, name)?;
+            }
+        }
+        for definition in self.indexes.iter().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            for expression in definition.expressions.iter().flatten() {
+                let mut expression = *expression;
+                rename_schema_qualified_sql(&mut expression, prior, name)?;
+            }
+            if let Some(predicate) = definition.predicate {
+                let mut predicate = predicate;
+                rename_schema_qualified_sql(&mut predicate, prior, name)?;
+            }
+        }
+
+        self.schemas[slot].name = name;
+
+        for table_slot in 0..self.tables.len() {
+            if self.tables[table_slot].database != self.current_database {
+                continue;
+            }
+            let table = &mut self.tables[table_slot];
+            if !table.live && table.pending_ddl.is_none() {
+                continue;
+            }
+            rename_schema_name(&mut table.def.schema, prior, name);
+            for column in table.def.columns.iter_mut().take(table.def.n_columns) {
+                rename_user_type_schema(&mut column.user_type, prior, name);
+            }
+            for key in table.def.fkeys.iter_mut().take(table.def.n_fkeys) {
+                rename_schema_name(&mut key.parent_schema, prior, name);
+            }
+            rename_table_sql_identity(&mut table.def, prior, name)?;
+            table.mark_dirty();
+            let pending_count = table.n_pending_defs as usize;
+            for pending_position in 0..pending_count {
+                let pending_slot = table.pending_def_slots[pending_position] as usize;
+                let pending = &mut self.pending_table_defs[pending_slot].version;
+                rename_schema_name(&mut pending.def.schema, prior, name);
+                for column in pending.def.columns.iter_mut().take(pending.def.n_columns) {
+                    rename_user_type_schema(&mut column.user_type, prior, name);
+                }
+                for key in pending.def.fkeys.iter_mut().take(pending.def.n_fkeys) {
+                    rename_schema_name(&mut key.parent_schema, prior, name);
+                }
+                rename_table_sql_identity(&mut pending.def, prior, name)?;
+            }
+        }
+
+        for definition in self.views.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.schema, prior, name);
+            if let Some(pending) = &mut definition.pending_schema {
+                rename_schema_name(&mut pending.schema, prior, name);
+            }
+        }
+        for definition in self.sequences.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.schema, prior, name);
+            if let Some(owner) = &mut definition.owner {
+                rename_schema_name(&mut owner.table_schema, prior, name);
+            }
+            if let Some(generator) = &mut definition.generator_for {
+                rename_schema_name(&mut generator.table_schema, prior, name);
+            }
+            if let Some(pending) = &mut definition.pending_definition {
+                rename_schema_name(&mut pending.schema, prior, name);
+                if let Some(owner) = &mut pending.owner {
+                    rename_schema_name(&mut owner.table_schema, prior, name);
+                }
+                if let Some(generator) = &mut pending.generator_for {
+                    rename_schema_name(&mut generator.table_schema, prior, name);
+                }
+            }
+        }
+        for definition in self.indexes.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.schema, prior, name);
+            for expression in definition.expressions.iter_mut().flatten() {
+                rename_schema_qualified_sql(expression, prior, name)?;
+            }
+            if let Some(predicate) = &mut definition.predicate {
+                rename_schema_qualified_sql(predicate, prior, name)?;
+            }
+        }
+        for definition in self.domains.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.schema, prior, name);
+            rename_user_type_schema(&mut definition.base_domain, prior, name);
+            rename_user_type_schema(&mut definition.base_user_type, prior, name);
+            if let Some(default) = &mut definition.default_expr {
+                rename_schema_qualified_sql(default, prior, name)?;
+            }
+            for check in definition.checks.iter_mut().take(definition.n_checks) {
+                rename_schema_qualified_sql(&mut check.expression, prior, name)?;
+            }
+            if let Some(pending) = &mut definition.pending_definition
+                && let Some(identity) = &mut pending.identity
+            {
+                rename_schema_name(&mut identity.schema, prior, name);
+            }
+        }
+        for definition in self.enums.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.schema, prior, name);
+            if let Some(pending) = &mut definition.pending_definition {
+                rename_schema_name(&mut pending.schema, prior, name);
+            }
+        }
+        for definition in self.composites.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.schema, prior, name);
+            for field in definition.fields.iter_mut().take(definition.n_fields) {
+                rename_user_type_schema(&mut field.user_type, prior, name);
+            }
+            if let Some(pending) = &mut definition.pending_definition {
+                rename_schema_name(&mut pending.schema, prior, name);
+                for field in pending.fields.iter_mut().take(pending.n_fields) {
+                    rename_user_type_schema(&mut field.user_type, prior, name);
+                }
+            }
+        }
+        for definition in self.routines.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.schema, prior, name);
+            if let Some(pending) = &mut definition.pending_identity {
+                rename_schema_name(&mut pending.schema, prior, name);
+            }
+            rename_routine_arguments_schema(
+                &mut definition.arguments,
+                definition.argument_count,
+                prior,
+                name,
+            );
+            rename_routine_parameters_schema(
+                &mut definition.parameters,
+                definition.parameter_count,
+                prior,
+                name,
+            );
+            rename_routine_arguments_schema(
+                &mut definition.result_columns,
+                definition.result_column_count,
+                prior,
+                name,
+            );
+            rename_routine_kind_schema(&mut definition.kind, prior, name);
+            rename_schema_path(&mut definition.creation_path, prior, name)?;
+            rename_schema_qualified_sql(&mut definition.body, prior, name)?;
+            if let Some(pending) = &mut definition.pending_definition {
+                rename_routine_arguments_schema(
+                    &mut pending.arguments,
+                    pending.argument_count,
+                    prior,
+                    name,
+                );
+                rename_routine_parameters_schema(
+                    &mut pending.parameters,
+                    pending.parameter_count,
+                    prior,
+                    name,
+                );
+                rename_routine_arguments_schema(
+                    &mut pending.result_columns,
+                    pending.result_column_count,
+                    prior,
+                    name,
+                );
+                rename_routine_kind_schema(&mut pending.kind, prior, name);
+                rename_schema_path(&mut pending.creation_path, prior, name)?;
+                rename_schema_qualified_sql(&mut pending.body, prior, name)?;
+            }
+        }
+        for definition in self.collations.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.definition.schema, prior, name);
+            if let Some(pending) = &mut definition.pending {
+                rename_schema_name(&mut pending.definition.schema, prior, name);
+            }
+        }
+        for definition in self.conversions.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.definition.schema, prior, name);
+            if let Some(pending) = &mut definition.pending {
+                rename_schema_name(&mut pending.definition.schema, prior, name);
+            }
+        }
+        for definition in self.text_search_objects.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            if definition.definition.schema() == prior {
+                definition.definition.rename(Some(name), None);
+            }
+            if let Some(pending) = &mut definition.pending
+                && pending.definition.schema() == prior
+            {
+                pending.definition.rename(Some(name), None);
+            }
+        }
+        for definition in self.operators.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.definition.schema, prior, name);
+            if let Some(pending) = &mut definition.pending {
+                rename_schema_name(&mut pending.definition.schema, prior, name);
+            }
+        }
+        for definition in self.operator_families.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.definition.schema, prior, name);
+            if let Some(pending) = &mut definition.pending {
+                rename_schema_name(&mut pending.definition.schema, prior, name);
+            }
+        }
+        for definition in self.operator_classes.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.definition.schema, prior, name);
+            if let Some(pending) = &mut definition.pending {
+                rename_schema_name(&mut pending.definition.schema, prior, name);
+            }
+        }
+        for definition in self.extended_statistics.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            rename_schema_name(&mut definition.mutable.schema, prior, name);
+            if let Some(pending) = &mut definition.pending_definition {
+                rename_schema_name(&mut pending.definition.schema, prior, name);
+            }
+        }
+
+        for definition in self.rules.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            definition
+                .definition
+                .dependencies
+                .rename_schema(prior, name);
+            rename_schema_path(&mut definition.definition.creation_path, prior, name)?;
+            rename_schema_qualified_sql(&mut definition.definition.source, prior, name)?;
+            if let Some(pending) = &mut definition.pending {
+                pending.definition.dependencies.rename_schema(prior, name);
+                rename_schema_path(&mut pending.definition.creation_path, prior, name)?;
+                rename_schema_qualified_sql(&mut pending.definition.source, prior, name)?;
+            }
+        }
+        for (slot, definition) in self.matviews.iter_mut().enumerate() {
+            if definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+            {
+                rename_schema_path(&mut definition.creation_path, prior, name)?;
+                rename_schema_qualified_sql(&mut definition.sql, prior, name)?;
+                self.matview_dependencies[slot].rename_schema(prior, name);
+            }
+        }
+        for definition in self.policies.iter_mut().filter(|definition| {
+            definition.database == self.current_database
+                && definition.ddl_state != CatalogDdlState::Absent
+        }) {
+            definition
+                .definition
+                .dependencies
+                .rename_schema(prior, name);
+            if let Some(pending) = &mut definition.pending_definition {
+                pending.definition.dependencies.rename_schema(prior, name);
+            }
+        }
+        for dependencies in self.routine_dependencies.iter_mut() {
+            dependencies.rename_schema(prior, name);
+        }
+        for pending in self.pending_routine_dependencies.iter_mut() {
+            if pending.used {
+                pending.dependencies.rename_schema(prior, name);
+            }
+        }
+        for comment in self.comments.iter_mut() {
+            if comment.used && comment.database == Some(self.current_database) {
+                if comment.class == CommentClass::Schema && comment.name == prior {
+                    comment.name = name;
+                }
+                rename_schema_name(&mut comment.schema, prior, name);
+                if let Some(identity) = &mut comment.pending_identity {
+                    rename_schema_name(&mut identity.schema, prior, name);
+                }
+            }
+        }
+        Ok(prior)
     }
 
     pub(crate) fn extension(&self, slot: usize) -> &ExtensionDef {
@@ -36198,6 +36899,20 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_sql_rewrite_leaves_literals_and_comments_opaque() {
+        let old = SqlName::parse("old_schema").unwrap();
+        let new = SqlName::parse("new_schema").unwrap();
+        let mut source = StackStr::<256>::from_str(
+            "SELECT old_schema.item, 'old_schema.item', $$old_schema.item$$ /* old_schema.item /* nested */ */ FROM old_schema.items",
+        );
+        rename_schema_qualified_sql(&mut source, old, new).unwrap();
+        assert_eq!(
+            source.as_str(),
+            "SELECT new_schema.item, 'old_schema.item', $$old_schema.item$$ /* old_schema.item /* nested */ */ FROM new_schema.items"
+        );
+    }
 
     #[test]
     fn committed_image_obeys_an_lsn_snapshot() {

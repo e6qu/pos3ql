@@ -123,6 +123,33 @@ CREATE TABLE public.taken(a int);
 ALTER TABLE public.taken SET SCHEMA sc;
 ALTER TABLE public.taken SET SCHEMA ghost;
 
+-- ALTER SCHEMA preserves catalog identities while changing every qualified
+-- reference: relation/default, view, type, comments, rollback, and the old
+-- spelling all follow PostgreSQL's namespace transition.
+CREATE SCHEMA schema_rename_source_diff;
+CREATE TYPE schema_rename_source_diff.mood AS ENUM ('calm', 'storm');
+CREATE SEQUENCE schema_rename_source_diff.ticket;
+CREATE TABLE schema_rename_source_diff.items (
+  id bigint DEFAULT nextval('schema_rename_source_diff.ticket'),
+  state schema_rename_source_diff.mood
+);
+CREATE VIEW schema_rename_source_diff.item_view AS
+  SELECT id, state FROM schema_rename_source_diff.items;
+COMMENT ON SEQUENCE schema_rename_source_diff.ticket IS 'renamed sequence';
+ALTER SCHEMA schema_rename_source_diff RENAME TO schema_rename_target_diff;
+ALTER SCHEMA schema_rename_target_diff OWNER TO postgres;
+INSERT INTO schema_rename_target_diff.items(state) VALUES ('calm') RETURNING id;
+SELECT id, state FROM schema_rename_target_diff.item_view;
+SELECT 'storm'::schema_rename_target_diff.mood;
+SELECT obj_description('schema_rename_target_diff.ticket'::regclass);
+SELECT nextval('schema_rename_source_diff.ticket');
+BEGIN;
+ALTER SCHEMA schema_rename_target_diff RENAME TO schema_rename_rolled_back_diff;
+INSERT INTO schema_rename_rolled_back_diff.items(state) VALUES ('storm');
+ROLLBACK;
+INSERT INTO schema_rename_target_diff.items(state) VALUES ('storm') RETURNING id;
+DROP SCHEMA schema_rename_target_diff CASCADE;
+
 -- Multi-name DROP TABLE across schemas.
 CREATE TABLE public.d1(a int);
 CREATE TABLE sc.d2(a int);

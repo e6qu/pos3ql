@@ -4359,7 +4359,6 @@ impl<'a> Parser<'a> {
 
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
-        use crate::sql::ast::AlterOwnerKind;
         if self.eat_ident("large")? {
             self.expect_ident("object")?;
             let oid = self.large_object_id()?;
@@ -4613,11 +4612,16 @@ impl<'a> Parser<'a> {
             return self.alter_routine(crate::sql::ast::RoutineTargetKind::Either);
         }
         if self.eat_ident("schema")? {
-            let name = QualName {
-                schema: None,
-                name: self.col_ident("schema name")?,
+            let name = self.col_ident("schema name")?;
+            let action = if self.eat_ident("rename")? {
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterSchemaAction::RenameTo(self.col_ident("new schema name")?)
+            } else {
+                self.expect_ident("owner")?;
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterSchemaAction::OwnerTo(self.any_ident("role name")?)
             };
-            return self.alter_owner(AlterOwnerKind::Schema, name, false);
+            return Ok(Stmt::AlterSchema { name, action });
         }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;

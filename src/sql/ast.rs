@@ -2328,10 +2328,12 @@ pub struct RoleOptions<'a> {
     pub replication: Option<bool>,
     pub bypass_row_level_security: Option<bool>,
     pub connection_limit: Option<i32>,
+    /// Obsolete PostgreSQL spelling retained as an explicit no-state option.
+    pub sysid: Option<i32>,
     /// `Some(None)` is PASSWORD NULL; `None` means no PASSWORD clause.
     pub password: Option<Option<RolePasswordSpec<'a>>>,
-    /// Canonical source text of VALID UNTIL, or NULL for infinity.
-    pub valid_until: Option<Option<&'a str>>,
+    /// Canonical source text of a PostgreSQL VALID UNTIL timestamp literal.
+    pub valid_until: Option<&'a str>,
 }
 
 /// A password is either plaintext or a complete imported SCRAM verifier.
@@ -2351,6 +2353,7 @@ impl RoleOptions<'_> {
         replication: None,
         bypass_row_level_security: None,
         connection_limit: None,
+        sysid: None,
         password: None,
         valid_until: None,
     };

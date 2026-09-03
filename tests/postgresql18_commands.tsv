@@ -26,7 +26,7 @@ ALTER EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native-
 ALTER FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh (native handlers are rejected)
 ALTER FOREIGN TABLE	complete	tests/external/ci_diff.sh
 ALTER FUNCTION	partial	90_routine_lifecycle.sql, 111_extension_lifecycle.sql, and 112_routine_bodies_attributes_do.sql
-ALTER GROUP	partial	83_roles_acl.sql
+ALTER GROUP	complete	100_role_credentials.sql
 ALTER INDEX	partial	107_index_lifecycle.sql and 111_extension_lifecycle.sql
 ALTER LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; custom executable handlers are outside the architecture)
 ALTER LARGE OBJECT	complete	tests/external/differential/121_large_objects.sql
@@ -54,7 +54,7 @@ ALTER TEXT SEARCH PARSER	complete	tests/external/differential/123_full_text_sear
 ALTER TEXT SEARCH TEMPLATE	complete	tests/external/differential/123_full_text_search.sql
 ALTER TRIGGER	complete	101_trigger_timing.sql
 ALTER TYPE	partial	63_enums.sql
-ALTER USER	partial	83_roles_acl.sql
+ALTER USER	complete	83_roles_acl.sql and 100_role_credentials.sql
 ALTER USER MAPPING	complete	tests/external/ci_diff.sh
 ALTER VIEW	partial	76_stored_dependencies.sql and typed output-column identity, auto-updatable DML, rollback, WAL, checkpoints, and recovery
 ANALYZE	complete	48_vacuum_analyze.sql
@@ -79,7 +79,7 @@ CREATE EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native
 CREATE FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh (native handlers are rejected)
 CREATE FOREIGN TABLE	complete	tests/external/ci_diff.sh
 CREATE FUNCTION	partial	87_sql_routines.sql and 112_routine_bodies_attributes_do.sql
-CREATE GROUP	partial	83_roles_acl.sql
+CREATE GROUP	complete	83_roles_acl.sql and 100_role_credentials.sql
 CREATE INDEX	partial	43_indexes.sql, 107_index_lifecycle.sql, and 108_index_operator_classes.sql
 CREATE LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; native handlers are outside the architecture)
 CREATE MATERIALIZED VIEW	complete	53_materialized_view.sql
@@ -106,7 +106,7 @@ CREATE TEXT SEARCH TEMPLATE	complete	tests/external/differential/123_full_text_s
 CREATE TRANSFORM	missing	-
 CREATE TRIGGER	complete	101_trigger_timing.sql
 CREATE TYPE	partial	63_enums.sql
-CREATE USER	partial	83_roles_acl.sql
+CREATE USER	complete	83_roles_acl.sql and 100_role_credentials.sql
 CREATE USER MAPPING	complete	tests/external/ci_diff.sh
 CREATE VIEW	complete	76_stored_dependencies.sql
 DEALLOCATE	complete	14_surface.sql
@@ -126,7 +126,7 @@ DROP EXTENSION	partial	111_extension_lifecycle.sql covers SQL-package dependency
 DROP FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh
 DROP FOREIGN TABLE	complete	tests/external/ci_diff.sh
 DROP FUNCTION	partial	87_sql_routines.sql
-DROP GROUP	partial	83_roles_acl.sql
+DROP GROUP	complete	83_roles_acl.sql and 100_role_credentials.sql
 DROP INDEX	complete	43_indexes.sql
 DROP LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; builtin language mutation remains unsupported)
 DROP MATERIALIZED VIEW	complete	53_materialized_view.sql
@@ -154,7 +154,7 @@ DROP TEXT SEARCH TEMPLATE	complete	tests/external/differential/123_full_text_sea
 DROP TRANSFORM	missing	-
 DROP TRIGGER	complete	101_trigger_timing.sql
 DROP TYPE	complete	63_enums.sql
-DROP USER	partial	83_roles_acl.sql
+DROP USER	complete	83_roles_acl.sql and 100_role_credentials.sql
 DROP USER MAPPING	complete	tests/external/ci_diff.sh
 DROP VIEW	complete	76_stored_dependencies.sql
 END	complete	05_transactions.sql

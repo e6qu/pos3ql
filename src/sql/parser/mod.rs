@@ -4429,8 +4429,11 @@ impl<'a> Parser<'a> {
             }
             return self.alter_role();
         }
-        if self.eat_ident("role")? || self.eat_ident("group")? {
+        if self.eat_ident("role")? {
             return self.alter_role();
+        }
+        if self.eat_ident("group")? {
+            return self.alter_group();
         }
         if self.eat_ident("collation")? {
             let name = self.qual_name("collation name")?;
@@ -8517,6 +8520,55 @@ mod tests {
     }
 
     #[test]
+    fn legacy_alter_group_is_typed_as_role_membership() {
+        with_parser(
+            "ALTER GROUP parent ADD USER child, other; \
+             ALTER GROUP parent DROP USER child; \
+             ALTER GROUP parent RENAME TO renamed",
+            |parser| {
+                let Some(Stmt::GrantRole {
+                    roles,
+                    members,
+                    options,
+                    grantor,
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER GROUP ADD USER did not parse")
+                };
+                assert_eq!(roles, ["parent"]);
+                assert_eq!(members, ["child", "other"]);
+                assert_eq!(options, crate::sql::ast::RoleMembershipPatch::EMPTY);
+                assert_eq!(grantor, None);
+
+                let Some(Stmt::RevokeRole {
+                    roles,
+                    members,
+                    option,
+                    grantor,
+                    cascade,
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER GROUP DROP USER did not parse")
+                };
+                assert_eq!(roles, ["parent"]);
+                assert_eq!(members, ["child"]);
+                assert_eq!(option, None);
+                assert_eq!(grantor, None);
+                assert!(!cascade);
+
+                let Some(Stmt::AlterRoleRename { name, new_name }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER GROUP RENAME did not parse")
+                };
+                assert_eq!((name, new_name), ("parent", "renamed"));
+            },
+        );
+        with_parser("ALTER GROUP parent NOLOGIN", |parser| {
+            assert!(parser.next_stmt().is_err());
+        });
+    }
+
+    #[test]
     fn role_password_forms_are_typed_at_the_parse_boundary() {
         let server = crate::pg::auth::ScramServer::derive("imported-password", [9; 16], 4096);
         let mut salt = crate::util::StackStr::<512>::new();
@@ -8592,6 +8644,15 @@ mod tests {
                 );
             },
         );
+        with_parser("CREATE ROLE old_sysid SYSID 7", |parser| {
+            let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
+                panic!("obsolete SYSID did not parse")
+            };
+            assert_eq!(options.sysid, Some(7));
+        });
+        with_parser("CREATE ROLE invalid_expiry VALID UNTIL NULL", |parser| {
+            assert!(parser.next_stmt().is_err());
+        });
     }
 
     #[test]

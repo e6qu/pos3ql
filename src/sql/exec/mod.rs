@@ -5909,22 +5909,16 @@ fn apply_role_options(
         };
     }
     if let Some(valid_until) = options.valid_until {
-        attributes.valid_until = if let Some(valid_until) = valid_until {
-            if !valid_until.eq_ignore_ascii_case("infinity") {
-                crate::sql::datetime::parse_timestamp(valid_until, true)?;
-            }
-            let value = crate::util::StackStr::from_str(valid_until);
-            if value.is_truncated() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "VALID UNTIL value exceeds {} bytes",
-                    crate::storage::ROLE_VALID_UNTIL_MAX
-                ));
-            }
-            Some(value)
-        } else {
-            None
-        };
+        crate::sql::datetime::parse_timestamp(valid_until, true)?;
+        let value = crate::util::StackStr::from_str(valid_until);
+        if value.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "VALID UNTIL value exceeds {} bytes",
+                crate::storage::ROLE_VALID_UNTIL_MAX
+            ));
+        }
+        attributes.valid_until = Some(value);
     }
     Ok(attributes)
 }
@@ -5974,6 +5968,12 @@ pub fn create_role(
     }) {
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
+    }
+    if options.sysid.is_some() {
+        responder.notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            "SYSID can no longer be specified",
+        )?;
     }
     let membership_count = memberships
         .in_roles

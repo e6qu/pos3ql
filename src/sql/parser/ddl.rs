@@ -3854,7 +3854,7 @@ impl<'a> Parser<'a> {
         let mut role_members: &'a [&'a str] = &[];
         let mut admin_members: &'a [&'a str] = &[];
         loop {
-            if self.role_option(&mut options)? {
+            if self.role_option(&mut options, true)? {
                 continue;
             }
             if self.eat_ident("in")? {
@@ -3950,13 +3950,54 @@ impl<'a> Parser<'a> {
         Ok(Stmt::AlterRole { name, options })
     }
 
+    /// Parse PostgreSQL's legacy membership-only ALTER GROUP grammar into the
+    /// canonical role membership statements used by execution.
+    pub(super) fn alter_group(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let group = self.any_ident("group name")?;
+        if self.eat_ident("add")? {
+            self.expect_ident("user")?;
+            let members = self.role_name_list("user name")?;
+            let roles = self.arena_slice(&[group])?;
+            return Ok(Stmt::GrantRole {
+                roles,
+                members,
+                options: crate::sql::ast::RoleMembershipPatch::EMPTY,
+                grantor: None,
+            });
+        }
+        if self.eat_ident("drop")? {
+            self.expect_ident("user")?;
+            let members = self.role_name_list("user name")?;
+            let roles = self.arena_slice(&[group])?;
+            return Ok(Stmt::RevokeRole {
+                roles,
+                members,
+                option: None,
+                grantor: None,
+                cascade: false,
+            });
+        }
+        if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            return Ok(Stmt::AlterRoleRename {
+                name: group,
+                new_name: self.any_ident("new group name")?,
+            });
+        }
+        Err(self.unexpected("expected ADD USER, DROP USER, or RENAME TO"))
+    }
+
     fn role_options(&mut self) -> Result<RoleOptions<'a>, ParseError> {
         let mut options = RoleOptions::EMPTY;
-        while self.role_option(&mut options)? {}
+        while self.role_option(&mut options, false)? {}
         Ok(options)
     }
 
-    fn role_option(&mut self, options: &mut RoleOptions<'a>) -> Result<bool, ParseError> {
+    fn role_option(
+        &mut self,
+        options: &mut RoleOptions<'a>,
+        allow_sysid: bool,
+    ) -> Result<bool, ParseError> {
         if self.eat_ident("superuser")? {
             options.superuser = Some(true);
         } else if self.eat_ident("nosuperuser")? {
@@ -3996,6 +4037,16 @@ impl<'a> Parser<'a> {
                 .map_err(|_| self.unexpected("connection limit is out of range"))?;
             self.advance()?;
             options.connection_limit = Some(if negative { -parsed } else { parsed });
+        } else if allow_sysid && self.eat_ident("sysid")? {
+            let negative = self.eat_op("-")?;
+            let Tok::Num(raw) = self.peeked else {
+                return Err(self.unexpected("expected SYSID"));
+            };
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| self.unexpected("SYSID is out of range"))?;
+            self.advance()?;
+            options.sysid = Some(if negative { -parsed } else { parsed });
         } else if self.eat_ident("password")? {
             options.password = Some(self.role_password_spec()?);
         } else if self.eat_ident("encrypted")? {
@@ -4010,11 +4061,7 @@ impl<'a> Parser<'a> {
             });
         } else if self.eat_ident("valid")? {
             self.expect_ident("until")?;
-            options.valid_until = Some(if self.eat_ident("null")? {
-                None
-            } else {
-                Some(self.str_literal("VALID UNTIL")?)
-            });
+            options.valid_until = Some(self.str_literal("VALID UNTIL")?);
         } else {
             return Ok(false);
         }

@@ -6525,7 +6525,7 @@ fn role_catalog_replays_from_wal() {
         [
             "durable_renamed|f|t|t|t|7",
             "durable_renamed|durable_member|t",
-            "t|t|durable role comment",
+            "t|f|durable role comment",
             "t",
             "t|f"
         ],

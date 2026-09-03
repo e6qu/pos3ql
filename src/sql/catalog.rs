@@ -14391,6 +14391,7 @@ fn pg_roles<'a>(
             ("rolcreatedb", ColType::Bool),
             ("rolcanlogin", ColType::Bool),
             ("rolconnlimit", ColType::Int4),
+            ("rolpassword", ColType::Text),
             ("rolvaliduntil", ColType::Timestamptz),
             ("rolreplication", ColType::Bool),
             ("rolbypassrls", ColType::Bool),
@@ -14410,6 +14411,7 @@ fn pg_roles<'a>(
                 Datum::Bool(false),
                 Datum::Bool(false),
                 Datum::Int4(-1),
+                text("********", arena)?,
                 Datum::Null,
                 Datum::Bool(false),
                 Datum::Bool(false),
@@ -14426,7 +14428,6 @@ fn pg_roles<'a>(
         let attributes = role.attributes_to(txid);
         let valid_until = match attributes.valid_until.as_ref() {
             None => Datum::Null,
-            Some(value) if value.as_str().eq_ignore_ascii_case("infinity") => Datum::Null,
             Some(value) => {
                 Datum::Timestamptz(crate::sql::datetime::parse_timestamp(value.as_str(), true)?)
             }
@@ -14446,6 +14447,7 @@ fn pg_roles<'a>(
                 Datum::Bool(attributes.create_database),
                 Datum::Bool(attributes.can_login),
                 Datum::Int4(attributes.connection_limit),
+                text("********", arena)?,
                 valid_until,
                 Datum::Bool(attributes.replication),
                 Datum::Bool(attributes.bypass_row_level_security),
@@ -14571,7 +14573,6 @@ fn pg_authid<'a>(
         };
         let valid_until = match attributes.valid_until.as_ref() {
             None => Datum::Null,
-            Some(value) if value.as_str().eq_ignore_ascii_case("infinity") => Datum::Null,
             Some(value) => {
                 Datum::Timestamptz(crate::sql::datetime::parse_timestamp(value.as_str(), true)?)
             }

@@ -16,6 +16,9 @@ use super::eval::SqlError;
 pub const PG_EPOCH_DAYS: i64 = 10_957;
 /// Seconds between the unix and PostgreSQL epochs.
 pub const PG_EPOCH_SECS: i64 = 946_684_800;
+/// PostgreSQL's binary timestamp sentinels.
+pub const TIMESTAMP_NEG_INFINITY: i64 = i64::MIN;
+pub const TIMESTAMP_INFINITY: i64 = i64::MAX;
 
 pub fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let shifted = days_since_epoch + 719_468;
@@ -907,6 +910,12 @@ pub fn parse_timestamp(s: &str, apply_timezone: bool) -> Result<i64, SqlError> {
         )
     };
     let t = s.trim();
+    if t.eq_ignore_ascii_case("infinity") {
+        return Ok(TIMESTAMP_INFINITY);
+    }
+    if t.eq_ignore_ascii_case("-infinity") {
+        return Ok(TIMESTAMP_NEG_INFINITY);
+    }
     // PostgreSQL's era marker applies to the date even when it follows a
     // timestamp time component. Consume it before the ordinary zone parser,
     // where `BC` would otherwise look like a named zone.
@@ -1880,6 +1889,12 @@ pub fn format_timestamp_styled(
     style: DateStyle,
     timezone: super::timezone::Timezone,
 ) -> StackStr<48> {
+    if micros == TIMESTAMP_INFINITY {
+        return StackStr::from_str("infinity");
+    }
+    if micros == TIMESTAMP_NEG_INFINITY {
+        return StackStr::from_str("-infinity");
+    }
     // The offset and abbreviation are resolved for this specific instant, so
     // DST is honored; a plain timestamp (no timezone) always renders at wall clock.
     let (timezone_offset_seconds, abbrev) = if with_timezone {
@@ -1946,6 +1961,12 @@ pub fn format_timestamp_styled(
 /// `+00:00` — the session-zone shift PostgreSQL also applies here is the same
 /// limitation the plain `::text` render carries.
 pub fn format_timestamp_json(micros: i64, with_timezone: bool) -> StackStr<48> {
+    if micros == TIMESTAMP_INFINITY {
+        return StackStr::from_str("infinity");
+    }
+    if micros == TIMESTAMP_NEG_INFINITY {
+        return StackStr::from_str("-infinity");
+    }
     let days = micros.div_euclid(DAY_US);
     let in_day = micros.rem_euclid(DAY_US);
     let (y, m, d) = civil_from_days(days + PG_EPOCH_DAYS);
@@ -2370,6 +2391,22 @@ mod tests {
         assert_eq!(
             format_timestamp(t, true).as_str(),
             "2024-06-15 12:34:56.789+00"
+        );
+        assert_eq!(
+            parse_timestamp("infinity", false).unwrap(),
+            TIMESTAMP_INFINITY
+        );
+        assert_eq!(
+            parse_timestamp("-infinity", true).unwrap(),
+            TIMESTAMP_NEG_INFINITY
+        );
+        assert_eq!(
+            format_timestamp(TIMESTAMP_INFINITY, false).as_str(),
+            "infinity"
+        );
+        assert_eq!(
+            format_timestamp_json(TIMESTAMP_NEG_INFINITY, true).as_str(),
+            "-infinity"
         );
 
         // Zone shifting for timestamptz.

@@ -4751,6 +4751,13 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
          CREATE SCHEMA moved_extensions; \
          ALTER EXTENSION typed_ext SET SCHEMA moved_extensions; \
          ALTER EXTENSION typed_ext UPDATE TO '2.0'; \
+         CREATE FUNCTION aggregate_dependency_state(state bigint, value integer) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 0) + coalesce(value, 0)'; \
+         CREATE AGGREGATE aggregate_dependency_total(integer) ( \
+           SFUNC = aggregate_dependency_state, STYPE = bigint, INITCOND = '0' \
+         ); \
+         ALTER AGGREGATE aggregate_dependency_total(integer) DEPENDS ON EXTENSION typed_ext; \
+         SELECT aggregate_dependency_total(value) FROM (VALUES (2), (3)) rows(value); \
          INSERT INTO moved_extensions.typed_values(id,value) VALUES (1,'kept'); \
          SELECT value, enabled FROM moved_extensions.typed_values; \
          SELECT nextval('moved_extensions.typed_sequence'); \
@@ -4764,6 +4771,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
             "typed_ext|1.0|extensions|t",
             "10",
             "t|{\"WHERE NOT built_in\",\"\"}",
+            "5",
             "kept|t",
             "1",
             "42",
@@ -4781,6 +4789,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
             &mut recovered,
             &mut recovered_budget,
             "SELECT extname, extversion FROM pg_extension ORDER BY extname; \
+             SELECT aggregate_dependency_total(value) FROM (VALUES (2), (3)) rows(value); \
              SELECT value, enabled FROM moved_extensions.typed_values; \
              SELECT nextval('moved_extensions.typed_sequence'); \
              SELECT value FROM moved_extensions.typed_snapshot; \
@@ -4792,6 +4801,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         [
             "base_ext|1.0",
             "typed_ext|2.0",
+            "5",
             "kept|t",
             "2",
             "42",
@@ -4813,6 +4823,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
             &mut recovered,
             &mut recovered_budget,
             "SELECT extname, extversion FROM pg_extension ORDER BY extname; \
+             SELECT aggregate_dependency_total(value) FROM (VALUES (2), (3)) rows(value); \
              SELECT value, enabled FROM moved_extensions.typed_values; \
              SELECT value FROM moved_extensions.typed_snapshot; \
              SELECT count(*) FROM moved_extensions.typed_view; \
@@ -4827,6 +4838,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         [
             "base_ext|1.0",
             "typed_ext|2.0",
+            "5",
             "kept|t",
             "42",
             "1",
@@ -4875,11 +4887,12 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         "DROP EXTENSION base_ext CASCADE; \
          SELECT count(*) FROM pg_extension; \
          SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
-         SELECT count(*) FROM pg_proc WHERE proname='typed_identity'",
+         SELECT count(*) FROM pg_proc WHERE proname='typed_identity'; \
+         SELECT count(*) FROM pg_proc WHERE proname='aggregate_dependency_total'",
     );
     assert_eq!(
         data_rows(&dropped),
-        ["0", "0", "0"],
+        ["0", "0", "0", "0"],
         "{}",
         String::from_utf8_lossy(&dropped)
     );

@@ -4834,6 +4834,20 @@ mod tests {
                 text: "[(1,2),(3,4)]",
             }
         );
+
+        let mut path = [0u8; 37];
+        path[1..5].copy_from_slice(&2_i32.to_be_bytes());
+        for (index, value) in [1.0_f64, 2.0, 3.0, 4.0].into_iter().enumerate() {
+            path[5 + index * 8..][..8].copy_from_slice(&value.to_be_bytes());
+        }
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::PATH, &path, &arena)
+                .expect("path parameter decodes"),
+            Datum::Geometry {
+                kind: crate::sql::types::GeometryKind::Path,
+                text: "[(1,2),(3,4)]",
+            }
+        );
     }
 
     #[test]

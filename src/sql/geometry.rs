@@ -392,7 +392,7 @@ pub fn binary_len(kind: GeometryKind, text: &str) -> Result<usize, SqlError> {
         GeometryKind::Point => 16,
         GeometryKind::Line | GeometryKind::Circle => 24,
         GeometryKind::Lseg | GeometryKind::Box => 32,
-        GeometryKind::Path => 8 + count * 8,
+        GeometryKind::Path => 5 + count * 8,
         GeometryKind::Polygon => 4 + count * 8,
     })
 }
@@ -407,7 +407,7 @@ pub fn emit_binary(
     let (count, closed) = read_values(kind, text, &mut values)?;
     match kind {
         GeometryKind::Path => {
-            emit(&[u8::from(closed), 0, 0, 0]);
+            emit(&[u8::from(closed)]);
             emit(&((count / 2) as i32).to_be_bytes());
         }
         GeometryKind::Polygon => emit(&((count / 2) as i32).to_be_bytes()),
@@ -435,16 +435,16 @@ pub fn decode_binary<'a>(
     };
     let (closed, payload) = match kind {
         GeometryKind::Path => {
-            let header = bytes.get(..8).ok_or_else(bad_binary)?;
-            if !matches!(header[0], 0 | 1) || header[1..4] != [0; 3] {
+            let header = bytes.get(..5).ok_or_else(bad_binary)?;
+            if !matches!(header[0], 0 | 1) {
                 return Err(bad_binary());
             }
-            let points = i32::from_be_bytes(header[4..8].try_into().unwrap());
-            if !(1..=MAX_POINTS as i32).contains(&points) || bytes.len() != 8 + points as usize * 16
+            let points = i32::from_be_bytes(header[1..5].try_into().unwrap());
+            if !(1..=MAX_POINTS as i32).contains(&points) || bytes.len() != 5 + points as usize * 16
             {
                 return Err(bad_binary());
             }
-            (Some(header[0] != 0), &bytes[8..])
+            (Some(header[0] != 0), &bytes[5..])
         }
         GeometryKind::Polygon => {
             let header = bytes.get(..4).ok_or_else(bad_binary)?;

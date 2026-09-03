@@ -6037,8 +6037,8 @@ pub fn create_role(
             "too many role memberships in one statement"
         ));
     }
-    if !current_is_superuser {
-        if let Err(error) = stage_role_membership(
+    if !current_is_superuser
+        && let Err(error) = stage_role_membership(
             storage,
             wal,
             txn,
@@ -6050,9 +6050,9 @@ pub fn create_role(
                 inherit: false,
                 set: false,
             },
-        ) {
-            return sql_fail(error);
-        }
+        )
+    {
+        return sql_fail(error);
     }
     let grantor = current;
     for written in request.memberships.in_roles {

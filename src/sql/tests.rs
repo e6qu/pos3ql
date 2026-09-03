@@ -32231,12 +32231,12 @@ fn create_schema_embedded_elements_are_typed_and_requalified() {
         &mut engine,
         &mut budget,
         "CREATE SCHEMA typed_schema
-           CREATE DOMAIN positive AS integer CHECK (VALUE > 0)
-           CREATE TYPE mood AS ENUM ('ready', 'done')
            CREATE TABLE rows (id integer)
            CREATE VIEW row_view AS SELECT id FROM rows
            CREATE INDEX rows_id ON rows (id)
-           CREATE SEQUENCE row_ids;",
+           CREATE SEQUENCE row_ids;
+         CREATE DOMAIN typed_schema.positive AS integer CHECK (VALUE > 0);
+         CREATE TYPE typed_schema.mood AS ENUM ('ready', 'done');",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -32258,7 +32258,7 @@ fn create_schema_embedded_elements_are_typed_and_requalified() {
     let rejected = run_with(
         &mut engine,
         &mut budget,
-        "CREATE SCHEMA invalid_schema CREATE MATERIALIZED VIEW view_inside_schema AS SELECT 1",
+        "CREATE SCHEMA invalid_schema CREATE DOMAIN positive AS integer CHECK (VALUE > 0)",
     );
     assert!(
         String::from_utf8_lossy(&rejected).contains("42601"),

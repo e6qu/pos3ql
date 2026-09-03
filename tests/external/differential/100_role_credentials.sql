@@ -24,7 +24,16 @@ SELECT rolpassword = '********', rolvaliduntil IS NULL
   FROM pg_roles WHERE rolname = 'credential_default_expiry';
 DROP ROLE credential_default_expiry;
 
+CREATE ROLE credential_duplicate_option LOGIN NOLOGIN;
+CREATE ROLE credential_duplicate_password PASSWORD 'one' ENCRYPTED PASSWORD 'two';
+SELECT count(*) FROM pg_roles
+WHERE rolname IN ('credential_duplicate_option',
+                   'credential_duplicate_password');
+
 CREATE ROLE credential_membership_parent;
+CREATE ROLE credential_duplicate_membership
+  IN ROLE credential_membership_parent IN GROUP credential_membership_parent;
+SELECT count(*) FROM pg_roles WHERE rolname = 'credential_duplicate_membership';
 CREATE ROLE credential_membership_member NOINHERIT;
 CREATE ROLE credential_membership_administrator;
 CREATE ROLE "session_user";

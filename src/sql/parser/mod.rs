@@ -8726,6 +8726,22 @@ mod tests {
         with_parser("CREATE ROLE invalid_expiry VALID UNTIL NULL", |parser| {
             assert!(parser.next_stmt().is_err());
         });
+        for source in [
+            "CREATE ROLE duplicate_role_options LOGIN NOLOGIN",
+            "ALTER ROLE duplicate_role_options PASSWORD 'one' ENCRYPTED PASSWORD 'two'",
+            "CREATE ROLE duplicate_role_options VALID UNTIL 'infinity' VALID UNTIL 'infinity'",
+            "CREATE ROLE duplicate_role_options IN ROLE parent IN GROUP parent",
+            "CREATE ROLE duplicate_role_options ROLE member ROLE member",
+            "CREATE ROLE duplicate_role_options ADMIN member ADMIN member",
+        ] {
+            with_parser(source, |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    crate::sql::eval::sqlstate::SYNTAX_ERROR,
+                    "{source}"
+                );
+            });
+        }
         with_parser("CREATE ROLE empty_password PASSWORD ''", |parser| {
             let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
                 panic!("empty password did not parse")

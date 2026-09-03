@@ -6353,6 +6353,37 @@ fn role_catalog_is_transactional_and_attribute_complete() {
 }
 
 #[test]
+fn duplicate_role_options_fail_before_catalog_mutation() {
+    let (mut engine, mut budget) = test_engine();
+    for source in [
+        "CREATE ROLE rejected_role LOGIN NOLOGIN",
+        "CREATE ROLE rejected_role PASSWORD 'one' ENCRYPTED PASSWORD 'two'",
+        "CREATE ROLE rejected_role VALID UNTIL 'infinity' VALID UNTIL 'infinity'",
+        "CREATE ROLE rejected_role IN ROLE parent IN GROUP parent",
+        "CREATE ROLE rejected_role ROLE member USER member",
+        "CREATE ROLE rejected_role ADMIN member ADMIN member",
+    ] {
+        let output = run_with(&mut engine, &mut budget, source);
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("42601") && output.contains("conflicting or redundant options"),
+            "{source}: {output}"
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_roles WHERE rolname = 'rejected_role'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn role_connection_limit_is_reserved_and_released_exactly() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

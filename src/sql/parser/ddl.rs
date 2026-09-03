@@ -3861,10 +3861,19 @@ impl<'a> Parser<'a> {
                 if !self.eat_ident("role")? {
                     self.expect_ident("group")?;
                 }
+                if !in_roles.is_empty() {
+                    return Err(self.err_here("conflicting or redundant options"));
+                }
                 in_roles = self.role_name_list("role name")?;
             } else if self.eat_ident("role")? || self.eat_ident("user")? {
+                if !role_members.is_empty() {
+                    return Err(self.err_here("conflicting or redundant options"));
+                }
                 role_members = self.role_name_list("member role name")?;
             } else if self.eat_ident("admin")? {
+                if !admin_members.is_empty() {
+                    return Err(self.err_here("conflicting or redundant options"));
+                }
                 admin_members = self.role_name_list("member role name")?;
             } else {
                 break;
@@ -4002,33 +4011,33 @@ impl<'a> Parser<'a> {
         allow_sysid: bool,
     ) -> Result<bool, ParseError> {
         if self.eat_ident("superuser")? {
-            options.superuser = Some(true);
+            self.set_role_option(&mut options.superuser, true)?;
         } else if self.eat_ident("nosuperuser")? {
-            options.superuser = Some(false);
+            self.set_role_option(&mut options.superuser, false)?;
         } else if self.eat_ident("inherit")? {
-            options.inherit = Some(true);
+            self.set_role_option(&mut options.inherit, true)?;
         } else if self.eat_ident("noinherit")? {
-            options.inherit = Some(false);
+            self.set_role_option(&mut options.inherit, false)?;
         } else if self.eat_ident("createrole")? {
-            options.create_role = Some(true);
+            self.set_role_option(&mut options.create_role, true)?;
         } else if self.eat_ident("nocreaterole")? {
-            options.create_role = Some(false);
+            self.set_role_option(&mut options.create_role, false)?;
         } else if self.eat_ident("createdb")? {
-            options.create_database = Some(true);
+            self.set_role_option(&mut options.create_database, true)?;
         } else if self.eat_ident("nocreatedb")? {
-            options.create_database = Some(false);
+            self.set_role_option(&mut options.create_database, false)?;
         } else if self.eat_ident("login")? {
-            options.can_login = Some(true);
+            self.set_role_option(&mut options.can_login, true)?;
         } else if self.eat_ident("nologin")? {
-            options.can_login = Some(false);
+            self.set_role_option(&mut options.can_login, false)?;
         } else if self.eat_ident("replication")? {
-            options.replication = Some(true);
+            self.set_role_option(&mut options.replication, true)?;
         } else if self.eat_ident("noreplication")? {
-            options.replication = Some(false);
+            self.set_role_option(&mut options.replication, false)?;
         } else if self.eat_ident("bypassrls")? {
-            options.bypass_row_level_security = Some(true);
+            self.set_role_option(&mut options.bypass_row_level_security, true)?;
         } else if self.eat_ident("nobypassrls")? {
-            options.bypass_row_level_security = Some(false);
+            self.set_role_option(&mut options.bypass_row_level_security, false)?;
         } else if self.eat_ident("connection")? {
             self.expect_ident("limit")?;
             let negative = self.eat_op("-")?;
@@ -4039,7 +4048,10 @@ impl<'a> Parser<'a> {
                 .parse::<i32>()
                 .map_err(|_| self.unexpected("connection limit is out of range"))?;
             self.advance()?;
-            options.connection_limit = Some(if negative { -parsed } else { parsed });
+            self.set_role_option(
+                &mut options.connection_limit,
+                if negative { -parsed } else { parsed },
+            )?;
         } else if allow_sysid && self.eat_ident("sysid")? {
             let negative = self.eat_op("-")?;
             let Tok::Num(raw) = self.peeked else {
@@ -4049,12 +4061,14 @@ impl<'a> Parser<'a> {
                 .parse::<i32>()
                 .map_err(|_| self.unexpected("SYSID is out of range"))?;
             self.advance()?;
-            options.sysid = Some(if negative { -parsed } else { parsed });
+            self.set_role_option(&mut options.sysid, if negative { -parsed } else { parsed })?;
         } else if self.eat_ident("password")? {
-            options.password = Some(self.role_password_spec()?);
+            let password = self.role_password_spec()?;
+            self.set_role_option(&mut options.password, password)?;
         } else if self.eat_ident("encrypted")? {
             self.expect_ident("password")?;
-            options.password = Some(self.role_password_spec()?);
+            let password = self.role_password_spec()?;
+            self.set_role_option(&mut options.password, password)?;
         } else if self.eat_ident("unencrypted")? {
             self.expect_ident("password")?;
             return Err(ParseError {
@@ -4064,11 +4078,20 @@ impl<'a> Parser<'a> {
             });
         } else if self.eat_ident("valid")? {
             self.expect_ident("until")?;
-            options.valid_until = Some(self.str_literal("VALID UNTIL")?);
+            let valid_until = self.str_literal("VALID UNTIL")?;
+            self.set_role_option(&mut options.valid_until, valid_until)?;
         } else {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    fn set_role_option<T>(&self, destination: &mut Option<T>, value: T) -> Result<(), ParseError> {
+        if destination.is_some() {
+            return Err(self.err_here("conflicting or redundant options"));
+        }
+        *destination = Some(value);
+        Ok(())
     }
 
     fn role_password_spec(

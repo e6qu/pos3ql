@@ -317,7 +317,7 @@ fn point(out: &mut StackStr<2048>, x: f64, y: f64) {
 }
 
 fn points(out: &mut StackStr<2048>, values: &[f64]) {
-    for (index, pair) in values.chunks_exact(2).enumerate() {
+    for (index, pair) in values.as_chunks::<2>().0.iter().enumerate() {
         if index != 0 {
             let _ = out.write_str(",");
         }

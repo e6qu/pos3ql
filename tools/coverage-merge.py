@@ -14,6 +14,22 @@ Usage: tools/coverage-merge.py <floor-percent> <tracefile.lcov>...
 import sys
 
 
+def parse_data_record(raw, path, line_number):
+    fields = raw[3:].split(",", 2)
+    if len(fields) < 2 or not fields[0] or not fields[1]:
+        raise ValueError(f"{path}:{line_number}: malformed LCOV data record: {raw!r}")
+    try:
+        source_line = int(fields[0])
+        count = int(fields[1])
+    except ValueError as error:
+        raise ValueError(
+            f"{path}:{line_number}: malformed LCOV data record: {raw!r}"
+        ) from error
+    if source_line <= 0 or count < 0:
+        raise ValueError(f"{path}:{line_number}: malformed LCOV data record: {raw!r}")
+    return source_line, count
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__.strip(), file=sys.stderr)
@@ -25,14 +41,21 @@ def main():
     for path in tracefiles:
         source = None
         with open(path) as tracefile:
-            for raw in tracefile:
+            for trace_line, raw in enumerate(tracefile, start=1):
                 raw = raw.strip()
                 if raw.startswith("SF:"):
                     source = raw[3:]
                 elif raw.startswith("DA:"):
-                    line_number, count = raw[3:].split(",")[:2]
-                    key = (source, int(line_number))
-                    covered_by_line[key] = covered_by_line.get(key, False) or int(count) > 0
+                    try:
+                        source_line, count = parse_data_record(raw, path, trace_line)
+                    except ValueError as error:
+                        print(f"FAIL: {error}")
+                        return 1
+                    if not source:
+                        print(f"FAIL: {path}:{trace_line}: LCOV data record has no source file")
+                        return 1
+                    key = (source, source_line)
+                    covered_by_line[key] = covered_by_line.get(key, False) or count > 0
 
     if not covered_by_line:
         print("FAIL: the tracefiles contain no line records; nothing was measured")

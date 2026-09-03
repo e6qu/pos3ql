@@ -49,6 +49,9 @@ jobs:
       - name: CI timeout guard
         run: bash tools/check-ci-timeouts.sh
 
+      - name: Coverage merge guard
+        run: python3 -m unittest tools/tests/test_coverage_merge.py
+
       # Copy-paste gate: fails if source duplication exceeds the ratchet in
       # .jscpd.json. See tools/check-dups.sh.
       - name: Duplicate-code guard (jscpd)

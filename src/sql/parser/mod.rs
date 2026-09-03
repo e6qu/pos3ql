@@ -7876,6 +7876,29 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_extension_dependencies_are_typed_at_parse_time() {
+        with_parser(
+            "ALTER AGGREGATE public.total(integer) DEPENDS ON EXTENSION reporting; \
+             ALTER AGGREGATE public.total(integer) NO DEPENDS ON EXTENSION reporting",
+            |parser| {
+                for enabled in [true, false] {
+                    let Some(Stmt::AlterAggregate { action, .. }) = parser.next_stmt().unwrap()
+                    else {
+                        panic!("ALTER AGGREGATE did not retain its typed statement")
+                    };
+                    assert_eq!(
+                        action,
+                        AlterRoutineAction::ExtensionDependency {
+                            extension: "reporting",
+                            enabled,
+                        }
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
     fn publication_options_parse_without_heap_allocation() {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "publication parser", 1 << 18).unwrap();

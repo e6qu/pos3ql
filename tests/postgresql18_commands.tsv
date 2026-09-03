@@ -15,7 +15,7 @@
 # tools/check-pg18-surface.sh passes. Individual fat PRs advance the measured
 # states without pretending that the remaining surface is complete.
 ABORT	complete	05_transactions.sql
-ALTER AGGREGATE	partial	110_user_defined_aggregates.sql
+ALTER AGGREGATE	complete	110_user_defined_aggregates.sql and typed extension-dependency parsing
 ALTER COLLATION	complete	120_collation_conversion.sql
 ALTER CONVERSION	complete	120_collation_conversion.sql
 ALTER DATABASE	complete	118_database_configuration.sql

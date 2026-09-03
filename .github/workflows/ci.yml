@@ -49,8 +49,11 @@ jobs:
       - name: CI timeout guard
         run: bash tools/check-ci-timeouts.sh
 
-      - name: Coverage merge guard
-        run: python3 -m unittest tools/tests/test_coverage_merge.py
+      - name: Tool guard tests
+        run: python3 -m unittest tools/tests/test_coverage_merge.py tools/tests/test_check_dups.py
+
+      - name: Duplicate-code guard
+        run: sh tools/check-dups.sh
 
       - name: Build
         run: cargo build --all-targets --locked
@@ -80,23 +83,6 @@ jobs:
           POS3QL_OBJECT_STORE_NAMESPACE=ci-contract \
           POS3QL_OBJECT_STORE_TLS=off \
           cargo test --locked --test object_store_it -- --test-threads=1
-
-  # jscpd is Node-distributed and its registry/cache latency must not consume
-  # the compiled verification job's budget.
-  duplicate-code:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Cache jscpd
-        uses: actions/cache@v5
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-npm-jscpd-v5
-
-      - name: Duplicate-code guard (jscpd)
-        run: sh tools/check-dups.sh
 
   # Each worker runs two fixed seed ranges. The complete 16-seed sweep is
   # unchanged, while four short jobs become two so the limited runner pool

@@ -6468,6 +6468,9 @@ fn role_catalog_replays_from_wal() {
            PASSWORD 'never-store-this' VALID UNTIL 'infinity';
          CREATE USER durable_precomputed LOGIN ENCRYPTED PASSWORD '{}';
          ALTER USER durable_precomputed ENCRYPTED PASSWORD '{}';
+         CREATE ROLE durable_md5 LOGIN PASSWORD 'md547fcb6615d41c53cd39822141eb05da2';
+         CREATE ROLE durable_md5_rename LOGIN PASSWORD 'md547fcb6615d41c53cd39822141eb05da2';
+         ALTER ROLE durable_md5_rename RENAME TO durable_md5_renamed;
          ALTER ROLE durable NOINHERIT CREATEDB;
          COMMENT ON ROLE durable IS 'durable role comment';
          ALTER ROLE durable RENAME TO durable_renamed;
@@ -6513,6 +6516,10 @@ fn role_catalog_replays_from_wal() {
            FROM pg_authid WHERE rolname = 'durable_renamed';
          SELECT rolpassword = '{}'
            FROM pg_authid WHERE rolname = 'durable_precomputed';
+         SELECT rolpassword = 'md547fcb6615d41c53cd39822141eb05da2'
+           FROM pg_authid WHERE rolname = 'durable_md5';
+         SELECT rolpassword IS NULL
+           FROM pg_authid WHERE rolname = 'durable_md5_renamed';
          SELECT has_column_privilege(
                   'durable_member', 'durable_column_acl', 'visible', 'SELECT'),
                 has_column_privilege(
@@ -6526,6 +6533,8 @@ fn role_catalog_replays_from_wal() {
             "durable_renamed|f|t|t|t|7",
             "durable_renamed|durable_member|t",
             "t|f|durable role comment",
+            "t",
+            "t",
             "t",
             "t|f"
         ],

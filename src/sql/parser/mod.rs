@@ -8675,6 +8675,22 @@ mod tests {
             },
         );
         with_parser(
+            "CREATE ROLE imported_md5 PASSWORD 'md547fcb6615d41c53cd39822141eb05da2'",
+            |parser| {
+                let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("MD5 verifier did not parse")
+                };
+                assert_eq!(
+                    options.password,
+                    Some(Some(crate::sql::ast::RolePasswordSpec::Md5Verifier(
+                        crate::storage::Md5Verifier {
+                            hash: *b"47fcb6615d41c53cd39822141eb05da2",
+                        },
+                    )))
+                );
+            },
+        );
+        with_parser(
             "ALTER ROLE imported UNENCRYPTED PASSWORD 'secret'",
             |parser| {
                 assert_eq!(

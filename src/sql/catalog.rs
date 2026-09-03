@@ -14551,16 +14551,27 @@ fn pg_authid<'a>(
         let password = if let Some(password) = attributes.password {
             use core::fmt::Write;
             let mut verifier = StackStr::<256>::new();
-            let _ = write!(verifier, "SCRAM-SHA-256${}:", password.iterations);
-            append_base64(password.salt.as_bytes(), &mut verifier);
-            let _ = verifier.write_char('$');
-            append_base64(&password.stored_key, &mut verifier);
-            let _ = verifier.write_char(':');
-            append_base64(&password.server_key, &mut verifier);
+            match password {
+                crate::storage::RoleCredential::Scram(password) => {
+                    let _ = verifier.write_str("SCRAM-SHA-256$");
+                    let _ = write!(verifier, "{}:", password.iterations);
+                    append_base64(password.salt.as_bytes(), &mut verifier);
+                    let _ = verifier.write_char('$');
+                    append_base64(&password.stored_key, &mut verifier);
+                    let _ = verifier.write_char(':');
+                    append_base64(&password.server_key, &mut verifier);
+                }
+                crate::storage::RoleCredential::Md5(password) => {
+                    let _ = verifier.write_str("md5");
+                    let _ = verifier.write_str(
+                        core::str::from_utf8(&password.hash).expect("MD5 verifier is ASCII"),
+                    );
+                }
+            }
             if verifier.is_truncated() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "SCRAM verifier exceeds catalog rendering limit"
+                    "role verifier exceeds catalog rendering limit"
                 ));
             }
             Datum::Text(

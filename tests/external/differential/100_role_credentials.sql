@@ -52,6 +52,15 @@ SELECT rolpassword IS NULL
   FROM pg_authid WHERE rolname = 'credential_empty_password';
 DROP USER credential_empty_password;
 
+CREATE ROLE credential_md5 LOGIN
+  PASSWORD 'md547fcb6615d41c53cd39822141eb05da2';
+SELECT rolpassword = 'md547fcb6615d41c53cd39822141eb05da2'
+  FROM pg_authid WHERE rolname = 'credential_md5';
+ALTER ROLE credential_md5 RENAME TO credential_md5_renamed;
+SELECT rolpassword IS NULL
+  FROM pg_authid WHERE rolname = 'credential_md5_renamed';
+DROP ROLE credential_md5_renamed;
+
 CREATE ROLE "current_user";
 CREATE ROLE "all";
 ALTER ROLE "current_user" NOLOGIN;

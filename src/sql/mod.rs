@@ -266,7 +266,7 @@ pub(crate) struct RoleLogin {
     pub superuser: bool,
     pub replication: bool,
     pub connection_limit: i32,
-    pub password: Option<crate::storage::RolePassword>,
+    pub password: Option<crate::storage::RoleCredential>,
 }
 
 #[derive(Clone, Copy)]

@@ -18,6 +18,7 @@ const NONCE_RAW: usize = 18; // 24 base64 chars
 pub enum AuthMode {
     Trust,
     Password,
+    Md5,
     ScramSha256,
 }
 

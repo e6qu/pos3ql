@@ -3182,16 +3182,18 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             statistics,
         } => 1 + schema.len() + 1 + name.len() + statistics.encoded_len(),
         WalOp::UpsertRole { name, attributes } => {
+            let credential_len = match attributes.password {
+                None => 0,
+                Some(crate::storage::RoleCredential::Scram(password)) => {
+                    1 + password.salt.as_bytes().len() + 32 + 32 + 4
+                }
+                Some(crate::storage::RoleCredential::Md5(_)) => 32,
+            };
             1 + name.len()
                 + 2
                 + 4
                 + 1
-                + attributes
-                    .password
-                    .map_or(0, |password| password.salt.as_bytes().len())
-                + 32
-                + 32
-                + 4
+                + credential_len
                 + 1
                 + attributes
                     .valid_until
@@ -5162,9 +5164,6 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::UpsertRole { name, attributes } => {
-            let password = attributes
-                .password
-                .unwrap_or(crate::storage::RolePassword::EMPTY);
             let flags = u16::from(attributes.superuser)
                 | (u16::from(attributes.inherit) << 1)
                 | (u16::from(attributes.create_role) << 2)
@@ -5177,11 +5176,20 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name)
                 && buffer.append(&flags.to_le_bytes())
                 && buffer.append(&attributes.connection_limit.to_le_bytes())
-                && buffer.append(&[password.salt.as_bytes().len() as u8])
-                && buffer.append(password.salt.as_bytes())
-                && buffer.append(&password.stored_key)
-                && buffer.append(&password.server_key)
-                && buffer.append(&password.iterations.to_le_bytes())
+                && match attributes.password {
+                    None => buffer.append(&[0]),
+                    Some(crate::storage::RoleCredential::Scram(password)) => {
+                        buffer.append(&[1])
+                            && buffer.append(&[password.salt.as_bytes().len() as u8])
+                            && buffer.append(password.salt.as_bytes())
+                            && buffer.append(&password.stored_key)
+                            && buffer.append(&password.server_key)
+                            && buffer.append(&password.iterations.to_le_bytes())
+                    }
+                    Some(crate::storage::RoleCredential::Md5(password)) => {
+                        buffer.append(&[2]) && buffer.append(&password.hash)
+                    }
+                }
                 && name_bytes(
                     buffer,
                     attributes
@@ -9308,36 +9316,46 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             }
             let connection_limit = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
-            let salt_len = usize::from(*payload.get(at)?);
+            let credential_kind = *payload.get(at)?;
             at += 1;
-            if salt_len > crate::pg::auth::SCRAM_SALT_MAX {
-                return None;
-            }
-            let salt = if salt_len == 0 {
-                crate::pg::auth::ScramSalt::EMPTY
-            } else {
-                crate::pg::auth::ScramSalt::from_bytes(payload.get(at..at + salt_len)?)?
+            let password = match credential_kind {
+                0 => None,
+                1 => {
+                    let salt_len = usize::from(*payload.get(at)?);
+                    at += 1;
+                    let salt =
+                        crate::pg::auth::ScramSalt::from_bytes(payload.get(at..at + salt_len)?)?;
+                    at += salt_len;
+                    let stored_key = payload.get(at..at + 32)?.try_into().ok()?;
+                    at += 32;
+                    let server_key = payload.get(at..at + 32)?.try_into().ok()?;
+                    at += 32;
+                    let iterations = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                    at += 4;
+                    (iterations != 0).then_some(crate::storage::RoleCredential::Scram(
+                        crate::pg::auth::ScramServer {
+                            salt,
+                            stored_key,
+                            server_key,
+                            iterations,
+                        },
+                    ))
+                }
+                2 => {
+                    let hash: [u8; 32] = payload.get(at..at + 32)?.try_into().ok()?;
+                    at += 32;
+                    hash.iter().all(u8::is_ascii_hexdigit).then_some(
+                        crate::storage::RoleCredential::Md5(crate::storage::Md5Verifier { hash }),
+                    )
+                }
+                _ => return None,
             };
-            at += salt_len;
-            let stored_key = payload.get(at..at + 32)?.try_into().ok()?;
-            at += 32;
-            let server_key = payload.get(at..at + 32)?.try_into().ok()?;
-            at += 32;
-            let iterations = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-            at += 4;
             let valid_until = take_name(&mut at)?;
             let password_present = flags & (1 << 7) != 0;
             let valid_until_present = flags & (1 << 8) != 0;
-            let password = crate::storage::RolePassword {
-                salt,
-                stored_key,
-                server_key,
-                iterations,
-            };
             if at != payload.len()
                 || valid_until.len() > crate::storage::ROLE_VALID_UNTIL_MAX
-                || (password_present && (iterations == 0 || salt.is_empty()))
-                || (!password_present && password != crate::storage::RolePassword::EMPTY)
+                || (password_present != password.is_some())
                 || (valid_until_present == valid_until.is_empty())
             {
                 return None;
@@ -9353,7 +9371,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     replication: flags & (1 << 5) != 0,
                     bypass_row_level_security: flags & (1 << 6) != 0,
                     connection_limit,
-                    password: password_present.then_some(password),
+                    password,
                     valid_until: valid_until_present
                         .then(|| crate::util::StackStr::from_str(valid_until)),
                 },

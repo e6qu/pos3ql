@@ -2346,11 +2346,12 @@ pub struct RoleOptions<'a> {
     pub valid_until: Option<&'a str>,
 }
 
-/// A password is either plaintext or a complete imported SCRAM verifier.
+/// A password is either plaintext or a complete imported PostgreSQL verifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RolePasswordSpec<'a> {
     Plaintext(&'a str),
     ScramVerifier(crate::pg::auth::ScramServer),
+    Md5Verifier(crate::storage::Md5Verifier),
 }
 
 impl RoleOptions<'_> {

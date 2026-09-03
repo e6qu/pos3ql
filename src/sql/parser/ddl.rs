@@ -4097,10 +4097,32 @@ impl<'a> Parser<'a> {
                 });
             }
         }
+        if let Some(verifier) = Self::parse_md5_verifier(password) {
+            return Ok(Some(crate::sql::ast::RolePasswordSpec::Md5Verifier(
+                verifier,
+            )));
+        }
         Ok(
             (!password.is_empty())
                 .then_some(crate::sql::ast::RolePasswordSpec::Plaintext(password)),
         )
+    }
+
+    /// PostgreSQL MD5 verifier input is the literal md5 prefix plus its
+    /// 32-byte hexadecimal catalog digest.
+    fn parse_md5_verifier(password: &str) -> Option<crate::storage::Md5Verifier> {
+        let bytes = password.as_bytes();
+        if bytes.len() != 35 || &bytes[..3] != b"md5" {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        for (at, byte) in bytes[3..].iter().copied().enumerate() {
+            if !byte.is_ascii_hexdigit() {
+                return None;
+            }
+            hash[at] = byte;
+        }
+        Some(crate::storage::Md5Verifier { hash })
     }
 
     fn role_specification(&mut self) -> Result<crate::sql::ast::RoleSpecification<'a>, ParseError> {

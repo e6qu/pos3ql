@@ -658,6 +658,13 @@ impl<'b> Responder<'b> {
         m.finish()
     }
 
+    pub fn auth_md5_password(&mut self, salt: &[u8; 4]) -> Result<(), WireFull> {
+        let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
+        m.i32(wire::AUTH_MD5);
+        m.bytes(salt);
+        m.finish()
+    }
+
     pub fn auth_sasl_mechanisms(&mut self) -> Result<(), WireFull> {
         let mut m = MsgOut::begin(self.buffer, wire::MSG_AUTHENTICATION);
         m.i32(wire::AUTH_SASL);
@@ -1936,6 +1943,19 @@ mod tests {
         let mut buffer = FixedBuf::new(&mut budget, "test", 256).unwrap();
         Responder::new(&mut buffer).copy_both_response().unwrap();
         assert_eq!(buffer.readable(), &[b'W', 0, 0, 0, 7, 0, 0, 0]);
+    }
+
+    #[test]
+    fn md5_authentication_challenge_matches_the_postgresql_wire_frame() {
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "test", 256).unwrap();
+        Responder::new(&mut buffer)
+            .auth_md5_password(&[1, 2, 3, 4])
+            .unwrap();
+        assert_eq!(
+            buffer.readable(),
+            &[b'R', 0, 0, 0, 12, 0, 0, 0, 5, 1, 2, 3, 4]
+        );
     }
 
     #[test]

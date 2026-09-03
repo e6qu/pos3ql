@@ -5889,7 +5889,7 @@ fn apply_role_options(
     }
     if let Some(password) = options.password {
         attributes.password = if let Some(password) = password {
-            let verifier = match password {
+            let credential = match password {
                 crate::sql::ast::RolePasswordSpec::Plaintext(password) => {
                     if password.len() > crate::storage::ROLE_PASSWORD_MAX {
                         return Err(sql_err!(
@@ -5905,20 +5905,20 @@ fn apply_role_options(
                             "could not generate role password salt"
                         ));
                     }
-                    crate::pg::auth::ScramServer::derive(
+                    crate::storage::RoleCredential::Scram(crate::pg::auth::ScramServer::derive(
                         password,
                         salt,
                         crate::pg::auth::SCRAM_ITERATIONS,
-                    )
+                    ))
                 }
-                crate::sql::ast::RolePasswordSpec::ScramVerifier(verifier) => verifier,
+                crate::sql::ast::RolePasswordSpec::ScramVerifier(verifier) => {
+                    crate::storage::RoleCredential::Scram(verifier)
+                }
+                crate::sql::ast::RolePasswordSpec::Md5Verifier(verifier) => {
+                    crate::storage::RoleCredential::Md5(verifier)
+                }
             };
-            Some(crate::storage::RolePassword {
-                salt: verifier.salt,
-                stored_key: verifier.stored_key,
-                server_key: verifier.server_key,
-                iterations: verifier.iterations,
-            })
+            Some(credential)
         } else {
             None
         };
@@ -6065,6 +6065,12 @@ pub fn create_role(
             }
         }
     }
+    if matches!(
+        options.password,
+        Some(Some(crate::sql::ast::RolePasswordSpec::Md5Verifier(_)))
+    ) {
+        responder.warning("01P01", "setting an MD5-encrypted password")?;
+    }
     responder.command_complete("CREATE ROLE")?;
     sql_ok()
 }
@@ -6194,6 +6200,12 @@ pub fn alter_role(
     }) {
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
+    }
+    if matches!(
+        options.password,
+        Some(Some(crate::sql::ast::RolePasswordSpec::Md5Verifier(_)))
+    ) {
+        responder.warning("01P01", "setting an MD5-encrypted password")?;
     }
     responder.command_complete("ALTER ROLE")?;
     sql_ok()

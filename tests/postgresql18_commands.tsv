@@ -37,7 +37,7 @@ ALTER OPERATOR FAMILY	complete	117_cast_operator_catalog.sql
 ALTER POLICY	complete	106_row_level_security.sql
 ALTER PROCEDURE	partial	90_routine_lifecycle.sql
 ALTER PUBLICATION	partial	84_publication.sql
-ALTER ROLE	partial	83_roles_acl.sql and 100_role_credentials.sql cover typed role specifications, attributes, settings, aliases, and recovery
+ALTER ROLE	partial	83_roles_acl.sql and 100_role_credentials.sql cover typed role specifications, SCRAM/MD5 credentials, settings, aliases, and recovery
 ALTER ROUTINE	partial	90_routine_lifecycle.sql and aggregate extension dependencies in 111_extension_lifecycle.sql
 ALTER RULE	complete	tests/external/differential/122_rewrite_rules.sql
 ALTER SCHEMA	complete	37_schemas.sql, raw-wire lifecycle probe, and object-only WAL/checkpoint recovery
@@ -89,7 +89,7 @@ CREATE OPERATOR FAMILY	complete	117_cast_operator_catalog.sql (btree; unsupporte
 CREATE POLICY	complete	106_row_level_security.sql
 CREATE PROCEDURE	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql
 CREATE PUBLICATION	partial	84_publication.sql
-CREATE ROLE	partial	83_roles_acl.sql and 100_role_credentials.sql cover attributes, credentials, aliases, initial memberships, and recovery
+CREATE ROLE	partial	83_roles_acl.sql and 100_role_credentials.sql cover attributes, SCRAM/MD5 credentials, aliases, initial memberships, and recovery
 CREATE RULE	complete	tests/external/differential/122_rewrite_rules.sql
 CREATE SCHEMA	complete	37_schemas.sql and typed dynamic-utility checkpoint/cold-recovery coverage
 CREATE SEQUENCE	partial	54_sequence.sql (permanent sequences; temporary and unlogged variants remain object-native durability boundaries)

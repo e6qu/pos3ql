@@ -1722,32 +1722,65 @@ impl Checkpointer {
                     )?;
                     let flags: u16 = parse_field(words.next(), "rol flags")?;
                     let connection_limit: i32 = parse_field(words.next(), "rol connection limit")?;
-                    let salt = parse_hex_salt(
-                        words
-                            .next()
-                            .ok_or(CheckpointSetupError::Corrupt("rol salt missing"))?,
-                    )?;
-                    let stored_key = parse_hex_array::<32>(
-                        words
-                            .next()
-                            .ok_or(CheckpointSetupError::Corrupt("rol stored key missing"))?,
-                    )?;
-                    let server_key = parse_hex_array::<32>(
-                        words
-                            .next()
-                            .ok_or(CheckpointSetupError::Corrupt("rol server key missing"))?,
-                    )?;
+                    let credential_kind = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rol credential kind missing"))?;
+                    let credential_value = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rol credential missing"))?;
+                    let stored_key_encoded = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rol stored key missing"))?;
+                    let server_key_encoded = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rol server key missing"))?;
                     let iterations: u32 = parse_field(words.next(), "rol iterations")?;
                     let valid_until_encoded = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("rol valid-until missing"))?;
                     let password_present = flags & (1 << 7) != 0;
                     let valid_until_present = flags & (1 << 8) != 0;
-                    let password = crate::storage::RolePassword {
-                        salt,
-                        stored_key,
-                        server_key,
-                        iterations,
+                    let password = match credential_kind {
+                        "-" if credential_value == "-"
+                            && stored_key_encoded == "-"
+                            && server_key_encoded == "-"
+                            && iterations == 0 =>
+                        {
+                            None
+                        }
+                        "s" => {
+                            let salt = parse_hex_salt(credential_value)?;
+                            let stored_key = parse_hex_array::<32>(stored_key_encoded)?;
+                            let server_key = parse_hex_array::<32>(server_key_encoded)?;
+                            if iterations == 0 {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "invalid SCRAM verifier",
+                                ));
+                            }
+                            Some(crate::storage::RoleCredential::Scram(
+                                crate::pg::auth::ScramServer {
+                                    salt,
+                                    stored_key,
+                                    server_key,
+                                    iterations,
+                                },
+                            ))
+                        }
+                        "m" if stored_key_encoded == "-"
+                            && server_key_encoded == "-"
+                            && iterations == 0 =>
+                        {
+                            let bytes = credential_value.as_bytes();
+                            if bytes.len() != 32 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+                                return Err(CheckpointSetupError::Corrupt("invalid MD5 verifier"));
+                            }
+                            let mut hash = [0; 32];
+                            hash.copy_from_slice(bytes);
+                            Some(crate::storage::RoleCredential::Md5(
+                                crate::storage::Md5Verifier { hash },
+                            ))
+                        }
+                        _ => return Err(CheckpointSetupError::Corrupt("invalid rol credential")),
                     };
                     let valid_until = match (valid_until_present, valid_until_encoded) {
                         (false, "-") => None,
@@ -1765,8 +1798,7 @@ impl Checkpointer {
                     };
                     if words.next().is_some()
                         || flags & !0x01ff != 0
-                        || (password_present && (iterations == 0 || salt.is_empty()))
-                        || (!password_present && password != crate::storage::RolePassword::EMPTY)
+                        || (password_present != password.is_some())
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid rol record"));
                     }
@@ -1782,7 +1814,7 @@ impl Checkpointer {
                                 replication: flags & (1 << 5) != 0,
                                 bypass_row_level_security: flags & (1 << 6) != 0,
                                 connection_limit,
-                                password: password_present.then_some(password),
+                                password,
                                 valid_until,
                             },
                         )
@@ -5640,32 +5672,48 @@ impl Checkpointer {
         )?;
         let mut database_context = None;
 
-        // Roles are durable catalog authority. Only SCRAM verifier material
-        // crosses this object-backed manifest; plaintext passwords never do.
+        // Roles are durable catalog authority. Parsed verifier material crosses
+        // this object-backed manifest; plaintext passwords never do.
         for (_, role) in storage.live_roles() {
             use core::fmt::Write;
             let attributes = role.attributes;
-            let password = attributes
-                .password
-                .unwrap_or(crate::storage::RolePassword::EMPTY);
             let mut name = StackStr::<130>::new();
             for byte in role.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
             }
+            let mut credential_kind = StackStr::<1>::new();
             let mut salt = StackStr::<{ 2 * crate::pg::auth::SCRAM_SALT_MAX }>::new();
             let mut stored_key = StackStr::<64>::new();
             let mut server_key = StackStr::<64>::new();
-            for byte in password.salt.as_bytes() {
-                let _ = write!(salt, "{byte:02x}");
-            }
-            if password.salt.is_empty() {
-                let _ = write!(salt, "-");
-            }
-            for byte in password.stored_key {
-                let _ = write!(stored_key, "{byte:02x}");
-            }
-            for byte in password.server_key {
-                let _ = write!(server_key, "{byte:02x}");
+            let mut iterations = 0u32;
+            match attributes.password {
+                None => {
+                    let _ = write!(credential_kind, "-");
+                    let _ = write!(salt, "-");
+                    let _ = write!(stored_key, "-");
+                    let _ = write!(server_key, "-");
+                }
+                Some(crate::storage::RoleCredential::Scram(password)) => {
+                    let _ = write!(credential_kind, "s");
+                    for byte in password.salt.as_bytes() {
+                        let _ = write!(salt, "{byte:02x}");
+                    }
+                    for byte in password.stored_key {
+                        let _ = write!(stored_key, "{byte:02x}");
+                    }
+                    for byte in password.server_key {
+                        let _ = write!(server_key, "{byte:02x}");
+                    }
+                    iterations = password.iterations;
+                }
+                Some(crate::storage::RoleCredential::Md5(password)) => {
+                    let _ = write!(credential_kind, "m");
+                    let _ = salt.write_str(
+                        core::str::from_utf8(&password.hash).expect("MD5 verifier is ASCII"),
+                    );
+                    let _ = write!(stored_key, "-");
+                    let _ = write!(server_key, "-");
+                }
             }
             let mut valid_until = StackStr::<{ 2 * crate::storage::ROLE_VALID_UNTIL_MAX }>::new();
             if let Some(value) = attributes.valid_until.as_ref() {
@@ -5691,14 +5739,15 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rol {} {} {} {} {} {} {} {}",
+                    "rol {} {} {} {} {} {} {} {} {}",
                     name.as_str(),
                     flags,
                     attributes.connection_limit,
+                    credential_kind.as_str(),
                     salt.as_str(),
                     stored_key.as_str(),
                     server_key.as_str(),
-                    password.iterations,
+                    iterations,
                     valid_until.as_str()
                 ),
             )?;

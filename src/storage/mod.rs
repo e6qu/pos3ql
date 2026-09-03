@@ -9602,21 +9602,19 @@ pub(crate) const ROLE_SETTING_VALUE_MAX: usize = 256;
 pub(crate) const ROLE_PASSWORD_MAX: usize = 128;
 pub(crate) const ROLE_VALID_UNTIL_MAX: usize = 64;
 
+/// An imported PostgreSQL MD5 verifier keeps its exact catalog bytes. The
+/// role name is part of its derivation, so role rename clears this credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RolePassword {
-    pub salt: crate::pg::auth::ScramSalt,
-    pub stored_key: [u8; 32],
-    pub server_key: [u8; 32],
-    pub iterations: u32,
+pub struct Md5Verifier {
+    pub hash: [u8; 32],
 }
 
-impl RolePassword {
-    pub const EMPTY: Self = Self {
-        salt: crate::pg::auth::ScramSalt::EMPTY,
-        stored_key: [0; 32],
-        server_key: [0; 32],
-        iterations: 0,
-    };
+/// A role credential is a parsed durable authentication verifier. Plaintext
+/// never reaches catalog, WAL, checkpoint, or object storage state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoleCredential {
+    Scram(crate::pg::auth::ScramServer),
+    Md5(Md5Verifier),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -9629,7 +9627,7 @@ pub struct RoleAttributes {
     pub replication: bool,
     pub bypass_row_level_security: bool,
     pub connection_limit: i32,
-    pub password: Option<RolePassword>,
+    pub password: Option<RoleCredential>,
     pub valid_until: Option<StackStr<ROLE_VALID_UNTIL_MAX>>,
 }
 
@@ -17696,7 +17694,10 @@ impl Storage {
             ));
         }
         let prior = self.roles[slot].pending;
-        let attributes = self.roles[slot].attributes_to(txid);
+        let mut attributes = self.roles[slot].attributes_to(txid);
+        if matches!(attributes.password, Some(RoleCredential::Md5(_))) {
+            attributes.password = None;
+        }
         self.roles[slot].pending = Some(PendingRole {
             txid,
             exists: true,
@@ -17836,6 +17837,12 @@ impl Storage {
             ));
         }
         self.roles[slot].name = new_name;
+        if matches!(
+            self.roles[slot].attributes.password,
+            Some(RoleCredential::Md5(_))
+        ) {
+            self.roles[slot].attributes.password = None;
+        }
         Ok(())
     }
 

@@ -604,6 +604,7 @@ impl Server {
         let mode = match config.auth.as_str() {
             "trust" => AuthMode::Trust,
             "password" => AuthMode::Password,
+            "md5" => AuthMode::Md5,
             "scram-sha-256" => AuthMode::ScramSha256,
             other => {
                 return Err(ServerSetupError::Io(

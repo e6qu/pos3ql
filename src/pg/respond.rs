@@ -179,8 +179,10 @@ fn write_wire_record_field(value: &Datum, out: &mut dyn FnMut(&[u8])) {
         for (index, byte) in bytes.iter().enumerate() {
             if matches!(byte, b'"' | b'\\') {
                 out(&bytes[plain..index]);
-                out(b"\\");
-                plain = index;
+                // `record_out` doubles these bytes inside its quoted fields;
+                // array output uses a different, backslash-based grammar.
+                out(&[*byte, *byte]);
+                plain = index + 1;
             }
         }
         out(&bytes[plain..]);
@@ -2047,6 +2049,31 @@ mod tests {
             buffer.readable(),
             &[b'd', 0, 0, 0, 11, 0, 0, 0, 3, b'(', 0xff, b')']
         );
+    }
+
+    #[test]
+    fn record_text_doubles_quotes_and_backslashes() {
+        let fields = [RecordField {
+            name: "value",
+            type_oid: oid::TEXT,
+            value: Datum::Text("quote\"and\\slash"),
+        }];
+        let value = Datum::Record(&fields);
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "record escapes", 64).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_text(
+            &mut message,
+            &value,
+            crate::sql::guc::RenderContext::default(),
+        );
+        message.finish().unwrap();
+        let expected = b"(\"quote\"\"and\\\\slash\")";
+        assert_eq!(
+            &buffer.readable()[5..9],
+            &(expected.len() as i32).to_be_bytes()
+        );
+        assert_eq!(&buffer.readable()[9..], expected);
     }
 
     #[test]

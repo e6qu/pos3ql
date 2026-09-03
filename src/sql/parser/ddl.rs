@@ -6721,14 +6721,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("schema")?;
             AlterRoutineAction::SetSchema(self.col_ident("schema name")?)
         } else {
-            let enabled = !self.eat_ident("no")?;
-            self.expect_ident("depends")?;
-            self.expect_ident("on")?;
-            self.expect_ident("extension")?;
-            AlterRoutineAction::ExtensionDependency {
-                extension: self.col_ident("extension name")?,
-                enabled,
-            }
+            return Err(self.unexpected("expected OWNER, RENAME, or SET SCHEMA"));
         };
         Ok(Stmt::AlterAggregate { aggregate, action })
     }

@@ -4756,7 +4756,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
          CREATE AGGREGATE aggregate_dependency_total(integer) ( \
            SFUNC = aggregate_dependency_state, STYPE = bigint, INITCOND = '0' \
          ); \
-         ALTER AGGREGATE aggregate_dependency_total(integer) DEPENDS ON EXTENSION typed_ext; \
+         ALTER ROUTINE aggregate_dependency_total(integer) DEPENDS ON EXTENSION typed_ext; \
          SELECT aggregate_dependency_total(value) FROM (VALUES (2), (3)) rows(value); \
          INSERT INTO moved_extensions.typed_values(id,value) VALUES (1,'kept'); \
          SELECT value, enabled FROM moved_extensions.typed_values; \

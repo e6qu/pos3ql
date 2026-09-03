@@ -7876,26 +7876,18 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_extension_dependencies_are_typed_at_parse_time() {
-        with_parser(
-            "ALTER AGGREGATE public.total(integer) DEPENDS ON EXTENSION reporting; \
-             ALTER AGGREGATE public.total(integer) NO DEPENDS ON EXTENSION reporting",
-            |parser| {
-                for enabled in [true, false] {
-                    let Some(Stmt::AlterAggregate { action, .. }) = parser.next_stmt().unwrap()
-                    else {
-                        panic!("ALTER AGGREGATE did not retain its typed statement")
-                    };
-                    assert_eq!(
-                        action,
-                        AlterRoutineAction::ExtensionDependency {
-                            extension: "reporting",
-                            enabled,
-                        }
-                    );
-                }
-            },
-        );
+    fn aggregate_extension_dependencies_are_rejected_at_parse_time() {
+        for input in [
+            "ALTER AGGREGATE public.total(integer) DEPENDS ON EXTENSION reporting",
+            "ALTER AGGREGATE public.total(integer) NO DEPENDS ON EXTENSION reporting",
+        ] {
+            with_parser(input, |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    sqlstate::SYNTAX_ERROR
+                );
+            });
+        }
     }
 
     #[test]

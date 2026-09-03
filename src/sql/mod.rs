@@ -13403,19 +13403,19 @@ impl Engine {
                 memberships,
                 responder,
             ),
-            Stmt::AlterRole { name, options } => exec::alter_role(
+            Stmt::AlterRole { role, options } => exec::alter_role(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                name,
+                *role,
                 options,
                 responder,
             ),
-            Stmt::AlterRoleRename { name, new_name } => exec::rename_role(
+            Stmt::AlterRoleRename { role, new_name } => exec::rename_role(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                name,
+                *role,
                 new_name,
                 responder,
             ),

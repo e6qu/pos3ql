@@ -1139,17 +1139,17 @@ pub enum Stmt<'a> {
         options: RoleOptions<'a>,
         memberships: RoleMembershipClauses<'a>,
     },
-    /// ALTER ROLE / USER / GROUP name [WITH] role-option ...
+    /// ALTER ROLE / USER role-specification [WITH] role-option ...
     AlterRole {
-        name: &'a str,
+        role: RoleSpecification<'a>,
         options: RoleOptions<'a>,
     },
     AlterRoleRename {
-        name: &'a str,
+        role: RoleSpecification<'a>,
         new_name: &'a str,
     },
     AlterRoleSetting {
-        role: Option<&'a str>,
+        role: Option<RoleSpecification<'a>>,
         database: Option<&'a str>,
         action: RoleSettingAction<'a>,
     },
@@ -2277,6 +2277,16 @@ pub enum RoleMembershipOption {
     Admin,
     Inherit,
     Set,
+}
+
+/// PostgreSQL role specifications keep session identities distinct from quoted
+/// role names with the same spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleSpecification<'a> {
+    Name(&'a str),
+    CurrentRole,
+    CurrentUser,
+    SessionUser,
 }
 
 /// Membership option changes are patches. PostgreSQL preserves an existing

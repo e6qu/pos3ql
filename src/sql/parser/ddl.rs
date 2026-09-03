@@ -3862,7 +3862,7 @@ impl<'a> Parser<'a> {
                     self.expect_ident("group")?;
                 }
                 in_roles = self.role_name_list("role name")?;
-            } else if self.eat_ident("role")? {
+            } else if self.eat_ident("role")? || self.eat_ident("user")? {
                 role_members = self.role_name_list("member role name")?;
             } else if self.eat_ident("admin")? {
                 admin_members = self.role_name_list("member role name")?;
@@ -3885,8 +3885,11 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn alter_role(&mut self) -> Result<Stmt<'a>, ParseError> {
-        let written_name = self.any_ident("role name")?;
-        let role = (!written_name.eq_ignore_ascii_case("all")).then_some(written_name);
+        let role = if self.eat_ident("all")? {
+            None
+        } else {
+            Some(self.role_specification()?)
+        };
         let database = if self.eat_ident("in")? {
             self.expect_ident("database")?;
             Some(self.any_ident("database name")?)
@@ -3929,7 +3932,7 @@ impl<'a> Parser<'a> {
                 ),
             });
         }
-        let Some(name) = role else {
+        let Some(role) = role else {
             return Err(self.unexpected("expected SET or RESET for ALTER ROLE ALL"));
         };
         if database.is_some() {
@@ -3938,7 +3941,7 @@ impl<'a> Parser<'a> {
         if self.eat_ident("rename")? {
             self.expect_ident("to")?;
             return Ok(Stmt::AlterRoleRename {
-                name,
+                role,
                 new_name: self.any_ident("new role name")?,
             });
         }
@@ -3947,7 +3950,7 @@ impl<'a> Parser<'a> {
         if options == RoleOptions::EMPTY {
             return Err(self.unexpected("expected a role option"));
         }
-        Ok(Stmt::AlterRole { name, options })
+        Ok(Stmt::AlterRole { role, options })
     }
 
     /// Parse PostgreSQL's legacy membership-only ALTER GROUP grammar into the
@@ -3980,7 +3983,7 @@ impl<'a> Parser<'a> {
         if self.eat_ident("rename")? {
             self.expect_ident("to")?;
             return Ok(Stmt::AlterRoleRename {
-                name: group,
+                role: crate::sql::ast::RoleSpecification::Name(group),
                 new_name: self.any_ident("new group name")?,
             });
         }
@@ -4094,7 +4097,24 @@ impl<'a> Parser<'a> {
                 });
             }
         }
-        Ok(Some(crate::sql::ast::RolePasswordSpec::Plaintext(password)))
+        Ok(
+            (!password.is_empty())
+                .then_some(crate::sql::ast::RolePasswordSpec::Plaintext(password)),
+        )
+    }
+
+    fn role_specification(&mut self) -> Result<crate::sql::ast::RoleSpecification<'a>, ParseError> {
+        if self.eat_ident("current_role")? {
+            Ok(crate::sql::ast::RoleSpecification::CurrentRole)
+        } else if self.eat_ident("current_user")? {
+            Ok(crate::sql::ast::RoleSpecification::CurrentUser)
+        } else if self.eat_ident("session_user")? {
+            Ok(crate::sql::ast::RoleSpecification::SessionUser)
+        } else {
+            Ok(crate::sql::ast::RoleSpecification::Name(
+                self.any_ident("role name")?,
+            ))
+        }
     }
 
     /// The shared tail of `CREATE TABLE ... AS` / `CREATE MATERIALIZED VIEW`:

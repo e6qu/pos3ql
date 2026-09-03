@@ -24,6 +24,46 @@ SELECT rolpassword = '********', rolvaliduntil IS NULL
   FROM pg_roles WHERE rolname = 'credential_default_expiry';
 DROP ROLE credential_default_expiry;
 
+CREATE ROLE credential_membership_parent;
+CREATE ROLE credential_membership_member NOINHERIT;
+CREATE ROLE credential_membership_administrator;
+CREATE ROLE "session_user";
+CREATE GROUP credential_membership_bundle
+  IN GROUP credential_membership_parent, "session_user"
+  USER credential_membership_member
+  ADMIN credential_membership_administrator;
+SELECT parent.rolname, member.rolname, membership.admin_option,
+       membership.inherit_option, membership.set_option
+  FROM pg_auth_members membership
+  JOIN pg_roles parent ON parent.oid = membership.roleid
+  JOIN pg_roles member ON member.oid = membership.member
+ WHERE parent.rolname IN ('credential_membership_parent',
+                          'session_user',
+                          'credential_membership_bundle')
+ ORDER BY parent.rolname, member.rolname;
+DROP ROLE credential_membership_bundle;
+DROP ROLE credential_membership_administrator;
+DROP ROLE credential_membership_member;
+DROP ROLE credential_membership_parent;
+DROP ROLE "session_user";
+
+CREATE USER credential_empty_password PASSWORD '';
+SELECT rolpassword IS NULL
+  FROM pg_authid WHERE rolname = 'credential_empty_password';
+DROP USER credential_empty_password;
+
+CREATE ROLE "current_user";
+CREATE ROLE "all";
+ALTER ROLE "current_user" NOLOGIN;
+ALTER USER "all" LOGIN;
+SELECT rolname, rolcanlogin
+  FROM pg_roles
+ WHERE rolname IN ('current_user', 'all')
+ ORDER BY rolname;
+ALTER ROLE CURRENT_ROLE SET application_name TO 'credential-current-role';
+ALTER USER SESSION_USER RESET application_name;
+DROP ROLE "current_user", "all";
+
 CREATE ROLE credential_options
   NOSUPERUSER INHERIT CREATEROLE CREATEDB LOGIN NOREPLICATION NOBYPASSRLS
   CONNECTION LIMIT 4 VALID UNTIL 'infinity';

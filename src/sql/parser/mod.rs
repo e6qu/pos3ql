@@ -8486,7 +8486,10 @@ mod tests {
                 else {
                     panic!("role setting did not parse")
                 };
-                assert_eq!(role, Some("child"));
+                assert_eq!(
+                    role,
+                    Some(crate::sql::ast::RoleSpecification::Name("child"))
+                );
                 assert_eq!(database, Some("postgres"));
                 assert_eq!(name, "search_path");
                 assert_eq!(
@@ -8556,16 +8559,70 @@ mod tests {
                 assert_eq!(grantor, None);
                 assert!(!cascade);
 
-                let Some(Stmt::AlterRoleRename { name, new_name }) = parser.next_stmt().unwrap()
+                let Some(Stmt::AlterRoleRename { role, new_name }) = parser.next_stmt().unwrap()
                 else {
                     panic!("ALTER GROUP RENAME did not parse")
                 };
-                assert_eq!((name, new_name), ("parent", "renamed"));
+                assert_eq!(
+                    (role, new_name),
+                    (
+                        crate::sql::ast::RoleSpecification::Name("parent"),
+                        "renamed"
+                    )
+                );
             },
         );
         with_parser("ALTER GROUP parent NOLOGIN", |parser| {
             assert!(parser.next_stmt().is_err());
         });
+    }
+
+    #[test]
+    fn role_aliases_and_special_targets_are_closed_parse_states() {
+        with_parser(
+            "CREATE GROUP bundle IN GROUP parent USER member ADMIN administrator; \
+             ALTER ROLE CURRENT_ROLE SET application_name TO role_default; \
+             ALTER USER SESSION_USER RESET application_name; \
+             ALTER ROLE \"current_user\" NOLOGIN; \
+             ALTER ROLE \"all\" LOGIN",
+            |parser| {
+                let Some(Stmt::CreateRole { memberships, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("CREATE GROUP aliases did not parse")
+                };
+                assert_eq!(memberships.in_roles, ["parent"]);
+                assert_eq!(memberships.role_members, ["member"]);
+                assert_eq!(memberships.admin_members, ["administrator"]);
+
+                let Some(Stmt::AlterRoleSetting {
+                    role: Some(crate::sql::ast::RoleSpecification::CurrentRole),
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("CURRENT_ROLE did not parse as a role specification")
+                };
+                let Some(Stmt::AlterRoleSetting {
+                    role: Some(crate::sql::ast::RoleSpecification::SessionUser),
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("SESSION_USER did not parse as a role specification")
+                };
+                let Some(Stmt::AlterRole {
+                    role: crate::sql::ast::RoleSpecification::Name("current_user"),
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("quoted current_user did not remain a named role")
+                };
+                let Some(Stmt::AlterRole {
+                    role: crate::sql::ast::RoleSpecification::Name("all"),
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("quoted all did not remain a named role")
+                };
+            },
+        );
     }
 
     #[test]
@@ -8652,6 +8709,12 @@ mod tests {
         });
         with_parser("CREATE ROLE invalid_expiry VALID UNTIL NULL", |parser| {
             assert!(parser.next_stmt().is_err());
+        });
+        with_parser("CREATE ROLE empty_password PASSWORD ''", |parser| {
+            let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
+                panic!("empty password did not parse")
+            };
+            assert_eq!(options.password, Some(None));
         });
     }
 

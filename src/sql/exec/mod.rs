@@ -5783,6 +5783,21 @@ fn resolve_role_name(written: &str) -> crate::util::StackStr<64> {
     }
 }
 
+fn resolve_role_specification(
+    specification: crate::sql::ast::RoleSpecification<'_>,
+) -> crate::util::StackStr<64> {
+    match specification {
+        crate::sql::ast::RoleSpecification::Name(name) => crate::util::StackStr::from_str(name),
+        crate::sql::ast::RoleSpecification::CurrentRole
+        | crate::sql::ast::RoleSpecification::CurrentUser => {
+            super::eval::funcs::system::current_user_owned()
+        }
+        crate::sql::ast::RoleSpecification::SessionUser => {
+            super::eval::funcs::system::session_user_owned()
+        }
+    }
+}
+
 fn require_create_role(storage: &Storage, txid: u32) -> Result<(), SqlError> {
     let current = super::eval::funcs::system::current_user_owned();
     let allowed = storage
@@ -5988,7 +6003,7 @@ pub fn create_role(
     }
     let grantor = storage.current_role_slot(txn.txid).unwrap_or(0);
     for written in memberships.in_roles {
-        let resolved = resolve_role_name(written);
+        let resolved = crate::util::StackStr::<64>::from_str(written);
         let Some(parent) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -6025,7 +6040,7 @@ pub fn create_role(
         (memberships.admin_members, true),
     ] {
         for written in members {
-            let resolved = resolve_role_name(written);
+            let resolved = crate::util::StackStr::<64>::from_str(written);
             let Some(member) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -6104,11 +6119,11 @@ pub fn alter_role(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    name: &str,
+    specification: crate::sql::ast::RoleSpecification<'_>,
     options: &crate::sql::ast::RoleOptions<'_>,
     responder: &mut Responder,
 ) -> Outcome {
-    let resolved = resolve_role_name(name);
+    let resolved = resolve_role_specification(specification);
     let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -6189,7 +6204,7 @@ pub fn alter_role_setting(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    written_role: Option<&str>,
+    written_role: Option<crate::sql::ast::RoleSpecification<'_>>,
     written_database: Option<&str>,
     action: crate::sql::ast::RoleSettingAction<'_>,
     guc: &crate::sql::guc::GucState,
@@ -6219,8 +6234,8 @@ pub fn alter_role_setting(
         .find_role_visible(current_name.as_str(), txn.txid)
         .expect("current SQL role exists");
     let current_attributes = storage.role(current).attributes_to(txn.txid);
-    let scope = if let Some(written) = written_role {
-        let resolved = resolve_role_name(written);
+    let scope = if let Some(specification) = written_role {
+        let resolved = resolve_role_specification(specification);
         let Some(role) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -6504,14 +6519,14 @@ pub fn rename_role(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    name: &str,
+    specification: crate::sql::ast::RoleSpecification<'_>,
     new_name: &str,
     responder: &mut Responder,
 ) -> Outcome {
     if let Err(error) = require_create_role(storage, txn.txid) {
         return sql_fail(error);
     }
-    let resolved = resolve_role_name(name);
+    let resolved = resolve_role_specification(specification);
     let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -6570,7 +6585,7 @@ pub fn drop_role(
     }
     let current = super::eval::funcs::system::session_user_owned();
     for written in names {
-        let resolved = resolve_role_name(written);
+        let resolved = crate::util::StackStr::<64>::from_str(written);
         let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
             if if_exists {
                 responder.notice(
@@ -19308,19 +19323,19 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     memberships,
                     responder,
                 ),
-                Stmt::AlterRole { name, options } => super::exec::alter_role(
+                Stmt::AlterRole { role, options } => super::exec::alter_role(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
-                    name,
+                    *role,
                     options,
                     responder,
                 ),
-                Stmt::AlterRoleRename { name, new_name } => super::exec::rename_role(
+                Stmt::AlterRoleRename { role, new_name } => super::exec::rename_role(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
-                    name,
+                    *role,
                     new_name,
                     responder,
                 ),

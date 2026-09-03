@@ -279,6 +279,23 @@ impl Collation {
     }
 }
 
+/// A role specification accepted by `CREATE SCHEMA AUTHORIZATION`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaAuthorization<'a> {
+    Name(&'a str),
+    CurrentRole,
+    CurrentUser,
+    SessionUser,
+}
+
+/// A `CREATE SCHEMA` name is either written explicitly or derived from the
+/// resolved authorization role at execution time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaName<'a> {
+    Explicit(&'a str),
+    Authorization,
+}
+
 /// A statement PostgreSQL permits inside CREATE SCHEMA. Keeping this distinct
 /// from [`Stmt`] makes the parser's grammar guarantee available to execution.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -313,14 +330,13 @@ pub enum CreateSchemaElement<'a> {
         if_not_exists: bool,
         options: SeqOptions<'a>,
     },
-    Domain(CreateDomain<'a>),
-    Enum {
-        name: QualName<'a>,
-        labels: &'a [&'a str],
-    },
-    Composite {
-        name: QualName<'a>,
-        fields: &'a [CompositeField<'a>],
+    Trigger(CreateTrigger<'a>),
+    Grant {
+        privileges: &'a [PrivilegeSpec<'a>],
+        target: PrivilegeTarget<'a>,
+        grantees: &'a [&'a str],
+        grant_option: bool,
+        grantor: Option<&'a str>,
     },
 }
 
@@ -1019,8 +1035,8 @@ pub enum Stmt<'a> {
     /// Elements are the grammar-permitted CREATE forms, executed with the new
     /// schema as their creation target.
     CreateSchema {
-        name: &'a str,
-        authorization: Option<&'a str>,
+        name: SchemaName<'a>,
+        authorization: Option<SchemaAuthorization<'a>>,
         if_not_exists: bool,
         elements: &'a [&'a CreateSchemaElement<'a>],
     },

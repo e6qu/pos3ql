@@ -30,14 +30,14 @@ use crate::sql::ast::{
     PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget,
     RelationPersistence, RelationStorageOptionNames, RelationStorageOptions, RoleOptions,
     RoutineArgument, RoutineArgumentMode, RoutineCreateKind, RoutineIdentity, RoutineParallel,
-    RoutineResultColumn, RoutineTargetKind, RuleAction, RuleEvent, RuleMode, StatisticsExpression,
-    StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget,
-    SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin,
-    SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
-    SubscriptionSynchronousCommit, TableAccessMethod, TableMembership, TablespaceOptionNames,
-    TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption,
-    TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables,
-    ViewSecurity, ViewSecurityBarrier,
+    RoutineResultColumn, RoutineTargetKind, RuleAction, RuleEvent, RuleMode, SchemaAuthorization,
+    SchemaName, StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds,
+    StatisticsName, StatisticsTarget, SubscriptionBehavior, SubscriptionConnect,
+    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
+    SubscriptionStreaming, SubscriptionSynchronousCommit, TableAccessMethod, TableMembership,
+    TablespaceOptionNames, TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind,
+    TextSearchOption, TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming,
+    TriggerTransitionTables, ViewSecurity, ViewSecurityBarrier,
 };
 use crate::sql::eval::sqlstate;
 
@@ -4753,15 +4753,18 @@ impl<'a> Parser<'a> {
         };
         let mut authorization = None;
         let name = if self.eat_ident("authorization")? {
-            let role = self.col_ident("role name")?;
+            let role = self.schema_authorization()?;
             authorization = Some(role);
-            // An omitted name defaults to the role's name, as PostgreSQL.
-            name.unwrap_or(role)
+            // PostgreSQL resolves an omitted name from the authorization role.
+            match (name, role) {
+                (Some(name), _) => SchemaName::Explicit(name),
+                (None, _) => SchemaName::Authorization,
+            }
         } else {
             let Some(n) = name else {
                 return Err(self.err_here("expected schema name or AUTHORIZATION"));
             };
-            n
+            SchemaName::Explicit(n)
         };
         static EMPTY_SCHEMA_ELEMENT: CreateSchemaElement<'static> =
             CreateSchemaElement::Table(CreateTable {
@@ -4782,77 +4785,96 @@ impl<'a> Parser<'a> {
             });
         let mut elements: [&'a CreateSchemaElement<'a>; 16] = [&EMPTY_SCHEMA_ELEMENT; 16];
         let mut n = 0usize;
-        while self.peeked == Tok::Ident("create") {
+        while matches!(self.peeked, Tok::Ident("create") | Tok::Ident("grant")) {
             if n == elements.len() {
                 return Err(self.limit("schema elements", elements.len()));
             }
-            let element = match self.create()? {
-                Stmt::CreateTable(table) => CreateSchemaElement::Table(table),
-                Stmt::CreateView {
-                    name,
-                    columns,
-                    or_replace,
-                    security,
-                    security_barrier,
-                    check_option,
-                    sql,
-                } => CreateSchemaElement::View {
-                    name,
-                    columns,
-                    or_replace,
-                    security,
-                    security_barrier,
-                    check_option,
-                    sql,
+            let element = match self.peeked {
+                Tok::Ident("grant") => match self.grant_statement()? {
+                    Stmt::GrantPrivileges {
+                        privileges,
+                        target,
+                        grantees,
+                        grant_option,
+                        grantor,
+                    } => CreateSchemaElement::Grant {
+                        privileges,
+                        target,
+                        grantees,
+                        grant_option,
+                        grantor,
+                    },
+                    _ => {
+                        return Err(
+                            self.err_here("CREATE SCHEMA permits only privilege GRANT clauses")
+                        );
+                    }
                 },
-                Stmt::CreateIndex {
-                    name,
-                    table,
-                    build,
-                    scope,
-                    if_not_exists,
-                    columns,
-                    include_columns,
-                    nulls_not_distinct,
-                    predicate,
-                    predicate_text,
-                    options,
-                    tablespace,
-                    unique,
-                } => CreateSchemaElement::Index {
-                    name,
-                    table,
-                    build,
-                    scope,
-                    if_not_exists,
-                    columns,
-                    include_columns,
-                    nulls_not_distinct,
-                    predicate,
-                    predicate_text,
-                    options,
-                    tablespace,
-                    unique,
-                },
-                Stmt::CreateSequence {
-                    name,
-                    if_not_exists,
-                    options,
-                } => CreateSchemaElement::Sequence {
-                    name,
-                    if_not_exists,
-                    options,
-                },
-                Stmt::CreateDomain(domain) => CreateSchemaElement::Domain(domain),
-                Stmt::CreateEnum { name, labels } => CreateSchemaElement::Enum { name, labels },
-                Stmt::CreateComposite { name, fields } => {
-                    CreateSchemaElement::Composite { name, fields }
-                }
-                _ => {
-                    return Err(self.err_here(
-                        "CREATE SCHEMA elements may be CREATE TABLE, VIEW, INDEX, SEQUENCE, DOMAIN, or TYPE",
+                Tok::Ident("create") => match self.create()? {
+                    Stmt::CreateTable(table) => CreateSchemaElement::Table(table),
+                    Stmt::CreateView {
+                        name,
+                        columns,
+                        or_replace,
+                        security,
+                        security_barrier,
+                        check_option,
+                        sql,
+                    } => CreateSchemaElement::View {
+                        name,
+                        columns,
+                        or_replace,
+                        security,
+                        security_barrier,
+                        check_option,
+                        sql,
+                    },
+                    Stmt::CreateIndex {
+                        name,
+                        table,
+                        build,
+                        scope,
+                        if_not_exists,
+                        columns,
+                        include_columns,
+                        nulls_not_distinct,
+                        predicate,
+                        predicate_text,
+                        options,
+                        tablespace,
+                        unique,
+                    } => CreateSchemaElement::Index {
+                        name,
+                        table,
+                        build,
+                        scope,
+                        if_not_exists,
+                        columns,
+                        include_columns,
+                        nulls_not_distinct,
+                        predicate,
+                        predicate_text,
+                        options,
+                        tablespace,
+                        unique,
+                    },
+                    Stmt::CreateSequence {
+                        name,
+                        if_not_exists,
+                        options,
+                    } => CreateSchemaElement::Sequence {
+                        name,
+                        if_not_exists,
+                        options,
+                    },
+                    Stmt::CreateTrigger(trigger) => CreateSchemaElement::Trigger(trigger),
+                    _ => {
+                        return Err(self.err_here(
+                        "CREATE SCHEMA elements may be CREATE TABLE, VIEW, INDEX, SEQUENCE, TRIGGER, or GRANT",
                     ));
-                }
+                    }
+                },
+                _ => unreachable!("CREATE SCHEMA loop admits only CREATE or GRANT"),
             };
             elements[n] = self
                 .arena
@@ -4860,12 +4882,34 @@ impl<'a> Parser<'a> {
                 .map_err(|_| self.err_here("statement too large for SQL arena"))?;
             n += 1;
         }
+        if if_not_exists && n != 0 {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    96,
+                    "CREATE SCHEMA IF NOT EXISTS cannot include schema elements"
+                ),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
         Ok(Stmt::CreateSchema {
             name,
             authorization,
             if_not_exists,
             elements: self.arena_slice(&elements[..n])?,
         })
+    }
+
+    fn schema_authorization(&mut self) -> Result<SchemaAuthorization<'a>, ParseError> {
+        if self.eat_ident("current_role")? {
+            Ok(SchemaAuthorization::CurrentRole)
+        } else if self.eat_ident("current_user")? {
+            Ok(SchemaAuthorization::CurrentUser)
+        } else if self.eat_ident("session_user")? {
+            Ok(SchemaAuthorization::SessionUser)
+        } else {
+            Ok(SchemaAuthorization::Name(self.col_ident("role name")?))
+        }
     }
 
     /// CREATE INDEX after the INDEX keyword. Syntax defaults become explicit

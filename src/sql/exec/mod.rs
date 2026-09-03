@@ -6725,6 +6725,8 @@ pub fn set_role(
 ) -> Outcome {
     let Some(written) = role else {
         guc.reset_role(local);
+        let current_role = guc.current_role();
+        super::eval::funcs::system::set_current_user(current_role.as_str());
         responder.command_complete(if reset { "RESET" } else { "SET" })?;
         return sql_ok();
     };
@@ -6750,7 +6752,9 @@ pub fn set_role(
             resolved.as_str()
         ));
     }
-    guc.set_role(storage.role_name(target, txn.txid).as_str(), local);
+    let target_name = storage.role_name(target, txn.txid);
+    guc.set_role(target_name.as_str(), local);
+    super::eval::funcs::system::set_current_user(target_name.as_str());
     responder.command_complete("SET")?;
     sql_ok()
 }
@@ -6766,6 +6770,10 @@ pub fn set_session_authorization(
 ) -> Outcome {
     if role.is_none() {
         guc.reset_session_authorization(local);
+        let session_user = guc.session_user();
+        let current_role = guc.current_role();
+        super::eval::funcs::system::set_session_user(session_user.as_str());
+        super::eval::funcs::system::set_current_user(current_role.as_str());
         responder.command_complete(if reset { "RESET" } else { "SET" })?;
         return sql_ok();
     }
@@ -6804,6 +6812,10 @@ pub fn set_session_authorization(
         let canonical = storage.role_name(target, txn.txid);
         guc.set_session_authorization(canonical.as_str(), local);
     }
+    let session_user = guc.session_user();
+    let current_role = guc.current_role();
+    super::eval::funcs::system::set_session_user(session_user.as_str());
+    super::eval::funcs::system::set_current_user(current_role.as_str());
     responder.command_complete(if reset { "RESET" } else { "SET" })?;
     sql_ok()
 }
@@ -11376,6 +11388,18 @@ pub fn drop_schema(
                 .count()
         })
         .sum::<usize>();
+    let table_trigger_undo = storage
+        .triggers_with_slots_visible_to(txn.txid)
+        .filter(|(_, trigger)| {
+            matches!(
+                trigger.target,
+                crate::storage::TriggerTarget::Table(table)
+                    if objects[..n_objects].iter().flatten().any(|object| {
+                        matches!(object, SchemaObject::Table(selected) if *selected == usize::from(table))
+                    })
+            )
+        })
+        .count();
     let routine_trigger_undo = storage
         .triggers_with_slots_visible_to(txn.txid)
         .filter(|(_, trigger)| {
@@ -11395,6 +11419,7 @@ pub fn drop_schema(
             .filter(|object| matches!(object, SchemaObject::Matview { .. }))
             .count()
         + owned_sequence_undo
+        + table_trigger_undo
         + routine_trigger_undo
         + n_slots;
     if txn.ddl().len() + undo_needed > super::txn::MAX_TXN_DDL {
@@ -11833,6 +11858,20 @@ pub fn drop_schema(
                         }
                         Ok(None) => {}
                         Err(error) => return sql_fail(error),
+                    }
+                }
+                let trigger_target = crate::storage::TriggerTarget::Table(*t as u16);
+                loop {
+                    let trigger = storage.triggers_with_slots_visible_to(txn.txid).find_map(
+                        |(slot, trigger)| (trigger.target == trigger_target).then_some(slot),
+                    );
+                    let Some(slot) = trigger else { break };
+                    storage.drop_trigger(slot, txn.txid);
+                    if let Err(error) =
+                        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))
+                    {
+                        storage.rollback_trigger_drop(slot, txn.txid);
+                        return sql_fail(error);
                     }
                 }
                 let lsn = storage.bump_lsn();
@@ -18644,6 +18683,22 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
         elements,
     } = query.statement
     {
+        let resolved = match &context.host {
+            PlpgsqlExecHost::Routine { guc, .. } => {
+                super::resolve_create_schema(*name, *authorization, guc)?
+            }
+            PlpgsqlExecHost::Atomic { .. } => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "PL/pgSQL dynamic utility commands are not valid in trigger execution"
+                ));
+            }
+        };
+        let authorization = resolved.authorization.as_ref().map(|role| role.as_str());
+        let name = context
+            .arena
+            .alloc_str(resolved.name.as_str())
+            .map_err(|_| super::query::arena_full_pub())?;
         let outcome = {
             let PlpgsqlExecHost::Routine {
                 engine,
@@ -18672,7 +18727,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                             &mut engine.wal,
                             txn,
                             name,
-                            *authorization,
+                            authorization,
                             *if_not_exists,
                             responder,
                         )
@@ -18682,82 +18737,106 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
         };
         dynamic_utility_outcome(outcome)?;
 
+        let prior_user = crate::sql::eval::funcs::system::current_user_owned();
+        let prior_role = {
+            let PlpgsqlExecHost::Routine { guc, .. } = &mut context.host else {
+                unreachable!("schema creation requires a routine execution host")
+            };
+            let prior_role = guc.current_role();
+            if let Some(owner) = resolved.authorization.as_ref() {
+                guc.set_role(owner.as_str(), true);
+                crate::sql::eval::funcs::system::set_current_user(owner.as_str());
+            }
+            prior_role
+        };
+
         // CREATE SCHEMA elements retain their static, typed qualification and
         // durable utility execution path instead of reconstructing SQL text.
-        for element in *elements {
-            let requalified = super::requalify_schema_element(element, name, context.arena)?;
-            if let Stmt::CreateView {
-                name: view_name,
-                columns,
-                or_replace,
-                security,
-                security_barrier,
-                check_option,
-                sql,
-            } = requalified
-            {
-                let outcome = {
-                    let PlpgsqlExecHost::Routine {
-                        engine,
-                        guc,
-                        cursors,
-                        transaction_context,
-                    } = &mut context.host
-                    else {
-                        unreachable!("schema creation requires a routine execution host")
-                    };
-                    let schema_path = crate::sql::eval::quote_ident_str(name, context.arena)?;
-                    let role = guc.current_role();
-                    let path =
-                        engine
-                            .storage
-                            .compute_path(schema_path, role.as_str(), context.txn.txid);
-                    let old_path = engine.storage.swap_path(path);
-                    let outcome = context.responder.without_query_output(|responder| {
-                        engine.execute_dynamic_utility(
-                            requalified,
-                            context.txn,
-                            cursors,
+        let elements_result = (|| {
+            for element in *elements {
+                let requalified = super::requalify_schema_element(element, name, context.arena)?;
+                if let Stmt::CreateView {
+                    name: view_name,
+                    columns,
+                    or_replace,
+                    security,
+                    security_barrier,
+                    check_option,
+                    sql,
+                } = requalified
+                {
+                    let outcome = {
+                        let PlpgsqlExecHost::Routine {
+                            engine,
                             guc,
-                            *transaction_context,
-                            context.arena,
-                            responder,
-                            |engine, txn, responder| {
-                                super::exec::create_view(
-                                    &mut engine.storage,
-                                    &mut engine.wal,
-                                    txn,
-                                    super::exec::CreateViewCommand {
-                                        name: view_name,
-                                        columns,
-                                        or_replace: *or_replace,
-                                        security: *security,
-                                        security_barrier: *security_barrier,
-                                        check_option: *check_option,
-                                        sql,
-                                        raw_path: schema_path,
-                                    },
-                                    context.arena,
-                                    responder,
-                                )
-                            },
-                        )
-                    });
-                    engine.storage.swap_path(old_path);
-                    outcome
-                };
-                dynamic_utility_outcome(outcome)?;
-            } else {
-                execute_bound_plpgsql_dynamic_utility(
-                    context,
-                    BoundPlpgsqlDynamicQuery {
-                        statement: requalified,
-                        arguments: &[],
-                    },
-                )?;
+                            cursors,
+                            transaction_context,
+                        } = &mut context.host
+                        else {
+                            unreachable!("schema creation requires a routine execution host")
+                        };
+                        let schema_path = crate::sql::eval::quote_ident_str(name, context.arena)?;
+                        let role = guc.current_role();
+                        let path = engine.storage.compute_path(
+                            schema_path,
+                            role.as_str(),
+                            context.txn.txid,
+                        );
+                        let old_path = engine.storage.swap_path(path);
+                        let outcome = context.responder.without_query_output(|responder| {
+                            engine.execute_dynamic_utility(
+                                requalified,
+                                context.txn,
+                                cursors,
+                                guc,
+                                *transaction_context,
+                                context.arena,
+                                responder,
+                                |engine, txn, responder| {
+                                    super::exec::create_view(
+                                        &mut engine.storage,
+                                        &mut engine.wal,
+                                        txn,
+                                        super::exec::CreateViewCommand {
+                                            name: view_name,
+                                            columns,
+                                            or_replace: *or_replace,
+                                            security: *security,
+                                            security_barrier: *security_barrier,
+                                            check_option: *check_option,
+                                            sql,
+                                            raw_path: schema_path,
+                                        },
+                                        context.arena,
+                                        responder,
+                                    )
+                                },
+                            )
+                        });
+                        engine.storage.swap_path(old_path);
+                        outcome
+                    };
+                    dynamic_utility_outcome(outcome)?;
+                } else {
+                    execute_bound_plpgsql_dynamic_utility(
+                        context,
+                        BoundPlpgsqlDynamicQuery {
+                            statement: requalified,
+                            arguments: &[],
+                        },
+                    )?;
+                }
             }
+            Ok(())
+        })();
+        if resolved.authorization.is_some() {
+            let PlpgsqlExecHost::Routine { guc, .. } = &mut context.host else {
+                unreachable!("schema creation requires a routine execution host")
+            };
+            guc.set_role(prior_role.as_str(), true);
+            crate::sql::eval::funcs::system::set_current_user(prior_user.as_str());
         }
-        return Ok(());
+        return elements_result;
     }
     let PlpgsqlExecHost::Routine {
         engine,

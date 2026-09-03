@@ -13249,86 +13249,104 @@ impl Engine {
                 if_not_exists,
                 elements,
             } => {
+                let resolved = match resolve_create_schema(*name, *authorization, guc) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let name = resolved.name.as_str();
                 let out = exec::create_schema(
                     &mut self.storage,
                     &mut self.wal,
                     txn,
                     name,
-                    *authorization,
+                    resolved.authorization.as_ref().map(|role| role.as_str()),
                     *if_not_exists,
                     responder,
                 )?;
                 if let Err(e) = out {
                     return Ok(Err(e));
                 }
+                let prior_role = guc.current_role();
+                let prior_user = eval::funcs::system::current_user_owned();
+                if let Some(owner) = resolved.authorization.as_ref() {
+                    guc.set_role(owner.as_str(), true);
+                    eval::funcs::system::set_current_user(owner.as_str());
+                }
                 // Schema elements run with the new schema as their creation
                 // target; an element naming a different schema is refused, as
                 // PostgreSQL has it (42P15).
-                for element in *elements {
-                    let requalified = match requalify_schema_element(element, name, arena) {
-                        Ok(r) => r,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                    let result = if let Stmt::CreateView {
-                        name,
-                        columns,
-                        or_replace,
-                        security,
-                        security_barrier,
-                        check_option,
-                        sql,
-                    } = requalified
-                    {
-                        let schema = name
-                            .schema
-                            .expect("CREATE SCHEMA requalification assigns a schema");
-                        let schema_path = match eval::quote_ident_str(schema, arena) {
-                            Ok(path) => path,
+                let elements_result = (|| {
+                    for element in *elements {
+                        let requalified = match requalify_schema_element(element, name, arena) {
+                            Ok(r) => r,
                             Err(e) => return Ok(Err(e)),
                         };
-                        let role = guc.current_role();
-                        let path = self
-                            .storage
-                            .compute_path(schema_path, role.as_str(), txn.txid);
-                        let old_path = self.storage.swap_path(path);
-                        let result = exec::create_view(
-                            &mut self.storage,
-                            &mut self.wal,
-                            txn,
-                            exec::CreateViewCommand {
-                                name,
-                                columns,
-                                or_replace: *or_replace,
-                                security: *security,
-                                security_barrier: *security_barrier,
-                                check_option: *check_option,
-                                sql,
-                                raw_path: schema_path,
-                            },
-                            arena,
-                            responder,
-                        );
-                        self.storage.swap_path(old_path);
-                        result
-                    } else {
-                        self.execute_stmt(
-                            requalified,
-                            arena,
-                            params,
-                            txn,
-                            sqlprep,
-                            cursors,
-                            guc,
-                            exec::PlpgsqlTransactionContext::Atomic,
-                            responder,
-                        )
-                    };
-                    let result = result?;
-                    if let Err(e) = result {
-                        return Ok(Err(e));
+                        let result = if let Stmt::CreateView {
+                            name,
+                            columns,
+                            or_replace,
+                            security,
+                            security_barrier,
+                            check_option,
+                            sql,
+                        } = requalified
+                        {
+                            let schema = name
+                                .schema
+                                .expect("CREATE SCHEMA requalification assigns a schema");
+                            let schema_path = match eval::quote_ident_str(schema, arena) {
+                                Ok(path) => path,
+                                Err(e) => return Ok(Err(e)),
+                            };
+                            let role = guc.current_role();
+                            let path =
+                                self.storage
+                                    .compute_path(schema_path, role.as_str(), txn.txid);
+                            let old_path = self.storage.swap_path(path);
+                            let result = exec::create_view(
+                                &mut self.storage,
+                                &mut self.wal,
+                                txn,
+                                exec::CreateViewCommand {
+                                    name,
+                                    columns,
+                                    or_replace: *or_replace,
+                                    security: *security,
+                                    security_barrier: *security_barrier,
+                                    check_option: *check_option,
+                                    sql,
+                                    raw_path: schema_path,
+                                },
+                                arena,
+                                responder,
+                            );
+                            self.storage.swap_path(old_path);
+                            result
+                        } else {
+                            self.execute_stmt(
+                                requalified,
+                                arena,
+                                params,
+                                txn,
+                                sqlprep,
+                                cursors,
+                                guc,
+                                exec::PlpgsqlTransactionContext::Atomic,
+                                responder,
+                            )
+                        };
+                        let result = result?;
+                        if let Err(e) = result {
+                            return Ok(Err(e));
+                        }
                     }
+                    Ok(Ok(()))
+                })();
+                if resolved.authorization.is_some() {
+                    guc.set_role(prior_role.as_str(), true);
+                    eval::funcs::system::set_current_user(prior_user.as_str());
                 }
-                Ok(Ok(()))
+                elements_result
             }
             Stmt::DropSchema {
                 names,
@@ -16218,23 +16236,97 @@ pub(crate) fn requalify_schema_element<'a>(
             if_not_exists: *if_not_exists,
             options: *options,
         },
-        ast::CreateSchemaElement::Domain(domain) => Stmt::CreateDomain(ast::CreateDomain {
-            name: requalify(domain.name)?,
-            ..*domain
-        }),
-        ast::CreateSchemaElement::Enum { name, labels } => Stmt::CreateEnum {
-            name: requalify(*name)?,
-            labels,
-        },
-        ast::CreateSchemaElement::Composite { name, fields } => Stmt::CreateComposite {
-            name: requalify(*name)?,
-            fields,
-        },
+        ast::CreateSchemaElement::Trigger(trigger) => {
+            let kind = match trigger.kind {
+                ast::TriggerKind::Ordinary => ast::TriggerKind::Ordinary,
+                ast::TriggerKind::Constraint {
+                    referenced_table,
+                    timing,
+                } => ast::TriggerKind::Constraint {
+                    referenced_table: referenced_table.map(requalify).transpose()?,
+                    timing,
+                },
+            };
+            Stmt::CreateTrigger(ast::CreateTrigger {
+                table: requalify(trigger.table)?,
+                kind,
+                ..*trigger
+            })
+        }
+        ast::CreateSchemaElement::Grant {
+            privileges,
+            target,
+            grantees,
+            grant_option,
+            grantor,
+        } => {
+            let target = match target {
+                ast::PrivilegeTarget::Objects {
+                    kind:
+                        kind @ (ast::PrivilegeObjectKind::Table | ast::PrivilegeObjectKind::Sequence),
+                    names,
+                } => {
+                    for name in names.iter().copied() {
+                        requalify(name)?;
+                    }
+                    let names = arena
+                        .alloc_slice_with(names.len(), |index| {
+                            requalify(names[index])
+                                .expect("schema grant names were validated before allocation")
+                        })
+                        .map_err(|_| query::arena_full_pub())?;
+                    ast::PrivilegeTarget::Objects { kind: *kind, names }
+                }
+                _ => *target,
+            };
+            Stmt::GrantPrivileges {
+                privileges,
+                target,
+                grantees,
+                grant_option: *grant_option,
+                grantor: *grantor,
+            }
+        }
     };
     arena
         .alloc(rewritten)
         .map(|r| &*r)
         .map_err(|_| query::arena_full_pub())
+}
+
+/// The runtime form of a parsed `CREATE SCHEMA` identity. Role keywords are
+/// resolved once against the session before any catalog mutation begins.
+pub(crate) struct ResolvedCreateSchema {
+    pub name: crate::util::StackStr<64>,
+    pub authorization: Option<crate::util::StackStr<64>>,
+}
+
+pub(crate) fn resolve_create_schema(
+    name: ast::SchemaName<'_>,
+    authorization: Option<ast::SchemaAuthorization<'_>>,
+    guc: &guc::GucState,
+) -> Result<ResolvedCreateSchema, SqlError> {
+    let authorization = match authorization {
+        Some(ast::SchemaAuthorization::Name(role)) => Some(crate::util::StackStr::from_str(role)),
+        Some(ast::SchemaAuthorization::CurrentRole | ast::SchemaAuthorization::CurrentUser) => {
+            Some(guc.current_role())
+        }
+        Some(ast::SchemaAuthorization::SessionUser) => Some(guc.session_user()),
+        None => None,
+    };
+    let name = match name {
+        ast::SchemaName::Explicit(name) => crate::util::StackStr::from_str(name),
+        ast::SchemaName::Authorization => authorization.ok_or_else(|| {
+            sql_err!(
+                crate::sql::eval::sqlstate::SYNTAX_ERROR,
+                "CREATE SCHEMA AUTHORIZATION requires a role"
+            )
+        })?,
+    };
+    Ok(ResolvedCreateSchema {
+        name,
+        authorization,
+    })
 }
 
 /// Reapplies one journal record to storage during recovery.

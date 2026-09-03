@@ -91,7 +91,7 @@ CREATE PROCEDURE	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql
 CREATE PUBLICATION	partial	84_publication.sql
 CREATE ROLE	partial	83_roles_acl.sql
 CREATE RULE	complete	tests/external/differential/122_rewrite_rules.sql
-CREATE SCHEMA	partial	37_schemas.sql
+CREATE SCHEMA	complete	37_schemas.sql and typed dynamic-utility checkpoint/cold-recovery coverage
 CREATE SEQUENCE	partial	54_sequence.sql (permanent sequences; temporary and unlogged variants remain object-native durability boundaries)
 CREATE SERVER	complete	tests/external/ci_diff.sh
 CREATE STATISTICS	complete	109_extended_statistics.sql

@@ -320,10 +320,21 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
              EXECUTE ''CREATE PUBLICATION plpgsql_dynamic_catalog_publication \
                FOR TABLE plpgsql_dynamic_catalog_rows'';
            END'; \
+         CREATE ROLE plpgsql_dynamic_schema_reader; \
+         CREATE TABLE plpgsql_dynamic_schema_audit(value integer); \
+         CREATE FUNCTION public.plpgsql_dynamic_schema_audit_fn() RETURNS trigger
+           LANGUAGE plpgsql AS 'BEGIN
+             INSERT INTO plpgsql_dynamic_schema_audit VALUES (NEW.value);
+             RETURN NEW;
+           END'; \
          CREATE FUNCTION plpgsql_dynamic_catalog_schema() RETURNS void
            LANGUAGE plpgsql AS 'BEGIN
              EXECUTE ''CREATE SCHEMA plpgsql_dynamic_catalog_ns \
                CREATE TABLE schema_rows (value integer) \
+               CREATE SEQUENCE schema_sequence \
+               CREATE TRIGGER schema_audit AFTER INSERT ON schema_rows FOR EACH ROW \
+                 EXECUTE FUNCTION public.plpgsql_dynamic_schema_audit_fn() \
+               GRANT SELECT ON TABLE schema_rows TO plpgsql_dynamic_schema_reader \
                CREATE VIEW schema_view AS SELECT value FROM schema_rows'';
            END'; \
          CREATE FUNCTION plpgsql_dynamic_catalog_drop_schema() RETURNS void
@@ -353,6 +364,9 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
          SELECT plpgsql_dynamic_catalog_schema(); \
          INSERT INTO plpgsql_dynamic_catalog_ns.schema_rows VALUES (11); \
          SELECT * FROM plpgsql_dynamic_catalog_ns.schema_view; \
+         SELECT * FROM plpgsql_dynamic_schema_audit; \
+         SELECT nextval('plpgsql_dynamic_catalog_ns.schema_sequence'); \
+         SELECT has_table_privilege('plpgsql_dynamic_schema_reader', 'plpgsql_dynamic_catalog_ns.schema_rows', 'SELECT'); \
          INSERT INTO plpgsql_dynamic_catalog_rows VALUES \
            (nextval('plpgsql_dynamic_catalog_sequence'), 'nine'); \
          SELECT plpgsql_dynamic_catalog_lifecycle(); \
@@ -377,6 +391,9 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
             "NULL",
             "NULL",
             "11",
+            "11",
+            "1",
+            "t",
             "NULL",
             "9|nine",
             "9|nine",
@@ -404,6 +421,9 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
         "SELECT * FROM plpgsql_dynamic_catalog_view; \
          SELECT * FROM plpgsql_dynamic_catalog_materialized; \
          SELECT * FROM plpgsql_dynamic_catalog_ns.schema_view; \
+         SELECT * FROM plpgsql_dynamic_schema_audit; \
+         SELECT nextval('plpgsql_dynamic_catalog_ns.schema_sequence'); \
+         SELECT has_table_privilege('plpgsql_dynamic_schema_reader', 'plpgsql_dynamic_catalog_ns.schema_rows', 'SELECT'); \
          SELECT obj_description('plpgsql_dynamic_catalog_rows'::regclass, 'pg_class'); \
          SELECT enumlabel FROM pg_enum \
            WHERE enumtypid = 'plpgsql_dynamic_catalog_state'::regtype \
@@ -421,6 +441,9 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
             "9|nine",
             "9|nine",
             "11",
+            "11",
+            "2",
+            "t",
             "dynamic catalog table",
             "ready",
             "blocked",
@@ -439,6 +462,9 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
         "SELECT plpgsql_dynamic_catalog_drop_schema(); \
          DROP FUNCTION plpgsql_dynamic_catalog_drop_schema(); \
          DROP FUNCTION plpgsql_dynamic_catalog_schema(); \
+         DROP FUNCTION plpgsql_dynamic_schema_audit_fn(); \
+         DROP TABLE plpgsql_dynamic_schema_audit; \
+         DROP ROLE plpgsql_dynamic_schema_reader; \
          DROP FUNCTION plpgsql_dynamic_catalog_lifecycle(); \
          DROP MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized; \
          DROP STATISTICS plpgsql_dynamic_catalog_stats; \

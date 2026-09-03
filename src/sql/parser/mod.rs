@@ -7830,6 +7830,52 @@ mod tests {
     }
 
     #[test]
+    fn create_schema_keeps_its_closed_element_grammar_and_role_identity_typed() {
+        with_parser(
+            "CREATE SCHEMA AUTHORIZATION CURRENT_ROLE \
+             CREATE TABLE entries(value integer) \
+             CREATE TRIGGER audit AFTER INSERT ON entries FOR EACH ROW \
+               EXECUTE FUNCTION public.audit_fn() \
+             GRANT SELECT ON TABLE entries TO public",
+            |parser| {
+                let Some(Stmt::CreateSchema {
+                    name,
+                    authorization,
+                    elements,
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("CREATE SCHEMA did not retain its typed statement")
+                };
+                assert_eq!(name, SchemaName::Authorization);
+                assert_eq!(authorization, Some(SchemaAuthorization::CurrentRole));
+                assert!(matches!(
+                    elements,
+                    [
+                        CreateSchemaElement::Table(_),
+                        CreateSchemaElement::Trigger(_),
+                        CreateSchemaElement::Grant { .. },
+                    ]
+                ));
+            },
+        );
+
+        with_parser(
+            "CREATE SCHEMA invalid CREATE DOMAIN value AS integer",
+            |parser| assert!(parser.next_stmt().is_err()),
+        );
+        with_parser(
+            "CREATE SCHEMA IF NOT EXISTS invalid CREATE TABLE value(id integer)",
+            |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    sqlstate::FEATURE_NOT_SUPPORTED
+                );
+            },
+        );
+    }
+
+    #[test]
     fn publication_options_parse_without_heap_allocation() {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "publication parser", 1 << 18).unwrap();

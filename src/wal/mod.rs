@@ -170,6 +170,7 @@ const KIND_SET_VIEW_SECURITY: u8 = 119;
 const KIND_RENAME_VIEW: u8 = 120;
 const KIND_SET_VIEW_CHECK_OPTION: u8 = 121;
 const KIND_RENAME_ROLE: u8 = 122;
+const KIND_RENAME_SEQUENCE: u8 = 124;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -177,7 +178,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_SET_PARAMETER_ACL;
+const LAST_KIND: u8 = KIND_RENAME_SEQUENCE;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -924,6 +925,11 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
         new_schema: &'a str,
+    },
+    RenameSequence {
+        schema: &'a str,
+        name: &'a str,
+        new_name: &'a str,
     },
     SetViewSchema {
         schema: &'a str,
@@ -2042,6 +2048,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetExtensionDependency { .. } => KIND_SET_EXTENSION_DEPENDENCY,
         WalOp::SetTableSchema { .. } => KIND_SET_TABLE_SCHEMA,
         WalOp::SetSequenceSchema { .. } => KIND_SET_SEQUENCE_SCHEMA,
+        WalOp::RenameSequence { .. } => KIND_RENAME_SEQUENCE,
         WalOp::SetViewSchema { .. } => KIND_SET_VIEW_SCHEMA,
         WalOp::SetExtensionConfig { .. } => KIND_SET_EXTENSION_CONFIG,
         WalOp::DropTableFk { .. } => KIND_DROP_FK,
@@ -2672,6 +2679,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
             new_schema,
         } => 1 + schema.len() + 1 + name.len() + 1 + new_schema.len(),
+        WalOp::RenameSequence {
+            schema,
+            name,
+            new_name,
+        } => 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
         WalOp::DropTableFk {
             schema,
             table,
@@ -4485,6 +4497,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         } => {
             name_bytes(buffer, schema) && name_bytes(buffer, name) && name_bytes(buffer, new_schema)
         }
+        WalOp::RenameSequence {
+            schema,
+            name,
+            new_name,
+        } => name_bytes(buffer, schema) && name_bytes(buffer, name) && name_bytes(buffer, new_name),
         WalOp::DropTableFk {
             schema,
             table,
@@ -7689,38 +7706,28 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let cache = take_i64(&mut at)?;
             let cycle = *payload.get(at)? != 0;
             at += 1;
-            // Ownership was added as an optional suffix; old journals end
-            // after `cycle` and replay as unowned sequences.
-            let owner = if at == payload.len() {
-                None
-            } else {
-                let has_owner = *payload.get(at)? != 0;
-                at += 1;
-                if has_owner {
+            let has_owner = *payload.get(at)? != 0;
+            at += 1;
+            let owner = has_owner
+                .then(|| {
                     Some(crate::storage::SequenceOwner {
                         table_schema: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                         table: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                         column: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                     })
-                } else {
-                    None
-                }
-            };
-            let generator_for = if at == payload.len() {
-                None
-            } else {
-                let has_generator = *payload.get(at)? != 0;
-                at += 1;
-                if has_generator {
+                })
+                .flatten();
+            let has_generator = *payload.get(at)? != 0;
+            at += 1;
+            let generator_for = has_generator
+                .then(|| {
                     Some(crate::storage::SequenceOwner {
                         table_schema: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                         table: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                         column: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                     })
-                } else {
-                    None
-                }
-            };
+                })
+                .flatten();
             (at == payload.len()).then_some(WalOp::CreateSequence {
                 schema,
                 name,
@@ -8982,6 +8989,16 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 name,
                 new_schema,
+            })
+        }
+        KIND_RENAME_SEQUENCE => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RenameSequence {
+                schema,
+                name,
+                new_name,
             })
         }
         KIND_SET_VIEW_SCHEMA => {

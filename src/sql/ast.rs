@@ -818,12 +818,12 @@ pub enum Stmt<'a> {
         if_not_exists: bool,
         options: SeqOptions<'a>,
     },
-    /// ALTER SEQUENCE [IF EXISTS] name [options] [RESTART [WITH n]].
+    /// ALTER SEQUENCE has exactly one typed action.  A rename cannot carry
+    /// parameter options or a schema move into execution.
     AlterSequence {
         name: QualName<'a>,
         if_exists: bool,
-        options: SeqOptions<'a>,
-        set_schema: Option<&'a str>,
+        action: AlterSequenceAction<'a>,
     },
     /// DROP SEQUENCE [IF EXISTS] name [, ...].
     DropSequence {
@@ -3404,6 +3404,14 @@ pub struct SeqOptions<'a> {
     /// None = omitted; Some(None) = OWNED BY NONE; Some(Some(owner)) assigns
     /// the sequence to a table column.
     pub owned_by: Option<Option<SeqOwner<'a>>>,
+}
+
+/// One `ALTER SEQUENCE` action after its target has been parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterSequenceAction<'a> {
+    Options(SeqOptions<'a>),
+    RenameTo(&'a str),
+    SetSchema(&'a str),
 }
 
 impl<'a> SeqOptions<'a> {

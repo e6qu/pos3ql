@@ -19679,8 +19679,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 Stmt::AlterSequence {
                     name,
                     if_exists,
-                    options,
-                    set_schema,
+                    action,
                 } => super::exec::alter_sequence(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -19688,10 +19687,10 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     super::exec::AlterSequenceCommand {
                         name,
                         if_exists: *if_exists,
-                        options,
-                        set_schema: *set_schema,
+                        action: *action,
                     },
                     context.seq_session,
+                    context.arena,
                     responder,
                 ),
                 Stmt::DropSequence {
@@ -34989,12 +34988,192 @@ pub fn create_sequence(
     sql_ok()
 }
 
-/// ALTER SEQUENCE [IF EXISTS] — redefine parameters (and optionally RESTART).
+/// ALTER SEQUENCE [IF EXISTS] — a typed parameter, name, or schema change.
 pub struct AlterSequenceCommand<'a> {
     pub name: &'a QualName<'a>,
     pub if_exists: bool,
-    pub options: &'a crate::sql::ast::SeqOptions<'a>,
-    pub set_schema: Option<&'a str>,
+    pub action: crate::sql::ast::AlterSequenceAction<'a>,
+}
+
+/// Rebind direct sequence literals in a persisted column default before the
+/// sequence identity changes.  The lexer supplies the replacement boundary,
+/// so comments, unrelated strings, and dynamic expressions remain untouched.
+fn rewrite_sequence_default_reference<const N: usize>(
+    text: &str,
+    storage: &Storage,
+    txid: u32,
+    sequence_slot: usize,
+    schema: SqlName,
+    name: SqlName,
+    arena: &Arena,
+) -> Result<StackStr<N>, SqlError> {
+    use crate::sql::lexer::{Lexer, Tok};
+    use core::fmt::Write;
+
+    crate::sql::parser::parse_expr(text, arena)?;
+    let mut output = StackStr::<N>::new();
+    let mut lexer = Lexer::new(text, arena);
+    let mut copied = 0usize;
+    loop {
+        let token = lexer.next_token().map_err(|error| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid stored expression at byte {}: {}",
+                error.at,
+                error.message
+            )
+        })?;
+        if token == Tok::Eof {
+            break;
+        }
+        let Tok::Ident(function) = token else {
+            continue;
+        };
+        if !matches!(function, "nextval" | "currval" | "setval") {
+            continue;
+        }
+        let mut arguments = lexer.clone();
+        if arguments.next_token().map_err(|error| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid stored expression at byte {}: {}",
+                error.at,
+                error.message
+            )
+        })? != Tok::Op("(")
+        {
+            continue;
+        }
+        let Tok::Str(written) = arguments.next_token().map_err(|error| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid stored expression at byte {}: {}",
+                error.at,
+                error.message
+            )
+        })?
+        else {
+            continue;
+        };
+        let literal_start = arguments.token_start();
+        let (qualifier, base) = written
+            .rsplit_once('.')
+            .map_or((None, written), |(schema, name)| (Some(schema), name));
+        if storage.sequence_on_path(qualifier, base, txid) != Some(sequence_slot) {
+            continue;
+        }
+        let _ = output.write_str(&text[copied..literal_start]);
+        let _ = output.write_char('\'');
+        write_identifier(&mut output, schema.as_str());
+        let _ = output.write_char('.');
+        write_identifier(&mut output, name.as_str());
+        let _ = output.write_char('\'');
+        copied = arguments.token_end();
+    }
+    let _ = output.write_str(&text[copied..]);
+    if output.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "rewritten stored expression exceeds {} bytes",
+            N
+        ));
+    }
+    crate::sql::parser::parse_expr(output.as_str(), arena)?;
+    Ok(output)
+}
+
+fn rewrite_sequence_default_references(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    sequence_slot: usize,
+    schema: SqlName,
+    name: SqlName,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for table_slot in 0..storage.table_count() {
+        if !storage.table(table_slot).visible_to(txn.txid) {
+            continue;
+        }
+        let current = *storage.table_def(table_slot, txn.txid);
+        let mut altered = current;
+        let mut changed = false;
+        for column in altered.columns.iter_mut().take(altered.n_columns) {
+            column.default = match column.default {
+                crate::storage::ColumnDefault::None => column.default,
+                crate::storage::ColumnDefault::Constant { value, expression } => {
+                    let rewritten = rewrite_sequence_default_reference(
+                        expression.as_str(),
+                        storage,
+                        txn.txid,
+                        sequence_slot,
+                        schema,
+                        name,
+                        arena,
+                    )?;
+                    changed |= rewritten != expression;
+                    crate::storage::ColumnDefault::Constant {
+                        value,
+                        expression: rewritten,
+                    }
+                }
+                crate::storage::ColumnDefault::Expression(expression) => {
+                    let rewritten = rewrite_sequence_default_reference(
+                        expression.as_str(),
+                        storage,
+                        txn.txid,
+                        sequence_slot,
+                        schema,
+                        name,
+                        arena,
+                    )?;
+                    changed |= rewritten != expression;
+                    crate::storage::ColumnDefault::Expression(rewritten)
+                }
+                crate::storage::ColumnDefault::Generated(expression) => {
+                    let rewritten = rewrite_sequence_default_reference(
+                        expression.as_str(),
+                        storage,
+                        txn.txid,
+                        sequence_slot,
+                        schema,
+                        name,
+                        arena,
+                    )?;
+                    changed |= rewritten != expression;
+                    crate::storage::ColumnDefault::Generated(rewritten)
+                }
+            };
+        }
+        if !changed {
+            continue;
+        }
+        let mut mapping = [None; MAX_COLUMNS];
+        let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+        for (position, column) in current.columns().iter().enumerate() {
+            mapping[position] = Some(column.name);
+            wal_mapping[position] = position as u16;
+        }
+        storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::BeginTableRewrite {
+                previous_schema: current.schema.as_str(),
+                previous_name: current.name.as_str(),
+                preserve_rows: true,
+                column_mapping: wal_mapping,
+            },
+        )?;
+        let lsn = storage.bump_lsn();
+        wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered))?;
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
+            storage.rollback_table_def(table_slot, txn.txid);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 pub fn alter_sequence(
@@ -35003,13 +35182,13 @@ pub fn alter_sequence(
     txn: &mut TxnState,
     command: AlterSequenceCommand<'_>,
     seq_session: &crate::sql::guc::SeqSession,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let AlterSequenceCommand {
         name,
         if_exists,
-        options,
-        set_schema,
+        action,
     } = command;
     let slot = match resolve_sequence(storage, name, txn.txid) {
         Ok(Some(slot)) => slot,
@@ -35035,8 +35214,17 @@ pub fn alter_sequence(
         return sql_fail(error);
     }
     let prior = storage.sequence_for(slot, txn.txid);
-    let target_schema = match set_schema {
-        Some(schema) => {
+    let base = SeqSpec {
+        data_type: prior.data_type,
+        increment: prior.increment,
+        min_value: prior.min_value,
+        max_value: prior.max_value,
+        start_value: prior.start_value,
+        cache: prior.cache,
+        cycle: prior.cycle,
+    };
+    let (target_schema, target_name, options, schema_move, rename) = match action {
+        crate::sql::ast::AlterSequenceAction::SetSchema(schema) => {
             if storage.find_schema_visible(schema, txn.txid).is_none() {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_SCHEMA_NAME,
@@ -35057,27 +35245,38 @@ pub fn alter_sequence(
                     schema
                 ));
             }
-            match SqlName::parse(schema) {
+            let schema = match SqlName::parse(schema) {
                 Ok(schema) => schema,
                 Err(error) => return sql_fail(error),
-            }
+            };
+            (schema, prior.name, None, true, false)
         }
-        None => prior.schema,
+        crate::sql::ast::AlterSequenceAction::RenameTo(new_name) => {
+            let new_name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            if storage.relation_name_taken(prior.schema.as_str(), new_name.as_str(), txn.txid) {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
+                    new_name.as_str()
+                ));
+            }
+            (prior.schema, new_name, None, false, true)
+        }
+        crate::sql::ast::AlterSequenceAction::Options(options) => {
+            (prior.schema, prior.name, Some(options), false, false)
+        }
     };
-    let base = SeqSpec {
-        data_type: prior.data_type,
-        increment: prior.increment,
-        min_value: prior.min_value,
-        max_value: prior.max_value,
-        start_value: prior.start_value,
-        cache: prior.cache,
-        cycle: prior.cycle,
+    let (spec, restart) = match options {
+        Some(options) => match resolve_seq_spec(&options, Some(base)) {
+            Ok(v) => v,
+            Err(error) => return sql_fail(error),
+        },
+        None => (base, None),
     };
-    let (spec, restart) = match resolve_seq_spec(options, Some(base)) {
-        Ok(v) => v,
-        Err(e) => return sql_fail(e),
-    };
-    if options.owned_by.is_some()
+    if options.is_some_and(|options| options.owned_by.is_some())
         && let Some(generator) = prior.generator_for
         && let Some(table_slot) = storage.find_visible(
             generator.table_schema.as_str(),
@@ -35094,7 +35293,7 @@ pub fn alter_sequence(
             "cannot change ownership of identity sequence"
         ));
     }
-    let owner = match options.owned_by {
+    let owner = match options.and_then(|options| options.owned_by) {
         None => prior.owner,
         Some(None) => None,
         Some(Some(requested)) => {
@@ -35106,10 +35305,24 @@ pub fn alter_sequence(
         }
     };
     let generator_for = prior.generator_for;
+    if (schema_move || rename)
+        && let Err(error) = rewrite_sequence_default_references(
+            storage,
+            wal,
+            txn,
+            slot,
+            target_schema,
+            target_name,
+            arena,
+        )
+    {
+        return sql_fail(error);
+    }
     let prior_definition = match storage.stage_sequence_alter(
         slot,
         crate::storage::SequenceAlteration {
             schema: target_schema,
+            name: target_name,
             spec,
             owner,
             generator_for,
@@ -35124,14 +35337,21 @@ pub fn alter_sequence(
         let s = storage.sequence_for(slot, txn.txid);
         (s.schema, s.name)
     };
-    // Parameter changes are absolute definitions; namespace changes preserve
-    // the sequence identity through their dedicated operation.
+    // Each identity change has a dedicated WAL operation.  Parameter changes
+    // remain absolute definitions, so replay never guesses which prior image
+    // a partial ALTER was based on.
     let lsn = storage.bump_lsn();
-    let operation = if set_schema.is_some() {
+    let operation = if schema_move {
         WalOp::SetSequenceSchema {
             schema: prior.schema.as_str(),
             name: prior.name.as_str(),
             new_schema: schema.as_str(),
+        }
+    } else if rename {
+        WalOp::RenameSequence {
+            schema: prior.schema.as_str(),
+            name: prior.name.as_str(),
+            new_name: sname.as_str(),
         }
     } else {
         WalOp::CreateSequence {
@@ -57078,6 +57298,7 @@ fn alter_table_inner(
                 alteration.slot,
                 crate::storage::SequenceAlteration {
                     schema: sequence.schema,
+                    name: sequence.name,
                     spec: alteration.spec,
                     owner: sequence.owner,
                     generator_for: sequence.generator_for,
@@ -58614,6 +58835,7 @@ fn alter_table_inner(
             alteration.slot,
             crate::storage::SequenceAlteration {
                 schema: sequence.schema,
+                name: sequence.name,
                 spec: alteration.spec,
                 owner: sequence.owner,
                 generator_for: sequence.generator_for,

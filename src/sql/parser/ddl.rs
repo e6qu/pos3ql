@@ -4453,8 +4453,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `ALTER SEQUENCE [IF EXISTS] name [options] [RESTART [WITH n]]` ("alter
-    /// sequence" consumed).
+    /// `ALTER SEQUENCE [IF EXISTS] name { options | RENAME TO | SET SCHEMA }`
+    /// ("alter sequence" consumed).
     pub(super) fn alter_sequence(&mut self) -> Result<Stmt<'a>, ParseError> {
         let if_exists = if self.eat_ident("if")? {
             self.expect_ident("exists")?;
@@ -4466,21 +4466,30 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Ident("owner") {
             return self.alter_owner(crate::sql::ast::AlterOwnerKind::Sequence, name, if_exists);
         }
+        if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            return Ok(Stmt::AlterSequence {
+                name,
+                if_exists,
+                action: crate::sql::ast::AlterSequenceAction::RenameTo(
+                    self.col_ident("new sequence name")?,
+                ),
+            });
+        }
         if self.eat_ident("set")? {
             self.expect_ident("schema")?;
             return Ok(Stmt::AlterSequence {
                 name,
                 if_exists,
-                options: crate::sql::ast::SeqOptions::EMPTY,
-                set_schema: Some(self.col_ident("schema name")?),
+                action: crate::sql::ast::AlterSequenceAction::SetSchema(
+                    self.col_ident("schema name")?,
+                ),
             });
         }
-        let options = self.seq_options(true)?;
         Ok(Stmt::AlterSequence {
             name,
             if_exists,
-            options,
-            set_schema: None,
+            action: crate::sql::ast::AlterSequenceAction::Options(self.seq_options(true)?),
         })
     }
 

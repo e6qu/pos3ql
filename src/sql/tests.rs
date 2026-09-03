@@ -1748,7 +1748,7 @@ fn prepare_transaction_is_strictly_configured_and_eligible() {
 
     let mut config = test_config("prepared-eligibility");
     config.max_prepared_transactions = 1;
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for statement in [
         "PREPARE TRANSACTION 'outside'",
@@ -27545,6 +27545,148 @@ fn sequence_basics() {
     run_with(&mut e, &mut b, "DROP SEQUENCE s");
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('s')")).contains("42P01")
+    );
+}
+
+#[test]
+fn sequence_rename_preserves_value_comment_transaction_and_cold_recovery() {
+    let mut config = test_config("sequence-rename-lifecycle");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("sequence-rename-lifecycle-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA sequence_rename_lifecycle_schema; \
+         CREATE SEQUENCE sequence_rename_lifecycle_source START WITH 40 INCREMENT BY 3; \
+         CREATE TABLE sequence_rename_lifecycle_default (id bigint DEFAULT nextval('sequence_rename_lifecycle_source')); \
+         CREATE VIEW sequence_rename_lifecycle_view AS WITH value AS MATERIALIZED (SELECT nextval('sequence_rename_lifecycle_source') AS id) SELECT id FROM value; \
+         COMMENT ON SEQUENCE sequence_rename_lifecycle_source IS 'renamed sequence'; \
+         SELECT nextval('sequence_rename_lifecycle_source'); \
+         ALTER SEQUENCE sequence_rename_lifecycle_source RENAME TO sequence_rename_lifecycle_target; \
+         SELECT nextval('sequence_rename_lifecycle_target')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relname FROM pg_class WHERE relname = 'sequence_rename_lifecycle_target'; \
+             SELECT obj_description('sequence_rename_lifecycle_target'::regclass)",
+        )),
+        ["sequence_rename_lifecycle_target", "renamed sequence"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('sequence_rename_lifecycle_source')",
+        ))
+        .contains("42P01")
+    );
+    let rebound = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO sequence_rename_lifecycle_default DEFAULT VALUES RETURNING id; \
+             SELECT id FROM sequence_rename_lifecycle_view; \
+             SELECT nextval('sequence_rename_lifecycle_target')",
+    );
+    assert_eq!(
+        data_rows(&rebound),
+        ["46", "49", "52"],
+        "{}",
+        String::from_utf8_lossy(&rebound)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         ALTER SEQUENCE sequence_rename_lifecycle_target RENAME TO sequence_rename_lifecycle_rollback; \
+         SELECT nextval('sequence_rename_lifecycle_rollback'); \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('sequence_rename_lifecycle_target')",
+        )),
+        ["58"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         ALTER SEQUENCE sequence_rename_lifecycle_target RESTART WITH 100; \
+         SELECT nextval('sequence_rename_lifecycle_target'); \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('sequence_rename_lifecycle_target')",
+        )),
+        ["61"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SEQUENCE sequence_rename_lifecycle_target \
+           SET SCHEMA sequence_rename_lifecycle_schema; \
+         ALTER SEQUENCE sequence_rename_lifecycle_schema.sequence_rename_lifecycle_target \
+           RENAME TO sequence_rename_lifecycle_durable; \
+         INSERT INTO sequence_rename_lifecycle_default DEFAULT VALUES RETURNING id",
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "INSERT INTO sequence_rename_lifecycle_default DEFAULT VALUES RETURNING id; \
+             SELECT obj_description('sequence_rename_lifecycle_schema.sequence_rename_lifecycle_durable'::regclass)",
+        )),
+        ["67", "renamed sequence"]
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn simple_query_begin_commits_prior_sequence_rename() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE simple_query_sequence; \
+         ALTER SEQUENCE simple_query_sequence RENAME TO simple_query_target; \
+         BEGIN; \
+         ALTER SEQUENCE simple_query_target RENAME TO simple_query_rollback; \
+         ROLLBACK; \
+         SELECT nextval('simple_query_target')",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1"],
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 

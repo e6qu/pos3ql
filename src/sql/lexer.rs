@@ -81,6 +81,13 @@ impl<'a> Lexer<'a> {
         self.token_start
     }
 
+    /// Byte offset immediately after the most recently returned token.
+    /// Stored-expression rewrites use these parser-owned boundaries rather
+    /// than re-scanning SQL literals themselves.
+    pub fn token_end(&self) -> usize {
+        self.at
+    }
+
     pub fn next_token(&mut self) -> Result<Tok<'a>, LexError> {
         self.skip_ws_and_comments()?;
         self.token_start = self.at;

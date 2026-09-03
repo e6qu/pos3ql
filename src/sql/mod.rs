@@ -6792,9 +6792,9 @@ impl Engine {
                 return Ok(ExecutionStatus::Complete);
             }
         };
-        // The whole message runs in one implicit transaction unless an
-        // explicit block is open — an error undoes the entire message,
-        // matching PostgreSQL's implicit-transaction rule.
+        // One Query message owns an implicit transaction until an explicit
+        // BEGIN boundary. PostgreSQL commits preceding simple-query commands
+        // before opening that block, so ROLLBACK cannot erase them.
         // Freeze this statement's clock before anything anchors a transaction
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
@@ -6863,6 +6863,13 @@ impl Engine {
                     "COPY FROM STDIN must be the last statement in a query string"
                 );
                 responder.error(e.sqlstate, e.message.as_str())?;
+                return Ok(ExecutionStatus::Complete);
+            }
+            if matches!(statement, Stmt::Begin(_))
+                && txn.mode == TxnMode::Implicit
+                && let Err(error) = self.commit_txn(txn, guc)
+            {
+                responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
             }
             executed_any = true;
@@ -12861,8 +12868,7 @@ impl Engine {
             Stmt::AlterSequence {
                 name,
                 if_exists,
-                options,
-                set_schema,
+                action,
             } => exec::alter_sequence(
                 &mut self.storage,
                 &mut self.wal,
@@ -12870,10 +12876,10 @@ impl Engine {
                 exec::AlterSequenceCommand {
                     name,
                     if_exists: *if_exists,
-                    options,
-                    set_schema: *set_schema,
+                    action: *action,
                 },
                 guc.seq_session(),
+                arena,
                 responder,
             ),
             Stmt::DropSequence {
@@ -16409,6 +16415,7 @@ fn replay_transaction_batches(
                                     sequence,
                                     crate::storage::SequenceAlteration {
                                         schema: crate::storage::SqlName::parse(schema)?,
+                                        name: crate::storage::SqlName::parse(name)?,
                                         spec,
                                         owner,
                                         generator_for,
@@ -17953,6 +17960,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     slot,
                     crate::storage::SequenceAlteration {
                         schema: crate::storage::SqlName::parse(schema)?,
+                        name: crate::storage::SqlName::parse(name)?,
                         spec,
                         owner,
                         generator_for,
@@ -18536,6 +18544,43 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 slot,
                 crate::storage::SequenceAlteration {
                     schema: crate::storage::SqlName::parse(new_schema)?,
+                    name: current.name,
+                    spec,
+                    owner: current.owner,
+                    generator_for: current.generator_for,
+                    restart: None,
+                },
+                0,
+            )?;
+            storage.commit_sequence_alter(slot, 0);
+        }
+        WalOp::RenameSequence {
+            schema,
+            name,
+            new_name,
+        } => {
+            let slot = storage.sequence_slot(schema, name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "journal renames unknown sequence \"{}\"",
+                    name
+                )
+            })?;
+            let current = storage.sequence_for(slot, 0);
+            let spec = crate::storage::SeqSpec {
+                data_type: current.data_type,
+                increment: current.increment,
+                min_value: current.min_value,
+                max_value: current.max_value,
+                start_value: current.start_value,
+                cache: current.cache,
+                cycle: current.cycle,
+            };
+            storage.stage_sequence_alter(
+                slot,
+                crate::storage::SequenceAlteration {
+                    schema: current.schema,
+                    name: crate::storage::SqlName::parse(new_name)?,
                     spec,
                     owner: current.owner,
                     generator_for: current.generator_for,

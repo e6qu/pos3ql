@@ -5043,6 +5043,60 @@ fn rewrite_stored_text_search_arguments<'a>(
     Ok(rewritten)
 }
 
+fn rewrite_stored_sequence_arguments<'a>(
+    function: &str,
+    args: &'a [&'a Expr<'a>],
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a [&'a Expr<'a>], SqlError> {
+    if !matches!(function, "nextval" | "currval" | "setval") {
+        return Ok(args);
+    }
+    let Some(written) = args.first().and_then(|argument| match argument {
+        Expr::Str(value) => Some(*value),
+        Expr::Cast { operand, .. } | Expr::Collate { operand, .. } => match **operand {
+            Expr::Str(value) => Some(value),
+            _ => None,
+        },
+        _ => None,
+    }) else {
+        return Ok(args);
+    };
+    let Some(dependencies) = context.dependencies else {
+        return Ok(args);
+    };
+    let (referenced_schema, referenced_name) = written.split_once('.').unwrap_or(("", written));
+    let Some(dependency) = dependencies.entries().iter().find(|dependency| {
+        dependency.class == crate::storage::DependencyClass::Sequence
+            && dependency.referenced_schema.as_str() == referenced_schema
+            && dependency.referenced_name.as_str() == referenced_name
+    }) else {
+        return Ok(args);
+    };
+    let sequence = context
+        .storage
+        .sequence_for(dependency.slot as usize, context.txid);
+    let qualified = crate::stack_format!(
+        128,
+        "{}.{}",
+        sequence.schema.as_str(),
+        sequence.name.as_str()
+    );
+    if qualified.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "sequence name is too long"
+        ));
+    }
+    let rendered = arena
+        .alloc_str(qualified.as_str())
+        .map_err(|_| arena_full())?;
+    let first = arena.alloc(Expr::Str(rendered)).map_err(|_| arena_full())?;
+    let rewritten = arena.alloc_slice_copy(args).map_err(|_| arena_full())?;
+    rewritten[0] = first;
+    Ok(rewritten)
+}
+
 fn rewrite_stored_routine_name<'a>(
     name: &'a str,
     args: &[&Expr<'a>],
@@ -5224,6 +5278,7 @@ fn subst_expr<'a>(
             };
             let args = subst_expr_slice(args, context, arena)?;
             let args = rewrite_stored_text_search_arguments(name, args, context, arena)?;
+            let args = rewrite_stored_sequence_arguments(name, args, context, arena)?;
             Expr::Call {
                 name,
                 args,

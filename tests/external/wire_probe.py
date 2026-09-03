@@ -5126,6 +5126,54 @@ def test_generated_expression_lifecycle_over_raw_wire():
     s.close()
 
 
+def test_sequence_rename_lifecycle_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE SCHEMA wire_sequence_rename_schema; "
+        "CREATE SEQUENCE wire_sequence_rename_source START WITH 10 INCREMENT BY 2; "
+        "CREATE TABLE wire_sequence_rename_default (id bigint DEFAULT nextval('wire_sequence_rename_source')); "
+        "CREATE VIEW wire_sequence_rename_view AS WITH value AS MATERIALIZED (SELECT nextval('wire_sequence_rename_source') AS id) SELECT id FROM value; "
+        "COMMENT ON SEQUENCE wire_sequence_rename_source IS 'wire renamed sequence'; "
+        "SELECT nextval('wire_sequence_rename_source'); "
+        "ALTER SEQUENCE wire_sequence_rename_source RENAME TO wire_sequence_rename_target; "
+        "SELECT nextval('wire_sequence_rename_target'); "
+        "INSERT INTO wire_sequence_rename_default DEFAULT VALUES RETURNING id; "
+        "SELECT id FROM wire_sequence_rename_view; "
+        "SELECT nextval('wire_sequence_rename_target'); "
+        "BEGIN; "
+        "ALTER SEQUENCE wire_sequence_rename_target RENAME TO wire_sequence_rename_rollback; "
+        "SELECT nextval('wire_sequence_rename_rollback'); "
+        "ROLLBACK; "
+        "SELECT nextval('wire_sequence_rename_target'); "
+        "BEGIN; "
+        "ALTER SEQUENCE wire_sequence_rename_target RESTART WITH 100; "
+        "SELECT nextval('wire_sequence_rename_target'); "
+        "ROLLBACK; "
+        "SELECT nextval('wire_sequence_rename_target'); "
+        "ALTER SEQUENCE wire_sequence_rename_target SET SCHEMA wire_sequence_rename_schema; "
+        "ALTER SEQUENCE wire_sequence_rename_schema.wire_sequence_rename_target "
+        "RENAME TO wire_sequence_rename_durable; "
+        "SELECT nextval('wire_sequence_rename_schema.wire_sequence_rename_durable'); "
+        "INSERT INTO wire_sequence_rename_default DEFAULT VALUES RETURNING id; "
+        "SELECT obj_description('wire_sequence_rename_schema.wire_sequence_rename_durable'::regclass); "
+        "DROP VIEW wire_sequence_rename_view; "
+        "DROP TABLE wire_sequence_rename_default; "
+        "DROP SEQUENCE wire_sequence_rename_schema.wire_sequence_rename_durable; "
+        "DROP SCHEMA wire_sequence_rename_schema",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "sequence rename: raw wire preserves identity, rollback gaps, and comments",
+        not any(kind == b"E" for kind, _ in result)
+        and rows == [["10"], ["12"], ["14"], ["16"], ["18"], ["20"], ["22"], ["100"], ["24"], ["26"], ["28"], ["wire renamed sequence"]],
+        result,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

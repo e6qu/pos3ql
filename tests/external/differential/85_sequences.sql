@@ -33,3 +33,43 @@ CREATE SEQUENCE cycling_cache_diff MINVALUE 1 MAXVALUE 3 CACHE 5 CYCLE;
 SELECT nextval('cycling_cache_diff') FROM generate_series(1, 5);
 SELECT last_value, log_cnt, is_called FROM cycling_cache_diff;
 DROP SEQUENCE cycling_cache_diff;
+
+-- A sequence rename preserves the catalog identity, current value, comment,
+-- transaction visibility, and WAL/checkpoint recovery identity.
+CREATE SCHEMA sequence_rename_schema_diff;
+CREATE SEQUENCE sequence_rename_source_diff START WITH 40 INCREMENT BY 3;
+CREATE TABLE sequence_rename_default_diff (
+  id bigint DEFAULT nextval('sequence_rename_source_diff')
+);
+CREATE VIEW sequence_rename_view_diff AS
+  WITH value AS MATERIALIZED (SELECT nextval('sequence_rename_source_diff') AS id)
+  SELECT id FROM value;
+COMMENT ON SEQUENCE sequence_rename_source_diff IS 'renamed sequence';
+SELECT nextval('sequence_rename_source_diff');
+ALTER SEQUENCE sequence_rename_source_diff RENAME TO sequence_rename_target_diff;
+SELECT nextval('sequence_rename_target_diff');
+INSERT INTO sequence_rename_default_diff DEFAULT VALUES RETURNING id;
+SELECT id FROM sequence_rename_view_diff;
+SELECT nextval('sequence_rename_target_diff');
+SELECT relname FROM pg_class WHERE relname = 'sequence_rename_target_diff';
+SELECT obj_description('sequence_rename_target_diff'::regclass);
+SELECT nextval('sequence_rename_source_diff');
+BEGIN;
+ALTER SEQUENCE sequence_rename_target_diff RENAME TO sequence_rename_rolled_back_diff;
+SELECT nextval('sequence_rename_rolled_back_diff');
+ROLLBACK;
+SELECT nextval('sequence_rename_target_diff');
+BEGIN;
+ALTER SEQUENCE sequence_rename_target_diff RESTART WITH 100;
+SELECT nextval('sequence_rename_target_diff');
+ROLLBACK;
+SELECT nextval('sequence_rename_target_diff');
+ALTER SEQUENCE sequence_rename_target_diff SET SCHEMA sequence_rename_schema_diff;
+ALTER SEQUENCE sequence_rename_schema_diff.sequence_rename_target_diff
+  RENAME TO sequence_rename_durable_diff;
+SELECT nextval('sequence_rename_schema_diff.sequence_rename_durable_diff');
+INSERT INTO sequence_rename_default_diff DEFAULT VALUES RETURNING id;
+DROP VIEW sequence_rename_view_diff;
+DROP TABLE sequence_rename_default_diff;
+DROP SEQUENCE sequence_rename_schema_diff.sequence_rename_durable_diff;
+DROP SCHEMA sequence_rename_schema_diff;

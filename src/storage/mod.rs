@@ -7616,12 +7616,16 @@ pub(crate) struct SequenceCacheIdentity {
 pub(crate) struct PendingSequenceDefinition {
     pub txid: u32,
     pub schema: SqlName,
+    pub name: SqlName,
     pub spec: SeqSpec,
     pub owner: Option<SequenceOwner>,
     pub generator_for: Option<SequenceOwner>,
     pub last_value: i64,
     pub is_called: bool,
     pub log_count: i64,
+    /// A staged RESTART owns its temporary value image. Other definition
+    /// changes do not make `nextval` transactional.
+    pub restarted: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7686,6 +7690,7 @@ pub struct SeqSpec {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SequenceAlteration {
     pub schema: SqlName,
+    pub name: SqlName,
     pub spec: SeqSpec,
     pub owner: Option<SequenceOwner>,
     pub generator_for: Option<SequenceOwner>,
@@ -7711,6 +7716,7 @@ impl SequenceDef {
                 || self.clone(),
                 |pending| Self {
                     schema: pending.schema,
+                    name: pending.name,
                     data_type: pending.spec.data_type,
                     increment: pending.spec.increment,
                     min_value: pending.spec.min_value,
@@ -24986,6 +24992,7 @@ impl Storage {
         alteration: SequenceAlteration,
         txid: u32,
     ) -> Result<Option<PendingSequenceDefinition>, SqlError> {
+        let current_identity = self.sequences[slot].definition_for(txid);
         let sequence = &mut self.sequences[slot];
         if let Some(pending) = sequence.pending_definition
             && pending.txid != txid
@@ -25030,20 +25037,37 @@ impl Storage {
         let (last_value, is_called) = alteration
             .restart
             .map_or((last_value, is_called), |value| (value, false));
+        let restarted = sequence
+            .pending_definition
+            .is_some_and(|pending| pending.txid == txid && pending.restarted)
+            || alteration.restart.is_some();
         sequence.pending_definition = Some(PendingSequenceDefinition {
             txid,
             schema: alteration.schema,
+            name: alteration.name,
             spec: alteration.spec,
             owner: alteration.owner,
             generator_for: alteration.generator_for,
             last_value,
             is_called,
             log_count: 0,
+            restarted,
         });
         sequence.pending_last_value.set(last_value);
         sequence.pending_is_called.set(is_called);
         sequence.pending_log_count.set(0);
         sequence.pending_dirty.set(alteration.restart.is_some());
+        if current_identity.schema != alteration.schema || current_identity.name != alteration.name
+        {
+            self.stage_object_comment_identity(
+                CommentClass::Relation,
+                current_identity.schema,
+                current_identity.name,
+                alteration.schema,
+                alteration.name,
+                txid,
+            );
+        }
         Ok(prior)
     }
 
@@ -25054,7 +25078,7 @@ impl Storage {
             .is_some()
         {
             let old_schema = self.sequences[slot].schema;
-            let name = self.sequences[slot].name;
+            let old_name = self.sequences[slot].name;
             let last_value = self.sequences[slot].pending_last_value.get();
             let is_called = self.sequences[slot].pending_is_called.get();
             let log_count = self.sequences[slot].pending_log_count.get();
@@ -25065,18 +25089,21 @@ impl Storage {
             self.sequences[slot].log_count.set(log_count);
             self.sequences[slot].dirty.set(false);
             self.sequences[slot].pending_dirty.set(false);
-            if old_schema != self.sequences[slot].schema {
+            if old_schema != self.sequences[slot].schema || old_name != self.sequences[slot].name {
                 let new_schema = self.sequences[slot].schema;
-                for comment in self.comments.iter_mut() {
-                    if comment.used
-                        && comment.database == Some(self.current_database)
-                        && comment.class == CommentClass::Relation
-                        && comment.schema == old_schema
-                        && comment.name == name
-                    {
-                        comment.schema = new_schema;
-                    }
-                }
+                let new_name = self.sequences[slot].name;
+                self.commit_object_comment_identity(
+                    CommentClass::Relation,
+                    old_schema,
+                    old_name,
+                    txid,
+                );
+                self.rename_stored_query_dependency(
+                    DependencyClass::Sequence,
+                    slot,
+                    new_schema,
+                    new_name,
+                );
             }
         }
     }
@@ -25086,6 +25113,26 @@ impl Storage {
         slot: usize,
         prior: Option<PendingSequenceDefinition>,
     ) {
+        let current = self.sequences[slot].pending_definition;
+        let txid = current.map(|pending| pending.txid);
+        let old_identity = current.map(|pending| (pending.schema, pending.name));
+        // ALTER SEQUENCE's definition is transactional, but an advance made
+        // under an ordinary staged definition is not.  Only RESTART owns a
+        // temporary value image that rollback may discard.
+        if current.is_some_and(|pending| !pending.restarted) {
+            self.sequences[slot]
+                .last_value
+                .set(self.sequences[slot].pending_last_value.get());
+            self.sequences[slot]
+                .is_called
+                .set(self.sequences[slot].pending_is_called.get());
+            self.sequences[slot]
+                .log_count
+                .set(self.sequences[slot].pending_log_count.get());
+            self.sequences[slot]
+                .dirty
+                .set(self.sequences[slot].pending_dirty.get());
+        }
         self.sequences[slot].pending_definition = prior;
         if let Some(prior) = prior {
             self.sequences[slot]
@@ -25096,6 +25143,19 @@ impl Storage {
             self.sequences[slot].pending_dirty.set(false);
         } else {
             self.sequences[slot].pending_dirty.set(false);
+        }
+        if let (Some(txid), Some((old_schema, old_name))) = (txid, old_identity) {
+            let visible = self.sequences[slot].definition_for(txid);
+            if old_schema != visible.schema || old_name != visible.name {
+                self.stage_object_comment_identity(
+                    CommentClass::Relation,
+                    old_schema,
+                    old_name,
+                    visible.schema,
+                    visible.name,
+                    txid,
+                );
+            }
         }
     }
 
@@ -25281,19 +25341,21 @@ impl Storage {
         txid: u32,
     ) -> Result<Option<usize>, SqlError> {
         if let Some(blocker) = self.sequences.iter().find_map(|s| {
+            let definition = s.definition_for(txid);
             (s.database == self.current_database
-                && s.schema.as_str() == schema
-                && s.name.as_str() == name)
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name)
                 .then_some(s.ddl_state.pending_txid()?)
                 .filter(|&owner| owner != txid)
         }) {
             return Err(self.catalog_ddl_wait_error(txid, blocker, name));
         }
         let Some(i) = self.sequences.iter().position(|s| {
+            let definition = s.definition_for(txid);
             s.database == self.current_database
                 && s.visible_to(txid)
-                && s.schema.as_str() == schema
-                && s.name.as_str() == name
+                && definition.schema.as_str() == schema
+                && definition.name.as_str() == name
         }) else {
             return Ok(None);
         };

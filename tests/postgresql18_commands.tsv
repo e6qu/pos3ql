@@ -41,7 +41,7 @@ ALTER ROLE	partial	83_roles_acl.sql
 ALTER ROUTINE	partial	90_routine_lifecycle.sql and aggregate extension dependencies in 111_extension_lifecycle.sql
 ALTER RULE	complete	tests/external/differential/122_rewrite_rules.sql
 ALTER SCHEMA	partial	37_schemas.sql
-ALTER SEQUENCE	partial	54_sequence.sql
+ALTER SEQUENCE	partial	54_sequence.sql and 85_sequences.sql (options, ownership, rename/schema, dependent defaults, recovery; unlogged remains an object-native durability boundary)
 ALTER SERVER	complete	tests/external/ci_diff.sh
 ALTER STATISTICS	complete	109_extended_statistics.sql
 ALTER SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard
@@ -92,7 +92,7 @@ CREATE PUBLICATION	partial	84_publication.sql
 CREATE ROLE	partial	83_roles_acl.sql
 CREATE RULE	complete	tests/external/differential/122_rewrite_rules.sql
 CREATE SCHEMA	partial	37_schemas.sql
-CREATE SEQUENCE	complete	54_sequence.sql
+CREATE SEQUENCE	partial	54_sequence.sql (permanent sequences; temporary and unlogged variants remain object-native durability boundaries)
 CREATE SERVER	complete	tests/external/ci_diff.sh
 CREATE STATISTICS	complete	109_extended_statistics.sql
 CREATE SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard

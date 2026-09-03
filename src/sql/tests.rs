@@ -27257,21 +27257,6 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
     let config = test_config("alter-materialized-view-lifecycle");
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let setup = run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE SCHEMA materialized_target;
-         CREATE TABLE materialized_source (value integer);
-         INSERT INTO materialized_source VALUES (7);
-         CREATE MATERIALIZED VIEW materialized_old AS SELECT value FROM materialized_source;
-         COMMENT ON MATERIALIZED VIEW materialized_old IS 'durable materialized view';
-         CREATE ROLE materialized_owner;",
-    );
-    assert!(
-        !message_types(&setup).contains(&b'E'),
-        "{}",
-        String::from_utf8_lossy(&setup)
-    );
     let tablespace = run_with(
         &mut engine,
         &mut budget,
@@ -27281,6 +27266,23 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
         !message_types(&tablespace).contains(&b'E'),
         "{}",
         String::from_utf8_lossy(&tablespace)
+    );
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA materialized_target;
+         CREATE TABLE materialized_source (value integer);
+         INSERT INTO materialized_source VALUES (7);
+         CREATE MATERIALIZED VIEW materialized_old
+           USING heap WITH (fillfactor = 75) TABLESPACE materialized_space
+           AS SELECT value FROM materialized_source;
+         COMMENT ON MATERIALIZED VIEW materialized_old IS 'durable materialized view';
+         CREATE ROLE materialized_owner;",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
     );
     let old_oid = data_rows(&run_with(
         &mut engine,
@@ -27329,6 +27331,13 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
         "ALTER MATERIALIZED VIEW materialized_old SET SCHEMA materialized_target;
          ALTER MATERIALIZED VIEW materialized_target.materialized_old RENAME TO materialized_new;
          ALTER MATERIALIZED VIEW materialized_target.materialized_new SET TABLESPACE materialized_space;
+         ALTER MATERIALIZED VIEW materialized_target.materialized_new
+           ALTER COLUMN value SET STATISTICS 61, SET (fillfactor = 80);
+         BEGIN;
+         ALTER MATERIALIZED VIEW materialized_target.materialized_new SET (fillfactor = 90);
+         ROLLBACK;
+         ALTER MATERIALIZED VIEW materialized_target.materialized_new
+           RENAME COLUMN value TO measured;
          ALTER MATERIALIZED VIEW materialized_target.materialized_new OWNER TO materialized_owner;
          GRANT USAGE ON SCHEMA materialized_target TO materialized_owner;
          GRANT SELECT ON materialized_source TO materialized_owner;
@@ -27339,8 +27348,13 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
            WHERE schemaname = 'materialized_target' AND matviewname = 'materialized_new';
          SELECT obj_description('materialized_target.materialized_new'::regclass);
          SET ROLE materialized_owner;
-         SELECT value FROM materialized_target.materialized_new;
+         SELECT measured FROM materialized_target.materialized_new;
          REFRESH MATERIALIZED VIEW materialized_target.materialized_new;
+         SELECT attname, attstattarget FROM pg_attribute
+           WHERE attrelid = 'materialized_target.materialized_new'::regclass
+             AND attnum > 0;
+         SELECT reloptions::text FROM pg_class
+           WHERE oid = 'materialized_target.materialized_new'::regclass;
          RESET ROLE;",
     );
     let rows = data_rows(&altered);
@@ -27349,7 +27363,7 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
         "{}",
         String::from_utf8_lossy(&altered)
     );
-    assert_eq!(rows.len(), 5, "{}", String::from_utf8_lossy(&altered));
+    assert_eq!(rows.len(), 7, "{}", String::from_utf8_lossy(&altered));
     assert_eq!(rows[0], format!("{old_oid}|materialized_new|m"));
     assert_eq!(
         rows[1],
@@ -27358,6 +27372,8 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
     assert_eq!(rows[2], "materialized_space|f");
     assert_eq!(rows[3], "durable materialized view");
     assert_eq!(rows[4], "7");
+    assert_eq!(rows[5], "measured|61");
+    assert_eq!(rows[6], "{fillfactor=80}");
     engine.commit_wal().unwrap();
     drop(engine);
 
@@ -27366,7 +27382,7 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
     let recovered_values = run_with(
         &mut recovered,
         &mut recovered_budget,
-        "SELECT value FROM materialized_target.materialized_new",
+        "SELECT measured FROM materialized_target.materialized_new",
     );
     assert_eq!(
         data_rows(&recovered_values),
@@ -27392,6 +27408,25 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
                WHERE schemaname = 'materialized_target' AND matviewname = 'materialized_new'",
         )),
         ["materialized_space|f"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT attname, attstattarget FROM pg_attribute
+               WHERE attrelid = 'materialized_target.materialized_new'::regclass
+                 AND attnum > 0",
+        )),
+        ["measured|61"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT reloptions::text FROM pg_class
+               WHERE oid = 'materialized_target.materialized_new'::regclass",
+        )),
+        ["{fillfactor=80}"]
     );
     assert_eq!(
         data_rows(&run_with(

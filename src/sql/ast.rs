@@ -145,11 +145,14 @@ pub enum AlterViewAction<'a> {
 
 /// `ALTER MATERIALIZED VIEW` deliberately exposes only operations whose
 /// backing-relation effects have one durable implementation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlterMaterializedViewAction<'a> {
     RenameTo(&'a str),
     SetSchema(&'a str),
-    SetTablespace(&'a str),
+    /// The table-like metadata actions PostgreSQL permits on a materialized
+    /// view. They are already typed `ALTER TABLE` states, so the backing
+    /// relation cannot acquire an unparsed second definition.
+    TableActions(&'a [AlterAction<'a>]),
 }
 
 /// One explicitly named relation in a publication.  An empty `columns` slice
@@ -801,6 +804,7 @@ pub enum Stmt<'a> {
         with_data: bool,
         if_not_exists: bool,
         kind: CreateTableAsKind,
+        options: TableAsOptions<'a>,
     },
     /// REFRESH MATERIALIZED VIEW name — re-run the stored query, replacing rows.
     RefreshMaterializedView {
@@ -3194,6 +3198,24 @@ pub enum TableAccessMethod<'a> {
     /// deferred to execution. It cannot reach storage unless it resolves to
     /// one of the executable variants above.
     Named(&'a str),
+}
+
+/// The relation metadata accepted before the AS query of a table-producing
+/// command. Keeping it whole avoids a parser/executor boundary where one
+/// option can be carried without the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableAsOptions<'a> {
+    pub access_method: TableAccessMethod<'a>,
+    pub tablespace: Option<&'a str>,
+    pub storage_options: RelationStorageOptions,
+}
+
+impl<'a> TableAsOptions<'a> {
+    pub const DEFAULT: Self = Self {
+        access_method: TableAccessMethod::Heap,
+        tablespace: None,
+        storage_options: RelationStorageOptions::DEFAULT,
+    };
 }
 
 /// PostgreSQL's table-persistence grammar, parsed before execution decides

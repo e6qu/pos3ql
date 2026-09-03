@@ -2202,6 +2202,7 @@ impl<'a> Parser<'a> {
                 with_data: true,
                 if_not_exists: false,
                 kind: CreateTableAsKind::SelectInto,
+                options: crate::sql::ast::TableAsOptions::DEFAULT,
             });
         }
         if let SetTree::Select(s) = body {
@@ -4735,28 +4736,104 @@ impl<'a> Parser<'a> {
             return self.alter_owner(AlterOwnerKind::MaterializedView, name, if_exists);
         }
         let action = if self.eat_ident("rename")? {
-            self.expect_ident("to")?;
-            crate::sql::ast::AlterMaterializedViewAction::RenameTo(
-                self.col_ident("new materialized view name")?,
-            )
-        } else {
-            self.expect_ident("set")?;
-            if self.eat_ident("schema")? {
-                crate::sql::ast::AlterMaterializedViewAction::SetSchema(
-                    self.col_ident("schema name")?,
+            if self.eat_ident("to")? {
+                crate::sql::ast::AlterMaterializedViewAction::RenameTo(
+                    self.col_ident("new materialized view name")?,
                 )
             } else {
-                self.expect_ident("tablespace")?;
-                crate::sql::ast::AlterMaterializedViewAction::SetTablespace(
-                    self.col_ident("tablespace name")?,
+                let _ = self.eat_ident("column")?;
+                let from = self.col_ident("materialized view column name")?;
+                self.expect_ident("to")?;
+                let to = self.col_ident("new materialized view column name")?;
+                crate::sql::ast::AlterMaterializedViewAction::TableActions(
+                    self.arena_slice(&[crate::sql::ast::AlterAction::RenameColumn { from, to }])?,
                 )
             }
+        } else {
+            let first = if self.eat_ident("set")? {
+                if self.eat_ident("schema")? {
+                    return Ok(Stmt::AlterMaterializedView {
+                        name,
+                        if_exists,
+                        action: crate::sql::ast::AlterMaterializedViewAction::SetSchema(
+                            self.col_ident("schema name")?,
+                        ),
+                    });
+                }
+                self.materialized_view_table_action_after_set()?
+            } else {
+                self.materialized_view_table_action()?
+            };
+            let mut actions = [crate::sql::ast::AlterAction::SetTablespace(""); MAX_LIST];
+            actions[0] = first;
+            let mut count = 1usize;
+            while self.eat_op(",")? {
+                if count == actions.len() {
+                    return Err(self.limit("ALTER MATERIALIZED VIEW actions", actions.len()));
+                }
+                actions[count] = self.materialized_view_table_action()?;
+                count += 1;
+            }
+            crate::sql::ast::AlterMaterializedViewAction::TableActions(
+                self.arena_slice(&actions[..count])?,
+            )
         };
         Ok(Stmt::AlterMaterializedView {
             name,
             if_exists,
             action,
         })
+    }
+
+    fn materialized_view_table_action_after_set(
+        &mut self,
+    ) -> Result<crate::sql::ast::AlterAction<'a>, ParseError> {
+        if self.eat_ident("tablespace")? {
+            return Ok(crate::sql::ast::AlterAction::SetTablespace(
+                self.col_ident("tablespace name")?,
+            ));
+        }
+        if self.eat_ident("access")? {
+            self.expect_ident("method")?;
+            let method = self.any_ident("table access method")?;
+            return Ok(crate::sql::ast::AlterAction::SetAccessMethod(
+                if method.eq_ignore_ascii_case("heap") {
+                    crate::sql::ast::TableAccessMethod::Heap
+                } else {
+                    crate::sql::ast::TableAccessMethod::Named(method)
+                },
+            ));
+        }
+        self.expect_op("(")?;
+        let options = self.relation_storage_options()?;
+        self.expect_op(")")?;
+        Ok(crate::sql::ast::AlterAction::SetStorageOptions(options))
+    }
+
+    fn materialized_view_table_action(
+        &mut self,
+    ) -> Result<crate::sql::ast::AlterAction<'a>, ParseError> {
+        if self.eat_ident("set")? {
+            return self.materialized_view_table_action_after_set();
+        }
+        if self.eat_ident("reset")? {
+            self.expect_op("(")?;
+            let options = self.relation_storage_option_names()?;
+            self.expect_op(")")?;
+            return Ok(crate::sql::ast::AlterAction::ResetStorageOptions(options));
+        }
+        self.expect_ident("alter")?;
+        let _ = self.eat_ident("column")?;
+        let column = self.col_ident("materialized view column name")?;
+        self.expect_ident("set")?;
+        self.expect_ident("statistics")?;
+        let target = if self.eat_ident("default")? {
+            -1
+        } else {
+            i16::try_from(self.seq_int()?)
+                .map_err(|_| self.err_here("statistics target is out of range"))?
+        };
+        Ok(crate::sql::ast::AlterAction::SetStatistics { column, target })
     }
 
     fn view_options(&mut self) -> Result<&'a [crate::sql::ast::ViewOption], ParseError> {
@@ -7973,13 +8050,43 @@ mod tests {
                 };
                 assert_eq!(
                     action,
-                    crate::sql::ast::AlterMaterializedViewAction::SetTablespace("cold_store")
+                    crate::sql::ast::AlterMaterializedViewAction::TableActions(&[
+                        crate::sql::ast::AlterAction::SetTablespace("cold_store")
+                    ])
                 );
             },
         );
         with_parser(
-            "ALTER MATERIALIZED VIEW snapshot SET (fillfactor = 90)",
-            |parser| assert!(parser.next_stmt().is_err()),
+            "ALTER MATERIALIZED VIEW snapshot ALTER COLUMN value SET STATISTICS 77, \
+             SET (fillfactor = 90), RESET (fillfactor)",
+            |parser| {
+                let Some(Stmt::AlterMaterializedView { action, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER MATERIALIZED VIEW metadata actions did not parse")
+                };
+                let crate::sql::ast::AlterMaterializedViewAction::TableActions(actions) = action
+                else {
+                    panic!("ALTER MATERIALIZED VIEW metadata lost its typed action list")
+                };
+                assert_eq!(actions.len(), 3);
+                assert!(matches!(
+                    actions[0],
+                    crate::sql::ast::AlterAction::SetStatistics {
+                        column: "value",
+                        target: 77
+                    }
+                ));
+                assert!(matches!(
+                    actions[1],
+                    crate::sql::ast::AlterAction::SetStorageOptions(options)
+                    if options.fillfactor == Some(90)
+                ));
+                assert!(matches!(
+                    actions[2],
+                    crate::sql::ast::AlterAction::ResetStorageOptions(options)
+                    if options.fillfactor
+                ));
+            },
         );
     }
 
@@ -8147,17 +8254,19 @@ mod tests {
     fn table_producing_ddl_keeps_its_postgresql_command_kind() {
         with_parser(
             "CREATE TABLE from_query AS SELECT 1; \
-             CREATE MATERIALIZED VIEW materialized_query AS SELECT 1; \
+             CREATE MATERIALIZED VIEW materialized_query USING heap WITH (fillfactor = 75) AS SELECT 1; \
              SELECT 1 INTO selected_query",
             |parser| {
                 let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
                     panic!("CREATE TABLE AS did not parse")
                 };
                 assert_eq!(kind, crate::sql::ast::CreateTableAsKind::Table);
-                let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
+                let Some(Stmt::CreateTableAs { kind, options, .. }) = parser.next_stmt().unwrap()
+                else {
                     panic!("CREATE MATERIALIZED VIEW did not parse")
                 };
                 assert_eq!(kind, crate::sql::ast::CreateTableAsKind::MaterializedView);
+                assert_eq!(options.storage_options.fillfactor, Some(75));
                 let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
                     panic!("SELECT INTO did not parse")
                 };

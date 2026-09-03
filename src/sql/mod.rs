@@ -12819,6 +12819,7 @@ impl Engine {
                 with_data,
                 if_not_exists,
                 kind,
+                options,
             } => exec::create_table_as(
                 &mut self.storage,
                 &mut self.wal,
@@ -12829,6 +12830,7 @@ impl Engine {
                 *with_data,
                 *if_not_exists,
                 *kind == ast::CreateTableAsKind::MaterializedView,
+                *options,
                 guc.search_path().as_str(),
                 guc.seq_session(),
                 arena,

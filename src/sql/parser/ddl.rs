@@ -4024,6 +4024,7 @@ impl<'a> Parser<'a> {
         columns: &'a [&'a str],
         if_not_exists: bool,
         kind: crate::sql::ast::CreateTableAsKind,
+        options: crate::sql::ast::TableAsOptions<'a>,
     ) -> Result<Stmt<'a>, ParseError> {
         let start = self.peek_at;
         let _ = self.query_select()?;
@@ -4043,6 +4044,39 @@ impl<'a> Parser<'a> {
             with_data,
             if_not_exists,
             kind,
+            options,
+        })
+    }
+
+    /// Parses the relation metadata shared by CREATE TABLE AS and CREATE
+    /// MATERIALIZED VIEW before their AS query. The closed output is consumed
+    /// directly by the durable backing relation definition.
+    fn table_as_options(&mut self) -> Result<crate::sql::ast::TableAsOptions<'a>, ParseError> {
+        let mut access_method = TableAccessMethod::Heap;
+        let mut tablespace = None;
+        let mut storage_options = RelationStorageOptions::DEFAULT;
+        loop {
+            if self.eat_ident("using")? {
+                let method = self.any_ident("table access method")?;
+                access_method = if method.eq_ignore_ascii_case("heap") {
+                    TableAccessMethod::Heap
+                } else {
+                    TableAccessMethod::Named(method)
+                };
+            } else if self.eat_ident("with")? {
+                self.expect_op("(")?;
+                storage_options = self.relation_storage_options()?;
+                self.expect_op(")")?;
+            } else if self.eat_ident("tablespace")? {
+                tablespace = Some(self.col_ident("tablespace name")?);
+            } else {
+                break;
+            }
+        }
+        Ok(crate::sql::ast::TableAsOptions {
+            access_method,
+            tablespace,
+            storage_options,
         })
     }
 
@@ -4689,12 +4723,14 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             columns = self.arena_slice(&list[..m])?;
         }
+        let options = self.table_as_options()?;
         self.expect_ident("as")?;
         self.create_table_as(
             name,
             columns,
             if_not_exists,
             crate::sql::ast::CreateTableAsKind::MaterializedView,
+            options,
         )
     }
 
@@ -7006,6 +7042,21 @@ impl<'a> Parser<'a> {
                 &[],
                 if_not_exists,
                 crate::sql::ast::CreateTableAsKind::Table,
+                crate::sql::ast::TableAsOptions::DEFAULT,
+            );
+        }
+        if matches!(self.peeked, Tok::Ident("using" | "with" | "tablespace")) {
+            if foreign {
+                return Err(self.err_here("CREATE FOREIGN TABLE AS is not supported by PostgreSQL"));
+            }
+            let options = self.table_as_options()?;
+            self.expect_ident("as")?;
+            return self.create_table_as(
+                name,
+                &[],
+                if_not_exists,
+                crate::sql::ast::CreateTableAsKind::Table,
+                options,
             );
         }
         if matches!(membership, TableMembership::OfType(_)) && self.peeked != Tok::Op("(") {
@@ -7070,6 +7121,7 @@ impl<'a> Parser<'a> {
                     m += 1;
                 }
                 self.expect_op(")")?;
+                let options = self.table_as_options()?;
                 self.expect_ident("as")?;
                 if foreign {
                     return Err(
@@ -7082,6 +7134,7 @@ impl<'a> Parser<'a> {
                     cols,
                     if_not_exists,
                     crate::sql::ast::CreateTableAsKind::Table,
+                    options,
                 );
             }
             // Otherwise it is a column definition whose name we already read.

@@ -30,7 +30,7 @@ ALTER GROUP	partial	83_roles_acl.sql
 ALTER INDEX	partial	107_index_lifecycle.sql and 111_extension_lifecycle.sql
 ALTER LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; custom executable handlers are outside the architecture)
 ALTER LARGE OBJECT	complete	tests/external/differential/121_large_objects.sql
-ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql and typed extension dependencies in 111_extension_lifecycle.sql
+ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql covers identity, metadata, rollback, and recovery; typed extension dependencies in 111_extension_lifecycle.sql
 ALTER OPERATOR	partial	117_cast_operator_catalog.sql (typed owner/schema and optimization links; selectivity estimators rejected)
 ALTER OPERATOR CLASS	complete	117_cast_operator_catalog.sql
 ALTER OPERATOR FAMILY	complete	117_cast_operator_catalog.sql

@@ -5212,6 +5212,43 @@ def test_schema_rename_lifecycle_over_raw_wire():
     s.close()
 
 
+def test_materialized_view_metadata_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE TABLE wire_matview_metadata_source (value integer); "
+        "INSERT INTO wire_matview_metadata_source VALUES (7), (9); "
+        "CREATE MATERIALIZED VIEW wire_matview_metadata (raw_value) "
+        "USING heap WITH (fillfactor = 75) "
+        "AS SELECT value FROM wire_matview_metadata_source; "
+        "ALTER MATERIALIZED VIEW wire_matview_metadata "
+        "ALTER COLUMN raw_value SET STATISTICS 61, SET (fillfactor = 80); "
+        "ALTER MATERIALIZED VIEW wire_matview_metadata "
+        "RENAME COLUMN raw_value TO measured; "
+        "SELECT measured FROM wire_matview_metadata ORDER BY measured; "
+        "SELECT attname, attstattarget FROM pg_attribute "
+        "WHERE attrelid = 'wire_matview_metadata'::regclass AND attnum > 0; "
+        "SELECT reloptions::text FROM pg_class "
+        "WHERE oid = 'wire_matview_metadata'::regclass; "
+        "BEGIN; ALTER MATERIALIZED VIEW wire_matview_metadata "
+        "SET (fillfactor = 90); ROLLBACK; "
+        "SELECT reloptions::text FROM pg_class "
+        "WHERE oid = 'wire_matview_metadata'::regclass; "
+        "DROP MATERIALIZED VIEW wire_matview_metadata; "
+        "DROP TABLE wire_matview_metadata_source",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "materialized view: raw wire retains typed metadata and rollback",
+        not any(kind == b"E" for kind, _ in result)
+        and rows == [["7"], ["9"], ["measured", "61"], ["{fillfactor=80}"], ["{fillfactor=80}"]],
+        result,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

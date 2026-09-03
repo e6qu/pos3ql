@@ -5421,8 +5421,27 @@ pub fn alter_materialized_view(
         crate::sql::ast::AlterMaterializedViewAction::SetSchema(schema) => {
             crate::sql::ast::AlterAction::SetSchema(schema)
         }
-        crate::sql::ast::AlterMaterializedViewAction::SetTablespace(tablespace) => {
-            crate::sql::ast::AlterAction::SetTablespace(tablespace)
+        crate::sql::ast::AlterMaterializedViewAction::TableActions(actions) => {
+            let statement = crate::sql::ast::AlterTable {
+                table: name,
+                if_exists: false,
+                only: false,
+                actions,
+            };
+            return alter_table_inner(
+                storage,
+                wal,
+                txn,
+                scratch,
+                &statement,
+                arena,
+                seq_session,
+                responder,
+                true,
+                Some(crate::storage::TableKind::Local),
+                "ALTER MATERIALIZED VIEW",
+                AlterInheritanceScope::Direct,
+            );
         }
     };
     let statement = crate::sql::ast::AlterTable {
@@ -19729,6 +19748,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     with_data,
                     if_not_exists,
                     kind,
+                    options,
                 } => super::exec::create_table_as(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -19739,6 +19759,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *with_data,
                     *if_not_exists,
                     *kind == crate::sql::ast::CreateTableAsKind::MaterializedView,
+                    *options,
                     guc.search_path().as_str(),
                     context.seq_session,
                     context.arena,
@@ -34124,6 +34145,7 @@ pub fn create_table_as(
     with_data: bool,
     if_not_exists: bool,
     materialized: bool,
+    options: crate::sql::ast::TableAsOptions<'_>,
     raw_path: &str,
     seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
@@ -34131,6 +34153,11 @@ pub fn create_table_as(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{ColumnMeta, SqlName, TableDef};
+    let crate::sql::ast::TableAsOptions {
+        access_method,
+        tablespace,
+        storage_options,
+    } = options;
     // Resolve the query's output columns without running it.
     let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
     let n_cols = match super::query::describe_query(sql, storage, txn.txid, arena, &mut columns) {
@@ -34163,6 +34190,23 @@ pub fn create_table_as(
     def.name = match SqlName::parse(name.name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
+    };
+    def.access_method = match access_method {
+        crate::sql::ast::TableAccessMethod::Heap => crate::storage::TableAccessMethod::Heap,
+        crate::sql::ast::TableAccessMethod::Named(method) => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "access method \"{}\" does not exist",
+                method
+            ));
+        }
+    };
+    def.tablespace = match resolve_relation_tablespace(storage, tablespace, txn.txid) {
+        Ok(tablespace) => tablespace,
+        Err(error) => return sql_fail(error),
+    };
+    def.storage_options = crate::storage::TableStorageOptions {
+        fillfactor: storage_options.fillfactor,
     };
     def.n_columns = n_cols;
     for i in 0..n_cols {

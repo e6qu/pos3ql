@@ -456,16 +456,12 @@ pub fn decode_binary<'a>(
             (None, &bytes[4..])
         }
         _ => {
-            let expected = binary_len(
-                kind,
-                match kind {
-                    GeometryKind::Point => "(0,0)",
-                    GeometryKind::Line => "{0,0,0}",
-                    GeometryKind::Lseg | GeometryKind::Box => "(0,0),(0,0)",
-                    GeometryKind::Circle => "<(0,0),0>",
-                    GeometryKind::Path | GeometryKind::Polygon => unreachable!(),
-                },
-            )?;
+            let expected = match kind {
+                GeometryKind::Point => 16,
+                GeometryKind::Line | GeometryKind::Circle => 24,
+                GeometryKind::Lseg | GeometryKind::Box => 32,
+                GeometryKind::Path | GeometryKind::Polygon => unreachable!(),
+            };
             if bytes.len() != expected {
                 return Err(bad_binary());
             }

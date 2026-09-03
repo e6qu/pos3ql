@@ -4821,6 +4821,19 @@ mod tests {
             }
         );
         assert!(decode_binary_param(crate::sql::types::oid::POINT, &point[..15], &arena).is_err());
+
+        let mut lseg = [0u8; 32];
+        for (index, value) in [1.0_f64, 2.0, 3.0, 4.0].into_iter().enumerate() {
+            lseg[index * 8..][..8].copy_from_slice(&value.to_be_bytes());
+        }
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::LSEG, &lseg, &arena)
+                .expect("segment parameter decodes"),
+            Datum::Geometry {
+                kind: crate::sql::types::GeometryKind::Lseg,
+                text: "[(1,2),(3,4)]",
+            }
+        );
     }
 
     #[test]

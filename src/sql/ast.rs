@@ -2329,9 +2329,16 @@ pub struct RoleOptions<'a> {
     pub bypass_row_level_security: Option<bool>,
     pub connection_limit: Option<i32>,
     /// `Some(None)` is PASSWORD NULL; `None` means no PASSWORD clause.
-    pub password: Option<Option<&'a str>>,
+    pub password: Option<Option<RolePasswordSpec<'a>>>,
     /// Canonical source text of VALID UNTIL, or NULL for infinity.
     pub valid_until: Option<Option<&'a str>>,
+}
+
+/// A password is either plaintext or a complete imported SCRAM verifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolePasswordSpec<'a> {
+    Plaintext(&'a str),
+    ScramVerifier(crate::pg::auth::ScramServer),
 }
 
 impl RoleOptions<'_> {

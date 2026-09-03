@@ -6429,14 +6429,45 @@ fn create_role_authority_cannot_escalate_attributes_or_alter_unmanaged_roles() {
 
 #[test]
 fn role_catalog_replays_from_wal() {
-    let config = test_config("role-wal-replay");
+    let mut config = test_config("role-wal-replay");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("role-wal-replay-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let verifier = crate::pg::auth::ScramServer::derive_with_salt(
+        "precomputed-role-password",
+        crate::pg::auth::ScramSalt::from_bytes(&[9; crate::pg::auth::SCRAM_SALT_MAX]).unwrap(),
+        8192,
+    );
+    let verifier_text = {
+        use core::fmt::Write;
+        let mut salt = crate::util::StackStr::<512>::new();
+        let mut stored_key = crate::util::StackStr::<512>::new();
+        let mut server_key = crate::util::StackStr::<512>::new();
+        crate::pg::auth::b64_encode(verifier.salt.as_bytes(), &mut salt);
+        crate::pg::auth::b64_encode(&verifier.stored_key, &mut stored_key);
+        crate::pg::auth::b64_encode(&verifier.server_key, &mut server_key);
+        let mut rendered = crate::util::StackStr::<256>::new();
+        let _ = write!(
+            rendered,
+            "SCRAM-SHA-256${}:{}${}:{}",
+            verifier.iterations,
+            salt.as_str(),
+            stored_key.as_str(),
+            server_key.as_str()
+        );
+        rendered
+    };
     let output = run_with(
         &mut engine,
         &mut budget,
-        "CREATE ROLE durable LOGIN CREATEROLE CONNECTION LIMIT 7 \
+        &format!(
+            "CREATE ROLE durable LOGIN CREATEROLE CONNECTION LIMIT 7 \
            PASSWORD 'never-store-this' VALID UNTIL 'infinity';
+         CREATE USER durable_precomputed LOGIN ENCRYPTED PASSWORD '{}';
+         ALTER USER durable_precomputed ENCRYPTED PASSWORD '{}';
          ALTER ROLE durable NOINHERIT CREATEDB;
          COMMENT ON ROLE durable IS 'durable role comment';
          ALTER ROLE durable RENAME TO durable_renamed;
@@ -6444,8 +6475,17 @@ fn role_catalog_replays_from_wal() {
          GRANT durable_renamed TO durable_member WITH ADMIN OPTION;
          CREATE TABLE durable_column_acl (id integer, visible text, secret text);
          GRANT SELECT (visible) ON durable_column_acl TO durable_member;",
+            verifier_text.as_str(),
+            verifier_text.as_str(),
+        ),
     );
     assert!(!output.is_empty());
+    let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+    assert!(
+        String::from_utf8_lossy(&checkpoint).contains("CHECKPOINT"),
+        "{}",
+        String::from_utf8_lossy(&checkpoint)
+    );
     drop(engine);
     let wal_bytes =
         std::fs::read(std::path::Path::new(&config.data_dir).join("journal.wal")).unwrap();
@@ -6456,12 +6496,13 @@ fn role_catalog_replays_from_wal() {
         "role password leaked into WAL"
     );
 
-    let mut restarted_budget = Budget::new(1 << 27);
+    let mut restarted_budget = Budget::new(1 << 30);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "SELECT rolname, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolconnlimit
+        &format!(
+            "SELECT rolname, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolconnlimit
            FROM pg_roles WHERE rolname = 'durable_renamed';
          SELECT parent.rolname, child.rolname, membership.admin_option
            FROM pg_auth_members membership
@@ -6470,10 +6511,14 @@ fn role_catalog_replays_from_wal() {
          SELECT rolpassword LIKE 'SCRAM-SHA-256$%', rolvaliduntil IS NULL,
                 shobj_description(oid, 'pg_authid')
            FROM pg_authid WHERE rolname = 'durable_renamed';
+         SELECT rolpassword = '{}'
+           FROM pg_authid WHERE rolname = 'durable_precomputed';
          SELECT has_column_privilege(
                   'durable_member', 'durable_column_acl', 'visible', 'SELECT'),
                 has_column_privilege(
                   'durable_member', 'durable_column_acl', 'secret', 'SELECT')",
+            verifier_text.as_str(),
+        ),
     );
     assert_eq!(
         data_rows(&output),
@@ -6481,6 +6526,7 @@ fn role_catalog_replays_from_wal() {
             "durable_renamed|f|t|t|t|7",
             "durable_renamed|durable_member|t",
             "t|t|durable role comment",
+            "t",
             "t|f"
         ],
         "{}",

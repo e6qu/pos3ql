@@ -8,6 +8,10 @@ use crate::crypto::sha256::sha256;
 use crate::util::StackStr;
 
 pub const SCRAM_ITERATIONS: u32 = 4096;
+/// Largest SCRAM salt a server connection can emit within its fixed protocol
+/// buffer. Imported verifiers exceeding this bound are rejected before they
+/// become catalog state.
+pub const SCRAM_SALT_MAX: usize = 96;
 const NONCE_RAW: usize = 18; // 24 base64 chars
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,17 +21,63 @@ pub enum AuthMode {
     ScramSha256,
 }
 
+/// A bounded, non-empty SCRAM salt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScramSalt {
+    bytes: [u8; SCRAM_SALT_MAX],
+    len: u8,
+}
+
+impl ScramSalt {
+    pub const EMPTY: Self = Self {
+        bytes: [0; SCRAM_SALT_MAX],
+        len: 0,
+    };
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() || bytes.len() > SCRAM_SALT_MAX {
+            return None;
+        }
+        let mut value = Self::EMPTY;
+        value.bytes[..bytes.len()].copy_from_slice(bytes);
+        value.len = bytes.len() as u8;
+        Some(value)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
 /// Server-side SCRAM verifier, derived from the configured password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScramServer {
-    pub salt: [u8; 16],
+    pub salt: ScramSalt,
     pub stored_key: [u8; 32],
     pub server_key: [u8; 32],
     pub iterations: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScramVerifierError {
+    SaltTooLong,
+}
+
 impl ScramServer {
     pub fn derive(password: &str, salt: [u8; 16], iterations: u32) -> Self {
-        let salted = hi(password.as_bytes(), &salt, iterations);
+        Self::derive_with_salt(
+            password,
+            ScramSalt::from_bytes(&salt).expect("fixed SCRAM salt fits"),
+            iterations,
+        )
+    }
+
+    pub fn derive_with_salt(password: &str, salt: ScramSalt, iterations: u32) -> Self {
+        let salted = hi(password.as_bytes(), salt.as_bytes(), iterations);
         let client_key = hmac_sha256(&salted, b"Client Key");
         let stored_key = sha256(&client_key);
         let server_key = hmac_sha256(&salted, b"Server Key");
@@ -38,15 +88,67 @@ impl ScramServer {
             iterations,
         }
     }
+
+    /// Decodes a complete PostgreSQL SCRAM verifier. Other text remains a
+    /// cleartext password, matching PostgreSQL's role-DDL behavior.
+    pub fn parse_verifier(value: &str) -> Result<Option<Self>, ScramVerifierError> {
+        let Some(value) = value.strip_prefix("SCRAM-SHA-256$") else {
+            return Ok(None);
+        };
+        let Some((parameters, keys)) = value.split_once('$') else {
+            return Ok(None);
+        };
+        if keys.contains('$') {
+            return Ok(None);
+        }
+        let Some((iterations, salt)) = parameters.split_once(':') else {
+            return Ok(None);
+        };
+        let Some(iterations) = iterations.parse::<u32>().ok().filter(|value| *value != 0) else {
+            return Ok(None);
+        };
+        let Some((stored_key, server_key)) = keys.split_once(':') else {
+            return Ok(None);
+        };
+        if stored_key.contains(':') || server_key.contains(':') {
+            return Ok(None);
+        }
+        let mut salt_bytes = [0u8; SCRAM_SALT_MAX];
+        let mut stored_key_bytes = [0u8; 32];
+        let mut server_key_bytes = [0u8; 32];
+        if b64_decode(stored_key, &mut stored_key_bytes) != Some(stored_key_bytes.len())
+            || b64_decode(server_key, &mut server_key_bytes) != Some(server_key_bytes.len())
+        {
+            return Ok(None);
+        }
+        let Some(salt_len) = b64_decoded_len(salt) else {
+            return Ok(None);
+        };
+        if salt_len > SCRAM_SALT_MAX {
+            return Err(ScramVerifierError::SaltTooLong);
+        }
+        let Some(salt_len) = b64_decode(salt, &mut salt_bytes) else {
+            return Ok(None);
+        };
+        let Some(salt) = ScramSalt::from_bytes(&salt_bytes[..salt_len]) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            salt,
+            stored_key: stored_key_bytes,
+            server_key: server_key_bytes,
+            iterations,
+        }))
+    }
 }
 
 /// PBKDF2-HMAC-SHA256 with a single block (dkLen = 32), i.e. RFC 5802 Hi.
 pub(crate) fn hi(password: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
-    let mut msg = [0u8; 64];
-    let n = salt.len().min(60);
-    msg[..n].copy_from_slice(&salt[..n]);
-    msg[n..n + 4].copy_from_slice(&1u32.to_be_bytes());
-    let mut u = hmac_sha256(password, &msg[..n + 4]);
+    let mut msg = [0u8; 260];
+    assert!(salt.len() <= 256, "SCRAM salt exceeds fixed client buffer");
+    msg[..salt.len()].copy_from_slice(salt);
+    msg[salt.len()..salt.len() + 4].copy_from_slice(&1u32.to_be_bytes());
+    let mut u = hmac_sha256(password, &msg[..salt.len() + 4]);
     let mut out = u;
     for _ in 1..iterations {
         u = hmac_sha256(password, &u);
@@ -84,17 +186,18 @@ pub fn b64_encode(input: &[u8], out: &mut StackStr<512>) {
     }
 }
 
-pub fn b64_decode(input: &str, out: &mut [u8]) -> Option<usize> {
-    fn value(c: u8) -> Option<u8> {
-        Some(match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        })
-    }
+fn b64_value(c: u8) -> Option<u8> {
+    Some(match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => return None,
+    })
+}
+
+fn b64_decoded_len(input: &str) -> Option<usize> {
     let bytes = input.as_bytes();
     if !bytes.len().is_multiple_of(4) {
         return None;
@@ -104,16 +207,30 @@ pub fn b64_decode(input: &str, out: &mut [u8]) -> Option<usize> {
         return None;
     }
     if !bytes.is_empty() {
-        let last = value(bytes[bytes.len() - padding - 1])?;
+        let last = b64_value(bytes[bytes.len() - padding - 1])?;
         if (padding == 1 && last & 0b11 != 0) || (padding == 2 && last & 0b1111 != 0) {
             return None;
         }
     }
+    bytes
+        .len()
+        .checked_div(4)?
+        .checked_mul(3)?
+        .checked_sub(padding)
+}
+
+pub fn b64_decode(input: &str, out: &mut [u8]) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let expected = b64_decoded_len(input)?;
+    if expected > out.len() {
+        return None;
+    }
+    let padding = bytes.iter().rev().take_while(|&&byte| byte == b'=').count();
     let mut w = 0usize;
     let mut acc = 0u32;
     let mut bits = 0u32;
     for &c in &bytes[..bytes.len() - padding] {
-        acc = (acc << 6) | u32::from(value(c)?);
+        acc = (acc << 6) | u32::from(b64_value(c)?);
         bits += 6;
         if bits >= 8 {
             bits -= 8;
@@ -124,7 +241,7 @@ pub fn b64_decode(input: &str, out: &mut [u8]) -> Option<usize> {
             w += 1;
         }
     }
-    (w == bytes.len() / 4 * 3 - padding).then_some(w)
+    (w == expected).then_some(w)
 }
 
 struct ScramClientFirst<'a> {
@@ -287,7 +404,7 @@ impl ScramFlow {
         }
 
         let mut salt_b64 = StackStr::<512>::new();
-        b64_encode(&server.salt, &mut salt_b64);
+        b64_encode(server.salt.as_bytes(), &mut salt_b64);
         self.server_first.clear();
         let _ = core::fmt::Write::write_fmt(
             &mut self.server_first,
@@ -373,6 +490,88 @@ impl Default for ScramFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verifier_text(server: ScramServer) -> StackStr<256> {
+        use core::fmt::Write;
+        let mut salt = StackStr::<512>::new();
+        let mut stored_key = StackStr::<512>::new();
+        let mut server_key = StackStr::<512>::new();
+        b64_encode(server.salt.as_bytes(), &mut salt);
+        b64_encode(&server.stored_key, &mut stored_key);
+        b64_encode(&server.server_key, &mut server_key);
+        let mut rendered = StackStr::<256>::new();
+        let _ = write!(
+            rendered,
+            "SCRAM-SHA-256${}:{}${}:{}",
+            server.iterations,
+            salt.as_str(),
+            stored_key.as_str(),
+            server_key.as_str()
+        );
+        rendered
+    }
+
+    #[test]
+    fn stored_postgresql_scram_verifiers_are_typed_and_exact() {
+        let original = ScramServer::derive("precomputed-password", [9; 16], 8192);
+        let rendered = verifier_text(original);
+        crate::mem::guard::forbid_alloc(|| {
+            assert_eq!(
+                ScramServer::parse_verifier(rendered.as_str()),
+                Ok(Some(original))
+            );
+        });
+        for malformed in [
+            "SCRAM-SHA-256$0:c2FsdA==$stored:server",
+            "SCRAM-SHA-256$4096:c2FsdA==$stored",
+            "SCRAM-SHA-256$4096:c2FsdA==$stored:server:extra",
+            "SCRAM-SHA-256$4096:bad$stored:server",
+        ] {
+            assert_eq!(
+                ScramServer::parse_verifier(malformed),
+                Ok(None),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_scram_salt_never_truncates_imported_verifiers() {
+        let salt = ScramSalt::from_bytes(&[7; SCRAM_SALT_MAX]).unwrap();
+        let original = ScramServer::derive_with_salt("precomputed-password", salt, 8192);
+        let rendered = verifier_text(original);
+        assert_eq!(
+            ScramServer::parse_verifier(rendered.as_str()),
+            Ok(Some(original))
+        );
+        assert_ne!(
+            hi(b"precomputed-password", salt.as_bytes(), 1),
+            hi(b"precomputed-password", &[7; 60], 1)
+        );
+        let too_long = [7; SCRAM_SALT_MAX + 1];
+        assert!(ScramSalt::from_bytes(&too_long).is_none());
+        let standard = ScramServer::derive("precomputed-password", [7; 16], 8192);
+        let mut encoded_salt = StackStr::<512>::new();
+        let mut encoded_stored_key = StackStr::<512>::new();
+        let mut encoded_server_key = StackStr::<512>::new();
+        b64_encode(&too_long, &mut encoded_salt);
+        b64_encode(&standard.stored_key, &mut encoded_stored_key);
+        b64_encode(&standard.server_key, &mut encoded_server_key);
+        let mut rendered = StackStr::<256>::new();
+        let _ = core::fmt::Write::write_fmt(
+            &mut rendered,
+            format_args!(
+                "SCRAM-SHA-256$4096:{}${}:{}",
+                encoded_salt.as_str(),
+                encoded_stored_key.as_str(),
+                encoded_server_key.as_str()
+            ),
+        );
+        assert_eq!(
+            ScramServer::parse_verifier(rendered.as_str()),
+            Err(ScramVerifierError::SaltTooLong)
+        );
+    }
 
     #[test]
     fn scram_messages_reject_duplicate_or_reordered_required_attributes() {

@@ -1722,7 +1722,7 @@ impl Checkpointer {
                     )?;
                     let flags: u16 = parse_field(words.next(), "rol flags")?;
                     let connection_limit: i32 = parse_field(words.next(), "rol connection limit")?;
-                    let salt = parse_hex_array::<16>(
+                    let salt = parse_hex_salt(
                         words
                             .next()
                             .ok_or(CheckpointSetupError::Corrupt("rol salt missing"))?,
@@ -1765,7 +1765,7 @@ impl Checkpointer {
                     };
                     if words.next().is_some()
                         || flags & !0x01ff != 0
-                        || (password_present && iterations == 0)
+                        || (password_present && (iterations == 0 || salt.is_empty()))
                         || (!password_present && password != crate::storage::RolePassword::EMPTY)
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid rol record"));
@@ -5652,11 +5652,14 @@ impl Checkpointer {
             for byte in role.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
             }
-            let mut salt = StackStr::<32>::new();
+            let mut salt = StackStr::<{ 2 * crate::pg::auth::SCRAM_SALT_MAX }>::new();
             let mut stored_key = StackStr::<64>::new();
             let mut server_key = StackStr::<64>::new();
-            for byte in password.salt {
+            for byte in password.salt.as_bytes() {
                 let _ = write!(salt, "{byte:02x}");
+            }
+            if password.salt.is_empty() {
+                let _ = write!(salt, "-");
             }
             for byte in password.stored_key {
                 let _ = write!(stored_key, "{byte:02x}");
@@ -9313,8 +9316,18 @@ fn append_uploaded_wal_record(
 }
 
 fn parse_hex_array<const N: usize>(hex: &str) -> Result<[u8; N], CheckpointSetupError> {
+    let (output, len) = parse_hex_bytes(hex)?;
+    if len != N {
+        return Err(CheckpointSetupError::Corrupt(
+            "fixed byte field has the wrong hex length",
+        ));
+    }
+    Ok(output)
+}
+
+fn parse_hex_bytes<const N: usize>(hex: &str) -> Result<([u8; N], usize), CheckpointSetupError> {
     let bytes = hex.as_bytes();
-    if bytes.len() != 2 * N {
+    if !bytes.len().is_multiple_of(2) || bytes.len() > 2 * N {
         return Err(CheckpointSetupError::Corrupt(
             "fixed byte field has the wrong hex length",
         ));
@@ -9332,7 +9345,16 @@ fn parse_hex_array<const N: usize>(hex: &str) -> Result<[u8; N], CheckpointSetup
     for (i, pair) in bytes.chunks(2).enumerate() {
         output[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
-    Ok(output)
+    Ok((output, bytes.len() / 2))
+}
+
+fn parse_hex_salt(hex: &str) -> Result<crate::pg::auth::ScramSalt, CheckpointSetupError> {
+    if hex == "-" {
+        return Ok(crate::pg::auth::ScramSalt::EMPTY);
+    }
+    let (bytes, len) = parse_hex_bytes::<{ crate::pg::auth::SCRAM_SALT_MAX }>(hex)?;
+    crate::pg::auth::ScramSalt::from_bytes(&bytes[..len])
+        .ok_or(CheckpointSetupError::Corrupt("invalid SCRAM salt"))
 }
 
 fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {

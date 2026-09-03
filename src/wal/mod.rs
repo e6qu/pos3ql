@@ -3185,7 +3185,10 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + name.len()
                 + 2
                 + 4
-                + 16
+                + 1
+                + attributes
+                    .password
+                    .map_or(0, |password| password.salt.as_bytes().len())
                 + 32
                 + 32
                 + 4
@@ -5174,7 +5177,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name)
                 && buffer.append(&flags.to_le_bytes())
                 && buffer.append(&attributes.connection_limit.to_le_bytes())
-                && buffer.append(&password.salt)
+                && buffer.append(&[password.salt.as_bytes().len() as u8])
+                && buffer.append(password.salt.as_bytes())
                 && buffer.append(&password.stored_key)
                 && buffer.append(&password.server_key)
                 && buffer.append(&password.iterations.to_le_bytes())
@@ -9304,8 +9308,17 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             }
             let connection_limit = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
-            let salt = payload.get(at..at + 16)?.try_into().ok()?;
-            at += 16;
+            let salt_len = usize::from(*payload.get(at)?);
+            at += 1;
+            if salt_len > crate::pg::auth::SCRAM_SALT_MAX {
+                return None;
+            }
+            let salt = if salt_len == 0 {
+                crate::pg::auth::ScramSalt::EMPTY
+            } else {
+                crate::pg::auth::ScramSalt::from_bytes(payload.get(at..at + salt_len)?)?
+            };
+            at += salt_len;
             let stored_key = payload.get(at..at + 32)?.try_into().ok()?;
             at += 32;
             let server_key = payload.get(at..at + 32)?.try_into().ok()?;
@@ -9323,7 +9336,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             };
             if at != payload.len()
                 || valid_until.len() > crate::storage::ROLE_VALID_UNTIL_MAX
-                || (password_present && iterations == 0)
+                || (password_present && (iterations == 0 || salt.is_empty()))
                 || (!password_present && password != crate::storage::RolePassword::EMPTY)
                 || (valid_until_present == valid_until.is_empty())
             {

@@ -14548,9 +14548,9 @@ fn pg_authid<'a>(
         let attributes = role.attributes_to(txid);
         let password = if let Some(password) = attributes.password {
             use core::fmt::Write;
-            let mut verifier = StackStr::<192>::new();
+            let mut verifier = StackStr::<256>::new();
             let _ = write!(verifier, "SCRAM-SHA-256${}:", password.iterations);
-            append_base64(&password.salt, &mut verifier);
+            append_base64(password.salt.as_bytes(), &mut verifier);
             let _ = verifier.write_char('$');
             append_base64(&password.stored_key, &mut verifier);
             let _ = verifier.write_char(':');

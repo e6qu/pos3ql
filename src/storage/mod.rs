@@ -9604,7 +9604,7 @@ pub(crate) const ROLE_VALID_UNTIL_MAX: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RolePassword {
-    pub salt: [u8; 16],
+    pub salt: crate::pg::auth::ScramSalt,
     pub stored_key: [u8; 32],
     pub server_key: [u8; 32],
     pub iterations: u32,
@@ -9612,7 +9612,7 @@ pub struct RolePassword {
 
 impl RolePassword {
     pub const EMPTY: Self = Self {
-        salt: [0; 16],
+        salt: crate::pg::auth::ScramSalt::EMPTY,
         stored_key: [0; 32],
         server_key: [0; 32],
         iterations: 0,

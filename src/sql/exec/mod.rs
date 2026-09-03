@@ -5874,25 +5874,30 @@ fn apply_role_options(
     }
     if let Some(password) = options.password {
         attributes.password = if let Some(password) = password {
-            if password.len() > crate::storage::ROLE_PASSWORD_MAX {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "role password exceeds {} bytes",
-                    crate::storage::ROLE_PASSWORD_MAX
-                ));
-            }
-            let mut salt = [0u8; 16];
-            if unsafe { libc::getentropy(salt.as_mut_ptr().cast(), salt.len()) } != 0 {
-                return Err(sql_err!(
-                    sqlstate::IO_ERROR,
-                    "could not generate role password salt"
-                ));
-            }
-            let verifier = crate::pg::auth::ScramServer::derive(
-                password,
-                salt,
-                crate::pg::auth::SCRAM_ITERATIONS,
-            );
+            let verifier = match password {
+                crate::sql::ast::RolePasswordSpec::Plaintext(password) => {
+                    if password.len() > crate::storage::ROLE_PASSWORD_MAX {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "role password exceeds {} bytes",
+                            crate::storage::ROLE_PASSWORD_MAX
+                        ));
+                    }
+                    let mut salt = [0u8; 16];
+                    if unsafe { libc::getentropy(salt.as_mut_ptr().cast(), salt.len()) } != 0 {
+                        return Err(sql_err!(
+                            sqlstate::IO_ERROR,
+                            "could not generate role password salt"
+                        ));
+                    }
+                    crate::pg::auth::ScramServer::derive(
+                        password,
+                        salt,
+                        crate::pg::auth::SCRAM_ITERATIONS,
+                    )
+                }
+                crate::sql::ast::RolePasswordSpec::ScramVerifier(verifier) => verifier,
+            };
             Some(crate::storage::RolePassword {
                 salt: verifier.salt,
                 stored_key: verifier.stored_key,

@@ -3997,10 +3997,16 @@ impl<'a> Parser<'a> {
             self.advance()?;
             options.connection_limit = Some(if negative { -parsed } else { parsed });
         } else if self.eat_ident("password")? {
-            options.password = Some(if self.eat_ident("null")? {
-                None
-            } else {
-                Some(self.str_literal("password")?)
+            options.password = Some(self.role_password_spec()?);
+        } else if self.eat_ident("encrypted")? {
+            self.expect_ident("password")?;
+            options.password = Some(self.role_password_spec()?);
+        } else if self.eat_ident("unencrypted")? {
+            self.expect_ident("password")?;
+            return Err(ParseError {
+                at: self.peek_at,
+                message: crate::stack_format!(96, "UNENCRYPTED PASSWORD is no longer supported"),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
             });
         } else if self.eat_ident("valid")? {
             self.expect_ident("until")?;
@@ -4013,6 +4019,35 @@ impl<'a> Parser<'a> {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    fn role_password_spec(
+        &mut self,
+    ) -> Result<Option<crate::sql::ast::RolePasswordSpec<'a>>, ParseError> {
+        if self.eat_ident("null")? {
+            return Ok(None);
+        }
+        let password = self.str_literal("password")?;
+        match crate::pg::auth::ScramServer::parse_verifier(password) {
+            Ok(Some(verifier)) => {
+                return Ok(Some(crate::sql::ast::RolePasswordSpec::ScramVerifier(
+                    verifier,
+                )));
+            }
+            Ok(None) => {}
+            Err(crate::pg::auth::ScramVerifierError::SaltTooLong) => {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: crate::stack_format!(
+                        96,
+                        "SCRAM verifier salt exceeds {} bytes",
+                        crate::pg::auth::SCRAM_SALT_MAX
+                    ),
+                    sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                });
+            }
+        }
+        Ok(Some(crate::sql::ast::RolePasswordSpec::Plaintext(password)))
     }
 
     /// The shared tail of `CREATE TABLE ... AS` / `CREATE MATERIALIZED VIEW`:

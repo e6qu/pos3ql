@@ -8517,6 +8517,84 @@ mod tests {
     }
 
     #[test]
+    fn role_password_forms_are_typed_at_the_parse_boundary() {
+        let server = crate::pg::auth::ScramServer::derive("imported-password", [9; 16], 4096);
+        let mut salt = crate::util::StackStr::<512>::new();
+        let mut stored_key = crate::util::StackStr::<512>::new();
+        let mut server_key = crate::util::StackStr::<512>::new();
+        crate::pg::auth::b64_encode(server.salt.as_bytes(), &mut salt);
+        crate::pg::auth::b64_encode(&server.stored_key, &mut stored_key);
+        crate::pg::auth::b64_encode(&server.server_key, &mut server_key);
+        let verifier = format!(
+            "SCRAM-SHA-256${}:{}${}:{}",
+            server.iterations,
+            salt.as_str(),
+            stored_key.as_str(),
+            server_key.as_str()
+        );
+        with_parser(
+            &format!(
+                "CREATE USER imported LOGIN ENCRYPTED PASSWORD '{verifier}'; ALTER USER imported ENCRYPTED PASSWORD '{verifier}'"
+            ),
+            |parser| {
+                let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("CREATE USER did not parse")
+                };
+                assert!(matches!(
+                    options.password,
+                    Some(Some(crate::sql::ast::RolePasswordSpec::ScramVerifier(_)))
+                ));
+                let Some(Stmt::AlterRole { options, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("ALTER USER did not parse")
+                };
+                assert!(matches!(
+                    options.password,
+                    Some(Some(crate::sql::ast::RolePasswordSpec::ScramVerifier(_)))
+                ));
+            },
+        );
+        with_parser(
+            "CREATE ROLE malformed PASSWORD 'SCRAM-SHA-256$4096:not-base64$bad:bad'",
+            |parser| {
+                let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("malformed verifier did not parse as plaintext")
+                };
+                assert!(matches!(
+                    options.password,
+                    Some(Some(crate::sql::ast::RolePasswordSpec::Plaintext(_)))
+                ));
+            },
+        );
+        with_parser(
+            "ALTER ROLE imported UNENCRYPTED PASSWORD 'secret'",
+            |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED
+                );
+            },
+        );
+        let too_long_salt = [9; crate::pg::auth::SCRAM_SALT_MAX + 1];
+        let mut encoded_salt = crate::util::StackStr::<512>::new();
+        crate::pg::auth::b64_encode(&too_long_salt, &mut encoded_salt);
+        let too_long_verifier = format!(
+            "SCRAM-SHA-256$4096:{}${}:{}",
+            encoded_salt.as_str(),
+            stored_key.as_str(),
+            server_key.as_str()
+        );
+        with_parser(
+            &format!("CREATE ROLE oversized PASSWORD '{too_long_verifier}'"),
+            |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
+            },
+        );
+    }
+
+    #[test]
     fn publication_rename_is_typed_without_allocation() {
         with_parser(
             "ALTER PUBLICATION changes RENAME TO renamed_changes",

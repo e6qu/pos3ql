@@ -1204,7 +1204,8 @@ impl Conn {
                 // Fixed-pattern comparison over both strings.
                 let expected = self.auth_password.as_str();
                 let ok = if let LoginVerifier::Role(verifier) = self.login_verifier {
-                    let candidate = ScramServer::derive(pass, verifier.salt, verifier.iterations);
+                    let candidate =
+                        ScramServer::derive_with_salt(pass, verifier.salt, verifier.iterations);
                     candidate
                         .stored_key
                         .iter()
@@ -5085,11 +5086,12 @@ mod tests {
             login_verifier_for("application", login, true),
             LoginVerifier::Rejected
         ));
+        let server = ScramServer::derive("role-password", [7; 16], 4096);
         let role_verifier = crate::storage::RolePassword {
-            salt: [7; 16],
-            stored_key: [8; 32],
-            server_key: [9; 32],
-            iterations: 4096,
+            salt: server.salt,
+            stored_key: server.stored_key,
+            server_key: server.server_key,
+            iterations: server.iterations,
         };
         assert!(!reject_role_login(
             AuthMode::ScramSha256,

@@ -613,6 +613,7 @@ fn hash_datum(datum: &Datum, hasher: &mut crate::mem::fixed_map::Fnv1aHasher) {
             hasher.write(&[3]);
             hasher.write(&canon_float(*f).to_le_bytes());
         }
+        Datum::Char(value) => hasher.write(&[40, *value]),
         Datum::Text(s) => {
             hasher.write(&[4]);
             hasher.write(s.as_bytes());
@@ -727,6 +728,7 @@ pub(crate) fn compare_datums_as(
     use core::cmp::Ordering;
     let ord = match (l, r) {
         (Datum::Bool(a), Datum::Bool(b)) => a.cmp(b),
+        (Datum::Char(a), Datum::Char(b)) => a.cmp(b),
         (Datum::Text(a), Datum::Text(b)) => a.cmp(b),
         (Datum::TsVector(a), Datum::TsVector(b)) => {
             crate::sql::full_text::compare_vector(a.as_str(), b.as_str())
@@ -1012,6 +1014,7 @@ pub(crate) fn coerce_unknown<'a>(v: Datum<'a>, other: &Datum) -> Result<Datum<'a
             Datum::Float4(x)
         }
         Datum::Bool(_) => Datum::Bool(parse_bool(s)?),
+        Datum::Char(_) => Datum::Char(s.as_bytes().first().copied().unwrap_or(0)),
         Datum::Date(_) => Datum::Date(datetime::parse_date(s)?),
         Datum::Timestamp(_) => Datum::Timestamp(datetime::parse_timestamp(s, false)?),
         Datum::Timestamptz(_) => Datum::Timestamptz(datetime::parse_timestamp(s, true)?),
@@ -2166,6 +2169,7 @@ mod hash_tests {
         // of the index is that the common types separate).
         assert_ne!(h(Datum::Int4(5)), h(Datum::Int4(6)));
         assert_ne!(h(Datum::Text("a")), h(Datum::Text("b")));
+        assert_ne!(h(Datum::Char(0)), h(Datum::Char(0xff)));
         // The load-bearing invariant, cross-checked against compare_datums:
         // equal values hash equal, so the index never misses a true collision.
         for (a, b) in [
@@ -2180,6 +2184,19 @@ mod hash_tests {
             assert!(compare_datums(&a, &b).unwrap().is_eq(), "{a:?} == {b:?}");
             assert_eq!(h(a), h(b));
         }
+    }
+
+    #[test]
+    fn internal_char_comparison_and_unknown_coercion_keep_the_byte() {
+        assert!(
+            compare_datums(&Datum::Char(0), &Datum::Char(0xff))
+                .unwrap()
+                .is_lt()
+        );
+        assert_eq!(
+            coerce_unknown(Datum::Text("x"), &Datum::Char(0)).unwrap(),
+            Datum::Char(b'x')
+        );
     }
 
     #[test]

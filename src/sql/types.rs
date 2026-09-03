@@ -1702,6 +1702,7 @@ impl ArrElem {
             Datum::Int8(_) => ArrElem::Int8,
             Datum::Float4(_) => ArrElem::Float4,
             Datum::Float8(_) => ArrElem::Float8,
+            Datum::Char(_) => ArrElem::Char,
             Datum::Text(_) => ArrElem::Text,
             Datum::Bpchar(_) => ArrElem::Bpchar,
             Datum::Numeric(_) => ArrElem::Numeric,
@@ -2586,6 +2587,10 @@ pub enum Datum<'a> {
     /// 8-byte float8 layout; decode narrows by schema.
     Float4(f32),
     Float8(f64),
+    /// PostgreSQL's internal one-byte `"char"`. This is a byte, not UTF-8
+    /// text: representing it separately keeps binary protocol values outside
+    /// ASCII from being silently transformed or rejected.
+    Char(u8),
     Text(&'a str),
     /// A `char(n)` value, blank-padded to its declared width. The padding is
     /// part of the value (PostgreSQL emits `max(c)` padded even when the
@@ -2740,6 +2745,7 @@ impl<'a> Datum<'a> {
             Datum::Int8(_) => oid::INT8,
             Datum::Float4(_) => oid::FLOAT4,
             Datum::Float8(_) => oid::FLOAT8,
+            Datum::Char(_) => oid::CHAR,
             Datum::Text(_) => oid::TEXT,
             Datum::Bpchar(_) => oid::BPCHAR,
             Datum::Regtype { .. } => oid::REGTYPE,
@@ -2909,6 +2915,10 @@ impl fmt::Display for Datum<'_> {
             Datum::Int8(v) => write!(f, "{v}"),
             Datum::Float4(v) => write_pg_float4(f, *v),
             Datum::Float8(v) => write_pg_float8(f, *v),
+            // Direct protocol and COPY output bypass `Display` so an
+            // arbitrary byte remains arbitrary there. `Display` is used only
+            // by SQL text construction, which must stay valid UTF-8.
+            Datum::Char(value) => f.write_char(char::from(*value)),
             // The output function emits the padding — psql shows `hi   `.
             Datum::Text(s)
             | Datum::Bpchar(s)

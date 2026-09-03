@@ -363,6 +363,7 @@ impl core::fmt::Debug for SqlName {
 pub enum OwnedDatum {
     Null,
     Bool(bool),
+    Char(u8),
     Int4(i32),
     Oid(u32),
     Int8(i64),
@@ -558,6 +559,7 @@ impl OwnedDatum {
             }
             Datum::Null => Self::Null,
             Datum::Bool(b) => Self::Bool(*b),
+            Datum::Char(byte) => Self::Char(*byte),
             Datum::Int4(v) => Self::Int4(*v),
             Datum::Oid(v) => Self::Oid(*v),
             Datum::Int2(v) => Self::Int4(*v as i32),
@@ -668,6 +670,7 @@ impl OwnedDatum {
         match self {
             Self::Null => Datum::Null,
             Self::Bool(b) => Datum::Bool(*b),
+            Self::Char(byte) => Datum::Char(*byte),
             Self::Int4(v) => Datum::Int4(*v),
             Self::Oid(v) => Datum::Oid(*v),
             Self::Int8(v) => Datum::Int8(*v),

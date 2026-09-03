@@ -6117,6 +6117,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Int8(_) => "bigint",
         Datum::Float4(_) => "real",
         Datum::Float8(_) => "double precision",
+        Datum::Char(_) => "\"char\"",
         Datum::Numeric(_) => "numeric",
         Datum::Text(_) => "text",
         Datum::Bpchar(_) => "character",

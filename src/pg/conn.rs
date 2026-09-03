@@ -4549,6 +4549,14 @@ fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, messa
 mod tests {
     use super::*;
 
+    fn frontend(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut message = Vec::with_capacity(payload.len() + 5);
+        message.push(kind);
+        message.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        message.extend_from_slice(payload);
+        message
+    }
+
     fn function_call(function: i32, arguments: &[&[u8]], binary_result: bool) -> Vec<u8> {
         let payload_len = 4
             + 2
@@ -4663,6 +4671,98 @@ mod tests {
             &response[18..],
             &[wire::MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I']
         );
+
+        drop(connection);
+        drop(engine);
+        crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn extended_binary_char_bind_and_result_preserve_the_raw_byte() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "pos3ql-binary-char-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        config.object_store_namespace = format!("binary-char-{}-{suffix}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        config.max_tables = 8;
+        config.table_rows = 256;
+        config.wal_bytes = 1 << 20;
+        config.wal_buffer_bytes = 1 << 16;
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).expect("engine");
+        let mut connection = Conn::new(&config, &mut budget).expect("connection");
+        connection.phase = Phase::Ready;
+
+        let mut parse = Vec::new();
+        parse.extend_from_slice(b"char\0SELECT $1\0");
+        parse.extend_from_slice(&1i16.to_be_bytes());
+        parse.extend_from_slice(&crate::sql::types::oid::CHAR.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_PARSE, &parse));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut bind = Vec::new();
+        bind.extend_from_slice(b"char_portal\0char\0");
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i32.to_be_bytes());
+        bind.push(0xff);
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_BIND, &bind));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut execute = Vec::new();
+        execute.extend_from_slice(b"char_portal\0");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_EXECUTE, &execute));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(
+            connection.send.readable().windows(12).any(|frame| {
+                frame == [wire::MSG_DATA_ROW, 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, 0xff]
+            })
+        );
+
+        connection.recv.append(&frontend(wire::FMSG_SYNC, b""));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(connection.send.readable().ends_with(&[
+            wire::MSG_READY_FOR_QUERY,
+            0,
+            0,
+            0,
+            5,
+            b'I'
+        ]));
 
         drop(connection);
         drop(engine);

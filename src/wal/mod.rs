@@ -9589,6 +9589,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
     1 + match d {
         None | Some(OwnedDatum::Null) => 0,
         Some(OwnedDatum::Bool(_)) => 1,
+        Some(OwnedDatum::Char(_)) => 1,
         Some(OwnedDatum::Int4(_)) | Some(OwnedDatum::Oid(_)) => 4,
         Some(OwnedDatum::Int8(_)) | Some(OwnedDatum::Float8(_)) => 8,
         Some(OwnedDatum::Regtype { len, .. }) => 5 + *len as usize,
@@ -9700,6 +9701,11 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
         Some(OwnedDatum::Bool(b)) => {
             out[0] = 2;
             out[1] = u8::from(*b);
+            2
+        }
+        Some(OwnedDatum::Char(byte)) => {
+            out[0] = 30;
+            out[1] = *byte;
             2
         }
         Some(OwnedDatum::Int4(v)) => {
@@ -9925,6 +9931,11 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let b = *payload.get(*at)?;
             *at += 1;
             Some(OwnedDatum::Bool(b != 0))
+        }
+        30 => {
+            let byte = *payload.get(*at)?;
+            *at += 1;
+            Some(OwnedDatum::Char(byte))
         }
         3 => {
             let b = payload.get(*at..*at + 4)?;
@@ -10565,6 +10576,7 @@ mod tests {
         text[..3].copy_from_slice(b"101");
         let defaults = [
             None,
+            Some(OwnedDatum::Char(0xff)),
             Some(OwnedDatum::Date(8_767)),
             Some(OwnedDatum::Interval(crate::sql::types::Interval {
                 months: 1,

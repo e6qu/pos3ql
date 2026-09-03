@@ -47884,18 +47884,7 @@ fn decode_binary_field_with_context<'a>(
         ColType::Float8 => via(oids::FLOAT8),
         ColType::Char => {
             let [byte]: [u8; 1] = bytes.try_into().map_err(|_| bad())?;
-            if byte == 0 {
-                Ok(Datum::Text(""))
-            } else if byte.is_ascii() {
-                core::str::from_utf8(bytes)
-                    .map(Datum::Text)
-                    .map_err(|_| bad())
-            } else {
-                Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "non-ASCII binary input for type \"char\" is not supported"
-                ))
-            }
+            Ok(Datum::Char(byte))
         }
         ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
             core::str::from_utf8(bytes)
@@ -48437,17 +48426,17 @@ pub fn copy_out(
                     }
                     let name = def.columns()[setup.targets[i]].name.as_str();
                     if fmt.csv {
-                        crate::sql::copy::encode_field_csv(
+                        crate::sql::copy::encode_field_csv_bytes(
                             out,
-                            Some(name),
-                            fmt.null.as_str(),
+                            Some(name.as_bytes()),
+                            fmt.null.as_str().as_bytes(),
                             fmt.delimiter,
                             fmt.quote,
                             fmt.escape,
                             false,
                         );
                     } else {
-                        crate::sql::copy::encode_field(out, Some(name));
+                        crate::sql::copy::encode_field_bytes(out, Some(name.as_bytes()));
                     }
                 }
             })
@@ -48573,7 +48562,7 @@ pub fn copy_out(
             // Render each target into the arena first (fallible), so the
             // wire write below is a deterministic, retry-safe emission.
             let render = responder.render_context();
-            let mut texts: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+            let mut texts: [Option<&[u8]>; MAX_COLUMNS] = [None; MAX_COLUMNS];
             for (i, texts_slot) in texts.iter_mut().enumerate().take(setup.n_targets) {
                 // The wire-text output function, exactly as a SELECT would
                 // render it — styled timestamps, GUC-honoring bytea, `t`
@@ -48595,17 +48584,17 @@ pub fn copy_out(
                         if fmt.csv {
                             let force = fmt.force_quote_all
                                 || CopyFmt::forced(fmt.force_quote, setup.targets[i]);
-                            crate::sql::copy::encode_field_csv(
+                            crate::sql::copy::encode_field_csv_bytes(
                                 out,
                                 *text,
-                                fmt.null.as_str(),
+                                fmt.null.as_str().as_bytes(),
                                 fmt.delimiter,
                                 fmt.quote,
                                 fmt.escape,
                                 force,
                             );
                         } else if let Some(value) = text {
-                            crate::sql::copy::encode_field(out, Some(value));
+                            crate::sql::copy::encode_field_bytes(out, Some(value));
                         } else {
                             out(fmt.null.as_str().as_bytes());
                         }
@@ -48756,17 +48745,17 @@ pub fn copy_out_query(
                         out(&[fmt.delimiter]);
                     }
                     if fmt.csv {
-                        crate::sql::copy::encode_field_csv(
+                        crate::sql::copy::encode_field_csv_bytes(
                             out,
-                            Some(c.name),
-                            fmt.null.as_str(),
+                            Some(c.name.as_bytes()),
+                            fmt.null.as_str().as_bytes(),
                             fmt.delimiter,
                             fmt.quote,
                             fmt.escape,
                             false,
                         );
                     } else {
-                        crate::sql::copy::encode_field(out, Some(c.name));
+                        crate::sql::copy::encode_field_bytes(out, Some(c.name.as_bytes()));
                     }
                 }
             })
@@ -48791,7 +48780,7 @@ pub fn copy_out_query(
                 })
                 .map_err(wire_to_sql)?;
         } else {
-            let mut texts: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+            let mut texts: [Option<&[u8]>; MAX_COLUMNS] = [None; MAX_COLUMNS];
             let catalog = super::query::storage_catalog(storage, arena, txid);
             for (i, slot) in texts.iter_mut().enumerate().take(n) {
                 let output =
@@ -48806,17 +48795,17 @@ pub fn copy_out_query(
                         }
                         if fmt.csv {
                             let force = fmt.force_quote_all || CopyFmt::forced(fmt.force_quote, i);
-                            crate::sql::copy::encode_field_csv(
+                            crate::sql::copy::encode_field_csv_bytes(
                                 out,
                                 *text,
-                                fmt.null.as_str(),
+                                fmt.null.as_str().as_bytes(),
                                 fmt.delimiter,
                                 fmt.quote,
                                 fmt.escape,
                                 force,
                             );
                         } else if let Some(value) = text {
-                            crate::sql::copy::encode_field(out, Some(value));
+                            crate::sql::copy::encode_field_bytes(out, Some(value));
                         } else {
                             out(fmt.null.as_str().as_bytes());
                         }
@@ -62551,6 +62540,22 @@ mod tests {
         let datum = decode_binary_field(ColType::OidVector, &bytes, &arena).unwrap();
         assert_eq!(datum, Datum::OidVector(&[23, 0, 0, 0, 54, 12, 0, 0]));
         assert_eq!(datum.to_string(), "23 3126");
+    }
+
+    #[test]
+    fn binary_char_is_a_raw_byte_not_utf8_text() {
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "binary char", 1 << 12).unwrap();
+        assert_eq!(
+            decode_binary_field(ColType::Char, &[0xff], &arena).unwrap(),
+            Datum::Char(0xff)
+        );
+        assert_eq!(
+            decode_binary_field(ColType::Char, &[], &arena)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::BAD_COPY_FILE_FORMAT
+        );
     }
 
     #[test]

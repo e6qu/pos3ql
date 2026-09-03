@@ -126,10 +126,175 @@ fn display_len(value: impl core::fmt::Display) -> usize {
     counter.0
 }
 
+/// Streams output-function bytes without making PostgreSQL's internal
+/// one-byte `"char"` into a UTF-8 character. Arrays and records recurse so a
+/// byte stays exact wherever a client can observe it.
+fn write_wire_text(value: &Datum, out: &mut dyn FnMut(&[u8])) {
+    struct Writer<'a>(&'a mut dyn FnMut(&[u8]));
+    impl core::fmt::Write for Writer<'_> {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            self.0(text.as_bytes());
+            Ok(())
+        }
+    }
+    match value {
+        Datum::Char(byte) => out(&[*byte]),
+        Datum::Array { element, raw } => write_wire_array(*element, raw, out),
+        Datum::Record(fields) | Datum::Composite { fields, .. } => {
+            out(b"(");
+            for (index, field) in fields.iter().enumerate() {
+                if index > 0 {
+                    out(b",");
+                }
+                write_wire_record_field(&field.value, out);
+            }
+            out(b")");
+        }
+        other => {
+            use core::fmt::Write as _;
+            let _ = write!(Writer(out), "{other}");
+        }
+    }
+}
+
+fn write_wire_record_field(value: &Datum, out: &mut dyn FnMut(&[u8])) {
+    if value.is_null() {
+        return;
+    }
+    let mut empty = true;
+    let mut quote = false;
+    write_wire_text(value, &mut |bytes| {
+        if !bytes.is_empty() {
+            empty = false;
+        }
+        quote |= bytes.iter().any(|byte| {
+            matches!(byte, b',' | b'(' | b')' | b'"' | b'\\') || byte.is_ascii_whitespace()
+        });
+    });
+    if quote || empty {
+        out(b"\"");
+    }
+    write_wire_text(value, &mut |bytes| {
+        let mut plain = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if matches!(byte, b'"' | b'\\') {
+                out(&bytes[plain..index]);
+                out(b"\\");
+                plain = index;
+            }
+        }
+        out(&bytes[plain..]);
+    });
+    if quote || empty {
+        out(b"\"");
+    }
+}
+
+fn write_wire_array_element(value: Datum, delimiter: u8, out: &mut dyn FnMut(&[u8])) {
+    if value.is_null() {
+        out(b"NULL");
+        return;
+    }
+    let mut empty = true;
+    let mut quote = false;
+    let mut prefix = [0u8; 4];
+    let mut prefix_len = 0;
+    write_wire_text(&value, &mut |bytes| {
+        if !bytes.is_empty() {
+            empty = false;
+        }
+        quote |= bytes.iter().any(|byte| {
+            *byte == delimiter
+                || matches!(byte, b'{' | b'}' | b'"' | b'\\')
+                || byte.is_ascii_whitespace()
+        });
+        for byte in bytes {
+            if prefix_len < prefix.len() {
+                prefix[prefix_len] = *byte;
+            }
+            prefix_len += 1;
+        }
+    });
+    quote |= prefix_len == 4 && prefix.eq_ignore_ascii_case(b"null");
+    if quote || empty {
+        out(b"\"");
+    }
+    write_wire_text(&value, &mut |bytes| {
+        let mut plain = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if matches!(byte, b'"' | b'\\') {
+                out(&bytes[plain..index]);
+                out(b"\\");
+                plain = index;
+            }
+        }
+        out(&bytes[plain..]);
+    });
+    if quote || empty {
+        out(b"\"");
+    }
+}
+
+fn write_wire_array(element: crate::sql::types::ArrElem, raw: &[u8], out: &mut dyn FnMut(&[u8])) {
+    let shape = crate::sql::array::shape(raw).expect("array datum invariant");
+    if shape.dimension_count() == 0 {
+        out(b"{}");
+        return;
+    }
+    if (0..shape.dimension_count()).any(|index| shape.lower_bound(index) != Some(1)) {
+        for index in 0..shape.dimension_count() {
+            let bound = stack_format!(
+                32,
+                "[{}:{}]",
+                shape.lower_bound(index).unwrap(),
+                shape.upper_bound(index).unwrap()
+            );
+            out(bound.as_str().as_bytes());
+        }
+        out(b"=");
+    }
+    fn level(
+        element: crate::sql::types::ArrElem,
+        raw: &[u8],
+        shape: crate::sql::array::Shape,
+        depth: usize,
+        index: &mut usize,
+        out: &mut dyn FnMut(&[u8]),
+    ) {
+        out(b"{");
+        for member in 0..shape.dimension(depth).unwrap() {
+            if member > 0 {
+                out(&[element.delimiter()]);
+            }
+            if depth + 1 == shape.dimension_count() {
+                write_wire_array_element(
+                    crate::sql::array::get(raw, element, *index).unwrap_or(Datum::Null),
+                    element.delimiter(),
+                    out,
+                );
+                *index += 1;
+            } else {
+                level(element, raw, shape, depth + 1, index, out);
+            }
+        }
+        out(b"}");
+    }
+    let mut index = 0;
+    level(element, raw, shape, 0, &mut index, out);
+}
+
+fn wire_text_len(value: &Datum) -> usize {
+    let mut len = 0;
+    write_wire_text(value, &mut |bytes| len += bytes.len());
+    len
+}
+
 fn text_value_len(value: &Datum, render: crate::sql::guc::RenderContext) -> usize {
     match value {
         Datum::Null => 0,
         Datum::PgDdlCommand => unreachable!("pg_ddl_command output is rejected before encoding"),
+        Datum::Char(_) => 1,
+        Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => wire_text_len(value),
         Datum::Text(text)
         | Datum::Bpchar(text)
         | Datum::Regtype { name: text, .. }
@@ -171,6 +336,7 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Null => 0,
         Datum::PgDdlCommand => unreachable!("pg_ddl_command output is rejected before encoding"),
         Datum::Bool(_) => 1,
+        Datum::Char(_) => 1,
         Datum::Int2(_) => 2,
         Datum::Int4(_)
         | Datum::Oid(_)
@@ -854,6 +1020,17 @@ impl<'b> Responder<'b> {
                     m.i32(s.len() as i32);
                     m.bytes(s.as_bytes());
                 }
+                Datum::Char(byte) => {
+                    m.i32(1);
+                    m.u8(*byte);
+                }
+                Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => {
+                    m.field(|m| {
+                        write_wire_text(v, &mut |bytes| {
+                            m.bytes(bytes);
+                        })
+                    });
+                }
                 Datum::Bytea(b) => {
                     if render.bytea_escape {
                         // bytea_output = escape: printable ASCII verbatim,
@@ -957,7 +1134,7 @@ impl<'b> Responder<'b> {
         }
     }
 
-    /// One value's wire-text form as an arena string — the same output
+    /// One value's wire-text form as arena bytes — the same output
     /// function semantics `encode_value_text` streams onto the wire (styled
     /// dates and timestamps, GUC-honoring bytea, Display for the rest), for
     /// consumers that must post-process the text (COPY escapes it).
@@ -966,7 +1143,7 @@ impl<'b> Responder<'b> {
         v: &Datum<'a>,
         render: crate::sql::guc::RenderContext,
         arena: &'a crate::mem::arena::Arena,
-    ) -> Result<Option<&'a str>, crate::sql::eval::SqlError> {
+    ) -> Result<Option<&'a [u8]>, crate::sql::eval::SqlError> {
         use crate::sql::eval::sqlstate;
         let full = || {
             crate::sql_err!(
@@ -982,7 +1159,18 @@ impl<'b> Responder<'b> {
                     "cannot display a value of type pg_ddl_command"
                 ));
             }
-            Datum::Text(s) | Datum::Bpchar(s) => s,
+            Datum::Char(byte) => arena.alloc_slice_copy(&[*byte]).map_err(|_| full())?,
+            Datum::Array { .. } | Datum::Record(_) | Datum::Composite { .. } => {
+                let len = wire_text_len(v);
+                let bytes = arena.alloc_slice_with(len, |_| 0u8).map_err(|_| full())?;
+                let mut at = 0;
+                write_wire_text(v, &mut |part| {
+                    bytes[at..at + part.len()].copy_from_slice(part);
+                    at += part.len();
+                });
+                &*bytes
+            }
+            Datum::Text(s) | Datum::Bpchar(s) => s.as_bytes(),
             Datum::Bytea(b) if render.bytea_escape => {
                 let escaped_len: usize = b
                     .iter()
@@ -1015,11 +1203,12 @@ impl<'b> Responder<'b> {
                         }
                     }
                 }
-                core::str::from_utf8(out).expect("escaped bytea is ASCII")
+                &*out
             }
             Datum::Date(d) => arena
                 .alloc_str(crate::sql::datetime::format_date_styled(*d, render.datestyle).as_str())
-                .map_err(|_| full())?,
+                .map_err(|_| full())?
+                .as_bytes(),
             Datum::Timestamp(t) | Datum::Timestamptz(t) => {
                 let with_timezone = matches!(v, Datum::Timestamptz(_));
                 let text = crate::sql::datetime::format_timestamp_styled(
@@ -1028,15 +1217,22 @@ impl<'b> Responder<'b> {
                     render.datestyle,
                     render.parsed_timezone,
                 );
-                arena.alloc_str(text.as_str()).map_err(|_| full())?
+                arena
+                    .alloc_str(text.as_str())
+                    .map_err(|_| full())?
+                    .as_bytes()
             }
             Datum::Interval(interval) => arena
                 .alloc_str(
                     crate::sql::datetime::format_interval_styled(*interval, render.intervalstyle)
                         .as_str(),
                 )
-                .map_err(|_| full())?,
-            other => arena.alloc_str_display(other).map_err(|_| full())?,
+                .map_err(|_| full())?
+                .as_bytes(),
+            other => arena
+                .alloc_str_display(other)
+                .map_err(|_| full())?
+                .as_bytes(),
         }))
     }
 
@@ -1147,6 +1343,10 @@ impl<'b> Responder<'b> {
                 Datum::Float8(x) => {
                     m.i32(8);
                     m.bytes(&x.to_bits().to_be_bytes());
+                }
+                Datum::Char(byte) => {
+                    m.i32(1);
+                    m.u8(*byte);
                 }
                 Datum::Text(s) | Datum::Bpchar(s) => {
                     m.i32(s.len() as i32);
@@ -1766,6 +1966,86 @@ mod tests {
                 0, 0, 0, 25, // text OID.
                 0xff, 0xff, 0xff, 0xff, // NULL field.
             ]
+        );
+    }
+
+    #[test]
+    fn internal_char_writes_its_single_raw_byte_in_both_formats() {
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "raw char", 64).unwrap();
+        let mut text = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_text(
+            &mut text,
+            &Datum::Char(0xff),
+            crate::sql::guc::RenderContext::default(),
+        );
+        text.finish().unwrap();
+        assert_eq!(buffer.readable(), &[b'd', 0, 0, 0, 9, 0, 0, 0, 1, 0xff]);
+
+        buffer.clear();
+        let mut binary = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_binary(&mut binary, &Datum::Char(0xff));
+        binary.finish().unwrap();
+        assert_eq!(buffer.readable(), &[b'd', 0, 0, 0, 9, 0, 0, 0, 1, 0xff]);
+    }
+
+    #[test]
+    fn internal_char_array_text_preserves_raw_elements_and_bounds() {
+        let mut arena_budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut arena_budget, "raw char array", 1 << 12).unwrap();
+        let raw = crate::sql::array::build_shaped(
+            &[Datum::Char(0xff), Datum::Char(b'{')],
+            crate::sql::array::Shape::new(&[2], &[0]).unwrap(),
+            &arena,
+        )
+        .unwrap();
+        let value = Datum::Array {
+            element: crate::sql::types::ArrElem::Char,
+            raw,
+        };
+        let expected = b"[0:1]={\xff,\"{\"}";
+
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "raw char array", 64).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_text(
+            &mut message,
+            &value,
+            crate::sql::guc::RenderContext::default(),
+        );
+        message.finish().unwrap();
+        assert_eq!(
+            &buffer.readable()[5..9],
+            &(expected.len() as i32).to_be_bytes()
+        );
+        assert_eq!(&buffer.readable()[9..], expected);
+        assert_eq!(
+            Responder::datum_wire_text(&value, crate::sql::guc::RenderContext::default(), &arena)
+                .unwrap(),
+            Some(expected.as_slice())
+        );
+    }
+
+    #[test]
+    fn internal_char_record_text_preserves_the_raw_field_byte() {
+        let fields = [RecordField {
+            name: "kind",
+            type_oid: oid::CHAR,
+            value: Datum::Char(0xff),
+        }];
+        let value = Datum::Record(&fields);
+        let mut budget = Budget::new(1 << 16);
+        let mut buffer = FixedBuf::new(&mut budget, "raw char record", 64).unwrap();
+        let mut message = MsgOut::begin(&mut buffer, b'd');
+        Responder::encode_value_text(
+            &mut message,
+            &value,
+            crate::sql::guc::RenderContext::default(),
+        );
+        message.finish().unwrap();
+        assert_eq!(
+            buffer.readable(),
+            &[b'd', 0, 0, 0, 11, 0, 0, 0, 3, b'(', 0xff, b')']
         );
     }
 

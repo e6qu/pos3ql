@@ -1562,6 +1562,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int8(_) => "bigint",
                     Datum::Float4(_) => "real",
                     Datum::Float8(_) => "double precision",
+                    Datum::Char(_) => "\"char\"",
                     Datum::Text(_) => "text",
                     Datum::Bpchar(_) => "character",
                     Datum::Regtype { .. } => "regtype",

@@ -31,6 +31,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
             Datum::RegObject { name, .. } => 12 + name.len(),
             Datum::Null => 0,
             Datum::Bool(_) => 1,
+            Datum::Char(_) => 1,
             Datum::Int2(_) | Datum::Int4(_) | Datum::Oid(_) | Datum::Date(_) => 4,
             // float4 keeps the historical 8-byte float8 layout (see the decode
             // side); the schema narrows it back to f32.
@@ -121,6 +122,10 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
             }
             Datum::Bool(b) => {
                 rest[0] = u8::from(*b);
+                take = 1;
+            }
+            Datum::Char(byte) => {
+                rest[0] = *byte;
                 take = 1;
             }
             Datum::Int4(x) => {
@@ -301,6 +306,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
     let corrupt = || sql_err!(sqlstate::PROTOCOL_VIOLATION, "corrupt row encoding");
     let fixed = match column {
         ColType::Bool => Some(1),
+        ColType::Char => Some(1),
         ColType::Int2 | ColType::Int4 | ColType::Oid | ColType::Xid | ColType::Date => Some(4),
         ColType::Int8
         | ColType::Float4
@@ -317,8 +323,7 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             let header = bytes.get(..7).ok_or_else(corrupt)?;
             Some(7 + u16::from_le_bytes([header[5], header[6]]) as usize * 2)
         }
-        ColType::Char
-        | ColType::Text
+        ColType::Text
         | ColType::Name
         | ColType::Varchar
         | ColType::Bpchar
@@ -535,7 +540,11 @@ pub(crate) fn decode<'a>(
                 };
                 at += 8;
             }
-            ColType::Char | ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
+            ColType::Char => {
+                out[i] = Datum::Char(*bytes.get(at).ok_or_else(corrupt)?);
+                at += 1;
+            }
+            ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
                 let b = bytes.get(at..at + 4).ok_or_else(corrupt)?;
                 let len = u32::from_le_bytes(b.try_into().unwrap()) as usize;
                 at += 4;
@@ -776,6 +785,7 @@ mod tests {
     fn roundtrip_all_types_and_nulls() {
         let schema = [
             ColType::Bool,
+            ColType::Char,
             ColType::Int4,
             ColType::Int8,
             ColType::Float8,
@@ -785,6 +795,7 @@ mod tests {
         ];
         let values = [
             Datum::Bool(true),
+            Datum::Char(0xff),
             Datum::Int4(-7),
             Datum::Null,
             Datum::Float8(2.5),
@@ -799,7 +810,7 @@ mod tests {
         encode(&values, &mut buffer);
         let mut out = [Datum::Null; MAX_COLUMNS];
         decode(&buffer, &schema, &mut out).unwrap();
-        assert_eq!(&out[..7], &values);
+        assert_eq!(&out[..8], &values);
     }
 
     #[test]

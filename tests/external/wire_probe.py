@@ -5057,6 +5057,75 @@ def test_privilege_targets_over_raw_wire():
     s.close()
 
 
+def test_generated_expression_lifecycle_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_generated_lifecycle "
+        "(a integer, b integer GENERATED ALWAYS AS (a + 1) STORED); "
+        "INSERT INTO wire_generated_lifecycle (a) VALUES (2), (4); "
+        "ALTER TABLE wire_generated_lifecycle "
+        "ALTER COLUMN b SET EXPRESSION AS (a * 10)",
+    )
+    rewritten = simple_query(
+        s,
+        "SELECT a, b FROM wire_generated_lifecycle ORDER BY a",
+    )
+    set_default = simple_query(
+        s,
+        "ALTER TABLE wire_generated_lifecycle ALTER COLUMN b SET DEFAULT 7",
+    )
+    drop_default = simple_query(
+        s,
+        "ALTER TABLE wire_generated_lifecycle ALTER COLUMN b DROP DEFAULT",
+    )
+    add_identity = simple_query(
+        s,
+        "ALTER TABLE wire_generated_lifecycle ALTER COLUMN b SET NOT NULL; "
+        "ALTER TABLE wire_generated_lifecycle "
+        "ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY",
+    )
+    drop_expression = simple_query(
+        s,
+        "ALTER TABLE wire_generated_lifecycle ALTER COLUMN b DROP EXPRESSION; "
+        "UPDATE wire_generated_lifecycle SET b = 99 WHERE a = 2; "
+        "INSERT INTO wire_generated_lifecycle VALUES (7, 8); "
+        "SELECT a, b, attgenerated FROM wire_generated_lifecycle "
+        "CROSS JOIN pg_attribute "
+        "WHERE attrelid = 'wire_generated_lifecycle'::regclass AND attname = 'b' "
+        "ORDER BY a; "
+        "ALTER TABLE wire_generated_lifecycle ALTER COLUMN b DROP EXPRESSION IF EXISTS",
+    )
+    cleanup = simple_query(s, "DROP TABLE wire_generated_lifecycle")
+    rewritten_rows = [text_row_fields(payload) for kind, payload in rewritten if kind == b"D"]
+    dropped_rows = [
+        text_row_fields(payload) for kind, payload in drop_expression if kind == b"D"
+    ]
+    results = (
+        setup,
+        rewritten,
+        set_default,
+        drop_default,
+        add_identity,
+        drop_expression,
+        cleanup,
+    )
+    check(
+        "generated expressions: raw wire preserves rewrites and typed DROP EXPRESSION transition",
+        not any(kind == b"E" for result in (setup, rewritten, drop_expression, cleanup) for kind, _ in result)
+        and has_sqlstate(set_default, "42601")
+        and has_sqlstate(drop_default, "42601")
+        and has_sqlstate(add_identity, "55000")
+        and rewritten_rows == [["2", "20"], ["4", "40"]]
+        and dropped_rows == [["2", "99", ""], ["4", "40", ""], ["7", "8", ""]]
+        and any(kind == b"N" and b"not a stored generated column, skipping" in payload for kind, payload in drop_expression),
+        results,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

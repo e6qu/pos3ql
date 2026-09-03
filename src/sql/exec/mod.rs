@@ -57492,6 +57492,14 @@ fn alter_table_inner(
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
+                if new_def.columns[i].default.is_generated() {
+                    return sql_fail(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "column \"{}\" of relation \"{}\" is a generated column",
+                        column,
+                        statement.table.name
+                    ));
+                }
                 let ctype = new_def.columns[i].ctype;
                 let type_mod = new_def.columns[i].type_mod;
                 // A literal-only default folds to a constant; a call-bearing one
@@ -57514,6 +57522,14 @@ fn alter_table_inner(
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
+                if new_def.columns[i].default.is_generated() {
+                    return sql_fail(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "column \"{}\" of relation \"{}\" is a generated column; use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead",
+                        column,
+                        statement.table.name
+                    ));
+                }
                 new_def.columns[i].default = crate::storage::ColumnDefault::NONE;
                 // Dropping a serial column's default detaches its auto-increment.
                 new_def.columns[i].auto_increment = false;
@@ -57527,6 +57543,14 @@ fn alter_table_inner(
                     return sql_fail(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                         "column \"{}\" of relation \"{}\" is already an identity column",
+                        column,
+                        statement.table.name
+                    ));
+                }
+                if !matches!(col.default, crate::storage::ColumnDefault::None) {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" already has a default value",
                         column,
                         statement.table.name
                     ));
@@ -57699,6 +57723,36 @@ fn alter_table_inner(
                 new_def.columns[i].default = crate::storage::ColumnDefault::Generated(expression);
                 generated_changed = true;
                 validate_definition = true;
+            }
+            AlterAction::DropGeneratedExpression { column, if_exists } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if !new_def.columns[i].default.is_generated() {
+                    if *if_exists {
+                        responder.notice(
+                            crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                            stack_format!(
+                                192,
+                                "column \"{}\" of relation \"{}\" is not a stored generated column, skipping",
+                                column,
+                                statement.table.name
+                            )
+                            .as_str(),
+                        )?;
+                        continue;
+                    }
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" is not a stored generated column",
+                        column,
+                        statement.table.name
+                    ));
+                }
+                // PostgreSQL preserves the already-materialized datum. Only
+                // the catalog expression changes, so later writes use the
+                // ordinary-column path without a recomputing rewrite.
+                new_def.columns[i].default = crate::storage::ColumnDefault::NONE;
             }
             AlterAction::SetNotNull { column } => {
                 let Some(i) = new_def.column_index(column) else {

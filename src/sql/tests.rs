@@ -28148,7 +28148,99 @@ fn generated_expression_evolution_rewrites_rows_and_survives_cold_recovery() {
         )),
         ["3|30", "4|40", "5|50"]
     );
+    // A rollback restores the typed generated definition. Once committed,
+    // DROP EXPRESSION keeps the materialized values and makes the column
+    // writable without retaining a stale generation expression.
+    run_with(
+        &mut cold,
+        &mut cold_budget,
+        "BEGIN; \
+         ALTER TABLE generated_expression_evolution ALTER COLUMN b DROP EXPRESSION; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT attgenerated FROM pg_attribute \
+             WHERE attrelid = 'generated_expression_evolution'::regclass AND attname = 'b'"
+        )),
+        ["s"]
+    );
+    for statement in [
+        "ALTER TABLE generated_expression_evolution ALTER COLUMN b SET DEFAULT 1",
+        "ALTER TABLE generated_expression_evolution ALTER COLUMN b DROP DEFAULT",
+    ] {
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut cold, &mut cold_budget, statement))
+                .contains("42601"),
+            "{statement}"
+        );
+    }
+    run_with(
+        &mut cold,
+        &mut cold_budget,
+        "ALTER TABLE generated_expression_evolution ALTER COLUMN b SET NOT NULL",
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "ALTER TABLE generated_expression_evolution \
+             ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY"
+        ))
+        .contains("55000")
+    );
+    run_with(
+        &mut cold,
+        &mut cold_budget,
+        "ALTER TABLE generated_expression_evolution ALTER COLUMN b DROP EXPRESSION; \
+         UPDATE generated_expression_evolution SET b = 99 WHERE a = 3; \
+         INSERT INTO generated_expression_evolution VALUES (6, 8)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT a, b, attgenerated \
+             FROM generated_expression_evolution \
+             CROSS JOIN pg_attribute \
+             WHERE attrelid = 'generated_expression_evolution'::regclass \
+               AND attname = 'b' \
+             ORDER BY a"
+        )),
+        ["3|99|", "4|40|", "5|50|", "6|8|"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "ALTER TABLE generated_expression_evolution \
+             ALTER COLUMN b DROP EXPRESSION IF EXISTS"
+        ))
+        .contains("not a stored generated column, skipping")
+    );
+    cold.commit_wal().unwrap();
+    assert!(cold.checkpoint().unwrap());
     drop(cold);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut final_budget = Budget::new(1 << 29);
+    let mut final_cold = Engine::new(&config, &mut final_budget).unwrap();
+    run_with(
+        &mut final_cold,
+        &mut final_budget,
+        "INSERT INTO generated_expression_evolution VALUES (7, 11)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut final_cold,
+            &mut final_budget,
+            "SELECT a, b FROM generated_expression_evolution ORDER BY a"
+        )),
+        ["3|99", "4|40", "5|50", "6|8", "7|11"]
+    );
+    drop(final_cold);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }

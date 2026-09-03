@@ -4349,6 +4349,13 @@ pub enum AlterAction<'a> {
         column: &'a str,
         expression_text: &'a str,
     },
+    /// ALTER [COLUMN] col DROP EXPRESSION [IF EXISTS]. This changes a stored
+    /// generated column back into an ordinary writable column while retaining
+    /// its already-materialized values.
+    DropGeneratedExpression {
+        column: &'a str,
+        if_exists: bool,
+    },
     /// ALTER [COLUMN] col SET identity-sequence options.
     AlterIdentitySequence {
         column: &'a str,

@@ -87,6 +87,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::DropIdentity { .. }
         | AlterAction::SetIdentityMode { .. }
         | AlterAction::SetGeneratedExpression { .. }
+        | AlterAction::DropGeneratedExpression { .. }
         | AlterAction::AlterIdentitySequence { .. } => 4,
         AlterAction::SetForeignOptions(_)
         | AlterAction::SetColumnForeignOptions { .. }
@@ -5674,6 +5675,14 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("drop")? {
                 if self.eat_ident("default")? {
                     Ok(AlterAction::DropDefault { column })
+                } else if self.eat_ident("expression")? {
+                    let if_exists = if self.eat_ident("if")? {
+                        self.expect_ident("exists")?;
+                        true
+                    } else {
+                        false
+                    };
+                    Ok(AlterAction::DropGeneratedExpression { column, if_exists })
                 } else if self.eat_ident("identity")? {
                     let if_exists = if self.eat_ident("if")? {
                         self.expect_ident("exists")?;

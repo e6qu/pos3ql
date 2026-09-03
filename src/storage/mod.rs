@@ -9139,9 +9139,11 @@ pub(crate) const fn all_object_privileges(class: AccessClass) -> PrivilegeSet {
 }
 
 pub(crate) const PUBLIC_ROLE: u16 = u16::MAX;
+pub(crate) const BOOTSTRAP_ROLE: u16 = 0;
 pub(crate) const MAX_ACL_ENTRIES: usize = 512;
 pub(crate) const MAX_COLUMN_ACL_ENTRIES: usize = 1024;
 pub(crate) const MAX_DEFAULT_ACL_ENTRIES: usize = 256;
+pub(crate) const MAX_PARAMETER_ACL_ENTRIES: usize = 128;
 pub(crate) const DEFAULT_ACL_ALL_SCHEMAS: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9164,11 +9166,35 @@ pub(crate) struct AclEntry {
     pub pending: Option<PendingAcl>,
 }
 
+/// A non-default `pg_parameter_acl` row.  Parameters have no owner or
+/// database scope, so their ACL identity is intentionally separate from an
+/// [`AccessObject`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ParameterAclEntry {
+    pub parameter: crate::sql::ast::ParameterName,
+    pub grantee: u16,
+    pub grantor: u16,
+    pub privileges: crate::sql::ast::ParameterPrivileges,
+    pub grant_options: crate::sql::ast::ParameterPrivileges,
+    pub live: bool,
+    pub pending: Option<PendingParameterAcl>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingParameterAcl {
+    pub txid: u32,
+    pub grantee: u16,
+    pub grantor: u16,
+    pub privileges: crate::sql::ast::ParameterPrivileges,
+    pub grant_options: crate::sql::ast::ParameterPrivileges,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RoleObjectDependency {
     OwnedObject,
     OwnedCatalogObject,
     ObjectPrivilege,
+    ParameterPrivilege,
     DefaultPrivilege,
     ColumnPrivilege,
     Policy,
@@ -9936,6 +9962,7 @@ pub struct Storage {
     acl_entries: FixedVec<AclEntry>,
     column_acl_entries: FixedVec<ColumnAclEntry>,
     default_acl_entries: FixedVec<DefaultAclEntry>,
+    parameter_acl_entries: FixedVec<ParameterAclEntry>,
     /// Object comments (`COMMENT ON ...`), keyed by object identity. A slab of
     /// fixed slots reused as comments are added and removed.
     comments: FixedVec<CommentEntry>,
@@ -11229,6 +11256,7 @@ impl Storage {
             + MAX_ACL_ENTRIES * size_of::<AclEntry>()
             + MAX_COLUMN_ACL_ENTRIES * size_of::<ColumnAclEntry>()
             + MAX_DEFAULT_ACL_ENTRIES * size_of::<DefaultAclEntry>()
+            + MAX_PARAMETER_ACL_ENTRIES * size_of::<ParameterAclEntry>()
             + MAX_SEQUENCES * size_of::<SequenceDef>()
             + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_ENUMS * size_of::<EnumDef>()
@@ -11852,6 +11880,8 @@ impl Storage {
             FixedVec::new(budget, "default_acl_entries", MAX_DEFAULT_ACL_ENTRIES)?;
         let column_acl_entries =
             FixedVec::new(budget, "column_acl_entries", MAX_COLUMN_ACL_ENTRIES)?;
+        let parameter_acl_entries =
+            FixedVec::new(budget, "parameter_acl_entries", MAX_PARAMETER_ACL_ENTRIES)?;
         let mut indexes = FixedVec::new(budget, "indexes", config.max_tables)?;
         for _ in 0..config.max_tables {
             indexes
@@ -12025,6 +12055,7 @@ impl Storage {
             acl_entries,
             column_acl_entries,
             default_acl_entries,
+            parameter_acl_entries,
             comments,
             path: PathContext::public_schema(2),
             catalog_seq: 0,
@@ -15326,6 +15357,12 @@ impl Storage {
         }) {
             return Some(RoleObjectDependency::ObjectPrivilege);
         }
+        if self.parameter_acl_entries.iter().any(|entry| {
+            let (visible, grantee, grantor, _, _) = Self::parameter_acl_visible(entry, txid);
+            visible && (grantee == role as u16 || grantor == role as u16)
+        }) {
+            return Some(RoleObjectDependency::ParameterPrivilege);
+        }
         if self.default_acl_entries.iter().any(|entry| {
             let (defined, _, _) = Self::default_acl_visible(entry, txid);
             defined && (entry.owner == role as u16 || entry.grantee == role as u16)
@@ -15619,6 +15656,310 @@ impl Storage {
 
     pub(crate) fn restore_acl_pending(&mut self, slot: usize, prior: Option<PendingAcl>) {
         self.acl_entries[slot].pending = prior;
+    }
+
+    fn parameter_acl_visible(
+        entry: &ParameterAclEntry,
+        txid: u32,
+    ) -> (
+        bool,
+        u16,
+        u16,
+        crate::sql::ast::ParameterPrivileges,
+        crate::sql::ast::ParameterPrivileges,
+    ) {
+        match entry.pending {
+            Some(pending) if pending.txid == txid => (
+                pending.privileges.bits() != 0,
+                pending.grantee,
+                pending.grantor,
+                pending.privileges,
+                pending.grant_options,
+            ),
+            _ => (
+                entry.live,
+                entry.grantee,
+                entry.grantor,
+                entry.privileges,
+                entry.grant_options,
+            ),
+        }
+    }
+
+    pub(crate) fn change_parameter_acl(
+        &mut self,
+        parameter: crate::sql::ast::ParameterName,
+        grantee: u16,
+        grantor: u16,
+        privileges: crate::sql::ast::ParameterPrivileges,
+        grant_options: crate::sql::ast::ParameterPrivileges,
+        txid: u32,
+    ) -> Result<(usize, Option<PendingParameterAcl>), SqlError> {
+        let slot = self
+            .parameter_acl_entries
+            .iter()
+            .position(|entry| {
+                let (_, visible_grantee, visible_grantor, _, _) =
+                    Self::parameter_acl_visible(entry, txid);
+                entry.parameter == parameter
+                    && visible_grantee == grantee
+                    && visible_grantor == grantor
+                    && (entry.live || entry.pending.is_some())
+            })
+            .or_else(|| {
+                self.parameter_acl_entries.iter().position(|entry| {
+                    entry.parameter.is_empty() && !entry.live && entry.pending.is_none()
+                })
+            })
+            .unwrap_or(self.parameter_acl_entries.len());
+        if slot == self.parameter_acl_entries.len() {
+            self.parameter_acl_entries
+                .push(ParameterAclEntry {
+                    parameter,
+                    grantee,
+                    grantor,
+                    privileges: crate::sql::ast::ParameterPrivileges::NONE,
+                    grant_options: crate::sql::ast::ParameterPrivileges::NONE,
+                    live: false,
+                    pending: None,
+                })
+                .map_err(|_| {
+                    sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "too many parameter privilege entries (limit {})",
+                        MAX_PARAMETER_ACL_ENTRIES
+                    )
+                })?;
+        } else if self.parameter_acl_entries[slot].parameter.is_empty() {
+            self.parameter_acl_entries[slot].parameter = parameter;
+            self.parameter_acl_entries[slot].grantee = grantee;
+            self.parameter_acl_entries[slot].grantor = grantor;
+        }
+        let entry = &mut self.parameter_acl_entries[slot];
+        let prior = entry.pending;
+        if txid == 0 {
+            entry.grantee = grantee;
+            entry.grantor = grantor;
+            entry.privileges = privileges;
+            entry.grant_options = grant_options;
+            entry.live = privileges.bits() != 0;
+            entry.pending = None;
+        } else {
+            entry.pending = Some(PendingParameterAcl {
+                txid,
+                grantee,
+                grantor,
+                privileges,
+                grant_options,
+            });
+        }
+        Ok((slot, prior))
+    }
+
+    pub(crate) fn parameter_acl_from(
+        &self,
+        parameter: crate::sql::ast::ParameterName,
+        grantee: u16,
+        grantor: u16,
+        txid: u32,
+    ) -> (
+        crate::sql::ast::ParameterPrivileges,
+        crate::sql::ast::ParameterPrivileges,
+    ) {
+        self.parameter_acl_entries
+            .iter()
+            .filter(|entry| {
+                let (_, visible_grantee, visible_grantor, _, _) =
+                    Self::parameter_acl_visible(entry, txid);
+                entry.parameter == parameter
+                    && visible_grantee == grantee
+                    && visible_grantor == grantor
+            })
+            .fold(
+                (
+                    crate::sql::ast::ParameterPrivileges::NONE,
+                    crate::sql::ast::ParameterPrivileges::NONE,
+                ),
+                |(privileges, grant_options), entry| {
+                    let (visible, _, _, entry_privileges, entry_options) =
+                        Self::parameter_acl_visible(entry, txid);
+                    if visible {
+                        (
+                            privileges.union(entry_privileges),
+                            grant_options.union(entry_options),
+                        )
+                    } else {
+                        (privileges, grant_options)
+                    }
+                },
+            )
+    }
+
+    fn parameter_acl_to(
+        &self,
+        parameter: crate::sql::ast::ParameterName,
+        grantee: u16,
+        txid: u32,
+    ) -> (
+        crate::sql::ast::ParameterPrivileges,
+        crate::sql::ast::ParameterPrivileges,
+    ) {
+        self.parameter_acl_entries
+            .iter()
+            .filter(|entry| {
+                let (_, visible_grantee, _, _, _) = Self::parameter_acl_visible(entry, txid);
+                entry.parameter == parameter && visible_grantee == grantee
+            })
+            .fold(
+                (
+                    crate::sql::ast::ParameterPrivileges::NONE,
+                    crate::sql::ast::ParameterPrivileges::NONE,
+                ),
+                |(privileges, grant_options), entry| {
+                    let (visible, _, _, entry_privileges, entry_options) =
+                        Self::parameter_acl_visible(entry, txid);
+                    if visible {
+                        (
+                            privileges.union(entry_privileges),
+                            grant_options.union(entry_options),
+                        )
+                    } else {
+                        (privileges, grant_options)
+                    }
+                },
+            )
+    }
+
+    pub(crate) fn has_parameter_privilege(
+        &self,
+        parameter: crate::sql::ast::ParameterName,
+        role: usize,
+        required: crate::sql::ast::ParameterPrivileges,
+        txid: u32,
+    ) -> bool {
+        let mut effective = self.parameter_acl_to(parameter, PUBLIC_ROLE, txid).0;
+        for candidate in 0..self.roles.len() {
+            if candidate == role || self.role_is_member_of(role, candidate, txid) {
+                effective =
+                    effective.union(self.parameter_acl_to(parameter, candidate as u16, txid).0);
+            }
+        }
+        effective.contains(required)
+    }
+
+    pub(crate) fn has_parameter_grant_option(
+        &self,
+        parameter: crate::sql::ast::ParameterName,
+        role: usize,
+        required: crate::sql::ast::ParameterPrivileges,
+        txid: u32,
+    ) -> bool {
+        let mut effective = self.parameter_acl_to(parameter, PUBLIC_ROLE, txid).1;
+        for candidate in 0..self.roles.len() {
+            if candidate == role || self.role_is_member_of(role, candidate, txid) {
+                effective =
+                    effective.union(self.parameter_acl_to(parameter, candidate as u16, txid).1);
+            }
+        }
+        effective.contains(required)
+    }
+
+    pub(crate) fn dependent_parameter_acl_slots(
+        &self,
+        parameter: crate::sql::ast::ParameterName,
+        grantor: u16,
+        privileges: crate::sql::ast::ParameterPrivileges,
+        txid: u32,
+        output: &mut [usize; MAX_PARAMETER_ACL_ENTRIES],
+    ) -> usize {
+        let mut count = 0usize;
+        for (slot, entry) in self.parameter_acl_entries.iter().enumerate() {
+            let (visible, _, entry_grantor, entry_privileges, _) =
+                Self::parameter_acl_visible(entry, txid);
+            if visible
+                && entry.parameter == parameter
+                && entry_grantor == grantor
+                && entry_privileges.bits() & privileges.bits() != 0
+            {
+                output[count] = slot;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub(crate) fn parameter_acl_entry(&self, slot: usize) -> &ParameterAclEntry {
+        &self.parameter_acl_entries[slot]
+    }
+
+    pub(crate) fn parameter_acl_identity(&self, slot: usize, txid: u32) -> (u16, u16) {
+        let (_, grantee, grantor, _, _) =
+            Self::parameter_acl_visible(&self.parameter_acl_entries[slot], txid);
+        (grantee, grantor)
+    }
+
+    pub(crate) fn parameter_acl_state(
+        &self,
+        slot: usize,
+        txid: u32,
+    ) -> (
+        crate::sql::ast::ParameterPrivileges,
+        crate::sql::ast::ParameterPrivileges,
+    ) {
+        let (_, _, _, privileges, grant_options) =
+            Self::parameter_acl_visible(&self.parameter_acl_entries[slot], txid);
+        (privileges, grant_options)
+    }
+
+    pub(crate) fn parameter_acl_entries_visible(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &ParameterAclEntry)> {
+        self.parameter_acl_entries
+            .iter()
+            .enumerate()
+            .filter(move |(_, entry)| Self::parameter_acl_visible(entry, txid).0)
+    }
+
+    pub(crate) fn checkpoint_parameter_acls(
+        &self,
+    ) -> impl Iterator<Item = (usize, &ParameterAclEntry)> {
+        self.parameter_acl_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.live)
+    }
+
+    pub(crate) fn commit_parameter_acl(&mut self, slot: usize, txid: u32) {
+        let Some(pending) = self.parameter_acl_entries[slot].pending else {
+            return;
+        };
+        if pending.txid != txid {
+            return;
+        }
+        let entry = &mut self.parameter_acl_entries[slot];
+        entry.grantee = pending.grantee;
+        entry.grantor = pending.grantor;
+        entry.privileges = pending.privileges;
+        entry.grant_options = pending.grant_options;
+        entry.live = pending.privileges.bits() != 0;
+        entry.pending = None;
+        if !entry.live {
+            entry.parameter = crate::sql::ast::ParameterName::EMPTY;
+            entry.privileges = crate::sql::ast::ParameterPrivileges::NONE;
+            entry.grant_options = crate::sql::ast::ParameterPrivileges::NONE;
+        }
+    }
+
+    pub(crate) fn restore_parameter_acl_pending(
+        &mut self,
+        slot: usize,
+        prior: Option<PendingParameterAcl>,
+    ) {
+        self.parameter_acl_entries[slot].pending = prior;
+        if !self.parameter_acl_entries[slot].live && prior.is_none() {
+            self.parameter_acl_entries[slot].parameter = crate::sql::ast::ParameterName::EMPTY;
+        }
     }
 
     pub(crate) fn acl_identity(&self, slot: usize, txid: u32) -> (u16, u16) {

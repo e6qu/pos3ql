@@ -2261,6 +2261,7 @@ pub(crate) fn alter_foreign_table(
             false,
             Some(crate::storage::TableKind::Foreign),
             "ALTER FOREIGN TABLE",
+            AlterInheritanceScope::Direct,
         ) {
             Ok(Ok(())) => {}
             other => return other,
@@ -5345,6 +5346,7 @@ pub fn alter_materialized_view(
         true,
         Some(crate::storage::TableKind::Local),
         "ALTER MATERIALIZED VIEW",
+        AlterInheritanceScope::Direct,
     )
 }
 
@@ -6290,7 +6292,19 @@ pub fn alter_system(
     let current = storage
         .current_role_slot(txn.txid)
         .expect("current role exists");
-    if !storage.role(current).attributes_to(txn.txid).superuser {
+    let superuser = storage.role(current).attributes_to(txn.txid).superuser;
+    if !superuser
+        && name
+            .and_then(crate::sql::ast::ParameterName::parse)
+            .is_none_or(|parameter| {
+                !storage.has_parameter_privilege(
+                    parameter,
+                    current,
+                    crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM,
+                    txn.txid,
+                )
+            })
+    {
         return sql_fail(sql_err!(
             sqlstate::INSUFFICIENT_PRIVILEGE,
             "permission denied to alter system configuration"
@@ -7137,6 +7151,7 @@ fn privilege_mask(
             Privilege::Maintain => PrivilegeSet::MAINTAIN,
             Privilege::Connect => PrivilegeSet::CONNECT,
             Privilege::Temporary => PrivilegeSet::TEMPORARY,
+            Privilege::Set | Privilege::AlterSystem => PrivilegeSet::NONE,
         };
         if !allowed.contains(bit) {
             return Err(sql_err!(
@@ -7187,6 +7202,7 @@ fn default_privilege_mask(
             Privilege::Maintain => PrivilegeSet::MAINTAIN,
             Privilege::Connect => PrivilegeSet::CONNECT,
             Privilege::Temporary => PrivilegeSet::TEMPORARY,
+            Privilege::Set | Privilege::AlterSystem => PrivilegeSet::NONE,
         };
         if !allowed.contains(bit) {
             return Err(sql_err!(
@@ -7206,6 +7222,8 @@ fn default_privilege_mask(
                     Privilege::Maintain => "MAINTAIN",
                     Privilege::Connect => "CONNECT",
                     Privilege::Temporary => "TEMPORARY",
+                    Privilege::Set => "SET",
+                    Privilege::AlterSystem => "ALTER SYSTEM",
                     Privilege::All => "ALL",
                 }
             ));
@@ -8750,6 +8768,9 @@ fn resolve_privilege_objects(
     use crate::storage::{AccessClass, AccessObject};
     let mut count = 0usize;
     match target {
+        PrivilegeTarget::Parameters(_) => {
+            unreachable!("parameter privileges use their typed executor")
+        }
         PrivilegeTarget::LargeObjects(oids) => {
             for oid in oids {
                 let Some(slot) = storage.large_object_slot(*oid, txid) else {
@@ -9700,6 +9721,372 @@ pub fn revoke_privileges(
                         return sql_fail(error);
                     }
                 }
+            }
+        }
+    }
+    responder.command_complete("REVOKE")?;
+    sql_ok()
+}
+
+fn parameter_acl_grantee(storage: &Storage, written: &str, txid: u32) -> Result<u16, SqlError> {
+    if written.eq_ignore_ascii_case("public") {
+        return Ok(crate::storage::PUBLIC_ROLE);
+    }
+    storage
+        .find_role_visible(written, txid)
+        .map(|slot| slot as u16)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                written
+            )
+        })
+}
+
+fn parameter_acl_grantor(
+    storage: &Storage,
+    txn: &TxnState,
+    written: Option<&str>,
+) -> Result<usize, SqlError> {
+    let current = super::eval::funcs::system::current_user_owned();
+    let grantor = storage
+        .find_role_visible(current.as_str(), txn.txid)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                current.as_str()
+            )
+        })?;
+    if let Some(written) = written {
+        let resolved = resolve_role_name(written);
+        if resolved.as_str() != current.as_str() {
+            return Err(sql_err!(
+                sqlstate::INVALID_GRANT_OPERATION,
+                "GRANTED BY must specify the current user"
+            ));
+        }
+    }
+    Ok(grantor)
+}
+
+fn ensure_parameter_acl_target(parameter: crate::sql::ast::ParameterName) -> Result<(), SqlError> {
+    if crate::sql::guc::knows_parameter(parameter.as_str()) {
+        Ok(())
+    } else {
+        Err(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "unrecognized configuration parameter \"{}\"",
+            parameter.as_str()
+        ))
+    }
+}
+
+/// PostgreSQL records the bootstrap role's `SET, ALTER SYSTEM` ACL whenever a
+/// parameter first gains explicit ACL state.  Materializing it with the first
+/// mutation keeps catalog output, WAL, and checkpoint recovery identical.
+fn materialize_parameter_acl_default(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    parameter: crate::sql::ast::ParameterName,
+) -> Result<(), SqlError> {
+    let (privileges, _) = storage.parameter_acl_from(
+        parameter,
+        crate::storage::BOOTSTRAP_ROLE,
+        crate::storage::BOOTSTRAP_ROLE,
+        txn.txid,
+    );
+    if privileges == crate::sql::ast::ParameterPrivileges::ALL {
+        return Ok(());
+    }
+    let (slot, prior) = storage.change_parameter_acl(
+        parameter,
+        crate::storage::BOOTSTRAP_ROLE,
+        crate::storage::BOOTSTRAP_ROLE,
+        crate::sql::ast::ParameterPrivileges::ALL,
+        crate::sql::ast::ParameterPrivileges::NONE,
+        txn.txid,
+    )?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.restore_parameter_acl_pending(slot, prior);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub struct ParameterPrivilegeTarget<'a> {
+    pub privileges: crate::sql::ast::ParameterPrivileges,
+    pub names: &'a [crate::sql::ast::ParameterName],
+    pub grantees: &'a [&'a str],
+    pub grantor: Option<&'a str>,
+}
+
+pub struct ParameterGrantCommand<'a> {
+    pub target: ParameterPrivilegeTarget<'a>,
+    pub grant_option: bool,
+}
+
+pub struct ParameterRevokeCommand<'a> {
+    pub target: ParameterPrivilegeTarget<'a>,
+    pub grant_option_only: bool,
+    pub cascade: bool,
+}
+
+pub fn grant_parameter_privileges(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    command: ParameterGrantCommand<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let grantor = match parameter_acl_grantor(storage, txn, command.target.grantor) {
+        Ok(grantor) => grantor,
+        Err(error) => return sql_fail(error),
+    };
+    if command
+        .target
+        .names
+        .len()
+        .saturating_mul(command.target.grantees.len())
+        > super::txn::MAX_TXN_DDL
+    {
+        return sql_fail(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "too many parameter privilege changes in one statement"
+        ));
+    }
+    for parameter in command.target.names {
+        if let Err(error) = ensure_parameter_acl_target(*parameter) {
+            return sql_fail(error);
+        }
+        if let Err(error) = materialize_parameter_acl_default(storage, txn, *parameter) {
+            return sql_fail(error);
+        }
+        let can_grant = storage.role(grantor).attributes_to(txn.txid).superuser
+            || storage.has_parameter_grant_option(
+                *parameter,
+                grantor,
+                command.target.privileges,
+                txn.txid,
+            );
+        if !can_grant {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for parameter \"{}\"",
+                parameter.as_str()
+            ));
+        }
+        for written in command.target.grantees {
+            let grantee = match parameter_acl_grantee(storage, written, txn.txid) {
+                Ok(grantee) => grantee,
+                Err(error) => return sql_fail(error),
+            };
+            let (old_privileges, old_options) =
+                storage.parameter_acl_from(*parameter, grantee, grantor as u16, txn.txid);
+            let (slot, prior) = match storage.change_parameter_acl(
+                *parameter,
+                grantee,
+                grantor as u16,
+                old_privileges.union(command.target.privileges),
+                if command.grant_option {
+                    old_options.union(command.target.privileges)
+                } else {
+                    old_options
+                },
+                txn.txid,
+            ) {
+                Ok(change) => change,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.restore_parameter_acl_pending(slot, prior);
+                return sql_fail(error);
+            }
+        }
+    }
+    responder.command_complete("GRANT")?;
+    sql_ok()
+}
+
+fn cascade_parameter_acl_grants(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    parameter: crate::sql::ast::ParameterName,
+    source_role: u16,
+    lost: crate::sql::ast::ParameterPrivileges,
+    cascade: bool,
+) -> Result<(), SqlError> {
+    let mut roles = [0u16; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
+    let mut privileges =
+        [crate::sql::ast::ParameterPrivileges::NONE; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
+    let mut count = 1usize;
+    let mut at = 0usize;
+    roles[0] = source_role;
+    privileges[0] = lost;
+    while at < count {
+        let grantor = roles[at];
+        let lost = privileges[at];
+        at += 1;
+        let mut dependent = [usize::MAX; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
+        let dependent_count = storage.dependent_parameter_acl_slots(
+            parameter,
+            grantor,
+            lost,
+            txn.txid,
+            &mut dependent,
+        );
+        if dependent_count != 0 && !cascade {
+            return Err(sql_err!(
+                sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                "dependent parameter privileges exist"
+            ));
+        }
+        for slot in &dependent[..dependent_count] {
+            let entry = *storage.parameter_acl_entry(*slot);
+            let (grantee, grantor) = storage.parameter_acl_identity(*slot, txn.txid);
+            let (old_privileges, old_options) = storage.parameter_acl_state(*slot, txn.txid);
+            let removed = crate::sql::ast::ParameterPrivileges::from_bits(
+                old_privileges.bits() & lost.bits(),
+            )
+            .expect("intersection of parameter privilege bits is valid");
+            let (changed, prior) = storage.change_parameter_acl(
+                entry.parameter,
+                grantee,
+                grantor,
+                old_privileges.without(removed),
+                old_options.without(removed),
+                txn.txid,
+            )?;
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
+                slot: changed as u32,
+                prior,
+            }) {
+                storage.restore_parameter_acl_pending(changed, prior);
+                return Err(error);
+            }
+            if grantee != crate::storage::PUBLIC_ROLE
+                && !storage.has_parameter_grant_option(
+                    entry.parameter,
+                    grantee as usize,
+                    removed,
+                    txn.txid,
+                )
+            {
+                if count == roles.len() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "parameter privilege dependency graph exceeds {} entries",
+                        roles.len()
+                    ));
+                }
+                roles[count] = grantee;
+                privileges[count] = removed;
+                count += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn revoke_parameter_privileges(
+    storage: &mut Storage,
+    txn: &mut TxnState,
+    command: ParameterRevokeCommand<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let grantor = match parameter_acl_grantor(storage, txn, command.target.grantor) {
+        Ok(grantor) => grantor,
+        Err(error) => return sql_fail(error),
+    };
+    for parameter in command.target.names {
+        if let Err(error) = ensure_parameter_acl_target(*parameter) {
+            return sql_fail(error);
+        }
+        if let Err(error) = materialize_parameter_acl_default(storage, txn, *parameter) {
+            return sql_fail(error);
+        }
+        let can_revoke = storage.role(grantor).attributes_to(txn.txid).superuser
+            || storage.has_parameter_grant_option(
+                *parameter,
+                grantor,
+                command.target.privileges,
+                txn.txid,
+            );
+        if !can_revoke {
+            return sql_fail(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied for parameter \"{}\"",
+                parameter.as_str()
+            ));
+        }
+        for written in command.target.grantees {
+            let grantee = match parameter_acl_grantee(storage, written, txn.txid) {
+                Ok(grantee) => grantee,
+                Err(error) => return sql_fail(error),
+            };
+            let (old_privileges, old_options) =
+                storage.parameter_acl_from(*parameter, grantee, grantor as u16, txn.txid);
+            if old_privileges.bits() == 0 && old_options.bits() == 0 {
+                continue;
+            }
+            let (new_privileges, new_options) = if command.grant_option_only {
+                (
+                    old_privileges,
+                    old_options.without(command.target.privileges),
+                )
+            } else {
+                (
+                    old_privileges.without(command.target.privileges),
+                    old_options.without(command.target.privileges),
+                )
+            };
+            let (slot, prior) = match storage.change_parameter_acl(
+                *parameter,
+                grantee,
+                grantor as u16,
+                new_privileges,
+                new_options,
+                txn.txid,
+            ) {
+                Ok(change) => change,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ParameterAclChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.restore_parameter_acl_pending(slot, prior);
+                return sql_fail(error);
+            }
+            let removed_options = crate::sql::ast::ParameterPrivileges::from_bits(
+                old_options.bits() & command.target.privileges.bits(),
+            )
+            .expect("intersection of parameter privilege bits is valid");
+            if removed_options.bits() != 0
+                && grantee != crate::storage::PUBLIC_ROLE
+                && !storage.has_parameter_grant_option(
+                    *parameter,
+                    grantee as usize,
+                    removed_options,
+                    txn.txid,
+                )
+                && let Err(error) = cascade_parameter_acl_grants(
+                    storage,
+                    txn,
+                    *parameter,
+                    grantee,
+                    removed_options,
+                    command.cascade,
+                )
+            {
+                storage.restore_parameter_acl_pending(slot, prior);
+                return sql_fail(error);
             }
         }
     }
@@ -35895,6 +36282,7 @@ fn cascade_drop_type_column(
         false,
         None,
         "ALTER TABLE",
+        AlterInheritanceScope::Direct,
     ) {
         Ok(result) => result,
         Err(_) => Err(sql_err!(
@@ -53989,6 +54377,7 @@ fn validate_all_rows(
     new_def: &TableDef,
     txid: u32,
     arena: &Arena,
+    include_descendants: bool,
 ) -> Result<(), SqlError> {
     let mut validated = *new_def;
     for check in &mut validated.checks[..validated.n_checks] {
@@ -54003,12 +54392,10 @@ fn validate_all_rows(
     }
     let new_def = &validated;
     let checks = parse_checks(new_def, arena)?;
-    let mut schema = [ColType::Bool; MAX_COLUMNS];
-    new_def.schema(&mut schema);
-    let schema = &schema[..new_def.n_columns];
     let mut result = Ok(());
     for candidate in 0..storage.table_count() {
-        let selected = if storage.relation_has_descendants(table_index, txid) {
+        let selected = if include_descendants && storage.relation_has_descendants(table_index, txid)
+        {
             storage.table(candidate).visible_to(txid)
                 && !storage
                     .table_def(candidate, txid)
@@ -54035,10 +54422,34 @@ fn validate_all_rows(
             else {
                 return Ok(ControlFlow::Continue(()));
             };
+            let physical = *storage.table_def(candidate, txid);
+            let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
+            physical.schema(&mut physical_schema);
             let bytes = storage.row_bytes(candidate, rowid, home, arena)?;
+            let mut physical_values = [Datum::Null; MAX_COLUMNS];
+            rowenc::decode(
+                bytes,
+                &physical_schema[..physical.n_columns],
+                &mut physical_values,
+            )?;
+            // An ordinary child may have local columns interleaved with later
+            // parent additions. Constraints inherited from `new_def` therefore
+            // bind by the durable column name, never by physical position.
             let mut values = [Datum::Null; MAX_COLUMNS];
-            rowenc::decode(bytes, schema, &mut values)?;
+            for (index, column) in new_def.columns().iter().enumerate() {
+                let source = physical.column_index(column.name.as_str()).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "inherited row is missing column \"{}\"",
+                        column.name.as_str()
+                    )
+                })?;
+                values[index] = physical_values[source];
+            }
             let values = &values[..new_def.n_columns];
+            let mut schema = [ColType::Bool; MAX_COLUMNS];
+            new_def.schema(&mut schema);
+            let schema = &schema[..new_def.n_columns];
             let check = check_not_null(new_def, values).and_then(|()| {
                 enforce_row_constraints(
                     storage,
@@ -54767,7 +55178,106 @@ pub fn alter_table(
         true,
         Some(crate::storage::TableKind::Local),
         "ALTER TABLE",
+        AlterInheritanceScope::Direct,
     )
+}
+
+/// Identifies subcommands whose result is part of an ordinary child's physical
+/// definition. PostgreSQL lets `ONLY` retain parent-local defaults and NOT
+/// NULL state, but it cannot split a shared column or inherited CHECK shape.
+fn ordinary_inheritance_propagates(definition: &TableDef, actions: &[AlterAction<'_>]) -> bool {
+    actions
+        .iter()
+        .any(|action| ordinary_inheritance_propagates_action(definition, action))
+}
+
+fn ordinary_inheritance_propagates_action(definition: &TableDef, action: &AlterAction<'_>) -> bool {
+    match action {
+        AlterAction::AddColumn(_)
+        | AlterAction::DropColumn { .. }
+        | AlterAction::RenameColumn { .. }
+        | AlterAction::AlterColumnType { .. }
+        | AlterAction::SetDefault { .. }
+        | AlterAction::DropDefault { .. }
+        | AlterAction::SetNotNull { .. }
+        | AlterAction::DropNotNull { .. } => true,
+        AlterAction::AddConstraint(crate::sql::ast::TableConstraint::Check { .. }) => true,
+        AlterAction::DropConstraint { name, .. }
+        | AlterAction::RenameConstraint { from: name, .. }
+        | AlterAction::ValidateConstraint(name) => definition
+            .checks()
+            .iter()
+            .any(|check| check.name.as_str() == *name),
+        _ => false,
+    }
+}
+
+/// `ONLY` may retain parent-local defaults and NOT NULL state, but changing a
+/// shared column or CHECK without its children would make the inheritance
+/// layout contradictory.
+fn ordinary_inheritance_only_error(
+    definition: &TableDef,
+    actions: &[AlterAction<'_>],
+) -> Option<SqlError> {
+    for action in actions {
+        match action {
+            AlterAction::AddColumn(_) => {
+                return Some(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "column must be added to child tables too"
+                ));
+            }
+            AlterAction::DropColumn { .. } => {
+                return Some(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "column must be dropped from child tables too"
+                ));
+            }
+            AlterAction::RenameColumn { from, .. } => {
+                return Some(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "inherited column \"{}\" must be renamed in child tables too",
+                    from
+                ));
+            }
+            AlterAction::AlterColumnType { column, .. } => {
+                return Some(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "type of inherited column \"{}\" must be changed in child tables too",
+                    column
+                ));
+            }
+            AlterAction::AddConstraint(crate::sql::ast::TableConstraint::Check { .. }) => {
+                return Some(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "constraint must be added to child tables too"
+                ));
+            }
+            AlterAction::DropConstraint { name, .. }
+            | AlterAction::RenameConstraint { from: name, .. }
+            | AlterAction::ValidateConstraint(name)
+                if definition
+                    .checks()
+                    .iter()
+                    .any(|check| check.name.as_str() == *name) =>
+            {
+                return Some(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "constraint must be changed in child tables too"
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Distinguishes a client-targeted ALTER from the typed recursion that keeps
+/// an ordinary inherited definition synchronized with its parent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlterInheritanceScope {
+    Direct,
+    Propagated,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -55336,7 +55846,14 @@ fn alter_table_inheritance(
                 "child table has fewer columns than parent table"
             ));
         }
-        for (index, expected) in parent_definition.columns().iter().enumerate() {
+        for expected in parent_definition.columns() {
+            let Some(index) = updated.column_index(expected.name.as_str()) else {
+                return sql_fail(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "child table is missing column \"{}\"",
+                    expected.name.as_str()
+                ));
+            };
             let actual = updated.columns[index];
             if actual.name != expected.name
                 || actual.ctype != expected.ctype
@@ -55363,8 +55880,11 @@ fn alter_table_inheritance(
         if let Err(error) = updated.inheritance.append(parent) {
             return sql_fail(error);
         }
-        for (index, expected) in parent_definition.columns().iter().enumerate() {
+        for expected in parent_definition.columns() {
             if expected.not_null.is_required() {
+                let index = updated
+                    .column_index(expected.name.as_str())
+                    .expect("validated inherited column exists");
                 updated.columns[index].not_null = updated.columns[index].not_null.add_inherited();
             }
         }
@@ -55601,7 +56121,7 @@ fn alter_partition_attachment(
         }
         let mut schema = [ColType::Bool; MAX_COLUMNS];
         parent_def.schema(&mut schema);
-        if let Err(error) = validate_all_rows(storage, child, &new_def, txn.txid, arena) {
+        if let Err(error) = validate_all_rows(storage, child, &new_def, txn.txid, arena, true) {
             return sql_fail(error);
         }
         let parent_checks = match parse_checks(&parent_def, arena) {
@@ -55988,6 +56508,7 @@ fn alter_table_inner(
     emit_completion: bool,
     expected_kind: Option<crate::storage::TableKind>,
     tag: &'static str,
+    inheritance_scope: AlterInheritanceScope,
 ) -> Outcome {
     let table_index =
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
@@ -56115,27 +56636,10 @@ fn alter_table_inner(
                 .contains(table_index)
     });
     if has_ordinary_child
-        && statement.actions.iter().any(|action| {
-            matches!(
-                action,
-                AlterAction::AddColumn(_)
-                    | AlterAction::DropColumn { .. }
-                    | AlterAction::RenameColumn { .. }
-                    | AlterAction::AlterColumnType { .. }
-                    | AlterAction::SetDefault { .. }
-                    | AlterAction::DropDefault { .. }
-                    | AlterAction::SetNotNull { .. }
-                    | AlterAction::DropNotNull { .. }
-                    | AlterAction::AddConstraint(_)
-                    | AlterAction::DropConstraint { .. }
-                    | AlterAction::RenameConstraint { .. }
-            )
-        })
+        && statement.only
+        && let Some(error) = ordinary_inheritance_only_error(&def, statement.actions)
     {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "ALTER TABLE parent definition propagation through ordinary inheritance is not implemented"
-        ));
+        return sql_fail(error);
     }
 
     // The ACCESS EXCLUSIVE acquisition above waits for ordinary readers and
@@ -56779,10 +57283,15 @@ fn alter_table_inner(
                         MAX_COLUMNS
                     ));
                 }
-                let meta = match build_column(c, &*storage, txn.txid, arena) {
+                let mut meta = match build_column(c, &*storage, txn.txid, arena) {
                     Ok(m) => m,
                     Err(e) => return sql_fail(e),
                 };
+                if inheritance_scope == AlterInheritanceScope::Propagated
+                    && meta.not_null.is_required()
+                {
+                    meta.not_null = crate::storage::NotNullOrigin::Inherited;
+                }
                 // NOT NULL without a default over a non-empty table is a
                 // constraint violation, as in PostgreSQL.
                 if matches!(meta.default, crate::storage::ColumnDefault::None)
@@ -57138,7 +57647,12 @@ fn alter_table_inner(
                 // A NULL is caught by the content validation below, against the
                 // rewritten image so it composes with a type change in the same
                 // statement.
-                new_def.columns[i].not_null = new_def.columns[i].not_null.add_local();
+                new_def.columns[i].not_null =
+                    if inheritance_scope == AlterInheritanceScope::Propagated {
+                        new_def.columns[i].not_null.add_inherited()
+                    } else {
+                        new_def.columns[i].not_null.add_local()
+                    };
                 validate_definition = true;
             }
             AlterAction::DropNotNull { column } => {
@@ -57158,7 +57672,12 @@ fn alter_table_inner(
                         column
                     ));
                 }
-                new_def.columns[i].not_null = new_def.columns[i].not_null.drop_local();
+                new_def.columns[i].not_null =
+                    if inheritance_scope == AlterInheritanceScope::Propagated {
+                        new_def.columns[i].not_null.drop_inherited()
+                    } else {
+                        new_def.columns[i].not_null.drop_local()
+                    };
             }
             AlterAction::SetStatistics { column, target } => {
                 let Some(i) = new_def.column_index(column) else {
@@ -57227,28 +57746,26 @@ fn alter_table_inner(
                         };
                         retyped_any = true;
                     }
-                    ColSource::FillDefault(fi) => {
-                        if let Some(od) = new_def.columns[fi].default.constant().copied() {
-                            match cast_to(od.as_datum(), target, arena)
-                                .and_then(|v| apply_typmod(v, target, *type_mod, arena))
-                                .and_then(|v| crate::storage::OwnedDatum::from_datum(&v))
-                            {
-                                Ok(value) => {
-                                    let expression = new_def.columns[fi]
-                                        .default
-                                        .expression()
-                                        .copied()
-                                        .expect("constant default has source");
-                                    new_def.columns[fi].default =
-                                        crate::storage::ColumnDefault::Constant {
-                                            value,
-                                            expression,
-                                        };
-                                }
-                                Err(e) => return sql_fail(e),
-                            }
-                        }
-                    }
+                    ColSource::FillDefault(_) => {}
+                }
+                // The column's folded default is a typed runtime value, not
+                // merely catalog text. Rebind it with the row representation
+                // so a later INSERT cannot encode the former type's bytes.
+                if let Some(default) = new_def.columns[i].default.constant().copied() {
+                    let value = match cast_to(default.as_datum(), target, arena)
+                        .and_then(|value| apply_typmod(value, target, *type_mod, arena))
+                        .and_then(|value| crate::storage::OwnedDatum::from_datum(&value))
+                    {
+                        Ok(value) => value,
+                        Err(error) => return sql_fail(error),
+                    };
+                    let expression = new_def.columns[i]
+                        .default
+                        .expression()
+                        .copied()
+                        .expect("constant default has source");
+                    new_def.columns[i].default =
+                        crate::storage::ColumnDefault::Constant { value, expression };
                 }
                 new_def.columns[i].ctype = target;
                 new_def.columns[i].type_mod = *type_mod;
@@ -57595,7 +58112,7 @@ fn alter_table_inner(
     // journaled. A rewrite validates each transformed image instead, below.
     if !has_rewrite
         && validate_definition
-        && let Err(e) = validate_all_rows(storage, table_index, &new_def, txn.txid, arena)
+        && let Err(e) = validate_all_rows(storage, table_index, &new_def, txn.txid, arena, false)
     {
         return sql_fail(e);
     }
@@ -58475,6 +58992,61 @@ fn alter_table_inner(
                 }
             }
             Err(error) => return sql_fail(error),
+        }
+    }
+    if has_ordinary_child
+        && !statement.only
+        && ordinary_inheritance_propagates(&def, statement.actions)
+    {
+        // Descendants run after this relation has consumed the shared bounded
+        // rewrite scratch. Each then uses the same typed ALTER pipeline for
+        // row validation, WAL, undo, checkpoint recovery, and catalogs.
+        let mut inherited_actions =
+            [AlterAction::DropDefault { column: "" }; crate::sql::parser::MAX_ALTER_ACTIONS];
+        let mut inherited_action_count = 0usize;
+        for action in statement.actions {
+            if ordinary_inheritance_propagates_action(&def, action) {
+                inherited_actions[inherited_action_count] = *action;
+                inherited_action_count += 1;
+            }
+        }
+        for child in 0..storage.table_count() {
+            if !storage.table(child).visible_to(txn.txid)
+                || !storage
+                    .table_def(child, txn.txid)
+                    .inheritance
+                    .contains(table_index)
+            {
+                continue;
+            }
+            let child_def = *storage.table_def(child, txn.txid);
+            let child_statement = AlterTable {
+                table: QualName {
+                    schema: Some(child_def.schema.as_str()),
+                    name: child_def.name.as_str(),
+                },
+                if_exists: false,
+                only: false,
+                actions: &inherited_actions[..inherited_action_count],
+            };
+            match alter_table_inner(
+                storage,
+                wal,
+                txn,
+                scratch,
+                &child_statement,
+                arena,
+                seq_session,
+                responder,
+                false,
+                Some(crate::storage::TableKind::Local),
+                tag,
+                AlterInheritanceScope::Propagated,
+            ) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Ok(Err(error)),
+                Err(error) => return Err(error),
+            }
         }
     }
     if emit_completion {

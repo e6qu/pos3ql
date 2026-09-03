@@ -863,6 +863,7 @@ fn utility_command_object_type(statement: &Stmt<'_>) -> Option<&'static str> {
     use crate::sql::ast::{DefaultPrivilegeObjectKind, PrivilegeObjectKind, PrivilegeTarget};
     let privilege_type = |target: PrivilegeTarget<'_>| {
         Some(match target {
+            PrivilegeTarget::Parameters(_) => "PARAMETER",
             PrivilegeTarget::Objects { kind, .. } => match kind {
                 PrivilegeObjectKind::Table | PrivilegeObjectKind::AllTablesInSchema => "TABLE",
                 PrivilegeObjectKind::Sequence | PrivilegeObjectKind::AllSequencesInSchema => {

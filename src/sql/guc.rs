@@ -616,6 +616,14 @@ fn guc_bit(name: &str) -> u32 {
     }
 }
 
+pub(crate) fn knows_parameter(name: &str) -> bool {
+    guc_bit(name) != 0
+}
+
+pub(crate) fn requires_set_privilege(name: &str) -> bool {
+    name.eq_ignore_ascii_case("event_triggers")
+}
+
 fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
     macro_rules! copy {
         ($bit:ident, $field:ident) => {

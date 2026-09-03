@@ -1137,6 +1137,14 @@ pub trait CatalogAccess {
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
+    fn has_parameter_privilege(
+        &self,
+        _role: Option<&str>,
+        _parameter: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
     fn tablespace_name<'a>(
         &self,
         _oid: i32,

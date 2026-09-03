@@ -511,6 +511,7 @@ pub(crate) fn dispatch<'a>(
             | "has_function_privilege"
             | "has_database_privilege"
             | "has_tablespace_privilege"
+            | "has_parameter_privilege"
             | "pg_relation_is_publishable"
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
@@ -839,7 +840,8 @@ pub(crate) fn dispatch<'a>(
             | "has_type_privilege"
             | "has_function_privilege"
             | "has_database_privilege"
-            | "has_tablespace_privilege" => {
+            | "has_tablespace_privilege"
+            | "has_parameter_privilege" => {
                 let Some(cat) = hooks.catalog else {
                     return Ok(Datum::Null);
                 };
@@ -868,9 +870,22 @@ pub(crate) fn dispatch<'a>(
                 };
                 let object = eval_full(args[at], arena, params, row, hooks)?;
                 at += 1;
-                let object = match privilege_object_name(object, name, cat, arena)? {
-                    Some(object) => object,
-                    None => return Ok(Datum::Null),
+                let object = if name == "has_parameter_privilege" {
+                    match object {
+                        Datum::Text(parameter) => parameter,
+                        Datum::Null => return Ok(Datum::Null),
+                        _ => {
+                            return Err(sql_err!(
+                                sqlstate::DATATYPE_MISMATCH,
+                                "has_parameter_privilege() requires a text parameter name"
+                            ));
+                        }
+                    }
+                } else {
+                    match privilege_object_name(object, name, cat, arena)? {
+                        Some(object) => object,
+                        None => return Ok(Datum::Null),
+                    }
                 };
                 let privilege_column = if column {
                     let column = eval_full(args[at], arena, params, row, hooks)?;
@@ -924,6 +939,9 @@ pub(crate) fn dispatch<'a>(
                     }
                     "has_tablespace_privilege" => {
                         cat.has_tablespace_privilege(role, object, privilege)?
+                    }
+                    "has_parameter_privilege" => {
+                        cat.has_parameter_privilege(role, object, privilege)?
                     }
                     _ => unreachable!(),
                 };

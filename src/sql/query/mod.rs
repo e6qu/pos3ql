@@ -2875,6 +2875,34 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
         .map(Some)
     }
 
+    fn has_parameter_privilege(
+        &self,
+        role: Option<&str>,
+        parameter: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let parameter = match crate::sql::ast::ParameterName::parse(parameter) {
+            Some(parameter) if crate::sql::guc::knows_parameter(parameter.as_str()) => parameter,
+            _ => return Ok(None),
+        };
+        parameter_privilege_query(
+            privileges,
+            |privilege| {
+                self.storage
+                    .has_parameter_privilege(parameter, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_parameter_grant_option(parameter, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
     fn tablespace_name<'a>(&self, oid: i32, arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         super::catalog::tablespace_name_by_oid(self.storage, self.txid, oid, arena)
     }
@@ -3155,6 +3183,45 @@ fn privilege_query(
             catalog_default.contains(privilege) || has_privilege(privilege)
         };
         answer &= allowed;
+    }
+    Ok(answer)
+}
+
+fn parameter_privilege_query(
+    written: &str,
+    has_privilege: impl Fn(crate::sql::ast::ParameterPrivileges) -> bool,
+    has_grant_option: impl Fn(crate::sql::ast::ParameterPrivileges) -> bool,
+) -> Result<bool, SqlError> {
+    let mut answer = true;
+    for item in written.split(',') {
+        let item = item.trim();
+        const GRANT_OPTION: &str = " WITH GRANT OPTION";
+        let (name, grant_option) = if item.len() >= GRANT_OPTION.len()
+            && item[item.len() - GRANT_OPTION.len()..].eq_ignore_ascii_case(GRANT_OPTION)
+        {
+            (item[..item.len() - GRANT_OPTION.len()].trim_end(), true)
+        } else {
+            (item, false)
+        };
+        let privilege =
+            if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("all privileges") {
+                crate::sql::ast::ParameterPrivileges::ALL
+            } else if name.eq_ignore_ascii_case("set") {
+                crate::sql::ast::ParameterPrivileges::SET
+            } else if name.eq_ignore_ascii_case("alter system") {
+                crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM
+            } else {
+                return Err(sql_err!(
+                    sqlstate::INVALID_PARAMETER_VALUE,
+                    "unrecognized privilege type: \"{}\"",
+                    name
+                ));
+            };
+        answer &= if grant_option {
+            has_grant_option(privilege)
+        } else {
+            has_privilege(privilege)
+        };
     }
     Ok(answer)
 }

@@ -5,6 +5,42 @@
 use crate::sql::types::ColType;
 use crate::util::StackStr;
 
+/// A normalized PostgreSQL configuration parameter identity.  Configuration
+/// parameters are not SQL objects: they may be dotted and their spelling is
+/// case-insensitive, so keeping them separate prevents object ACL code from
+/// accepting an invalid target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParameterName(StackStr<63>);
+
+impl ParameterName {
+    pub const EMPTY: Self = Self(StackStr::new());
+
+    pub fn parse(value: &str) -> Option<Self> {
+        if value.is_empty()
+            || value.len() > 63
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        {
+            return None;
+        }
+        use core::fmt::Write;
+        let mut normalized = StackStr::new();
+        for byte in value.bytes() {
+            let _ = normalized.write_char((byte as char).to_ascii_lowercase());
+        }
+        Some(Self(normalized))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0.len() == 0
+    }
+}
+
 /// A PostgreSQL two-phase transaction identifier. PostgreSQL requires a
 /// quoted value shorter than 200 bytes; constructing the closed value at the
 /// parse boundary keeps overlong or truncated identifiers out of execution,
@@ -1100,6 +1136,21 @@ pub enum Stmt<'a> {
         grantor: Option<&'a str>,
         cascade: bool,
     },
+    GrantParameterPrivileges {
+        privileges: ParameterPrivileges,
+        names: &'a [ParameterName],
+        grantees: &'a [&'a str],
+        grant_option: bool,
+        grantor: Option<&'a str>,
+    },
+    RevokeParameterPrivileges {
+        grant_option_only: bool,
+        privileges: ParameterPrivileges,
+        names: &'a [ParameterName],
+        grantees: &'a [&'a str],
+        grantor: Option<&'a str>,
+        cascade: bool,
+    },
     AlterDefaultPrivileges {
         roles: &'a [&'a str],
         schemas: &'a [&'a str],
@@ -2032,6 +2083,44 @@ pub enum Privilege {
     Maintain,
     Connect,
     Temporary,
+    Set,
+    AlterSystem,
+}
+
+/// The only privileges PostgreSQL permits on a configuration parameter.
+/// This closed type is deliberately distinct from object privileges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParameterPrivileges(u8);
+
+impl ParameterPrivileges {
+    pub const NONE: Self = Self(0);
+    pub const SET: Self = Self(1 << 0);
+    pub const ALTER_SYSTEM: Self = Self(1 << 1);
+    pub const ALL: Self = Self(Self::SET.0 | Self::ALTER_SYSTEM.0);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2084,6 +2173,7 @@ pub enum PrivilegeObjectKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivilegeTarget<'a> {
+    Parameters(&'a [ParameterName]),
     Objects {
         kind: PrivilegeObjectKind,
         names: &'a [QualName<'a>],
@@ -4196,7 +4286,7 @@ pub struct AlterTable<'a> {
     pub table: QualName<'a>,
     /// ALTER TABLE IF EXISTS: a missing target emits a notice and succeeds.
     pub if_exists: bool,
-    /// `ONLY` suppresses partition recursion.
+    /// `ONLY` suppresses permitted descendant propagation.
     pub only: bool,
     /// One or more subcommands. PostgreSQL applies a comma-separated list in a
     /// fixed pass order (drops, then type changes, then adds, then constraints,

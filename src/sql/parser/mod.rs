@@ -1280,7 +1280,7 @@ impl<'a> Parser<'a> {
                     self.expect_ident("zone")?;
                     return Ok(Stmt::Show("timezone"));
                 }
-                let name = self.any_ident("configuration parameter")?;
+                let name = self.configuration_parameter_name()?;
                 Ok(Stmt::Show(name))
             }
             Tok::Ident("checkpoint") => {
@@ -3579,6 +3579,8 @@ impl<'a> Parser<'a> {
                     | "connect"
                     | "temporary"
                     | "temp"
+                    | "set"
+                    | "alter"
             )
         )
     }
@@ -3606,6 +3608,15 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        if let crate::sql::ast::PrivilegeTarget::Parameters(names) = target {
+            return Ok(Stmt::GrantParameterPrivileges {
+                privileges: self.parameter_privileges(privileges)?,
+                names,
+                grantees,
+                grant_option,
+                grantor,
+            });
+        }
         Ok(Stmt::GrantPrivileges {
             privileges,
             target,
@@ -3669,7 +3680,7 @@ impl<'a> Parser<'a> {
         let mut privileges = [PrivilegeSpec {
             privilege: Privilege::All,
             columns: &[],
-        }; 14];
+        }; 16];
         let mut count = 0usize;
         loop {
             if count == privileges.len() {
@@ -3704,6 +3715,11 @@ impl<'a> Parser<'a> {
                 Privilege::Connect
             } else if self.eat_ident("temporary")? || self.eat_ident("temp")? {
                 Privilege::Temporary
+            } else if self.eat_ident("set")? {
+                Privilege::Set
+            } else if self.eat_ident("alter")? {
+                self.expect_ident("system")?;
+                Privilege::AlterSystem
             } else {
                 return Err(self.unexpected("expected an object privilege"));
             };
@@ -3744,6 +3760,26 @@ impl<'a> Parser<'a> {
         self.arena_slice(&privileges[..count])
     }
 
+    fn parameter_privileges(
+        &self,
+        specifications: &[crate::sql::ast::PrivilegeSpec<'_>],
+    ) -> Result<crate::sql::ast::ParameterPrivileges, ParseError> {
+        use crate::sql::ast::{ParameterPrivileges, Privilege};
+        let mut result = ParameterPrivileges::NONE;
+        for specification in specifications {
+            if !specification.columns.is_empty() {
+                return Err(self.err_here("parameter privileges cannot name columns"));
+            }
+            result = result.union(match specification.privilege {
+                Privilege::All => ParameterPrivileges::ALL,
+                Privilege::Set => ParameterPrivileges::SET,
+                Privilege::AlterSystem => ParameterPrivileges::ALTER_SYSTEM,
+                _ => return Err(self.err_here("invalid privilege type for parameter")),
+            });
+        }
+        Ok(result)
+    }
+
     fn default_privilege_list(&mut self) -> Result<&'a [crate::sql::ast::Privilege], ParseError> {
         let specifications = self.privilege_list()?;
         let mut privileges = [crate::sql::ast::Privilege::All; 12];
@@ -3757,7 +3793,28 @@ impl<'a> Parser<'a> {
     }
 
     fn privilege_target(&mut self) -> Result<crate::sql::ast::PrivilegeTarget<'a>, ParseError> {
-        use crate::sql::ast::{PrivilegeObjectKind, PrivilegeTarget, RoutineTargetKind};
+        use crate::sql::ast::{
+            ParameterName, PrivilegeObjectKind, PrivilegeTarget, RoutineTargetKind,
+        };
+        if self.eat_ident("parameter")? {
+            let mut names = [ParameterName::EMPTY; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("parameter privilege targets", names.len()));
+                }
+                let name = self.configuration_parameter_name()?;
+                names[count] = ParameterName::parse(name)
+                    .ok_or_else(|| self.err_here("invalid configuration parameter name"))?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            return Ok(PrivilegeTarget::Parameters(
+                self.arena_slice(&names[..count])?,
+            ));
+        }
         if self.eat_ident("large")? {
             self.expect_ident("object")?;
             let mut objects = [crate::sql::ast::LargeObjectId::parse(1).unwrap(); MAX_LIST];
@@ -3854,6 +3911,15 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn configuration_parameter_name(&mut self) -> Result<&'a str, ParseError> {
+        let start = self.peek_at;
+        let _ = self.any_ident("configuration parameter")?;
+        while self.eat_op(".")? {
+            let _ = self.any_ident("configuration parameter component")?;
+        }
+        Ok(self.text[start..self.peek_at].trim())
+    }
+
     fn routine_privilege_target(
         &mut self,
         kind: crate::sql::ast::RoutineTargetKind,
@@ -3920,13 +3986,19 @@ impl<'a> Parser<'a> {
         for (name, option) in [
             ("admin", crate::sql::ast::RoleMembershipOption::Admin),
             ("inherit", crate::sql::ast::RoleMembershipOption::Inherit),
-            ("set", crate::sql::ast::RoleMembershipOption::Set),
         ] {
             if self.eat_ident(name)? {
                 self.expect_ident("option")?;
                 self.expect_ident("for")?;
                 return self.revoke_role_after_keyword(Some(option));
             }
+        }
+        if self.peeked == Tok::Ident("set") && self.next_token_is_ident("option")? {
+            self.advance()?;
+            self.expect_ident("option")?;
+            self.expect_ident("for")?;
+            return self
+                .revoke_role_after_keyword(Some(crate::sql::ast::RoleMembershipOption::Set));
         }
         let grant_option_only = if self.eat_ident("grant")? {
             self.expect_ident("option")?;
@@ -3955,6 +4027,16 @@ impl<'a> Parser<'a> {
             let _ = self.eat_ident("restrict")?;
             false
         };
+        if let crate::sql::ast::PrivilegeTarget::Parameters(names) = target {
+            return Ok(Stmt::RevokeParameterPrivileges {
+                grant_option_only,
+                privileges: self.parameter_privileges(privileges)?,
+                names,
+                grantees,
+                grantor,
+                cascade,
+            });
+        }
         Ok(Stmt::RevokePrivileges {
             grant_option_only,
             privileges,
@@ -4293,7 +4375,7 @@ impl<'a> Parser<'a> {
             let name = if self.eat_ident("all")? {
                 None
             } else {
-                Some(self.any_ident("configuration parameter")?)
+                Some(self.configuration_parameter_name()?)
             };
             return Ok(Stmt::AlterSystem { name, value: None });
         }
@@ -6891,6 +6973,17 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Looks past the current token without consuming it.  The only caller
+    /// resolves PostgreSQL's `REVOKE SET` grammar ambiguity: `SET OPTION FOR`
+    /// is role membership syntax; every other `SET` starts an object or
+    /// parameter privilege list.
+    fn next_token_is_ident(&mut self, word: &str) -> Result<bool, ParseError> {
+        let mark = self.lexer.mark();
+        let next = self.lexer.next_token()?;
+        self.lexer.reset(mark);
+        Ok(next == Tok::Ident(word))
+    }
+
     fn eat_op(&mut self, operator: &str) -> Result<bool, ParseError> {
         if self.peeked == Tok::Op(operator) {
             self.advance()?;
@@ -8238,6 +8331,52 @@ mod tests {
                     action,
                     crate::sql::ast::AlterPublicationAction::Rename("renamed_changes")
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn parameter_privileges_are_a_closed_typed_statement() {
+        with_parser(
+            "GRANT SET, ALTER SYSTEM ON PARAMETER event_triggers TO operator; \
+             REVOKE SET ON PARAMETER event_triggers FROM operator RESTRICT; \
+             REVOKE GRANT OPTION FOR SET ON PARAMETER event_triggers FROM operator CASCADE",
+            |parser| {
+                let Some(Stmt::GrantParameterPrivileges {
+                    privileges,
+                    names,
+                    grant_option,
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("parameter GRANT did not produce a typed statement")
+                };
+                assert!(privileges.contains(crate::sql::ast::ParameterPrivileges::SET));
+                assert!(privileges.contains(crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM));
+                assert_eq!(names[0].as_str(), "event_triggers");
+                assert!(!grant_option);
+                let Some(Stmt::RevokeParameterPrivileges {
+                    grant_option_only,
+                    privileges,
+                    cascade,
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("parameter REVOKE did not produce a typed statement")
+                };
+                assert!(!grant_option_only && !cascade);
+                assert_eq!(privileges, crate::sql::ast::ParameterPrivileges::SET);
+                let Some(Stmt::RevokeParameterPrivileges {
+                    grant_option_only,
+                    privileges,
+                    cascade,
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("parameter REVOKE did not produce a typed statement")
+                };
+                assert!(grant_option_only && cascade);
+                assert_eq!(privileges, crate::sql::ast::ParameterPrivileges::SET);
             },
         );
     }

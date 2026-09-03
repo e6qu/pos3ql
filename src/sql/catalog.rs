@@ -1052,6 +1052,7 @@ const CATALOG_RELATIONS: &[(&str, i32)] = &[
     ("pg_opfamily", PG_OPFAMILY_OID),
     ("pg_extension", 3079),
     ("pg_default_acl", 826),
+    ("pg_parameter_acl", 6243),
     ("pg_replication_slots", 121),
     ("pg_subscription", 6107),
     ("pg_transform", 3576),
@@ -1278,17 +1279,7 @@ pub fn synthesize<'a>(
         (false, "pg_language") => pg_language(arena),
         (false, "pg_auth_members") => pg_auth_members(storage, txid, arena),
         (false, "pg_db_role_setting") => pg_db_role_setting(storage, txid, arena),
-        (false, "pg_parameter_acl") => finish(
-            def_of(
-                "pg_parameter_acl",
-                &[
-                    ("parname", ColType::Text),
-                    ("paracl", ColType::Array(super::types::ArrElem::AclItem)),
-                ],
-            ),
-            &[],
-            arena,
-        ),
+        (false, "pg_parameter_acl") => pg_parameter_acl(storage, txid, arena),
         (false, "pg_default_acl") => pg_default_acl(storage, txid, arena),
         (false, "pg_extension") => pg_extension(storage, txid, arena),
         (false, "pg_available_extensions") => pg_available_extensions(storage, txid, arena),
@@ -2205,6 +2196,91 @@ fn column_acl<'a>(
         element: super::types::ArrElem::AclItem,
         raw: super::array::build(&values[..count], arena)?,
     })
+}
+
+fn pg_parameter_acl<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
+    use core::fmt::Write;
+    let definition = def_of(
+        "pg_parameter_acl",
+        &[
+            ("parname", ColType::Text),
+            ("paracl", ColType::Array(super::types::ArrElem::AclItem)),
+        ],
+    );
+    let mut rows: [&[Datum]; crate::storage::MAX_PARAMETER_ACL_ENTRIES] =
+        [&[]; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
+    let mut row_count = 0usize;
+    for (slot, entry) in storage.parameter_acl_entries_visible(txid) {
+        let parameter = entry.parameter;
+        if storage
+            .parameter_acl_entries_visible(txid)
+            .take(slot)
+            .any(|(_, earlier)| earlier.parameter == parameter)
+        {
+            continue;
+        }
+        let mut values = [Datum::Null; crate::storage::MAX_PARAMETER_ACL_ENTRIES];
+        let mut count = 0usize;
+        for (candidate_slot, candidate) in storage.parameter_acl_entries_visible(txid) {
+            if candidate.parameter != parameter {
+                continue;
+            }
+            let (grantee, grantor) = storage.parameter_acl_identity(candidate_slot, txid);
+            if storage
+                .parameter_acl_entries_visible(txid)
+                .take(candidate_slot)
+                .any(|(earlier_slot, earlier)| {
+                    earlier.parameter == parameter
+                        && storage.parameter_acl_identity(earlier_slot, txid) == (grantee, grantor)
+                })
+            {
+                continue;
+            }
+            let (privileges, grant_options) =
+                storage.parameter_acl_from(parameter, grantee, grantor, txid);
+            if privileges.bits() == 0 {
+                continue;
+            }
+            let grantee_name = (grantee != crate::storage::PUBLIC_ROLE)
+                .then(|| storage.role_name(grantee as usize, txid));
+            let grantor_name = storage.role_name(grantor as usize, txid);
+            let grantee_name =
+                super::types::acl_identifier(grantee_name.as_ref().map_or("", SqlName::as_str));
+            let grantor_name = super::types::acl_identifier(grantor_name.as_str());
+            let mut rendered = StackStr::<256>::new();
+            let _ = write!(rendered, "{}=", grantee_name.as_str());
+            for (privilege, letter) in [
+                (crate::sql::ast::ParameterPrivileges::SET, 's'),
+                (crate::sql::ast::ParameterPrivileges::ALTER_SYSTEM, 'A'),
+            ] {
+                if privileges.contains(privilege) {
+                    let _ = write!(rendered, "{letter}");
+                    if grant_options.contains(privilege) {
+                        let _ = write!(rendered, "*");
+                    }
+                }
+            }
+            let _ = write!(rendered, "/{}", grantor_name.as_str());
+            values[count] = text(rendered.as_str(), arena)?;
+            count += 1;
+        }
+        rows[row_count] = row(
+            &[
+                text(parameter.as_str(), arena)?,
+                Datum::Array {
+                    element: super::types::ArrElem::AclItem,
+                    raw: super::array::build(&values[..count], arena)?,
+                },
+            ],
+            arena,
+        )?;
+        row_count += 1;
+    }
+    finish(definition, &rows[..row_count], arena)
 }
 
 fn pg_default_acl<'a>(

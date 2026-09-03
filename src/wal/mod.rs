@@ -153,6 +153,7 @@ const KIND_SET_EVENT_TRIGGER: u8 = 103;
 const KIND_DROP_EVENT_TRIGGER: u8 = 104;
 const KIND_SET_RULE: u8 = 105;
 const KIND_DROP_RULE: u8 = 106;
+const KIND_SET_PARAMETER_ACL: u8 = 123;
 const KIND_PREPARE_TRANSACTION: u8 = 107;
 const KIND_COMMIT_PREPARED: u8 = 108;
 const KIND_ROLLBACK_PREPARED: u8 = 109;
@@ -176,7 +177,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_RENAME_ROLE;
+const LAST_KIND: u8 = KIND_SET_PARAMETER_ACL;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -1227,6 +1228,13 @@ pub(crate) enum WalOp<'a> {
         privileges: crate::storage::PrivilegeSet,
         grant_options: crate::storage::PrivilegeSet,
     },
+    SetParameterAcl {
+        parameter: &'a str,
+        grantee: &'a str,
+        grantor: &'a str,
+        privileges: crate::sql::ast::ParameterPrivileges,
+        grant_options: crate::sql::ast::ParameterPrivileges,
+    },
 }
 
 pub struct Wal {
@@ -2088,6 +2096,7 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SetColumnAcl { .. } => KIND_SET_COLUMN_ACL,
         WalOp::BeginTableRewrite { .. } => KIND_REWRITE_TABLE,
         WalOp::SetDefaultAcl { .. } => KIND_SET_DEFAULT_ACL,
+        WalOp::SetParameterAcl { .. } => KIND_SET_PARAMETER_ACL,
     }
 }
 
@@ -3194,6 +3203,12 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             grantee,
             ..
         } => 1 + owner.len() + 1 + schema.len() + 1 + 1 + grantee.len() + 1 + 4,
+        WalOp::SetParameterAcl {
+            parameter,
+            grantee,
+            grantor,
+            ..
+        } => 1 + parameter.len() + 1 + grantee.len() + 1 + grantor.len() + 2,
     }
 }
 
@@ -5181,6 +5196,18 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&[u8::from(*defined)])
                 && buffer.append(&privileges.0.to_le_bytes())
                 && buffer.append(&grant_options.0.to_le_bytes())
+        }
+        WalOp::SetParameterAcl {
+            parameter,
+            grantee,
+            grantor,
+            privileges,
+            grant_options,
+        } => {
+            name_bytes(buffer, parameter)
+                && name_bytes(buffer, grantee)
+                && name_bytes(buffer, grantor)
+                && buffer.append(&[privileges.bits(), grant_options.bits()])
         }
         WalOp::Analyze {
             schema,
@@ -9368,6 +9395,26 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 grant_options: crate::storage::PrivilegeSet(grant_options),
             })
         }
+        KIND_SET_PARAMETER_ACL => {
+            let parameter = take_name(&mut at)?;
+            crate::sql::ast::ParameterName::parse(parameter)?;
+            let grantee = take_name(&mut at)?;
+            let grantor = take_name(&mut at)?;
+            let privileges = crate::sql::ast::ParameterPrivileges::from_bits(*payload.get(at)?)?;
+            at += 1;
+            let grant_options = crate::sql::ast::ParameterPrivileges::from_bits(*payload.get(at)?)?;
+            at += 1;
+            if !privileges.contains(grant_options) {
+                return None;
+            }
+            (at == payload.len()).then_some(WalOp::SetParameterAcl {
+                parameter,
+                grantee,
+                grantor,
+                privileges,
+                grant_options,
+            })
+        }
         _ => None,
     }
 }
@@ -10452,6 +10499,37 @@ mod tests {
             }
         ));
         assert!(decode_op(KIND_SET_OBJECT_ACL, invalid.readable()).is_none());
+    }
+
+    #[test]
+    fn parameter_acl_codec_is_typed_and_strict() {
+        let operation = WalOp::SetParameterAcl {
+            parameter: "event_triggers",
+            grantee: "reader",
+            grantor: "postgres",
+            privileges: crate::sql::ast::ParameterPrivileges::ALL,
+            grant_options: crate::sql::ast::ParameterPrivileges::SET,
+        };
+        let mut bytes = [0; 4096];
+        let payload = encode_catalog_operation(&operation, &mut bytes);
+        assert!(matches!(
+            decode_op(KIND_SET_PARAMETER_ACL, payload),
+            Some(WalOp::SetParameterAcl {
+                parameter: "event_triggers",
+                grantee: "reader",
+                grantor: "postgres",
+                privileges,
+                grant_options,
+            }) if privileges == crate::sql::ast::ParameterPrivileges::ALL
+                && grant_options == crate::sql::ast::ParameterPrivileges::SET
+        ));
+
+        let mut invalid = [0; 4096];
+        invalid[..payload.len()].copy_from_slice(payload);
+        let grant_options_offset = payload.len() - 1;
+        invalid[grant_options_offset] = 4;
+        assert!(decode_op(KIND_SET_PARAMETER_ACL, &invalid[..payload.len()]).is_none());
+        assert!(decode_op(KIND_SET_PARAMETER_ACL, &payload[..payload.len() - 1]).is_none());
     }
 
     #[test]

@@ -573,6 +573,10 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingDefaultAcl>,
     },
+    ParameterAclChanged {
+        slot: u32,
+        prior: Option<crate::storage::PendingParameterAcl>,
+    },
     /// A `COMMENT ON` set or removed an object's comment — undo by restoring
     /// the slot's prior uncommitted overlay. On commit, the overlay is
     /// promoted and journaled.

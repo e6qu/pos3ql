@@ -565,7 +565,13 @@ pub(crate) fn dispatch<'a>(
                 let mut weights = 0u8;
                 for index in 0..count {
                     let weight = match crate::sql::array::get(raw, ArrElem::Char, index) {
-                        Some(Datum::Text(weight)) => weight,
+                        Some(Datum::Char(weight)) => match weight {
+                            b'A' => "A",
+                            b'B' => "B",
+                            b'C' => "C",
+                            b'D' => "D",
+                            _ => "",
+                        },
                         Some(Datum::Null) | None => {
                             return Err(sql_err!(
                                 sqlstate::NULL_VALUE_NOT_ALLOWED,

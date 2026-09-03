@@ -6909,7 +6909,7 @@ fn extended_statistics_kinds<'a>(
         ),
     ] {
         if enabled {
-            values[count] = Datum::Bpchar(code);
+            values[count] = Datum::Char(code.as_bytes()[0]);
             count += 1;
         }
     }
@@ -12299,7 +12299,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         if let Some((output_oids, output_names)) = record_outputs {
             for output in 0..output_oids.len() {
                 all_types[output] = Datum::Oid(output_oids[output] as u32);
-                modes[output] = Datum::Bpchar("o");
+                modes[output] = Datum::Char(b'o');
                 names[output] = Datum::Text(output_names[output]);
             }
         }
@@ -12431,7 +12431,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     "v"
                 }
             };
-            argument_modes[index] = Datum::Bpchar(mode);
+            argument_modes[index] = Datum::Char(mode.as_bytes()[0]);
             if !parameter.name.as_str().is_empty() {
                 has_names = true;
             }

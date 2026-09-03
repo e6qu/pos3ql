@@ -604,6 +604,22 @@ pub(crate) fn dispatch<'a>(
                 arity(2)?;
                 let object_type = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Text(value) => value,
+                    Datum::Char(value) => match value {
+                        b'c' => "c",
+                        b'd' => "d",
+                        b'F' => "F",
+                        b'S' => "S",
+                        b'f' => "f",
+                        b'l' => "l",
+                        b'L' => "L",
+                        b'p' => "p",
+                        b'r' => "r",
+                        b'n' => "n",
+                        b's' => "s",
+                        b't' => "t",
+                        b'T' => "T",
+                        _ => "",
+                    },
                     Datum::Null => return Ok(Datum::Null),
                     _ => {
                         return Err(sql_err!(

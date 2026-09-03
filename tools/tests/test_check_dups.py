@@ -24,7 +24,7 @@ class DuplicateCodeTests(unittest.TestCase):
             )
 
     def test_rejects_a_normalized_clone(self):
-        body = "\n".join(f"let value_{number} = {number};" for number in range(4))
+        body = "\n".join(f"let  value_{number}  =  {number};" for number in range(4))
         result = self.run_check({"one.rs": body, "two.rs": body.replace("  ", " ")})
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("clone:", result.stdout)

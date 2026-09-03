@@ -27137,6 +27137,54 @@ fn routine_acls_are_signature_typed_enforced_and_durable() {
 }
 
 #[test]
+fn revoke_all_functions_does_not_materialize_unrelated_public_acls() {
+    let mut config = test_config("revoke-all-functions-public-acl");
+    config.max_tables = crate::sql::txn::MAX_TXN_DDL + 1;
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE routine_acl_unrelated_reader;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for index in 0..=crate::sql::txn::MAX_TXN_DDL {
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "CREATE FUNCTION routine_acl_unrelated_{index}() RETURNS integer LANGUAGE SQL AS 'SELECT {index}'"
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+    let revoked = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM routine_acl_unrelated_reader;
+         SELECT has_function_privilege(
+             'routine_acl_unrelated_reader',
+             'routine_acl_unrelated_0()',
+             'EXECUTE'
+         );",
+    );
+    assert_eq!(
+        data_rows(&revoked),
+        ["t"],
+        "{}",
+        String::from_utf8_lossy(&revoked)
+    );
+}
+
+#[test]
 fn privilege_targets_keep_language_composite_and_routine_kinds_distinct() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(

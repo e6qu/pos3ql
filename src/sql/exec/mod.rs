@@ -9683,8 +9683,15 @@ pub fn revoke_privileges(
             ));
         }
     }
+    let revokes_public = grantees
+        .iter()
+        .any(|grantee| grantee.eq_ignore_ascii_case("public"));
     for object in &objects[..object_count] {
-        if let Err(error) = materialize_public_acl_default(storage, txn, *object) {
+        // Only a PUBLIC revocation changes PostgreSQL's implicit default ACL.
+        // Materializing it for another grantee consumes a durable ACL entry and
+        // transaction undo record for an otherwise untouched object.
+        if revokes_public && let Err(error) = materialize_public_acl_default(storage, txn, *object)
+        {
             return sql_fail(error);
         }
         let requested = match privilege_mask(privileges, object.class, false) {
@@ -9836,13 +9843,15 @@ pub fn revoke_privileges(
             } else {
                 old_privileges.without(requested)
             };
-            if requested.0 != 0 {
+            let new_options = old_options.without(requested);
+            if requested.0 != 0 && (new_privileges != old_privileges || new_options != old_options)
+            {
                 let (slot, prior) = match storage.change_acl(
                     *object,
                     grantee,
                     acl_grantor as u16,
                     new_privileges,
-                    old_options.without(requested),
+                    new_options,
                     txn.txid,
                 ) {
                     Ok(change) => change,

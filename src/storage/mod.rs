@@ -9609,6 +9609,21 @@ pub struct Md5Verifier {
     pub hash: [u8; 32],
 }
 
+impl Md5Verifier {
+    pub fn derive(password: &str, role: &str) -> Option<Self> {
+        let mut source = [0u8; ROLE_PASSWORD_MAX + 64];
+        let len = password.len().checked_add(role.len())?;
+        if len > source.len() {
+            return None;
+        }
+        source[..password.len()].copy_from_slice(password.as_bytes());
+        source[password.len()..len].copy_from_slice(role.as_bytes());
+        let mut hash = [0u8; 32];
+        crate::sql::md5::hex(&crate::sql::md5::digest(&source[..len]), &mut hash);
+        Some(Self { hash })
+    }
+}
+
 /// A role credential is a parsed durable authentication verifier. Plaintext
 /// never reaches catalog, WAL, checkpoint, or object storage state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

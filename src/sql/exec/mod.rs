@@ -5854,6 +5854,8 @@ fn require_role_attribute_authority(
 
 fn apply_role_options(
     mut attributes: crate::storage::RoleAttributes,
+    role_name: &str,
+    password_encryption: crate::sql::guc::PasswordEncryption,
     options: &crate::sql::ast::RoleOptions<'_>,
 ) -> Result<crate::storage::RoleAttributes, SqlError> {
     if let Some(value) = options.superuser {
@@ -5898,18 +5900,36 @@ fn apply_role_options(
                             crate::storage::ROLE_PASSWORD_MAX
                         ));
                     }
-                    let mut salt = [0u8; 16];
-                    if unsafe { libc::getentropy(salt.as_mut_ptr().cast(), salt.len()) } != 0 {
-                        return Err(sql_err!(
-                            sqlstate::IO_ERROR,
-                            "could not generate role password salt"
-                        ));
+                    match password_encryption {
+                        crate::sql::guc::PasswordEncryption::ScramSha256 => {
+                            let mut salt = [0u8; 16];
+                            if unsafe { libc::getentropy(salt.as_mut_ptr().cast(), salt.len()) }
+                                != 0
+                            {
+                                return Err(sql_err!(
+                                    sqlstate::IO_ERROR,
+                                    "could not generate role password salt"
+                                ));
+                            }
+                            crate::storage::RoleCredential::Scram(
+                                crate::pg::auth::ScramServer::derive(
+                                    password,
+                                    salt,
+                                    crate::pg::auth::SCRAM_ITERATIONS,
+                                ),
+                            )
+                        }
+                        crate::sql::guc::PasswordEncryption::Md5 => {
+                            let verifier = crate::storage::Md5Verifier::derive(password, role_name)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "role password exceeds bounded MD5 input"
+                                    )
+                                })?;
+                            crate::storage::RoleCredential::Md5(verifier)
+                        }
                     }
-                    crate::storage::RoleCredential::Scram(crate::pg::auth::ScramServer::derive(
-                        password,
-                        salt,
-                        crate::pg::auth::SCRAM_ITERATIONS,
-                    ))
                 }
                 crate::sql::ast::RolePasswordSpec::ScramVerifier(verifier) => {
                     crate::storage::RoleCredential::Scram(verifier)
@@ -5938,26 +5958,36 @@ fn apply_role_options(
     Ok(attributes)
 }
 
+pub struct CreateRoleRequest<'a> {
+    pub name: &'a str,
+    pub options: &'a crate::sql::ast::RoleOptions<'a>,
+    pub memberships: &'a crate::sql::ast::RoleMembershipClauses<'a>,
+}
+
 pub fn create_role(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    name: &str,
-    options: &crate::sql::ast::RoleOptions<'_>,
-    memberships: &crate::sql::ast::RoleMembershipClauses<'_>,
+    request: CreateRoleRequest<'_>,
+    guc: &crate::sql::guc::GucState,
     responder: &mut Responder,
 ) -> Outcome {
     if let Err(error) = require_create_role(storage, txn.txid) {
         return sql_fail(error);
     }
-    if let Err(error) = require_role_attribute_authority(storage, txn.txid, options) {
+    if let Err(error) = require_role_attribute_authority(storage, txn.txid, request.options) {
         return sql_fail(error);
     }
-    let name = match SqlName::parse(name) {
+    let name = match SqlName::parse(request.name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
-    let attributes = match apply_role_options(crate::storage::RoleAttributes::ORDINARY, options) {
+    let attributes = match apply_role_options(
+        crate::storage::RoleAttributes::ORDINARY,
+        name.as_str(),
+        guc.password_encryption(),
+        request.options,
+    ) {
         Ok(attributes) => attributes,
         Err(error) => return sql_fail(error),
     };
@@ -5984,17 +6014,18 @@ pub fn create_role(
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
-    if options.sysid.is_some() {
+    if request.options.sysid.is_some() {
         responder.notice(
             sqlstate::SUCCESSFUL_COMPLETION,
             "SYSID can no longer be specified",
         )?;
     }
-    let membership_count = memberships
+    let membership_count = request
+        .memberships
         .in_roles
         .len()
-        .saturating_add(memberships.role_members.len())
-        .saturating_add(memberships.admin_members.len());
+        .saturating_add(request.memberships.role_members.len())
+        .saturating_add(request.memberships.admin_members.len());
     if membership_count >= super::txn::MAX_TXN_DDL {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -6002,7 +6033,7 @@ pub fn create_role(
         ));
     }
     let grantor = storage.current_role_slot(txn.txid).unwrap_or(0);
-    for written in memberships.in_roles {
+    for written in request.memberships.in_roles {
         let resolved = crate::util::StackStr::<64>::from_str(written);
         let Some(parent) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
             return sql_fail(sql_err!(
@@ -6036,8 +6067,8 @@ pub fn create_role(
         }
     }
     for (members, admin) in [
-        (memberships.role_members, false),
-        (memberships.admin_members, true),
+        (request.memberships.role_members, false),
+        (request.memberships.admin_members, true),
     ] {
         for written in members {
             let resolved = crate::util::StackStr::<64>::from_str(written);
@@ -6065,10 +6096,12 @@ pub fn create_role(
             }
         }
     }
-    if matches!(
-        options.password,
-        Some(Some(crate::sql::ast::RolePasswordSpec::Md5Verifier(_)))
-    ) {
+    if request.options.password.is_some()
+        && matches!(
+            attributes.password,
+            Some(crate::storage::RoleCredential::Md5(_))
+        )
+    {
         responder.warning("01P01", "setting an MD5-encrypted password")?;
     }
     responder.command_complete("CREATE ROLE")?;
@@ -6127,6 +6160,7 @@ pub fn alter_role(
     txn: &mut TxnState,
     specification: crate::sql::ast::RoleSpecification<'_>,
     options: &crate::sql::ast::RoleOptions<'_>,
+    guc: &crate::sql::guc::GucState,
     responder: &mut Responder,
 ) -> Outcome {
     let resolved = resolve_role_specification(specification);
@@ -6174,7 +6208,12 @@ pub fn alter_role(
     if let Err(error) = require_role_attribute_authority(storage, txn.txid, options) {
         return sql_fail(error);
     }
-    let attributes = match apply_role_options(storage.role(slot).attributes_to(txn.txid), options) {
+    let attributes = match apply_role_options(
+        storage.role(slot).attributes_to(txn.txid),
+        storage.role_name(slot, txn.txid).as_str(),
+        guc.password_encryption(),
+        options,
+    ) {
         Ok(attributes) => attributes,
         Err(error) => return sql_fail(error),
     };
@@ -6201,10 +6240,12 @@ pub fn alter_role(
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
-    if matches!(
-        options.password,
-        Some(Some(crate::sql::ast::RolePasswordSpec::Md5Verifier(_)))
-    ) {
+    if options.password.is_some()
+        && matches!(
+            attributes.password,
+            Some(crate::storage::RoleCredential::Md5(_))
+        )
+    {
         responder.warning("01P01", "setting an MD5-encrypted password")?;
     }
     responder.command_complete("ALTER ROLE")?;
@@ -19330,9 +19371,12 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
-                    name,
-                    options,
-                    memberships,
+                    super::exec::CreateRoleRequest {
+                        name,
+                        options,
+                        memberships,
+                    },
+                    guc,
                     responder,
                 ),
                 Stmt::AlterRole { role, options } => super::exec::alter_role(
@@ -19341,6 +19385,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     txn,
                     *role,
                     options,
+                    guc,
                     responder,
                 ),
                 Stmt::AlterRoleRename { role, new_name } => super::exec::rename_role(

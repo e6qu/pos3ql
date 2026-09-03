@@ -13398,9 +13398,12 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                name,
-                options,
-                memberships,
+                exec::CreateRoleRequest {
+                    name,
+                    options,
+                    memberships,
+                },
+                guc,
                 responder,
             ),
             Stmt::AlterRole { role, options } => exec::alter_role(
@@ -13409,6 +13412,7 @@ impl Engine {
                 txn,
                 *role,
                 options,
+                guc,
                 responder,
             ),
             Stmt::AlterRoleRename { role, new_name } => exec::rename_role(

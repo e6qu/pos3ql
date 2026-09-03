@@ -61,6 +61,31 @@ SELECT rolpassword IS NULL
   FROM pg_authid WHERE rolname = 'credential_md5_renamed';
 DROP ROLE credential_md5_renamed;
 
+SET password_encryption TO 'md5';
+SHOW password_encryption;
+CREATE ROLE credential_md5_generated LOGIN PASSWORD 'credential-secret';
+SELECT rolpassword = 'md5a3221a0fd80db2ebd0ce7b454dd89139'
+  FROM pg_authid WHERE rolname = 'credential_md5_generated';
+ALTER ROLE credential_md5_generated PASSWORD 'replacement-secret';
+SELECT rolpassword = 'md53c7622c401b4a25294783f1c91d31b4a'
+  FROM pg_authid WHERE rolname = 'credential_md5_generated';
+DROP ROLE credential_md5_generated;
+RESET password_encryption;
+SHOW password_encryption;
+
+BEGIN;
+SET LOCAL password_encryption TO 'md5';
+CREATE ROLE credential_md5_local PASSWORD 'credential-secret';
+COMMIT;
+CREATE ROLE credential_scram_default PASSWORD 'credential-secret';
+SELECT md5_role.rolpassword LIKE 'md5%',
+       scram_role.rolpassword LIKE 'SCRAM-SHA-256$%'
+  FROM pg_authid md5_role
+  CROSS JOIN pg_authid scram_role
+ WHERE md5_role.rolname = 'credential_md5_local'
+   AND scram_role.rolname = 'credential_scram_default';
+DROP ROLE credential_md5_local, credential_scram_default;
+
 CREATE ROLE "current_user";
 CREATE ROLE "all";
 ALTER ROLE "current_user" NOLOGIN;

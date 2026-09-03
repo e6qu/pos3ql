@@ -48,16 +48,7 @@ fn reject_replication_login(mode: ReplicationMode, role: crate::sql::RoleLogin) 
 }
 
 fn md5_inner(password: &str, role: &str) -> Option<[u8; 32]> {
-    let mut source = [0u8; crate::storage::ROLE_PASSWORD_MAX + 64];
-    let len = password.len().checked_add(role.len())?;
-    if len > source.len() {
-        return None;
-    }
-    source[..password.len()].copy_from_slice(password.as_bytes());
-    source[password.len()..len].copy_from_slice(role.as_bytes());
-    let mut hash = [0u8; 32];
-    crate::sql::md5::hex(&crate::sql::md5::digest(&source[..len]), &mut hash);
-    Some(hash)
+    crate::storage::Md5Verifier::derive(password, role).map(|verifier| verifier.hash)
 }
 
 fn md5_response(hash: &[u8; 32], salt: &[u8; 4]) -> [u8; 35] {

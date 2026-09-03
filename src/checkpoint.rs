@@ -2833,7 +2833,7 @@ impl Checkpointer {
                         )
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
-                Some("vw7") => {
+                Some("vw11") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_view(storage, line)?;
                 }
@@ -6827,22 +6827,25 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "vw7 {} {} {} {} {} {} {}",
+                    "vw11 {} {} {} {} {} {} {} {} {}",
                     hex.as_str(),
                     hschema.as_str(),
                     hpath.as_str(),
                     hname.as_str(),
                     u8::from(matches!(
-                        view.security,
+                        view.options.security,
                         crate::storage::ViewSecurity::Invoker
                     )),
-                    view.check_option
+                    view.options.security_barrier.code(),
+                    view.options
+                        .check_option
                         .map_or(0, crate::storage::ViewCheckOption::code),
+                    ManifestViewColumns(view.columns),
                     ManifestDependencies(storage.view_dependencies(view_slot))
                 ),
             )?;
         }
-        // Materialized views: like `vw2`, plus a trailing populated flag (0/1).
+        // Materialized views persist their backing relation separately.
         // Publications: database-scoped names plus explicit table slots.
         for (_, publication) in storage.checkpoint_publications() {
             write_database_context(
@@ -10762,21 +10765,114 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
         word.ok_or(CheckpointSetupError::Corrupt(what))
             .and_then(decode_hex_name)
     };
-    let sql = read_hex(words.next(), "vw2 sql missing")?;
-    let schema = read_hex(words.next(), "vw2 schema missing")?;
-    let path = read_hex(words.next(), "vw2 path missing")?;
-    let name = read_hex(words.next(), "vw2 name missing")?;
+    let sql = read_hex(words.next(), "view sql missing")?;
+    let schema = read_hex(words.next(), "view schema missing")?;
+    let path = read_hex(words.next(), "view path missing")?;
+    let name = read_hex(words.next(), "view name missing")?;
     let security = match parse_field::<u8>(words.next(), "view security missing")? {
         0 => crate::storage::ViewSecurity::Definer,
         1 => crate::storage::ViewSecurity::Invoker,
         _ => return Err(CheckpointSetupError::Corrupt("invalid view security")),
     };
+    let security_barrier = crate::storage::ViewSecurityBarrier::from_code(parse_field(
+        words.next(),
+        "view security barrier missing",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt(
+        "invalid view security barrier",
+    ))?;
     let check_option = match parse_field::<u8>(words.next(), "view check option missing")? {
         0 => None,
         code => crate::storage::ViewCheckOption::from_code(code)
             .ok_or(CheckpointSetupError::Corrupt("invalid view check option"))
             .map(Some)?,
     };
+    let encoded_columns = words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("view columns missing"))?;
+    let mut encoded_columns = encoded_columns.splitn(3, ':');
+    let aliases = match parse_field::<u8>(encoded_columns.next(), "view column aliases")? {
+        0 => false,
+        1 => true,
+        _ => return Err(CheckpointSetupError::Corrupt("invalid view column aliases")),
+    };
+    let count = encoded_columns
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("invalid view columns"))?;
+    let encoded_entries = encoded_columns
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("invalid view columns"))?;
+    let count = parse_field::<usize>(Some(count), "view column count")?;
+    if count > crate::storage::MAX_COLUMNS {
+        return Err(CheckpointSetupError::Corrupt("view column count"));
+    }
+    let mut names = [crate::storage::SqlName::EMPTY; crate::storage::MAX_COLUMNS];
+    let mut defaults = [ColumnDefault::NONE; crate::storage::MAX_COLUMNS];
+    if count == 0 {
+        if !encoded_entries.is_empty() {
+            return Err(CheckpointSetupError::Corrupt("invalid empty view columns"));
+        }
+    } else {
+        let mut entries = encoded_entries.split(',');
+        for index in 0..count {
+            let entry = entries
+                .next()
+                .ok_or(CheckpointSetupError::Corrupt("view column missing"))?;
+            let mut fields = entry.splitn(4, '/');
+            names[index] =
+                sql_name(&decode_hex_name(fields.next().ok_or(
+                    CheckpointSetupError::Corrupt("view column name missing"),
+                )?)?)?;
+            let tag = parse_field::<u8>(fields.next(), "view column default kind")?;
+            let value = fields.next().ok_or(CheckpointSetupError::Corrupt(
+                "view column default value missing",
+            ))?;
+            let expression = fields.next().ok_or(CheckpointSetupError::Corrupt(
+                "view column default expression missing",
+            ))?;
+            let expression = if expression == "0" {
+                None
+            } else {
+                let source = decode_hex_name(expression)?;
+                let expression = StackStr::from_str(&source);
+                if expression.is_truncated() {
+                    return Err(CheckpointSetupError::Corrupt(
+                        "view column default expression exceeds limit",
+                    ));
+                }
+                Some(expression)
+            };
+            defaults[index] = match tag {
+                0 if value == "0" && expression.is_none() => ColumnDefault::NONE,
+                1 => ColumnDefault::from_parts(default_from_hex(value)?, expression, false).ok_or(
+                    CheckpointSetupError::Corrupt("invalid view constant default"),
+                )?,
+                2 if value == "0" => ColumnDefault::from_parts(None, expression, false).ok_or(
+                    CheckpointSetupError::Corrupt("invalid view expression default"),
+                )?,
+                _ => return Err(CheckpointSetupError::Corrupt("invalid view column default")),
+            };
+        }
+        if entries.next().is_some() {
+            return Err(CheckpointSetupError::Corrupt("trailing view columns"));
+        }
+    }
+    let mut columns = crate::storage::ViewColumns::from_sql_names(&names[..count])
+        .map(|columns| columns.with_aliases(aliases))
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest view columns rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+    for (index, default) in defaults[..count].iter().copied().enumerate() {
+        columns = columns.with_default(index, default).map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest view default rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+    }
     let dependencies = parse_stored_query_dependencies(&mut words)?;
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
@@ -10787,14 +10883,18 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
         .create_view(
             sql_name(&schema)?,
             sql_name(&name)?,
-            crate::storage::StoredQueryDefinition {
-                sql: buffer,
-                creation_path: path_buffer,
-                dependencies,
-            },
-            crate::storage::ViewOptions {
-                security,
-                check_option,
+            crate::storage::ViewDefinition {
+                columns,
+                query: crate::storage::StoredQueryDefinition {
+                    sql: buffer,
+                    creation_path: path_buffer,
+                    dependencies,
+                },
+                options: crate::storage::ViewOptions {
+                    security,
+                    security_barrier,
+                    check_option,
+                },
             },
             true,
             0,
@@ -10860,6 +10960,8 @@ fn load_matview(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
 
 struct ManifestDependencies<'a>(&'a crate::storage::StoredQueryDependencies);
 
+struct ManifestViewColumns(crate::storage::ViewColumns);
+
 struct ManifestName<'a>(&'a str);
 
 fn text_search_behavior_code(behavior: crate::storage::TextSearchDictionaryBehavior) -> u8 {
@@ -10892,6 +10994,48 @@ impl core::fmt::Display for ManifestName<'_> {
         }
         for byte in self.0.as_bytes() {
             write!(output, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for ManifestViewColumns {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            output,
+            "{}:{}:",
+            u8::from(self.0.has_aliases()),
+            self.0.len()
+        )?;
+        for (index, name) in self.0.names().iter().enumerate() {
+            if index != 0 {
+                output.write_str(",")?;
+            }
+            for byte in name.as_str().as_bytes() {
+                write!(output, "{byte:02x}")?;
+            }
+            let default = self
+                .0
+                .default_at(index)
+                .expect("view column index is bounded by its name slice");
+            match default {
+                ColumnDefault::None => output.write_str("/0/0/0")?,
+                ColumnDefault::Constant { value, expression } => {
+                    write!(output, "/1/{}/", default_to_hex(&Some(value)).as_str())?;
+                    for byte in expression.as_str().as_bytes() {
+                        write!(output, "{byte:02x}")?;
+                    }
+                }
+                ColumnDefault::Expression(expression) => {
+                    output.write_str("/2/0/")?;
+                    for byte in expression.as_str().as_bytes() {
+                        write!(output, "{byte:02x}")?;
+                    }
+                }
+                ColumnDefault::Generated(_) => {
+                    return Err(core::fmt::Error);
+                }
+            }
         }
         Ok(())
     }

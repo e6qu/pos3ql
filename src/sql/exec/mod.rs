@@ -116,6 +116,16 @@ pub struct RowCtx<'s, 'v, 'd> {
 pub(crate) struct ViewCheck<'a> {
     pub predicate: Option<&'a Expr<'a>>,
     pub view_name: &'a str,
+    pub defaults: ViewInsertDefaults<'a>,
+}
+
+/// View-column defaults paired with the base columns reached by an
+/// auto-updatable view.  Keeping this mapping with the view rewrite avoids
+/// treating catalog aliases as table-column names at the INSERT boundary.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewInsertDefaults<'a> {
+    pub base_columns: &'a [&'a str],
+    pub columns: crate::storage::ViewColumns,
 }
 
 struct ViewCheckContext<'storage, 'arena, 'params, 'sequence> {
@@ -13372,8 +13382,10 @@ fn replica_identity_columns(
 /// transaction and response dependencies distinct from statement input.
 pub struct CreateViewCommand<'a> {
     pub name: &'a QualName<'a>,
+    pub columns: &'a [&'a str],
     pub or_replace: bool,
     pub security: super::ast::ViewSecurity,
+    pub security_barrier: super::ast::ViewSecurityBarrier,
     pub check_option: Option<super::ast::ViewCheckOption>,
     pub sql: &'a str,
     pub raw_path: &'a str,
@@ -18676,8 +18688,10 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
             let requalified = super::requalify_schema_element(element, name, context.arena)?;
             if let Stmt::CreateView {
                 name: view_name,
+                columns,
                 or_replace,
                 security,
+                security_barrier,
                 check_option,
                 sql,
             } = requalified
@@ -18715,8 +18729,10 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                                     txn,
                                     super::exec::CreateViewCommand {
                                         name: view_name,
+                                        columns,
                                         or_replace: *or_replace,
                                         security: *security,
+                                        security_barrier: *security_barrier,
                                         check_option: *check_option,
                                         sql,
                                         raw_path: schema_path,
@@ -18898,8 +18914,10 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 }
                 Stmt::CreateView {
                     name,
+                    columns,
                     or_replace,
                     security,
+                    security_barrier,
                     check_option,
                     sql,
                 } => super::exec::create_view(
@@ -18908,8 +18926,10 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     txn,
                     super::exec::CreateViewCommand {
                         name,
+                        columns,
                         or_replace: *or_replace,
                         security: *security,
+                        security_barrier: *security_barrier,
                         check_option: *check_option,
                         sql,
                         raw_path: guc.search_path().as_str(),
@@ -32054,8 +32074,10 @@ pub fn create_view(
 ) -> Outcome {
     let CreateViewCommand {
         name,
+        columns,
         or_replace,
         security,
+        security_barrier,
         check_option,
         sql,
         raw_path,
@@ -32070,13 +32092,114 @@ pub fn create_view(
             crate::storage::VIEW_SQL_MAX
         ));
     }
-    // Validate the definition now (tables/views exist, columns resolve), as
-    // PostgreSQL does at CREATE VIEW time.
-    if let Err(e) = super::query::validate_view(buffer.as_str(), storage, txn.txid, arena) {
-        return sql_fail(e);
-    }
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
+    let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let described_count = match super::query::describe_query_under(
+        buffer.as_str(),
+        storage,
+        txn.txid,
+        path,
+        arena,
+        &mut described,
+    ) {
+        Ok(count) => count,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = super::query::validate_view_columns(&described[..described_count]) {
+        return sql_fail(error);
+    }
+    let mut derived_names = [""; MAX_COLUMNS];
+    if described_count > derived_names.len() {
+        return sql_fail(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "view has more than {} columns",
+            MAX_COLUMNS
+        ));
+    }
+    if !columns.is_empty() && columns.len() != described_count {
+        return sql_fail(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "CREATE VIEW specifies {} column names, but query has {} columns",
+            columns.len(),
+            described_count
+        ));
+    }
+    let mut columns = if columns.is_empty() {
+        for (slot, description) in derived_names.iter_mut().zip(&described[..described_count]) {
+            *slot = description.name;
+        }
+        match crate::storage::ViewColumns::from_derived_names(&derived_names[..described_count]) {
+            Ok(columns) => columns,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        match crate::storage::ViewColumns::from_names(columns) {
+            Ok(columns) => columns,
+            Err(error) => return sql_fail(error),
+        }
+    };
+    if or_replace
+        && let Some(crate::storage::ResolvedRelation::View(slot)) =
+            storage.resolve_relation(name.schema, name.name, txn.txid)
+    {
+        let prior = *storage.view(slot).columns_for(txn.txid);
+        if prior.len() > columns.len() {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                "cannot drop columns from view \"{}\"",
+                name.name
+            ));
+        }
+        let mut prior_description = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let prior_count = match super::catalog::describe_view(
+            storage,
+            txn.txid,
+            storage.view(slot),
+            arena,
+            &mut prior_description,
+        ) {
+            Ok(count) => count,
+            Err(error) => return sql_fail(error),
+        };
+        if prior_count != prior.len() {
+            return sql_fail(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view output-column catalog state does not match its definition"
+            ));
+        }
+        for index in 0..prior.len() {
+            if prior.names()[index] != columns.names()[index] {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "cannot change name of view column \"{}\" to \"{}\"",
+                    prior.names()[index].as_str(),
+                    columns.names()[index].as_str()
+                ));
+            }
+            let old = prior_description[index];
+            let new = described[index];
+            if old.type_oid != new.type_oid
+                || old.type_mod != new.type_mod
+                || old.collation != new.collation
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "cannot change data type of view column \"{}\"",
+                    prior.names()[index].as_str()
+                ));
+            }
+            columns = match columns.with_default(
+                index,
+                prior
+                    .default_at(index)
+                    .expect("view column index is bounded"),
+            ) {
+                Ok(columns) => columns,
+                Err(error) => return sql_fail(error),
+            };
+        }
+    }
     let dependencies = match super::query::stored_query_dependencies(
         buffer.as_str(),
         storage,
@@ -32106,20 +32229,36 @@ pub fn create_view(
     match storage.create_view(
         schema,
         sqlname,
-        crate::storage::StoredQueryDefinition {
-            sql: buffer,
-            creation_path,
-            dependencies,
-        },
-        crate::storage::ViewOptions {
-            security: match security {
-                super::ast::ViewSecurity::Definer => crate::storage::ViewSecurity::Definer,
-                super::ast::ViewSecurity::Invoker => crate::storage::ViewSecurity::Invoker,
+        crate::storage::ViewDefinition {
+            columns,
+            query: crate::storage::StoredQueryDefinition {
+                sql: buffer,
+                creation_path,
+                dependencies,
             },
-            check_option: check_option.map(|option| match option {
-                super::ast::ViewCheckOption::Local => crate::storage::ViewCheckOption::Local,
-                super::ast::ViewCheckOption::Cascaded => crate::storage::ViewCheckOption::Cascaded,
-            }),
+            options: crate::storage::ViewOptions {
+                security: match security {
+                    super::ast::ViewSecurity::Definer => crate::storage::ViewSecurity::Definer,
+                    super::ast::ViewSecurity::Invoker => crate::storage::ViewSecurity::Invoker,
+                },
+                security_barrier: match security_barrier {
+                    super::ast::ViewSecurityBarrier::Default => {
+                        crate::storage::ViewSecurityBarrier::Default
+                    }
+                    super::ast::ViewSecurityBarrier::Enabled => {
+                        crate::storage::ViewSecurityBarrier::Enabled
+                    }
+                    super::ast::ViewSecurityBarrier::Disabled => {
+                        crate::storage::ViewSecurityBarrier::Disabled
+                    }
+                },
+                check_option: check_option.map(|option| match option {
+                    super::ast::ViewCheckOption::Local => crate::storage::ViewCheckOption::Local,
+                    super::ast::ViewCheckOption::Cascaded => {
+                        crate::storage::ViewCheckOption::Cascaded
+                    }
+                }),
+            },
         },
         or_replace,
         txn.txid,
@@ -32154,9 +32293,15 @@ pub fn create_view(
                 &WalOp::CreateView {
                     schema: schema.as_str(),
                     name: name.name,
+                    columns,
                     sql,
                     path: raw_path,
                     security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
+                    security_barrier: match security_barrier {
+                        super::ast::ViewSecurityBarrier::Default => 0,
+                        super::ast::ViewSecurityBarrier::Enabled => 1,
+                        super::ast::ViewSecurityBarrier::Disabled => 2,
+                    },
                     check_option: check_option.map_or(0, |option| match option {
                         super::ast::ViewCheckOption::Local => 1,
                         super::ast::ViewCheckOption::Cascaded => 2,
@@ -32322,26 +32467,22 @@ pub fn alter_view(
         responder.command_complete("ALTER VIEW")?;
         return sql_ok();
     }
-    let mut security = storage.view(slot).security_for(txn.txid);
-    let mut check_option = storage.view(slot).check_option_for(txn.txid);
+    let mut options = storage.view(slot).options_for(txn.txid);
     match action {
-        AlterViewAction::SetOptions(options) => {
-            for option in options {
+        AlterViewAction::SetOptions(view_options) => {
+            for option in view_options {
                 match option {
                     ViewOption::SecurityInvoker(enabled) => {
-                        security = if *enabled {
+                        options.security = if *enabled {
                             crate::storage::ViewSecurity::Invoker
                         } else {
                             crate::storage::ViewSecurity::Definer
                         };
                     }
-                    ViewOption::SecurityBarrier(true) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "security_barrier requires a predicate-ordering boundary"
-                        ));
+                    ViewOption::SecurityBarrier(enabled) => {
+                        options.security_barrier =
+                            crate::storage::ViewSecurityBarrier::from_enabled(*enabled);
                     }
-                    ViewOption::SecurityBarrier(false) => {}
                     ViewOption::CheckOption(option) => {
                         match super::query::resolve_view_for_dml(storage, name, txn.txid, arena) {
                             Ok(Some(_)) => {}
@@ -32353,7 +32494,7 @@ pub fn alter_view(
                             }
                             Err(error) => return sql_fail(error),
                         }
-                        check_option = Some(match option {
+                        options.check_option = Some(match option {
                             crate::sql::ast::ViewCheckOption::Local => {
                                 crate::storage::ViewCheckOption::Local
                             }
@@ -32365,28 +32506,198 @@ pub fn alter_view(
                 }
             }
         }
-        AlterViewAction::ResetOptions(options) => {
-            for option in options {
+        AlterViewAction::ResetOptions(view_options) => {
+            for option in view_options {
                 match option {
                     ViewOptionName::SecurityInvoker => {
-                        security = crate::storage::ViewSecurity::Definer;
+                        options.security = crate::storage::ViewSecurity::Definer;
                     }
-                    ViewOptionName::SecurityBarrier => {}
-                    ViewOptionName::CheckOption => check_option = None,
+                    ViewOptionName::SecurityBarrier => {
+                        options.security_barrier = crate::storage::ViewSecurityBarrier::Default;
+                    }
+                    ViewOptionName::CheckOption => options.check_option = None,
                 }
             }
         }
-        AlterViewAction::SetDefault { .. } | AlterViewAction::DropDefault { .. } => {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "view column defaults require automatically updatable view enforcement"
-            ));
+        AlterViewAction::SetDefault { column, expression } => {
+            let current = *storage.view(slot).columns_for(txn.txid);
+            let Some(index) = current
+                .names()
+                .iter()
+                .position(|name| name.as_str() == column)
+            else {
+                return sql_fail(undefined_column(column));
+            };
+            if let Err(error) = super::query::resolve_view_for_dml(storage, name, txn.txid, arena) {
+                return sql_fail(error);
+            }
+            let mut descriptions = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let count = match super::catalog::describe_view(
+                storage,
+                txn.txid,
+                storage.view(slot),
+                arena,
+                &mut descriptions,
+            ) {
+                Ok(count) => count,
+                Err(error) => return sql_fail(error),
+            };
+            if index >= count {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "view column definition does not match its query output"
+                ));
+            }
+            let Some((ctype, _)) =
+                catalog_column_type(storage, txn.txid, descriptions[index].type_oid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "view column type identity is unavailable"
+                ));
+            };
+            let parsed = match crate::sql::parser::parse_expr(expression, arena) {
+                Ok(expression) => expression,
+                Err(error) => return sql_fail(error),
+            };
+            let default = match ddl::resolve_default(
+                Some(parsed),
+                Some(expression),
+                ctype,
+                descriptions[index].type_mod,
+                storage,
+                txn.txid,
+                arena,
+            ) {
+                Ok(default) => default,
+                Err(error) => return sql_fail(error),
+            };
+            let columns = match current.with_default(index, default) {
+                Ok(columns) => columns,
+                Err(error) => return sql_fail(error),
+            };
+            let (schema, view_name) = {
+                let view = storage.view(slot);
+                (view.schema_for(txn.txid), view.name_for(txn.txid))
+            };
+            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetViewColumns {
+                    schema: schema.as_str(),
+                    name: view_name.as_str(),
+                    columns,
+                },
+            ) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            responder.command_complete("ALTER VIEW")?;
+            return sql_ok();
         }
-        AlterViewAction::RenameColumn { .. } => {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "view column renames require a durable output-column identity"
-            ));
+        AlterViewAction::DropDefault { column } => {
+            let current = *storage.view(slot).columns_for(txn.txid);
+            let Some(index) = current
+                .names()
+                .iter()
+                .position(|name| name.as_str() == column)
+            else {
+                return sql_fail(undefined_column(column));
+            };
+            let columns = match current.with_default(index, crate::storage::ColumnDefault::NONE) {
+                Ok(columns) => columns,
+                Err(error) => return sql_fail(error),
+            };
+            let (schema, view_name) = {
+                let view = storage.view(slot);
+                (view.schema_for(txn.txid), view.name_for(txn.txid))
+            };
+            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetViewColumns {
+                    schema: schema.as_str(),
+                    name: view_name.as_str(),
+                    columns,
+                },
+            ) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            responder.command_complete("ALTER VIEW")?;
+            return sql_ok();
+        }
+        AlterViewAction::RenameColumn { from, to } => {
+            let current = storage.view(slot).columns_for(txn.txid);
+            let Some(index) = current
+                .names()
+                .iter()
+                .position(|name| name.as_str() == from)
+            else {
+                return sql_fail(undefined_column(from));
+            };
+            let name = match SqlName::parse(to) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            let columns = match (*current).with_name(index, name) {
+                Ok(columns) => columns,
+                Err(error) => return sql_fail(error),
+            };
+            let (schema, view_name) = {
+                let view = storage.view(slot);
+                (view.schema_for(txn.txid), view.name_for(txn.txid))
+            };
+            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetViewColumns {
+                    schema: schema.as_str(),
+                    name: view_name.as_str(),
+                    columns,
+                },
+            ) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            responder.command_complete("ALTER VIEW")?;
+            return sql_ok();
         }
         AlterViewAction::RenameTo(new_name) => {
             let (schema, current_name) = {
@@ -32437,9 +32748,7 @@ pub fn alter_view(
         }
         AlterViewAction::SetSchema(_) => unreachable!("handled before option staging"),
     }
-    let current_security = storage.view(slot).security_for(txn.txid);
-    let current_check_option = storage.view(slot).check_option_for(txn.txid);
-    if security == current_security && check_option == current_check_option {
+    if options == storage.view(slot).options_for(txn.txid) {
         responder.command_complete("ALTER VIEW")?;
         return sql_ok();
     }
@@ -32447,57 +32756,33 @@ pub fn alter_view(
         let view = storage.view(slot);
         (view.schema, view.name)
     };
-    if security != current_security {
-        let prior = match storage.stage_view_security(slot, security, txn.txid) {
-            Ok(prior) => prior,
-            Err(error) => return sql_fail(error),
-        };
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::SetViewSecurity {
-                schema: schema.as_str(),
-                name: view_name.as_str(),
-                security_invoker: matches!(security, crate::storage::ViewSecurity::Invoker),
-            },
-        ) {
-            storage.rollback_view_security(slot, prior);
-            return sql_fail(error);
-        }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewSecurityChanged {
-            slot: slot as u32,
-            prior,
-        }) {
-            storage.rollback_view_security(slot, prior);
-            return sql_fail(error);
-        }
+    let prior = match storage.stage_view_options(slot, options, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetViewOptions {
+            schema: schema.as_str(),
+            name: view_name.as_str(),
+            security_invoker: matches!(options.security, crate::storage::ViewSecurity::Invoker),
+            security_barrier: options.security_barrier.code(),
+            check_option: options
+                .check_option
+                .map_or(0, crate::storage::ViewCheckOption::code),
+        },
+    ) {
+        storage.rollback_view_options(slot, prior);
+        return sql_fail(error);
     }
-    if check_option != current_check_option {
-        let prior = match storage.stage_view_check_option(slot, check_option, txn.txid) {
-            Ok(prior) => prior,
-            Err(error) => return sql_fail(error),
-        };
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::SetViewCheckOption {
-                schema: schema.as_str(),
-                name: view_name.as_str(),
-                check_option: check_option.map_or(0, crate::storage::ViewCheckOption::code),
-            },
-        ) {
-            storage.rollback_view_check_option(slot, prior);
-            return sql_fail(error);
-        }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewCheckOptionChanged {
-            slot: slot as u32,
-            prior,
-        }) {
-            storage.rollback_view_check_option(slot, prior);
-            return sql_fail(error);
-        }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewOptionsChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_view_options(slot, prior);
+        return sql_fail(error);
     }
     responder.command_complete("ALTER VIEW")?;
     sql_ok()
@@ -41227,14 +41512,16 @@ fn rewrite_composite_dependent_views(
         let (new_slot, old_slot) = storage.create_view(
             view.schema,
             view.name,
-            crate::storage::StoredQueryDefinition {
-                sql: rewritten,
-                creation_path,
-                dependencies,
-            },
-            crate::storage::ViewOptions {
-                security: view.security_for(txn.txid),
-                check_option: view.check_option_for(txn.txid),
+            crate::storage::ViewDefinition {
+                columns: view.columns,
+                query: crate::storage::StoredQueryDefinition {
+                    sql: rewritten,
+                    creation_path,
+                    dependencies,
+                },
+                options: crate::storage::ViewOptions {
+                    ..view.options_for(txn.txid)
+                },
             },
             true,
             txn.txid,
@@ -41246,12 +41533,14 @@ fn rewrite_composite_dependent_views(
             &WalOp::CreateView {
                 schema: view.schema.as_str(),
                 name: view.name.as_str(),
+                columns: view.columns,
                 sql: rewritten.as_str(),
                 path: creation_path.as_str(),
                 security_invoker: matches!(
                     view.security_for(txn.txid),
                     crate::storage::ViewSecurity::Invoker
                 ),
+                security_barrier: view.security_barrier_for(txn.txid).code(),
                 check_option: view
                     .check_option_for(txn.txid)
                     .map_or(0, |option| option.code()),
@@ -48839,6 +49128,108 @@ where
     coerce(value, column, storage, txid, arena)
 }
 
+/// Parses only expression-backed defaults installed on an auto-updatable view.
+/// The catalog already stores constants in typed form, so execution never
+/// reparses or re-coerces those values.
+fn parse_view_defaults<'a>(
+    view: Option<ViewCheck<'_>>,
+    definition: &TableDef,
+    arena: &'a Arena,
+) -> Result<constraints::ParsedDefaults<'a>, SqlError> {
+    let mut parsed = [None; MAX_COLUMNS];
+    let Some(view) = view else {
+        return Ok(parsed);
+    };
+    for (view_index, base_name) in view.defaults.base_columns.iter().enumerate() {
+        let Some(default) = view.defaults.columns.default_at(view_index) else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view default columns do not match the view output"
+            ));
+        };
+        let Some(source) = default.expression() else {
+            continue;
+        };
+        if default.constant().is_some() {
+            continue;
+        }
+        if default.is_generated() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view column default is a generated expression"
+            ));
+        }
+        let Some(base_index) = definition.column_index(base_name) else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view default target is absent from its base relation"
+            ));
+        };
+        let source = arena.alloc_str(source.as_str()).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "view default expression exceeds the statement arena"
+            )
+        })?;
+        parsed[base_index] = Some(crate::sql::parser::parse_expr(source, arena)?);
+    }
+    Ok(parsed)
+}
+
+fn view_default_for(
+    view: Option<ViewCheck<'_>>,
+    definition: &TableDef,
+    base_index: usize,
+) -> Option<crate::storage::ColumnDefault> {
+    let view = view?;
+    let base_name = definition.columns().get(base_index)?.name.as_str();
+    let view_index = view
+        .defaults
+        .base_columns
+        .iter()
+        .position(|candidate| *candidate == base_name)?;
+    view.defaults
+        .columns
+        .default_at(view_index)
+        .filter(|default| !matches!(default, crate::storage::ColumnDefault::None))
+}
+
+#[expect(clippy::too_many_arguments, reason = "default evaluation context")]
+fn insert_default_value<'values, 'arena>(
+    storage: &Storage,
+    txid: u32,
+    view: Option<ViewCheck<'_>>,
+    definition: &'values TableDef,
+    base_index: usize,
+    table_expression: Option<&'arena Expr<'arena>>,
+    view_expression: Option<&'arena Expr<'arena>>,
+    arena: &'arena Arena,
+    hooks: &super::eval::EvalHooks<'_, 'arena>,
+) -> Result<Datum<'values>, SqlError>
+where
+    'arena: 'values,
+{
+    let column = &definition.columns()[base_index];
+    let (default, expression) = match view_default_for(view, definition, base_index) {
+        Some(default) => (default, view_expression),
+        None => (column.default, table_expression),
+    };
+    if let Some(constant) = default.constant() {
+        return detach_routine_datum(constant.as_datum(), arena);
+    }
+    let Some(expression) = expression else {
+        return Ok(Datum::Null);
+    };
+    let value = super::eval::eval_full(
+        expression,
+        arena,
+        crate::sql::eval::NO_PARAMS,
+        &NoColumns,
+        hooks,
+    )?;
+    coerce(value, column, storage, txid, arena)
+}
+
 /// What to do with an explicitly supplied value for a column, given the
 /// statement's `OVERRIDING` mode.
 #[derive(PartialEq)]
@@ -51128,6 +51519,7 @@ pub(crate) fn view_trigger_definition(
         arena,
         &mut columns,
     )?;
+    let n_columns = super::catalog::overlay_view_column_names(view, txid, &mut columns, n_columns)?;
     if n_columns > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -52287,6 +52679,10 @@ where
             Ok(d) => d,
             Err(e) => return sql_fail(e),
         };
+        let view_default_exprs = match parse_view_defaults(view_check, &def, arena) {
+            Ok(d) => d,
+            Err(e) => return sql_fail(e),
+        };
         let generated_exprs = match parse_generated(&def, arena) {
             Ok(g) => g,
             Err(e) => return sql_fail(e),
@@ -52365,28 +52761,24 @@ where
                     sequences: Some(&seq),
                     ..super::eval::NO_HOOKS
                 };
-                for (i, col) in def.columns().iter().enumerate() {
+                for i in 0..def.n_columns {
                     if explicit[i] {
                         continue;
                     }
-                    if let Some(d) = col.default.constant() {
-                        values[i] = d.as_datum();
-                    } else if let Some(expr) = default_exprs[i] {
-                        let v = match super::eval::eval_full(
-                            expr,
-                            arena,
-                            crate::sql::eval::NO_PARAMS,
-                            &NoColumns,
-                            &hooks,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => return sql_fail(e),
-                        };
-                        match coerce(v, col, storage, txn.txid, arena) {
-                            Ok(v) => values[i] = v,
-                            Err(e) => return sql_fail(e),
-                        }
-                    }
+                    values[i] = match insert_default_value(
+                        storage,
+                        txn.txid,
+                        view_check,
+                        &def,
+                        i,
+                        default_exprs[i],
+                        view_default_exprs[i],
+                        arena,
+                        &hooks,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => return sql_fail(error),
+                    };
                 }
             }
             if let Err(e) = fill_auto_increment(
@@ -52491,6 +52883,10 @@ where
     // Non-constant DEFAULT expressions (now(), nextval(...), …) and GENERATED
     // expressions, re-parsed once and evaluated per row below.
     let default_exprs = match parse_defaults(&def, arena) {
+        Ok(d) => d,
+        Err(e) => return sql_fail(e),
+    };
+    let view_default_exprs = match parse_view_defaults(view_check, &def, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -52600,28 +52996,24 @@ where
                 }
             }
             // Defaults for the columns the row did not set explicitly.
-            for (i, col) in def.columns().iter().enumerate() {
+            for i in 0..def.n_columns {
                 if explicit[i] {
                     continue;
                 }
-                if let Some(d) = col.default.constant() {
-                    values[i] = d.as_datum();
-                } else if let Some(expr) = default_exprs[i] {
-                    let v = match super::eval::eval_full(
-                        expr,
-                        arena,
-                        crate::sql::eval::NO_PARAMS,
-                        &NoColumns,
-                        &hooks,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => return sql_fail(e),
-                    };
-                    match coerce(v, col, storage, txn.txid, arena) {
-                        Ok(v) => values[i] = v,
-                        Err(e) => return sql_fail(e),
-                    }
-                }
+                values[i] = match insert_default_value(
+                    storage,
+                    txn.txid,
+                    view_check,
+                    &def,
+                    i,
+                    default_exprs[i],
+                    view_default_exprs[i],
+                    arena,
+                    &hooks,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return sql_fail(error),
+                };
             }
         }
         if let Err(e) = fill_auto_increment(
@@ -61736,6 +62128,7 @@ fn enforce_view_check<'a>(
     let Some(ViewCheck {
         predicate: Some(predicate),
         view_name,
+        ..
     }) = check
     else {
         return Ok(());

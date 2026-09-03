@@ -97,6 +97,25 @@ pub enum ViewSecurity {
     Invoker,
 }
 
+/// The view option keeps an explicit `false` distinct from the PostgreSQL
+/// default, because `pg_class.reloptions` exposes that distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewSecurityBarrier {
+    Default,
+    Enabled,
+    Disabled,
+}
+
+impl ViewSecurityBarrier {
+    pub const fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
 /// PostgreSQL's three view options.  Parsing them as a closed state keeps a
 /// later executor from treating a misspelled option as inert catalog text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,8 +286,10 @@ pub enum CreateSchemaElement<'a> {
     Table(CreateTable<'a>),
     View {
         name: QualName<'a>,
+        columns: &'a [&'a str],
         or_replace: bool,
         security: ViewSecurity,
+        security_barrier: ViewSecurityBarrier,
         check_option: Option<ViewCheckOption>,
         sql: &'a str,
     },
@@ -489,8 +510,12 @@ pub enum Stmt<'a> {
     /// stored and re-expanded as a derived table at query time.
     CreateView {
         name: QualName<'a>,
+        /// Output names are part of the view's durable relation identity, not
+        /// aliases discarded after parsing the SELECT body.
+        columns: &'a [&'a str],
         or_replace: bool,
         security: ViewSecurity,
+        security_barrier: ViewSecurityBarrier,
         check_option: Option<ViewCheckOption>,
         sql: &'a str,
     },

@@ -8913,6 +8913,30 @@ mod tests {
     }
 
     #[test]
+    fn view_security_barrier_keeps_default_and_explicit_false_distinct() {
+        with_parser(
+            "CREATE VIEW default_barrier AS SELECT 1; \
+             CREATE VIEW disabled_barrier WITH (security_barrier = false) AS SELECT 1; \
+             CREATE VIEW enabled_barrier WITH (security_barrier = true) AS SELECT 1",
+            |parser| {
+                for expected in [
+                    crate::sql::ast::ViewSecurityBarrier::Default,
+                    crate::sql::ast::ViewSecurityBarrier::Disabled,
+                    crate::sql::ast::ViewSecurityBarrier::Enabled,
+                ] {
+                    let Some(Stmt::CreateView {
+                        security_barrier, ..
+                    }) = parser.next_stmt().unwrap()
+                    else {
+                        panic!("CREATE VIEW did not parse into a typed view statement")
+                    };
+                    assert_eq!(security_barrier, expected);
+                }
+            },
+        );
+    }
+
+    #[test]
     fn constraint_attributes_reject_unrepresentable_states_at_parse_time() {
         for sql in [
             "CREATE TABLE t (id integer UNIQUE ENFORCED)",

@@ -37,7 +37,7 @@ use crate::sql::ast::{
     SubscriptionSynchronousCommit, TableAccessMethod, TableMembership, TablespaceOptionNames,
     TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption,
     TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables,
-    ViewSecurity,
+    ViewSecurity, ViewSecurityBarrier,
 };
 use crate::sql::eval::sqlstate;
 
@@ -4790,14 +4790,18 @@ impl<'a> Parser<'a> {
                 Stmt::CreateTable(table) => CreateSchemaElement::Table(table),
                 Stmt::CreateView {
                     name,
+                    columns,
                     or_replace,
                     security,
+                    security_barrier,
                     check_option,
                     sql,
                 } => CreateSchemaElement::View {
                     name,
+                    columns,
                     or_replace,
                     security,
+                    security_barrier,
                     check_option,
                     sql,
                 },
@@ -5204,7 +5208,27 @@ impl<'a> Parser<'a> {
     /// CREATE VIEW name AS <select> ("create [or replace] view" consumed).
     fn create_view(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("view name")?;
+        let columns = if self.peeked == Tok::Op("(") {
+            let mut names = [""; crate::storage::MAX_COLUMNS];
+            self.expect_op("(")?;
+            let mut count = 0;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("view column list", names.len()));
+                }
+                names[count] = self.col_ident("view column name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            self.arena_slice(&names[..count])?
+        } else {
+            &[]
+        };
         let mut security = ViewSecurity::Definer;
+        let mut security_barrier = ViewSecurityBarrier::Default;
         let mut check_option = None;
         if self.eat_ident("with")? {
             self.expect_op("(")?;
@@ -5220,11 +5244,9 @@ impl<'a> Parser<'a> {
                     crate::sql::ast::ViewOption::CheckOption(option) => {
                         check_option = Some(*option);
                     }
-                    crate::sql::ast::ViewOption::SecurityBarrier(true) => {
-                        return Err(self
-                            .err_here("security_barrier requires a predicate-ordering boundary"));
+                    crate::sql::ast::ViewOption::SecurityBarrier(enabled) => {
+                        security_barrier = ViewSecurityBarrier::from_enabled(*enabled);
                     }
-                    crate::sql::ast::ViewOption::SecurityBarrier(false) => {}
                 }
             }
         }
@@ -5237,8 +5259,10 @@ impl<'a> Parser<'a> {
         let sql = self.text[start..end].trim();
         Ok(Stmt::CreateView {
             name,
+            columns,
             or_replace,
             security,
+            security_barrier,
             check_option,
             sql,
         })

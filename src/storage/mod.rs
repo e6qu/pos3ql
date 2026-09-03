@@ -454,7 +454,7 @@ pub(crate) const MAX_DEFAULT_TEXT: usize = DEFAULT_EXPR_MAX;
 /// catalog identity. Keeping the alternatives together prevents a column from
 /// being both generated and defaulted, or from carrying a value without the
 /// expression that describes it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColumnDefault {
     None,
     Constant {
@@ -1032,6 +1032,9 @@ impl DeclaredColumnType {
 /// Ample for real defaults (`nextval('schema.seq')`, `now()`,
 /// `gen_random_uuid()`, …); a longer one is a loud error, never silent growth.
 pub(crate) const DEFAULT_EXPR_MAX: usize = 128;
+/// Active view defaults stay sparse so catalog and WAL frames fit their
+/// startup-bounded execution envelopes.
+pub(crate) const MAX_VIEW_DEFAULTS: usize = 8;
 
 impl ColumnMeta {
     pub const EMPTY: Self = ColumnMeta {
@@ -3834,6 +3837,50 @@ pub enum ViewSecurity {
     Invoker,
 }
 
+/// The option's absent, explicitly enabled, and explicitly disabled states
+/// are observably different through `pg_class.reloptions`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewSecurityBarrier {
+    Default,
+    Enabled,
+    Disabled,
+}
+
+impl ViewSecurityBarrier {
+    pub const fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::Enabled => 1,
+            Self::Disabled => 2,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Default),
+            1 => Some(Self::Enabled),
+            2 => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    pub const fn reloption(self) -> Option<bool> {
+        match self {
+            Self::Default => None,
+            Self::Enabled => Some(true),
+            Self::Disabled => Some(false),
+        }
+    }
+}
+
 /// A persisted view check policy. Absence is PostgreSQL's default: writes
 /// through the view are not required to remain visible through its predicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3845,13 +3892,224 @@ pub enum ViewCheckOption {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewOptions {
     pub security: ViewSecurity,
+    pub security_barrier: ViewSecurityBarrier,
     pub check_option: Option<ViewCheckOption>,
 }
 
 impl ViewOptions {
     pub const DEFAULT: Self = Self {
         security: ViewSecurity::Definer,
+        security_barrier: ViewSecurityBarrier::Default,
         check_option: None,
+    };
+}
+
+#[derive(Clone)]
+pub struct ViewDefinition {
+    pub columns: ViewColumns,
+    pub query: StoredQueryDefinition,
+    pub options: ViewOptions,
+}
+
+/// The output relation of a view.  A stored SELECT describes types at the
+/// query boundary, while these names are catalog identity and therefore must
+/// never be recovered by reparsing aliases from the source text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewColumns {
+    names: [SqlName; MAX_COLUMNS],
+    defaults: [ViewColumnDefault; MAX_VIEW_DEFAULTS],
+    count: u8,
+    aliases: bool,
+}
+
+impl ViewColumns {
+    pub const EMPTY: Self = Self {
+        names: [SqlName::EMPTY; MAX_COLUMNS],
+        defaults: [ViewColumnDefault::EMPTY; MAX_VIEW_DEFAULTS],
+        count: 0,
+        aliases: false,
+    };
+
+    pub fn from_names(names: &[&str]) -> Result<Self, SqlError> {
+        if names.len() > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_COLUMNS,
+                "view has more than {} columns",
+                MAX_COLUMNS
+            ));
+        }
+        let mut output = Self::EMPTY;
+        for (index, name) in names.iter().enumerate() {
+            let parsed = SqlName::parse(name)?;
+            if output.names[..index].contains(&parsed) {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_COLUMN,
+                    "column \"{}\" specified more than once",
+                    name
+                ));
+            }
+            output.names[index] = parsed;
+        }
+        output.count = names.len() as u8;
+        output.aliases = true;
+        Ok(output)
+    }
+
+    pub fn from_sql_names(names: &[SqlName]) -> Result<Self, SqlError> {
+        if names.len() > MAX_COLUMNS {
+            return Err(sql_err!(
+                sqlstate::TOO_MANY_COLUMNS,
+                "view has more than {} columns",
+                MAX_COLUMNS
+            ));
+        }
+        let mut output = Self::EMPTY;
+        for (index, name) in names.iter().copied().enumerate() {
+            if output.names[..index].contains(&name) {
+                return Err(sql_err!(
+                    sqlstate::DUPLICATE_COLUMN,
+                    "column \"{}\" specified more than once",
+                    name.as_str()
+                ));
+            }
+            output.names[index] = name;
+        }
+        output.count = names.len() as u8;
+        output.aliases = true;
+        Ok(output)
+    }
+
+    pub fn from_derived_names(names: &[&str]) -> Result<Self, SqlError> {
+        let mut output = Self::from_names(names)?;
+        output.aliases = false;
+        Ok(output)
+    }
+
+    pub const fn with_aliases(mut self, aliases: bool) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    pub const fn len(self) -> usize {
+        self.count as usize
+    }
+
+    pub fn names(&self) -> &[SqlName] {
+        &self.names[..self.count as usize]
+    }
+
+    pub const fn default_at(&self, index: usize) -> Option<ColumnDefault> {
+        if index < self.count as usize {
+            let mut default = ColumnDefault::NONE;
+            let mut slot = 0;
+            while slot < MAX_VIEW_DEFAULTS {
+                if self.defaults[slot].column == index as u8 {
+                    default = self.defaults[slot].default;
+                    break;
+                }
+                slot += 1;
+            }
+            Some(default)
+        } else {
+            None
+        }
+    }
+
+    pub fn default_at_ref(&self, index: usize) -> Option<&ColumnDefault> {
+        if index >= self.count as usize {
+            return None;
+        }
+        self.defaults
+            .iter()
+            .find(|entry| entry.column == index as u8)
+            .map(|entry| &entry.default)
+    }
+
+    pub fn with_default(mut self, index: usize, default: ColumnDefault) -> Result<Self, SqlError> {
+        if index >= self.count as usize {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view default column index is out of bounds"
+            ));
+        }
+        if default.is_generated() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view columns cannot carry generated expressions"
+            ));
+        }
+        if let Some(entry) = self
+            .defaults
+            .iter_mut()
+            .find(|entry| entry.column == index as u8)
+        {
+            if matches!(default, ColumnDefault::None) {
+                *entry = ViewColumnDefault::EMPTY;
+            } else {
+                entry.default = default;
+            }
+            return Ok(self);
+        }
+        if matches!(default, ColumnDefault::None) {
+            return Ok(self);
+        }
+        let Some(entry) = self
+            .defaults
+            .iter_mut()
+            .find(|entry| entry.column == u8::MAX)
+        else {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "view has more than {} column defaults",
+                MAX_VIEW_DEFAULTS
+            ));
+        };
+        *entry = ViewColumnDefault {
+            column: index as u8,
+            default,
+        };
+        Ok(self)
+    }
+
+    pub fn with_name(mut self, index: usize, name: SqlName) -> Result<Self, SqlError> {
+        if index >= self.count as usize {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view column index is out of bounds"
+            ));
+        }
+        if self
+            .names()
+            .iter()
+            .enumerate()
+            .any(|(candidate, existing)| candidate != index && *existing == name)
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_COLUMN,
+                "column \"{}\" specified more than once",
+                name.as_str()
+            ));
+        }
+        self.names[index] = name;
+        self.aliases = true;
+        Ok(self)
+    }
+
+    pub const fn has_aliases(self) -> bool {
+        self.aliases
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ViewColumnDefault {
+    column: u8,
+    default: ColumnDefault,
+}
+
+impl ViewColumnDefault {
+    const EMPTY: Self = Self {
+        column: u8::MAX,
+        default: ColumnDefault::NONE,
     };
 }
 
@@ -3880,13 +4138,13 @@ pub struct ViewDef {
     pub schema: SqlName,
     pub name: SqlName,
     pub(crate) return_rule: u16,
-    pub security: ViewSecurity,
-    pub check_option: Option<ViewCheckOption>,
+    pub options: ViewOptions,
+    pub columns: ViewColumns,
     pub ownership: Ownership,
     pending_schema: Option<PendingObjectSchema>,
     pending_name: Option<PendingViewName>,
-    pending_security: Option<PendingViewSecurity>,
-    pending_check_option: Option<PendingViewCheckOption>,
+    pending_options: Option<PendingViewOptions>,
+    pending_columns: Option<PendingViewColumns>,
     ddl_state: CatalogDdlState,
 }
 
@@ -3902,21 +4160,34 @@ impl ViewDef {
     }
 
     pub(crate) fn security_for(&self, txid: u32) -> ViewSecurity {
-        self.pending_security
-            .filter(|pending| pending.txid == txid)
-            .map_or(self.security, |pending| pending.security)
+        self.options_for(txid).security
     }
 
     pub(crate) fn check_option_for(&self, txid: u32) -> Option<ViewCheckOption> {
-        self.pending_check_option
+        self.options_for(txid).check_option
+    }
+
+    pub(crate) fn security_barrier_for(&self, txid: u32) -> ViewSecurityBarrier {
+        self.options_for(txid).security_barrier
+    }
+
+    pub(crate) fn options_for(&self, txid: u32) -> ViewOptions {
+        self.pending_options
             .filter(|pending| pending.txid == txid)
-            .map_or(self.check_option, |pending| pending.check_option)
+            .map_or(self.options, |pending| pending.options)
     }
 
     pub(crate) fn name_for(&self, txid: u32) -> SqlName {
         self.pending_name
             .filter(|pending| pending.txid == txid)
             .map_or(self.name, |pending| pending.name)
+    }
+
+    pub(crate) fn columns_for(&self, txid: u32) -> &ViewColumns {
+        match self.pending_columns.as_ref() {
+            Some(pending) if pending.txid == txid => &pending.columns,
+            _ => &self.columns,
+        }
     }
 }
 
@@ -3926,19 +4197,18 @@ pub(crate) struct PendingObjectSchema {
     pub schema: SqlName,
 }
 
-/// A transaction-visible `security_invoker` change.  The closed enum means a
-/// view can never expose a transient spelling that query authorization would
-/// have to reinterpret at execution time.
+/// One transaction-visible view option state. It keeps authorization,
+/// predicate ordering, and write checks from committing independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PendingViewSecurity {
+pub(crate) struct PendingViewOptions {
     pub txid: u32,
-    pub security: ViewSecurity,
+    pub options: ViewOptions,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PendingViewCheckOption {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingViewColumns {
     pub txid: u32,
-    pub check_option: Option<ViewCheckOption>,
+    pub columns: ViewColumns,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -11724,13 +11994,13 @@ impl Storage {
                     schema: SqlName::parse("").expect("empty name fits"),
                     name: SqlName::parse("").expect("empty name fits"),
                     return_rule: u16::MAX,
-                    security: ViewSecurity::Definer,
-                    check_option: None,
+                    options: ViewOptions::DEFAULT,
+                    columns: ViewColumns::EMPTY,
                     ownership: Ownership::BOOTSTRAP,
                     pending_schema: None,
                     pending_name: None,
-                    pending_security: None,
-                    pending_check_option: None,
+                    pending_options: None,
+                    pending_columns: None,
                     ddl_state: CatalogDdlState::Absent,
                 })
                 .expect("sized to max_tables");
@@ -28385,8 +28655,7 @@ impl Storage {
         &mut self,
         schema: SqlName,
         name: SqlName,
-        query: StoredQueryDefinition,
-        options: ViewOptions,
+        definition: ViewDefinition,
         or_replace: bool,
         txid: u32,
     ) -> Result<(usize, Option<usize>), SqlError> {
@@ -28446,18 +28715,18 @@ impl Storage {
             schema,
             name,
             return_rule: u16::MAX,
-            security: options.security,
-            check_option: options.check_option,
+            options: definition.options,
+            columns: definition.columns,
             ownership,
             pending_schema: None,
             pending_name: None,
-            pending_security: None,
-            pending_check_option: None,
+            pending_options: None,
+            pending_columns: None,
             ddl_state: CatalogDdlState::PendingCreate { txid },
         };
         let mut source = StackStr::<RULE_SQL_MAX>::new();
         use core::fmt::Write as _;
-        let _ = source.write_str(query.sql.as_str());
+        let _ = source.write_str(definition.query.sql.as_str());
         let rule_definition = RuleDefinition {
             name: SqlName::parse("_RETURN").expect("fixed name fits"),
             target: RuleTarget::View(new as u16),
@@ -28469,14 +28738,14 @@ impl Storage {
                 let mut actions = [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS];
                 actions[0] = RuleTextSpan {
                     start: 0,
-                    len: query.sql.as_str().len() as u16,
+                    len: definition.query.sql.as_str().len() as u16,
                 };
                 actions
             },
             action_count: 1,
             returning_action: None,
-            creation_path: query.creation_path,
-            dependencies: query.dependencies,
+            creation_path: definition.query.creation_path,
+            dependencies: definition.query.dependencies,
         };
         let (rule, prior) = match self.create_rule(rule_definition, false, txid) {
             Ok(created) => created,
@@ -28732,13 +29001,13 @@ impl Storage {
         }
     }
 
-    pub(crate) fn stage_view_security(
+    pub(crate) fn stage_view_options(
         &mut self,
         slot: usize,
-        security: ViewSecurity,
+        options: ViewOptions,
         txid: u32,
-    ) -> Result<Option<PendingViewSecurity>, SqlError> {
-        let prior = self.views[slot].pending_security;
+    ) -> Result<Option<PendingViewOptions>, SqlError> {
+        let prior = self.views[slot].pending_options;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(self.catalog_ddl_wait_error(
                 txid,
@@ -28746,36 +29015,32 @@ impl Storage {
                 self.views[slot].name.as_str(),
             ));
         }
-        self.views[slot].pending_security = Some(PendingViewSecurity { txid, security });
+        self.views[slot].pending_options = Some(PendingViewOptions { txid, options });
         Ok(prior)
     }
 
-    pub(crate) fn commit_view_security(&mut self, slot: usize, txid: u32) {
+    pub(crate) fn commit_view_options(&mut self, slot: usize, txid: u32) {
         let Some(pending) = self.views[slot]
-            .pending_security
+            .pending_options
             .filter(|pending| pending.txid == txid)
         else {
             return;
         };
-        self.views[slot].security = pending.security;
-        self.views[slot].pending_security = None;
+        self.views[slot].options = pending.options;
+        self.views[slot].pending_options = None;
     }
 
-    pub(crate) fn rollback_view_security(
-        &mut self,
-        slot: usize,
-        prior: Option<PendingViewSecurity>,
-    ) {
-        self.views[slot].pending_security = prior;
+    pub(crate) fn rollback_view_options(&mut self, slot: usize, prior: Option<PendingViewOptions>) {
+        self.views[slot].pending_options = prior;
     }
 
-    pub(crate) fn stage_view_check_option(
+    pub(crate) fn stage_view_columns(
         &mut self,
         slot: usize,
-        check_option: Option<ViewCheckOption>,
+        columns: ViewColumns,
         txid: u32,
-    ) -> Result<Option<PendingViewCheckOption>, SqlError> {
-        let prior = self.views[slot].pending_check_option;
+    ) -> Result<Option<PendingViewColumns>, SqlError> {
+        let prior = self.views[slot].pending_columns;
         if prior.is_some_and(|pending| pending.txid != txid) {
             return Err(self.catalog_ddl_wait_error(
                 txid,
@@ -28783,27 +29048,23 @@ impl Storage {
                 self.views[slot].name.as_str(),
             ));
         }
-        self.views[slot].pending_check_option = Some(PendingViewCheckOption { txid, check_option });
+        self.views[slot].pending_columns = Some(PendingViewColumns { txid, columns });
         Ok(prior)
     }
 
-    pub(crate) fn commit_view_check_option(&mut self, slot: usize, txid: u32) {
+    pub(crate) fn commit_view_columns(&mut self, slot: usize, txid: u32) {
         let Some(pending) = self.views[slot]
-            .pending_check_option
+            .pending_columns
             .filter(|pending| pending.txid == txid)
         else {
             return;
         };
-        self.views[slot].check_option = pending.check_option;
-        self.views[slot].pending_check_option = None;
+        self.views[slot].columns = pending.columns;
+        self.views[slot].pending_columns = None;
     }
 
-    pub(crate) fn rollback_view_check_option(
-        &mut self,
-        slot: usize,
-        prior: Option<PendingViewCheckOption>,
-    ) {
-        self.views[slot].pending_check_option = prior;
+    pub(crate) fn rollback_view_columns(&mut self, slot: usize, prior: Option<PendingViewColumns>) {
+        self.views[slot].pending_columns = prior;
     }
 
     /// Promotes an uncommitted DROP VIEW into the committed catalog.

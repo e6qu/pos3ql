@@ -56,7 +56,7 @@ ALTER TRIGGER	complete	101_trigger_timing.sql
 ALTER TYPE	partial	63_enums.sql
 ALTER USER	partial	83_roles_acl.sql
 ALTER USER MAPPING	complete	tests/external/ci_diff.sh
-ALTER VIEW	partial	76_stored_dependencies.sql
+ALTER VIEW	partial	76_stored_dependencies.sql and typed output-column identity, auto-updatable DML, rollback, WAL, checkpoints, and recovery
 ANALYZE	complete	48_vacuum_analyze.sql
 BEGIN	complete	05_transactions.sql
 CALL	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql (lone top-level PL/pgSQL transaction control, typed outputs, SQL procedures, and explicit rejection of post-boundary suspension)

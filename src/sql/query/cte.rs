@@ -1311,6 +1311,7 @@ pub fn rewrite_view_dml<'a>(
     base_name: &'a str,
     base_schema: &'a str,
     exposed_columns: &'a [&'a str],
+    base_columns: &'a [&'a str],
     storage: &Storage,
     txid: u32,
     arena: &'a Arena,
@@ -1328,6 +1329,8 @@ pub fn rewrite_view_dml<'a>(
             from: view_name,
             to: base_name,
             to_schema: base_schema,
+            exposed_columns,
+            base_columns,
         }),
         rule_transition: None,
         recursive_state: None,
@@ -1340,7 +1343,15 @@ pub fn rewrite_view_dml<'a>(
             for column in insert.columns {
                 require_view_column(view_name, exposed_columns, column)?;
             }
+            let columns = map_view_columns(
+                view_name,
+                exposed_columns,
+                base_columns,
+                insert.columns,
+                arena,
+            )?;
             let adjusted = Insert {
+                columns,
                 returning: Returning {
                     items: expanded_returning(insert.returning.items)?,
                     ..insert.returning
@@ -1354,7 +1365,15 @@ pub fn rewrite_view_dml<'a>(
             for (column, _) in update.assignments {
                 require_view_column(view_name, exposed_columns, column)?;
             }
+            let assignments = map_view_assignments(
+                view_name,
+                exposed_columns,
+                base_columns,
+                update.assignments,
+                arena,
+            )?;
             let adjusted = Update {
+                assignments,
                 returning: Returning {
                     items: expanded_returning(update.returning.items)?,
                     ..update.returning
@@ -1383,6 +1402,58 @@ pub fn rewrite_view_dml<'a>(
         }
     };
     Ok(&*arena.alloc(rewritten).map_err(|_| arena_full())?)
+}
+
+fn view_base_column<'a>(exposed: &[&'a str], base: &[&'a str], name: &'a str) -> &'a str {
+    exposed
+        .iter()
+        .position(|candidate| *candidate == name)
+        .map_or(name, |index| base[index])
+}
+
+fn map_view_columns<'a>(
+    view_name: &str,
+    exposed: &'a [&'a str],
+    base: &'a [&'a str],
+    source: &'a [&'a str],
+    arena: &'a Arena,
+) -> Result<&'a [&'a str], SqlError> {
+    let mut columns = [""; crate::storage::MAX_COLUMNS];
+    if source.len() > columns.len() {
+        return Err(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "too many target columns"
+        ));
+    }
+    for (target, name) in columns.iter_mut().zip(source) {
+        require_view_column(view_name, exposed, name)?;
+        *target = view_base_column(exposed, base, name);
+    }
+    arena
+        .alloc_slice_copy(&columns[..source.len()])
+        .map(|columns| &*columns)
+        .map_err(|_| arena_full())
+}
+
+fn map_view_assignments<'a>(
+    view_name: &str,
+    exposed: &'a [&'a str],
+    base: &'a [&'a str],
+    source: &'a [(&'a str, &'a Expr<'a>)],
+    arena: &'a Arena,
+) -> Result<&'a [(&'a str, &'a Expr<'a>)], SqlError> {
+    let mut assignments = [("", &Expr::Null); crate::storage::MAX_COLUMNS];
+    if source.len() > assignments.len() {
+        return Err(sql_err!(sqlstate::TOO_MANY_COLUMNS, "too many assignments"));
+    }
+    for (target, (name, expression)) in assignments.iter_mut().zip(source) {
+        require_view_column(view_name, exposed, name)?;
+        *target = (view_base_column(exposed, base, name), expression);
+    }
+    arena
+        .alloc_slice_copy(&assignments[..source.len()])
+        .map(|assignments| &*assignments)
+        .map_err(|_| arena_full())
 }
 
 fn require_view_column(
@@ -1925,6 +1996,8 @@ struct ViewQualifier<'a> {
     from: &'a str,
     to: &'a str,
     to_schema: &'a str,
+    exposed_columns: &'a [&'a str],
+    base_columns: &'a [&'a str],
 }
 
 #[derive(Clone, Copy)]
@@ -4681,6 +4754,40 @@ fn subst_tableref<'a>(
                 arena,
             )?
         };
+        let view_columns = view.columns_for(context.txid);
+        if !view_columns.has_aliases() {
+            return Ok(TableRef {
+                schema: None,
+                table: "",
+                alias: Some(t.alias.unwrap_or(t.table)),
+                subquery: Some(expanded),
+                func_args: None,
+                func_argument_names: &[],
+                func_variadic: false,
+                rows_from: None,
+                col_alias: None,
+                inheritance: t.inheritance,
+                sample: t.sample,
+                cte: None,
+                with_ordinality: false,
+                lateral: false,
+                authorization_role: None,
+                view_access: Some(slot as u16),
+            });
+        }
+        let aliases = if view_columns.has_aliases() {
+            let mut names = [""; crate::storage::MAX_COLUMNS];
+            for (slot, name) in names.iter_mut().zip(view_columns.names()) {
+                *slot = arena.alloc_str(name.as_str()).map_err(|_| arena_full())?;
+            }
+            Some(
+                arena
+                    .alloc_slice_copy(&names[..view_columns.len()])
+                    .map_err(|_| arena_full())?,
+            )
+        } else {
+            None
+        };
         return Ok(TableRef {
             schema: None,
             table: "",
@@ -4690,7 +4797,7 @@ fn subst_tableref<'a>(
             func_argument_names: &[],
             func_variadic: false,
             rows_from: None,
-            col_alias: None,
+            col_alias: aliases.map(|aliases| &*aliases),
             inheritance: t.inheritance,
             sample: t.sample,
             cte: None,
@@ -5438,7 +5545,14 @@ fn subst_expr<'a>(
                         }
                         _ => *qualifier,
                     },
-                    name,
+                    name: match context.qualifier {
+                        Some(rewrite)
+                            if qualifier.is_none_or(|written| written == rewrite.from) =>
+                        {
+                            view_base_column(rewrite.exposed_columns, rewrite.base_columns, name)
+                        }
+                        _ => name,
+                    },
                 }
             }
         }
@@ -5454,7 +5568,7 @@ fn subst_expr<'a>(
             Some(rewrite) if *table == rewrite.from => Expr::SchemaColumn {
                 schema: rewrite.to_schema,
                 table: rewrite.to,
-                name,
+                name: view_base_column(rewrite.exposed_columns, rewrite.base_columns, name),
             },
             _ => Expr::SchemaColumn {
                 schema,

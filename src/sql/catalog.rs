@@ -6684,7 +6684,7 @@ pub(crate) fn describe_view<'a>(
             (candidate.schema == view.schema && candidate.name == view.name).then_some(slot)
         })
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "view does not exist"))?;
-    super::query::describe_stored_query(
+    let count = super::query::describe_stored_query(
         storage.view_sql_for(view),
         storage,
         txid,
@@ -6692,7 +6692,31 @@ pub(crate) fn describe_view<'a>(
         storage.view_dependencies(slot),
         arena,
         out,
-    )
+    )?;
+    overlay_view_column_names(view, txid, out, count)
+}
+
+/// A view's body supplies types; its stored output relation supplies names.
+/// Keeping that overlay here makes SQL descriptions, catalogs, and wire
+/// metadata consume exactly the same identity.
+pub(crate) fn overlay_view_column_names<'a>(
+    view: &'a crate::storage::ViewDef,
+    txid: u32,
+    out: &mut [super::types::ColDesc<'a>],
+    count: usize,
+) -> Result<usize, SqlError> {
+    let columns = view.columns_for(txid);
+    if columns.len() != count {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "view \"{}\" has an invalid output-column definition",
+            view.name.as_str()
+        ));
+    }
+    for (column, name) in out[..count].iter_mut().zip(columns.names()) {
+        column.name = name.as_str();
+    }
+    Ok(count)
 }
 
 fn describe_stored_view<'a>(
@@ -6704,7 +6728,7 @@ fn describe_stored_view<'a>(
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(storage.view_creation_path(slot), user.as_str(), txid);
-    super::query::describe_stored_query(
+    let count = super::query::describe_stored_query(
         storage.view_sql(slot),
         storage,
         txid,
@@ -6712,7 +6736,8 @@ fn describe_stored_view<'a>(
         storage.view_dependencies(slot),
         arena,
         out,
-    )
+    )?;
+    overlay_view_column_names(storage.view(slot), txid, out, count)
 }
 
 fn pg_stats<'a>(
@@ -8540,13 +8565,24 @@ fn pg_class<'a>(
         }
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
         let n_columns = describe_view(storage, txid, view, arena, &mut columns)?;
-        let mut option_values = [Datum::Null; 2];
+        let mut option_values = [Datum::Null; 3];
         let mut option_count = 0;
         if matches!(
             view.security_for(txid),
             crate::storage::ViewSecurity::Invoker
         ) {
             option_values[option_count] = text("security_invoker=true", arena)?;
+            option_count += 1;
+        }
+        if let Some(enabled) = view.security_barrier_for(txid).reloption() {
+            option_values[option_count] = text(
+                if enabled {
+                    "security_barrier=true"
+                } else {
+                    "security_barrier=false"
+                },
+                arena,
+            )?;
             option_count += 1;
         }
         if let Some(option) = view.check_option_for(txid) {
@@ -11056,6 +11092,7 @@ fn pg_attribute<'a>(
     for (slot, view) in storage.views_visible_to(txid) {
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
         let count = describe_view(storage, txid, view, arena, &mut columns)?;
+        let defaults = view.columns_for(txid);
         for (attribute, column) in columns[..count].iter().enumerate() {
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attribute"));
@@ -11074,7 +11111,10 @@ fn pg_attribute<'a>(
                     } else {
                         column.type_mod
                     }),
-                    Datum::Bool(false),
+                    Datum::Bool(!matches!(
+                        defaults.default_at(attribute),
+                        Some(crate::storage::ColumnDefault::None) | None
+                    )),
                     Datum::Int4(0),
                     text("", arena)?,
                     text("", arena)?,
@@ -11234,6 +11274,30 @@ fn pg_attrdef<'a>(
                     Datum::Int4(relid),
                     Datum::Int4(ci as i32 + 1),
                     text(text_expr.as_str(), arena)?,
+                    Datum::Int4(2604),
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    for (slot, view) in storage.views_visible_to(txid) {
+        let columns = view.columns_for(txid);
+        for (column, default) in (0..columns.len()).filter_map(|index| {
+            columns
+                .default_at_ref(index)
+                .and_then(|default| default.expression().map(|expression| (index, expression)))
+        }) {
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_attrdef"));
+            }
+            let relid = view_oid(slot);
+            out[n] = row(
+                &[
+                    Datum::Int4(relid * 100 + column as i32 + 1),
+                    Datum::Int4(relid),
+                    Datum::Int4(column as i32 + 1),
+                    text(default.as_str(), arena)?,
                     Datum::Int4(2604),
                 ],
                 arena,

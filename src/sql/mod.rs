@@ -4826,12 +4826,12 @@ impl Engine {
                 DdlUndo::ViewRenamed { slot, .. } => {
                     self.storage.commit_view_rename(*slot as usize, txn.txid)
                 }
-                DdlUndo::ViewSecurityChanged { slot, .. } => {
-                    self.storage.commit_view_security(*slot as usize, txn.txid)
+                DdlUndo::ViewOptionsChanged { slot, .. } => {
+                    self.storage.commit_view_options(*slot as usize, txn.txid)
                 }
-                DdlUndo::ViewCheckOptionChanged { slot, .. } => self
-                    .storage
-                    .commit_view_check_option(*slot as usize, txn.txid),
+                DdlUndo::ViewColumnsChanged { slot, .. } => {
+                    self.storage.commit_view_columns(*slot as usize, txn.txid)
+                }
                 DdlUndo::RuleCreated { slot, .. } => {
                     self.storage.commit_rule_create(*slot as usize)
                 }
@@ -5713,12 +5713,12 @@ impl Engine {
             DdlUndo::ViewRenamed { slot, prior } => {
                 self.storage.rollback_view_rename(slot as usize, prior)
             }
-            DdlUndo::ViewSecurityChanged { slot, prior } => {
-                self.storage.rollback_view_security(slot as usize, prior)
+            DdlUndo::ViewOptionsChanged { slot, prior } => {
+                self.storage.rollback_view_options(slot as usize, prior)
             }
-            DdlUndo::ViewCheckOptionChanged { slot, prior } => self
-                .storage
-                .rollback_view_check_option(slot as usize, prior),
+            DdlUndo::ViewColumnsChanged { slot, prior } => {
+                self.storage.rollback_view_columns(slot as usize, prior)
+            }
             DdlUndo::PublicationCreated(slot) => {
                 self.storage.rollback_publication_create(slot as usize)
             }
@@ -7841,6 +7841,7 @@ impl Engine {
                         view.base.name,
                         view.base.schema.expect("view base is qualified"),
                         view.columns,
+                        view.base_columns,
                         &self.storage,
                         txn.txid,
                         arena,
@@ -9286,9 +9287,13 @@ impl Engine {
                 let (insert, view_check) =
                     match query::resolve_view_for_dml(storage, insert.table, txn.txid, arena) {
                         Ok(Some(view)) => {
-                            let view_check = view.check_option.map(|_| exec::ViewCheck {
-                                predicate: view.where_clause,
+                            let view_check = Some(exec::ViewCheck {
+                                predicate: view.check_option.and(view.where_clause),
                                 view_name: insert.table.name,
+                                defaults: exec::ViewInsertDefaults {
+                                    base_columns: view.base_columns,
+                                    columns: view.defaults,
+                                },
                             });
                             let rewritten = match query::rewrite_view_dml(
                                 statement,
@@ -9296,6 +9301,7 @@ impl Engine {
                                 view.base.name,
                                 view.base.schema.expect("view base is qualified"),
                                 view.columns,
+                                view.base_columns,
                                 storage,
                                 txn.txid,
                                 arena,
@@ -9305,7 +9311,7 @@ impl Engine {
                                 Err(error) => return Ok(Err(error)),
                             };
                             let columns = if rewritten.columns.is_empty() {
-                                view.columns
+                                view.base_columns
                             } else {
                                 rewritten.columns
                             };
@@ -9374,6 +9380,10 @@ impl Engine {
                             let view_check = view.check_option.map(|_| exec::ViewCheck {
                                 predicate: view.where_clause,
                                 view_name: update.table.name,
+                                defaults: exec::ViewInsertDefaults {
+                                    base_columns: view.base_columns,
+                                    columns: view.defaults,
+                                },
                             });
                             let rewritten = match query::rewrite_view_dml(
                                 statement,
@@ -9381,6 +9391,7 @@ impl Engine {
                                 view.base.name,
                                 view.base.schema.expect("view base is qualified"),
                                 view.columns,
+                                view.base_columns,
                                 storage,
                                 txn.txid,
                                 arena,
@@ -9461,6 +9472,7 @@ impl Engine {
                                 view.base.name,
                                 view.base.schema.expect("view base is qualified"),
                                 view.columns,
+                                view.base_columns,
                                 storage,
                                 txn.txid,
                                 arena,
@@ -12009,8 +12021,10 @@ impl Engine {
             }
             Stmt::CreateView {
                 name,
+                columns,
                 or_replace,
                 security,
+                security_barrier,
                 check_option,
                 sql,
             } => exec::create_view(
@@ -12019,8 +12033,10 @@ impl Engine {
                 txn,
                 exec::CreateViewCommand {
                     name,
+                    columns,
                     or_replace: *or_replace,
                     security: *security,
+                    security_barrier: *security_barrier,
                     check_option: *check_option,
                     sql,
                     raw_path: guc.search_path().as_str(),
@@ -13255,8 +13271,10 @@ impl Engine {
                     };
                     let result = if let Stmt::CreateView {
                         name,
+                        columns,
                         or_replace,
                         security,
+                        security_barrier,
                         check_option,
                         sql,
                     } = requalified
@@ -13279,8 +13297,10 @@ impl Engine {
                             txn,
                             exec::CreateViewCommand {
                                 name,
+                                columns,
                                 or_replace: *or_replace,
                                 security: *security,
+                                security_barrier: *security_barrier,
                                 check_option: *check_option,
                                 sql,
                                 raw_path: schema_path,
@@ -16145,14 +16165,18 @@ pub(crate) fn requalify_schema_element<'a>(
         }),
         ast::CreateSchemaElement::View {
             name,
+            columns,
             or_replace,
             security,
+            security_barrier,
             check_option,
             sql,
         } => Stmt::CreateView {
             name: requalify(*name)?,
+            columns,
             or_replace: *or_replace,
             security: *security,
+            security_barrier: *security_barrier,
             check_option: *check_option,
             sql,
         },
@@ -17310,9 +17334,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::CreateView {
             schema,
             name,
+            columns,
             sql,
             path,
             security_invoker,
+            security_barrier,
             check_option,
             dependencies,
         } => {
@@ -17327,27 +17353,41 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             let (new_slot, old_slot) = storage.create_view(
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
-                crate::storage::StoredQueryDefinition {
-                    sql: buffer,
-                    creation_path,
-                    dependencies,
-                },
-                crate::storage::ViewOptions {
-                    security: if security_invoker {
-                        crate::storage::ViewSecurity::Invoker
-                    } else {
-                        crate::storage::ViewSecurity::Definer
+                crate::storage::ViewDefinition {
+                    columns,
+                    query: crate::storage::StoredQueryDefinition {
+                        sql: buffer,
+                        creation_path,
+                        dependencies,
                     },
-                    check_option: match check_option {
-                        0 => None,
-                        code => Some(crate::storage::ViewCheckOption::from_code(code).ok_or_else(
-                            || {
-                                sql_err!(
-                                    sqlstate::DATA_EXCEPTION,
-                                    "journal has invalid view check option"
-                                )
-                            },
-                        )?),
+                    options: crate::storage::ViewOptions {
+                        security: if security_invoker {
+                            crate::storage::ViewSecurity::Invoker
+                        } else {
+                            crate::storage::ViewSecurity::Definer
+                        },
+                        security_barrier: crate::storage::ViewSecurityBarrier::from_code(
+                            security_barrier,
+                        )
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "journal has invalid view security barrier"
+                            )
+                        })?,
+                        check_option: match check_option {
+                            0 => None,
+                            code => {
+                                Some(crate::storage::ViewCheckOption::from_code(code).ok_or_else(
+                                    || {
+                                        sql_err!(
+                                            sqlstate::DATA_EXCEPTION,
+                                            "journal has invalid view check option"
+                                        )
+                                    },
+                                )?)
+                            }
+                        },
                     },
                 },
                 true,
@@ -17363,35 +17403,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_view_drop(slot);
             }
         }
-        WalOp::SetViewSecurity {
+        WalOp::SetViewOptions {
             schema,
             name,
             security_invoker,
-        } => {
-            let slot = storage
-                .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
-                .map(|object| object.slot as usize)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_TABLE,
-                        "journal changes unknown view \"{}\"",
-                        name
-                    )
-                })?;
-            storage.stage_view_security(
-                slot,
-                if security_invoker {
-                    crate::storage::ViewSecurity::Invoker
-                } else {
-                    crate::storage::ViewSecurity::Definer
-                },
-                0,
-            )?;
-            storage.commit_view_security(slot, 0);
-        }
-        WalOp::SetViewCheckOption {
-            schema,
-            name,
+            security_barrier,
             check_option,
         } => {
             let slot = storage
@@ -17415,8 +17431,46 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     },
                 )?),
             };
-            storage.stage_view_check_option(slot, check_option, 0)?;
-            storage.commit_view_check_option(slot, 0);
+            storage.stage_view_options(
+                slot,
+                crate::storage::ViewOptions {
+                    security: if security_invoker {
+                        crate::storage::ViewSecurity::Invoker
+                    } else {
+                        crate::storage::ViewSecurity::Definer
+                    },
+                    security_barrier: crate::storage::ViewSecurityBarrier::from_code(
+                        security_barrier,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "journal has invalid view security barrier"
+                        )
+                    })?,
+                    check_option,
+                },
+                0,
+            )?;
+            storage.commit_view_options(slot, 0);
+        }
+        WalOp::SetViewColumns {
+            schema,
+            name,
+            columns,
+        } => {
+            let slot = storage
+                .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
+                .map(|object| object.slot as usize)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "journal changes unknown view \"{}\"",
+                        name
+                    )
+                })?;
+            storage.stage_view_columns(slot, columns, 0)?;
+            storage.commit_view_columns(slot, 0);
         }
         WalOp::RenameView {
             schema,

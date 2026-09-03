@@ -6725,7 +6725,11 @@ fn row_level_security_composes_and_survives_recovery() {
 
 #[test]
 fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
-    let config = test_config("alter-view-security-invoker");
+    let mut config = test_config("alter-view-security-invoker");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("alter-view-options-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -6737,7 +6741,8 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
          SET ROLE view_owner;
          CREATE TABLE view_secret (value integer);
          INSERT INTO view_secret VALUES (7);
-         CREATE VIEW view_gateway AS SELECT value FROM view_secret;
+         CREATE VIEW view_gateway WITH (security_barrier = true) AS
+           SELECT value FROM view_secret;
          RESET ROLE;
          GRANT SELECT ON view_gateway TO view_reader;",
     );
@@ -6746,18 +6751,26 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    let default_barrier = run_with(
+    let barrier_state = run_with(
         &mut engine,
         &mut budget,
         "SET ROLE view_owner;
+         SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
          ALTER VIEW view_gateway SET (security_barrier = false);
          ALTER VIEW view_gateway RESET (security_barrier);
+         SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
+         ALTER VIEW view_gateway SET (security_barrier = true);
+         SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
          RESET ROLE;",
     );
     assert!(
-        !String::from_utf8_lossy(&default_barrier).contains("ERROR"),
+        !String::from_utf8_lossy(&barrier_state).contains("ERROR"),
         "{}",
-        String::from_utf8_lossy(&default_barrier)
+        String::from_utf8_lossy(&barrier_state)
+    );
+    assert_eq!(
+        data_rows(&barrier_state),
+        ["{security_barrier=true}", "NULL", "{security_barrier=true}"]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -6782,19 +6795,27 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
         &mut budget,
         "RESET ROLE; SET ROLE view_owner;
          BEGIN;
-         ALTER VIEW view_gateway SET (security_invoker = true);
+         ALTER VIEW view_gateway SET (security_invoker = true, security_barrier = false);
          SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
          ROLLBACK;
+         SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
          RESET ROLE;
          SET ROLE view_reader;
          SELECT value FROM view_gateway;",
     );
-    assert_eq!(data_rows(&changed), ["{security_invoker=true}", "7"]);
+    assert_eq!(
+        data_rows(&changed),
+        [
+            "{security_invoker=true,security_barrier=false}",
+            "{security_barrier=true}",
+            "7"
+        ]
+    );
     let committed = run_with(
         &mut engine,
         &mut budget,
         "RESET ROLE; SET ROLE view_owner;
-         ALTER VIEW view_gateway SET (security_invoker = true)",
+         ALTER VIEW view_gateway SET (security_invoker = true, security_barrier = true)",
     );
     assert!(
         !String::from_utf8_lossy(&committed).contains("ERROR"),
@@ -6814,7 +6835,9 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
         "{}",
         String::from_utf8_lossy(&denied_after_commit)
     );
+    assert!(engine.checkpoint().unwrap());
     drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 
     let mut recovered_budget = Budget::new(1 << 29);
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
@@ -6823,7 +6846,10 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
         &mut recovered_budget,
         "SELECT reloptions FROM pg_class WHERE relname = 'view_gateway'",
     );
-    assert_eq!(data_rows(&recovered_state), ["{security_invoker=true}"]);
+    assert_eq!(
+        data_rows(&recovered_state),
+        ["{security_invoker=true,security_barrier=true}"]
+    );
     let recovered_denied = run_with(
         &mut recovered,
         &mut recovered_budget,
@@ -6839,12 +6865,14 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
         &mut recovered,
         &mut recovered_budget,
         "RESET ROLE; SET ROLE view_owner;
-         ALTER VIEW view_gateway RESET (security_invoker);
+         ALTER VIEW view_gateway RESET (security_invoker, security_barrier);
          RESET ROLE;
          SET ROLE view_reader;
          SELECT value FROM view_gateway;",
     );
     assert_eq!(data_rows(&reset), ["7"]);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
 #[test]
@@ -7066,6 +7094,170 @@ fn alter_view_set_schema_preserves_identity_dependencies_and_comments() {
         "{}",
         String::from_utf8_lossy(&after_recovery)
     );
+}
+
+#[test]
+fn view_output_columns_are_typed_catalog_identity_and_durable() {
+    let mut config = test_config("view-output-columns");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("view-output-columns-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE view_output_source (value integer);
+         INSERT INTO view_output_source VALUES (9);
+         CREATE VIEW view_output_gateway (published_value) AS
+           SELECT value FROM view_output_source;
+         SELECT published_value FROM view_output_gateway;
+         INSERT INTO view_output_gateway (published_value) VALUES (10);
+         UPDATE view_output_gateway SET published_value = published_value + 1
+          WHERE published_value = 10;
+         SELECT value FROM view_output_source ORDER BY value;
+         SELECT attname FROM pg_attribute
+          WHERE attrelid = 'view_output_gateway'::regclass AND attnum = 1;
+         ALTER VIEW view_output_gateway RENAME COLUMN published_value TO current_value;
+         SELECT current_value FROM view_output_gateway;
+         BEGIN;
+         ALTER VIEW view_output_gateway RENAME COLUMN current_value TO temporary_value;
+         SELECT temporary_value FROM view_output_gateway;
+         ROLLBACK;
+         SELECT current_value FROM view_output_gateway;",
+    );
+    assert_eq!(
+        data_rows(&created),
+        [
+            "9",
+            "9",
+            "11",
+            "published_value",
+            "9",
+            "11",
+            "9",
+            "11",
+            "9",
+            "11"
+        ],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_rows = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT current_value FROM view_output_gateway;
+             SELECT attname FROM pg_attribute
+              WHERE attrelid = 'view_output_gateway'::regclass AND attnum = 1;",
+    );
+    assert_eq!(
+        data_rows(&recovered_rows),
+        ["9", "11", "current_value"],
+        "{}",
+        String::from_utf8_lossy(&recovered_rows)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn view_defaults_are_typed_catalog_state_and_survive_object_recovery() {
+    let mut config = test_config("view-defaults");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("view-defaults-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE view_default_source (value integer DEFAULT 7);
+         CREATE VIEW view_default_gateway (published_value) AS
+           SELECT value FROM view_default_source;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER VIEW view_default_gateway ALTER COLUMN published_value
+           SET DEFAULT value + random();",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER VIEW view_default_gateway ALTER COLUMN published_value SET DEFAULT 22;
+         INSERT INTO view_default_gateway DEFAULT VALUES;
+         INSERT INTO view_default_gateway (published_value) VALUES (DEFAULT);
+         INSERT INTO view_default_gateway (published_value) SELECT 24;
+         SELECT value FROM view_default_source ORDER BY value;
+         SELECT atthasdef FROM pg_attribute
+          WHERE attrelid = 'view_default_gateway'::regclass AND attnum = 1;
+         SELECT adbin FROM pg_attrdef
+          WHERE adrelid = 'view_default_gateway'::regclass AND adnum = 1;",
+    );
+    assert_eq!(
+        data_rows(&created),
+        ["22", "22", "24", "t", "22"],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let replaced = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE OR REPLACE VIEW view_default_gateway (published_value) AS
+           SELECT value FROM view_default_source;
+         INSERT INTO view_default_gateway DEFAULT VALUES;
+         SELECT value FROM view_default_source ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&replaced),
+        ["22", "22", "22", "24"],
+        "{}",
+        String::from_utf8_lossy(&replaced)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let after_recovery = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "INSERT INTO view_default_gateway DEFAULT VALUES;
+         ALTER VIEW view_default_gateway ALTER COLUMN published_value DROP DEFAULT;
+         INSERT INTO view_default_gateway DEFAULT VALUES;
+         SELECT value FROM view_default_source ORDER BY value;
+         SELECT atthasdef FROM pg_attribute
+          WHERE attrelid = 'view_default_gateway'::regclass AND attnum = 1;",
+    );
+    assert_eq!(
+        data_rows(&after_recovery),
+        ["7", "22", "22", "22", "22", "24", "f"],
+        "{}",
+        String::from_utf8_lossy(&after_recovery)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]
@@ -46485,10 +46677,20 @@ fn create_view_basic() {
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE VIEW big AS SELECT 1"))
             .contains("42P07")
     );
-    run_with(
+    let incompatible_replace = run_with(
         &mut e,
         &mut b,
         "CREATE OR REPLACE VIEW big AS SELECT id FROM t WHERE id = 1",
+    );
+    assert!(
+        String::from_utf8_lossy(&incompatible_replace).contains("42P16"),
+        "{}",
+        String::from_utf8_lossy(&incompatible_replace)
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE OR REPLACE VIEW big AS SELECT id, v FROM t WHERE id = 1",
     );
     assert_eq!(
         data_rows(&run_with(&mut e, &mut b, "SELECT id FROM big")),

@@ -384,6 +384,20 @@ pub(super) fn resolve_default(
     let Some(expression) = default else {
         return Ok(ColumnDefault::None);
     };
+    if expression.contains_subquery() {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot use subquery in DEFAULT expression"
+        ));
+    }
+    let mut has_reference = false;
+    expression.for_each_column_reference(&mut |_, _| has_reference = true);
+    if has_reference {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot use column reference in DEFAULT expression"
+        ));
+    }
     // A literal-only default folds to a constant now; anything volatile or
     // stable (any function call) is kept as text and evaluated at insert time.
     if !expression.contains_call() {

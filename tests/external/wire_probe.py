@@ -5249,6 +5249,33 @@ def test_materialized_view_metadata_over_raw_wire():
     s.close()
 
 
+def test_view_output_columns_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE TABLE wire_view_output_source (value integer); "
+        "INSERT INTO wire_view_output_source VALUES (7); "
+        "CREATE VIEW wire_view_output (published_value) AS "
+        "SELECT value FROM wire_view_output_source; "
+        "INSERT INTO wire_view_output (published_value) VALUES (8); "
+        "ALTER VIEW wire_view_output RENAME COLUMN published_value TO current_value; "
+        "SELECT current_value FROM wire_view_output ORDER BY current_value; "
+        "SELECT attname FROM pg_attribute "
+        "WHERE attrelid = 'wire_view_output'::regclass AND attnum = 1; "
+        "DROP VIEW wire_view_output; DROP TABLE wire_view_output_source",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "view output columns: raw wire retains declared names through DML and rename",
+        not any(kind == b"E" for kind, _ in result)
+        and rows == [["7"], ["8"], ["current_value"]],
+        result,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

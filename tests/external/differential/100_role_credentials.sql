@@ -34,6 +34,22 @@ CREATE ROLE credential_membership_parent;
 CREATE ROLE credential_duplicate_membership
   IN ROLE credential_membership_parent IN GROUP credential_membership_parent;
 SELECT count(*) FROM pg_roles WHERE rolname = 'credential_duplicate_membership';
+CREATE ROLE credential_creator CREATEROLE;
+GRANT credential_creator TO postgres;
+SET ROLE credential_creator;
+CREATE ROLE credential_created;
+ALTER ROLE credential_created LOGIN;
+RESET ROLE;
+SELECT parent.rolname, member.rolname, membership.admin_option,
+       membership.inherit_option, membership.set_option, grantor.rolname
+  FROM pg_auth_members membership
+  JOIN pg_roles parent ON parent.oid = membership.roleid
+  JOIN pg_roles member ON member.oid = membership.member
+  JOIN pg_roles grantor ON grantor.oid = membership.grantor
+ WHERE parent.rolname = 'credential_created';
+DROP ROLE credential_created;
+REVOKE credential_creator FROM postgres;
+DROP ROLE credential_creator;
 CREATE ROLE credential_membership_member NOINHERIT;
 CREATE ROLE credential_membership_administrator;
 CREATE ROLE "session_user";

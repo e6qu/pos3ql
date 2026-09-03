@@ -6429,10 +6429,20 @@ fn create_role_authority_cannot_escalate_attributes_or_alter_unmanaged_roles() {
         "SET ROLE role_administrator;
          ALTER ROLE managed_role LOGIN;
          ALTER ROLE role_administrator PASSWORD 'changed';
-         CREATE ROLE ordinary_child;",
+         CREATE ROLE ordinary_child;
+         ALTER ROLE ordinary_child LOGIN;
+         RESET ROLE;
+         SELECT parent.rolname, member.rolname, membership.admin_option,
+                membership.inherit_option, membership.set_option, grantor.rolname
+           FROM pg_auth_members membership
+           JOIN pg_roles parent ON parent.oid = membership.roleid
+           JOIN pg_roles member ON member.oid = membership.member
+           JOIN pg_roles grantor ON grantor.oid = membership.grantor
+          WHERE parent.rolname = 'ordinary_child';",
     );
-    assert!(
-        !String::from_utf8_lossy(&allowed).contains("ERROR"),
+    assert_eq!(
+        data_rows(&allowed),
+        ["ordinary_child|role_administrator|t|f|f|postgres"],
         "{}",
         String::from_utf8_lossy(&allowed)
     );
@@ -6507,6 +6517,11 @@ fn role_catalog_replays_from_wal() {
          ALTER ROLE durable RENAME TO durable_renamed;
          CREATE ROLE durable_member;
          GRANT durable_renamed TO durable_member WITH ADMIN OPTION;
+         CREATE ROLE durable_creator CREATEROLE;
+         GRANT durable_creator TO postgres;
+         SET ROLE durable_creator;
+         CREATE ROLE durable_created;
+         RESET ROLE;
          CREATE TABLE durable_column_acl (id integer, visible text, secret text);
          GRANT SELECT (visible) ON durable_column_acl TO durable_member;",
             verifier_text.as_str(),
@@ -6542,6 +6557,13 @@ fn role_catalog_replays_from_wal() {
            FROM pg_auth_members membership
            JOIN pg_roles parent ON parent.oid = membership.roleid
            JOIN pg_roles child ON child.oid = membership.member;
+         SELECT parent.rolname, child.rolname, membership.admin_option,
+                membership.inherit_option, membership.set_option, grantor.rolname
+           FROM pg_auth_members membership
+           JOIN pg_roles parent ON parent.oid = membership.roleid
+           JOIN pg_roles child ON child.oid = membership.member
+           JOIN pg_roles grantor ON grantor.oid = membership.grantor
+          WHERE parent.rolname = 'durable_created';
          SELECT rolpassword LIKE 'SCRAM-SHA-256$%', rolvaliduntil IS NULL,
                 shobj_description(oid, 'pg_authid')
            FROM pg_authid WHERE rolname = 'durable_renamed';
@@ -6563,6 +6585,9 @@ fn role_catalog_replays_from_wal() {
         [
             "durable_renamed|f|t|t|t|7",
             "durable_renamed|durable_member|t",
+            "durable_creator|postgres|f",
+            "durable_created|durable_creator|t",
+            "durable_created|durable_creator|t|f|f|postgres",
             "t|f|durable role comment",
             "t",
             "t",

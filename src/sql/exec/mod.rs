@@ -6020,19 +6020,41 @@ pub fn create_role(
             "SYSID can no longer be specified",
         )?;
     }
+    let current = storage
+        .current_role_slot(txn.txid)
+        .expect("CREATE ROLE privilege check resolved current role");
+    let current_is_superuser = storage.role(current).attributes_to(txn.txid).superuser;
     let membership_count = request
         .memberships
         .in_roles
         .len()
         .saturating_add(request.memberships.role_members.len())
-        .saturating_add(request.memberships.admin_members.len());
+        .saturating_add(request.memberships.admin_members.len())
+        .saturating_add(usize::from(!current_is_superuser));
     if membership_count >= super::txn::MAX_TXN_DDL {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "too many role memberships in one statement"
         ));
     }
-    let grantor = storage.current_role_slot(txn.txid).unwrap_or(0);
+    if !current_is_superuser {
+        if let Err(error) = stage_role_membership(
+            storage,
+            wal,
+            txn,
+            slot,
+            current,
+            usize::from(crate::storage::BOOTSTRAP_ROLE),
+            crate::storage::RoleMembershipOptions {
+                admin: true,
+                inherit: false,
+                set: false,
+            },
+        ) {
+            return sql_fail(error);
+        }
+    }
+    let grantor = current;
     for written in request.memberships.in_roles {
         let resolved = crate::util::StackStr::<64>::from_str(written);
         let Some(parent) = storage.find_role_visible(resolved.as_str(), txn.txid) else {

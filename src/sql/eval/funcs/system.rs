@@ -1592,6 +1592,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Cidr(_) => "cidr",
                     Datum::Macaddr(_) => "macaddr",
                     Datum::Macaddr8(_) => "macaddr8",
+                    Datum::Geometry { kind, .. } => kind.name(),
                     Datum::Record(_) => "record",
                     Datum::Enum { .. } => "enum",
                     Datum::Composite { .. } | Datum::CompositeText { .. } => "record",

@@ -193,6 +193,9 @@ fn binary_value_len(value: &Datum) -> usize {
         Datum::Bytea(bytes) => bytes.len(),
         Datum::Json { text, jsonb } => text.len().saturating_add(usize::from(*jsonb)),
         Datum::Range { text, .. } | Datum::Multirange { text, .. } => text.len(),
+        Datum::Geometry { kind, text } => {
+            crate::sql::geometry::binary_len(*kind, text).expect("geometry datum is canonical")
+        }
         Datum::Bit { bits, .. } => 4usize.saturating_add(bits.len().div_ceil(8)),
         Datum::Inet(network) | Datum::Cidr(network) => 4usize.saturating_add(network.addr_len()),
         Datum::Enum { label, .. } => label.len(),
@@ -1095,6 +1098,14 @@ impl<'b> Responder<'b> {
                     m.bytes(&interval.micros.to_be_bytes());
                     m.bytes(&interval.days.to_be_bytes());
                     m.bytes(&interval.months.to_be_bytes());
+                }
+                Datum::Geometry { kind, text } => {
+                    m.field(|m| {
+                        crate::sql::geometry::emit_binary(*kind, text, |bytes| {
+                            m.bytes(bytes);
+                        })
+                        .expect("geometry datum is canonical");
+                    });
                 }
                 Datum::Json { text, jsonb } => {
                     // json binary is the text; jsonb prefixes a version byte (1).

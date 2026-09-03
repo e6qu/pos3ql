@@ -3117,6 +3117,26 @@ pub fn infer_type_res(
             "array_length" | "cardinality" | "array_upper" | "array_lower" | "array_ndims" => {
                 of(ColType::Int4)
             }
+            "point" | "center" => of(ColType::Geometry(crate::sql::types::GeometryKind::Point)),
+            "lseg" => of(ColType::Geometry(crate::sql::types::GeometryKind::Lseg)),
+            "path" | "pclose" | "popen" => {
+                of(ColType::Geometry(crate::sql::types::GeometryKind::Path))
+            }
+            "box" => of(ColType::Geometry(crate::sql::types::GeometryKind::Box)),
+            "polygon" => of(ColType::Geometry(crate::sql::types::GeometryKind::Polygon)),
+            "line" => of(ColType::Geometry(crate::sql::types::GeometryKind::Line)),
+            "circle" => of(ColType::Geometry(crate::sql::types::GeometryKind::Circle)),
+            "x" | "y" | "radius" | "diameter" | "area" => of(ColType::Float8),
+            "length" => match args
+                .first()
+                .map(|arg| infer_type_res(arg, columns))
+                .transpose()?
+            {
+                Some((oid::LSEG | oid::PATH, _)) => of(ColType::Float8),
+                _ => of(ColType::Int4),
+            },
+            "npoints" => of(ColType::Int4),
+            "isclosed" | "isopen" => of(ColType::Bool),
             // Network address functions.
             "family" | "masklen" => of(ColType::Int4),
             "host" | "abbrev" => of(ColType::Text),
@@ -3332,8 +3352,8 @@ pub fn infer_type_res(
                     None => infer_type_res(args[0], columns)?,
                 }
             }
-            "length" | "char_length" | "character_length" | "octet_length" | "strpos"
-            | "position" | "ascii" => of(ColType::Int4),
+            "char_length" | "character_length" | "octet_length" | "strpos" | "position"
+            | "ascii" => of(ColType::Int4),
             // Math: sqrt/exp/ln/power stay numeric for a numeric argument (and
             // no float argument outranking it), else double; floor/ceil/trunc/
             // round/sign are numeric for a numeric argument and double

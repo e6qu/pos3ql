@@ -4427,8 +4427,7 @@ pub(crate) fn decode_binary_param<'a>(
             let b: [u8; 8] = bytes.try_into().map_err(|_| wrong)?;
             Ok(Datum::Macaddr8(b))
         }
-        // Composite types (arrays, ranges, multiranges, bit strings) share the
-        // COPY-binary receive codec, driven by the column type the OID names.
+        // Structured and geometric values share the typed COPY receive codec.
         _ => match crate::sql::types::ColType::from_oid(oid) {
             Some(
                 ctype @ (crate::sql::types::ColType::Array(_)
@@ -4436,7 +4435,8 @@ pub(crate) fn decode_binary_param<'a>(
                 | crate::sql::types::ColType::OidVector
                 | crate::sql::types::ColType::Range(_)
                 | crate::sql::types::ColType::Multirange(_)
-                | crate::sql::types::ColType::Bit { .. }),
+                | crate::sql::types::ColType::Bit { .. }
+                | crate::sql::types::ColType::Geometry(_)),
             ) => crate::sql::exec::decode_binary_field(ctype, bytes, arena)
                 .map_err(|_| "invalid binary composite parameter"),
             _ => Err("binary format for this parameter type is not implemented (use text)"),
@@ -4803,6 +4803,24 @@ mod tests {
                 .expect("timetz decodes"),
             Datum::Timetz(time, -west)
         );
+    }
+
+    #[test]
+    fn binary_geometric_parameters_use_the_shared_typed_decoder() {
+        let mut budget = Budget::new(1024);
+        let arena = Arena::new(&mut budget, "binary point test", 64).expect("test arena");
+        let mut point = [0u8; 16];
+        point[..8].copy_from_slice(&1.5_f64.to_be_bytes());
+        point[8..].copy_from_slice(&(-2.25_f64).to_be_bytes());
+        assert_eq!(
+            decode_binary_param(crate::sql::types::oid::POINT, &point, &arena)
+                .expect("point parameter decodes"),
+            Datum::Geometry {
+                kind: crate::sql::types::GeometryKind::Point,
+                text: "(1.5,-2.25)",
+            }
+        );
+        assert!(decode_binary_param(crate::sql::types::oid::POINT, &point[..15], &arena).is_err());
     }
 
     #[test]

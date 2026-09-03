@@ -144,6 +144,14 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
                 ));
             }
         },
+        ColType::Geometry(kind) => match v {
+            Datum::Geometry { kind: actual, .. } if actual == kind => v,
+            Datum::Text(text) => Datum::Geometry {
+                kind,
+                text: crate::sql::geometry::parse(kind, text, arena)?,
+            },
+            _ => return Err(cast_unsupported(&v, kind.name())),
+        },
         ColType::Bool => match v {
             Datum::Bool(_) => v,
             Datum::Int4(x) => Datum::Bool(x != 0),

@@ -10703,6 +10703,9 @@ impl Engine {
         transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) = self.storage.require_language_usage("plpgsql", txn.txid) {
+            return Ok(Err(error));
+        }
         match exec::execute_anonymous_plpgsql(
             self,
             txn,
@@ -15357,7 +15360,8 @@ impl Engine {
             | crate::storage::AccessClass::Database
             | crate::storage::AccessClass::LargeObject
             | crate::storage::AccessClass::ForeignDataWrapper
-            | crate::storage::AccessClass::ForeignServer => {
+            | crate::storage::AccessClass::ForeignServer
+            | crate::storage::AccessClass::Language => {
                 return Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "unsupported extension member class"

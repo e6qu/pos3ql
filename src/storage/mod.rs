@@ -8943,6 +8943,8 @@ pub(crate) enum AccessClass {
     LargeObject = 16,
     ForeignDataWrapper = 17,
     ForeignServer = 18,
+    /// Built-in procedural language, addressed by its stable `pg_language` OID.
+    Language = 19,
 }
 
 /// A PostgreSQL large-object identity. Zero is reserved by the OID allocator
@@ -9038,6 +9040,7 @@ impl AccessClass {
             16 => Self::LargeObject,
             17 => Self::ForeignDataWrapper,
             18 => Self::ForeignServer,
+            19 => Self::Language,
             _ => return None,
         })
     }
@@ -9128,7 +9131,10 @@ impl PrivilegeSet {
 
 pub(crate) const fn default_public_object_privileges(class: AccessClass) -> PrivilegeSet {
     match class {
-        AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => PrivilegeSet::USAGE,
+        AccessClass::Domain
+        | AccessClass::Enum
+        | AccessClass::Composite
+        | AccessClass::Language => PrivilegeSet::USAGE,
         AccessClass::Routine => PrivilegeSet::EXECUTE,
         AccessClass::Database => PrivilegeSet::CONNECT.union(PrivilegeSet::TEMPORARY),
         _ => PrivilegeSet::NONE,
@@ -9145,7 +9151,9 @@ pub(crate) const fn all_object_privileges(class: AccessClass) -> PrivilegeSet {
         AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => PrivilegeSet::TYPE_ALL,
         AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
         AccessClass::LargeObject => PrivilegeSet::LARGE_OBJECT_ALL,
-        AccessClass::ForeignDataWrapper | AccessClass::ForeignServer => PrivilegeSet::USAGE,
+        AccessClass::ForeignDataWrapper | AccessClass::ForeignServer | AccessClass::Language => {
+            PrivilegeSet::USAGE
+        }
         AccessClass::Tablespace => PrivilegeSet::CREATE,
         AccessClass::Database => PrivilegeSet::DATABASE_ALL,
         AccessClass::Index
@@ -13944,7 +13952,7 @@ impl Storage {
                         .entry_server(usize::from(entry.object.slot))
                         .database
                 }
-                AccessClass::Tablespace | AccessClass::Database => continue,
+                AccessClass::Tablespace | AccessClass::Database | AccessClass::Language => continue,
             };
             if object_database == database {
                 entry.object.slot = u16::MAX;
@@ -14363,6 +14371,9 @@ impl Storage {
             AccessClass::LargeObject => &self.large_objects[slot].ownership,
             AccessClass::ForeignDataWrapper => &self.foreign.entry_wrapper(slot).ownership,
             AccessClass::ForeignServer => &self.foreign.entry_server(slot).ownership,
+            AccessClass::Language => {
+                unreachable!("built-in procedural languages have bootstrap ownership")
+            }
         }
     }
 
@@ -14390,6 +14401,9 @@ impl Storage {
             AccessClass::LargeObject => &mut self.large_objects[slot].ownership,
             AccessClass::ForeignDataWrapper => &mut self.foreign.entry_wrapper_mut(slot).ownership,
             AccessClass::ForeignServer => &mut self.foreign.entry_server_mut(slot).ownership,
+            AccessClass::Language => {
+                unreachable!("built-in procedural languages have immutable ownership")
+            }
         }
     }
 
@@ -14408,6 +14422,9 @@ impl Storage {
     }
 
     pub(crate) fn object_owner(&self, object: AccessObject, txid: u32) -> usize {
+        if object.class == AccessClass::Language {
+            return usize::from(BOOTSTRAP_ROLE);
+        }
         self.ownership(object).owner_to(txid) as usize
     }
 
@@ -14643,6 +14660,14 @@ impl Storage {
         name: &str,
         txid: u32,
     ) -> Option<AccessObject> {
+        if class == AccessClass::Language {
+            let slot = schema
+                .is_empty()
+                .then(|| crate::sql::catalog::procedural_language_oid(name))
+                .flatten()
+                .and_then(|oid| u16::try_from(oid).ok())?;
+            return Some(AccessObject { class, slot });
+        }
         let slot = match class {
             AccessClass::Table => self.find_visible(schema, name, txid),
             AccessClass::View => self.views.iter().position(|view| {
@@ -14692,6 +14717,7 @@ impl Storage {
                 .is_empty()
                 .then(|| self.foreign_server(name, txid).map(|(slot, _)| slot))
                 .flatten(),
+            AccessClass::Language => unreachable!("handled before catalog slot lookup"),
         }?;
         u16::try_from(slot)
             .ok()
@@ -14784,6 +14810,14 @@ impl Storage {
                 SqlName::EMPTY,
                 self.foreign.entry_server(slot).definition_for(txid).name,
             ),
+            AccessClass::Language => {
+                let name = crate::sql::catalog::procedural_language_name(object.slot.into())
+                    .expect("live language ACL target has a known catalog OID");
+                (
+                    SqlName::EMPTY,
+                    SqlName::parse(name).expect("built-in procedural language name is valid"),
+                )
+            }
         }
     }
 
@@ -14821,6 +14855,9 @@ impl Storage {
             AccessClass::ForeignServer => {
                 self.foreign.entry_server(slot).ddl_state == CatalogDdlState::Present
             }
+            AccessClass::Language => {
+                crate::sql::catalog::procedural_language_name(object.slot.into()).is_some()
+            }
         }
     }
 
@@ -14849,6 +14886,9 @@ impl Storage {
             AccessClass::LargeObject => self.large_objects[slot].visible_to(txid),
             AccessClass::ForeignDataWrapper => self.foreign.entry_wrapper(slot).visible_to(txid),
             AccessClass::ForeignServer => self.foreign.entry_server(slot).visible_to(txid),
+            AccessClass::Language => {
+                crate::sql::catalog::procedural_language_name(object.slot.into()).is_some()
+            }
         }
     }
 
@@ -14877,7 +14917,7 @@ impl Storage {
             AccessClass::LargeObject => Some(self.large_objects[slot].database),
             AccessClass::ForeignDataWrapper => Some(self.foreign.entry_wrapper(slot).database),
             AccessClass::ForeignServer => Some(self.foreign.entry_server(slot).database),
-            AccessClass::Tablespace | AccessClass::Database => None,
+            AccessClass::Tablespace | AccessClass::Database | AccessClass::Language => None,
         }
     }
 
@@ -15006,7 +15046,7 @@ impl Storage {
                             .then_some(slot)
                     })?
             }
-            AccessClass::Database | AccessClass::Tablespace => return None,
+            AccessClass::Database | AccessClass::Tablespace | AccessClass::Language => return None,
         };
         Some(AccessObject {
             class: source.class,
@@ -15249,6 +15289,7 @@ impl Storage {
                             | AccessClass::Enum
                             | AccessClass::Composite
                             | AccessClass::Routine
+                            | AccessClass::Language
                     ) && value.grantee == PUBLIC_ROLE))
         })
     }
@@ -15281,6 +15322,7 @@ impl Storage {
             AccessClass::LargeObject => self.large_objects.len(),
             AccessClass::ForeignDataWrapper => self.foreign.wrapper_capacity(),
             AccessClass::ForeignServer => self.foreign.server_capacity(),
+            AccessClass::Language => 0,
         }
     }
 
@@ -16824,6 +16866,44 @@ impl Storage {
             "must be owner of {} {}",
             object_type,
             name.as_str()
+        ))
+    }
+
+    pub(crate) fn require_language_usage(&self, name: &str, txid: u32) -> Result<(), SqlError> {
+        if txid == 0 {
+            return Ok(());
+        }
+        let oid = crate::sql::catalog::procedural_language_oid(name).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "language \"{}\" does not exist",
+                name
+            )
+        })?;
+        let slot = u16::try_from(oid).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "language OID {} cannot be represented by the fixed ACL identity",
+                oid
+            )
+        })?;
+        let role = self.current_role_slot(txid).ok_or_else(|| {
+            sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "current role is not present in the role catalog"
+            )
+        })?;
+        let object = AccessObject {
+            class: AccessClass::Language,
+            slot,
+        };
+        if self.has_object_privilege(object, role, PrivilegeSet::USAGE, txid) {
+            return Ok(());
+        }
+        Err(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for language {}",
+            name
         ))
     }
 
@@ -36150,6 +36230,10 @@ mod tests {
             AccessClass::Trigger,
             AccessClass::EventTrigger,
             AccessClass::Database,
+            AccessClass::LargeObject,
+            AccessClass::ForeignDataWrapper,
+            AccessClass::ForeignServer,
+            AccessClass::Language,
         ] {
             assert_eq!(AccessClass::from_u8(class as u8), Some(class));
         }

@@ -2702,6 +2702,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Some(schema) => self.storage.enum_slot(schema, name, self.txid),
             None => self.storage.resolve_enum_slot(name, self.txid),
         };
+        let composite = match written_schema {
+            Some(schema) => self.storage.composite_slot(schema, name, self.txid),
+            None => self.storage.resolve_composite_slot(name, self.txid),
+        };
         let object = domain
             .map(|slot| crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Domain,
@@ -2710,6 +2714,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .or_else(|| {
                 enumeration.map(|slot| crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Enum,
+                    slot: slot as u16,
+                })
+            })
+            .or_else(|| {
+                composite.map(|slot| crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Composite,
                     slot: slot as u16,
                 })
             });
@@ -2730,6 +2740,50 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             },
         )
         .map(Some)
+    }
+
+    fn has_language_privilege(
+        &self,
+        role: Option<&str>,
+        language: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let Some(oid) = super::catalog::procedural_language_oid(language) else {
+            return Ok(None);
+        };
+        let Some(slot) = u16::try_from(oid).ok() else {
+            return Ok(None);
+        };
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Language,
+            slot,
+        };
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            crate::storage::PrivilegeSet::USAGE,
+            |privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_object_grant_option(object, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
+    fn language_name<'a>(
+        &self,
+        oid: i32,
+        _arena: &'a crate::mem::arena::Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(super::catalog::procedural_language_name(oid))
     }
 
     fn has_function_privilege(

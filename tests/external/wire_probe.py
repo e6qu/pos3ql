@@ -4972,6 +4972,91 @@ def test_catalog_comments_over_raw_wire():
     s.close()
 
 
+def test_privilege_targets_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE ROLE wire_privilege_owner; "
+        "CREATE ROLE wire_privilege_reader; "
+        "CREATE SCHEMA wire_privilege_schema; "
+        "GRANT USAGE, CREATE ON SCHEMA wire_privilege_schema "
+        "TO wire_privilege_owner, wire_privilege_reader; "
+        "SET ROLE wire_privilege_owner; "
+        "CREATE TYPE wire_privilege_schema.wire_privilege_pair AS (value integer); "
+        "CREATE FUNCTION wire_privilege_schema.wire_privilege_function() "
+        "RETURNS integer LANGUAGE sql AS 'SELECT 7'; "
+        "CREATE PROCEDURE wire_privilege_schema.wire_privilege_procedure() "
+        "LANGUAGE sql AS 'SELECT 1'; "
+        "RESET ROLE; "
+        "REVOKE USAGE ON LANGUAGE sql FROM PUBLIC; "
+        "GRANT USAGE ON LANGUAGE sql TO wire_privilege_reader; "
+        "GRANT USAGE ON TYPE wire_privilege_schema.wire_privilege_pair TO wire_privilege_reader; "
+        "REVOKE EXECUTE ON FUNCTION wire_privilege_schema.wire_privilege_function() FROM PUBLIC; "
+        "REVOKE EXECUTE ON PROCEDURE wire_privilege_schema.wire_privilege_procedure() FROM PUBLIC; "
+        "GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA wire_privilege_schema "
+        "TO wire_privilege_reader",
+    )
+    initial = simple_query(
+        s,
+        "SELECT has_language_privilege('wire_privilege_reader', 14::oid, 'USAGE'), "
+        "has_type_privilege('wire_privilege_reader', 'wire_privilege_schema.wire_privilege_pair', 'USAGE'), "
+        "has_function_privilege('wire_privilege_reader', "
+        "'wire_privilege_schema.wire_privilege_function()', 'EXECUTE'), "
+        "has_function_privilege('wire_privilege_reader', "
+        "'wire_privilege_schema.wire_privilege_procedure()', 'EXECUTE'), "
+        "lanacl IS NOT NULL FROM pg_language WHERE lanname = 'sql'",
+    )
+    reader_ddl = simple_query(
+        s,
+        "SET ROLE wire_privilege_reader; "
+        "CREATE FUNCTION wire_privilege_schema.wire_privilege_sql_allowed() "
+        "RETURNS integer LANGUAGE sql AS 'SELECT 9'; "
+        "CREATE TABLE wire_privilege_schema.wire_privilege_values "
+        "(value wire_privilege_schema.wire_privilege_pair); "
+        "RESET ROLE; "
+    )
+    routine_changes = simple_query(
+        s,
+        "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA wire_privilege_schema TO wire_privilege_reader; "
+        "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA wire_privilege_schema "
+        "FROM wire_privilege_reader; "
+        "SELECT has_function_privilege('wire_privilege_reader', "
+        "'wire_privilege_schema.wire_privilege_function()', 'EXECUTE'), "
+        "has_function_privilege('wire_privilege_reader', "
+        "'wire_privilege_schema.wire_privilege_procedure()', 'EXECUTE')",
+    )
+    cleanup = simple_query(
+        s,
+        "DROP TABLE wire_privilege_schema.wire_privilege_values; "
+        "DROP FUNCTION wire_privilege_schema.wire_privilege_sql_allowed(); "
+        "DROP FUNCTION wire_privilege_schema.wire_privilege_function(); "
+        "DROP PROCEDURE wire_privilege_schema.wire_privilege_procedure(); "
+        "DROP TYPE wire_privilege_schema.wire_privilege_pair; "
+        "REVOKE USAGE ON LANGUAGE sql FROM wire_privilege_reader; "
+        "GRANT USAGE ON LANGUAGE sql TO PUBLIC; "
+        "REVOKE USAGE, CREATE ON SCHEMA wire_privilege_schema "
+        "FROM wire_privilege_owner, wire_privilege_reader; "
+        "DROP SCHEMA wire_privilege_schema; "
+        "DROP ROLE wire_privilege_reader; "
+        "DROP ROLE wire_privilege_owner",
+    )
+    initial_rows = [text_row_fields(payload) for kind, payload in initial if kind == b"D"]
+    routine_rows = [
+        text_row_fields(payload) for kind, payload in routine_changes if kind == b"D"
+    ]
+    results = (setup, initial, reader_ddl, routine_changes, cleanup)
+    check(
+        "privilege targets: raw simple-query wire preserves language, composite, and routine ACLs",
+        not any(kind == b"E" for result in results for kind, _ in result)
+        and initial_rows == [["t", "t", "f", "t", "t"]]
+        and routine_rows == [["f", "t"]],
+        results,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

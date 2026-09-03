@@ -161,7 +161,7 @@ END	complete	05_transactions.sql
 EXECUTE	complete	14_surface.sql
 EXPLAIN	partial	48_vacuum_analyze.sql
 FETCH	complete	39_cursors.sql
-GRANT	partial	83_roles_acl.sql
+GRANT	partial	83_roles_acl.sql and 133_privilege_targets.sql
 IMPORT FOREIGN SCHEMA	complete	tests/external/ci_diff.sh
 INSERT	complete	02_dml_returning.sql
 LISTEN	complete	14_surface.sql
@@ -177,7 +177,7 @@ REFRESH MATERIALIZED VIEW	complete	53_materialized_view.sql
 REINDEX	partial	92_reindex.sql and 107_index_lifecycle.sql
 RELEASE SAVEPOINT	complete	05_transactions.sql
 RESET	complete	75_guc_mutation.sql
-REVOKE	partial	83_roles_acl.sql
+REVOKE	partial	83_roles_acl.sql and 133_privilege_targets.sql
 ROLLBACK	complete	05_transactions.sql
 ROLLBACK PREPARED	complete	120_two_phase_transactions.sql
 ROLLBACK TO SAVEPOINT	complete	05_transactions.sql

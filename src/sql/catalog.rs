@@ -1276,7 +1276,7 @@ pub fn synthesize<'a>(
             &[],
             arena,
         ),
-        (false, "pg_language") => pg_language(arena),
+        (false, "pg_language") => pg_language(storage, txid, arena),
         (false, "pg_auth_members") => pg_auth_members(storage, txid, arena),
         (false, "pg_db_role_setting") => pg_db_role_setting(storage, txid, arena),
         (false, "pg_parameter_acl") => pg_parameter_acl(storage, txid, arena),
@@ -1874,6 +1874,7 @@ fn acl<'a>(
                     crate::storage::AccessClass::Domain
                         | crate::storage::AccessClass::Enum
                         | crate::storage::AccessClass::Routine
+                        | crate::storage::AccessClass::Language
                 ) && grantee == crate::storage::PUBLIC_ROLE))
     });
     if !has_entries {
@@ -1887,15 +1888,15 @@ fn acl<'a>(
         | crate::storage::AccessClass::MaterializedView => crate::storage::PrivilegeSet::TABLE_ALL,
         crate::storage::AccessClass::Sequence => crate::storage::PrivilegeSet::SEQUENCE_ALL,
         crate::storage::AccessClass::Schema => crate::storage::PrivilegeSet::SCHEMA_ALL,
-        crate::storage::AccessClass::Domain | crate::storage::AccessClass::Enum => {
-            crate::storage::PrivilegeSet::TYPE_ALL
-        }
+        crate::storage::AccessClass::Domain
+        | crate::storage::AccessClass::Enum
+        | crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
         crate::storage::AccessClass::Index => crate::storage::PrivilegeSet::NONE,
         crate::storage::AccessClass::Routine => crate::storage::PrivilegeSet::FUNCTION_ALL,
         crate::storage::AccessClass::LargeObject => crate::storage::PrivilegeSet::LARGE_OBJECT_ALL,
         crate::storage::AccessClass::ForeignDataWrapper
-        | crate::storage::AccessClass::ForeignServer => crate::storage::PrivilegeSet::USAGE,
-        crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
+        | crate::storage::AccessClass::ForeignServer
+        | crate::storage::AccessClass::Language => crate::storage::PrivilegeSet::USAGE,
         crate::storage::AccessClass::Tablespace => crate::storage::PrivilegeSet::CREATE,
         crate::storage::AccessClass::Database => crate::storage::PrivilegeSet::DATABASE_ALL,
         crate::storage::AccessClass::Statistics
@@ -9682,6 +9683,7 @@ fn extension_dependency_catalog_identity(
         ),
         AccessClass::ForeignDataWrapper => (2328, foreign_data_wrapper_oid(slot)),
         AccessClass::ForeignServer => (1417, foreign_server_oid(slot)),
+        AccessClass::Language => (PG_LANGUAGE_OID, object.slot.into()),
     })
 }
 
@@ -12051,7 +12053,11 @@ fn pg_am<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     finish(definition, &rows, arena)
 }
 
-fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_language<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_language",
         &[
@@ -12078,7 +12084,15 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Int4(0),
             Datum::Int4(2246),
             Datum::Int4(0),
-            Datum::Null,
+            acl(
+                storage,
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Language,
+                    slot: INTERNAL_LANGUAGE_OID as u16,
+                },
+                txid,
+                arena,
+            )?,
         ],
         arena,
     )?;
@@ -12093,7 +12107,15 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Int4(0),
             Datum::Int4(2247),
             Datum::Int4(0),
-            Datum::Null,
+            acl(
+                storage,
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Language,
+                    slot: C_LANGUAGE_OID as u16,
+                },
+                txid,
+                arena,
+            )?,
         ],
         arena,
     )?;
@@ -12108,7 +12130,15 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Int4(0),
             Datum::Int4(2248),
             Datum::Int4(0),
-            Datum::Null,
+            acl(
+                storage,
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Language,
+                    slot: SQL_LANGUAGE_OID as u16,
+                },
+                txid,
+                arena,
+            )?,
         ],
         arena,
     )?;
@@ -12123,7 +12153,15 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Int4(13644),
             Datum::Int4(13646),
             Datum::Int4(13645),
-            Datum::Null,
+            acl(
+                storage,
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Language,
+                    slot: PLPGSQL_LANGUAGE_OID as u16,
+                },
+                txid,
+                arena,
+            )?,
         ],
         arena,
     )?;

@@ -7101,12 +7101,13 @@ fn privilege_mask(
         }
         AccessClass::Sequence => PrivilegeSet::SEQUENCE_ALL,
         AccessClass::Schema => PrivilegeSet::SCHEMA_ALL,
-        AccessClass::Domain | AccessClass::Enum => PrivilegeSet::TYPE_ALL,
+        AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => PrivilegeSet::TYPE_ALL,
         AccessClass::Index => PrivilegeSet::NONE,
         AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
         AccessClass::LargeObject => PrivilegeSet::LARGE_OBJECT_ALL,
-        AccessClass::ForeignDataWrapper | AccessClass::ForeignServer => PrivilegeSet::USAGE,
-        AccessClass::Composite => PrivilegeSet::TYPE_ALL,
+        AccessClass::ForeignDataWrapper | AccessClass::ForeignServer | AccessClass::Language => {
+            PrivilegeSet::USAGE
+        }
         AccessClass::Tablespace => PrivilegeSet::CREATE,
         AccessClass::Database => PrivilegeSet::DATABASE_ALL,
         AccessClass::Statistics
@@ -7173,6 +7174,7 @@ fn privilege_object_noun(class: crate::storage::AccessClass) -> &'static str {
         AccessClass::Routine => "function",
         AccessClass::LargeObject => "large object",
         AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => "type",
+        AccessClass::Language => "language",
         AccessClass::Tablespace => "tablespace",
         _ => "relation",
     }
@@ -7426,7 +7428,8 @@ fn apply_default_privileges_to_new_object(
         | AccessClass::EventTrigger
         | AccessClass::LargeObject
         | AccessClass::ForeignDataWrapper
-        | AccessClass::ForeignServer => return Ok(()),
+        | AccessClass::ForeignServer
+        | AccessClass::Language => return Ok(()),
     };
     let owner = storage.object_owner(object, txn.txid) as u16;
     let schema = if object.class == AccessClass::Schema {
@@ -8942,6 +8945,10 @@ fn resolve_privilege_objects(
                             Some(schema) => storage.enum_slot(schema, name.name, txid),
                             None => storage.resolve_enum_slot(name.name, txid),
                         };
+                        let composite = match name.schema {
+                            Some(schema) => storage.composite_slot(schema, name.name, txid),
+                            None => storage.resolve_composite_slot(name.name, txid),
+                        };
                         let object = domain
                             .map(|slot| AccessObject {
                                 class: AccessClass::Domain,
@@ -8953,6 +8960,12 @@ fn resolve_privilege_objects(
                                     slot: slot as u16,
                                 })
                             })
+                            .or_else(|| {
+                                composite.map(|slot| AccessObject {
+                                    class: AccessClass::Composite,
+                                    slot: slot as u16,
+                                })
+                            })
                             .ok_or_else(|| {
                                 sql_err!(
                                     sqlstate::UNDEFINED_OBJECT,
@@ -8961,6 +8974,31 @@ fn resolve_privilege_objects(
                                 )
                             })?;
                         add_privilege_object(objects, &mut count, object)?;
+                    }
+                    PrivilegeObjectKind::ProceduralLanguage => {
+                        let Some(oid) = crate::sql::catalog::procedural_language_oid(name.name)
+                        else {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "language \"{}\" does not exist",
+                                name.name
+                            ));
+                        };
+                        let slot = u16::try_from(oid).map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "language OID {} cannot be represented by the fixed ACL identity",
+                                oid
+                            )
+                        })?;
+                        add_privilege_object(
+                            objects,
+                            &mut count,
+                            AccessObject {
+                                class: AccessClass::Language,
+                                slot,
+                            },
+                        )?;
                     }
                     PrivilegeObjectKind::ForeignDataWrapper => {
                         let Some((slot, _)) = storage.foreign_wrapper(name.name, txid) else {
@@ -9063,7 +9101,9 @@ fn resolve_privilege_objects(
                             }
                         }
                     }
-                    PrivilegeObjectKind::AllFunctionsInSchema => {
+                    PrivilegeObjectKind::AllFunctionsInSchema
+                    | PrivilegeObjectKind::AllProceduresInSchema
+                    | PrivilegeObjectKind::AllRoutinesInSchema => {
                         let schema = name.name;
                         if storage.find_schema_visible(schema, txid).is_none() {
                             return Err(sql_err!(
@@ -9074,7 +9114,18 @@ fn resolve_privilege_objects(
                         }
                         for slot in 0..storage.routine_count() {
                             let routine = storage.routine(slot);
-                            if routine.visible_to(txid)
+                            let selected = match kind {
+                                PrivilegeObjectKind::AllFunctionsInSchema => {
+                                    !matches!(routine.kind, crate::storage::RoutineKind::Procedure)
+                                }
+                                PrivilegeObjectKind::AllProceduresInSchema => {
+                                    matches!(routine.kind, crate::storage::RoutineKind::Procedure)
+                                }
+                                PrivilegeObjectKind::AllRoutinesInSchema => true,
+                                _ => unreachable!("schema routine target is closed"),
+                            };
+                            if selected
+                                && routine.visible_to(txid)
                                 && routine.schema_for(txid).as_str() == schema
                             {
                                 add_privilege_object(
@@ -28599,6 +28650,13 @@ pub fn create_routine(
         RoutineLanguage::Sql => crate::storage::RoutineLanguage::Sql,
         RoutineLanguage::PlPgSql => crate::storage::RoutineLanguage::PlPgSql,
     };
+    let language_name = match routine.language {
+        RoutineLanguage::Sql => "sql",
+        RoutineLanguage::PlPgSql => "plpgsql",
+    };
+    if let Err(error) = storage.require_language_usage(language_name, txn.txid) {
+        return sql_fail(error);
+    }
     if matches!(routine.kind, super::ast::RoutineCreateKind::Trigger)
         && routine.language != RoutineLanguage::PlPgSql
     {

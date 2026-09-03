@@ -871,7 +871,10 @@ fn utility_command_object_type(statement: &Stmt<'_>) -> Option<&'static str> {
                 }
                 PrivilegeObjectKind::Schema => "SCHEMA",
                 PrivilegeObjectKind::Type => "TYPE",
+                PrivilegeObjectKind::ProceduralLanguage => "LANGUAGE",
                 PrivilegeObjectKind::AllFunctionsInSchema => "FUNCTION",
+                PrivilegeObjectKind::AllProceduresInSchema => "PROCEDURE",
+                PrivilegeObjectKind::AllRoutinesInSchema => "ROUTINE",
                 PrivilegeObjectKind::ForeignDataWrapper => "FOREIGN DATA WRAPPER",
                 PrivilegeObjectKind::ForeignServer => "FOREIGN SERVER",
                 PrivilegeObjectKind::Tablespace | PrivilegeObjectKind::Database => return None,
@@ -921,6 +924,7 @@ fn access_reference(object: crate::storage::AccessObject) -> Option<ObjectRef> {
         AccessClass::Extension => ObjectRef::Extension(slot),
         AccessClass::Trigger => ObjectRef::Trigger(slot),
         AccessClass::LargeObject => ObjectRef::LargeObject(slot),
+        AccessClass::Language => return None,
         AccessClass::Tablespace
         | AccessClass::Database
         | AccessClass::EventTrigger

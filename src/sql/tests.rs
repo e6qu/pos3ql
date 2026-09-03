@@ -26906,6 +26906,168 @@ fn routine_acls_are_signature_typed_enforced_and_durable() {
 }
 
 #[test]
+fn privilege_targets_keep_language_composite_and_routine_kinds_distinct() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE privilege_target_owner;
+         CREATE ROLE privilege_target_reader;
+         GRANT CREATE ON SCHEMA public TO privilege_target_owner, privilege_target_reader;
+         SET ROLE privilege_target_owner;
+         CREATE TYPE privilege_target_pair AS (left_value integer, right_value integer);
+         CREATE FUNCTION privilege_target_function() RETURNS integer LANGUAGE SQL AS 'SELECT 7';
+         CREATE PROCEDURE privilege_target_procedure() LANGUAGE SQL AS 'SELECT 1';
+         RESET ROLE;
+         REVOKE USAGE ON LANGUAGE sql FROM PUBLIC;
+         REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC;
+         GRANT USAGE ON LANGUAGE sql TO privilege_target_reader WITH GRANT OPTION;
+         GRANT USAGE ON TYPE privilege_target_pair TO privilege_target_reader;
+         REVOKE EXECUTE ON FUNCTION privilege_target_function() FROM PUBLIC;
+         REVOKE EXECUTE ON PROCEDURE privilege_target_procedure() FROM PUBLIC;
+         GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA public TO privilege_target_reader;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT has_language_privilege('privilege_target_reader', 'sql', 'USAGE'),
+                    has_language_privilege('privilege_target_reader', 14::oid, 'USAGE'),
+                    has_type_privilege('privilege_target_reader', 'privilege_target_pair', 'USAGE'),
+                    has_function_privilege('privilege_target_reader', 'privilege_target_function()', 'EXECUTE'),
+                    has_function_privilege('privilege_target_reader', 'privilege_target_procedure()', 'EXECUTE'),
+                    lanacl IS NOT NULL
+               FROM pg_language WHERE lanname = 'sql';"
+        )),
+        ["t|t|t|f|t|t"]
+    );
+    let allowed = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE privilege_target_reader;
+         CREATE FUNCTION privilege_target_sql_allowed() RETURNS integer LANGUAGE sql AS 'SELECT 9';
+         CREATE TABLE privilege_target_composite_values (value privilege_target_pair);
+         RESET ROLE;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&allowed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&allowed)
+    );
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE privilege_target_reader;
+         CREATE FUNCTION privilege_target_plpgsql_denied() RETURNS integer LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+    let do_denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE privilege_target_reader; DO $$ BEGIN NULL; END $$;",
+    );
+    assert!(
+        String::from_utf8_lossy(&do_denied).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&do_denied)
+    );
+    let routine_scopes = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE;
+         GRANT EXECUTE ON ALL ROUTINES IN SCHEMA public TO privilege_target_reader;
+         REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM privilege_target_reader;
+         SELECT has_function_privilege('privilege_target_reader', 'privilege_target_function()', 'EXECUTE'),
+                has_function_privilege('privilege_target_reader', 'privilege_target_procedure()', 'EXECUTE');
+         REVOKE EXECUTE ON ALL PROCEDURES IN SCHEMA public FROM privilege_target_reader;
+         SELECT has_function_privilege('privilege_target_reader', 'privilege_target_procedure()', 'EXECUTE');",
+    );
+    assert_eq!(data_rows(&routine_scopes), ["f|t", "f"]);
+}
+
+#[test]
+fn language_and_composite_privileges_survive_wal_checkpoint_and_cold_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_NAMESPACE.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("language-acl-recovery-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("language-acl-recovery-{}-{sequence}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE language_acl_owner;
+             CREATE ROLE language_acl_reader;
+             GRANT CREATE ON SCHEMA public TO language_acl_owner, language_acl_reader;
+             SET ROLE language_acl_owner;
+             CREATE TYPE language_acl_pair AS (value integer);
+             RESET ROLE;
+             REVOKE USAGE ON LANGUAGE sql FROM PUBLIC;
+             GRANT USAGE ON LANGUAGE sql TO language_acl_reader;
+             GRANT USAGE ON TYPE language_acl_pair TO language_acl_reader;",
+        );
+        assert!(
+            !String::from_utf8_lossy(&setup).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        engine.commit_wal().unwrap();
+        assert!(engine.checkpoint().unwrap());
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT has_language_privilege('language_acl_reader', 'sql', 'USAGE'),
+                    has_type_privilege('language_acl_reader', 'language_acl_pair', 'USAGE'),
+                    lanacl IS NOT NULL
+               FROM pg_language WHERE lanname = 'sql';"
+        )),
+        ["t|t|t"]
+    );
+    let allowed = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE language_acl_reader;
+         CREATE FUNCTION language_acl_after_recovery() RETURNS integer LANGUAGE sql AS 'SELECT 4';
+         CREATE TABLE language_acl_values (value language_acl_pair);
+         RESET ROLE;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&allowed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&allowed)
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
     use core::sync::atomic::{AtomicU32, Ordering};
 

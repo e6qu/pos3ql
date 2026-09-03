@@ -3846,8 +3846,18 @@ impl<'a> Parser<'a> {
                 self.expect_ident("in")?;
                 self.expect_ident("schema")?;
                 PrivilegeObjectKind::AllFunctionsInSchema
+            } else if self.eat_ident("procedures")? {
+                self.expect_ident("in")?;
+                self.expect_ident("schema")?;
+                PrivilegeObjectKind::AllProceduresInSchema
+            } else if self.eat_ident("routines")? {
+                self.expect_ident("in")?;
+                self.expect_ident("schema")?;
+                PrivilegeObjectKind::AllRoutinesInSchema
             } else {
-                return Err(self.unexpected("expected TABLES, SEQUENCES, or FUNCTIONS after ALL"));
+                return Err(self.unexpected(
+                    "expected TABLES, SEQUENCES, FUNCTIONS, PROCEDURES, or ROUTINES after ALL",
+                ));
             }
         } else if self.eat_ident("function")? {
             return self.routine_privilege_target(RoutineTargetKind::Function);
@@ -3867,6 +3877,8 @@ impl<'a> Parser<'a> {
             PrivilegeObjectKind::Database
         } else if self.eat_ident("type")? || self.eat_ident("domain")? {
             PrivilegeObjectKind::Type
+        } else if self.eat_ident("language")? {
+            PrivilegeObjectKind::ProceduralLanguage
         } else if self.eat_ident("foreign")? {
             if self.eat_ident("data")? {
                 self.expect_ident("wrapper")?;
@@ -3895,6 +3907,9 @@ impl<'a> Parser<'a> {
                     | PrivilegeObjectKind::AllTablesInSchema
                     | PrivilegeObjectKind::AllSequencesInSchema
                     | PrivilegeObjectKind::AllFunctionsInSchema
+                    | PrivilegeObjectKind::AllProceduresInSchema
+                    | PrivilegeObjectKind::AllRoutinesInSchema
+                    | PrivilegeObjectKind::ProceduralLanguage
             ) {
                 QualName::bare(self.col_ident("schema name")?)
             } else {

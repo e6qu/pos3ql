@@ -2164,11 +2164,14 @@ pub enum PrivilegeObjectKind {
     Tablespace,
     Database,
     Type,
+    ProceduralLanguage,
     ForeignDataWrapper,
     ForeignServer,
     AllTablesInSchema,
     AllSequencesInSchema,
     AllFunctionsInSchema,
+    AllProceduresInSchema,
+    AllRoutinesInSchema,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

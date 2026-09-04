@@ -63,14 +63,14 @@ pub(crate) const PG_EXTENSION_OID: i32 = 3079;
 pub(crate) const PG_PUBLICATION_OID: i32 = 6104;
 pub(crate) const PG_SUBSCRIPTION_OID: i32 = 6107;
 
-const ACCESS_METHODS: [(&str, i32, i32, &str); 7] = [
-    ("heap", 2, 3, "t"),
-    ("btree", 403, 330, "i"),
-    ("hash", 405, 331, "i"),
-    ("gist", 783, 332, "i"),
-    ("gin", 2742, 333, "i"),
-    ("brin", 3580, 335, "i"),
-    ("spgist", 4000, 334, "i"),
+const ACCESS_METHODS: [(&str, i32, i32, &str, &str); 7] = [
+    ("heap", 2, 3, "heap_tableam_handler", "t"),
+    ("btree", 403, 330, "bthandler", "i"),
+    ("hash", 405, 331, "hashhandler", "i"),
+    ("gist", 783, 332, "gisthandler", "i"),
+    ("gin", 2742, 333, "ginhandler", "i"),
+    ("brin", 3580, 335, "brinhandler", "i"),
+    ("spgist", 4000, 334, "spghandler", "i"),
 ];
 const INTERNAL_LANGUAGE_OID: i32 = 12;
 const C_LANGUAGE_OID: i32 = 13;
@@ -86,13 +86,13 @@ const PROCEDURAL_LANGUAGES: [(&str, i32); 4] = [
 pub(crate) fn access_method_oid(name: &str) -> Option<i32> {
     ACCESS_METHODS
         .iter()
-        .find_map(|(candidate, oid, _, _)| (*candidate == name).then_some(*oid))
+        .find_map(|(candidate, oid, _, _, _)| (*candidate == name).then_some(*oid))
 }
 
 pub(crate) fn access_method_name(oid: i32) -> Option<&'static str> {
     ACCESS_METHODS
         .iter()
-        .find_map(|(name, candidate, _, _)| (*candidate == oid).then_some(*name))
+        .find_map(|(name, candidate, _, _, _)| (*candidate == oid).then_some(*name))
 }
 
 pub(crate) fn access_method_oid_in(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
@@ -3445,7 +3445,7 @@ mod routine_name_tests {
 
     #[test]
     fn static_comment_catalog_identities_round_trip() {
-        for (name, oid, _, _) in ACCESS_METHODS {
+        for (name, oid, _, _, _) in ACCESS_METHODS {
             assert_eq!(access_method_oid(name), Some(oid));
             assert_eq!(access_method_name(oid), Some(name));
         }
@@ -12127,24 +12127,28 @@ fn pg_am<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTabl
     let definition = def_of(
         "pg_am",
         &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("amname", ColType::Text),
-            ("amhandler", ColType::Int4),
-            ("amtype", ColType::Bpchar),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("amname", ColType::Name),
+            ("amhandler", ColType::Regproc),
+            ("amtype", ColType::Char),
         ],
     );
     let mut rows: [&[Datum]; ACCESS_METHODS.len() + crate::storage::MAX_ACCESS_METHODS] =
         [&[]; ACCESS_METHODS.len() + crate::storage::MAX_ACCESS_METHODS];
     let mut count = 0usize;
-    for (name, oid, handler, method_type) in ACCESS_METHODS {
+    for (name, oid, handler, handler_name, method_type) in ACCESS_METHODS {
         rows[count] = row(
             &[
                 Datum::Int4(PG_AM_OID),
                 Datum::Int4(oid),
                 text(name, arena)?,
-                Datum::Int4(handler),
-                text(method_type, arena)?,
+                Datum::RegObject {
+                    type_oid: super::types::oid::REGPROC,
+                    referenced_oid: handler,
+                    name: arena.alloc_str(handler_name).map_err(|_| arena_full())?,
+                },
+                Datum::Char(method_type.as_bytes()[0]),
             ],
             arena,
         )?;
@@ -12159,14 +12163,37 @@ fn pg_am<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTabl
                 Datum::Int4(PG_AM_OID),
                 Datum::Int4(method.oid().get()),
                 text(method.definition.name.as_str(), arena)?,
-                Datum::Int4(method.definition.handler.postgres_handler_oid()),
-                text("t", arena)?,
+                access_method_handler_regproc(method.definition.handler, arena)?,
+                Datum::Char(b't'),
             ],
             arena,
         )?;
         count += 1;
     }
     finish(definition, &rows[..count], arena)
+}
+
+fn access_method_handler_regproc<'a>(
+    handler: crate::storage::TableAccessMethodHandler,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let oid = handler.postgres_handler_oid();
+    let name = ACCESS_METHODS
+        .iter()
+        .find_map(|(_, _, candidate_oid, candidate_name, _)| {
+            (*candidate_oid == oid).then_some(*candidate_name)
+        })
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "catalog access method handler identity is unavailable"
+            )
+        })?;
+    Ok(Datum::RegObject {
+        type_oid: super::types::oid::REGPROC,
+        referenced_oid: oid,
+        name: arena.alloc_str(name).map_err(|_| arena_full())?,
+    })
 }
 
 fn pg_language<'a>(

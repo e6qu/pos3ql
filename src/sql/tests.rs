@@ -40287,10 +40287,25 @@ fn table_access_methods_are_catalogued_typed_and_transactional() {
         data_rows(&run_with(
             &mut engine,
             &mut budget,
-            "SELECT amname, amhandler FROM pg_am \
+            "SELECT amname, amhandler::text, pg_typeof(amhandler)::text FROM pg_am \
              WHERE amname IN ('gist', 'gin', 'brin', 'spgist') ORDER BY amname",
         )),
-        ["brin|335", "gin|333", "gist|332", "spgist|334"]
+        [
+            "brin|brinhandler|regproc",
+            "gin|ginhandler|regproc",
+            "gist|gisthandler|regproc",
+            "spgist|spghandler|regproc",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof(oid)::text, pg_typeof(amname)::text, \
+                    pg_typeof(amhandler)::text, pg_typeof(amtype)::text \
+             FROM pg_am WHERE amname = 'heap'",
+        )),
+        ["oid|name|regproc|\"char\""]
     );
     let output = run_with(
         &mut engine,

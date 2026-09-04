@@ -439,6 +439,8 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterIndex { .. }
         | Stmt::AlterIndexesTablespace { .. }
         | Stmt::DropIndex { .. }
+        | Stmt::CreateAccessMethod { .. }
+        | Stmt::DropAccessMethod { .. }
         | Stmt::Reindex { .. }
         | Stmt::Cluster { .. }
         | Stmt::Checkpoint
@@ -821,6 +823,8 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::CreateIndex { .. } => "CREATE INDEX",
         Stmt::AlterIndex { .. } | Stmt::AlterIndexesTablespace { .. } => "ALTER INDEX",
         Stmt::DropIndex { .. } => "DROP INDEX",
+        Stmt::CreateAccessMethod { .. } => "CREATE ACCESS METHOD",
+        Stmt::DropAccessMethod { .. } => "DROP ACCESS METHOD",
         Stmt::Cluster { .. } => "CLUSTER",
         Stmt::Reindex { .. } => "REINDEX",
         Stmt::CreateSchema { .. } => "CREATE SCHEMA",
@@ -903,6 +907,7 @@ fn event_trigger_drop_command(statement: &Stmt<'_>) -> bool {
                 | Stmt::DropDomain { .. }
                 | Stmt::DropType { .. }
                 | Stmt::DropIndex { .. }
+                | Stmt::DropAccessMethod { .. }
                 | Stmt::DropSchema { .. }
         ),
     }
@@ -1161,6 +1166,7 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
         "ALTER TYPE",
         "COMMENT",
         "CREATE AGGREGATE",
+        "CREATE ACCESS METHOD",
         "CREATE CAST",
         "CREATE COLLATION",
         "CREATE CONVERSION",
@@ -1187,6 +1193,7 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
         "CREATE TYPE",
         "CREATE VIEW",
         "DROP AGGREGATE",
+        "DROP ACCESS METHOD",
         "DROP CAST",
         "DROP COLLATION",
         "DROP CONVERSION",
@@ -5169,6 +5176,12 @@ impl Engine {
                 DdlUndo::TablespaceDropped(slot) => {
                     self.storage.commit_tablespace_drop(*slot as usize)
                 }
+                DdlUndo::AccessMethodCreated(slot) => {
+                    self.storage.commit_access_method_create(*slot as usize)
+                }
+                DdlUndo::AccessMethodDropped(slot) => {
+                    self.storage.commit_access_method_drop(*slot as usize)
+                }
                 DdlUndo::DatabaseCreated(slot) => {
                     self.storage.commit_database_create(*slot as usize)
                 }
@@ -5891,6 +5904,12 @@ impl Engine {
             DdlUndo::TablespaceDropped(slot) => {
                 self.storage.rollback_tablespace_drop(slot as usize, txid)
             }
+            DdlUndo::AccessMethodCreated(slot) => {
+                self.storage.rollback_access_method_create(slot as usize)
+            }
+            DdlUndo::AccessMethodDropped(slot) => self
+                .storage
+                .rollback_access_method_drop(slot as usize, txid),
             DdlUndo::DatabaseCreated(slot) => self.storage.rollback_database_create(slot as usize),
             DdlUndo::DatabaseAltered {
                 slot,
@@ -13131,6 +13150,32 @@ impl Engine {
                 *if_exists,
                 responder,
             ),
+            Stmt::CreateAccessMethod {
+                name,
+                method_type,
+                handler,
+            } => exec::create_access_method(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *method_type,
+                *handler,
+                responder,
+            ),
+            Stmt::DropAccessMethod {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_access_method(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
             Stmt::CreateDatabase { name, options } => {
                 let template = options.template.unwrap_or("template1");
                 let mut connections = self.database_connection_count(template, txn.txid);
@@ -16509,6 +16554,15 @@ fn replay_transaction_batches(
                     })? {
                         WalOp::CreateTable(definition) => {
                             if storage
+                                .table_access_method_name(definition.access_method, transaction_id)
+                                .is_none()
+                            {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "prepared transaction references an unknown table access method"
+                                ));
+                            }
+                            if storage
                                 .find_visible(
                                     definition.schema.as_str(),
                                     definition.name.as_str(),
@@ -17243,6 +17297,15 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             // A journal written before its schema existed cannot occur going
             // forward (CreateSchema precedes in LSN order), but a pre-schema
             // journal names only public, which always exists.
+            if storage
+                .table_access_method_name(def.access_method, 0)
+                .is_none()
+            {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "journal table references an unknown access method"
+                ));
+            }
             if !storage.complete_replay_table_rewrite(def)? {
                 storage.create_table(def)?;
             }
@@ -18494,6 +18557,32 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             })?;
             storage.drop_tablespace(slot, 0)?;
             storage.commit_tablespace_drop(slot);
+        }
+        WalOp::CreateAccessMethod {
+            created_at,
+            name,
+            handler,
+        } => {
+            let slot = storage.create_access_method(
+                created_at,
+                crate::storage::AccessMethodDefinition {
+                    name: crate::storage::SqlName::parse(name)?,
+                    handler,
+                },
+                0,
+            )?;
+            storage.commit_access_method_create(slot);
+        }
+        WalOp::DropAccessMethod { name } => {
+            let slot = storage.access_method_slot(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal access method \"{}\" does not exist",
+                    name
+                )
+            })?;
+            storage.drop_access_method(slot, 0);
+            storage.commit_access_method_drop(slot);
         }
         WalOp::CreateDatabase {
             oid,

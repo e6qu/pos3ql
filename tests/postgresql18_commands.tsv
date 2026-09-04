@@ -67,7 +67,7 @@ COMMENT	partial	59_comment.sql; typed routine, policy, statistics, role, foreign
 COMMIT	complete	05_transactions.sql
 COMMIT PREPARED	complete	120_two_phase_transactions.sql
 COPY	complete	40_copy.sql
-CREATE ACCESS METHOD	missing	-
+CREATE ACCESS METHOD	partial	134_access_methods.sql; bounded table methods using heap_tableam_handler, transactional catalog/WAL/checkpoint/object recovery, and event-trigger identity; arbitrary native and index handlers reject explicitly
 CREATE AGGREGATE	complete	110_user_defined_aggregates.sql
 CREATE CAST	complete	117_cast_operator_catalog.sql
 CREATE COLLATION	complete	120_collation_conversion.sql
@@ -114,7 +114,7 @@ DECLARE	partial	39_cursors.sql
 DELETE	complete	02_dml_returning.sql
 DISCARD	complete	118_database_configuration.sql
 DO	partial	100_plpgsql_procedures.sql and 112_routine_bodies_attributes_do.sql (bounded PL/pgSQL declarations, control flow, diagnostics, exceptions, queries, DML, and lone top-level transaction control)
-DROP ACCESS METHOD	missing	-
+DROP ACCESS METHOD	partial	134_access_methods.sql; RESTRICT and transactional CASCADE through dependent table lifecycle, WAL/checkpoint/object recovery, and event-trigger identity
 DROP AGGREGATE	complete	110_user_defined_aggregates.sql
 DROP CAST	partial	117_cast_operator_catalog.sql
 DROP COLLATION	complete	120_collation_conversion.sql

@@ -4800,7 +4800,7 @@ impl<'a> Parser<'a> {
             self.expect_ident("method")?;
             let method = self.any_ident("table access method")?;
             return Ok(crate::sql::ast::AlterAction::SetAccessMethod(
-                if method.eq_ignore_ascii_case("heap") {
+                if method == "heap" {
                     crate::sql::ast::TableAccessMethod::Heap
                 } else {
                     crate::sql::ast::TableAccessMethod::Named(method)
@@ -4958,7 +4958,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("access")?;
                 self.expect_ident("method")?;
                 let method = self.any_ident("table access method")?;
-                AlterAction::SetAccessMethod(if method.eq_ignore_ascii_case("heap") {
+                AlterAction::SetAccessMethod(if method == "heap" {
                     crate::sql::ast::TableAccessMethod::Heap
                 } else {
                     crate::sql::ast::TableAccessMethod::Named(method)
@@ -5460,13 +5460,11 @@ impl<'a> Parser<'a> {
                 self.expect_ident("access")?;
                 self.expect_ident("method")?;
                 let method = self.any_ident("table access method")?;
-                Ok(AlterAction::SetAccessMethod(
-                    if method.eq_ignore_ascii_case("heap") {
-                        crate::sql::ast::TableAccessMethod::Heap
-                    } else {
-                        crate::sql::ast::TableAccessMethod::Named(method)
-                    },
-                ))
+                Ok(AlterAction::SetAccessMethod(if method == "heap" {
+                    crate::sql::ast::TableAccessMethod::Heap
+                } else {
+                    crate::sql::ast::TableAccessMethod::Named(method)
+                }))
             }
         } else if self.eat_ident("reset")? {
             self.expect_op("(")?;

@@ -1500,6 +1500,10 @@ impl<'a> Parser<'a> {
         if self.eat_ident("tablespace")? {
             return self.create_tablespace();
         }
+        if self.eat_ident("access")? {
+            self.expect_ident("method")?;
+            return self.create_access_method();
+        }
         if self.eat_ident("database")? {
             return self.create_database();
         }
@@ -2625,6 +2629,24 @@ impl<'a> Parser<'a> {
             owner,
             location,
             options,
+        })
+    }
+
+    fn create_access_method(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("access method name")?;
+        self.expect_ident("type")?;
+        let method_type = if self.eat_ident("table")? {
+            crate::sql::ast::AccessMethodType::Table
+        } else if self.eat_ident("index")? {
+            crate::sql::ast::AccessMethodType::Index
+        } else {
+            return Err(self.err_here("access method type must be TABLE or INDEX"));
+        };
+        self.expect_ident("handler")?;
+        Ok(Stmt::CreateAccessMethod {
+            name,
+            method_type,
+            handler: self.qual_name("access method handler")?,
         })
     }
 
@@ -4205,7 +4227,7 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat_ident("using")? {
                 let method = self.any_ident("table access method")?;
-                access_method = if method.eq_ignore_ascii_case("heap") {
+                access_method = if method == "heap" {
                     TableAccessMethod::Heap
                 } else {
                     TableAccessMethod::Named(method)
@@ -6089,6 +6111,38 @@ impl<'a> Parser<'a> {
     /// Dispatches DROP: `VIEW` or `TABLE` ("drop" consumed here).
     pub(super) fn drop_stmt(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("drop")?;
+        if self.eat_ident("access")? {
+            self.expect_ident("method")?;
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = [""; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("access methods", names.len()));
+                }
+                names[count] = self.col_ident("access method name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropAccessMethod {
+                names: self.arena_slice(&names[..count])?,
+                if_exists,
+                cascade,
+            });
+        }
         if self.eat_ident("foreign")? {
             if self.eat_ident("data")? {
                 self.expect_ident("wrapper")?;
@@ -7201,7 +7255,7 @@ impl<'a> Parser<'a> {
             };
             let access_method = if self.eat_ident("using")? {
                 let method = self.any_ident("table access method")?;
-                if method.eq_ignore_ascii_case("heap") {
+                if method == "heap" {
                     TableAccessMethod::Heap
                 } else {
                     TableAccessMethod::Named(method)
@@ -7288,7 +7342,7 @@ impl<'a> Parser<'a> {
                     self.expect_op(")")?;
                 } else if self.eat_ident("using")? {
                     let method = self.any_ident("table access method")?;
-                    access_method = if method.eq_ignore_ascii_case("heap") {
+                    access_method = if method == "heap" {
                         TableAccessMethod::Heap
                     } else {
                         TableAccessMethod::Named(method)
@@ -7596,7 +7650,7 @@ impl<'a> Parser<'a> {
                 self.expect_op(")")?;
             } else if self.eat_ident("using")? {
                 let method = self.any_ident("table access method")?;
-                access_method = if method.eq_ignore_ascii_case("heap") {
+                access_method = if method == "heap" {
                     TableAccessMethod::Heap
                 } else {
                     TableAccessMethod::Named(method)

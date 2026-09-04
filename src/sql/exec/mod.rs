@@ -633,11 +633,16 @@ fn create_table_kind(
     def.access_method = match statement.access_method {
         crate::sql::ast::TableAccessMethod::Heap => crate::storage::TableAccessMethod::Heap,
         crate::sql::ast::TableAccessMethod::Named(name) => {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "access method \"{}\" does not exist",
-                name
-            ));
+            match storage.table_access_method(name, txn.txid) {
+                Some(method) => method,
+                None => {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "access method \"{}\" does not exist",
+                        name
+                    ));
+                }
+            }
         }
     };
     def.storage_options = crate::storage::TableStorageOptions {
@@ -34220,7 +34225,8 @@ pub fn comment(
             )
         }
         CommentTarget::AccessMethod(access_method_name) => {
-            let Some(oid) = super::catalog::access_method_oid(access_method_name) else {
+            let Some(oid) = super::catalog::access_method_oid_in(storage, txid, access_method_name)
+            else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "access method \"{}\" does not exist",
@@ -34666,11 +34672,16 @@ pub fn create_table_as(
     def.access_method = match access_method {
         crate::sql::ast::TableAccessMethod::Heap => crate::storage::TableAccessMethod::Heap,
         crate::sql::ast::TableAccessMethod::Named(method) => {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "access method \"{}\" does not exist",
-                method
-            ));
+            match storage.table_access_method(method, txn.txid) {
+                Some(method) => method,
+                None => {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "access method \"{}\" does not exist",
+                        method
+                    ));
+                }
+            }
         }
     };
     def.tablespace = match resolve_relation_tablespace(storage, tablespace, txn.txid) {
@@ -44962,6 +44973,181 @@ pub fn drop_database(
         return sql_fail(error);
     }
     responder.command_complete("DROP DATABASE")?;
+    sql_ok()
+}
+
+pub fn create_access_method(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    method_type: crate::sql::ast::AccessMethodType,
+    handler: crate::sql::ast::QualName<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some(current) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to create access methods"
+        ));
+    };
+    if !storage.role(current).attributes_to(txn.txid).superuser {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to create access methods"
+        ));
+    }
+    let handler = match method_type {
+        crate::sql::ast::AccessMethodType::Table
+            if handler.schema.is_none_or(|schema| schema == "pg_catalog")
+                && handler.name == "heap_tableam_handler" =>
+        {
+            crate::storage::TableAccessMethodHandler::Heap
+        }
+        crate::sql::ast::AccessMethodType::Table => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {} does not exist",
+                handler.name
+            ));
+        }
+        crate::sql::ast::AccessMethodType::Index => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "index access method handlers are unavailable without a bounded executable index implementation"
+            ));
+        }
+    };
+    let name = match SqlName::parse(name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let slot = match storage.create_access_method(
+        0,
+        crate::storage::AccessMethodDefinition { name, handler },
+        txn.txid,
+    ) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let created_at = storage
+        .access_methods_visible_to(txn.txid)
+        .find(|(candidate, _)| *candidate == slot)
+        .map(|(_, method)| method.created_at)
+        .expect("new access method is visible to its creator");
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::CreateAccessMethod {
+            created_at,
+            name: name.as_str(),
+            handler,
+        },
+    ) {
+        storage.rollback_access_method_create(slot);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::AccessMethodCreated(slot as u32)) {
+        storage.rollback_access_method_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE ACCESS METHOD")?;
+    sql_ok()
+}
+
+pub fn drop_access_method(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[&str],
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some(current) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to drop access methods"
+        ));
+    };
+    if !storage.role(current).attributes_to(txn.txid).superuser {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to drop access methods"
+        ));
+    }
+    for name in names {
+        let Some(slot) = storage.access_method_slot(name, txn.txid) else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::UNDEFINED_OBJECT,
+                    stack_format!(128, "access method \"{}\" does not exist, skipping", name)
+                        .as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "access method \"{}\" does not exist",
+                name
+            ));
+        };
+        let method = storage
+            .access_methods_visible_to(txn.txid)
+            .find(|(candidate, _)| *candidate == slot)
+            .map(|(_, method)| *method)
+            .expect("resolved access method is visible");
+        while let Some((schema, table)) =
+            storage.access_method_table_dependency(method.oid(), txn.txid)
+        {
+            if !cascade {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop access method {} because other objects depend on it\nDETAIL:  table {} depends on access method {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                    name,
+                    table.as_str(),
+                    name
+                ));
+            }
+            let relation = QualName {
+                schema: Some(schema.as_str()),
+                name: table.as_str(),
+            };
+            let statement = DropTable {
+                names: core::slice::from_ref(&relation),
+                if_exists: false,
+                cascade: true,
+            };
+            let outcome = responder.without_command_complete(|responder| {
+                drop_table_kind(
+                    storage,
+                    wal,
+                    txn,
+                    &statement,
+                    Some(crate::storage::TableKind::Local),
+                    "DROP TABLE",
+                    responder,
+                )
+            });
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return sql_fail(error),
+                Err(error) => return Err(error),
+            }
+        }
+        storage.drop_access_method(slot, txn.txid);
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropAccessMethod { name }) {
+            storage.rollback_access_method_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::AccessMethodDropped(slot as u32)) {
+            storage.rollback_access_method_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("DROP ACCESS METHOD")?;
     sql_ok()
 }
 
@@ -57889,11 +58075,16 @@ fn alter_table_inner(
                     new_def.access_method = crate::storage::TableAccessMethod::Heap;
                 }
                 AlterAction::SetAccessMethod(crate::sql::ast::TableAccessMethod::Named(name)) => {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "access method \"{}\" does not exist",
-                        name
-                    ));
+                    new_def.access_method = match storage.table_access_method(name, txn.txid) {
+                        Some(method) => method,
+                        None => {
+                            return sql_fail(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "access method \"{}\" does not exist",
+                                name
+                            ));
+                        }
+                    };
                 }
                 AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent) => {}
                 AlterAction::SetPersistence(_) => {
@@ -58202,11 +58393,16 @@ fn alter_table_inner(
                         crate::storage::TableAccessMethod::Heap
                     }
                     crate::sql::ast::TableAccessMethod::Named(name) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "access method \"{}\" does not exist",
-                            name
-                        ));
+                        match storage.table_access_method(name, txn.txid) {
+                            Some(method) => method,
+                            None => {
+                                return sql_fail(sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "access method \"{}\" does not exist",
+                                    name
+                                ));
+                            }
+                        }
                     }
                 };
             }

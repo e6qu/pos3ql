@@ -1078,6 +1078,20 @@ pub enum Stmt<'a> {
         name: &'a str,
         if_exists: bool,
     },
+    /// CREATE ACCESS METHOD defines a database-local relation implementation.
+    /// The handler kind is parsed separately from its spelling so execution
+    /// cannot accidentally install an index handler on a table method.
+    CreateAccessMethod {
+        name: &'a str,
+        method_type: AccessMethodType,
+        handler: QualName<'a>,
+    },
+    /// DROP ACCESS METHOD [IF EXISTS] name [CASCADE | RESTRICT].
+    DropAccessMethod {
+        names: &'a [&'a str],
+        if_exists: bool,
+        cascade: bool,
+    },
     /// DECLARE name [BINARY] [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR select.
     /// `sql` is the raw SELECT text, materialized at DECLARE.
     DeclareCursor {
@@ -2408,6 +2422,15 @@ pub struct DropCast<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexAccessMethod {
     Btree,
+}
+
+/// The PostgreSQL relation class implemented by an access-method handler.
+/// This is a closed parser boundary: a handler cannot reach catalog mutation
+/// until its table/index contract is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMethodType {
+    Table,
+    Index,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

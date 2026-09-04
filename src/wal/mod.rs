@@ -166,7 +166,9 @@ const KIND_SET_FOREIGN_DATA_WRAPPER: u8 = 115;
 const KIND_SET_FOREIGN_SERVER: u8 = 116;
 const KIND_SET_USER_MAPPING: u8 = 117;
 const KIND_SET_FOREIGN_TABLE: u8 = 118;
+const KIND_CREATE_ACCESS_METHOD: u8 = 119;
 const KIND_RENAME_VIEW: u8 = 120;
+const KIND_DROP_ACCESS_METHOD: u8 = 121;
 const KIND_RENAME_ROLE: u8 = 122;
 const KIND_RENAME_SEQUENCE: u8 = 124;
 const KIND_RENAME_SCHEMA: u8 = 125;
@@ -853,6 +855,14 @@ pub(crate) enum WalOp<'a> {
         owner: u16,
     },
     DropTablespace {
+        name: &'a str,
+    },
+    CreateAccessMethod {
+        created_at: u64,
+        name: &'a str,
+        handler: crate::storage::TableAccessMethodHandler,
+    },
+    DropAccessMethod {
         name: &'a str,
     },
     CreateDatabase {
@@ -2044,6 +2054,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateTablespace { .. } => KIND_CREATE_TABLESPACE,
         WalOp::AlterTablespace { .. } => KIND_ALTER_TABLESPACE,
         WalOp::DropTablespace { .. } => KIND_DROP_TABLESPACE,
+        WalOp::CreateAccessMethod { .. } => KIND_CREATE_ACCESS_METHOD,
+        WalOp::DropAccessMethod { .. } => KIND_DROP_ACCESS_METHOD,
         WalOp::CreateDatabase { .. } => KIND_CREATE_DATABASE,
         WalOp::AlterDatabase { .. } => KIND_ALTER_DATABASE,
         WalOp::DropDatabase { .. } => KIND_DROP_DATABASE,
@@ -2199,7 +2211,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             })
         }
         WalOp::CreateTable(def) => {
-            let mut n = 1 + def.name.as_str().len() + 2 + 2 + 3;
+            let mut n = 1 + def.name.as_str().len() + 2 + 2 + 2;
+            n += match def.access_method {
+                crate::storage::TableAccessMethod::Heap => 1,
+                crate::storage::TableAccessMethod::Catalog(_) => 5,
+            };
             for c in def.columns() {
                 let default_value = c.default.constant().copied();
                 n += 1 + c.name.as_str().len() + 3 + 4 + encoded_default_len(&default_value);
@@ -2661,6 +2677,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + name.len() + 1 + new_name.len() + 24 + 2
         }
         WalOp::DropTablespace { name } => 1 + name.len(),
+        WalOp::CreateAccessMethod { name, .. } => 8 + 1 + name.len() + 1,
+        WalOp::DropAccessMethod { name } => 1 + name.len(),
         WalOp::CreateDatabase { definition, .. } => 10 + database_definition_len(*definition),
         WalOp::AlterDatabase { definition, .. } => 6 + database_definition_len(*definition),
         WalOp::DropDatabase { .. } => 4,
@@ -3781,7 +3799,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 },
             ]);
             ok &= buffer.append(&def.tablespace.to_le_bytes());
-            ok &= buffer.append(&[def.access_method.code()]);
+            ok &= match def.access_method {
+                crate::storage::TableAccessMethod::Heap => buffer.append(&[0]),
+                crate::storage::TableAccessMethod::Catalog(oid) => {
+                    buffer.append(&[1]) && buffer.append(&oid.get().to_le_bytes())
+                }
+            };
             for c in def.columns() {
                 ok &= name_bytes(buffer, c.name.as_str());
                 // Bit 7 (the last free per-column flag bit) marks a domain-typed
@@ -4477,6 +4500,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&owner.to_le_bytes())
         }
         WalOp::DropTablespace { name } => name_bytes(buffer, name),
+        WalOp::CreateAccessMethod {
+            created_at,
+            name,
+            handler,
+        } => {
+            buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, name)
+                && buffer.append(&[handler.code()])
+        }
+        WalOp::DropAccessMethod { name } => name_bytes(buffer, name),
         WalOp::CreateDatabase {
             oid,
             template_oid,
@@ -6247,8 +6280,23 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 1;
             let tablespace = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
-            let access_method = crate::storage::TableAccessMethod::from_code(*payload.get(at)?)?;
-            at += 1;
+            let access_method = match *payload.get(at)? {
+                0 => {
+                    at += 1;
+                    crate::storage::TableAccessMethod::Heap
+                }
+                1 => {
+                    at += 1;
+                    let access_method = crate::storage::TableAccessMethod::Catalog(
+                        crate::storage::AccessMethodOid::parse(i32::from_le_bytes(
+                            payload.get(at..at + 4)?.try_into().ok()?,
+                        ))?,
+                    );
+                    at += 4;
+                    access_method
+                }
+                _ => return None,
+            };
             let mut def = TableDef {
                 name: SqlName::parse(name).ok()?,
                 columns: [ColumnMeta {
@@ -7783,6 +7831,22 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         KIND_DROP_TABLESPACE => {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTablespace { name })
+        }
+        KIND_CREATE_ACCESS_METHOD => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let name = take_name(&mut at)?;
+            let handler = crate::storage::TableAccessMethodHandler::from_code(*payload.get(at)?)?;
+            at += 1;
+            (at == payload.len()).then_some(WalOp::CreateAccessMethod {
+                created_at,
+                name,
+                handler,
+            })
+        }
+        KIND_DROP_ACCESS_METHOD => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropAccessMethod { name })
         }
         KIND_CREATE_DATABASE => {
             let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);

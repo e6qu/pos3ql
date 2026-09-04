@@ -40262,6 +40262,152 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
 }
 
 #[test]
+fn table_access_methods_are_catalogued_typed_and_transactional() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ACCESS METHOD catalogued_heap TYPE TABLE HANDLER heap_tableam_handler",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT amtype, amhandler = 3 \
+             FROM pg_am WHERE amname = 'catalogued_heap'",
+        )),
+        ["t|t"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT amname, amhandler FROM pg_am \
+             WHERE amname IN ('gist', 'gin', 'brin', 'spgist') ORDER BY amname",
+        )),
+        ["brin|335", "gin|333", "gist|332", "spgist|334"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalogued_heap_rows (id integer) USING catalogued_heap; \
+         INSERT INTO catalogued_heap_rows VALUES (42)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT a.amname, r.id FROM pg_class c \
+             JOIN pg_am a ON a.oid = c.relam \
+             JOIN catalogued_heap_rows r ON true \
+             WHERE c.relname = 'catalogued_heap_rows'",
+        )),
+        ["catalogued_heap|42"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "COMMENT ON ACCESS METHOD catalogued_heap IS 'typed heap alias'; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'catalogued_heap'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["typed heap alias"]);
+    for statement in [
+        "CREATE TABLE quoted_builtin_access_method (id integer) USING \"HEAP\"",
+        "CREATE ACCESS METHOD unavailable_index TYPE INDEX HANDLER bthandler",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains(if statement.contains("INDEX") {
+                "0A000"
+            } else {
+                "42704"
+            }),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP ACCESS METHOD catalogued_heap",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP ACCESS METHOD catalogued_heap CASCADE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_class WHERE relname = 'catalogued_heap_rows'; \
+             SELECT count(*) FROM pg_am WHERE amname = 'catalogued_heap'",
+        )),
+        ["0", "0"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         CREATE ACCESS METHOD rolled_back_heap TYPE TABLE HANDLER heap_tableam_handler; \
+         ROLLBACK; \
+         CREATE TABLE rolled_back_heap_rows (id integer) USING rolled_back_heap",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42704"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn access_method_event_trigger_identity_is_dynamic_catalog_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE access_method_ddl_log(tag text, kind text, identity text); \
+         CREATE FUNCTION capture_access_method_ddl() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO access_method_ddl_log \
+              SELECT command_tag,object_type,object_identity \
+              FROM pg_event_trigger_ddl_commands(); RETURN; END'; \
+         CREATE EVENT TRIGGER capture_access_method_ddl_end ON ddl_command_end \
+           WHEN TAG IN ('CREATE ACCESS METHOD') \
+           EXECUTE FUNCTION capture_access_method_ddl(); \
+         CREATE ACCESS METHOD event_catalogued_heap TYPE TABLE HANDLER heap_tableam_handler; \
+         SELECT tag,kind,identity FROM access_method_ddl_log",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        ["CREATE ACCESS METHOD|access method|event_catalogued_heap"]
+    );
+}
+
+#[test]
 fn unimplemented_table_lifecycle_forms_are_typed_and_loud() {
     let (mut engine, mut budget) = test_engine();
     for statement in [
@@ -41158,14 +41304,17 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for statement in [
+        "CREATE ACCESS METHOD table_definition_recovery_heap TYPE TABLE HANDLER heap_tableam_handler",
         "CREATE TABLESPACE table_definition_recovery_space LOCATION '/object/table-definition-recovery'",
         "CREATE TABLE table_definition_recovery_rows (id integer NOT NULL CHECK (id > 0)) USING heap WITH (fillfactor = 70) TABLESPACE table_definition_recovery_space",
+        "CREATE TABLE table_definition_custom_rows (id integer) USING table_definition_recovery_heap",
         "CREATE TABLE table_definition_recovery_child (extra text) INHERITS (table_definition_recovery_rows)",
         "CREATE TYPE table_definition_recovery_type AS (id integer, label text)",
         "CREATE TABLE table_definition_typed_rows OF table_definition_recovery_type",
         "CREATE TABLE table_definition_detach_parent (id integer) PARTITION BY RANGE (id)",
         "CREATE TABLE table_definition_detach_child PARTITION OF table_definition_detach_parent FOR VALUES FROM (0) TO (10)",
         "INSERT INTO table_definition_recovery_child VALUES (1, 'child')",
+        "INSERT INTO table_definition_custom_rows VALUES (3)",
         "INSERT INTO table_definition_typed_rows VALUES (2, 'typed')",
         "INSERT INTO table_definition_detach_parent VALUES (4)",
         "ALTER TABLE table_definition_recovery_rows ADD COLUMN inherited_amount integer DEFAULT 7 NOT NULL",
@@ -41197,6 +41346,17 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
                ON s.oid = c.reltablespace WHERE c.relname = 'table_definition_recovery_rows'",
         )),
         ["2|table_definition_recovery_space"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT a.amname, r.id FROM pg_class c \
+             JOIN pg_am a ON a.oid = c.relam \
+             JOIN table_definition_custom_rows r ON true \
+             WHERE c.relname = 'table_definition_custom_rows'",
+        )),
+        ["table_definition_recovery_heap|3"]
     );
     assert_eq!(
         data_rows(&run_with(

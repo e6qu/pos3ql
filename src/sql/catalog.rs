@@ -63,7 +63,15 @@ pub(crate) const PG_EXTENSION_OID: i32 = 3079;
 pub(crate) const PG_PUBLICATION_OID: i32 = 6104;
 pub(crate) const PG_SUBSCRIPTION_OID: i32 = 6107;
 
-const ACCESS_METHODS: [(&str, i32); 3] = [("btree", 403), ("hash", 405), ("gist", 783)];
+const ACCESS_METHODS: [(&str, i32, i32, &str); 7] = [
+    ("heap", 2, 3, "t"),
+    ("btree", 403, 330, "i"),
+    ("hash", 405, 331, "i"),
+    ("gist", 783, 332, "i"),
+    ("gin", 2742, 333, "i"),
+    ("brin", 3580, 335, "i"),
+    ("spgist", 4000, 334, "i"),
+];
 const INTERNAL_LANGUAGE_OID: i32 = 12;
 const C_LANGUAGE_OID: i32 = 13;
 const SQL_LANGUAGE_OID: i32 = 14;
@@ -78,13 +86,37 @@ const PROCEDURAL_LANGUAGES: [(&str, i32); 4] = [
 pub(crate) fn access_method_oid(name: &str) -> Option<i32> {
     ACCESS_METHODS
         .iter()
-        .find_map(|(candidate, oid)| (*candidate == name).then_some(*oid))
+        .find_map(|(candidate, oid, _, _)| (*candidate == name).then_some(*oid))
 }
 
 pub(crate) fn access_method_name(oid: i32) -> Option<&'static str> {
     ACCESS_METHODS
         .iter()
-        .find_map(|(name, candidate)| (*candidate == oid).then_some(*name))
+        .find_map(|(name, candidate, _, _)| (*candidate == oid).then_some(*name))
+}
+
+pub(crate) fn access_method_oid_in(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
+    access_method_oid(name).or_else(|| {
+        storage
+            .access_method_slot(name, txid)
+            .and_then(|slot| {
+                storage
+                    .access_methods_visible_to(txid)
+                    .find(|(candidate, _)| *candidate == slot)
+            })
+            .map(|(_, method)| method.oid().get())
+    })
+}
+
+pub(crate) fn access_method_name_in(storage: &Storage, txid: u32, oid: i32) -> Option<&str> {
+    access_method_name(oid).or_else(|| {
+        crate::storage::AccessMethodOid::parse(oid).and_then(|oid| {
+            storage
+                .access_methods_visible_to(txid)
+                .find(|(_, method)| method.oid() == oid)
+                .map(|(_, method)| method.definition.name.as_str())
+        })
+    })
 }
 
 pub(crate) fn procedural_language_oid(name: &str) -> Option<i32> {
@@ -1220,7 +1252,7 @@ pub fn synthesize<'a>(
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
         (false, "pg_indexes") => pg_indexes(storage, txid, arena),
-        (false, "pg_am") => pg_am(arena),
+        (false, "pg_am") => pg_am(storage, txid, arena),
         (false, "pg_constraint") => pg_constraint(storage, txid, arena),
         (false, "pg_index") => pg_index(storage, txid, arena),
         (false, "pg_stats") => pg_stats(storage, txid, arena),
@@ -3413,7 +3445,7 @@ mod routine_name_tests {
 
     #[test]
     fn static_comment_catalog_identities_round_trip() {
-        for (name, oid) in ACCESS_METHODS {
+        for (name, oid, _, _) in ACCESS_METHODS {
             assert_eq!(access_method_oid(name), Some(oid));
             assert_eq!(access_method_name(oid), Some(name));
         }
@@ -4855,7 +4887,7 @@ fn pg_description<'a>(
                 let Ok(oid) = i32::try_from(subid) else {
                     continue;
                 };
-                if access_method_name(oid) != Some(name) {
+                if access_method_name_in(storage, txid, oid) != Some(name) {
                     continue;
                 }
                 (oid, PG_AM_OID)
@@ -5475,7 +5507,7 @@ pub fn comment_text_for<'a>(
                     && subid == 0
                     && signed_oid.is_some_and(|access_method_oid| {
                         csub == access_method_oid as u32
-                            && access_method_name(access_method_oid) == Some(name)
+                            && access_method_name_in(storage, txid, access_method_oid) == Some(name)
                     })
             }
             "pg_language" => {
@@ -8235,6 +8267,7 @@ fn pg_class<'a>(
                 Datum::Int4(relpages),
                 Datum::Int4(match table_def.access_method {
                     crate::storage::TableAccessMethod::Heap => 2,
+                    crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
                 }),
                 Datum::Int4(relation_owner),
                 Datum::Int4(n_checks), // relchecks
@@ -12090,7 +12123,7 @@ fn pg_event_trigger<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-fn pg_am<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_am<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_am",
         &[
@@ -12101,20 +12134,39 @@ fn pg_am<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             ("amtype", ColType::Bpchar),
         ],
     );
-    let mut rows: [&[Datum]; ACCESS_METHODS.len()] = [&[]; ACCESS_METHODS.len()];
-    for (index, (name, oid)) in ACCESS_METHODS.iter().enumerate() {
-        rows[index] = row(
+    let mut rows: [&[Datum]; ACCESS_METHODS.len() + crate::storage::MAX_ACCESS_METHODS] =
+        [&[]; ACCESS_METHODS.len() + crate::storage::MAX_ACCESS_METHODS];
+    let mut count = 0usize;
+    for (name, oid, handler, method_type) in ACCESS_METHODS {
+        rows[count] = row(
             &[
                 Datum::Int4(PG_AM_OID),
-                Datum::Int4(*oid),
+                Datum::Int4(oid),
                 text(name, arena)?,
-                Datum::Int4(0),
-                text("i", arena)?,
+                Datum::Int4(handler),
+                text(method_type, arena)?,
             ],
             arena,
         )?;
+        count += 1;
     }
-    finish(definition, &rows, arena)
+    for (_, method) in storage.access_methods_visible_to(txid) {
+        if count == rows.len() {
+            return Err(catalog_capacity_exceeded("pg_am"));
+        }
+        rows[count] = row(
+            &[
+                Datum::Int4(PG_AM_OID),
+                Datum::Int4(method.oid().get()),
+                text(method.definition.name.as_str(), arena)?,
+                Datum::Int4(method.definition.handler.postgres_handler_oid()),
+                text("t", arena)?,
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
 }
 
 fn pg_language<'a>(

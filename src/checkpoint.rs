@@ -1185,6 +1185,42 @@ impl Checkpointer {
                         .select_database_for_recovery(database)
                         .map_err(|_| CheckpointSetupError::Corrupt("unknown database context"))?;
                 }
+                Some("am") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let created_at: u64 = parse_field(words.next(), "access method sequence")?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("access method name missing"))?,
+                    )?;
+                    let handler: u8 = parse_field(words.next(), "access method handler")?;
+                    if words.next().is_some() || created_at == 0 {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid access method record",
+                        ));
+                    }
+                    let slot = storage
+                        .create_access_method(
+                            created_at,
+                            crate::storage::AccessMethodDefinition {
+                                name: sql_name(&name)?,
+                                handler: crate::storage::TableAccessMethodHandler::from_code(
+                                    handler,
+                                )
+                                .ok_or(
+                                    CheckpointSetupError::Corrupt("invalid access method handler"),
+                                )?,
+                            },
+                            0,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest access method rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                    storage.commit_access_method_create(slot);
+                }
                 Some("table") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let mindex: usize = parse_field(words.next(), "table index")?;
@@ -1201,11 +1237,21 @@ impl Checkpointer {
                         _ => return Err(CheckpointSetupError::Corrupt("invalid table kind")),
                     };
                     let tablespace: u16 = parse_field(words.next(), "table tablespace")?;
-                    let access_method = crate::storage::TableAccessMethod::from_code(parse_field(
-                        words.next(),
-                        "table access method",
-                    )?)
-                    .ok_or(CheckpointSetupError::Corrupt("invalid table access method"))?;
+                    let access_method: i32 = parse_field(words.next(), "table access method")?;
+                    let access_method = if access_method == 2 {
+                        crate::storage::TableAccessMethod::Heap
+                    } else {
+                        crate::storage::TableAccessMethod::Catalog(
+                            crate::storage::AccessMethodOid::parse(access_method).ok_or(
+                                CheckpointSetupError::Corrupt("invalid table access method"),
+                            )?,
+                        )
+                    };
+                    if storage.table_access_method_name(access_method, 0).is_none() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "table references an unknown access method",
+                        ));
+                    }
                     let inheritance_count: usize =
                         parse_field(words.next(), "table inheritance count")?;
                     if inheritance_count > crate::storage::MAX_TABLE_INHERITANCE_PARENTS {
@@ -6148,6 +6194,27 @@ impl Checkpointer {
             }
             write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
         }
+        for (_, method) in storage.checkpoint_access_methods() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                method.database,
+            )?;
+            use core::fmt::Write;
+            let mut name = StackStr::<130>::new();
+            for byte in method.definition.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "am {} {} {}",
+                    method.created_at,
+                    name.as_str(),
+                    method.definition.handler.code(),
+                ),
+            )?;
+        }
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
             if !table.live {
@@ -6177,7 +6244,10 @@ impl Checkpointer {
                     crate::storage::TableKind::Foreign => 1,
                 },
                 table.def.tablespace,
-                table.def.access_method.code(),
+                match table.def.access_method {
+                    crate::storage::TableAccessMethod::Heap => 2,
+                    crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
+                },
                 table.def.inheritance.parents_ref().len(),
             )
             .map_err(|_| {

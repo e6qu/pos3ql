@@ -499,6 +499,8 @@ pub(crate) enum DdlUndo {
         prior_owner: Option<crate::storage::PendingOwnership>,
     },
     TablespaceDropped(u32),
+    AccessMethodCreated(u32),
+    AccessMethodDropped(u32),
     DatabaseCreated(u32),
     DatabaseAltered {
         slot: u32,

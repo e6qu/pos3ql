@@ -1442,19 +1442,16 @@ pub enum TableKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableAccessMethod {
     Heap,
+    /// A database-local table access method. The OID, not its mutable name or
+    /// storage slot, crosses table definitions, WAL, and checkpoints.
+    Catalog(AccessMethodOid),
 }
 
 impl TableAccessMethod {
-    pub const fn code(self) -> u8 {
+    pub const fn builtin_code(self) -> Option<u8> {
         match self {
-            Self::Heap => 0,
-        }
-    }
-
-    pub const fn from_code(code: u8) -> Option<Self> {
-        match code {
-            0 => Some(Self::Heap),
-            _ => None,
+            Self::Heap => Some(0),
+            Self::Catalog(_) => None,
         }
     }
 }
@@ -5488,11 +5485,100 @@ pub(crate) const CAST_OID_BASE: i32 = 600_000;
 pub(crate) const OPERATOR_OID_BASE: i32 = 620_000;
 pub(crate) const OPERATOR_FAMILY_OID_BASE: i32 = 640_000;
 pub(crate) const OPERATOR_CLASS_OID_BASE: i32 = 660_000;
+pub(crate) const ACCESS_METHOD_OID_BASE: i32 = 680_000;
 pub(crate) const MAX_OPERATOR_FAMILY_MEMBERS: usize = 16;
+pub(crate) const MAX_ACCESS_METHODS: usize = 32;
 
 fn catalog_object_oid(base: i32, created_at: u64) -> i32 {
     base.checked_add(i32::try_from(created_at).expect("catalog OID range exhausted"))
         .expect("catalog OID range exhausted")
+}
+
+/// Stable identity of a user-defined table access method. Slots are reused
+/// after DROP, while table definitions and WAL retain this OID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessMethodOid(i32);
+
+impl AccessMethodOid {
+    pub(crate) const fn parse(oid: i32) -> Option<Self> {
+        if oid > ACCESS_METHOD_OID_BASE {
+            Some(Self(oid))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// The only executable table handler in the object-native runtime. The enum
+/// keeps a future handler implementation from being mistaken for heap just
+/// because both happen to store rows in the same process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableAccessMethodHandler {
+    Heap,
+}
+
+impl TableAccessMethodHandler {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Heap => 0,
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Heap),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn postgres_handler_oid(self) -> i32 {
+        match self {
+            Self::Heap => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AccessMethodDefinition {
+    pub name: SqlName,
+    pub handler: TableAccessMethodHandler,
+}
+
+impl AccessMethodDefinition {
+    pub(crate) const EMPTY: Self = Self {
+        name: SqlName::EMPTY,
+        handler: TableAccessMethodHandler::Heap,
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AccessMethodDef {
+    pub database: DatabaseOid,
+    pub created_at: u64,
+    pub definition: AccessMethodDefinition,
+    pub ddl_state: CatalogDdlState,
+}
+
+impl AccessMethodDef {
+    pub(crate) const EMPTY: Self = Self {
+        database: DatabaseOid::POSTGRES,
+        created_at: 0,
+        definition: AccessMethodDefinition::EMPTY,
+        ddl_state: CatalogDdlState::Absent,
+    };
+
+    pub(crate) fn oid(self) -> AccessMethodOid {
+        AccessMethodOid::parse(catalog_object_oid(ACCESS_METHOD_OID_BASE, self.created_at))
+            .expect("access method created_at yields a user OID")
+    }
+
+    pub(crate) fn visible_to(self, txid: u32) -> bool {
+        self.ddl_state.visible_to(txid)
+    }
 }
 
 /// Durable identity of a user-defined operator class selected by an index.
@@ -10247,6 +10333,7 @@ pub struct Storage {
     rules: FixedVec<RuleDef>,
     routines: FixedVec<RoutineDef>,
     casts: FixedVec<CastDef>,
+    access_methods: FixedVec<AccessMethodDef>,
     operators: FixedVec<OperatorDef>,
     operator_families: FixedVec<OperatorFamilyDef>,
     operator_classes: FixedVec<OperatorClassDef>,
@@ -11873,6 +11960,7 @@ impl Storage {
             + MAX_DOMAINS * size_of::<DomainDef>()
             + MAX_ENUMS * size_of::<EnumDef>()
             + MAX_COMPOSITES * size_of::<CompositeDef>()
+            + MAX_ACCESS_METHODS * size_of::<AccessMethodDef>()
             + MAX_DATABASES * size_of::<DatabaseDef>()
             + MAX_TABLESPACES * size_of::<TablespaceDef>()
             + MAX_COMMENTS * size_of::<CommentEntry>()
@@ -12032,6 +12120,12 @@ impl Storage {
                 .expect("sized to max_tables");
         }
         let mut casts = FixedVec::new(budget, "casts", config.max_tables)?;
+        let mut access_methods = FixedVec::new(budget, "access_methods", MAX_ACCESS_METHODS)?;
+        for _ in 0..MAX_ACCESS_METHODS {
+            access_methods
+                .push(AccessMethodDef::EMPTY)
+                .expect("sized to access-method capacity");
+        }
         let mut operators = FixedVec::new(budget, "operators", config.max_tables)?;
         let mut operator_families = FixedVec::new(budget, "operator_families", config.max_tables)?;
         let mut operator_classes = FixedVec::new(budget, "operator_classes", config.max_tables)?;
@@ -12621,6 +12715,7 @@ impl Storage {
             rules,
             routines,
             casts,
+            access_methods,
             operators,
             operator_families,
             operator_classes,
@@ -13865,6 +13960,27 @@ impl Storage {
                 self.routine_dependencies[target_slot] = self.routine_dependencies[source_slot];
             }
 
+            for source_slot in 0..self.access_methods.len() {
+                let mut definition = self.access_methods[source_slot];
+                if definition.database != source || definition.ddl_state != CatalogDdlState::Present
+                {
+                    continue;
+                }
+                let target_slot = self
+                    .access_methods
+                    .iter()
+                    .position(|candidate| candidate.ddl_state == CatalogDdlState::Absent)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "access method catalog is full"
+                        )
+                    })?;
+                definition.database = target;
+                definition.ddl_state = CatalogDdlState::PendingCreate { txid };
+                self.access_methods[target_slot] = definition;
+            }
+
             for source_slot in 0..self.event_triggers.len() {
                 let mut event_trigger = self.event_triggers[source_slot];
                 if event_trigger.database != source
@@ -14632,6 +14748,7 @@ impl Storage {
         clear_catalog!(rules);
         clear_catalog!(routines);
         clear_catalog!(casts);
+        clear_catalog!(access_methods);
         clear_catalog!(operators);
         clear_catalog!(collations);
         clear_catalog!(text_search_objects);
@@ -14747,6 +14864,7 @@ impl Storage {
         commit_catalog!(rules);
         commit_catalog!(routines);
         commit_catalog!(casts);
+        commit_catalog!(access_methods);
         commit_catalog!(operators);
         commit_catalog!(collations);
         commit_catalog!(text_search_objects);
@@ -15787,6 +15905,15 @@ impl Storage {
         &self,
     ) -> impl Iterator<Item = (usize, &OperatorClassDef)> {
         self.operator_classes
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
+    }
+
+    pub(crate) fn checkpoint_access_methods(
+        &self,
+    ) -> impl Iterator<Item = (usize, &AccessMethodDef)> {
+        self.access_methods
             .iter()
             .enumerate()
             .filter(|(_, value)| value.ddl_state == CatalogDdlState::Present)
@@ -32962,6 +33089,171 @@ impl Storage {
         self.tablespaces.iter().position(|tablespace| {
             tablespace.visible_to(txid) && tablespace.name_for(txid).as_str() == name
         })
+    }
+
+    /// Resolves a table access-method spelling to the durable implementation
+    /// identity stored on a relation. Built-in heap has its PostgreSQL OID;
+    /// user definitions retain their own stable OID rather than a catalog slot.
+    pub(crate) fn table_access_method(&self, name: &str, txid: u32) -> Option<TableAccessMethod> {
+        // Unquoted identifiers reach this boundary normalized to lower case.
+        // A quoted spelling such as "HEAP" is distinct and must not select
+        // heap merely because it differs only in case.
+        if name == "heap" {
+            return Some(TableAccessMethod::Heap);
+        }
+        self.access_methods.iter().find_map(|method| {
+            (method.database == self.current_database
+                && method.visible_to(txid)
+                && method.definition.name.as_str() == name)
+                .then(|| TableAccessMethod::Catalog(method.oid()))
+        })
+    }
+
+    pub(crate) fn table_access_method_name(
+        &self,
+        method: TableAccessMethod,
+        txid: u32,
+    ) -> Option<SqlName> {
+        match method {
+            TableAccessMethod::Heap => SqlName::parse("heap").ok(),
+            TableAccessMethod::Catalog(oid) => self.access_methods.iter().find_map(|candidate| {
+                (candidate.database == self.current_database
+                    && candidate.visible_to(txid)
+                    && candidate.oid() == oid)
+                    .then_some(candidate.definition.name)
+            }),
+        }
+    }
+
+    pub(crate) fn access_method_slot(&self, name: &str, txid: u32) -> Option<usize> {
+        self.access_methods.iter().position(|method| {
+            method.database == self.current_database
+                && method.visible_to(txid)
+                && method.definition.name.as_str() == name
+        })
+    }
+
+    pub(crate) fn access_method_oid_at(&self, slot: usize) -> Option<i32> {
+        self.access_methods.get(slot).and_then(|method| {
+            if method.database == self.current_database && method.created_at != 0 {
+                Some(method.oid().get())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub(crate) fn access_method_name_by_oid(&self, oid: i32) -> Option<&str> {
+        self.access_methods.iter().find_map(|method| {
+            if method.database == self.current_database
+                && method.created_at != 0
+                && method.oid().get() == oid
+            {
+                Some(method.definition.name.as_str())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub(crate) fn access_methods_visible_to(
+        &self,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, &AccessMethodDef)> {
+        self.access_methods
+            .iter()
+            .enumerate()
+            .filter(move |(_, method)| {
+                method.database == self.current_database && method.visible_to(txid)
+            })
+    }
+
+    pub(crate) fn access_method_table_dependency(
+        &self,
+        oid: AccessMethodOid,
+        txid: u32,
+    ) -> Option<(SqlName, SqlName)> {
+        (0..self.table_count()).find_map(|slot| {
+            (self.table_slot_visible_to(slot, txid)
+                && matches!(
+                    self.table_def(slot, txid).access_method,
+                    TableAccessMethod::Catalog(candidate) if candidate == oid
+                ))
+            .then_some((
+                self.table_def(slot, txid).schema,
+                self.table_def(slot, txid).name,
+            ))
+        })
+    }
+
+    pub(crate) fn create_access_method(
+        &mut self,
+        created_at: u64,
+        definition: AccessMethodDefinition,
+        txid: u32,
+    ) -> Result<usize, SqlError> {
+        if matches!(
+            definition.name.as_str(),
+            "heap" | "btree" | "hash" | "gist" | "gin" | "brin" | "spgist"
+        ) || self
+            .access_method_slot(definition.name.as_str(), txid)
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::DUPLICATE_OBJECT,
+                "access method \"{}\" already exists",
+                definition.name.as_str()
+            ));
+        }
+        let slot = self
+            .access_methods
+            .iter()
+            .position(|method| method.ddl_state == CatalogDdlState::Absent)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "access method catalog capacity exhausted"
+                )
+            })?;
+        let created_at = if created_at == 0 {
+            self.catalog_seq = self.catalog_seq.saturating_add(1);
+            self.catalog_seq
+        } else {
+            self.catalog_seq = self.catalog_seq.max(created_at);
+            created_at
+        };
+        self.access_methods[slot] = AccessMethodDef {
+            database: self.current_database,
+            created_at,
+            definition,
+            ddl_state: CatalogDdlState::PendingCreate { txid },
+        };
+        Ok(slot)
+    }
+
+    pub(crate) fn drop_access_method(&mut self, slot: usize, txid: u32) {
+        self.drop_comments_by_subid(
+            CommentClass::AccessMethod,
+            self.access_methods[slot].oid().get() as u32,
+        );
+        self.access_methods[slot].ddl_state = self.access_methods[slot].ddl_state.drop_by(txid);
+    }
+
+    pub(crate) fn commit_access_method_create(&mut self, slot: usize) {
+        self.access_methods[slot].ddl_state = self.access_methods[slot].ddl_state.commit_create();
+    }
+
+    pub(crate) fn rollback_access_method_create(&mut self, slot: usize) {
+        self.access_methods[slot].ddl_state = self.access_methods[slot].ddl_state.rollback_create();
+    }
+
+    pub(crate) fn commit_access_method_drop(&mut self, slot: usize) {
+        self.access_methods[slot].ddl_state = self.access_methods[slot].ddl_state.commit_drop();
+    }
+
+    pub(crate) fn rollback_access_method_drop(&mut self, slot: usize, txid: u32) {
+        self.access_methods[slot].ddl_state =
+            self.access_methods[slot].ddl_state.rollback_drop(txid);
     }
 
     pub(crate) fn tablespace_by_id(&self, id: u16, txid: u32) -> Option<TablespaceDef> {

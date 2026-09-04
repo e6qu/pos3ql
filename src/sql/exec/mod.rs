@@ -44641,6 +44641,15 @@ pub fn alter_indexes_tablespace(
     command: AlterIndexesTablespaceCommand<'_>,
     responder: &mut Responder,
 ) -> Outcome {
+    for owner in command.owners {
+        if storage.find_role_visible(owner, txn.txid).is_none() {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                owner
+            ));
+        }
+    }
     let source_slot = match storage.tablespace_id(command.source, txn.txid) {
         Some(slot) => slot,
         None => {
@@ -44687,6 +44696,136 @@ pub fn alter_indexes_tablespace(
     }
     responder.command_complete("ALTER INDEX")?;
     sql_ok()
+}
+
+pub struct AlterTablesTablespaceCommand<'a> {
+    pub source: &'a str,
+    pub owners: &'a [&'a str],
+    pub target: &'a str,
+    pub nowait: bool,
+}
+
+pub fn alter_tables_tablespace(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    command: AlterTablesTablespaceCommand<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    for owner in command.owners {
+        if storage.find_role_visible(owner, txn.txid).is_none() {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "role \"{}\" does not exist",
+                owner
+            ));
+        }
+    }
+    let source = match storage.tablespace_id(command.source, txn.txid) {
+        Some(id) => id,
+        None => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "tablespace \"{}\" does not exist",
+                command.source
+            ));
+        }
+    };
+    let target = match resolve_relation_tablespace(storage, Some(command.target), txn.txid) {
+        Ok(id) => id,
+        Err(error) => return sql_fail(error),
+    };
+    let mut tables = [usize::MAX; crate::storage::MAX_SCHEMAS * MAX_COLUMNS];
+    let mut count = 0usize;
+    for table in 0..storage.table_count() {
+        if !storage.table(table).visible_to(txn.txid) {
+            continue;
+        }
+        let definition = storage.table_def(table, txn.txid);
+        if definition.kind != crate::storage::TableKind::Local || definition.tablespace != source {
+            continue;
+        }
+        let object = storage.table_access_object(table, txn.txid);
+        if !command.owners.is_empty()
+            && !command.owners.iter().any(|owner| {
+                storage
+                    .find_role_visible(owner, txn.txid)
+                    .is_some_and(|role| role == storage.object_owner(object, txn.txid))
+            })
+        {
+            continue;
+        }
+        if let Err(error) = storage.require_owner(object, txn.txid, "table") {
+            return sql_fail(error);
+        }
+        if count == tables.len() {
+            return sql_fail(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "too many tables in tablespace \"{}\"",
+                command.source
+            ));
+        }
+        tables[count] = table;
+        count += 1;
+    }
+    for &table in &tables[..count] {
+        if let Err(error) = storage.lock_table(
+            txn.txid,
+            table,
+            crate::sql::ast::TableLockMode::AccessExclusive,
+            command.nowait,
+        ) {
+            return sql_fail(error);
+        }
+    }
+    for &table in &tables[..count] {
+        let definition = *storage.table_def(table, txn.txid);
+        if definition.tablespace == target {
+            continue;
+        }
+        let mut next = definition;
+        next.tablespace = target;
+        if let Err(error) = stage_table_definition(storage, wal, txn, table, definition, next) {
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("ALTER TABLE")?;
+    sql_ok()
+}
+
+fn stage_table_definition(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    table: usize,
+    previous: TableDef,
+    next: TableDef,
+) -> Result<(), SqlError> {
+    let mut mapping = [None; MAX_COLUMNS];
+    let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+    for column in 0..previous.n_columns {
+        mapping[column] = Some(previous.columns()[column].name);
+        wal_mapping[column] = column as u16;
+    }
+    let lsn = storage.bump_lsn();
+    wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::BeginTableRewrite {
+            previous_schema: previous.schema.as_str(),
+            previous_name: previous.name.as_str(),
+            preserve_rows: true,
+            column_mapping: wal_mapping,
+        },
+    )?;
+    let lsn = storage.bump_lsn();
+    wal.stage(txn.txid, lsn, &WalOp::CreateTable(next))?;
+    storage.write_table_def(table, txn.txid, next, &mapping, false)?;
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table as u32)) {
+        storage.rollback_table_def(table, txn.txid);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn stored_tablespace_options(
@@ -46223,6 +46362,59 @@ pub fn reindex(
     sql_ok()
 }
 
+/// Replaces a table's durable CLUSTER selection. `None` is the protocol's
+/// explicit `SET WITHOUT CLUSTER` state, not a default selection.
+fn set_clustered_index(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut super::txn::TxnState,
+    table: usize,
+    selected: Option<usize>,
+) -> Result<(), SqlError> {
+    if let Some(selected) = selected {
+        if storage.index_table_slot_to(selected, txn.txid) != Some(table) {
+            let index = storage
+                .index_visible_to(selected, txn.txid)
+                .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
+            let definition = storage.table_def(table, txn.txid);
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "index \"{}\" is not an index for table \"{}\"",
+                index.name_for(txn.txid).as_str(),
+                definition.name.as_str()
+            ));
+        }
+        let index = storage
+            .index_visible_to(selected, txn.txid)
+            .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_OBJECT, "index does not exist"))?;
+        if !matches!(
+            index.mutable_for(txn.txid).kind,
+            crate::storage::IndexKind::Ordinary
+        ) {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "cannot cluster on partitioned index"
+            ));
+        }
+    }
+    for index_slot in 0..storage.index_count() {
+        if storage.index_table_slot_to(index_slot, txn.txid) != Some(table) {
+            continue;
+        }
+        let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
+            continue;
+        };
+        let mut definition = index.mutable_for(txn.txid);
+        let clustered = selected == Some(index_slot);
+        if definition.clustered == clustered {
+            continue;
+        }
+        definition.clustered = clustered;
+        stage_index_definition(storage, wal, txn, index_slot, definition)?;
+    }
+    storage.refresh_enforcers(table)
+}
+
 /// Records the btree CLUSTER choice in the same typed index definition that
 /// owns tablespace, build state, WAL, checkpoints, and rollback. Physical
 /// block placement is cache-local in the object-native store, so its durable
@@ -46323,30 +46515,6 @@ pub fn cluster(
                 definition.name.as_str()
             ));
         }
-        if storage.index_table_slot_to(selected, txn.txid) != Some(table) {
-            let index = storage
-                .index_visible_to(selected, txn.txid)
-                .expect("resolved CLUSTER index is visible");
-            return sql_fail(sql_err!(
-                sqlstate::WRONG_OBJECT_TYPE,
-                "index \"{}\" is not an index for table \"{}\"",
-                index.name_for(txn.txid).as_str(),
-                definition.name.as_str()
-            ));
-        }
-        let selected_definition = storage
-            .index_visible_to(selected, txn.txid)
-            .expect("resolved CLUSTER index is visible")
-            .mutable_for(txn.txid);
-        if !matches!(
-            selected_definition.kind,
-            crate::storage::IndexKind::Ordinary
-        ) {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "cannot cluster on partitioned index"
-            ));
-        }
         if let Err(error) = require_table_privilege(
             storage,
             table,
@@ -46363,38 +46531,7 @@ pub fn cluster(
         ) {
             return sql_fail(error);
         }
-        // Clear the prior choice before setting the new one so the storage
-        // boundary can enforce the one-clustered-index invariant even inside
-        // this transaction.
-        for index_slot in 0..storage.index_count() {
-            if storage.index_table_slot_to(index_slot, txn.txid) != Some(table) {
-                continue;
-            }
-            let Some(index) = storage.index_visible_to(index_slot, txn.txid) else {
-                continue;
-            };
-            let mut mutable = index.mutable_for(txn.txid);
-            if index_slot == selected || !mutable.clustered {
-                continue;
-            }
-            mutable.clustered = false;
-            if let Err(error) = stage_index_definition(storage, wal, txn, index_slot, mutable) {
-                return sql_fail(error);
-            }
-        }
-        let selected_index = storage
-            .index_visible_to(selected, txn.txid)
-            .expect("resolved CLUSTER index remains visible");
-        let mut selected_mutable = selected_index.mutable_for(txn.txid);
-        if !selected_mutable.clustered {
-            selected_mutable.clustered = true;
-            if let Err(error) =
-                stage_index_definition(storage, wal, txn, selected, selected_mutable)
-            {
-                return sql_fail(error);
-            }
-        }
-        if let Err(error) = storage.refresh_enforcers(table) {
+        if let Err(error) = set_clustered_index(storage, wal, txn, table, Some(selected)) {
             return sql_fail(error);
         }
     }
@@ -56749,7 +56886,7 @@ fn ordinary_inheritance_propagates(definition: &TableDef, actions: &[AlterAction
 
 fn ordinary_inheritance_propagates_action(definition: &TableDef, action: &AlterAction<'_>) -> bool {
     match action {
-        AlterAction::AddColumn(_)
+        AlterAction::AddColumn { .. }
         | AlterAction::DropColumn { .. }
         | AlterAction::RenameColumn { .. }
         | AlterAction::AlterColumnType { .. }
@@ -56777,7 +56914,7 @@ fn ordinary_inheritance_only_error(
 ) -> Option<SqlError> {
     for action in actions {
         match action {
-            AlterAction::AddColumn(_) => {
+            AlterAction::AddColumn { .. } => {
                 return Some(sql_err!(
                     sqlstate::INVALID_TABLE_DEFINITION,
                     "column must be added to child tables too"
@@ -58169,7 +58306,7 @@ fn alter_table_inner(
         && statement.actions.iter().any(|action| {
             matches!(
                 action,
-                AlterAction::AddColumn(_)
+                AlterAction::AddColumn { .. }
                     | AlterAction::DropColumn { .. }
                     | AlterAction::RenameColumn { .. }
                     | AlterAction::AlterColumnType { .. }
@@ -58416,6 +58553,111 @@ fn alter_table_inner(
         );
     }
 
+    if let [AlterAction::SetWithoutOids] = statement.actions {
+        if emit_completion {
+            responder.command_complete(tag)?;
+        }
+        return sql_ok();
+    }
+
+    if let [AlterAction::SetCluster(index)] = statement.actions {
+        let schema = index.schema.unwrap_or(def.schema.as_str());
+        let Some(index_slot) = storage.index_slot(schema, index.name, txn.txid) else {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "index \"{}\" does not exist",
+                index.name
+            ));
+        };
+        if let Err(error) = set_clustered_index(storage, wal, txn, table_index, Some(index_slot)) {
+            return sql_fail(error);
+        }
+        if emit_completion {
+            responder.command_complete(tag)?;
+        }
+        return sql_ok();
+    }
+
+    if let [AlterAction::ClearCluster] = statement.actions {
+        if let Err(error) = set_clustered_index(storage, wal, txn, table_index, None) {
+            return sql_fail(error);
+        }
+        if emit_completion {
+            responder.command_complete(tag)?;
+        }
+        return sql_ok();
+    }
+
+    if let [AlterAction::SetTypeMembership(type_name)] = statement.actions {
+        let membership = if let Some(type_name) = type_name {
+            if !def.inheritance.parents_ref().is_empty() {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "cannot alter table \"{}\" to typed because it inherits from another table",
+                    def.name.as_str()
+                ));
+            }
+            let slot = match type_name.schema {
+                Some(schema) => storage.composite_slot(schema, type_name.name, txn.txid),
+                None => storage.resolve_composite_slot(type_name.name, txn.txid),
+            }
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "type \"{}\" does not exist",
+                    type_name.name
+                )
+            });
+            let slot = match slot {
+                Ok(slot) => slot,
+                Err(error) => return sql_fail(error),
+            };
+            let composite = storage.composite_for(slot, txn.txid);
+            let fields = composite.fields_for(txn.txid);
+            let matches = def.columns().len()
+                == fields.iter().filter(|field| !field.dropped).count()
+                && def
+                    .columns()
+                    .iter()
+                    .zip(fields.iter().filter(|field| !field.dropped))
+                    .all(|(column, field)| {
+                        column.name == field.name
+                            && column.ctype == field.ctype
+                            && column.type_mod == field.type_mod
+                            && column.collation == field.collation
+                            && column.user_type == field.user_type
+                            && column.not_null.is_required() == field.not_null
+                    });
+            if !matches {
+                return sql_fail(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "table \"{}\" has a row type that does not match composite type \"{}\"",
+                    def.name.as_str(),
+                    type_name.name
+                ));
+            }
+            crate::storage::TableTypeMembership::Composite(slot as u16)
+        } else {
+            if def.type_membership.composite_slot().is_none() {
+                return sql_fail(sql_err!(
+                    sqlstate::WRONG_OBJECT_TYPE,
+                    "table \"{}\" is not a typed table",
+                    def.name.as_str()
+                ));
+            }
+            crate::storage::TableTypeMembership::None
+        };
+        let mut new_def = def;
+        new_def.type_membership = membership;
+        if let Err(error) = stage_table_definition(storage, wal, txn, table_index, def, new_def) {
+            return sql_fail(error);
+        }
+        if emit_completion {
+            responder.command_complete(tag)?;
+        }
+        return sql_ok();
+    }
+
     // Metadata-only changes must not decode, re-home, or re-journal every row.
     // They retain the exact row image and install one transaction-owned table
     // definition, which is the same durable boundary used by row-security.
@@ -58424,6 +58666,7 @@ fn alter_table_inner(
             action,
             AlterAction::SetTablespace(_)
                 | AlterAction::SetAccessMethod(_)
+                | AlterAction::ResetAccessMethod
                 | AlterAction::SetPersistence(_)
                 | AlterAction::SetStatistics { .. }
                 | AlterAction::SetStatisticsOptions { .. }
@@ -58463,6 +58706,9 @@ fn alter_table_inner(
                             ));
                         }
                     };
+                }
+                AlterAction::ResetAccessMethod => {
+                    new_def.access_method = crate::storage::TableAccessMethod::Heap;
                 }
                 AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent) => {}
                 AlterAction::SetPersistence(_) => {
@@ -58877,6 +59123,9 @@ fn alter_table_inner(
                     }
                 };
             }
+            AlterAction::ResetAccessMethod => {
+                new_def.access_method = crate::storage::TableAccessMethod::Heap;
+            }
             AlterAction::SetReplicaIdentity(target) => {
                 let (mode, selected) = match resolve_replica_identity_target(
                     storage,
@@ -58890,6 +59139,12 @@ fn alter_table_inner(
                 };
                 new_def.replica_identity = mode;
                 replica_identity_selection = Some(selected);
+            }
+            AlterAction::SetCluster(_)
+            | AlterAction::ClearCluster
+            | AlterAction::SetWithoutOids
+            | AlterAction::SetTypeMembership(_) => {
+                unreachable!("cluster selection is a standalone action")
             }
             AlterAction::AttachPartition { .. } | AlterAction::DetachPartition { .. } => {
                 unreachable!("partition attachment is a standalone action")
@@ -58933,8 +59188,24 @@ fn alter_table_inner(
                     return sql_fail(error);
                 }
             }
-            AlterAction::AddColumn(c) => {
+            AlterAction::AddColumn {
+                definition: c,
+                if_not_exists,
+            } => {
                 if new_def.column_index(c.name).is_some() {
+                    if *if_not_exists {
+                        responder.notice(
+                            sqlstate::SUCCESSFUL_COMPLETION,
+                            stack_format!(
+                                160,
+                                "column \"{}\" of relation \"{}\" already exists, skipping",
+                                c.name,
+                                statement.table.name
+                            )
+                            .as_str(),
+                        )?;
+                        continue;
+                    }
                     return sql_fail(sql_err!(
                         sqlstate::DUPLICATE_COLUMN,
                         "column \"{}\" already exists",

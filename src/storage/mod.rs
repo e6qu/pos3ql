@@ -885,6 +885,9 @@ pub struct ColumnMeta {
     pub user_type: Option<UserTypeName>,
     /// PostgreSQL's `attstattarget`; -1 selects the server default.
     pub statistics_target: i16,
+    /// PostgreSQL's `attoptions` overrides for the local and inherited
+    /// `ANALYZE` paths. This is a typed catalog value, never an option string.
+    pub statistics_options: crate::sql::ast::ColumnStatisticsOptions,
 }
 
 /// Durable provenance of a table column's effective `NOT NULL` constraint.
@@ -1041,7 +1044,8 @@ impl DeclaredColumnType {
 /// Maximum stored length of a non-constant DEFAULT expression's source text.
 /// Ample for real defaults (`nextval('schema.seq')`, `now()`,
 /// `gen_random_uuid()`, …); a longer one is a loud error, never silent growth.
-pub(crate) const DEFAULT_EXPR_MAX: usize = 128;
+/// This keeps each copied column definition within the recovery stack envelope.
+pub(crate) const DEFAULT_EXPR_MAX: usize = 120;
 /// Active view defaults stay sparse so catalog and WAL frames fit their
 /// startup-bounded execution envelopes.
 pub(crate) const MAX_VIEW_DEFAULTS: usize = 8;
@@ -1064,6 +1068,7 @@ impl ColumnMeta {
         auto_increment_step: 1,
         user_type: None,
         statistics_target: -1,
+        statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     };
 }
 
@@ -2331,6 +2336,49 @@ impl ColumnStatistics {
         distinct_fraction_ppm: 0,
         average_width: 0,
     };
+}
+
+/// The planner and `pg_stats` consume the same declared override as ANALYZE.
+/// A negative value remains a fraction in catalog output but becomes a row
+/// count for selectivity and probe-cost decisions.
+pub(crate) fn column_distinct_estimate(
+    metadata: &ColumnMeta,
+    statistics: ColumnStatistics,
+    rows: u64,
+    inherited: bool,
+) -> f64 {
+    let declared = if inherited {
+        metadata.statistics_options.n_distinct_inherited()
+    } else {
+        metadata.statistics_options.n_distinct()
+    };
+    if let Some(declared) = declared {
+        let value = declared.value();
+        return if value < 0.0 {
+            -value * rows as f64
+        } else {
+            value
+        };
+    }
+    if statistics.distinct_fraction_ppm != 0 {
+        f64::from(statistics.distinct_fraction_ppm) * rows as f64 / 1_000_000.0
+    } else {
+        statistics.distinct_values as f64
+    }
+}
+
+pub(crate) fn column_distinct_catalog_value(
+    metadata: &ColumnMeta,
+    statistics: ColumnStatistics,
+) -> f32 {
+    if let Some(declared) = metadata.statistics_options.n_distinct() {
+        return declared.value() as f32;
+    }
+    if statistics.distinct_fraction_ppm != 0 {
+        -(statistics.distinct_fraction_ppm as f32 / 1_000_000.0)
+    } else {
+        statistics.distinct_values as f32
+    }
 }
 
 /// Table cardinality and width statistics used by the storage-aware planner.
@@ -37469,6 +37517,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn column_metadata_stays_within_recovery_stack_budget() {
+        assert!(core::mem::size_of::<ColumnMeta>() <= 512);
+    }
+
+    #[test]
     fn schema_sql_rewrite_leaves_literals_and_comments_opaque() {
         let old = SqlName::parse("old_schema").unwrap();
         let new = SqlName::parse("new_schema").unwrap();
@@ -37633,6 +37686,7 @@ mod tests {
                 auto_increment_step: 1,
                 user_type: None,
                 statistics_target: -1,
+                statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
             };
         }
         def

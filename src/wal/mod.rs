@@ -2232,6 +2232,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 // auto_increment_step (i64).
                 n += 8;
                 n += 2; // attstattarget
+                n += 9; // attoptions presence byte plus two float4 bit patterns
                 n += 2; // attstorage + attcompression
                 // User-defined column: name, then a format marker and schema.
                 if let Some(identity) = c.user_type {
@@ -3833,6 +3834,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(de.as_bytes());
                 ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
                 ok &= buffer.append(&c.statistics_target.to_le_bytes());
+                let (option_flags, n_distinct, n_distinct_inherited) =
+                    c.statistics_options.encoded();
+                ok &= buffer.append(&[option_flags]);
+                ok &= buffer.append(&n_distinct.to_le_bytes());
+                ok &= buffer.append(&n_distinct_inherited.to_le_bytes());
                 ok &= buffer.append(&[c.storage.code(), c.compression.code()]);
                 if let Some(identity) = c.user_type {
                     ok &= name_bytes(buffer, identity.name.as_str());
@@ -6343,6 +6349,21 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let statistics_target =
                     i16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
+                let option_flags = *payload.get(at)?;
+                at += 1;
+                if option_flags & !3 != 0 {
+                    return None;
+                }
+                let n_distinct_bits = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                let n_distinct_inherited_bits =
+                    u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                at += 4;
+                let statistics_options = crate::sql::ast::ColumnStatisticsOptions::decode(
+                    option_flags,
+                    n_distinct_bits,
+                    n_distinct_inherited_bits,
+                )?;
                 let storage = crate::sql::ast::ColumnStorage::from_code(*payload.get(at)?)?;
                 let compression =
                     crate::sql::ast::ColumnCompression::from_code(*payload.get(at + 1)?)?;
@@ -6379,6 +6400,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     auto_increment_step,
                     user_type,
                     statistics_target,
+                    statistics_options,
                 };
             }
             // Multi-column UNIQUE/PRIMARY KEY constraints.
@@ -11163,6 +11185,7 @@ mod tests {
             auto_increment_step: 1,
             user_type: None,
             statistics_target: -1,
+            statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
         };
         def.columns[1] = ColumnMeta {
             name: SqlName::parse("v").unwrap(),
@@ -11184,6 +11207,7 @@ mod tests {
             auto_increment_step: 1,
             user_type: None,
             statistics_target: -1,
+            statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
         };
         // Exercise every durable constraint state in one table record.
         let mut uk = UniqueKey::EMPTY;

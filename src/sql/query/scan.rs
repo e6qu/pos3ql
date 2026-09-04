@@ -793,8 +793,15 @@ fn indexed_candidates<'a>(
         .collation;
     let statistics = storage.table_statistics(slot, txid);
     let expected_rows = if statistics.valid && statistics.columns[column].valid {
-        let distinct = statistics.columns[column].distinct_values.max(1);
-        statistics.rows.div_ceil(distinct).max(1)
+        let distinct = crate::storage::column_distinct_estimate(
+            &scope.defs[0]
+                .expect("physical table has definition")
+                .columns()[column],
+            statistics.columns[column],
+            statistics.rows,
+            false,
+        );
+        (statistics.rows as f64 / distinct.max(1.0)).ceil().max(1.0) as u64
     } else {
         1
     };

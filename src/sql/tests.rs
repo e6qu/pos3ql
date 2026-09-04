@@ -40505,13 +40505,44 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
         )),
         ["77"]
     );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows ALTER COLUMN id \
+           SET (n_distinct = 3, n_distinct_inherited = -0.5); \
+         INSERT INTO table_definition_rows VALUES (43), (44), (45), (46), (47); \
+         ANALYZE table_definition_rows; \
+         SELECT attoptions::text FROM pg_attribute \
+          WHERE attrelid = 'table_definition_rows'::regclass AND attname = 'id'; \
+         SELECT n_distinct FROM pg_stats \
+          WHERE tablename = 'table_definition_rows' AND attname = 'id'; \
+         EXPLAIN SELECT * FROM table_definition_rows WHERE id = 42",
+    );
+    let statistics_rows = data_rows(&output);
+    assert_eq!(
+        &statistics_rows[..2],
+        ["{n_distinct=3,n_distinct_inherited=-0.5}", "3"]
+    );
+    assert!(
+        statistics_rows.iter().any(|row| row.contains("rows=2")),
+        "n_distinct override must affect planner selectivity: {}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE table_definition_rows ALTER COLUMN id RESET (n_distinct); \
+         SELECT attoptions::text FROM pg_attribute \
+          WHERE attrelid = 'table_definition_rows'::regclass AND attname = 'id'",
+    );
+    assert_eq!(data_rows(&output), ["{n_distinct_inherited=-0.5}"]);
     assert_eq!(
         data_rows(&run_with(
             &mut engine,
             &mut budget,
             "SELECT id FROM table_definition_rows",
         )),
-        ["42"]
+        ["42", "43", "44", "45", "46", "47"]
     );
     let output = run_with(
         &mut engine,
@@ -41681,6 +41712,7 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
         "ALTER TABLE table_definition_recovery_rows ADD CONSTRAINT table_definition_recovery_total_check CHECK (inherited_total > 0)",
         "INSERT INTO table_definition_recovery_child (id, extra) VALUES (2, 'defaulted')",
         "ALTER TABLE table_definition_recovery_rows ALTER COLUMN id SET STATISTICS 91",
+        "ALTER TABLE table_definition_recovery_rows ALTER COLUMN id SET (n_distinct = 17, n_distinct_inherited = -0.25)",
         "ALTER TABLE table_definition_detach_parent DETACH PARTITION table_definition_detach_child CONCURRENTLY",
     ] {
         let output = run_with(&mut engine, &mut budget, statement);
@@ -41732,6 +41764,15 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
               WHERE attrelid = 'table_definition_recovery_rows'::regclass AND attname = 'id'",
         )),
         ["91"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT attoptions::text FROM pg_attribute \
+              WHERE attrelid = 'table_definition_recovery_rows'::regclass AND attname = 'id'",
+        )),
+        ["{n_distinct=17,n_distinct_inherited=-0.25}"]
     );
     let inherited_recovery_rows = run_with(
         &mut restarted,

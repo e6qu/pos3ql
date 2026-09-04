@@ -35063,6 +35063,7 @@ pub fn create_table_as(
             auto_increment_step: 1,
             user_type,
             statistics_target: -1,
+            statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
         };
     }
     // Create the empty table, journaled — exactly as CREATE TABLE does.
@@ -52287,6 +52288,7 @@ pub(crate) fn view_trigger_definition(
             auto_increment_step: 1,
             user_type,
             statistics_target: -1,
+            statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
         };
     }
     Ok(definition)
@@ -58424,7 +58426,10 @@ fn alter_table_inner(
                 | AlterAction::SetAccessMethod(_)
                 | AlterAction::SetPersistence(_)
                 | AlterAction::SetStatistics { .. }
+                | AlterAction::SetStatisticsOptions { .. }
+                | AlterAction::ResetStatisticsOptions { .. }
                 | AlterAction::SetStorage { .. }
+                | AlterAction::ResetStorage { .. }
                 | AlterAction::SetCompression { .. }
                 | AlterAction::SetIdentityMode { .. }
                 | AlterAction::AlterIdentitySequence { .. }
@@ -58472,6 +58477,36 @@ fn alter_table_inner(
                     };
                     new_def.columns[column].statistics_target = *target;
                 }
+                AlterAction::SetStatisticsOptions { column, options } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    if let Some(value) = options.n_distinct() {
+                        new_def.columns[column]
+                            .statistics_options
+                            .set_n_distinct(value);
+                    }
+                    if let Some(value) = options.n_distinct_inherited() {
+                        new_def.columns[column]
+                            .statistics_options
+                            .set_n_distinct_inherited(value);
+                    }
+                }
+                AlterAction::ResetStatisticsOptions { column, options } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    if options.n_distinct {
+                        new_def.columns[column]
+                            .statistics_options
+                            .reset_n_distinct();
+                    }
+                    if options.n_distinct_inherited {
+                        new_def.columns[column]
+                            .statistics_options
+                            .reset_n_distinct_inherited();
+                    }
+                }
                 AlterAction::SetStorage {
                     column,
                     storage: policy,
@@ -58488,6 +58523,13 @@ fn alter_table_inner(
                         return sql_fail(error);
                     }
                     new_def.columns[column].storage = *policy;
+                }
+                AlterAction::ResetStorage { column } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    new_def.columns[column].storage =
+                        ddl::default_column_storage(new_def.columns[column].ctype);
                 }
                 AlterAction::SetCompression {
                     column,
@@ -58785,6 +58827,12 @@ fn alter_table_inner(
                     return sql_fail(error);
                 }
                 new_def.columns[i].storage = *policy;
+            }
+            AlterAction::ResetStorage { column } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                new_def.columns[i].storage = ddl::default_column_storage(new_def.columns[i].ctype);
             }
             AlterAction::SetCompression {
                 column,
@@ -59355,6 +59403,32 @@ fn alter_table_inner(
                     return sql_fail(undefined_column(column));
                 };
                 new_def.columns[i].statistics_target = *target;
+            }
+            AlterAction::SetStatisticsOptions { column, options } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if let Some(value) = options.n_distinct() {
+                    new_def.columns[i].statistics_options.set_n_distinct(value);
+                }
+                if let Some(value) = options.n_distinct_inherited() {
+                    new_def.columns[i]
+                        .statistics_options
+                        .set_n_distinct_inherited(value);
+                }
+            }
+            AlterAction::ResetStatisticsOptions { column, options } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if options.n_distinct {
+                    new_def.columns[i].statistics_options.reset_n_distinct();
+                }
+                if options.n_distinct_inherited {
+                    new_def.columns[i]
+                        .statistics_options
+                        .reset_n_distinct_inherited();
+                }
             }
             AlterAction::AlterColumnType {
                 column,
@@ -61800,6 +61874,7 @@ fn coerce_composite_value_inner<'a>(
             auto_increment_step: 1,
             user_type: field.user_type,
             statistics_target: -1,
+            statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
         };
         out.name = arena.alloc_str(field.name.as_str()).map_err(|_| {
             sql_err!(

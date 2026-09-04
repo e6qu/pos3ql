@@ -84,17 +84,18 @@ jobs:
           POS3QL_OBJECT_STORE_TLS=off \
           cargo test --locked --test object_store_it -- --test-threads=1
 
-  # Each worker runs two fixed seed ranges. The complete 16-seed sweep is
-  # unchanged, while four short jobs become two so the limited runner pool
-  # starts the substantive coverage sooner.
+  # One fixed range per worker preserves the complete 16-seed sweep within
+  # the five-minute job contract, including a cold rebuild.
   storage-vopr:
-    name: storage-vopr (${{ matrix.first }}-${{ matrix.second }})
+    name: storage-vopr (${{ matrix.first }}-${{ matrix.last }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { first: 460259, second: 460263 }
-          - { first: 460267, second: 460271 }
+          - { first: 460259, last: 460262 }
+          - { first: 460263, last: 460266 }
+          - { first: 460267, last: 460270 }
+          - { first: 460271, last: 460274 }
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -115,9 +116,7 @@ jobs:
         run: cargo clean -p pos3ql
 
       - name: Storage VOPR
-        run: |
-          POS3QL_STORAGE_VOPR_SEED0=${{ matrix.first }} cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
-          POS3QL_STORAGE_VOPR_SEED0=${{ matrix.second }} cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
+        run: POS3QL_STORAGE_VOPR_SEED0=${{ matrix.first }} cargo test --locked --lib sim::storage::storage_vopr -- --nocapture
         env:
           POS3QL_STORAGE_VOPR_SEEDS: 4
           POS3QL_STORAGE_VOPR_STEPS: 300

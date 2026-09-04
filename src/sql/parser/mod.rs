@@ -81,7 +81,10 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::SetNotNull { .. }
         | AlterAction::DropNotNull { .. }
         | AlterAction::SetStatistics { .. }
+        | AlterAction::SetStatisticsOptions { .. }
+        | AlterAction::ResetStatisticsOptions { .. }
         | AlterAction::SetStorage { .. }
+        | AlterAction::ResetStorage { .. }
         | AlterAction::SetCompression { .. }
         | AlterAction::AddIdentity { .. }
         | AlterAction::DropIdentity { .. }
@@ -5704,7 +5707,11 @@ impl<'a> Parser<'a> {
             if self.eat_ident("type")? {
                 self.alter_column_type(column)
             } else if self.eat_ident("set")? {
-                if self.eat_ident("data")? {
+                if self.eat_op("(")? {
+                    let options = self.column_statistics_options()?;
+                    self.expect_op(")")?;
+                    Ok(AlterAction::SetStatisticsOptions { column, options })
+                } else if self.eat_ident("data")? {
                     self.expect_ident("type")?;
                     self.alter_column_type(column)
                 } else if self.eat_ident("default")? {
@@ -5727,12 +5734,10 @@ impl<'a> Parser<'a> {
                     };
                     Ok(AlterAction::SetStatistics { column, target })
                 } else if self.eat_ident("storage")? {
-                    let Some(storage) = self.column_storage(false)? else {
-                        return Err(
-                            self.err_here("DEFAULT is not valid for ALTER COLUMN SET STORAGE")
-                        );
-                    };
-                    Ok(AlterAction::SetStorage { column, storage })
+                    match self.column_storage(true)? {
+                        Some(storage) => Ok(AlterAction::SetStorage { column, storage }),
+                        None => Ok(AlterAction::ResetStorage { column }),
+                    }
                 } else if self.eat_ident("compression")? {
                     let compression = self.column_compression()?;
                     Ok(AlterAction::SetCompression {
@@ -5781,6 +5786,11 @@ impl<'a> Parser<'a> {
                     self.expect_ident("null")?;
                     Ok(AlterAction::SetNotNull { column })
                 }
+            } else if self.eat_ident("reset")? {
+                self.expect_op("(")?;
+                let options = self.column_statistics_option_names()?;
+                self.expect_op(")")?;
+                Ok(AlterAction::ResetStatisticsOptions { column, options })
             } else if self.eat_ident("drop")? {
                 if self.eat_ident("default")? {
                     Ok(AlterAction::DropDefault { column })
@@ -5837,6 +5847,78 @@ impl<'a> Parser<'a> {
             }
         } else {
             Err(self.unexpected("expected ADD, DROP or ALTER"))
+        }
+    }
+
+    fn column_statistics_distinct(&mut self) -> Result<StatisticsDistinct, ParseError> {
+        let negative = self.eat_op("-")?;
+        let Tok::Num(raw) = self.peeked else {
+            return Err(self.unexpected("statistics option value"));
+        };
+        let value = raw
+            .parse::<f64>()
+            .map_err(|_| self.err_here("invalid statistics option value"))?;
+        self.advance()?;
+        let value = if negative { -value } else { value };
+        StatisticsDistinct::new(value).ok_or_else(|| ParseError {
+            at: self.peek_at,
+            message: stack_format!(96, "statistics option value {} is out of range", value),
+            sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+        })
+    }
+
+    fn column_statistics_options(&mut self) -> Result<ColumnStatisticsOptions, ParseError> {
+        let mut options = ColumnStatisticsOptions::DEFAULT;
+        loop {
+            let name = self.any_ident("column statistics option")?;
+            self.expect_op("=")?;
+            let value = self.column_statistics_distinct()?;
+            if name.eq_ignore_ascii_case("n_distinct") {
+                if options.n_distinct().is_some() {
+                    return Err(self.err_here("column statistics option specified more than once"));
+                }
+                options.set_n_distinct(value);
+            } else if name.eq_ignore_ascii_case("n_distinct_inherited") {
+                if options.n_distinct_inherited().is_some() {
+                    return Err(self.err_here("column statistics option specified more than once"));
+                }
+                options.set_n_distinct_inherited(value);
+            } else {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "unrecognized parameter \"{}\"", name),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            }
+            if !self.eat_op(",")? {
+                return Ok(options);
+            }
+        }
+    }
+
+    fn column_statistics_option_names(
+        &mut self,
+    ) -> Result<ColumnStatisticsOptionNames, ParseError> {
+        let mut names = ColumnStatisticsOptionNames::DEFAULT;
+        loop {
+            let name = self.any_ident("column statistics option")?;
+            let selected = if name.eq_ignore_ascii_case("n_distinct") {
+                &mut names.n_distinct
+            } else if name.eq_ignore_ascii_case("n_distinct_inherited") {
+                &mut names.n_distinct_inherited
+            } else {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: stack_format!(96, "unrecognized parameter \"{}\"", name),
+                    sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
+                });
+            };
+            if core::mem::replace(selected, true) {
+                return Err(self.err_here("column statistics option specified more than once"));
+            }
+            if !self.eat_op(",")? {
+                return Ok(names);
+            }
         }
     }
 
@@ -7694,9 +7776,10 @@ mod tests {
         with_parser(
             "ALTER TABLE storage_probe ALTER COLUMN value SET STORAGE EXTENDED; \
              ALTER TABLE storage_probe ALTER COLUMN value SET COMPRESSION DEFAULT; \
-             ALTER TABLE storage_probe ALTER COLUMN value SET COMPRESSION pglz",
+             ALTER TABLE storage_probe ALTER COLUMN value SET COMPRESSION pglz; \
+             ALTER TABLE storage_probe ALTER COLUMN value SET STORAGE DEFAULT",
             |parser| {
-                for _ in 0..3 {
+                for _ in 0..4 {
                     assert!(matches!(
                         parser.next_stmt().unwrap(),
                         Some(Stmt::AlterTable(_))
@@ -7738,6 +7821,33 @@ mod tests {
                 assert!(table.likes[0].comments);
                 assert!(table.likes[0].statistics);
             },
+        );
+    }
+
+    #[test]
+    fn column_statistics_options_are_typed_and_bounded() {
+        with_parser(
+            "ALTER TABLE statistics_rows ALTER COLUMN value \
+             SET (n_distinct = 7, n_distinct_inherited = -0.5); \
+             ALTER TABLE statistics_rows ALTER COLUMN value \
+             RESET (n_distinct, n_distinct_inherited)",
+            |parser| {
+                for _ in 0..2 {
+                    assert!(matches!(
+                        parser.next_stmt().unwrap(),
+                        Some(Stmt::AlterTable(_))
+                    ));
+                }
+                assert!(parser.next_stmt().unwrap().is_none());
+            },
+        );
+        with_parser(
+            "ALTER TABLE statistics_rows ALTER COLUMN value SET (n_distinct = -1.1)",
+            |parser| assert!(parser.statement().is_err()),
+        );
+        with_parser(
+            "ALTER TABLE statistics_rows ALTER COLUMN value SET (unknown = 1)",
+            |parser| assert!(parser.statement().is_err()),
         );
     }
 

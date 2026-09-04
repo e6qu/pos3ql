@@ -1475,6 +1475,32 @@ fn foreign_options_datum<'a>(
     })
 }
 
+fn column_statistics_options_datum<'a>(
+    options: crate::sql::ast::ColumnStatisticsOptions,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let mut values = [Datum::Null; 2];
+    let mut count = 0usize;
+    for (name, value) in [
+        ("n_distinct", options.n_distinct()),
+        ("n_distinct_inherited", options.n_distinct_inherited()),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        let rendered = stack_format!(96, "{}={}", name, value.value());
+        values[count] = text(rendered.as_str(), arena)?;
+        count += 1;
+    }
+    if count == 0 {
+        return Ok(Datum::Null);
+    }
+    Ok(Datum::Array {
+        element: super::types::ArrElem::Text,
+        raw: super::array::build(&values[..count], arena)?,
+    })
+}
+
 fn foreign_routine_oid(storage: &Storage, txid: u32, name: &str) -> Result<i32, SqlError> {
     routine_oid_by_name(storage, txid, name, false)?.ok_or_else(|| {
         sql_err!(
@@ -6832,11 +6858,8 @@ fn pg_stats<'a>(
                     rows.len()
                 ));
             }
-            let distinct = if column_statistics.distinct_fraction_ppm != 0 {
-                -(column_statistics.distinct_fraction_ppm as f32 / 1_000_000.0)
-            } else {
-                column_statistics.distinct_values as f32
-            };
+            let distinct =
+                crate::storage::column_distinct_catalog_value(metadata, column_statistics);
             rows[count] = row(
                 &[
                     text(table_definition.schema.as_str(), arena)?,
@@ -10908,7 +10931,7 @@ fn pg_attribute<'a>(
                     Datum::Int4(i as i32 + 1),
                     text("i", arena)?,
                     Datum::Bool(true),
-                    Datum::Null,
+                    column_statistics_options_datum(c.statistics_options, arena)?,
                     foreign_column_options,
                     Datum::Bool(false),
                     Datum::Null,
@@ -10998,6 +11021,7 @@ fn pg_attribute<'a>(
                 auto_increment_step: 1,
                 user_type: field.user_type,
                 statistics_target: -1,
+                statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
             };
             out[n] = row(
                 &[
@@ -16642,6 +16666,7 @@ fn info_columns<'a>(
                 auto_increment_step: 1,
                 user_type,
                 statistics_target: -1,
+                statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
             };
             out[n] = info_column_row(
                 storage,
@@ -18061,6 +18086,7 @@ fn info_column_privileges<'a>(
                 auto_increment_step: 1,
                 user_type,
                 statistics_target: -1,
+                statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
             };
         }
         append_relation(
@@ -18578,6 +18604,7 @@ fn info_column_type_usage<'a>(
                 auto_increment_step: 1,
                 user_type,
                 statistics_target: -1,
+                statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
             };
             append(
                 view.schema_for(txid).as_str(),

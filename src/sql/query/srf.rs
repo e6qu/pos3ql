@@ -1308,6 +1308,7 @@ pub(crate) fn synth_derived_def_outer<'a>(
         auto_increment_step: 1,
         user_type: None,
         statistics_target: -1,
+        statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     };
     let mut columns = [blank; MAX_COLUMNS];
     for i in 0..n_cols {

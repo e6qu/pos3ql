@@ -102,6 +102,7 @@ fn empty_meta() -> ColumnMeta {
         auto_increment_step: 1,
         user_type: None,
         statistics_target: -1,
+        statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     }
 }
 
@@ -322,6 +323,7 @@ pub(super) fn build_column(
         auto_increment_step,
         user_type,
         statistics_target: -1,
+        statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     })
 }
 

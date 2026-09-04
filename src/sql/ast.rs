@@ -3519,6 +3519,139 @@ pub struct LikeClause<'a> {
     pub statistics: bool,
 }
 
+/// A finite PostgreSQL `n_distinct` override. Negative values express a row
+/// fraction and must not be below `-1`; non-negative values are exact counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatisticsDistinct(u32);
+
+impl StatisticsDistinct {
+    pub fn new(value: f64) -> Option<Self> {
+        let value = value as f32;
+        (value.is_finite() && value >= -1.0).then_some(Self(value.to_bits()))
+    }
+
+    pub fn value(self) -> f64 {
+        f64::from(f32::from_bits(self.0))
+    }
+
+    const fn bits(self) -> u32 {
+        self.0
+    }
+
+    fn from_bits(bits: u32) -> Option<Self> {
+        let value = f32::from_bits(bits);
+        (value.is_finite() && value >= -1.0).then_some(Self(bits))
+    }
+}
+
+/// The two PostgreSQL per-column statistics overrides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnStatisticsOptions(u64);
+
+impl ColumnStatisticsOptions {
+    // PostgreSQL rejects NaN, so one canonical NaN payload is a compact,
+    // unrepresentable-value sentinel for an absent override.
+    const ABSENT: u32 = 0x7fc0_0000;
+    pub const DEFAULT: Self = Self(((Self::ABSENT as u64) << 32) | Self::ABSENT as u64);
+
+    const fn low(self) -> u32 {
+        self.0 as u32
+    }
+
+    const fn high(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+
+    fn replace_low(&mut self, value: u32) {
+        self.0 = (self.0 & !u64::from(u32::MAX)) | u64::from(value);
+    }
+
+    fn replace_high(&mut self, value: u32) {
+        self.0 = (self.0 & u64::from(u32::MAX)) | (u64::from(value) << 32);
+    }
+
+    pub fn n_distinct(self) -> Option<StatisticsDistinct> {
+        if self.low() != Self::ABSENT {
+            Some(StatisticsDistinct(self.low()))
+        } else {
+            None
+        }
+    }
+
+    pub fn n_distinct_inherited(self) -> Option<StatisticsDistinct> {
+        if self.high() != Self::ABSENT {
+            Some(StatisticsDistinct(self.high()))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_n_distinct(&mut self, value: StatisticsDistinct) {
+        self.replace_low(value.bits());
+    }
+
+    pub fn set_n_distinct_inherited(&mut self, value: StatisticsDistinct) {
+        self.replace_high(value.bits());
+    }
+
+    pub fn reset_n_distinct(&mut self) {
+        self.replace_low(Self::ABSENT);
+    }
+
+    pub fn reset_n_distinct_inherited(&mut self) {
+        self.replace_high(Self::ABSENT);
+    }
+
+    pub(crate) fn encoded(self) -> (u8, u32, u32) {
+        (
+            u8::from(self.low() != Self::ABSENT) | (u8::from(self.high() != Self::ABSENT) << 1),
+            if self.low() == Self::ABSENT {
+                0
+            } else {
+                self.low()
+            },
+            if self.high() == Self::ABSENT {
+                0
+            } else {
+                self.high()
+            },
+        )
+    }
+
+    pub(crate) fn decode(present: u8, n_distinct: u32, n_distinct_inherited: u32) -> Option<Self> {
+        if present & !3 != 0
+            || (present & 1 != 0 && StatisticsDistinct::from_bits(n_distinct).is_none())
+            || (present & 2 != 0 && StatisticsDistinct::from_bits(n_distinct_inherited).is_none())
+            || (present & 1 == 0 && n_distinct != 0)
+            || (present & 2 == 0 && n_distinct_inherited != 0)
+        {
+            return None;
+        }
+        let mut result = Self::DEFAULT;
+        if present & 1 != 0 {
+            result.replace_low(n_distinct);
+        }
+        if present & 2 != 0 {
+            result.replace_high(n_distinct_inherited);
+        }
+        Some(result)
+    }
+}
+
+/// Names selected by `ALTER COLUMN ... RESET (...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnStatisticsOptionNames {
+    pub n_distinct: bool,
+    pub n_distinct_inherited: bool,
+}
+
+impl ColumnStatisticsOptionNames {
+    pub const DEFAULT: Self = Self {
+        n_distinct: false,
+        n_distinct_inherited: false,
+    };
+}
+
 /// A table-level constraint, or a column-level CHECK/REFERENCES desugared to
 /// name its single column.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -4636,9 +4769,23 @@ pub enum AlterAction<'a> {
         column: &'a str,
         target: i16,
     },
+    /// ALTER [COLUMN] col SET (n_distinct = …, n_distinct_inherited = …).
+    SetStatisticsOptions {
+        column: &'a str,
+        options: ColumnStatisticsOptions,
+    },
+    /// ALTER [COLUMN] col RESET (n_distinct [, n_distinct_inherited]).
+    ResetStatisticsOptions {
+        column: &'a str,
+        options: ColumnStatisticsOptionNames,
+    },
     SetStorage {
         column: &'a str,
         storage: ColumnStorage,
+    },
+    /// ALTER [COLUMN] col SET STORAGE DEFAULT.
+    ResetStorage {
+        column: &'a str,
     },
     SetCompression {
         column: &'a str,

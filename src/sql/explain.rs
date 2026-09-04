@@ -264,7 +264,14 @@ fn column_selectivity(
         return default;
     }
     let non_null = 1.0 - f64::from(column_statistics.null_fraction_ppm) / 1_000_000.0;
-    (non_null / column_statistics.distinct_values.max(1) as f64).clamp(0.0, 1.0)
+    let definition = storage.table_def(scope.slots[table], txid);
+    let distinct = crate::storage::column_distinct_estimate(
+        &definition.columns()[column],
+        column_statistics,
+        statistics.rows,
+        false,
+    );
+    (non_null / distinct.max(1.0)).clamp(0.0, 1.0)
 }
 
 fn expression_statistics_selectivity(

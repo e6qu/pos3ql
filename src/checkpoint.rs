@@ -1331,6 +1331,22 @@ impl Checkpointer {
                     if !(-1..=10_000).contains(&statistics_target) {
                         return Err(CheckpointSetupError::Corrupt("column statistics target"));
                     }
+                    let statistics_option_flags: u8 =
+                        parse_field(words.next(), "column statistics option flags")?;
+                    if statistics_option_flags & !3 != 0 {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "column statistics option flags",
+                        ));
+                    }
+                    let n_distinct_bits: u32 = parse_field(words.next(), "column n_distinct")?;
+                    let n_distinct_inherited_bits: u32 =
+                        parse_field(words.next(), "column n_distinct inherited")?;
+                    let statistics_options = crate::sql::ast::ColumnStatisticsOptions::decode(
+                        statistics_option_flags,
+                        n_distinct_bits,
+                        n_distinct_inherited_bits,
+                    )
+                    .ok_or(CheckpointSetupError::Corrupt("column statistics options"))?;
                     let storage = crate::sql::ast::ColumnStorage::from_code(parse_field(
                         words.next(),
                         "col storage",
@@ -1375,7 +1391,7 @@ impl Checkpointer {
                             ));
                         }
                     };
-                    let name = rest_of(line, 13)?;
+                    let name = rest_of(line, 16)?;
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
@@ -1405,6 +1421,7 @@ impl Checkpointer {
                         identity_always: not_null & 128 != 0,
                         auto_increment_step,
                         statistics_target,
+                        statistics_options,
                     };
                     *seen += 1;
                 }
@@ -6378,7 +6395,7 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         c.type_mod,
@@ -6386,6 +6403,9 @@ impl Checkpointer {
                         dexpr_hex.as_str(),
                         c.auto_increment_step,
                         c.statistics_target,
+                        c.statistics_options.encoded().0,
+                        c.statistics_options.encoded().1,
+                        c.statistics_options.encoded().2,
                         c.storage.code(),
                         c.compression.code(),
                         c.collation.code(),
@@ -11339,6 +11359,7 @@ fn empty_column() -> ColumnMeta {
         auto_increment_step: 1,
         user_type: None,
         statistics_target: -1,
+        statistics_options: crate::sql::ast::ColumnStatisticsOptions::DEFAULT,
     }
 }
 

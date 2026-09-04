@@ -440,6 +440,7 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateIndex { .. }
         | Stmt::AlterIndex { .. }
         | Stmt::AlterIndexesTablespace { .. }
+        | Stmt::AlterTablesTablespace { .. }
         | Stmt::DropIndex { .. }
         | Stmt::CreateAccessMethod { .. }
         | Stmt::DropAccessMethod { .. }
@@ -826,6 +827,7 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::DropType { .. } => "DROP TYPE",
         Stmt::CreateIndex { .. } => "CREATE INDEX",
         Stmt::AlterIndex { .. } | Stmt::AlterIndexesTablespace { .. } => "ALTER INDEX",
+        Stmt::AlterTablesTablespace { .. } => "ALTER TABLE",
         Stmt::DropIndex { .. } => "DROP INDEX",
         Stmt::CreateAccessMethod { .. } => "CREATE ACCESS METHOD",
         Stmt::DropAccessMethod { .. } => "DROP ACCESS METHOD",
@@ -13088,6 +13090,23 @@ impl Engine {
                 &mut self.wal,
                 txn,
                 exec::AlterIndexesTablespaceCommand {
+                    source,
+                    owners,
+                    target,
+                    nowait: *nowait,
+                },
+                responder,
+            ),
+            Stmt::AlterTablesTablespace {
+                source,
+                owners,
+                target,
+                nowait,
+            } => exec::alter_tables_tablespace(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                exec::AlterTablesTablespaceCommand {
                     source,
                     owners,
                     target,

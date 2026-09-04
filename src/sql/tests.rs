@@ -39395,6 +39395,117 @@ fn cluster_selection_survives_checkpoint_and_cold_restart() {
 }
 
 #[test]
+fn alter_table_control_plane_is_typed_and_durable() {
+    let mut config = test_config("alter-table-control-plane");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("alter-table-control-plane-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE alter_control_rows (id int, payload text); \
+         INSERT INTO alter_control_rows VALUES (1, 'one'); \
+         CREATE INDEX alter_control_rows_id ON alter_control_rows (id); \
+         ALTER TABLE alter_control_rows CLUSTER ON alter_control_rows_id; \
+         ALTER TABLE alter_control_rows ADD COLUMN IF NOT EXISTS label text DEFAULT 'new'; \
+         ALTER TABLE alter_control_rows ADD COLUMN IF NOT EXISTS label integer; \
+         ALTER TABLE alter_control_rows SET WITHOUT OIDS",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT indisclustered FROM pg_index \
+             WHERE indexrelid = 'alter_control_rows_id'::regclass; \
+             SELECT id, payload, label FROM alter_control_rows; \
+             ALTER TABLE alter_control_rows SET WITHOUT CLUSTER; \
+             SELECT indisclustered FROM pg_index \
+             WHERE indexrelid = 'alter_control_rows_id'::regclass",
+        )),
+        ["t", "1|one|new", "f"]
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn alter_table_of_and_not_of_preserve_the_typed_table_dependency_boundary() {
+    let mut config = test_config("alter-table-of");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("alter-table-of-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TYPE alter_of_row AS (id integer, label text); \
+         CREATE TABLE alter_of_rows (id integer, label text); \
+         INSERT INTO alter_of_rows VALUES (1, 'one'); \
+         ALTER TABLE alter_of_rows OF alter_of_row",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+
+    let mut restarted_budget = Budget::new(1 << 29);
+    let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT c.reloftype = t.oid \
+             FROM pg_class c JOIN pg_type t ON t.typname = 'alter_of_row' \
+             WHERE c.relname = 'alter_of_rows'; \
+             ALTER TABLE alter_of_rows NOT OF; \
+             SELECT reloftype = 0 FROM pg_class WHERE relname = 'alter_of_rows'; \
+             DROP TYPE alter_of_row; \
+             SELECT id, label FROM alter_of_rows",
+        )),
+        ["t", "t", "1|one"]
+    );
+    let mismatch = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "CREATE TYPE alter_of_mismatch AS (id integer); \
+         ALTER TABLE alter_of_rows OF alter_of_mismatch",
+    );
+    assert!(
+        String::from_utf8_lossy(&mismatch).contains("42804"),
+        "{}",
+        String::from_utf8_lossy(&mismatch)
+    );
+    drop(restarted);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn cluster_rejects_an_index_from_another_relation_with_the_postgresql_class() {
     let (mut engine, mut budget) = test_engine();
     run_with(
@@ -41695,6 +41806,7 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
     for statement in [
         "CREATE ACCESS METHOD table_definition_recovery_heap TYPE TABLE HANDLER heap_tableam_handler",
         "CREATE TABLESPACE table_definition_recovery_space LOCATION '/object/table-definition-recovery'",
+        "CREATE TABLESPACE table_definition_recovery_target LOCATION '/object/table-definition-target'",
         "CREATE TABLE table_definition_recovery_rows (id integer NOT NULL CHECK (id > 0)) USING heap WITH (fillfactor = 70) TABLESPACE table_definition_recovery_space",
         "CREATE TABLE table_definition_custom_rows (id integer) USING table_definition_recovery_heap",
         "CREATE TABLE table_definition_recovery_child (extra text) INHERITS (table_definition_recovery_rows)",
@@ -41713,6 +41825,8 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
         "INSERT INTO table_definition_recovery_child (id, extra) VALUES (2, 'defaulted')",
         "ALTER TABLE table_definition_recovery_rows ALTER COLUMN id SET STATISTICS 91",
         "ALTER TABLE table_definition_recovery_rows ALTER COLUMN id SET (n_distinct = 17, n_distinct_inherited = -0.25)",
+        "ALTER TABLE table_definition_recovery_rows SET ACCESS METHOD DEFAULT",
+        "ALTER TABLE ALL IN TABLESPACE table_definition_recovery_space OWNED BY postgres SET TABLESPACE table_definition_recovery_target NOWAIT",
         "ALTER TABLE table_definition_detach_parent DETACH PARTITION table_definition_detach_child CONCURRENTLY",
     ] {
         let output = run_with(&mut engine, &mut budget, statement);
@@ -41735,7 +41849,19 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
             "SELECT c.relam, s.spcname FROM pg_class c JOIN pg_tablespace s \
                ON s.oid = c.reltablespace WHERE c.relname = 'table_definition_recovery_rows'",
         )),
-        ["2|table_definition_recovery_space"]
+        ["2|table_definition_recovery_target"]
+    );
+    let missing_owner = run_with(
+        &mut restarted,
+        &mut restarted_budget,
+        "ALTER TABLE ALL IN TABLESPACE table_definition_recovery_target \
+           OWNED BY no_such_tablespace_owner \
+           SET TABLESPACE table_definition_recovery_space",
+    );
+    assert!(
+        String::from_utf8_lossy(&missing_owner).contains("42704"),
+        "unknown tablespace owners must fail before selecting relations: {}",
+        String::from_utf8_lossy(&missing_owner)
     );
     assert_eq!(
         data_rows(&run_with(

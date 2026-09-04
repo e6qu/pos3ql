@@ -71,7 +71,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
     match action {
         AlterAction::DropColumn { .. } | AlterAction::DropConstraint { .. } => 0,
         AlterAction::AlterColumnType { .. } => 1,
-        AlterAction::AddColumn(_) => 2,
+        AlterAction::AddColumn { .. } => 2,
         AlterAction::AddConstraint(_)
         | AlterAction::AttachIndexConstraint { .. }
         | AlterAction::AlterConstraint { .. }
@@ -106,10 +106,15 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::SetInheritance { .. }
         | AlterAction::SetTablespace(_)
         | AlterAction::SetAccessMethod(_)
+        | AlterAction::ResetAccessMethod
         | AlterAction::SetReplicaIdentity(_)
         | AlterAction::AttachPartition { .. }
         | AlterAction::DetachPartition { .. }
-        | AlterAction::SetSchema(_) => 5,
+        | AlterAction::SetSchema(_)
+        | AlterAction::SetCluster(_)
+        | AlterAction::ClearCluster
+        | AlterAction::SetWithoutOids
+        | AlterAction::SetTypeMembership(_) => 5,
     }
 }
 
@@ -4649,6 +4654,27 @@ impl<'a> Parser<'a> {
             return self.alter_type();
         }
         self.expect_ident("table")?;
+        if self.eat_ident("all")? {
+            self.expect_ident("in")?;
+            self.expect_ident("tablespace")?;
+            let source = self.any_ident("tablespace name")?;
+            let owners = if self.eat_ident("owned")? {
+                self.expect_ident("by")?;
+                self.role_name_list("role name")?
+            } else {
+                &[]
+            };
+            self.expect_ident("set")?;
+            self.expect_ident("tablespace")?;
+            let target = self.any_ident("tablespace name")?;
+            let nowait = self.eat_ident("nowait")?;
+            return Ok(Stmt::AlterTablesTablespace {
+                source,
+                owners,
+                target,
+                nowait,
+            });
+        }
         self.alter_table_relation(false)
     }
 
@@ -4955,6 +4981,13 @@ impl<'a> Parser<'a> {
                 AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Unlogged)
             } else if self.eat_ident("tablespace")? {
                 AlterAction::SetTablespace(self.col_ident("tablespace name")?)
+            } else if self.eat_ident("without")? {
+                if self.eat_ident("cluster")? {
+                    AlterAction::ClearCluster
+                } else {
+                    self.expect_ident("oids")?;
+                    AlterAction::SetWithoutOids
+                }
             } else if self.eat_op("(")? {
                 let options = self.relation_storage_options()?;
                 self.expect_op(")")?;
@@ -4962,12 +4995,16 @@ impl<'a> Parser<'a> {
             } else {
                 self.expect_ident("access")?;
                 self.expect_ident("method")?;
-                let method = self.any_ident("table access method")?;
-                AlterAction::SetAccessMethod(if method == "heap" {
-                    crate::sql::ast::TableAccessMethod::Heap
+                if self.eat_ident("default")? {
+                    AlterAction::ResetAccessMethod
                 } else {
-                    crate::sql::ast::TableAccessMethod::Named(method)
-                })
+                    let method = self.any_ident("table access method")?;
+                    AlterAction::SetAccessMethod(if method == "heap" {
+                        crate::sql::ast::TableAccessMethod::Heap
+                    } else {
+                        crate::sql::ast::TableAccessMethod::Named(method)
+                    })
+                }
             };
             return Ok(Self::alter_table_statement(
                 foreign,
@@ -4976,6 +5013,32 @@ impl<'a> Parser<'a> {
                     if_exists,
                     only,
                     actions: self.arena_slice(&[action])?,
+                },
+            ));
+        }
+        if self.eat_ident("cluster")? {
+            self.expect_ident("on")?;
+            let index = self.qual_name("index name")?;
+            return Ok(Self::alter_table_statement(
+                foreign,
+                AlterTable {
+                    table,
+                    if_exists,
+                    only,
+                    actions: self.arena_slice(&[AlterAction::SetCluster(index)])?,
+                },
+            ));
+        }
+        if self.eat_ident("of")? {
+            let type_name = self.qual_name("composite type name")?;
+            return Ok(Self::alter_table_statement(
+                foreign,
+                AlterTable {
+                    table,
+                    if_exists,
+                    only,
+                    actions: self
+                        .arena_slice(&[AlterAction::SetTypeMembership(Some(type_name))])?,
                 },
             ));
         }
@@ -5017,6 +5080,18 @@ impl<'a> Parser<'a> {
                     actions: self.arena_slice(&[AlterAction::SetRowLevelSecurity(
                         RowLevelSecurityAlteration::Force,
                     )])?,
+                },
+            ));
+        }
+        if self.eat_ident("not")? {
+            self.expect_ident("of")?;
+            return Ok(Self::alter_table_statement(
+                foreign,
+                AlterTable {
+                    table,
+                    if_exists,
+                    only,
+                    actions: self.arena_slice(&[AlterAction::SetTypeMembership(None)])?,
                 },
             ));
         }
@@ -5493,12 +5568,16 @@ impl<'a> Parser<'a> {
             } else {
                 self.expect_ident("access")?;
                 self.expect_ident("method")?;
-                let method = self.any_ident("table access method")?;
-                Ok(AlterAction::SetAccessMethod(if method == "heap" {
-                    crate::sql::ast::TableAccessMethod::Heap
+                if self.eat_ident("default")? {
+                    Ok(AlterAction::ResetAccessMethod)
                 } else {
-                    crate::sql::ast::TableAccessMethod::Named(method)
-                }))
+                    let method = self.any_ident("table access method")?;
+                    Ok(AlterAction::SetAccessMethod(if method == "heap" {
+                        crate::sql::ast::TableAccessMethod::Heap
+                    } else {
+                        crate::sql::ast::TableAccessMethod::Named(method)
+                    }))
+                }
             }
         } else if self.eat_ident("reset")? {
             self.expect_op("(")?;
@@ -5521,6 +5600,13 @@ impl<'a> Parser<'a> {
                 return self.alter_table_add_constraint(None);
             }
             let _ = self.eat_ident("column")?;
+            let if_not_exists = if self.eat_ident("if")? {
+                self.expect_ident("not")?;
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
             let name = self.col_ident("column name")?;
             let (type_name, type_mod) = self.type_name_mod()?;
             let foreign_options = if foreign && self.eat_ident("options")? {
@@ -5576,22 +5662,25 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            Ok(AlterAction::AddColumn(ColumnDef {
-                name,
-                type_name,
-                type_mod,
-                collation,
-                foreign_options,
-                storage,
-                compression,
-                not_null,
-                unique,
-                primary: false,
-                default,
-                default_text,
-                generated_text,
-                identity,
-            }))
+            Ok(AlterAction::AddColumn {
+                definition: ColumnDef {
+                    name,
+                    type_name,
+                    type_mod,
+                    collation,
+                    foreign_options,
+                    storage,
+                    compression,
+                    not_null,
+                    unique,
+                    primary: false,
+                    default,
+                    default_text,
+                    generated_text,
+                    identity,
+                },
+                if_not_exists,
+            })
         } else if self.eat_ident("drop")? {
             if self.eat_ident("constraint")? {
                 let if_exists = self.eat_ident("if")? && {
@@ -7820,6 +7909,80 @@ mod tests {
                 assert!(table.likes[0].compression);
                 assert!(table.likes[0].comments);
                 assert!(table.likes[0].statistics);
+            },
+        );
+    }
+
+    #[test]
+    fn alter_table_control_plane_forms_are_closed_parse_states() {
+        with_parser(
+            "ALTER TABLE control_rows CLUSTER ON control_rows_id; \
+             ALTER TABLE control_rows SET WITHOUT CLUSTER; \
+             ALTER TABLE control_rows SET WITHOUT OIDS; \
+             ALTER TABLE control_rows ADD COLUMN IF NOT EXISTS label text; \
+             ALTER TABLE control_rows OF control_row; \
+             ALTER TABLE control_rows NOT OF; \
+             ALTER TABLE control_rows SET ACCESS METHOD DEFAULT; \
+             ALTER TABLE ALL IN TABLESPACE old_space OWNED BY postgres \
+               SET TABLESPACE new_space NOWAIT",
+            |parser| {
+                let Some(Stmt::AlterTable(cluster)) = parser.next_stmt().unwrap() else {
+                    panic!("CLUSTER ON did not parse as ALTER TABLE")
+                };
+                assert!(matches!(cluster.actions, [AlterAction::SetCluster(_)]));
+                let Some(Stmt::AlterTable(clear)) = parser.next_stmt().unwrap() else {
+                    panic!("SET WITHOUT CLUSTER did not parse as ALTER TABLE")
+                };
+                assert!(matches!(clear.actions, [AlterAction::ClearCluster]));
+                let Some(Stmt::AlterTable(oids)) = parser.next_stmt().unwrap() else {
+                    panic!("SET WITHOUT OIDS did not parse as ALTER TABLE")
+                };
+                assert!(matches!(oids.actions, [AlterAction::SetWithoutOids]));
+                let Some(Stmt::AlterTable(add)) = parser.next_stmt().unwrap() else {
+                    panic!("ADD COLUMN IF NOT EXISTS did not parse as ALTER TABLE")
+                };
+                assert!(matches!(
+                    add.actions,
+                    [AlterAction::AddColumn {
+                        if_not_exists: true,
+                        ..
+                    }]
+                ));
+                let Some(Stmt::AlterTable(of)) = parser.next_stmt().unwrap() else {
+                    panic!("OF did not parse as ALTER TABLE")
+                };
+                assert!(matches!(
+                    of.actions,
+                    [AlterAction::SetTypeMembership(Some(_))]
+                ));
+                let Some(Stmt::AlterTable(not_of)) = parser.next_stmt().unwrap() else {
+                    panic!("NOT OF did not parse as ALTER TABLE")
+                };
+                assert!(matches!(
+                    not_of.actions,
+                    [AlterAction::SetTypeMembership(None)]
+                ));
+                let Some(Stmt::AlterTable(default_access_method)) = parser.next_stmt().unwrap()
+                else {
+                    panic!("SET ACCESS METHOD DEFAULT did not parse as ALTER TABLE")
+                };
+                assert!(matches!(
+                    default_access_method.actions,
+                    [AlterAction::ResetAccessMethod]
+                ));
+                let Some(Stmt::AlterTablesTablespace {
+                    source,
+                    owners,
+                    target,
+                    nowait,
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER TABLE ALL IN TABLESPACE did not have a closed parse state")
+                };
+                assert_eq!(source, "old_space");
+                assert_eq!(owners, ["postgres"]);
+                assert_eq!(target, "new_space");
+                assert!(nowait);
             },
         );
     }

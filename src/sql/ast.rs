@@ -949,6 +949,13 @@ pub enum Stmt<'a> {
         target: &'a str,
         nowait: bool,
     },
+    /// ALTER TABLE ALL IN TABLESPACE ... SET TABLESPACE ... .
+    AlterTablesTablespace {
+        source: &'a str,
+        owners: &'a [&'a str],
+        target: &'a str,
+        nowait: bool,
+    },
     /// DROP INDEX [CONCURRENTLY] [IF EXISTS] name [, ...] [CASCADE|RESTRICT].
     DropIndex {
         names: &'a [QualName<'a>],
@@ -4707,7 +4714,10 @@ pub enum AlterAction<'a> {
         from: &'a str,
         to: &'a str,
     },
-    AddColumn(ColumnDef<'a>),
+    AddColumn {
+        definition: ColumnDef<'a>,
+        if_not_exists: bool,
+    },
     DropColumn {
         name: &'a str,
         if_exists: bool,
@@ -4845,6 +4855,19 @@ pub enum AlterAction<'a> {
     SetTablespace(&'a str),
     /// ALTER TABLE ... SET ACCESS METHOD heap.
     SetAccessMethod(TableAccessMethod<'a>),
+    /// ALTER TABLE ... SET ACCESS METHOD DEFAULT resolves the server's
+    /// configured default at the executor boundary.
+    ResetAccessMethod,
+    /// ALTER TABLE ... CLUSTER ON index selects the default index for a later
+    /// CLUSTER command without rewriting rows.
+    SetCluster(QualName<'a>),
+    /// ALTER TABLE ... SET WITHOUT CLUSTER clears that selection.
+    ClearCluster,
+    /// PostgreSQL retains this historical spelling as a no-state operation.
+    SetWithoutOids,
+    /// `OF` and `NOT OF` are one identity transition: a table is either bound
+    /// to one resolved composite type or explicitly has no typed-table edge.
+    SetTypeMembership(Option<QualName<'a>>),
     /// ALTER TABLE ... REPLICA IDENTITY controls the old tuple emitted for
     /// logical UPDATE and DELETE messages.
     SetReplicaIdentity(ReplicaIdentityTarget<'a>),

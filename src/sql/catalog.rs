@@ -1297,12 +1297,12 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_transform",
                 &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("trftype", ColType::Int4),
-                    ("trflang", ColType::Int4),
-                    ("trffromsql", ColType::Int4),
-                    ("trftosql", ColType::Int4),
+                    ("tableoid", ColType::Oid),
+                    ("oid", ColType::Oid),
+                    ("trftype", ColType::Oid),
+                    ("trflang", ColType::Oid),
+                    ("trffromsql", ColType::Regproc),
+                    ("trftosql", ColType::Regproc),
                 ],
             ),
             &[],

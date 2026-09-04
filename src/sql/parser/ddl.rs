@@ -20,7 +20,7 @@ use crate::sql::ast::{
     CreateEventTrigger, CreateForeignDataWrapper, CreateForeignServer, CreateForeignTable,
     CreateOperator, CreateOperatorClass, CreateRoutine, CreateRule, CreateSchemaElement,
     CreateStatistics, CreateTextSearchConfiguration, CreateTextSearchDictionary,
-    CreateTextSearchParser, CreateTextSearchTemplate, CreateTrigger, DomainCheck,
+    CreateTextSearchParser, CreateTextSearchTemplate, CreateTransform, CreateTrigger, DomainCheck,
     EventTriggerEvent, ExclusionOperator, Expr, ExtensionMemberIdentity, ExtensionRelationKind,
     ForeignDataHandler, ForeignDataValidator, ForeignOption, ForeignOptionAction,
     ForeignSchemaSelection, ForeignUser, ImportForeignSchema, IndexAccessMethod, IndexBuildMode,
@@ -36,7 +36,7 @@ use crate::sql::ast::{
     SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
     SubscriptionStreaming, SubscriptionSynchronousCommit, TableAccessMethod, TableMembership,
     TablespaceOptionNames, TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind,
-    TextSearchOption, TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming,
+    TextSearchOption, TransformFunction, TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming,
     TriggerTransitionTables, ViewSecurity, ViewSecurityBarrier,
 };
 use crate::sql::eval::sqlstate;
@@ -1455,6 +1455,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("cast")? {
             return self.create_cast();
         }
+        if self.eat_ident("transform")? {
+            return self.create_transform();
+        }
         if self.eat_ident("operator")? {
             if self.eat_ident("family")? {
                 return self.create_operator_family();
@@ -1682,6 +1685,61 @@ impl<'a> Parser<'a> {
             target_type,
             method,
             context,
+        }))
+    }
+
+    fn transform_function(&mut self) -> Result<TransformFunction<'a>, ParseError> {
+        if self.eat_ident("with")? {
+            self.expect_ident("function")?;
+            Ok(TransformFunction::WithFunction {
+                name: self.qual_name("transform function")?,
+                argument_types: self.optional_type_signature()?,
+            })
+        } else {
+            self.expect_ident("without")?;
+            self.expect_ident("function")?;
+            Ok(TransformFunction::WithoutFunction)
+        }
+    }
+
+    fn create_transform(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("for")?;
+        let type_name = self.unmodified_type_name()?;
+        self.expect_ident("language")?;
+        let language = self.col_ident("language name")?;
+        self.expect_op("(")?;
+        let mut from_sql = None;
+        let mut to_sql = None;
+        let mut first = true;
+        while from_sql.is_none() || to_sql.is_none() {
+            if !first {
+                self.expect_op(",")?;
+            }
+            first = false;
+            if self.eat_ident("from")? {
+                self.expect_ident("sql")?;
+                if from_sql.is_some() {
+                    return Err(
+                        self.err_here("FROM SQL transform function specified more than once")
+                    );
+                }
+                from_sql = Some(self.transform_function()?);
+            } else if self.eat_ident("to")? {
+                self.expect_ident("sql")?;
+                if to_sql.is_some() {
+                    return Err(self.err_here("TO SQL transform function specified more than once"));
+                }
+                to_sql = Some(self.transform_function()?);
+            } else {
+                return Err(self.err_here("expected FROM SQL or TO SQL transform function"));
+            }
+        }
+        self.expect_op(")")?;
+        Ok(Stmt::CreateTransform(CreateTransform {
+            type_name,
+            language,
+            from_sql: from_sql.expect("transform parser checked FROM SQL"),
+            to_sql: to_sql.expect("transform parser checked TO SQL"),
         }))
     }
 
@@ -6357,6 +6415,30 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::DropCast(crate::sql::ast::DropCast {
                 source_type,
                 target_type,
+                if_exists,
+                cascade,
+            }));
+        }
+        if self.eat_ident("transform")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            self.expect_ident("for")?;
+            let type_name = self.unmodified_type_name()?;
+            self.expect_ident("language")?;
+            let language = self.col_ident("language name")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropTransform(crate::sql::ast::DropTransform {
+                type_name,
+                language,
                 if_exists,
                 cascade,
             }));

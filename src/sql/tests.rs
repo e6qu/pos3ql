@@ -4115,6 +4115,54 @@ fn collation_and_conversion_survive_wal_checkpoint_and_cold_object_recovery() {
 }
 
 #[test]
+fn native_hook_ddl_rejects_before_catalog_publication() {
+    let config = test_config("native-hook-ddl");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for sql in [
+        "CREATE TRANSFORM FOR integer LANGUAGE plpgsql (FROM SQL WITHOUT FUNCTION, TO SQL WITHOUT FUNCTION)",
+        "DROP TRANSFORM IF EXISTS FOR integer LANGUAGE plpgsql",
+        "LOAD 'untrusted-library'",
+        "SECURITY LABEL ON TABLE untrusted_target IS 'label'",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("0A000"), "{sql}: {text}");
+    }
+    let malformed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRANSFORM FOR integer LANGUAGE plpgsql (FROM SQL WITHOUT FUNCTION TO SQL WITHOUT FUNCTION)",
+    );
+    let malformed = String::from_utf8_lossy(&malformed);
+    assert!(
+        malformed.contains("42601"),
+        "transform clauses must retain PostgreSQL's comma boundary: {malformed}"
+    );
+    let malformed = run_with(
+        &mut engine,
+        &mut budget,
+        "SECURITY LABEL ON TABLE IS 'label'",
+    );
+    let malformed = String::from_utf8_lossy(&malformed);
+    assert!(
+        malformed.contains("42601"),
+        "security-label targets must parse before the provider boundary: {malformed}"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT tableoid, oid, trftype, trflang, trffromsql, trftosql FROM pg_transform",
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [26, 26, 26, 26, 24, 24],
+        "pg_transform must retain PostgreSQL's oid/regproc wire shape"
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
     let config = test_config("cast-operator-ddl");
     let mut budget = Budget::new(1 << 29);

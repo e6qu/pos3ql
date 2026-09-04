@@ -955,6 +955,8 @@ impl<'a> Parser<'a> {
             Tok::Ident("call") => self.call_procedure(),
             Tok::Ident("do") => self.do_block(),
             Tok::Ident("comment") => self.comment(),
+            Tok::Ident("security") => self.security_label(),
+            Tok::Ident("load") => self.load(),
             Tok::Ident("truncate") => self.truncate(),
             Tok::Ident("lock") => self.lock_table(),
             Tok::Ident("declare") => self.declare_cursor(),
@@ -6344,11 +6346,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `COMMENT ON <object> IS { 'text' | NULL }`.
-    fn comment(&mut self) -> Result<Stmt<'a>, ParseError> {
+    fn comment_target(&mut self) -> Result<crate::sql::ast::CommentTarget<'a>, ParseError> {
         use crate::sql::ast::{CommentRelKind, CommentTarget, RoutineTargetKind};
-        self.expect_ident("comment")?;
-        self.expect_ident("on")?;
         let target = if self.eat_ident("table")? {
             CommentTarget::Relation {
                 kind: CommentRelKind::Table,
@@ -6548,13 +6547,52 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.err_here("unsupported COMMENT ON object type"));
         };
+        Ok(target)
+    }
+
+    fn comment_text(&mut self) -> Result<Option<&'a str>, ParseError> {
         self.expect_ident("is")?;
         let text = match self.expression(0)? {
             Expr::Str(s) => Some(*s),
             Expr::Null => None,
             _ => return Err(self.err_here("COMMENT value must be a string literal or NULL")),
         };
+        Ok(text)
+    }
+
+    /// `COMMENT ON <object> IS { 'text' | NULL }`.
+    fn comment(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("comment")?;
+        self.expect_ident("on")?;
+        let target = self.comment_target()?;
+        let text = self.comment_text()?;
         Ok(Stmt::Comment { target, text })
+    }
+
+    fn security_label(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("security")?;
+        self.expect_ident("label")?;
+        let provider = if self.eat_ident("for")? {
+            Some(self.col_ident("security label provider")?)
+        } else {
+            None
+        };
+        self.expect_ident("on")?;
+        let target = self.comment_target()?;
+        let label = self.comment_text()?;
+        Ok(Stmt::SecurityLabel {
+            provider,
+            target,
+            label,
+        })
+    }
+
+    fn load(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("load")?;
+        let Expr::Str(path) = self.expression(0)? else {
+            return Err(self.err_here("LOAD path must be a string literal"));
+        };
+        Ok(Stmt::Load(path))
     }
 
     /// A type name in `COMMENT ON TYPE/DOMAIN`: keep a user schema qualifier,

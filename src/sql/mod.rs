@@ -356,6 +356,8 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateAggregate(_)
         | Stmt::CreateCast(_)
         | Stmt::DropCast { .. }
+        | Stmt::CreateTransform(_)
+        | Stmt::DropTransform(_)
         | Stmt::CreateOperator(_)
         | Stmt::AlterOperator { .. }
         | Stmt::DropOperator { .. }
@@ -452,6 +454,8 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::Vacuum { .. }
         | Stmt::Notify { .. }
         | Stmt::Comment { .. }
+        | Stmt::SecurityLabel { .. }
+        | Stmt::Load(_)
         | Stmt::AlterOwner { .. }
         | Stmt::AlterLargeObjectOwner { .. }
         | Stmt::CreateRole { .. }
@@ -12143,6 +12147,18 @@ impl Engine {
             Stmt::DropCast(cast) => {
                 exec::drop_cast(&mut self.storage, &mut self.wal, txn, *cast, responder)
             }
+            Stmt::CreateTransform(_) | Stmt::DropTransform(_) => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "transforms require procedural-language type hooks, which pos3ql does not host"
+            ))),
+            Stmt::Load(_) => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "LOAD is not supported; pos3ql does not load native shared libraries"
+            ))),
+            Stmt::SecurityLabel { .. } => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "SECURITY LABEL requires a native security label provider, which pos3ql does not host"
+            ))),
             Stmt::CreateOperator(operator) => {
                 exec::create_operator(&mut self.storage, &mut self.wal, txn, operator, responder)
             }

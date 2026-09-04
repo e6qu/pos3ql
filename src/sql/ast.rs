@@ -565,6 +565,8 @@ pub enum Stmt<'a> {
     CreateAggregate(CreateAggregate<'a>),
     CreateCast(CreateCast<'a>),
     DropCast(DropCast<'a>),
+    CreateTransform(CreateTransform<'a>),
+    DropTransform(DropTransform<'a>),
     CreateOperator(CreateOperator<'a>),
     AlterOperator {
         identity: OperatorIdentity<'a>,
@@ -1133,6 +1135,16 @@ pub enum Stmt<'a> {
         target: CommentTarget<'a>,
         text: Option<&'a str>,
     },
+    /// A parsed provider, target, and label prevent malformed security-label
+    /// syntax from being hidden by the absent native provider boundary.
+    SecurityLabel {
+        provider: Option<&'a str>,
+        target: CommentTarget<'a>,
+        label: Option<&'a str>,
+    },
+    /// LOAD is intentionally not an application extension point: object-store
+    /// durability cannot safely host a session-loaded native library.
+    Load(&'a str),
     /// ALTER <supported object> name OWNER TO role. Every catalog object is
     /// owned by the one modeled role, but the target and requested role are
     /// still validated exactly.
@@ -2413,6 +2425,34 @@ pub struct CreateCast<'a> {
 pub struct DropCast<'a> {
     pub source_type: &'a str,
     pub target_type: &'a str,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+/// `WITH FUNCTION` and `WITHOUT FUNCTION` are distinct PostgreSQL grammar
+/// states. Keeping the former signature prevents an omitted signature from
+/// being mistaken for an unqualified function name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformFunction<'a> {
+    WithFunction {
+        name: QualName<'a>,
+        argument_types: &'a [&'a str],
+    },
+    WithoutFunction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTransform<'a> {
+    pub type_name: &'a str,
+    pub language: &'a str,
+    pub from_sql: TransformFunction<'a>,
+    pub to_sql: TransformFunction<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTransform<'a> {
+    pub type_name: &'a str,
+    pub language: &'a str,
     pub if_exists: bool,
     pub cascade: bool,
 }

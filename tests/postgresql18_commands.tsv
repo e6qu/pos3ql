@@ -103,7 +103,7 @@ CREATE TEXT SEARCH CONFIGURATION	complete	tests/external/differential/123_full_t
 CREATE TEXT SEARCH DICTIONARY	complete	tests/external/differential/123_full_text_search.sql
 CREATE TEXT SEARCH PARSER	complete	tests/external/differential/123_full_text_search.sql
 CREATE TEXT SEARCH TEMPLATE	complete	tests/external/differential/123_full_text_search.sql
-CREATE TRANSFORM	missing	-
+CREATE TRANSFORM	complete	sql::tests::native_hook_ddl_rejects_before_catalog_publication
 CREATE TRIGGER	complete	101_trigger_timing.sql
 CREATE TYPE	partial	63_enums.sql
 CREATE USER	complete	83_roles_acl.sql and 100_role_credentials.sql
@@ -151,7 +151,7 @@ DROP TEXT SEARCH CONFIGURATION	complete	tests/external/differential/123_full_tex
 DROP TEXT SEARCH DICTIONARY	complete	tests/external/differential/123_full_text_search.sql
 DROP TEXT SEARCH PARSER	complete	tests/external/differential/123_full_text_search.sql
 DROP TEXT SEARCH TEMPLATE	complete	tests/external/differential/123_full_text_search.sql
-DROP TRANSFORM	missing	-
+DROP TRANSFORM	complete	sql::tests::native_hook_ddl_rejects_before_catalog_publication
 DROP TRIGGER	complete	101_trigger_timing.sql
 DROP TYPE	complete	63_enums.sql
 DROP USER	complete	83_roles_acl.sql and 100_role_credentials.sql
@@ -165,7 +165,7 @@ GRANT	partial	83_roles_acl.sql and 133_privilege_targets.sql
 IMPORT FOREIGN SCHEMA	complete	tests/external/ci_diff.sh
 INSERT	complete	02_dml_returning.sql
 LISTEN	complete	14_surface.sql
-LOAD	missing	-
+LOAD	complete	sql::tests::native_hook_ddl_rejects_before_catalog_publication
 LOCK	complete	67_for_update.sql
 MERGE	partial	58_merge.sql
 MOVE	complete	39_cursors.sql
@@ -182,7 +182,7 @@ ROLLBACK	complete	05_transactions.sql
 ROLLBACK PREPARED	complete	120_two_phase_transactions.sql
 ROLLBACK TO SAVEPOINT	complete	05_transactions.sql
 SAVEPOINT	complete	05_transactions.sql
-SECURITY LABEL	missing	-
+SECURITY LABEL	complete	sql::tests::native_hook_ddl_rejects_before_catalog_publication
 SELECT	complete	14_surface.sql
 SELECT INTO	complete	69_select_into.sql
 SET	complete	75_guc_mutation.sql and 119_transaction_configuration.sql

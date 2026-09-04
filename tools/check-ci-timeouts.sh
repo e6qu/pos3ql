@@ -53,5 +53,24 @@ for spill_entry in \
     fi
 done
 
+# Four independent VOPR ranges preserve the complete 16-seed corpus while
+# keeping each range, including a cold rebuild, within its five-minute cap.
+vopr_workflow=.github/workflows/ci.yml
+for vopr_range in \
+    '- { first: 460259, last: 460262 }' \
+    '- { first: 460263, last: 460266 }' \
+    '- { first: 460267, last: 460270 }' \
+    '- { first: 460271, last: 460274 }'; do
+    if ! grep -Fq -- "$vopr_range" "$vopr_workflow"; then
+        printf 'CI timeout guard: missing storage VOPR range %s\n' "$vopr_range" >&2
+        failed=1
+    fi
+done
+vopr_invocations=$(grep -Fc 'POS3QL_STORAGE_VOPR_SEED0=${{ matrix.first }} cargo test' "$vopr_workflow")
+if (( vopr_invocations != 1 )); then
+    printf 'CI timeout guard: storage VOPR must run one range per job (found %s invocations)\n' "$vopr_invocations" >&2
+    failed=1
+fi
+
 (( failed == 0 )) || exit 1
 printf 'CI timeout guard: every declared timeout is at most %s minutes\n' "$limit"

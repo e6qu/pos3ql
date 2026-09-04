@@ -7732,8 +7732,9 @@ mod tests {
                 let Some(Stmt::CreateTable(table)) = parser.next_stmt().unwrap() else {
                     panic!("LIKE INCLUDING ALL did not parse")
                 };
-                assert!(table.likes[0].all);
                 assert!(!table.likes[0].defaults);
+                assert!(table.likes[0].storage);
+                assert!(table.likes[0].compression);
             },
         );
     }

@@ -7525,7 +7525,6 @@ impl<'a> Parser<'a> {
             generated: false,
             storage: false,
             compression: false,
-            all: false,
         }; MAX_LIST];
         let mut n_likes = 0;
         loop {
@@ -7911,7 +7910,6 @@ impl<'a> Parser<'a> {
             generated: false,
             storage: false,
             compression: false,
-            all: false,
         };
         loop {
             let including = if self.eat_ident("including")? {
@@ -7939,7 +7937,6 @@ impl<'a> Parser<'a> {
                     clause.generated = including;
                     clause.storage = including;
                     clause.compression = including;
-                    clause.all = including;
                 }
                 Tok::Ident(other @ ("comments" | "statistics")) => {
                     return Err(ParseError {

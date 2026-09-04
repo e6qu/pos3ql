@@ -90,6 +90,8 @@ fn empty_meta() -> ColumnMeta {
         ctype: ColType::Bool,
         type_mod: -1,
         collation: crate::sql::ast::Collation::None,
+        storage: crate::sql::ast::ColumnStorage::Plain,
+        compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         unique: false,
         primary: false,
@@ -297,6 +299,8 @@ pub(super) fn build_column(
             ctype.name()
         ));
     }
+    let column_storage = c.storage.unwrap_or_else(|| default_column_storage(ctype));
+    validate_column_storage(c.name, ctype, column_storage, c.compression)?;
     Ok(ColumnMeta {
         name: SqlName::parse(c.name)?,
         ctype,
@@ -306,6 +310,8 @@ pub(super) fn build_column(
         } else {
             crate::sql::ast::Collation::None
         },
+        storage: column_storage,
+        compression: c.compression,
         not_null: crate::storage::NotNullOrigin::local(c.not_null || auto_increment),
         unique: c.unique,
         primary: c.primary,
@@ -317,6 +323,56 @@ pub(super) fn build_column(
         user_type,
         statistics_target: -1,
     })
+}
+
+/// PostgreSQL exposes `p` for fixed-width and tsquery values; the remaining
+/// modeled varlena types start at the ordinary EXTENDED policy.
+pub(super) fn default_column_storage(ctype: ColType) -> crate::sql::ast::ColumnStorage {
+    if ctype.typlen() >= 0 || matches!(ctype, ColType::TsQuery) {
+        crate::sql::ast::ColumnStorage::Plain
+    } else {
+        crate::sql::ast::ColumnStorage::Extended
+    }
+}
+
+/// Storage and compression are catalog-visible schema properties. They are
+/// accepted only for the type families PostgreSQL can TOAST; object blocks keep
+/// their independent provider-neutral codec.
+pub(super) fn validate_column_storage(
+    name: &str,
+    ctype: ColType,
+    storage: crate::sql::ast::ColumnStorage,
+    compression: crate::sql::ast::ColumnCompression,
+) -> Result<(), SqlError> {
+    let toastable = ctype.typlen() < 0 && !matches!(ctype, ColType::TsQuery);
+    if !toastable && storage != crate::sql::ast::ColumnStorage::Plain {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot set storage option to {} for column \"{}\"",
+            match storage {
+                crate::sql::ast::ColumnStorage::Plain => "PLAIN",
+                crate::sql::ast::ColumnStorage::External => "EXTERNAL",
+                crate::sql::ast::ColumnStorage::Extended => "EXTENDED",
+                crate::sql::ast::ColumnStorage::Main => "MAIN",
+            },
+            name
+        ));
+    }
+    if toastable && storage == crate::sql::ast::ColumnStorage::Plain {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot set storage option to PLAIN for column \"{}\"",
+            name
+        ));
+    }
+    if compression != crate::sql::ast::ColumnCompression::Default && !toastable {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "compression is not supported for column \"{}\"",
+            name
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn resolve_parsed_collation(

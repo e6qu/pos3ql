@@ -855,6 +855,13 @@ pub struct ColumnMeta {
     /// numeric(p,s) encodes `((p<<16)|s) + 4`. Enforced during coercion.
     pub type_mod: i32,
     pub collation: Collation,
+    /// PostgreSQL's durable `attstorage` policy. The object-native row format
+    /// may choose a different block layout, but catalog and schema identity do
+    /// not lose the client-visible setting.
+    pub storage: crate::sql::ast::ColumnStorage,
+    /// PostgreSQL's durable `attcompression` policy (`Default` is empty in the
+    /// catalog). It is retained separately from the object block codec.
+    pub compression: crate::sql::ast::ColumnCompression,
     pub not_null: NotNullOrigin,
     pub unique: bool,
     pub primary: bool,
@@ -1045,6 +1052,8 @@ impl ColumnMeta {
         ctype: ColType::Bool,
         type_mod: -1,
         collation: Collation::None,
+        storage: crate::sql::ast::ColumnStorage::Plain,
+        compression: crate::sql::ast::ColumnCompression::Default,
         not_null: NotNullOrigin::Nullable,
         unique: false,
         primary: false,
@@ -12001,22 +12010,7 @@ impl Storage {
                     database: DatabaseOid::POSTGRES,
                     def: TableDef {
                         name: SqlName::parse("").expect("empty name fits"),
-                        columns: [ColumnMeta {
-                            name: SqlName::parse("").expect("empty name fits"),
-                            ctype: ColType::Bool,
-                            type_mod: -1,
-                            collation: Collation::None,
-                            not_null: NotNullOrigin::Nullable,
-                            unique: false,
-                            primary: false,
-                            auto_increment: false,
-                            default: ColumnDefault::NONE,
-                            is_identity: false,
-                            identity_always: false,
-                            auto_increment_step: 1,
-                            user_type: None,
-                            statistics_target: -1,
-                        }; MAX_COLUMNS],
+                        columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
                         n_columns: 0,
                         ..TableDef::empty()
                     },
@@ -37613,22 +37607,7 @@ mod tests {
         let mut def = TableDef {
             schema: SqlName::parse("public").unwrap(),
             name: SqlName::parse(name).unwrap(),
-            columns: [ColumnMeta {
-                name: SqlName::parse("").unwrap(),
-                ctype: ColType::Bool,
-                type_mod: -1,
-                collation: Collation::None,
-                not_null: NotNullOrigin::Nullable,
-                unique: false,
-                primary: false,
-                auto_increment: false,
-                default: ColumnDefault::NONE,
-                is_identity: false,
-                identity_always: false,
-                auto_increment_step: 1,
-                user_type: None,
-                statistics_target: -1,
-            }; MAX_COLUMNS],
+            columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: columns.len(),
             ..TableDef::empty()
         };
@@ -37642,6 +37621,8 @@ mod tests {
                 } else {
                     Collation::None
                 },
+                storage: crate::sql::ast::ColumnStorage::Plain,
+                compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: NotNullOrigin::local(*nn),
                 unique: false,
                 primary: false,

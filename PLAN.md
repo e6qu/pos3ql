@@ -112,4 +112,5 @@ One large PR is open at a time; it is merged and `main` is refreshed before the 
 - Checksums, immutable blocks, and CAS manifests make cache loss recoverable.
 - Cancellation keys are parsed as protocol-versioned values: v3.0 uses four bytes and v3.2 uses the full issued key.
 - Network values are constructed only from a valid address family, mask, and canonical address bytes; `cidr` additionally requires host bits clear.
+- A table column owns validated storage and compression policies. Parsing, `pg_attribute`, WAL, checkpoints, and object-cold recovery retain the same state; object blocks retain their provider-neutral codec.
 - Verification includes unit/property tests, PostgreSQL differential and SQLLogicTest corpora, driver probes, cold-start/crash recovery, and deterministic fault simulation. Golden `psql` tests compare stdout and stderr separately; CI uses runner `psql` for ordinary SQL, PostgreSQL 18 `psql` for its protocol meta-commands, and PostgreSQL 18 image dump tools. Forced-spill corpora and independent probes have separate bounded workers.

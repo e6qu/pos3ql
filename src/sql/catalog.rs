@@ -6635,22 +6635,7 @@ fn def_of<'a>(name: &'a str, columns: &'a [(&'a str, ColType)]) -> SynthDef<'a> 
 fn materialize_def(specification: SynthDef<'_>) -> TableDef {
     let mut definition = TableDef {
         name: SqlName::parse(specification.name).expect("catalog name fits"),
-        columns: [ColumnMeta {
-            name: SqlName::parse("").unwrap(),
-            ctype: ColType::Bool,
-            type_mod: -1,
-            collation: crate::sql::ast::Collation::None,
-            not_null: crate::storage::NotNullOrigin::Nullable,
-            unique: false,
-            primary: false,
-            auto_increment: false,
-            default: crate::storage::ColumnDefault::NONE,
-            is_identity: false,
-            identity_always: false,
-            auto_increment_step: 1,
-            user_type: None,
-            statistics_target: -1,
-        }; MAX_COLUMNS],
+        columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
         n_columns: specification.columns.len(),
         ..TableDef::empty()
     };
@@ -10780,6 +10765,8 @@ fn catalog_column_type_mod(column: &ColumnMeta) -> i32 {
     }
 }
 
+/// Synthetic catalog relations do not own a durable column policy; render the
+/// PostgreSQL type default for their `pg_attribute` rows.
 fn type_storage(ctype: ColType) -> &'static str {
     if matches!(ctype, ColType::TsQuery) || ctype.typlen() >= 0 {
         "p"
@@ -10878,10 +10865,23 @@ fn pg_attribute<'a>(
                         arena,
                     )?, // attidentity: always 'a' / by default 'd'
                     text(if c.default.is_generated() { "s" } else { "" }, arena)?, // attgenerated
-                    // Fixed-width values are plain; variable-width values use
-                    // PostgreSQL's ordinary extended storage policy.
-                    text(type_storage(c.ctype), arena)?,
-                    text("", arena)?, // attcompression: type default
+                    text(
+                        match c.storage {
+                            crate::sql::ast::ColumnStorage::Plain => "p",
+                            crate::sql::ast::ColumnStorage::External => "e",
+                            crate::sql::ast::ColumnStorage::Extended => "x",
+                            crate::sql::ast::ColumnStorage::Main => "m",
+                        },
+                        arena,
+                    )?,
+                    text(
+                        match c.compression {
+                            crate::sql::ast::ColumnCompression::Default => "",
+                            crate::sql::ast::ColumnCompression::Pglz => "p",
+                            crate::sql::ast::ColumnCompression::Lz4 => "l",
+                        },
+                        arena,
+                    )?,
                     // PostgreSQL exposes its durable `-1` default sentinel as NULL.
                     if c.statistics_target < 0 {
                         Datum::Null
@@ -10970,6 +10970,8 @@ fn pg_attribute<'a>(
                 ctype: field.ctype,
                 type_mod: field.type_mod,
                 collation: field.collation,
+                storage: crate::sql::ast::ColumnStorage::Plain,
+                compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 unique: false,
                 primary: false,
@@ -16612,6 +16614,8 @@ fn info_columns<'a>(
                 } else {
                     crate::sql::ast::Collation::None
                 },
+                storage: crate::sql::ast::ColumnStorage::Plain,
+                compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 unique: false,
                 primary: false,
@@ -18029,6 +18033,8 @@ fn info_column_privileges<'a>(
                 } else {
                     crate::sql::ast::Collation::None
                 },
+                storage: crate::sql::ast::ColumnStorage::Plain,
+                compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 unique: false,
                 primary: false,
@@ -18544,6 +18550,8 @@ fn info_column_type_usage<'a>(
                 } else {
                     crate::sql::ast::Collation::None
                 },
+                storage: crate::sql::ast::ColumnStorage::Plain,
+                compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
                 unique: false,
                 primary: false,

@@ -7498,6 +7498,8 @@ impl<'a> Parser<'a> {
             type_mod: -1,
             collation: crate::sql::ast::ParsedCollation::DEFAULT,
             foreign_options: &[],
+            storage: None,
+            compression: crate::sql::ast::ColumnCompression::Default,
             not_null: false,
             unique: false,
             primary: false,
@@ -7521,6 +7523,8 @@ impl<'a> Parser<'a> {
             indexes: false,
             identity: false,
             generated: false,
+            storage: false,
+            compression: false,
         }; MAX_LIST];
         let mut n_likes = 0;
         loop {
@@ -7584,6 +7588,22 @@ impl<'a> Parser<'a> {
                 self.foreign_options()?
             } else {
                 &[]
+            };
+            let storage = if self.eat_ident("storage")? {
+                if foreign {
+                    return Err(self.err_here("foreign columns do not support STORAGE"));
+                }
+                self.column_storage(true)?
+            } else {
+                None
+            };
+            let compression = if self.eat_ident("compression")? {
+                if foreign {
+                    return Err(self.err_here("foreign columns do not support COMPRESSION"));
+                }
+                self.column_compression()?
+            } else {
+                crate::sql::ast::ColumnCompression::Default
             };
             let collation = if self.eat_ident("collate")? {
                 self.collation_name()?
@@ -7695,6 +7715,8 @@ impl<'a> Parser<'a> {
                 type_mod,
                 collation,
                 foreign_options,
+                storage,
+                compression,
                 not_null,
                 unique,
                 primary,
@@ -7886,6 +7908,8 @@ impl<'a> Parser<'a> {
             indexes: false,
             identity: false,
             generated: false,
+            storage: false,
+            compression: false,
         };
         loop {
             let including = if self.eat_ident("including")? {
@@ -7895,28 +7919,23 @@ impl<'a> Parser<'a> {
             } else {
                 return Ok(clause);
             };
-            // PostgreSQL's option set. The four this engine has no notion of
-            // are rejected rather than accepted and quietly dropped; ALL does
-            // not name them, so it stays legal.
+            // COMMENTS and STATISTICS refer to separate catalog objects, not
+            // column properties. Accepting them without copying those objects
+            // would silently change a table definition.
             match self.peeked {
                 Tok::Ident("defaults") => clause.defaults = including,
                 Tok::Ident("constraints") => clause.constraints = including,
                 Tok::Ident("indexes") => clause.indexes = including,
                 Tok::Ident("identity") => clause.identity = including,
                 Tok::Ident("generated") => clause.generated = including,
-                Tok::Ident("all") => {
-                    clause.defaults = including;
-                    clause.constraints = including;
-                    clause.indexes = including;
-                    clause.identity = including;
-                    clause.generated = including;
-                }
-                Tok::Ident(other @ ("comments" | "compression" | "statistics" | "storage")) => {
+                Tok::Ident("storage") => clause.storage = including,
+                Tok::Ident("compression") => clause.compression = including,
+                Tok::Ident(other @ ("comments" | "statistics" | "all")) => {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(
                             96,
-                            "INCLUDING {} is not supported: this engine has no such column property",
+                            "INCLUDING {} is not supported: it requires copying catalog objects",
                             other
                         ),
                         sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,

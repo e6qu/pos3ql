@@ -1275,26 +1275,119 @@ fn large_objects_survive_checkpoint_wal_and_prepared_transaction_recovery() {
 }
 
 #[test]
-fn unsupported_column_storage_and_compression_fail_loudly() {
-    let (mut engine, mut budget) = test_engine();
-    assert!(
-        !String::from_utf8_lossy(&run_with(
+fn column_storage_and_compression_are_catalogued_and_object_cold_durable() {
+    let mut config = test_config("column-storage-compression");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("column-storage-compression-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
             &mut engine,
             &mut budget,
-            "CREATE TABLE storage_boundary_rows (payload text)"
-        ))
-        .contains("ERROR")
-    );
-    for statement in [
-        "ALTER TABLE storage_boundary_rows ALTER COLUMN payload SET STORAGE EXTERNAL",
-        "ALTER TABLE storage_boundary_rows ALTER COLUMN payload SET COMPRESSION pglz",
-    ] {
-        let output = run_with(&mut engine, &mut budget, statement);
-        assert!(
-            String::from_utf8_lossy(&output).contains("0A000"),
-            "{statement}"
+            "CREATE TABLE durable_column_attributes (\
+                 id integer,\
+                 body text STORAGE MAIN COMPRESSION pglz,\
+                 payload bytea STORAGE EXTERNAL COMPRESSION lz4\
+             )",
         );
+        assert_eq!(
+            data_rows(&setup),
+            Vec::<String>::new(),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attname, attstorage, attcompression FROM pg_attribute \
+              WHERE attrelid = 'durable_column_attributes'::regclass AND attnum > 0 \
+              ORDER BY attnum",
+        );
+        assert_eq!(
+            data_rows(&created),
+            ["id|p|", "body|m|p", "payload|e|l"],
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        let altered = run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TABLE durable_column_attributes ALTER COLUMN body SET STORAGE EXTENDED",
+        );
+        assert!(
+            !String::from_utf8_lossy(&altered).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&altered)
+        );
+        let altered = run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TABLE durable_column_attributes ALTER COLUMN body SET COMPRESSION DEFAULT",
+        );
+        assert!(
+            !String::from_utf8_lossy(&altered).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&altered)
+        );
+        let altered = run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TABLE durable_column_attributes ALTER COLUMN payload SET COMPRESSION pglz",
+        );
+        assert!(
+            !String::from_utf8_lossy(&altered).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&altered)
+        );
+        let altered = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT attname, attstorage, attcompression FROM pg_attribute \
+              WHERE attrelid = 'durable_column_attributes'::regclass AND attnum > 0 \
+              ORDER BY attnum",
+        );
+        assert_eq!(
+            data_rows(&altered),
+            ["id|p|", "body|x|", "payload|e|p"],
+            "{}",
+            String::from_utf8_lossy(&altered)
+        );
+        let invalid = run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER TABLE durable_column_attributes ALTER COLUMN id SET STORAGE EXTERNAL",
+        );
+        assert!(
+            String::from_utf8_lossy(&invalid).contains("0A000"),
+            "{}",
+            String::from_utf8_lossy(&invalid)
+        );
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
     }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT attname, attstorage, attcompression FROM pg_attribute \
+              WHERE attrelid = 'durable_column_attributes'::regclass AND attnum > 0 \
+              ORDER BY attnum"
+        )),
+        ["id|p|", "body|x|", "payload|e|p"]
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

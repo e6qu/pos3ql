@@ -3513,6 +3513,9 @@ pub struct LikeClause<'a> {
     pub storage: bool,
     /// `INCLUDING COMPRESSION` — the source column's compression policy.
     pub compression: bool,
+    /// `INCLUDING ALL` selects every table-definition property represented by
+    /// this closed state.
+    pub all: bool,
 }
 
 /// A table-level constraint, or a column-level CHECK/REFERENCES desugared to

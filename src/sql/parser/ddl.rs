@@ -7525,6 +7525,7 @@ impl<'a> Parser<'a> {
             generated: false,
             storage: false,
             compression: false,
+            all: false,
         }; MAX_LIST];
         let mut n_likes = 0;
         loop {
@@ -7910,6 +7911,7 @@ impl<'a> Parser<'a> {
             generated: false,
             storage: false,
             compression: false,
+            all: false,
         };
         loop {
             let including = if self.eat_ident("including")? {
@@ -7920,8 +7922,7 @@ impl<'a> Parser<'a> {
                 return Ok(clause);
             };
             // COMMENTS and STATISTICS refer to separate catalog objects, not
-            // column properties. Accepting them without copying those objects
-            // would silently change a table definition.
+            // column properties. They cannot become inert option bits.
             match self.peeked {
                 Tok::Ident("defaults") => clause.defaults = including,
                 Tok::Ident("constraints") => clause.constraints = including,
@@ -7930,7 +7931,17 @@ impl<'a> Parser<'a> {
                 Tok::Ident("generated") => clause.generated = including,
                 Tok::Ident("storage") => clause.storage = including,
                 Tok::Ident("compression") => clause.compression = including,
-                Tok::Ident(other @ ("comments" | "statistics" | "all")) => {
+                Tok::Ident("all") => {
+                    clause.defaults = including;
+                    clause.constraints = including;
+                    clause.indexes = including;
+                    clause.identity = including;
+                    clause.generated = including;
+                    clause.storage = including;
+                    clause.compression = including;
+                    clause.all = including;
+                }
+                Tok::Ident(other @ ("comments" | "statistics")) => {
                     return Err(ParseError {
                         at: self.peek_at,
                         message: stack_format!(

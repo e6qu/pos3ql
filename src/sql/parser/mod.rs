@@ -7716,7 +7716,7 @@ mod tests {
                 assert!(table.likes[0].compression);
             },
         );
-        for option in ["COMMENTS", "STATISTICS", "ALL"] {
+        for option in ["COMMENTS", "STATISTICS"] {
             let statement =
                 format!("CREATE TABLE storage_clone (LIKE storage_probe INCLUDING {option})");
             with_parser(&statement, |parser| {
@@ -7726,6 +7726,16 @@ mod tests {
                 );
             });
         }
+        with_parser(
+            "CREATE TABLE storage_clone (LIKE storage_probe INCLUDING ALL EXCLUDING DEFAULTS)",
+            |parser| {
+                let Some(Stmt::CreateTable(table)) = parser.next_stmt().unwrap() else {
+                    panic!("LIKE INCLUDING ALL did not parse")
+                };
+                assert!(table.likes[0].all);
+                assert!(!table.likes[0].defaults);
+            },
+        );
     }
 
     #[test]

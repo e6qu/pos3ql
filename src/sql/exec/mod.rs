@@ -673,7 +673,7 @@ fn create_table_kind(
     if let Err(e) = validate_partitioned_unique_keys(&def) {
         return sql_fail(e);
     }
-    match storage.create_table_in(def, txn.txid) {
+    let created_slot = match storage.create_table_in(def, txn.txid) {
         Ok(slot) => {
             let foreign_slot = if let Some(foreign) = foreign {
                 match storage.create_foreign_table_binding(
@@ -771,6 +771,7 @@ fn create_table_kind(
                     return sql_fail(error);
                 }
             }
+            slot
         }
         Err(e) if e.sqlstate == sqlstate::DUPLICATE_TABLE && statement.if_not_exists => {
             responder.notice(
@@ -782,11 +783,24 @@ fn create_table_kind(
                 )
                 .as_str(),
             )?;
+            responder.command_complete(tag)?;
+            return sql_ok();
         }
         Err(e) => return sql_fail(e),
+    };
+    if foreign.is_none()
+        && let Err(e) =
+            copy_like_statistics(storage, wal, txn, statement, &def, created_slot, arena)
+    {
+        return sql_fail(e);
     }
     if foreign.is_none()
         && let Err(e) = copy_like_indexes(storage, wal, txn, statement, &def)
+    {
+        return sql_fail(e);
+    }
+    if foreign.is_none()
+        && let Err(e) = copy_like_comments(storage, wal, txn, statement, &def, created_slot)
     {
         return sql_fail(e);
     }
@@ -3337,6 +3351,8 @@ struct CopiedIndex {
     options: crate::storage::IndexStorageOptions,
     tablespace: u16,
     unique: bool,
+    source_schema: SqlName,
+    source_name: SqlName,
 }
 
 /// Recreates each `LIKE` source's secondary indexes on the new table. It has no
@@ -3368,6 +3384,8 @@ fn copy_like_indexes(
             options: crate::storage::IndexStorageOptions::DEFAULT,
             tablespace: 0,
             unique: false,
+            source_schema: SqlName::EMPTY,
+            source_name: SqlName::EMPTY,
         }; MAX_LIKE_INDEXES];
         let mut n_copied = 0;
         let source_def = *storage.table_def(
@@ -3403,6 +3421,8 @@ fn copy_like_indexes(
                 options: index.mutable_for(txn.txid).options,
                 tablespace: index.mutable_for(txn.txid).tablespace,
                 unique: index.unique,
+                source_schema: index.schema,
+                source_name: index.name_for(txn.txid),
             };
             n_copied += 1;
         }
@@ -3481,9 +3501,275 @@ fn copy_like_indexes(
                 return Err(e);
             }
             txn.record_ddl(super::txn::DdlUndo::IndexCreated(slot as u32))?;
+            if like.comments {
+                copy_comment_if_present(
+                    storage,
+                    wal,
+                    txn,
+                    CommentIdentity {
+                        class: crate::storage::CommentClass::Relation,
+                        schema: index.source_schema,
+                        name: index.source_name,
+                        subid: 0,
+                    },
+                    CommentIdentity {
+                        class: crate::storage::CommentClass::Relation,
+                        schema: def.schema,
+                        name,
+                        subid: 0,
+                    },
+                )?;
+            }
         }
     }
     Ok(())
+}
+
+fn copy_like_statistics(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    statement: &CreateTable,
+    target: &TableDef,
+    target_slot: usize,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    use crate::sql::ast::{StatisticsExpression, StatisticsKey};
+    use crate::storage::{
+        ExtendedStatisticsSpec, MAX_EXTENDED_STATISTICS_KEYS, MAX_EXTENDED_STATISTICS_PER_TABLE,
+    };
+
+    for like in statement.likes.iter().filter(|like| like.statistics) {
+        let source_slot = resolve_dml_table(storage, &like.source, txn.txid)?;
+        let mut copied = [None; MAX_EXTENDED_STATISTICS_PER_TABLE];
+        let mut count = 0usize;
+        for (slot, definition) in storage.extended_statistics_for_table(source_slot, txn.txid) {
+            copied[count] = Some((slot, *definition));
+            count += 1;
+        }
+        for (source_statistics_slot, source) in copied[..count].iter().copied().flatten() {
+            let definition = source.definition_for(txn.txid);
+            let mut keys = [StatisticsKey::Column(""); MAX_EXTENDED_STATISTICS_KEYS];
+            for (position, key) in source.keys_for(txn.txid).iter().enumerate() {
+                keys[position] = match key {
+                    crate::storage::ExtendedStatisticsKey::Column(column) => {
+                        StatisticsKey::Column(column.as_str())
+                    }
+                    crate::storage::ExtendedStatisticsKey::Expression(source) => {
+                        StatisticsKey::Expression(StatisticsExpression {
+                            expression: crate::sql::parser::parse_expr(source.as_str(), arena)?,
+                            source: source.as_str(),
+                        })
+                    }
+                };
+            }
+            let name = generated_statistics_name(
+                storage,
+                target,
+                &keys[..usize::from(source.n_keys)],
+                txn.txid,
+            )?;
+            let slot = storage.create_extended_statistics(
+                ExtendedStatisticsSpec {
+                    created_at: 0,
+                    schema: target.schema,
+                    name,
+                    table: target_slot as u16,
+                    target: definition.target,
+                    keys: source.keys,
+                    n_keys: source.n_keys,
+                    kinds: source.kinds,
+                    expression_only: source.expression_only,
+                },
+                txn.txid,
+            )?;
+            if let Err(error) = stage_extended_statistics_definition(storage, wal, txn, slot) {
+                storage.rollback_extended_statistics_create(slot);
+                return Err(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::StatisticsCreated(slot as u32))
+            {
+                storage.rollback_extended_statistics_create(slot);
+                return Err(error);
+            }
+            if like.comments {
+                copy_comment_if_present(
+                    storage,
+                    wal,
+                    txn,
+                    CommentIdentity {
+                        class: crate::storage::CommentClass::Statistics,
+                        schema: definition.schema,
+                        name: definition.name,
+                        subid: source_statistics_slot as u32,
+                    },
+                    CommentIdentity {
+                        class: crate::storage::CommentClass::Statistics,
+                        schema: target.schema,
+                        name,
+                        subid: slot as u32,
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copies the comment kinds PostgreSQL defines for `LIKE`: copied columns,
+/// CHECK constraints, and copied NOT NULL constraints. Index and statistics
+/// comments are staged alongside those catalog objects as they are created.
+fn copy_like_comments(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    statement: &CreateTable,
+    target: &TableDef,
+    target_slot: usize,
+) -> Result<(), SqlError> {
+    use crate::storage::CommentClass;
+
+    let mut target_check = 0usize;
+    for like in statement.likes {
+        let source_slot = resolve_dml_table(storage, &like.source, txn.txid)?;
+        let source = *storage.table_def(source_slot, txn.txid);
+        if like.comments {
+            for subid in 1..=source.n_columns {
+                let source_comment = match storage.comment_text(
+                    CommentClass::Relation,
+                    source.schema.as_str(),
+                    source.name.as_str(),
+                    subid as u32,
+                    txn.txid,
+                ) {
+                    Some(text) => Some(crate::storage::comment_stackstr(text)?),
+                    None => None,
+                };
+                let Some(text) = source_comment else {
+                    continue;
+                };
+                let source_column = source.columns()[subid - 1].name.as_str();
+                let target_subid = target.column_index(source_column).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        source_column
+                    )
+                })? as u32
+                    + 1;
+                stage_comment(
+                    storage,
+                    wal,
+                    txn,
+                    CommentIdentity {
+                        class: CommentClass::Relation,
+                        schema: target.schema,
+                        name: target.name,
+                        subid: target_subid,
+                    },
+                    Some(text.as_str()),
+                )?;
+            }
+        }
+        if like.constraints {
+            for check in source.checks() {
+                let copied = target.checks().get(target_check).ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "copied CHECK constraint is missing from target table"
+                    )
+                })?;
+                target_check += 1;
+                if like.comments {
+                    copy_comment_if_present(
+                        storage,
+                        wal,
+                        txn,
+                        CommentIdentity {
+                            class: CommentClass::Constraint,
+                            schema: source.schema,
+                            name: check.name,
+                            subid: source_slot as u32,
+                        },
+                        CommentIdentity {
+                            class: CommentClass::Constraint,
+                            schema: target.schema,
+                            name: copied.name,
+                            subid: target_slot as u32,
+                        },
+                    )?;
+                }
+            }
+        }
+        if !like.comments {
+            continue;
+        }
+        for source_column in source
+            .columns()
+            .iter()
+            .filter(|column| column.not_null.is_required())
+        {
+            let target_column = target
+                .column_index(source_column.name.as_str())
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_COLUMN,
+                        "column \"{}\" does not exist",
+                        source_column.name.as_str()
+                    )
+                })?;
+            let source_name = stack_format!(
+                128,
+                "{}_{}_not_null",
+                source.name.as_str(),
+                source_column.name.as_str()
+            );
+            let target_name = stack_format!(
+                128,
+                "{}_{}_not_null",
+                target.name.as_str(),
+                target.columns()[target_column].name.as_str()
+            );
+            copy_comment_if_present(
+                storage,
+                wal,
+                txn,
+                CommentIdentity {
+                    class: CommentClass::Constraint,
+                    schema: source.schema,
+                    name: SqlName::parse(source_name.as_str())?,
+                    subid: source_slot as u32,
+                },
+                CommentIdentity {
+                    class: CommentClass::Constraint,
+                    schema: target.schema,
+                    name: SqlName::parse(target_name.as_str())?,
+                    subid: target_slot as u32,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_comment_if_present(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    source: CommentIdentity,
+    target: CommentIdentity,
+) -> Result<(), SqlError> {
+    let Some(text) = storage.comment_text(
+        source.class,
+        source.schema.as_str(),
+        source.name.as_str(),
+        source.subid,
+        txn.txid,
+    ) else {
+        return Ok(());
+    };
+    let text = crate::storage::comment_stackstr(text)?;
+    stage_comment(storage, wal, txn, target, Some(text.as_str()))
 }
 
 /// Upper bound on the secondary indexes one `LIKE ... INCLUDING INDEXES` copies.
@@ -34560,43 +34846,74 @@ pub fn comment(
         }
     };
 
-    let stored_text = match text {
-        Some("") | None => None,
-        Some(t) => match crate::storage::comment_stackstr(t) {
-            Ok(s) => Some(s),
-            Err(e) => return sql_fail(e),
-        },
-    };
-
-    let (slot, prior) = match storage.set_comment(class, schema, name, subid, stored_text, txid) {
-        Ok(v) => v,
-        Err(e) => return sql_fail(e),
-    };
-    let lsn = storage.bump_lsn();
-    if let Err(e) = wal.stage(
-        txn.txid,
-        lsn,
-        &WalOp::Comment {
-            class: class.to_u8(),
-            schema: schema.as_str(),
-            name: name.as_str(),
+    if let Err(e) = stage_comment(
+        storage,
+        wal,
+        txn,
+        CommentIdentity {
+            class,
+            schema,
+            name,
             subid,
-            text,
         },
+        text,
     ) {
-        // The journal rejected the record; undo the in-memory overlay.
-        storage.restore_comment_pending(slot, prior);
-        return sql_fail(e);
-    }
-    if let Err(e) = txn.record_ddl(super::txn::DdlUndo::CommentSet {
-        slot: slot as u32,
-        prior,
-    }) {
-        storage.restore_comment_pending(slot, prior);
         return sql_fail(e);
     }
     responder.command_complete("COMMENT")?;
     sql_ok()
+}
+
+#[derive(Clone, Copy)]
+struct CommentIdentity {
+    class: crate::storage::CommentClass,
+    schema: SqlName,
+    name: SqlName,
+    subid: u32,
+}
+
+fn stage_comment(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    identity: CommentIdentity,
+    text: Option<&str>,
+) -> Result<(), SqlError> {
+    let stored_text = match text {
+        Some("") | None => None,
+        Some(text) => Some(crate::storage::comment_stackstr(text)?),
+    };
+    let (slot, prior) = storage.set_comment(
+        identity.class,
+        identity.schema,
+        identity.name,
+        identity.subid,
+        stored_text,
+        txn.txid,
+    )?;
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::Comment {
+            class: identity.class.to_u8(),
+            schema: identity.schema.as_str(),
+            name: identity.name.as_str(),
+            subid: identity.subid,
+            text,
+        },
+    ) {
+        storage.restore_comment_pending(slot, prior);
+        return Err(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CommentSet {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.restore_comment_pending(slot, prior);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn require_static_catalog_comment_superuser(storage: &Storage, txid: u32) -> Result<(), SqlError> {

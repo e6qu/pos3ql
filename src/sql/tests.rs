@@ -5431,6 +5431,188 @@ fn extended_statistics_are_typed_transactional_catalog_objects() {
 }
 
 #[test]
+fn like_copies_supported_metadata_without_copying_the_relation_comment() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE like_metadata_source (\
+             id integer NOT NULL,\
+             value integer,\
+             label text,\
+             CONSTRAINT like_metadata_source_value_check CHECK (value > 0)\
+         ); \
+         CREATE INDEX like_metadata_source_label_idx ON like_metadata_source(label); \
+         CREATE STATISTICS like_metadata_source_value_label_stats (ndistinct, dependencies) \
+           ON value, label FROM like_metadata_source; \
+         COMMENT ON TABLE like_metadata_source IS 'relation comment is excluded'; \
+         COMMENT ON COLUMN like_metadata_source.label IS 'column comment'; \
+         COMMENT ON CONSTRAINT like_metadata_source_value_check ON like_metadata_source \
+           IS 'check comment'; \
+         COMMENT ON CONSTRAINT like_metadata_source_id_not_null ON like_metadata_source \
+           IS 'not null comment'; \
+         COMMENT ON INDEX like_metadata_source_label_idx IS 'index comment'; \
+         COMMENT ON STATISTICS like_metadata_source_value_label_stats IS 'statistics comment'; \
+         CREATE TABLE like_metadata_target (LIKE like_metadata_source INCLUDING ALL)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let copied = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT obj_description('like_metadata_target'::regclass); \
+         SELECT col_description('like_metadata_target'::regclass, 3); \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'like_metadata_target'::regclass AND contype = 'c'; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'like_metadata_target'::regclass AND contype = 'n'; \
+         SELECT obj_description(indexrelid, 'pg_class') FROM pg_index \
+           WHERE indrelid = 'like_metadata_target'::regclass AND NOT indisprimary; \
+         SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext \
+           WHERE stxrelid = 'like_metadata_target'::regclass; \
+         SELECT pg_get_statisticsobjdef(oid) FROM pg_statistic_ext \
+           WHERE stxrelid = 'like_metadata_target'::regclass",
+    );
+    assert_eq!(
+        data_rows(&copied),
+        [
+            "NULL",
+            "column comment",
+            "check comment",
+            "not null comment",
+            "index comment",
+            "statistics comment",
+            "CREATE STATISTICS public.like_metadata_target_value_label_stat ON value, label FROM like_metadata_target",
+        ],
+        "{}",
+        String::from_utf8_lossy(&copied)
+    );
+
+    let excluded = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE like_metadata_excluded (\
+             LIKE like_metadata_source INCLUDING ALL EXCLUDING COMMENTS EXCLUDING STATISTICS\
+         ); \
+         SELECT col_description('like_metadata_excluded'::regclass, 3); \
+         SELECT count(*) FROM pg_statistic_ext \
+           WHERE stxrelid = 'like_metadata_excluded'::regclass; \
+         CREATE TABLE IF NOT EXISTS like_metadata_target \
+           (LIKE like_metadata_source INCLUDING ALL); \
+         SELECT count(*) FROM pg_index \
+           WHERE indrelid = 'like_metadata_target'::regclass",
+    );
+    assert_eq!(
+        data_rows(&excluded),
+        ["NULL", "0", "1"],
+        "{}",
+        String::from_utf8_lossy(&excluded)
+    );
+}
+
+#[test]
+fn like_metadata_survives_checkpoint_and_object_cold_recovery() {
+    let mut config = test_config("like-metadata-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("like-metadata-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_like_source (id integer NOT NULL, value integer, \
+                 CONSTRAINT durable_like_source_check CHECK (value > 0)); \
+             CREATE INDEX durable_like_source_value_idx ON durable_like_source(value); \
+             CREATE STATISTICS durable_like_source_statistics (ndistinct) \
+               ON id, value FROM durable_like_source; \
+             COMMENT ON COLUMN durable_like_source.value IS 'durable column'; \
+             COMMENT ON CONSTRAINT durable_like_source_check ON durable_like_source \
+               IS 'durable check'; \
+             COMMENT ON CONSTRAINT durable_like_source_id_not_null ON durable_like_source \
+               IS 'durable not null'; \
+             COMMENT ON INDEX durable_like_source_value_idx IS 'durable index'; \
+             COMMENT ON STATISTICS durable_like_source_statistics IS 'durable statistics'; \
+             CREATE TABLE durable_like_target (LIKE durable_like_source INCLUDING ALL)",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut budget,
+        "SELECT col_description('durable_like_target'::regclass, 2); \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'durable_like_target'::regclass AND contype = 'c'; \
+         SELECT obj_description(oid, 'pg_constraint') FROM pg_constraint \
+           WHERE conrelid = 'durable_like_target'::regclass AND contype = 'n'; \
+         SELECT obj_description(indexrelid, 'pg_class') FROM pg_index \
+           WHERE indrelid = 'durable_like_target'::regclass AND NOT indisprimary; \
+         SELECT obj_description(oid, 'pg_statistic_ext') FROM pg_statistic_ext \
+           WHERE stxrelid = 'durable_like_target'::regclass; \
+         SELECT pg_get_statisticsobjdef(oid) FROM pg_statistic_ext \
+           WHERE stxrelid = 'durable_like_target'::regclass",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "durable column",
+            "durable check",
+            "durable not null",
+            "durable index",
+            "durable statistics",
+            "CREATE STATISTICS public.durable_like_target_id_value_stat ON id, value FROM durable_like_target",
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn like_statistics_reuses_the_typed_expression_name_rule() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE like_expression_source (label text); \
+         CREATE STATISTICS like_expression_source_stats \
+           ON (lower(label)) FROM like_expression_source; \
+         CREATE TABLE like_expression_target \
+           (LIKE like_expression_source INCLUDING STATISTICS); \
+         SELECT stxname, pg_get_statisticsobjdef(oid) FROM pg_statistic_ext \
+           WHERE stxrelid = 'like_expression_target'::regclass",
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "like_expression_target_lower_stat|CREATE STATISTICS public.like_expression_target_lower_stat ON lower(label) FROM like_expression_target",
+        ],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn extended_statistics_mcv_includes_null_combinations_and_empty_analyze_has_no_data() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(

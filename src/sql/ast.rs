@@ -3513,6 +3513,10 @@ pub struct LikeClause<'a> {
     pub storage: bool,
     /// `INCLUDING COMPRESSION` — the source column's compression policy.
     pub compression: bool,
+    /// `INCLUDING COMMENTS` — comments on copied catalog objects.
+    pub comments: bool,
+    /// `INCLUDING STATISTICS` — extended statistics definitions.
+    pub statistics: bool,
 }
 
 /// A table-level constraint, or a column-level CHECK/REFERENCES desugared to

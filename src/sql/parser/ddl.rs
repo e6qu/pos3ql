@@ -7525,6 +7525,8 @@ impl<'a> Parser<'a> {
             generated: false,
             storage: false,
             compression: false,
+            comments: false,
+            statistics: false,
         }; MAX_LIST];
         let mut n_likes = 0;
         loop {
@@ -7910,6 +7912,8 @@ impl<'a> Parser<'a> {
             generated: false,
             storage: false,
             compression: false,
+            comments: false,
+            statistics: false,
         };
         loop {
             let including = if self.eat_ident("including")? {
@@ -7919,8 +7923,6 @@ impl<'a> Parser<'a> {
             } else {
                 return Ok(clause);
             };
-            // COMMENTS and STATISTICS refer to separate catalog objects, not
-            // column properties. They cannot become inert option bits.
             match self.peeked {
                 Tok::Ident("defaults") => clause.defaults = including,
                 Tok::Ident("constraints") => clause.constraints = including,
@@ -7929,6 +7931,8 @@ impl<'a> Parser<'a> {
                 Tok::Ident("generated") => clause.generated = including,
                 Tok::Ident("storage") => clause.storage = including,
                 Tok::Ident("compression") => clause.compression = including,
+                Tok::Ident("comments") => clause.comments = including,
+                Tok::Ident("statistics") => clause.statistics = including,
                 Tok::Ident("all") => {
                     clause.defaults = including;
                     clause.constraints = including;
@@ -7937,17 +7941,8 @@ impl<'a> Parser<'a> {
                     clause.generated = including;
                     clause.storage = including;
                     clause.compression = including;
-                }
-                Tok::Ident(other @ ("comments" | "statistics")) => {
-                    return Err(ParseError {
-                        at: self.peek_at,
-                        message: stack_format!(
-                            96,
-                            "INCLUDING {} is not supported: it requires copying catalog objects",
-                            other
-                        ),
-                        sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-                    });
+                    clause.comments = including;
+                    clause.statistics = including;
                 }
                 _ => return Err(self.err_here("expected a LIKE option after INCLUDING/EXCLUDING")),
             }

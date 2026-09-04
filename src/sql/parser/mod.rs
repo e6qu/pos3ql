@@ -7716,16 +7716,16 @@ mod tests {
                 assert!(table.likes[0].compression);
             },
         );
-        for option in ["COMMENTS", "STATISTICS"] {
-            let statement =
-                format!("CREATE TABLE storage_clone (LIKE storage_probe INCLUDING {option})");
-            with_parser(&statement, |parser| {
-                assert_eq!(
-                    parser.next_stmt().unwrap_err().sqlstate,
-                    sqlstate::FEATURE_NOT_SUPPORTED
-                );
-            });
-        }
+        with_parser(
+            "CREATE TABLE storage_clone (LIKE storage_probe INCLUDING COMMENTS INCLUDING STATISTICS)",
+            |parser| {
+                let Some(Stmt::CreateTable(table)) = parser.next_stmt().unwrap() else {
+                    panic!("LIKE catalog metadata did not parse")
+                };
+                assert!(table.likes[0].comments);
+                assert!(table.likes[0].statistics);
+            },
+        );
         with_parser(
             "CREATE TABLE storage_clone (LIKE storage_probe INCLUDING ALL EXCLUDING DEFAULTS)",
             |parser| {
@@ -7735,6 +7735,8 @@ mod tests {
                 assert!(!table.likes[0].defaults);
                 assert!(table.likes[0].storage);
                 assert!(table.likes[0].compression);
+                assert!(table.likes[0].comments);
+                assert!(table.likes[0].statistics);
             },
         );
     }

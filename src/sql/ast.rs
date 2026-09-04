@@ -3398,11 +3398,51 @@ pub enum ColumnStorage {
     Main,
 }
 
+impl ColumnStorage {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Plain => b'p',
+            Self::External => b'e',
+            Self::Extended => b'x',
+            Self::Main => b'm',
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b'p' => Some(Self::Plain),
+            b'e' => Some(Self::External),
+            b'x' => Some(Self::Extended),
+            b'm' => Some(Self::Main),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnCompression {
     Default,
     Pglz,
     Lz4,
+}
+
+impl ColumnCompression {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Default => 0,
+            Self::Pglz => b'p',
+            Self::Lz4 => b'l',
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(Self::Default),
+            b'p' => Some(Self::Pglz),
+            b'l' => Some(Self::Lz4),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3469,6 +3509,10 @@ pub struct LikeClause<'a> {
     /// `INCLUDING GENERATED` — the STORED generation expression; without it a
     /// generated column is copied as a plain column.
     pub generated: bool,
+    /// `INCLUDING STORAGE` — the source column's TOAST storage policy.
+    pub storage: bool,
+    /// `INCLUDING COMPRESSION` — the source column's compression policy.
+    pub compression: bool,
 }
 
 /// A table-level constraint, or a column-level CHECK/REFERENCES desugared to
@@ -4071,6 +4115,12 @@ pub struct ColumnDef<'a> {
     /// Foreign-column options are parsed only by CREATE FOREIGN TABLE. An
     /// ordinary table can therefore reach execution only with an empty list.
     pub foreign_options: &'a [ForeignOption<'a>],
+    /// Explicit TOAST-storage policy. `None` selects the declared type's
+    /// PostgreSQL default before the definition becomes durable.
+    pub storage: Option<ColumnStorage>,
+    /// The PostgreSQL compression policy. `Default` remains distinct from an
+    /// explicit algorithm in `pg_attribute.attcompression`.
+    pub compression: ColumnCompression,
     pub not_null: bool,
     pub unique: bool,
     pub primary: bool,

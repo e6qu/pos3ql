@@ -46,7 +46,7 @@ ALTER SERVER	complete	tests/external/ci_diff.sh
 ALTER STATISTICS	complete	109_extended_statistics.sql
 ALTER SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard
 ALTER SYSTEM	complete	118_database_configuration.sql
-ALTER TABLE	partial	45_alter_column.sql, 125_replica_identity.sql, and 132_ordinary_inheritance_alter.sql
+ALTER TABLE	partial	45_alter_column.sql, 125_replica_identity.sql, 132_ordinary_inheritance_alter.sql, and 135_table_column_metadata.sql
 ALTER TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 ALTER TEXT SEARCH CONFIGURATION	complete	tests/external/differential/123_full_text_search.sql
 ALTER TEXT SEARCH DICTIONARY	complete	tests/external/differential/123_full_text_search.sql
@@ -96,7 +96,7 @@ CREATE SEQUENCE	partial	54_sequence.sql (permanent sequences; temporary and unlo
 CREATE SERVER	complete	tests/external/ci_diff.sh
 CREATE STATISTICS	complete	109_extended_statistics.sql
 CREATE SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard
-CREATE TABLE	partial	14_surface.sql
+CREATE TABLE	partial	14_surface.sql and 135_table_column_metadata.sql
 CREATE TABLE AS	complete	52_create_table_as.sql
 CREATE TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 CREATE TEXT SEARCH CONFIGURATION	complete	tests/external/differential/123_full_text_search.sql

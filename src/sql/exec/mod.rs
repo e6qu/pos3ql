@@ -3171,6 +3171,12 @@ fn build_def_with_likes(
                 if !like.generated && copied.default.is_generated() {
                     copied.default = crate::storage::ColumnDefault::NONE;
                 }
+                if !like.storage {
+                    copied.storage = ddl::default_column_storage(copied.ctype);
+                }
+                if !like.compression {
+                    copied.compression = crate::sql::ast::ColumnCompression::Default;
+                }
                 push_column(&mut def, &mut n, copied)?;
             }
         }
@@ -34728,6 +34734,8 @@ pub fn create_table_as(
             } else {
                 crate::sql::ast::Collation::None
             },
+            storage: crate::sql::ast::ColumnStorage::Plain,
+            compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             unique: false,
             primary: false,
@@ -51950,6 +51958,8 @@ pub(crate) fn view_trigger_definition(
             ctype,
             type_mod: column.type_mod,
             collation: column.collation,
+            storage: crate::sql::ast::ColumnStorage::Plain,
+            compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
             unique: false,
             primary: false,
@@ -58097,6 +58107,8 @@ fn alter_table_inner(
                 | AlterAction::SetAccessMethod(_)
                 | AlterAction::SetPersistence(_)
                 | AlterAction::SetStatistics { .. }
+                | AlterAction::SetStorage { .. }
+                | AlterAction::SetCompression { .. }
                 | AlterAction::SetIdentityMode { .. }
                 | AlterAction::AlterIdentitySequence { .. }
                 | AlterAction::SetStorageOptions(_)
@@ -58142,6 +58154,40 @@ fn alter_table_inner(
                         return sql_fail(undefined_column(column));
                     };
                     new_def.columns[column].statistics_target = *target;
+                }
+                AlterAction::SetStorage {
+                    column,
+                    storage: policy,
+                } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    if let Err(error) = ddl::validate_column_storage(
+                        new_def.columns[column].name.as_str(),
+                        new_def.columns[column].ctype,
+                        *policy,
+                        new_def.columns[column].compression,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    new_def.columns[column].storage = *policy;
+                }
+                AlterAction::SetCompression {
+                    column,
+                    compression,
+                } => {
+                    let Some(column) = new_def.column_index(column) else {
+                        return sql_fail(undefined_column(column));
+                    };
+                    if let Err(error) = ddl::validate_column_storage(
+                        new_def.columns[column].name.as_str(),
+                        new_def.columns[column].ctype,
+                        new_def.columns[column].storage,
+                        *compression,
+                    ) {
+                        return sql_fail(error);
+                    }
+                    new_def.columns[column].compression = *compression;
                 }
                 AlterAction::SetIdentityMode { column, always } => {
                     let Some(column) = new_def.column_index(column) else {
@@ -58306,18 +58352,6 @@ fn alter_table_inner(
         return sql_ok();
     }
 
-    if statement.actions.iter().any(|action| {
-        matches!(
-            action,
-            AlterAction::SetStorage { .. } | AlterAction::SetCompression { .. }
-        )
-    }) {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "column storage and compression require a durable row codec implementation"
-        ));
-    }
-
     // Collect every committed row up front: the row count decides whether an
     // added NOT NULL column needs a fill (a spilled table has rows even when
     // the overlay map has evicted them, so `rows.is_empty()` cannot answer
@@ -58418,11 +58452,39 @@ fn alter_table_inner(
                     "table inheritance requires object-native inherited-relation scans and dependencies"
                 ));
             }
-            AlterAction::SetStorage { .. } | AlterAction::SetCompression { .. } => {
-                return sql_fail(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "column storage and compression require a durable row codec implementation"
-                ));
+            AlterAction::SetStorage {
+                column,
+                storage: policy,
+            } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if let Err(error) = ddl::validate_column_storage(
+                    new_def.columns[i].name.as_str(),
+                    new_def.columns[i].ctype,
+                    *policy,
+                    new_def.columns[i].compression,
+                ) {
+                    return sql_fail(error);
+                }
+                new_def.columns[i].storage = *policy;
+            }
+            AlterAction::SetCompression {
+                column,
+                compression,
+            } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if let Err(error) = ddl::validate_column_storage(
+                    new_def.columns[i].name.as_str(),
+                    new_def.columns[i].ctype,
+                    new_def.columns[i].storage,
+                    *compression,
+                ) {
+                    return sql_fail(error);
+                }
+                new_def.columns[i].compression = *compression;
             }
             AlterAction::SetTablespace(name) => {
                 new_def.tablespace =
@@ -61409,6 +61471,8 @@ fn coerce_composite_value_inner<'a>(
             ctype: field.ctype,
             type_mod: field.type_mod,
             collation: crate::sql::ast::Collation::None,
+            storage: crate::sql::ast::ColumnStorage::Plain,
+            compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::local(field.not_null),
             unique: false,
             primary: false,

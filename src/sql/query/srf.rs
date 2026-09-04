@@ -1296,6 +1296,8 @@ pub(crate) fn synth_derived_def_outer<'a>(
         ctype: ColType::Bool,
         type_mod: -1,
         collation: crate::sql::ast::Collation::None,
+        storage: crate::sql::ast::ColumnStorage::Plain,
+        compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         unique: false,
         primary: false,

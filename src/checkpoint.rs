@@ -27,7 +27,7 @@ use crate::wal::crc32c::Crc32c;
 pub(crate) const MANIFEST_KEY: &str = "manifest";
 const COMMIT_HEAD_KEY: &str = "commit-head";
 const COMMIT_HEAD_HEADER: &str = "pos3ql-commit-head-v1";
-const MANIFEST_HEADER: &str = "pos3ql-manifest-v10";
+const MANIFEST_HEADER: &str = "pos3ql-manifest-v11";
 const EXTENSION_PACKAGE_HEADER: &str = "pos3ql-extension-package-v1";
 const MANIFEST_BUF_BYTES: usize = 256 * 1024;
 const VERSIONED_SST_ENTRY_HEADER: usize = 20; // rowid u64 | commit_lsn u64 | len u32
@@ -1305,7 +1305,7 @@ impl Checkpointer {
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
                 }
-                Some("col3") => {
+                Some("col4") => {
                     let Some((_, def, seen, _)) = pending_def.as_mut() else {
                         return Err(CheckpointSetupError::Corrupt("col outside table"));
                     };
@@ -1331,6 +1331,16 @@ impl Checkpointer {
                     if !(-1..=10_000).contains(&statistics_target) {
                         return Err(CheckpointSetupError::Corrupt("column statistics target"));
                     }
+                    let storage = crate::sql::ast::ColumnStorage::from_code(parse_field(
+                        words.next(),
+                        "col storage",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("unknown column storage"))?;
+                    let compression = crate::sql::ast::ColumnCompression::from_code(parse_field(
+                        words.next(),
+                        "col compression",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("unknown column compression"))?;
                     let ctype = ColType::from_code(type_code)
                         .ok_or(CheckpointSetupError::Corrupt("unknown column type code"))?;
                     let collation = crate::sql::ast::Collation::from_code(parse_field::<u8>(
@@ -1365,7 +1375,7 @@ impl Checkpointer {
                             ));
                         }
                     };
-                    let name = rest_of(line, 11)?;
+                    let name = rest_of(line, 13)?;
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
@@ -1383,6 +1393,8 @@ impl Checkpointer {
                         ctype,
                         type_mod,
                         collation,
+                        storage,
+                        compression,
                         not_null: crate::storage::NotNullOrigin::from_code(not_null & 3)
                             .ok_or(CheckpointSetupError::Corrupt("invalid NOT NULL provenance"))?,
                         unique: not_null & 4 != 0,
@@ -6366,7 +6378,7 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "col3 {} {} {} {} {} {} {} {} {} {} {}",
+                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
                         c.type_mod,
@@ -6374,6 +6386,8 @@ impl Checkpointer {
                         dexpr_hex.as_str(),
                         c.auto_increment_step,
                         c.statistics_target,
+                        c.storage.code(),
+                        c.compression.code(),
                         c.collation.code(),
                         domain_schema_hex.as_str(),
                         domain_hex.as_str(),
@@ -11313,6 +11327,8 @@ fn empty_column() -> ColumnMeta {
         ctype: ColType::Bool,
         type_mod: -1,
         collation: crate::sql::ast::Collation::None,
+        storage: crate::sql::ast::ColumnStorage::Plain,
+        compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
         unique: false,
         primary: false,

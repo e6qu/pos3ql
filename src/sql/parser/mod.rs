@@ -5393,6 +5393,35 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parses PostgreSQL's closed per-column storage policy. `DEFAULT` is
+    /// accepted only where the CREATE TABLE grammar allows it; callers retain
+    /// absence separately so execution can select the type-derived policy.
+    fn column_storage(&mut self, allow_default: bool) -> Result<Option<ColumnStorage>, ParseError> {
+        if allow_default && self.eat_ident("default")? {
+            return Ok(None);
+        }
+        let storage = match self.any_ident("column storage")? {
+            value if value.eq_ignore_ascii_case("plain") => ColumnStorage::Plain,
+            value if value.eq_ignore_ascii_case("external") => ColumnStorage::External,
+            value if value.eq_ignore_ascii_case("extended") => ColumnStorage::Extended,
+            value if value.eq_ignore_ascii_case("main") => ColumnStorage::Main,
+            _ => return Err(self.err_here("unrecognized column storage")),
+        };
+        Ok(Some(storage))
+    }
+
+    /// Parses the exact compression alphabet PostgreSQL exposes in table DDL.
+    fn column_compression(&mut self) -> Result<ColumnCompression, ParseError> {
+        if self.eat_ident("default")? {
+            return Ok(ColumnCompression::Default);
+        }
+        match self.any_ident("column compression")? {
+            value if value.eq_ignore_ascii_case("pglz") => Ok(ColumnCompression::Pglz),
+            value if value.eq_ignore_ascii_case("lz4") => Ok(ColumnCompression::Lz4),
+            _ => Err(self.err_here("unrecognized column compression")),
+        }
+    }
+
     /// One ADD / DROP / ALTER subcommand of an ALTER TABLE (the comma-listable
     /// forms; RENAME and SET SCHEMA are handled by the caller).
     fn alter_table_cmd(&mut self, foreign: bool) -> Result<AlterAction<'a>, ParseError> {
@@ -5496,6 +5525,22 @@ impl<'a> Parser<'a> {
             } else {
                 &[]
             };
+            let storage = if self.eat_ident("storage")? {
+                if foreign {
+                    return Err(self.err_here("foreign columns do not support STORAGE"));
+                }
+                self.column_storage(true)?
+            } else {
+                None
+            };
+            let compression = if self.eat_ident("compression")? {
+                if foreign {
+                    return Err(self.err_here("foreign columns do not support COMPRESSION"));
+                }
+                self.column_compression()?
+            } else {
+                ColumnCompression::Default
+            };
             let collation = if self.eat_ident("collate")? {
                 self.collation_name()?
             } else {
@@ -5534,6 +5579,8 @@ impl<'a> Parser<'a> {
                 type_mod,
                 collation,
                 foreign_options,
+                storage,
+                compression,
                 not_null,
                 unique,
                 primary: false,
@@ -5680,36 +5727,14 @@ impl<'a> Parser<'a> {
                     };
                     Ok(AlterAction::SetStatistics { column, target })
                 } else if self.eat_ident("storage")? {
-                    let storage = match self.any_ident("column storage")? {
-                        value if value.eq_ignore_ascii_case("plain") => {
-                            crate::sql::ast::ColumnStorage::Plain
-                        }
-                        value if value.eq_ignore_ascii_case("external") => {
-                            crate::sql::ast::ColumnStorage::External
-                        }
-                        value if value.eq_ignore_ascii_case("extended") => {
-                            crate::sql::ast::ColumnStorage::Extended
-                        }
-                        value if value.eq_ignore_ascii_case("main") => {
-                            crate::sql::ast::ColumnStorage::Main
-                        }
-                        _ => return Err(self.err_here("unrecognized column storage")),
+                    let Some(storage) = self.column_storage(false)? else {
+                        return Err(
+                            self.err_here("DEFAULT is not valid for ALTER COLUMN SET STORAGE")
+                        );
                     };
                     Ok(AlterAction::SetStorage { column, storage })
                 } else if self.eat_ident("compression")? {
-                    let compression = if self.eat_ident("default")? {
-                        crate::sql::ast::ColumnCompression::Default
-                    } else {
-                        match self.any_ident("column compression")? {
-                            value if value.eq_ignore_ascii_case("pglz") => {
-                                crate::sql::ast::ColumnCompression::Pglz
-                            }
-                            value if value.eq_ignore_ascii_case("lz4") => {
-                                crate::sql::ast::ColumnCompression::Lz4
-                            }
-                            _ => return Err(self.err_here("unrecognized column compression")),
-                        }
-                    };
+                    let compression = self.column_compression()?;
                     Ok(AlterAction::SetCompression {
                         column,
                         compression,
@@ -7654,6 +7679,64 @@ mod tests {
             let mut p = Parser::new(text, &arena).unwrap();
             f(&mut p)
         })
+    }
+
+    #[test]
+    fn column_storage_alter_consumes_the_policy() {
+        with_parser(
+            "ALTER TABLE storage_probe ALTER COLUMN value SET STORAGE EXTENDED",
+            |parser| {
+                let statement = parser.statement().unwrap();
+                assert!(matches!(statement, Stmt::AlterTable(_)));
+                assert_eq!(parser.peeked, Tok::Eof);
+            },
+        );
+        with_parser(
+            "ALTER TABLE storage_probe ALTER COLUMN value SET STORAGE EXTENDED; \
+             ALTER TABLE storage_probe ALTER COLUMN value SET COMPRESSION DEFAULT; \
+             ALTER TABLE storage_probe ALTER COLUMN value SET COMPRESSION pglz",
+            |parser| {
+                for _ in 0..3 {
+                    assert!(matches!(
+                        parser.next_stmt().unwrap(),
+                        Some(Stmt::AlterTable(_))
+                    ));
+                }
+                assert!(parser.next_stmt().unwrap().is_none());
+            },
+        );
+        with_parser(
+            "CREATE TABLE storage_clone (LIKE storage_probe INCLUDING STORAGE INCLUDING COMPRESSION)",
+            |parser| {
+                let Some(Stmt::CreateTable(table)) = parser.next_stmt().unwrap() else {
+                    panic!("LIKE table definition did not parse")
+                };
+                assert_eq!(table.likes.len(), 1);
+                assert!(table.likes[0].storage);
+                assert!(table.likes[0].compression);
+            },
+        );
+        for option in ["COMMENTS", "STATISTICS"] {
+            let statement =
+                format!("CREATE TABLE storage_clone (LIKE storage_probe INCLUDING {option})");
+            with_parser(&statement, |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    sqlstate::FEATURE_NOT_SUPPORTED
+                );
+            });
+        }
+        with_parser(
+            "CREATE TABLE storage_clone (LIKE storage_probe INCLUDING ALL EXCLUDING DEFAULTS)",
+            |parser| {
+                let Some(Stmt::CreateTable(table)) = parser.next_stmt().unwrap() else {
+                    panic!("LIKE INCLUDING ALL did not parse")
+                };
+                assert!(!table.likes[0].defaults);
+                assert!(table.likes[0].storage);
+                assert!(table.likes[0].compression);
+            },
+        );
     }
 
     #[test]

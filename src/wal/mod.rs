@@ -153,6 +153,10 @@ const KIND_SET_EVENT_TRIGGER: u8 = 103;
 const KIND_DROP_EVENT_TRIGGER: u8 = 104;
 const KIND_SET_RULE: u8 = 105;
 const KIND_DROP_RULE: u8 = 106;
+/// A table definition is an independently versioned payload inside the
+/// object-native logical WAL. Replays reject a definition from an incompatible
+/// schema instead of assigning later bytes to a different column property.
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 2;
 const KIND_SET_PARAMETER_ACL: u8 = 123;
 const KIND_PREPARE_TRANSACTION: u8 = 107;
 const KIND_COMMIT_PREPARED: u8 = 108;
@@ -2211,7 +2215,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             })
         }
         WalOp::CreateTable(def) => {
-            let mut n = 1 + def.name.as_str().len() + 2 + 2 + 2;
+            let mut n = 1 + 1 + def.name.as_str().len() + 2 + 2 + 2;
             n += match def.access_method {
                 crate::storage::TableAccessMethod::Heap => 1,
                 crate::storage::TableAccessMethod::Catalog(_) => 5,
@@ -2228,6 +2232,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 // auto_increment_step (i64).
                 n += 8;
                 n += 2; // attstattarget
+                n += 2; // attstorage + attcompression
                 // User-defined column: name, then a format marker and schema.
                 if let Some(identity) = c.user_type {
                     n += 1 + identity.name.as_str().len();
@@ -3789,7 +3794,8 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::CreateTable(def) => {
-            let mut ok = name_bytes(buffer, def.name.as_str());
+            let mut ok = buffer.append(&[TABLE_DEF_PAYLOAD_VERSION])
+                && name_bytes(buffer, def.name.as_str());
             ok &= buffer.append(&(def.n_columns as u16).to_le_bytes());
             ok &= buffer.append(&[
                 u8::from(def.has_toast),
@@ -3827,6 +3833,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 ok &= buffer.append(de.as_bytes());
                 ok &= buffer.append(&c.auto_increment_step.to_le_bytes());
                 ok &= buffer.append(&c.statistics_target.to_le_bytes());
+                ok &= buffer.append(&[c.storage.code(), c.compression.code()]);
                 if let Some(identity) = c.user_type {
                     ok &= name_bytes(buffer, identity.name.as_str());
                     ok &= buffer.append(&[u8::MAX]);
@@ -6264,6 +6271,10 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             })
         }
         KIND_CREATE => {
+            if payload.get(at).copied()? != TABLE_DEF_PAYLOAD_VERSION {
+                return None;
+            }
+            at += 1;
             let name = take_name(&mut at)?;
             let n_cols = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
@@ -6299,22 +6310,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             };
             let mut def = TableDef {
                 name: SqlName::parse(name).ok()?,
-                columns: [ColumnMeta {
-                    name: SqlName::parse("").ok()?,
-                    ctype: ColType::Bool,
-                    type_mod: -1,
-                    collation: crate::sql::ast::Collation::None,
-                    not_null: crate::storage::NotNullOrigin::Nullable,
-                    unique: false,
-                    primary: false,
-                    auto_increment: false,
-                    default: ColumnDefault::NONE,
-                    is_identity: false,
-                    identity_always: false,
-                    auto_increment_step: 1,
-                    user_type: None,
-                    statistics_target: -1,
-                }; MAX_COLUMNS],
+                columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
                 n_columns: n_cols,
                 has_toast,
                 kind,
@@ -6347,6 +6343,10 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 let statistics_target =
                     i16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
                 at += 2;
+                let storage = crate::sql::ast::ColumnStorage::from_code(*payload.get(at)?)?;
+                let compression =
+                    crate::sql::ast::ColumnCompression::from_code(*payload.get(at + 1)?)?;
+                at += 2;
                 // Bit 7 set means a durable user-type identity follows.
                 let user_type = if meta[1] & 128 != 0 {
                     let name = SqlName::parse(take_name(&mut at)?).ok()?;
@@ -6367,6 +6367,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     ctype: ColType::from_code(meta[0])?,
                     type_mod,
                     collation: crate::sql::ast::Collation::None,
+                    storage,
+                    compression,
                     not_null,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
@@ -11140,22 +11142,7 @@ mod tests {
     fn sample_def() -> TableDef {
         let mut def = TableDef {
             name: SqlName::parse("t").unwrap(),
-            columns: [ColumnMeta {
-                name: SqlName::parse("").unwrap(),
-                ctype: ColType::Bool,
-                type_mod: -1,
-                collation: crate::sql::ast::Collation::None,
-                not_null: crate::storage::NotNullOrigin::Nullable,
-                unique: false,
-                primary: false,
-                auto_increment: false,
-                default: ColumnDefault::NONE,
-                is_identity: false,
-                identity_always: false,
-                auto_increment_step: 1,
-                user_type: None,
-                statistics_target: -1,
-            }; MAX_COLUMNS],
+            columns: [ColumnMeta::EMPTY; MAX_COLUMNS],
             n_columns: 2,
             ..TableDef::empty()
         };
@@ -11164,6 +11151,8 @@ mod tests {
             ctype: ColType::Int4,
             type_mod: -1,
             collation: crate::sql::ast::Collation::None,
+            storage: crate::sql::ast::ColumnStorage::Plain,
+            compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Local,
             unique: true,
             primary: true,
@@ -11180,6 +11169,8 @@ mod tests {
             ctype: ColType::Text,
             type_mod: -1,
             collation: crate::sql::ast::Collation::C,
+            storage: crate::sql::ast::ColumnStorage::Extended,
+            compression: crate::sql::ast::ColumnCompression::Lz4,
             not_null: crate::storage::NotNullOrigin::Nullable,
             unique: false,
             primary: false,

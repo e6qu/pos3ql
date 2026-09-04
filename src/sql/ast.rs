@@ -1139,7 +1139,7 @@ pub enum Stmt<'a> {
     /// syntax from being hidden by the absent native provider boundary.
     SecurityLabel {
         provider: Option<&'a str>,
-        target: CommentTarget<'a>,
+        target: SecurityLabelTarget<'a>,
         label: Option<&'a str>,
     },
     /// LOAD is intentionally not an application extension point: object-store
@@ -2777,6 +2777,47 @@ pub enum CommentTarget<'a> {
         name: &'a str,
         domain_only: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityLabelRelationKind {
+    Table,
+    View,
+    MaterializedView,
+    Sequence,
+    ForeignTable,
+}
+
+/// The PostgreSQL object classes accepted by `SECURITY LABEL`. This is kept
+/// separate from `COMMENT` because their surface grammars differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityLabelTarget<'a> {
+    Aggregate(AggregateIdentity<'a>),
+    Relation {
+        kind: SecurityLabelRelationKind,
+        name: QualName<'a>,
+    },
+    Column {
+        relation: QualName<'a>,
+        column: &'a str,
+    },
+    Routine {
+        kind: RoutineTargetKind,
+        identity: RoutineIdentity<'a>,
+    },
+    Database(&'a str),
+    Type {
+        name: &'a str,
+        domain_only: bool,
+    },
+    EventTrigger(&'a str),
+    LargeObject(LargeObjectId),
+    ProceduralLanguage(&'a str),
+    Publication(&'a str),
+    Role(&'a str),
+    Schema(&'a str),
+    Subscription(&'a str),
+    Tablespace(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -2342,7 +2342,10 @@ impl<'a> Parser<'a> {
         let mark = self.lexer.mark();
         let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
         let candidate_type = self.type_name()?;
-        let argument_type = if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
+        let argument_type = if matches!(
+            self.peeked,
+            Tok::Op(",") | Tok::Op(")") | Tok::Ident("order")
+        ) {
             candidate_type
         } else {
             self.lexer.reset(mark);
@@ -6884,7 +6887,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn aggregate_identity(&mut self) -> Result<AggregateIdentity<'a>, ParseError> {
+    pub(super) fn aggregate_identity(&mut self) -> Result<AggregateIdentity<'a>, ParseError> {
         let name = self.qual_name("aggregate name")?;
         self.expect_op("(")?;
         let mut direct = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -6904,8 +6907,7 @@ impl<'a> Parser<'a> {
                     }
                     continue;
                 }
-                let _ = self.eat_ident("in")?;
-                let _ = self.eat_ident("variadic")?;
+                let (argument_type, input) = self.routine_identity_argument()?;
                 let target = if ordered_set {
                     &mut aggregated
                 } else {
@@ -6916,11 +6918,13 @@ impl<'a> Parser<'a> {
                 } else {
                     &mut direct_count
                 };
-                if *count == target.len() {
-                    return Err(self.limit("aggregate arguments", target.len()));
+                if input {
+                    if *count == target.len() {
+                        return Err(self.limit("aggregate arguments", target.len()));
+                    }
+                    target[*count] = argument_type;
+                    *count += 1;
                 }
-                target[*count] = self.type_name()?;
-                *count += 1;
                 if self.eat_op(")")? {
                     break;
                 }

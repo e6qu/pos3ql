@@ -6569,6 +6569,112 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Comment { target, text })
     }
 
+    fn security_label_target(
+        &mut self,
+    ) -> Result<crate::sql::ast::SecurityLabelTarget<'a>, ParseError> {
+        use crate::sql::ast::{SecurityLabelRelationKind, SecurityLabelTarget};
+        let target = if self.eat_ident("table")? {
+            SecurityLabelTarget::Relation {
+                kind: SecurityLabelRelationKind::Table,
+                name: self.qual_name("table name")?,
+            }
+        } else if self.eat_ident("column")? {
+            let first = self.col_ident("column reference")?;
+            self.expect_op(".")?;
+            let second = self.col_ident("column reference")?;
+            if self.eat_op(".")? {
+                let third = self.col_ident("column reference")?;
+                SecurityLabelTarget::Column {
+                    relation: QualName {
+                        schema: Some(first),
+                        name: second,
+                    },
+                    column: third,
+                }
+            } else {
+                SecurityLabelTarget::Column {
+                    relation: QualName::bare(first),
+                    column: second,
+                }
+            }
+        } else if self.eat_ident("aggregate")? {
+            SecurityLabelTarget::Aggregate(self.aggregate_identity()?)
+        } else if self.eat_ident("database")? {
+            SecurityLabelTarget::Database(self.col_ident("database name")?)
+        } else if self.eat_ident("domain")? {
+            SecurityLabelTarget::Type {
+                name: self.comment_type_name()?,
+                domain_only: true,
+            }
+        } else if self.eat_ident("event")? {
+            self.expect_ident("trigger")?;
+            SecurityLabelTarget::EventTrigger(self.col_ident("event trigger name")?)
+        } else if self.eat_ident("foreign")? {
+            self.expect_ident("table")?;
+            SecurityLabelTarget::Relation {
+                kind: SecurityLabelRelationKind::ForeignTable,
+                name: self.qual_name("foreign table name")?,
+            }
+        } else if self.eat_ident("function")? {
+            SecurityLabelTarget::Routine {
+                kind: RoutineTargetKind::Function,
+                identity: self.routine_identity()?,
+            }
+        } else if self.eat_ident("large")? {
+            self.expect_ident("object")?;
+            SecurityLabelTarget::LargeObject(self.large_object_id()?)
+        } else if self.eat_ident("materialized")? {
+            self.expect_ident("view")?;
+            SecurityLabelTarget::Relation {
+                kind: SecurityLabelRelationKind::MaterializedView,
+                name: self.qual_name("materialized view name")?,
+            }
+        } else if self.eat_ident("procedural")? {
+            self.expect_ident("language")?;
+            SecurityLabelTarget::ProceduralLanguage(self.col_ident("procedural language name")?)
+        } else if self.eat_ident("language")? {
+            SecurityLabelTarget::ProceduralLanguage(self.col_ident("procedural language name")?)
+        } else if self.eat_ident("procedure")? {
+            SecurityLabelTarget::Routine {
+                kind: RoutineTargetKind::Procedure,
+                identity: self.routine_identity()?,
+            }
+        } else if self.eat_ident("publication")? {
+            SecurityLabelTarget::Publication(self.col_ident("publication name")?)
+        } else if self.eat_ident("role")? {
+            SecurityLabelTarget::Role(self.col_ident("role name")?)
+        } else if self.eat_ident("routine")? {
+            SecurityLabelTarget::Routine {
+                kind: RoutineTargetKind::Either,
+                identity: self.routine_identity()?,
+            }
+        } else if self.eat_ident("schema")? {
+            SecurityLabelTarget::Schema(self.col_ident("schema name")?)
+        } else if self.eat_ident("sequence")? {
+            SecurityLabelTarget::Relation {
+                kind: SecurityLabelRelationKind::Sequence,
+                name: self.qual_name("sequence name")?,
+            }
+        } else if self.eat_ident("subscription")? {
+            SecurityLabelTarget::Subscription(self.col_ident("subscription name")?)
+        } else if self.eat_ident("tablespace")? {
+            SecurityLabelTarget::Tablespace(self.col_ident("tablespace name")?)
+        } else if self.eat_ident("type")? {
+            SecurityLabelTarget::Type {
+                name: self.comment_type_name()?,
+                domain_only: false,
+            }
+        } else if self.eat_ident("view")? {
+            SecurityLabelTarget::Relation {
+                kind: SecurityLabelRelationKind::View,
+                name: self.qual_name("view name")?,
+            }
+        } else {
+            return Err(self.err_here("unsupported SECURITY LABEL ON object type"));
+        };
+        Ok(target)
+    }
+
     fn security_label(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("security")?;
         self.expect_ident("label")?;
@@ -6578,7 +6684,7 @@ impl<'a> Parser<'a> {
             None
         };
         self.expect_ident("on")?;
-        let target = self.comment_target()?;
+        let target = self.security_label_target()?;
         let label = self.comment_text()?;
         Ok(Stmt::SecurityLabel {
             provider,
@@ -9447,6 +9553,62 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn security_labels_use_their_own_closed_object_grammar() {
+        with_parser(
+            "SECURITY LABEL FOR selinux ON PROCEDURAL LANGUAGE plpgsql IS 'label'; \
+             SECURITY LABEL ON COLUMN public.items.label IS NULL; \
+             SECURITY LABEL ON AGGREGATE public.percentile(IN fraction float8 ORDER BY value float8) IS 'label'",
+            |parser| {
+                let Some(Stmt::SecurityLabel {
+                    provider,
+                    target,
+                    label,
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("procedural language security label did not parse")
+                };
+                assert_eq!(provider, Some("selinux"));
+                assert_eq!(label, Some("label"));
+                assert_eq!(
+                    target,
+                    crate::sql::ast::SecurityLabelTarget::ProceduralLanguage("plpgsql")
+                );
+                let Some(Stmt::SecurityLabel { target, label, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("column security label did not parse")
+                };
+                assert_eq!(label, None);
+                assert_eq!(
+                    target,
+                    crate::sql::ast::SecurityLabelTarget::Column {
+                        relation: QualName {
+                            schema: Some("public"),
+                            name: "items",
+                        },
+                        column: "label",
+                    }
+                );
+                let Some(Stmt::SecurityLabel {
+                    target: crate::sql::ast::SecurityLabelTarget::Aggregate(identity),
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ordered aggregate security label did not parse")
+                };
+                assert_eq!(identity.name.name, "percentile");
+                assert_eq!(identity.direct_argument_types, ["float8"]);
+                assert_eq!(identity.aggregated_argument_types, ["float8"]);
+            },
+        );
+        with_parser("SECURITY LABEL ON INDEX items_index IS 'label'", |parser| {
+            assert_eq!(
+                parser.next_stmt().unwrap_err().sqlstate,
+                sqlstate::SYNTAX_ERROR
+            );
+        });
     }
 
     #[test]

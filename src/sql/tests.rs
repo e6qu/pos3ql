@@ -40323,6 +40323,16 @@ fn table_access_methods_are_catalogued_typed_and_transactional() {
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(data_rows(&output), ["typed heap alias"]);
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP ACCESS METHOD catalogued_heap CASCADE; ROLLBACK; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'catalogued_heap'; \
+         SELECT id FROM catalogued_heap_rows",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["typed heap alias", "42"]);
     for statement in [
         "CREATE TABLE quoted_builtin_access_method (id integer) USING \"HEAP\"",
         "CREATE ACCESS METHOD unavailable_index TYPE INDEX HANDLER bthandler",

@@ -33232,10 +33232,6 @@ impl Storage {
     }
 
     pub(crate) fn drop_access_method(&mut self, slot: usize, txid: u32) {
-        self.drop_comments_by_subid(
-            CommentClass::AccessMethod,
-            self.access_methods[slot].oid().get() as u32,
-        );
         self.access_methods[slot].ddl_state = self.access_methods[slot].ddl_state.drop_by(txid);
     }
 

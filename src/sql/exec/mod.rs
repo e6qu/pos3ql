@@ -45136,6 +45136,50 @@ pub fn drop_access_method(
                 Err(error) => return Err(error),
             }
         }
+        if storage
+            .comment_text(
+                crate::storage::CommentClass::AccessMethod,
+                "",
+                method.definition.name.as_str(),
+                method.oid().get() as u32,
+                txn.txid,
+            )
+            .is_some()
+        {
+            let (comment_slot, prior) = match storage.set_comment(
+                crate::storage::CommentClass::AccessMethod,
+                SqlName::EMPTY,
+                method.definition.name,
+                method.oid().get() as u32,
+                None,
+                txn.txid,
+            ) {
+                Ok(comment) => comment,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::Comment {
+                    class: crate::storage::CommentClass::AccessMethod.to_u8(),
+                    schema: "",
+                    name: method.definition.name.as_str(),
+                    subid: method.oid().get() as u32,
+                    text: None,
+                },
+            ) {
+                storage.restore_comment_pending(comment_slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CommentSet {
+                slot: comment_slot as u32,
+                prior,
+            }) {
+                storage.restore_comment_pending(comment_slot, prior);
+                return sql_fail(error);
+            }
+        }
         storage.drop_access_method(slot, txn.txid);
         let lsn = storage.bump_lsn();
         if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropAccessMethod { name }) {

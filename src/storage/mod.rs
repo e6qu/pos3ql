@@ -3774,6 +3774,46 @@ pub(crate) enum RewriteMode {
     Instead = 1,
 }
 
+/// PostgreSQL's durable `pg_rewrite.ev_enabled` state.  This is distinct
+/// from trigger state even though their wire codes coincide: a rule can be
+/// disabled without becoming a trigger, and ON SELECT remains executable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuleEnabled {
+    Origin,
+    Replica,
+    Always,
+    Disabled,
+}
+
+impl RuleEnabled {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Origin => b'O',
+            Self::Replica => b'R',
+            Self::Always => b'A',
+            Self::Disabled => b'D',
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b'O' => Some(Self::Origin),
+            b'R' => Some(Self::Replica),
+            b'A' => Some(Self::Always),
+            b'D' => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn fires_for_origin(self) -> bool {
+        matches!(self, Self::Origin | Self::Always)
+    }
+
+    pub(crate) const fn fires_for_replication(self) -> bool {
+        matches!(self, Self::Replica | Self::Always)
+    }
+}
+
 impl RewriteMode {
     pub(crate) const fn from_code(code: u8) -> Option<Self> {
         match code {
@@ -3800,6 +3840,7 @@ pub(crate) struct RuleDefinition {
     pub target: RuleTarget,
     pub event: RewriteEvent,
     pub mode: RewriteMode,
+    pub enabled: RuleEnabled,
     pub source: StackStr<RULE_SQL_MAX>,
     pub condition: Option<RuleTextSpan>,
     pub actions: [RuleTextSpan; MAX_RULE_ACTIONS],
@@ -3818,6 +3859,7 @@ impl RuleDefinition {
         target: RuleTarget::Table(u16::MAX),
         event: RewriteEvent::Select,
         mode: RewriteMode::Also,
+        enabled: RuleEnabled::Origin,
         source: StackStr::new(),
         condition: None,
         actions: [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS],
@@ -28926,6 +28968,7 @@ impl Storage {
             target: RuleTarget::View(new as u16),
             event: RewriteEvent::Select,
             mode: RewriteMode::Instead,
+            enabled: RuleEnabled::Origin,
             source,
             condition: None,
             actions: {
@@ -35766,6 +35809,27 @@ impl Storage {
                     && rule.visible_to(txid)
                     && rule.definition_for(txid).target == target
                     && rule.definition_for(txid).event == event
+            })
+    }
+
+    /// Rules are selected for rewriting only after their durable firing mode
+    /// is interpreted against the statement's replication context.
+    pub(crate) fn firing_rules_for(
+        &self,
+        target: RuleTarget,
+        event: RewriteEvent,
+        replication_apply: bool,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
+        self.rules_for(target, event, txid)
+            .filter(move |(_, rule)| {
+                let definition = rule.definition_for(txid);
+                definition.is_view_return()
+                    || if replication_apply {
+                        definition.enabled.fires_for_replication()
+                    } else {
+                        definition.enabled.fires_for_origin()
+                    }
             })
     }
 

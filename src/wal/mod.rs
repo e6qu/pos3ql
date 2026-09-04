@@ -589,6 +589,7 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
         event: crate::storage::RewriteEvent,
         mode: crate::storage::RewriteMode,
+        enabled: crate::storage::RuleEnabled,
         source: &'a str,
         condition: Option<crate::storage::RuleTextSpan>,
         actions: [crate::storage::RuleTextSpan; crate::storage::MAX_RULE_ACTIONS],
@@ -2402,7 +2403,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => {
             2 + 8
                 + 1
-                + 1
+                + 2
                 + table_schema.len()
                 + 1
                 + table.len()
@@ -4075,6 +4076,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name,
             event,
             mode,
+            enabled,
             source,
             condition,
             actions,
@@ -4093,7 +4095,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, name)
-                && buffer.append(&[*event as u8, *mode as u8])
+                && buffer.append(&[*event as u8, *mode as u8, enabled.code()])
                 && source.len() <= u16::MAX as usize
                 && buffer.append(&(source.len() as u16).to_le_bytes())
                 && buffer.append(source.as_bytes())
@@ -6882,6 +6884,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 1;
             let mode = crate::storage::RewriteMode::from_code(*payload.get(at)?)?;
             at += 1;
+            let enabled = crate::storage::RuleEnabled::from_code(*payload.get(at)?)?;
+            at += 1;
             let source_len = usize::from(u16::from_le_bytes(
                 payload.get(at..at + 2)?.try_into().ok()?,
             ));
@@ -6955,6 +6959,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 event,
                 mode,
+                enabled,
                 source,
                 condition,
                 actions,

@@ -33727,6 +33727,7 @@ fn stored_rule_definition(
         target,
         event,
         mode,
+        enabled: crate::storage::RuleEnabled::Origin,
         source,
         condition,
         actions,
@@ -33842,6 +33843,55 @@ pub fn alter_rule(
         return sql_fail(error);
     }
     responder.command_complete("ALTER RULE")?;
+    sql_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn alter_table_rule_enabled(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    target: crate::storage::RuleTarget,
+    relation: &str,
+    name: &str,
+    enabled: crate::sql::ast::TriggerEnableMode,
+    responder: &mut Responder,
+    emit_completion: bool,
+    tag: &'static str,
+) -> Outcome {
+    let Some(slot) = storage.rule_slot(target, name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "rule \"{}\" for relation \"{}\" does not exist",
+            name,
+            relation
+        ));
+    };
+    let mut definition = storage.rule(slot).definition_for(txn.txid);
+    definition.enabled = match enabled {
+        crate::sql::ast::TriggerEnableMode::Origin => crate::storage::RuleEnabled::Origin,
+        crate::sql::ast::TriggerEnableMode::Replica => crate::storage::RuleEnabled::Replica,
+        crate::sql::ast::TriggerEnableMode::Always => crate::storage::RuleEnabled::Always,
+        crate::sql::ast::TriggerEnableMode::Disabled => crate::storage::RuleEnabled::Disabled,
+    };
+    let prior = match storage.alter_rule(slot, definition, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
+        storage.rollback_rule_alter(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_rule_alter(slot, prior);
+        return sql_fail(error);
+    }
+    if emit_completion {
+        responder.command_complete(tag)?;
+    }
     sql_ok()
 }
 
@@ -33974,6 +34024,7 @@ fn stage_rule(
             name: definition.name.as_str(),
             event: definition.event,
             mode: definition.mode,
+            enabled: definition.enabled,
             source: definition.source.as_str(),
             condition: definition.condition,
             actions: definition.actions,
@@ -58207,7 +58258,10 @@ fn alter_table_inner(
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
             Some(crate::storage::ResolvedRelation::Table(i)) => i,
             Some(crate::storage::ResolvedRelation::View(view))
-                if matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]) =>
+                if matches!(
+                    statement.actions,
+                    [AlterAction::SetTriggerEnabled { .. } | AlterAction::SetRuleEnabled { .. }]
+                ) =>
             {
                 if emit_completion
                     && let Err(error) = storage.require_owner(
@@ -58225,24 +58279,36 @@ fn alter_table_inner(
                     let definition = storage.view(view);
                     (definition.schema, definition.name)
                 };
-                let [AlterAction::SetTriggerEnabled { target, enabled }] = statement.actions else {
-                    unreachable!("view ALTER TABLE action was checked above")
+                return match statement.actions {
+                    [AlterAction::SetTriggerEnabled { target, enabled }] => alter_trigger_enabled(
+                        storage,
+                        wal,
+                        txn,
+                        crate::storage::TriggerTarget::View(view as u16),
+                        crate::wal::TriggerTargetKind::View,
+                        schema.as_str(),
+                        relation.as_str(),
+                        *target,
+                        *enabled,
+                        !statement.only,
+                        responder,
+                        emit_completion,
+                        tag,
+                    ),
+                    [AlterAction::SetRuleEnabled { name, enabled }] => alter_table_rule_enabled(
+                        storage,
+                        wal,
+                        txn,
+                        crate::storage::RuleTarget::View(view as u16),
+                        relation.as_str(),
+                        name,
+                        *enabled,
+                        responder,
+                        emit_completion,
+                        tag,
+                    ),
+                    _ => unreachable!("view ALTER TABLE action was checked above"),
                 };
-                return alter_trigger_enabled(
-                    storage,
-                    wal,
-                    txn,
-                    crate::storage::TriggerTarget::View(view as u16),
-                    crate::wal::TriggerTargetKind::View,
-                    schema.as_str(),
-                    relation.as_str(),
-                    *target,
-                    *enabled,
-                    !statement.only,
-                    responder,
-                    emit_completion,
-                    tag,
-                );
             }
             None if statement.if_exists => {
                 responder.notice(
@@ -58446,6 +58512,21 @@ fn alter_table_inner(
             *target,
             *enabled,
             !statement.only,
+            responder,
+            emit_completion,
+            tag,
+        );
+    }
+
+    if let [AlterAction::SetRuleEnabled { name, enabled }] = statement.actions {
+        return alter_table_rule_enabled(
+            storage,
+            wal,
+            txn,
+            crate::storage::RuleTarget::Table(table_index as u16),
+            def.name.as_str(),
+            name,
+            *enabled,
             responder,
             emit_completion,
             tag,
@@ -59036,6 +59117,9 @@ fn alter_table_inner(
             }
             AlterAction::SetTriggerEnabled { .. } => {
                 unreachable!("trigger enablement is a standalone action")
+            }
+            AlterAction::SetRuleEnabled { .. } => {
+                unreachable!("rule enablement is a standalone action")
             }
             AlterAction::SetRowLevelSecurity(_) => {
                 unreachable!("row-level security is a standalone action")

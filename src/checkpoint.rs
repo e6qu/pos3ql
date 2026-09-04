@@ -3421,6 +3421,11 @@ impl Checkpointer {
                         "rule mode",
                     )?)
                     .ok_or(CheckpointSetupError::Corrupt("invalid rule mode"))?;
+                    let enabled = crate::storage::RuleEnabled::from_code(parse_field(
+                        words.next(),
+                        "rule enabled mode",
+                    )?)
+                    .ok_or(CheckpointSetupError::Corrupt("invalid rule enabled mode"))?;
                     let source =
                         StackStr::<{ crate::storage::RULE_SQL_MAX }>::from_str(&decode_hex_name(
                             words
@@ -3511,6 +3516,7 @@ impl Checkpointer {
                                 target,
                                 event,
                                 mode,
+                                enabled,
                                 source,
                                 condition,
                                 actions,
@@ -7622,7 +7628,7 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rul {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "rul {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     slot,
                     rule.created_at,
                     target,
@@ -7631,6 +7637,7 @@ impl Checkpointer {
                     ManifestName(definition.name.as_str()),
                     definition.event as u8,
                     definition.mode as u8,
+                    definition.enabled.code(),
                     ManifestName(definition.source.as_str()),
                     condition.start,
                     condition.len,

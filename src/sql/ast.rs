@@ -4843,6 +4843,11 @@ pub enum AlterAction<'a> {
         target: TriggerEnableTarget<'a>,
         enabled: TriggerEnableMode,
     },
+    /// ALTER TABLE ... {ENABLE|DISABLE} [REPLICA|ALWAYS] RULE name.
+    SetRuleEnabled {
+        name: &'a str,
+        enabled: TriggerEnableMode,
+    },
     SetRowLevelSecurity(RowLevelSecurityAlteration),
     SetPersistence(RelationPersistence),
     SetStorageOptions(RelationStorageOptions),

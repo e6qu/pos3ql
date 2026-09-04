@@ -9494,7 +9494,11 @@ fn pg_rewrite<'a>(
                 text(definition.name.as_str(), arena)?,
                 Datum::Int4(relation_oid),
                 text(event, arena)?,
-                text("O", arena)?,
+                text(
+                    core::str::from_utf8(&[definition.enabled.code()])
+                        .expect("rule enabled code is ASCII"),
+                    arena,
+                )?,
                 Datum::Bool(matches!(
                     definition.mode,
                     crate::storage::RewriteMode::Instead

@@ -101,6 +101,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::RenameColumn { .. }
         | AlterAction::RenameConstraint { .. }
         | AlterAction::SetTriggerEnabled { .. }
+        | AlterAction::SetRuleEnabled { .. }
         | AlterAction::SetRowLevelSecurity(_)
         | AlterAction::SetPersistence(_)
         | AlterAction::SetInheritance { .. }
@@ -5162,6 +5163,24 @@ impl<'a> Parser<'a> {
             None
         };
         if let Some(enabled) = trigger_mode {
+            if self.eat_ident("rule")? {
+                if matches!(self.peeked, Tok::Ident("all" | "user")) {
+                    return Err(self.err_here("expected a rewrite rule name"));
+                }
+                let action = AlterAction::SetRuleEnabled {
+                    name: self.col_ident("rewrite rule name")?,
+                    enabled,
+                };
+                return Ok(Self::alter_table_statement(
+                    foreign,
+                    AlterTable {
+                        table,
+                        if_exists,
+                        only,
+                        actions: self.arena_slice(&[action])?,
+                    },
+                ));
+            }
             self.expect_ident("trigger")?;
             let target = match (enabled, self.peeked) {
                 (
@@ -10216,6 +10235,8 @@ mod tests {
                ); \
              CREATE OR REPLACE RULE suppress_delete AS ON DELETE TO accounts \
                DO INSTEAD NOTHING; \
+             ALTER TABLE accounts ENABLE REPLICA RULE audit_update; \
+             ALTER TABLE accounts DISABLE RULE audit_update; \
              ALTER RULE audit_update ON app.accounts RENAME TO audit_balance; \
              DROP RULE IF EXISTS audit_balance ON app.accounts CASCADE",
             |parser| {
@@ -10236,6 +10257,27 @@ mod tests {
                 assert_eq!(replaced.event, RuleEvent::Delete);
                 assert_eq!(replaced.mode, RuleMode::Instead);
                 assert!(replaced.actions.is_empty());
+
+                assert!(matches!(
+                    parser.next_stmt().unwrap().unwrap(),
+                    Stmt::AlterTable(AlterTable {
+                        actions: [AlterAction::SetRuleEnabled {
+                            name: "audit_update",
+                            enabled: TriggerEnableMode::Replica,
+                        }],
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap().unwrap(),
+                    Stmt::AlterTable(AlterTable {
+                        actions: [AlterAction::SetRuleEnabled {
+                            name: "audit_update",
+                            enabled: TriggerEnableMode::Disabled,
+                        }],
+                        ..
+                    })
+                ));
 
                 assert!(matches!(
                     parser.next_stmt().unwrap().unwrap(),
@@ -10261,6 +10303,8 @@ mod tests {
             "CREATE RULE bad AS ON TRUNCATE TO t DO NOTHING",
             "CREATE RULE bad AS ON INSERT TO t DO VACUUM t",
             "CREATE RULE bad AS ON INSERT TO t DO (INSERT INTO x VALUES (1) SELECT 1)",
+            "ALTER TABLE t DISABLE RULE ALL",
+            "ALTER TABLE t ENABLE RULE USER",
         ] {
             with_parser(sql, |parser| {
                 assert!(parser.next_stmt().is_err(), "accepted {sql}");

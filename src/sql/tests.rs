@@ -2292,6 +2292,57 @@ fn rewrite_rule_lifecycle_catalogs_and_transactionality() {
 }
 
 #[test]
+fn rewrite_rule_enablement_controls_firing_catalogs_and_view_return_rules() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE rule_mode_source(id integer); \
+         CREATE TABLE rule_mode_audit(id integer); \
+         CREATE RULE rule_mode_audit AS ON INSERT TO rule_mode_source \
+           DO ALSO INSERT INTO rule_mode_audit VALUES (NEW.id); \
+         ALTER TABLE rule_mode_source DISABLE RULE rule_mode_audit; \
+         INSERT INTO rule_mode_source VALUES (1); \
+         SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'rule_mode_audit'; \
+         ALTER TABLE rule_mode_source ENABLE REPLICA RULE rule_mode_audit; \
+         INSERT INTO rule_mode_source VALUES (2); \
+         SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'rule_mode_audit'; \
+         ALTER TABLE rule_mode_source ENABLE ALWAYS RULE rule_mode_audit; \
+         INSERT INTO rule_mode_source VALUES (3); \
+         SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'rule_mode_audit'; \
+         ALTER TABLE rule_mode_source ENABLE RULE rule_mode_audit; \
+         INSERT INTO rule_mode_source VALUES (4); \
+         SELECT id FROM rule_mode_audit ORDER BY id; \
+         BEGIN; ALTER TABLE rule_mode_source DISABLE RULE rule_mode_audit; ROLLBACK; \
+         INSERT INTO rule_mode_source VALUES (5); \
+         SELECT id FROM rule_mode_audit ORDER BY id; \
+         CREATE VIEW rule_mode_view AS SELECT id FROM rule_mode_source; \
+         ALTER TABLE rule_mode_view DISABLE RULE \"_RETURN\"; \
+         SELECT ev_enabled FROM pg_rewrite WHERE rulename = '_RETURN' \
+           AND ev_class = 'rule_mode_view'::regclass; \
+         SELECT id FROM rule_mode_view WHERE id = 5",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        ["D", "R", "A", "3", "4", "3", "4", "5", "D", "5"],
+        "{text}"
+    );
+
+    let missing = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE rule_mode_source DISABLE RULE missing_rule",
+    );
+    assert!(
+        String::from_utf8_lossy(&missing).contains("42704"),
+        "{}",
+        String::from_utf8_lossy(&missing)
+    );
+}
+
+#[test]
 fn rewrite_rule_actions_are_set_oriented_ordered_and_qualified() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -2805,6 +2856,81 @@ fn rewrite_rules_survive_object_cold_checkpoint_recovery() {
         ["24", "12", "18", "24", "object durable", "t"]
     );
     drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn rewrite_rule_enablement_survives_wal_checkpoint_and_object_cold_recovery() {
+    let mut config = test_config("rewrite-rule-enablement-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace =
+        format!("rewrite-rule-enablement-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_rule_mode_source(id integer); \
+         CREATE TABLE durable_rule_mode_audit(id integer); \
+         CREATE RULE durable_rule_mode AS ON INSERT TO durable_rule_mode_source \
+           DO ALSO INSERT INTO durable_rule_mode_audit VALUES (NEW.id); \
+         ALTER TABLE durable_rule_mode_source DISABLE RULE durable_rule_mode; \
+         INSERT INTO durable_rule_mode_source VALUES (1); \
+         SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'durable_rule_mode'; \
+         SELECT count(*) FROM durable_rule_mode_audit",
+    );
+    assert_eq!(
+        data_rows(&created),
+        ["D", "0"],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let wal_output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "INSERT INTO durable_rule_mode_source VALUES (2); \
+         SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'durable_rule_mode'; \
+         SELECT count(*) FROM durable_rule_mode_audit",
+    );
+    assert_eq!(
+        data_rows(&wal_output),
+        ["D", "0"],
+        "{}",
+        String::from_utf8_lossy(&wal_output)
+    );
+    assert!(recovered.checkpoint().unwrap());
+    recovered.commit_wal().unwrap();
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let output = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "INSERT INTO durable_rule_mode_source VALUES (3); \
+         SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'durable_rule_mode'; \
+         SELECT count(*) FROM durable_rule_mode_audit",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["D", "0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(cold);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -41630,6 +41756,145 @@ fn table_inheritance_is_durable_typed_and_visible_to_parent_dml() {
         "{}",
         String::from_utf8_lossy(&output)
     );
+}
+
+#[test]
+fn not_null_constraint_inheritance_is_typed_transactional_and_catalog_visible() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE not_null_inherit_parent (id integer NOT NULL); \
+         CREATE TABLE not_null_inherit_child (extra integer) \
+           INHERITS (not_null_inherit_parent); \
+         SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_child'::regclass AND contype = 'n'; \
+         SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'not_null_inherit_child'::regclass AND attname = 'id'; \
+         ALTER TABLE not_null_inherit_parent \
+           ALTER CONSTRAINT not_null_inherit_parent_id_not_null NO INHERIT; \
+         SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_parent'::regclass \
+            AND conname = 'not_null_inherit_parent_id_not_null'; \
+         SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_child'::regclass AND contype = 'n'; \
+         ALTER TABLE not_null_inherit_parent \
+           ALTER CONSTRAINT not_null_inherit_parent_id_not_null INHERIT; \
+         SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'not_null_inherit_child'::regclass AND attname = 'id'; \
+         BEGIN; ALTER TABLE not_null_inherit_parent \
+           ALTER CONSTRAINT not_null_inherit_parent_id_not_null NO INHERIT; ROLLBACK; \
+         SELECT connoinherit FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_parent'::regclass \
+            AND conname = 'not_null_inherit_parent_id_not_null'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        ["1", "t", "t|0|t", "1", "t", "f"],
+        "{text}"
+    );
+    let only = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE ONLY not_null_inherit_parent \
+           ALTER CONSTRAINT not_null_inherit_parent_id_not_null NO INHERIT",
+    );
+    assert!(String::from_utf8_lossy(&only).contains("42P16"));
+    let no_inherit_at_creation = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE not_null_creation_parent (id integer NOT NULL NO INHERIT); \
+         CREATE TABLE not_null_creation_child (extra integer) \
+           INHERITS (not_null_creation_parent); \
+         SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'not_null_creation_child'::regclass \
+            AND contype = 'n'",
+    );
+    assert_eq!(
+        data_rows(&no_inherit_at_creation),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&no_inherit_at_creation)
+    );
+}
+
+#[test]
+fn not_null_constraint_inheritance_survives_wal_checkpoint_and_object_cold_recovery() {
+    let mut config = test_config("not-null-inheritance-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("not-null-inheritance-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_not_null_parent (id integer NOT NULL); \
+         CREATE TABLE durable_not_null_child (extra integer) \
+           INHERITS (durable_not_null_parent); \
+         ALTER TABLE durable_not_null_parent \
+           ALTER CONSTRAINT durable_not_null_parent_id_not_null NO INHERIT; \
+         SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'durable_not_null_child'::regclass AND attname = 'id'",
+    );
+    assert_eq!(
+        data_rows(&created),
+        ["t"],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let wal_output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT connoinherit FROM pg_constraint \
+          WHERE conrelid = 'durable_not_null_parent'::regclass \
+            AND conname = 'durable_not_null_parent_id_not_null'; \
+         SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'durable_not_null_child'::regclass AND attname = 'id'",
+    );
+    assert_eq!(
+        data_rows(&wal_output),
+        ["t", "t"],
+        "{}",
+        String::from_utf8_lossy(&wal_output)
+    );
+    assert!(recovered.checkpoint().unwrap());
+    recovered.commit_wal().unwrap();
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let output = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT connoinherit FROM pg_constraint \
+          WHERE conrelid = 'durable_not_null_parent'::regclass \
+            AND conname = 'durable_not_null_parent_id_not_null'; \
+         SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'durable_not_null_child'::regclass AND attname = 'id'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t", "t"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]

@@ -156,7 +156,7 @@ const KIND_DROP_RULE: u8 = 106;
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 2;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 3;
 const KIND_SET_PARAMETER_ACL: u8 = 123;
 const KIND_PREPARE_TRANSACTION: u8 = 107;
 const KIND_COMMIT_PREPARED: u8 = 108;
@@ -589,6 +589,7 @@ pub(crate) enum WalOp<'a> {
         name: &'a str,
         event: crate::storage::RewriteEvent,
         mode: crate::storage::RewriteMode,
+        enabled: crate::storage::RuleEnabled,
         source: &'a str,
         condition: Option<crate::storage::RuleTextSpan>,
         actions: [crate::storage::RuleTextSpan; crate::storage::MAX_RULE_ACTIONS],
@@ -2222,7 +2223,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             };
             for c in def.columns() {
                 let default_value = c.default.constant().copied();
-                n += 1 + c.name.as_str().len() + 3 + 4 + encoded_default_len(&default_value);
+                n += 1 + c.name.as_str().len() + 4 + 4 + encoded_default_len(&default_value);
                 // Non-constant DEFAULT text: 2-byte length prefix + bytes.
                 n += 2 + c
                     .default
@@ -2402,7 +2403,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => {
             2 + 8
                 + 1
-                + 1
+                + 2
                 + table_schema.len()
                 + 1
                 + table.len()
@@ -3826,6 +3827,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     | (u8::from(c.user_type.is_some()) << 7);
                 ok &= buffer.append(&[c.ctype.code(), flags]);
                 ok &= buffer.append(&[c.not_null.code()]);
+                ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 let default_value = c.default.constant().copied();
                 ok &= append_default(buffer, &default_value);
@@ -4075,6 +4077,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name,
             event,
             mode,
+            enabled,
             source,
             condition,
             actions,
@@ -4093,7 +4096,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && name_bytes(buffer, table_schema)
                 && name_bytes(buffer, table)
                 && name_bytes(buffer, name)
-                && buffer.append(&[*event as u8, *mode as u8])
+                && buffer.append(&[*event as u8, *mode as u8, enabled.code()])
                 && source.len() <= u16::MAX as usize
                 && buffer.append(&(source.len() as u16).to_le_bytes())
                 && buffer.append(source.as_bytes())
@@ -6330,6 +6333,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += 2;
                 let not_null = crate::storage::NotNullOrigin::from_code(*payload.get(at)?)?;
                 at += 1;
+                let not_null_inheritable = match *payload.get(at)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                at += 1;
                 let type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
                 at += 4;
                 let default_value = decode_default(payload, &mut at)?;
@@ -6391,6 +6400,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     storage,
                     compression,
                     not_null,
+                    not_null_inheritable,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
                     auto_increment: meta[1] & 8 != 0,
@@ -6882,6 +6892,8 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 1;
             let mode = crate::storage::RewriteMode::from_code(*payload.get(at)?)?;
             at += 1;
+            let enabled = crate::storage::RuleEnabled::from_code(*payload.get(at)?)?;
+            at += 1;
             let source_len = usize::from(u16::from_le_bytes(
                 payload.get(at..at + 2)?.try_into().ok()?,
             ));
@@ -6955,6 +6967,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
                 event,
                 mode,
+                enabled,
                 source,
                 condition,
                 actions,
@@ -11176,6 +11189,7 @@ mod tests {
             storage: crate::sql::ast::ColumnStorage::Plain,
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Local,
+            not_null_inheritable: true,
             unique: true,
             primary: true,
             auto_increment: false,
@@ -11195,6 +11209,7 @@ mod tests {
             storage: crate::sql::ast::ColumnStorage::Extended,
             compression: crate::sql::ast::ColumnCompression::Lz4,
             not_null: crate::storage::NotNullOrigin::Nullable,
+            not_null_inheritable: true,
             unique: false,
             primary: false,
             auto_increment: false,

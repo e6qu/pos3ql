@@ -8434,11 +8434,21 @@ impl Engine {
             })
         ) {
             let has_insert_or_update_rule = storage
-                .rules_for(target, crate::storage::RewriteEvent::Insert, txn.txid)
+                .firing_rules_for(
+                    target,
+                    crate::storage::RewriteEvent::Insert,
+                    txn.replication_apply,
+                    txn.txid,
+                )
                 .next()
                 .is_some()
                 || storage
-                    .rules_for(target, crate::storage::RewriteEvent::Update, txn.txid)
+                    .firing_rules_for(
+                        target,
+                        crate::storage::RewriteEvent::Update,
+                        txn.replication_apply,
+                        txn.txid,
+                    )
                     .next()
                     .is_some();
             if has_insert_or_update_rule {
@@ -8448,7 +8458,11 @@ impl Engine {
                 )));
             }
         }
-        if storage.rules_for(target, event, txn.txid).next().is_none() {
+        if storage
+            .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+            .next()
+            .is_none()
+        {
             return Self::execute_data_modification_unrewritten(
                 storage,
                 scratch,
@@ -8650,15 +8664,17 @@ impl Engine {
                 Ok(transition) => transition,
                 Err(error) => return Ok(Err(error)),
             };
-        let suppress_original = storage.rules_for(target, event, txn.txid).any(|(_, rule)| {
-            let definition = rule.definition_for(txn.txid);
-            definition.mode == crate::storage::RewriteMode::Instead
-                && definition.condition.is_none()
-        });
+        let suppress_original = storage
+            .firing_rules_for(target, event, txn.replication_apply, txn.txid)
+            .any(|(_, rule)| {
+                let definition = rule.definition_for(txn.txid);
+                definition.mode == crate::storage::RewriteMode::Instead
+                    && definition.condition.is_none()
+            });
         if outer_returns_rows
             && suppress_original
             && !storage
-                .rules_for(target, event, txn.txid)
+                .firing_rules_for(target, event, txn.replication_apply, txn.txid)
                 .any(|(_, rule)| rule.definition_for(txn.txid).returning_action.is_some())
         {
             return Ok(Err(sql_err!(
@@ -8669,7 +8685,7 @@ impl Engine {
         }
         let insert_event = event == crate::storage::RewriteEvent::Insert;
         let mut original_filter: Option<&Expr<'a>> = None;
-        for (_, rule) in storage.rules_for(target, event, txn.txid) {
+        for (_, rule) in storage.firing_rules_for(target, event, txn.replication_apply, txn.txid) {
             let definition = rule.definition_for(txn.txid);
             if definition.mode != crate::storage::RewriteMode::Instead
                 || definition.condition.is_none()
@@ -8765,7 +8781,7 @@ impl Engine {
         let mut rewritten_rows = 0u64;
         loop {
             let selected = storage
-                .rules_for(target, event, txn.txid)
+                .firing_rules_for(target, event, txn.replication_apply, txn.txid)
                 .filter(|(_, rule)| {
                     last_name.is_none_or(|last| {
                         rule.definition_for(txn.txid).name.as_str() > last.as_str()
@@ -17693,6 +17709,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             name,
             event,
             mode,
+            enabled,
             source,
             condition,
             actions,
@@ -17742,6 +17759,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     target,
                     event,
                     mode,
+                    enabled,
                     source: stored_source,
                     condition,
                     actions,

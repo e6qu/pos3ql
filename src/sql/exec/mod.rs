@@ -2504,11 +2504,12 @@ fn build_inherited_table_def(
         }
         for parent_column in parent_definition.columns() {
             let mut inherited = *parent_column;
-            inherited.not_null = if inherited.not_null.is_required() {
-                crate::storage::NotNullOrigin::Inherited
-            } else {
-                crate::storage::NotNullOrigin::Nullable
-            };
+            inherited.not_null =
+                if inherited.not_null.is_required() && inherited.not_null_inheritable {
+                    crate::storage::NotNullOrigin::Inherited
+                } else {
+                    crate::storage::NotNullOrigin::Nullable
+                };
             // A child has its own physical rows and its own identity-sequence
             // ownership. PostgreSQL does not make the parent's sequence an
             // implicit writable dependency of the child relation.
@@ -2556,8 +2557,19 @@ fn build_inherited_table_def(
                 definition.columns[existing].default = column.default;
             }
             if column.not_null.is_required() {
+                if inherited.not_null.is_required()
+                    && inherited.not_null_inheritable
+                    && !column.not_null_inheritable
+                {
+                    return Err(sql_err!(
+                        sqlstate::DATATYPE_MISMATCH,
+                        "not-null constraint on inherited column \"{}\" must be inheritable",
+                        column.name.as_str()
+                    ));
+                }
                 definition.columns[existing].not_null =
                     definition.columns[existing].not_null.add_local();
+                definition.columns[existing].not_null_inheritable = column.not_null_inheritable;
             }
         } else {
             let mut count = definition.n_columns;
@@ -33727,6 +33739,7 @@ fn stored_rule_definition(
         target,
         event,
         mode,
+        enabled: crate::storage::RuleEnabled::Origin,
         source,
         condition,
         actions,
@@ -33842,6 +33855,55 @@ pub fn alter_rule(
         return sql_fail(error);
     }
     responder.command_complete("ALTER RULE")?;
+    sql_ok()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn alter_table_rule_enabled(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    target: crate::storage::RuleTarget,
+    relation: &str,
+    name: &str,
+    enabled: crate::sql::ast::TriggerEnableMode,
+    responder: &mut Responder,
+    emit_completion: bool,
+    tag: &'static str,
+) -> Outcome {
+    let Some(slot) = storage.rule_slot(target, name, txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::UNDEFINED_OBJECT,
+            "rule \"{}\" for relation \"{}\" does not exist",
+            name,
+            relation
+        ));
+    };
+    let mut definition = storage.rule(slot).definition_for(txn.txid);
+    definition.enabled = match enabled {
+        crate::sql::ast::TriggerEnableMode::Origin => crate::storage::RuleEnabled::Origin,
+        crate::sql::ast::TriggerEnableMode::Replica => crate::storage::RuleEnabled::Replica,
+        crate::sql::ast::TriggerEnableMode::Always => crate::storage::RuleEnabled::Always,
+        crate::sql::ast::TriggerEnableMode::Disabled => crate::storage::RuleEnabled::Disabled,
+    };
+    let prior = match storage.alter_rule(slot, definition, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = stage_rule(storage, wal, txn, slot, definition) {
+        storage.rollback_rule_alter(slot, prior);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::RuleAltered {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_rule_alter(slot, prior);
+        return sql_fail(error);
+    }
+    if emit_completion {
+        responder.command_complete(tag)?;
+    }
     sql_ok()
 }
 
@@ -33974,6 +34036,7 @@ fn stage_rule(
             name: definition.name.as_str(),
             event: definition.event,
             mode: definition.mode,
+            enabled: definition.enabled,
             source: definition.source.as_str(),
             condition: definition.condition,
             actions: definition.actions,
@@ -35054,6 +35117,7 @@ pub fn create_table_as(
             storage: crate::sql::ast::ColumnStorage::Plain,
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
+            not_null_inheritable: true,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -52416,6 +52480,7 @@ pub(crate) fn view_trigger_definition(
             storage: crate::sql::ast::ColumnStorage::Plain,
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Nullable,
+            not_null_inheritable: true,
             unique: false,
             primary: false,
             auto_increment: false,
@@ -56893,7 +56958,12 @@ fn ordinary_inheritance_propagates_action(definition: &TableDef, action: &AlterA
         | AlterAction::SetDefault { .. }
         | AlterAction::DropDefault { .. }
         | AlterAction::SetNotNull { .. }
-        | AlterAction::DropNotNull { .. } => true,
+        | AlterAction::DropNotNull { .. }
+        | AlterAction::SetNotNullInheritance { .. } => true,
+        AlterAction::AlterConstraint {
+            alteration: crate::sql::ast::ConstraintAlteration::NotNullInheritance { .. },
+            ..
+        } => true,
         AlterAction::AddConstraint(crate::sql::ast::TableConstraint::Check { .. }) => true,
         AlterAction::DropConstraint { name, .. }
         | AlterAction::RenameConstraint { from: name, .. }
@@ -56944,6 +57014,15 @@ fn ordinary_inheritance_only_error(
                 return Some(sql_err!(
                     sqlstate::INVALID_TABLE_DEFINITION,
                     "constraint must be added to child tables too"
+                ));
+            }
+            AlterAction::AlterConstraint {
+                alteration: crate::sql::ast::ConstraintAlteration::NotNullInheritance { .. },
+                ..
+            } => {
+                return Some(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "not-null constraint inheritance must be changed in child tables too"
                 ));
             }
             AlterAction::DropConstraint { name, .. }
@@ -57559,10 +57638,23 @@ fn alter_table_inheritance(
                     expected.name.as_str()
                 ));
             }
-            if expected.not_null.is_required() && !actual.not_null.is_required() {
+            if expected.not_null.is_required()
+                && expected.not_null_inheritable
+                && !actual.not_null.is_required()
+            {
                 return sql_fail(sql_err!(
                     sqlstate::DATATYPE_MISMATCH,
                     "column \"{}\" in child table must be marked NOT NULL",
+                    expected.name.as_str()
+                ));
+            }
+            if expected.not_null.is_required()
+                && expected.not_null_inheritable
+                && !actual.not_null_inheritable
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::DATATYPE_MISMATCH,
+                    "not-null constraint on column \"{}\" in child table must be inheritable",
                     expected.name.as_str()
                 ));
             }
@@ -57574,7 +57666,7 @@ fn alter_table_inheritance(
             return sql_fail(error);
         }
         for expected in parent_definition.columns() {
-            if expected.not_null.is_required() {
+            if expected.not_null.is_required() && expected.not_null_inheritable {
                 let index = updated
                     .column_index(expected.name.as_str())
                     .expect("validated inherited column exists");
@@ -57598,7 +57690,10 @@ fn alter_table_inheritance(
                     let definition = storage.table_def(usize::from(*slot), txn.txid);
                     definition
                         .column_index(updated.columns[column].name.as_str())
-                        .is_some_and(|index| definition.columns[index].not_null.is_required())
+                        .is_some_and(|index| {
+                            definition.columns[index].not_null.is_required()
+                                && definition.columns[index].not_null_inheritable
+                        })
                 });
             updated.columns[column].not_null = if required_by_remaining_parent {
                 crate::storage::NotNullOrigin::Inherited
@@ -58207,7 +58302,10 @@ fn alter_table_inner(
         match storage.resolve_relation(statement.table.schema, statement.table.name, txn.txid) {
             Some(crate::storage::ResolvedRelation::Table(i)) => i,
             Some(crate::storage::ResolvedRelation::View(view))
-                if matches!(statement.actions, [AlterAction::SetTriggerEnabled { .. }]) =>
+                if matches!(
+                    statement.actions,
+                    [AlterAction::SetTriggerEnabled { .. } | AlterAction::SetRuleEnabled { .. }]
+                ) =>
             {
                 if emit_completion
                     && let Err(error) = storage.require_owner(
@@ -58225,24 +58323,36 @@ fn alter_table_inner(
                     let definition = storage.view(view);
                     (definition.schema, definition.name)
                 };
-                let [AlterAction::SetTriggerEnabled { target, enabled }] = statement.actions else {
-                    unreachable!("view ALTER TABLE action was checked above")
+                return match statement.actions {
+                    [AlterAction::SetTriggerEnabled { target, enabled }] => alter_trigger_enabled(
+                        storage,
+                        wal,
+                        txn,
+                        crate::storage::TriggerTarget::View(view as u16),
+                        crate::wal::TriggerTargetKind::View,
+                        schema.as_str(),
+                        relation.as_str(),
+                        *target,
+                        *enabled,
+                        !statement.only,
+                        responder,
+                        emit_completion,
+                        tag,
+                    ),
+                    [AlterAction::SetRuleEnabled { name, enabled }] => alter_table_rule_enabled(
+                        storage,
+                        wal,
+                        txn,
+                        crate::storage::RuleTarget::View(view as u16),
+                        relation.as_str(),
+                        name,
+                        *enabled,
+                        responder,
+                        emit_completion,
+                        tag,
+                    ),
+                    _ => unreachable!("view ALTER TABLE action was checked above"),
                 };
-                return alter_trigger_enabled(
-                    storage,
-                    wal,
-                    txn,
-                    crate::storage::TriggerTarget::View(view as u16),
-                    crate::wal::TriggerTargetKind::View,
-                    schema.as_str(),
-                    relation.as_str(),
-                    *target,
-                    *enabled,
-                    !statement.only,
-                    responder,
-                    emit_completion,
-                    tag,
-                );
             }
             None if statement.if_exists => {
                 responder.notice(
@@ -58446,6 +58556,21 @@ fn alter_table_inner(
             *target,
             *enabled,
             !statement.only,
+            responder,
+            emit_completion,
+            tag,
+        );
+    }
+
+    if let [AlterAction::SetRuleEnabled { name, enabled }] = statement.actions {
+        return alter_table_rule_enabled(
+            storage,
+            wal,
+            txn,
+            crate::storage::RuleTarget::Table(table_index as u16),
+            def.name.as_str(),
+            name,
+            *enabled,
             responder,
             emit_completion,
             tag,
@@ -59036,6 +59161,9 @@ fn alter_table_inner(
             }
             AlterAction::SetTriggerEnabled { .. } => {
                 unreachable!("trigger enablement is a standalone action")
+            }
+            AlterAction::SetRuleEnabled { .. } => {
+                unreachable!("rule enablement is a standalone action")
             }
             AlterAction::SetRowLevelSecurity(_) => {
                 unreachable!("row-level security is a standalone action")
@@ -59827,6 +59955,54 @@ fn alter_table_inner(
                 validate_definition = true;
             }
             AlterAction::AlterConstraint { name, alteration } => {
+                let alteration = match alteration {
+                    crate::sql::ast::ConstraintAlteration::ForeignKey(alteration) => alteration,
+                    crate::sql::ast::ConstraintAlteration::NotNullInheritance { inherit } => {
+                        let column = new_def.columns().iter().position(|column| {
+                            column.not_null.is_required()
+                                && stack_format!(
+                                    128,
+                                    "{}_{}_not_null",
+                                    new_def.name.as_str(),
+                                    column.name.as_str()
+                                )
+                                .as_str()
+                                    == *name
+                        });
+                        if let Some(column) = column {
+                            new_def.columns[column].not_null_inheritable = *inherit;
+                            continue;
+                        }
+                        if new_def.checks[..new_def.n_checks]
+                            .iter()
+                            .any(|check| check.name.as_str() == *name)
+                            || new_def.fkeys[..new_def.n_fkeys]
+                                .iter()
+                                .any(|foreign_key| foreign_key.name.as_str() == *name)
+                            || new_def
+                                .partition
+                                .detached_bound
+                                .is_some_and(|constraint| constraint.name.as_str() == *name)
+                            || new_def.exclusions[..new_def.n_exclusions]
+                                .iter()
+                                .any(|exclusion| exclusion.name.as_str() == *name)
+                            || named_key_columns(&new_def, name).is_some()
+                        {
+                            return sql_fail(sql_err!(
+                                sqlstate::WRONG_OBJECT_TYPE,
+                                "constraint \"{}\" of relation \"{}\" is not a not-null constraint",
+                                name,
+                                new_def.name.as_str()
+                            ));
+                        }
+                        return sql_fail(sql_err!(
+                            sqlstate::UNDEFINED_OBJECT,
+                            "constraint \"{}\" of relation \"{}\" does not exist",
+                            name,
+                            new_def.name.as_str()
+                        ));
+                    }
+                };
                 if let Some(index) = new_def.fkeys[..new_def.n_fkeys]
                     .iter()
                     .position(|foreign_key| foreign_key.name.as_str() == *name)
@@ -59902,6 +60078,22 @@ fn alter_table_inner(
                         new_def.name.as_str()
                     ));
                 }
+            }
+            AlterAction::SetNotNullInheritance { column, inherit } => {
+                let Some(column) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if !new_def.columns[column].not_null.is_required() {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "not-null constraint for column \"{}\" of relation \"{}\" does not exist",
+                        column,
+                        new_def.name.as_str()
+                    ));
+                }
+                // The existing child requirement stays inherited. This flag
+                // controls whether it can reach that child's descendants.
+                new_def.columns[column].not_null_inheritable = *inherit;
             }
             AlterAction::ValidateConstraint(name) => {
                 if new_def
@@ -61023,7 +61215,34 @@ fn alter_table_inner(
         let mut inherited_action_count = 0usize;
         for action in statement.actions {
             if ordinary_inheritance_propagates_action(&def, action) {
-                inherited_actions[inherited_action_count] = *action;
+                inherited_actions[inherited_action_count] = match action {
+                    AlterAction::AlterConstraint {
+                        name,
+                        alteration:
+                            crate::sql::ast::ConstraintAlteration::NotNullInheritance { inherit },
+                    } => {
+                        let column = def
+                            .columns()
+                            .iter()
+                            .find(|column| {
+                                column.not_null.is_required()
+                                    && stack_format!(
+                                        128,
+                                        "{}_{}_not_null",
+                                        def.name.as_str(),
+                                        column.name.as_str()
+                                    )
+                                    .as_str()
+                                        == *name
+                            })
+                            .expect("direct ALTER CONSTRAINT already resolved its NOT NULL column");
+                        AlterAction::SetNotNullInheritance {
+                            column: column.name.as_str(),
+                            inherit: *inherit,
+                        }
+                    }
+                    _ => *action,
+                };
                 inherited_action_count += 1;
             }
         }
@@ -62136,6 +62355,7 @@ fn coerce_composite_value_inner<'a>(
             storage: crate::sql::ast::ColumnStorage::Plain,
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::local(field.not_null),
+            not_null_inheritable: true,
             unique: false,
             primary: false,
             auto_increment: false,

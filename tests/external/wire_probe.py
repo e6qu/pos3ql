@@ -3800,6 +3800,59 @@ def test_trigger_enablement_modes_over_raw_wire():
     s.close()
 
 
+def test_rewrite_rule_enablement_modes_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE TABLE wire_rule_modes_source (id integer); "
+        "CREATE TABLE wire_rule_modes_audit (id integer); "
+        "CREATE RULE wire_rule_modes_audit AS ON INSERT TO wire_rule_modes_source "
+        "DO ALSO INSERT INTO wire_rule_modes_audit VALUES (NEW.id); "
+        "ALTER TABLE wire_rule_modes_source DISABLE RULE wire_rule_modes_audit; "
+        "INSERT INTO wire_rule_modes_source VALUES (1); "
+        "ALTER TABLE wire_rule_modes_source ENABLE ALWAYS RULE wire_rule_modes_audit; "
+        "INSERT INTO wire_rule_modes_source VALUES (2); "
+        "SELECT ev_enabled FROM pg_rewrite WHERE rulename = 'wire_rule_modes_audit'; "
+        "SELECT id FROM wire_rule_modes_audit; "
+        "DROP TABLE wire_rule_modes_source; DROP TABLE wire_rule_modes_audit",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "raw wire: rewrite rule modes reach catalog and dispatch",
+        not any(kind == b"E" for kind, _ in result) and rows == [["A"], ["2"]],
+        result,
+    )
+    s.close()
+
+
+def test_not_null_constraint_inheritance_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE TABLE wire_not_null_parent (id integer NOT NULL); "
+        "CREATE TABLE wire_not_null_child (extra integer) INHERITS (wire_not_null_parent); "
+        "ALTER TABLE wire_not_null_parent "
+        "ALTER CONSTRAINT wire_not_null_parent_id_not_null NO INHERIT; "
+        "SELECT connoinherit FROM pg_constraint "
+        "WHERE conrelid = 'wire_not_null_parent'::regclass "
+        "AND conname = 'wire_not_null_parent_id_not_null'; "
+        "SELECT attnotnull FROM pg_attribute "
+        "WHERE attrelid = 'wire_not_null_child'::regclass AND attname = 'id'; "
+        "DROP TABLE wire_not_null_child; DROP TABLE wire_not_null_parent",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "raw wire: not-null constraint inheritance updates catalog provenance",
+        not any(kind == b"E" for kind, _ in result) and rows == [["t"], ["t"]],
+        result,
+    )
+    s.close()
+
+
 def test_type_schema_moves_over_raw_wire():
     s = connect()
     s.sendall(startup_payload(0))

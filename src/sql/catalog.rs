@@ -9391,7 +9391,7 @@ fn pg_constraint<'a>(
                     text(" ", arena)?,
                     Datum::Bool(column.not_null.is_local()),
                     Datum::Int4(i32::from(column.not_null.is_inherited())),
-                    Datum::Bool(false),
+                    Datum::Bool(!column.not_null_inheritable),
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
                     empty_int_array(arena)?,
@@ -9494,7 +9494,11 @@ fn pg_rewrite<'a>(
                 text(definition.name.as_str(), arena)?,
                 Datum::Int4(relation_oid),
                 text(event, arena)?,
-                text("O", arena)?,
+                text(
+                    core::str::from_utf8(&[definition.enabled.code()])
+                        .expect("rule enabled code is ASCII"),
+                    arena,
+                )?,
                 Datum::Bool(matches!(
                     definition.mode,
                     crate::storage::RewriteMode::Instead
@@ -11012,6 +11016,7 @@ fn pg_attribute<'a>(
                 storage: crate::sql::ast::ColumnStorage::Plain,
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
+                not_null_inheritable: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -16657,6 +16662,7 @@ fn info_columns<'a>(
                 storage: crate::sql::ast::ColumnStorage::Plain,
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
+                not_null_inheritable: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -18077,6 +18083,7 @@ fn info_column_privileges<'a>(
                 storage: crate::sql::ast::ColumnStorage::Plain,
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
+                not_null_inheritable: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,
@@ -18595,6 +18602,7 @@ fn info_column_type_usage<'a>(
                 storage: crate::sql::ast::ColumnStorage::Plain,
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: crate::storage::NotNullOrigin::Nullable,
+                not_null_inheritable: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,

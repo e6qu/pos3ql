@@ -863,6 +863,9 @@ pub struct ColumnMeta {
     /// catalog). It is retained separately from the object block codec.
     pub compression: crate::sql::ast::ColumnCompression,
     pub not_null: NotNullOrigin,
+    /// Whether this column's local NOT NULL constraint participates in
+    /// ordinary table inheritance. It is irrelevant for a nullable column.
+    pub not_null_inheritable: bool,
     pub unique: bool,
     pub primary: bool,
     /// `serial`/`bigserial`/`smallserial` or GENERATED AS IDENTITY: when the
@@ -1059,6 +1062,7 @@ impl ColumnMeta {
         storage: crate::sql::ast::ColumnStorage::Plain,
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: NotNullOrigin::Nullable,
+        not_null_inheritable: true,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -3774,6 +3778,46 @@ pub(crate) enum RewriteMode {
     Instead = 1,
 }
 
+/// PostgreSQL's durable `pg_rewrite.ev_enabled` state.  This is distinct
+/// from trigger state even though their wire codes coincide: a rule can be
+/// disabled without becoming a trigger, and ON SELECT remains executable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuleEnabled {
+    Origin,
+    Replica,
+    Always,
+    Disabled,
+}
+
+impl RuleEnabled {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Self::Origin => b'O',
+            Self::Replica => b'R',
+            Self::Always => b'A',
+            Self::Disabled => b'D',
+        }
+    }
+
+    pub(crate) const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            b'O' => Some(Self::Origin),
+            b'R' => Some(Self::Replica),
+            b'A' => Some(Self::Always),
+            b'D' => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn fires_for_origin(self) -> bool {
+        matches!(self, Self::Origin | Self::Always)
+    }
+
+    pub(crate) const fn fires_for_replication(self) -> bool {
+        matches!(self, Self::Replica | Self::Always)
+    }
+}
+
 impl RewriteMode {
     pub(crate) const fn from_code(code: u8) -> Option<Self> {
         match code {
@@ -3800,6 +3844,7 @@ pub(crate) struct RuleDefinition {
     pub target: RuleTarget,
     pub event: RewriteEvent,
     pub mode: RewriteMode,
+    pub enabled: RuleEnabled,
     pub source: StackStr<RULE_SQL_MAX>,
     pub condition: Option<RuleTextSpan>,
     pub actions: [RuleTextSpan; MAX_RULE_ACTIONS],
@@ -3818,6 +3863,7 @@ impl RuleDefinition {
         target: RuleTarget::Table(u16::MAX),
         event: RewriteEvent::Select,
         mode: RewriteMode::Also,
+        enabled: RuleEnabled::Origin,
         source: StackStr::new(),
         condition: None,
         actions: [RuleTextSpan::EMPTY; MAX_RULE_ACTIONS],
@@ -28926,6 +28972,7 @@ impl Storage {
             target: RuleTarget::View(new as u16),
             event: RewriteEvent::Select,
             mode: RewriteMode::Instead,
+            enabled: RuleEnabled::Origin,
             source,
             condition: None,
             actions: {
@@ -35769,6 +35816,27 @@ impl Storage {
             })
     }
 
+    /// Rules are selected for rewriting only after their durable firing mode
+    /// is interpreted against the statement's replication context.
+    pub(crate) fn firing_rules_for(
+        &self,
+        target: RuleTarget,
+        event: RewriteEvent,
+        replication_apply: bool,
+        txid: u32,
+    ) -> impl Iterator<Item = (usize, RuleDef)> + '_ {
+        self.rules_for(target, event, txid)
+            .filter(move |(_, rule)| {
+                let definition = rule.definition_for(txid);
+                definition.is_view_return()
+                    || if replication_apply {
+                        definition.enabled.fires_for_replication()
+                    } else {
+                        definition.enabled.fires_for_origin()
+                    }
+            })
+    }
+
     pub(crate) fn rules_visible_to(
         &self,
         txid: u32,
@@ -37677,6 +37745,7 @@ mod tests {
                 storage: crate::sql::ast::ColumnStorage::Plain,
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: NotNullOrigin::local(*nn),
+                not_null_inheritable: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,

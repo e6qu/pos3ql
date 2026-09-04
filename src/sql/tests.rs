@@ -5485,7 +5485,7 @@ fn like_copies_supported_metadata_without_copying_the_relation_comment() {
             "not null comment",
             "index comment",
             "statistics comment",
-            "CREATE STATISTICS public.like_metadata_target_value_label_stat ON value, label FROM like_metadata_target",
+            "CREATE STATISTICS public.like_metadata_target_value_label_stat (ndistinct, dependencies) ON value, label FROM like_metadata_target",
         ],
         "{}",
         String::from_utf8_lossy(&copied)
@@ -5578,7 +5578,7 @@ fn like_metadata_survives_checkpoint_and_object_cold_recovery() {
             "durable not null",
             "durable index",
             "durable statistics",
-            "CREATE STATISTICS public.durable_like_target_id_value_stat ON id, value FROM durable_like_target",
+            "CREATE STATISTICS public.durable_like_target_id_value_stat (ndistinct) ON id, value FROM durable_like_target",
         ],
         "{}",
         String::from_utf8_lossy(&recovered)

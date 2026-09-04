@@ -2685,6 +2685,22 @@ pub(crate) fn extended_statistics_definition_by_oid<'a>(
     write_identifier(&mut output, mutable.schema.as_str());
     let _ = output.write_char('.');
     write_identifier(&mut output, mutable.name.as_str());
+    if !statistics.expression_only && statistics.kinds != crate::sql::ast::StatisticsKinds::ALL {
+        let _ = output.write_str(" (");
+        let mut separator = "";
+        for (enabled, name) in [
+            (statistics.kinds.ndistinct(), "ndistinct"),
+            (statistics.kinds.dependencies(), "dependencies"),
+            (statistics.kinds.mcv(), "mcv"),
+        ] {
+            if enabled {
+                let _ = output.write_str(separator);
+                let _ = output.write_str(name);
+                separator = ", ";
+            }
+        }
+        let _ = output.write_char(')');
+    }
     let _ = output.write_str(" ON ");
     for (position, key) in statistics.keys_for(txid).iter().enumerate() {
         if position != 0 {

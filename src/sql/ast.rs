@@ -2429,24 +2429,21 @@ pub struct DropCast<'a> {
     pub cascade: bool,
 }
 
-/// `WITH FUNCTION` and `WITHOUT FUNCTION` are distinct PostgreSQL grammar
-/// states. Keeping the former signature prevents an omitted signature from
-/// being mistaken for an unqualified function name.
+/// A transform function retains its optional signature, so an omitted
+/// signature cannot be confused with an unqualified function name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransformFunction<'a> {
-    WithFunction {
-        name: QualName<'a>,
-        argument_types: &'a [&'a str],
-    },
-    WithoutFunction,
+pub struct TransformFunction<'a> {
+    pub name: QualName<'a>,
+    pub argument_types: &'a [&'a str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateTransform<'a> {
     pub type_name: &'a str,
     pub language: &'a str,
-    pub from_sql: TransformFunction<'a>,
-    pub to_sql: TransformFunction<'a>,
+    pub from_sql: Option<TransformFunction<'a>>,
+    pub to_sql: Option<TransformFunction<'a>>,
+    pub or_replace: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9397,6 +9397,59 @@ mod tests {
     }
 
     #[test]
+    fn transforms_keep_direction_and_function_identity_typed() {
+        with_parser(
+            "CREATE OR REPLACE TRANSFORM FOR public.payload LANGUAGE plpgsql \
+             (TO SQL WITH FUNCTION public.to_payload(internal), \
+              FROM SQL WITH FUNCTION public.from_payload(internal)); \
+             CREATE TRANSFORM FOR public.payload LANGUAGE plpgsql \
+             (TO SQL WITH FUNCTION public.to_payload(internal)); \
+             DROP TRANSFORM IF EXISTS FOR public.payload LANGUAGE plpgsql CASCADE",
+            |parser| {
+                let Some(Stmt::CreateTransform(create)) = parser.next_stmt().unwrap() else {
+                    panic!("CREATE OR REPLACE TRANSFORM did not parse")
+                };
+                assert!(create.or_replace);
+                assert_eq!(create.type_name, "public.payload");
+                assert_eq!(create.language, "plpgsql");
+                let from = create.from_sql.expect("missing FROM SQL function");
+                assert_eq!(from.name.schema, Some("public"));
+                assert_eq!(from.name.name, "from_payload");
+                assert_eq!(from.argument_types, ["internal"]);
+                let to = create.to_sql.expect("missing TO SQL function");
+                assert_eq!(to.name.schema, Some("public"));
+                assert_eq!(to.name.name, "to_payload");
+                assert_eq!(to.argument_types, ["internal"]);
+
+                let Some(Stmt::CreateTransform(create)) = parser.next_stmt().unwrap() else {
+                    panic!("one-direction CREATE TRANSFORM did not parse")
+                };
+                assert!(!create.or_replace);
+                assert!(create.from_sql.is_none());
+                assert!(create.to_sql.is_some());
+
+                let Some(Stmt::DropTransform(drop)) = parser.next_stmt().unwrap() else {
+                    panic!("DROP TRANSFORM did not parse")
+                };
+                assert!(drop.if_exists);
+                assert!(drop.cascade);
+                assert_eq!(drop.type_name, "public.payload");
+                assert_eq!(drop.language, "plpgsql");
+                assert!(parser.next_stmt().unwrap().is_none());
+            },
+        );
+        with_parser(
+            "CREATE TRANSFORM FOR payload LANGUAGE plpgsql (FROM SQL WITHOUT FUNCTION)",
+            |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    sqlstate::SYNTAX_ERROR
+                );
+            },
+        );
+    }
+
+    #[test]
     fn comment_catalog_identities_are_closed_parse_states() {
         with_parser(
             "COMMENT ON CAST (public.mood AS text) IS 'cast'; \

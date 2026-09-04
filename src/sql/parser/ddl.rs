@@ -1383,6 +1383,9 @@ impl<'a> Parser<'a> {
             if self.eat_ident("trigger")? {
                 return self.create_trigger(true, false);
             }
+            if self.eat_ident("transform")? {
+                return self.create_transform(true);
+            }
             let trusted = self.eat_ident("trusted")?;
             let _procedural = self.eat_ident("procedural")?;
             if trusted || _procedural || self.eat_ident("language")? {
@@ -1392,7 +1395,7 @@ impl<'a> Parser<'a> {
                 return self.create_language(true, trusted);
             }
             return Err(self.unexpected(
-                "expected RULE, VIEW, FUNCTION, PROCEDURE, AGGREGATE, or TRIGGER after CREATE OR REPLACE",
+                "expected RULE, VIEW, FUNCTION, PROCEDURE, AGGREGATE, TRANSFORM, or TRIGGER after CREATE OR REPLACE",
             ));
         }
         if self.eat_ident("unique")? {
@@ -1456,7 +1459,7 @@ impl<'a> Parser<'a> {
             return self.create_cast();
         }
         if self.eat_ident("transform")? {
-            return self.create_transform();
+            return self.create_transform(false);
         }
         if self.eat_ident("operator")? {
             if self.eat_ident("family")? {
@@ -1689,20 +1692,15 @@ impl<'a> Parser<'a> {
     }
 
     fn transform_function(&mut self) -> Result<TransformFunction<'a>, ParseError> {
-        if self.eat_ident("with")? {
-            self.expect_ident("function")?;
-            Ok(TransformFunction::WithFunction {
-                name: self.qual_name("transform function")?,
-                argument_types: self.optional_type_signature()?,
-            })
-        } else {
-            self.expect_ident("without")?;
-            self.expect_ident("function")?;
-            Ok(TransformFunction::WithoutFunction)
-        }
+        self.expect_ident("with")?;
+        self.expect_ident("function")?;
+        Ok(TransformFunction {
+            name: self.qual_name("transform function")?,
+            argument_types: self.optional_type_signature()?,
+        })
     }
 
-    fn create_transform(&mut self) -> Result<Stmt<'a>, ParseError> {
+    fn create_transform(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("for")?;
         let type_name = self.unmodified_type_name()?;
         self.expect_ident("language")?;
@@ -1710,12 +1708,7 @@ impl<'a> Parser<'a> {
         self.expect_op("(")?;
         let mut from_sql = None;
         let mut to_sql = None;
-        let mut first = true;
-        while from_sql.is_none() || to_sql.is_none() {
-            if !first {
-                self.expect_op(",")?;
-            }
-            first = false;
+        loop {
             if self.eat_ident("from")? {
                 self.expect_ident("sql")?;
                 if from_sql.is_some() {
@@ -1733,13 +1726,17 @@ impl<'a> Parser<'a> {
             } else {
                 return Err(self.err_here("expected FROM SQL or TO SQL transform function"));
             }
+            if !self.eat_op(",")? {
+                break;
+            }
         }
         self.expect_op(")")?;
         Ok(Stmt::CreateTransform(CreateTransform {
             type_name,
             language,
-            from_sql: from_sql.expect("transform parser checked FROM SQL"),
-            to_sql: to_sql.expect("transform parser checked TO SQL"),
+            from_sql,
+            to_sql,
+            or_replace,
         }))
     }
 

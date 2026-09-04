@@ -4120,7 +4120,7 @@ fn native_hook_ddl_rejects_before_catalog_publication() {
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for sql in [
-        "CREATE TRANSFORM FOR integer LANGUAGE plpgsql (FROM SQL WITHOUT FUNCTION, TO SQL WITHOUT FUNCTION)",
+        "CREATE OR REPLACE TRANSFORM FOR integer LANGUAGE plpgsql (TO SQL WITH FUNCTION pg_catalog.int4recv(internal), FROM SQL WITH FUNCTION pg_catalog.int4recv(internal))",
         "DROP TRANSFORM IF EXISTS FOR integer LANGUAGE plpgsql",
         "LOAD 'untrusted-library'",
         "SECURITY LABEL ON TABLE untrusted_target IS 'label'",
@@ -4132,12 +4132,22 @@ fn native_hook_ddl_rejects_before_catalog_publication() {
     let malformed = run_with(
         &mut engine,
         &mut budget,
-        "CREATE TRANSFORM FOR integer LANGUAGE plpgsql (FROM SQL WITHOUT FUNCTION TO SQL WITHOUT FUNCTION)",
+        "CREATE TRANSFORM FOR integer LANGUAGE plpgsql (FROM SQL WITH FUNCTION pg_catalog.int4recv(internal) TO SQL WITH FUNCTION pg_catalog.int4recv(internal))",
     );
     let malformed = String::from_utf8_lossy(&malformed);
     assert!(
         malformed.contains("42601"),
         "transform clauses must retain PostgreSQL's comma boundary: {malformed}"
+    );
+    let malformed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRANSFORM FOR integer LANGUAGE plpgsql (FROM SQL WITHOUT FUNCTION)",
+    );
+    let malformed = String::from_utf8_lossy(&malformed);
+    assert!(
+        malformed.contains("42601"),
+        "a transform direction must retain its PostgreSQL WITH FUNCTION contract: {malformed}"
     );
     let malformed = run_with(
         &mut engine,

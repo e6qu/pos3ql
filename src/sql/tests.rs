@@ -13256,7 +13256,7 @@ fn partition_constraint_identity_and_not_null_provenance_follow_postgresql() {
               WHERE relation.relname IN ('provenance_mid', 'provenance_leaf') \
                 AND constraint_catalog.contype = 'n' ORDER BY relation.relname",
         )),
-        ["provenance_mid|t|0"]
+        ["provenance_leaf|f|1", "provenance_mid|t|0"]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -20478,7 +20478,7 @@ fn partition_routing_survives_checkpoint_and_cold_restart() {
               WHERE relation.relname IN ('restart_null_mid', 'restart_null_leaf') \
                 AND constraint_catalog.contype = 'n' ORDER BY relation.relname"
         )),
-        ["restart_null_mid|t|0"]
+        ["restart_null_leaf|f|1", "restart_null_mid|t|0"]
     );
 }
 
@@ -41792,7 +41792,7 @@ fn not_null_constraint_inheritance_is_typed_transactional_and_catalog_visible() 
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(
         data_rows(&output),
-        ["0", "t", "t|0|t", "0", "t", "f"],
+        ["1", "t", "t|0|t", "1", "t", "f"],
         "{text}"
     );
     let only = run_with(

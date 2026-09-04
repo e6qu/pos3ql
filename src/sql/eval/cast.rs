@@ -254,17 +254,11 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
             Datum::Float4(f)
         }
         ColType::Char => {
-            let text = cast_to_text(v, arena)?;
-            let Some(byte) = text.as_bytes().first().copied() else {
-                return Ok(Datum::Text(""));
-            };
-            if !byte.is_ascii() {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "non-ASCII input for type \"char\" is not supported"
-                ));
+            if let Datum::Char(_) = v {
+                return Ok(v);
             }
-            Datum::Text(&text[..1])
+            let text = cast_to_text(v, arena)?;
+            Datum::Char(text.as_bytes().first().copied().unwrap_or(0))
         }
         ColType::Text | ColType::Varchar | ColType::Bpchar => Datum::Text(cast_to_text(v, arena)?),
         ColType::Name => {
@@ -686,6 +680,14 @@ pub(crate) fn parse_bytea<'a>(s: &str, arena: &'a Arena) -> Result<&'a [u8], Sql
 /// Cast-to-text semantics (`true`/`false`), unlike wire output (`t`/`f`).
 pub(crate) fn cast_to_text<'a>(v: Datum<'a>, arena: &'a Arena) -> Result<&'a str, SqlError> {
     match v {
+        Datum::Char(byte) if byte.is_ascii() => {
+            let bytes = arena.alloc_slice_copy(&[byte]).map_err(|_| arena_full())?;
+            Ok(unsafe { core::str::from_utf8_unchecked(bytes) })
+        }
+        Datum::Char(_) => Err(sql_err!(
+            sqlstate::CHARACTER_NOT_IN_REPERTOIRE,
+            "invalid byte sequence for encoding \"UTF8\""
+        )),
         Datum::Text(s) => Ok(s),
         // bpchar-to-text strips the padding (`c || 'x'` sees "hi", not "hi   ").
         Datum::Bpchar(s) => Ok(s.trim_end_matches(' ')),

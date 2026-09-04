@@ -112,6 +112,52 @@ CREATE SCHEMA authorization postgres;
 DROP SCHEMA postgres CASCADE;
 CREATE SCHEMA au2 AUTHORIZATION nosuchrole;
 
+-- Inline schema elements use PostgreSQL's complete permitted set. Their
+-- unqualified targets belong to the new schema, while trigger functions keep
+-- their explicit lookup path.
+CREATE TABLE public.schema_inline_audit(value integer);
+CREATE FUNCTION public.schema_inline_audit_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO public.schema_inline_audit VALUES (NEW.value);
+  RETURN NEW;
+END
+$$;
+CREATE SCHEMA schema_inline_objects
+  CREATE TABLE entries(value integer)
+  CREATE SEQUENCE entry_ids
+  CREATE INDEX entries_value_idx ON entries(value)
+  CREATE VIEW entries_view AS SELECT value FROM entries
+  CREATE TRIGGER entries_audit AFTER INSERT ON entries
+    FOR EACH ROW EXECUTE FUNCTION public.schema_inline_audit_fn()
+  GRANT SELECT ON TABLE entries, entries_view TO public;
+INSERT INTO schema_inline_objects.entries VALUES (11);
+SELECT value FROM public.schema_inline_audit;
+SELECT value FROM schema_inline_objects.entries_view;
+SELECT nextval('schema_inline_objects.entry_ids');
+CREATE ROLE schema_inline_reader;
+SET ROLE schema_inline_reader;
+SELECT value FROM schema_inline_objects.entries;
+RESET ROLE;
+
+-- AUTHORIZATION applies to the schema and every inline object. Role keywords
+-- resolve from the session at execution, not as identifier spellings.
+CREATE ROLE schema_inline_owner;
+CREATE SCHEMA schema_inline_owned AUTHORIZATION schema_inline_owner
+  CREATE TABLE owned_table(value integer)
+  CREATE SEQUENCE owned_sequence;
+SELECT role.rolname
+FROM pg_class class_catalog JOIN pg_roles role ON role.oid = class_catalog.relowner
+WHERE class_catalog.relname IN ('owned_table', 'owned_sequence')
+ORDER BY class_catalog.relname;
+CREATE SCHEMA AUTHORIZATION CURRENT_ROLE CREATE TABLE current_role_table(value integer);
+SELECT nspname FROM pg_namespace WHERE nspname = 'postgres';
+DROP SCHEMA postgres CASCADE;
+
+-- PostgreSQL rejects elements outside CREATE TABLE, VIEW, INDEX, SEQUENCE,
+-- TRIGGER, and GRANT; IF NOT EXISTS never masks embedded definitions.
+CREATE SCHEMA schema_invalid_type CREATE DOMAIN bad_domain AS integer;
+CREATE SCHEMA IF NOT EXISTS schema_invalid_if CREATE TABLE bad_table(value integer);
+
 -- ALTER TABLE SET SCHEMA moves the table; inbound references follow.
 CREATE TABLE public.mv(a int);
 INSERT INTO public.mv VALUES (42);
@@ -122,6 +168,33 @@ CREATE TABLE sc.taken(a int);
 CREATE TABLE public.taken(a int);
 ALTER TABLE public.taken SET SCHEMA sc;
 ALTER TABLE public.taken SET SCHEMA ghost;
+
+-- ALTER SCHEMA preserves catalog identities while changing every qualified
+-- reference: relation/default, view, type, comments, rollback, and the old
+-- spelling all follow PostgreSQL's namespace transition.
+CREATE SCHEMA schema_rename_source_diff;
+CREATE TYPE schema_rename_source_diff.mood AS ENUM ('calm', 'storm');
+CREATE SEQUENCE schema_rename_source_diff.ticket;
+CREATE TABLE schema_rename_source_diff.items (
+  id bigint DEFAULT nextval('schema_rename_source_diff.ticket'),
+  state schema_rename_source_diff.mood
+);
+CREATE VIEW schema_rename_source_diff.item_view AS
+  SELECT id, state FROM schema_rename_source_diff.items;
+COMMENT ON SEQUENCE schema_rename_source_diff.ticket IS 'renamed sequence';
+ALTER SCHEMA schema_rename_source_diff RENAME TO schema_rename_target_diff;
+ALTER SCHEMA schema_rename_target_diff OWNER TO postgres;
+INSERT INTO schema_rename_target_diff.items(state) VALUES ('calm') RETURNING id;
+SELECT id, state FROM schema_rename_target_diff.item_view;
+SELECT 'storm'::schema_rename_target_diff.mood;
+SELECT obj_description('schema_rename_target_diff.ticket'::regclass);
+SELECT nextval('schema_rename_source_diff.ticket');
+BEGIN;
+ALTER SCHEMA schema_rename_target_diff RENAME TO schema_rename_rolled_back_diff;
+INSERT INTO schema_rename_rolled_back_diff.items(state) VALUES ('storm');
+ROLLBACK;
+INSERT INTO schema_rename_target_diff.items(state) VALUES ('storm') RETURNING id;
+DROP SCHEMA schema_rename_target_diff CASCADE;
 
 -- Multi-name DROP TABLE across schemas.
 CREATE TABLE public.d1(a int);

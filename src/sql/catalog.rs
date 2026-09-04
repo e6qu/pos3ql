@@ -63,7 +63,15 @@ pub(crate) const PG_EXTENSION_OID: i32 = 3079;
 pub(crate) const PG_PUBLICATION_OID: i32 = 6104;
 pub(crate) const PG_SUBSCRIPTION_OID: i32 = 6107;
 
-const ACCESS_METHODS: [(&str, i32); 3] = [("btree", 403), ("hash", 405), ("gist", 783)];
+const ACCESS_METHODS: [(&str, i32, i32, &str, &str); 7] = [
+    ("heap", 2, 3, "heap_tableam_handler", "t"),
+    ("btree", 403, 330, "bthandler", "i"),
+    ("hash", 405, 331, "hashhandler", "i"),
+    ("gist", 783, 332, "gisthandler", "i"),
+    ("gin", 2742, 333, "ginhandler", "i"),
+    ("brin", 3580, 335, "brinhandler", "i"),
+    ("spgist", 4000, 334, "spghandler", "i"),
+];
 const INTERNAL_LANGUAGE_OID: i32 = 12;
 const C_LANGUAGE_OID: i32 = 13;
 const SQL_LANGUAGE_OID: i32 = 14;
@@ -78,13 +86,37 @@ const PROCEDURAL_LANGUAGES: [(&str, i32); 4] = [
 pub(crate) fn access_method_oid(name: &str) -> Option<i32> {
     ACCESS_METHODS
         .iter()
-        .find_map(|(candidate, oid)| (*candidate == name).then_some(*oid))
+        .find_map(|(candidate, oid, _, _, _)| (*candidate == name).then_some(*oid))
 }
 
 pub(crate) fn access_method_name(oid: i32) -> Option<&'static str> {
     ACCESS_METHODS
         .iter()
-        .find_map(|(name, candidate)| (*candidate == oid).then_some(*name))
+        .find_map(|(name, candidate, _, _, _)| (*candidate == oid).then_some(*name))
+}
+
+pub(crate) fn access_method_oid_in(storage: &Storage, txid: u32, name: &str) -> Option<i32> {
+    access_method_oid(name).or_else(|| {
+        storage
+            .access_method_slot(name, txid)
+            .and_then(|slot| {
+                storage
+                    .access_methods_visible_to(txid)
+                    .find(|(candidate, _)| *candidate == slot)
+            })
+            .map(|(_, method)| method.oid().get())
+    })
+}
+
+pub(crate) fn access_method_name_in(storage: &Storage, txid: u32, oid: i32) -> Option<&str> {
+    access_method_name(oid).or_else(|| {
+        crate::storage::AccessMethodOid::parse(oid).and_then(|oid| {
+            storage
+                .access_methods_visible_to(txid)
+                .find(|(_, method)| method.oid() == oid)
+                .map(|(_, method)| method.definition.name.as_str())
+        })
+    })
 }
 
 pub(crate) fn procedural_language_oid(name: &str) -> Option<i32> {
@@ -1220,7 +1252,7 @@ pub fn synthesize<'a>(
         (false, "pg_namespace") => pg_namespace(storage, txid, arena),
         (false, "pg_tables") => pg_tables(storage, txid, arena),
         (false, "pg_indexes") => pg_indexes(storage, txid, arena),
-        (false, "pg_am") => pg_am(arena),
+        (false, "pg_am") => pg_am(storage, txid, arena),
         (false, "pg_constraint") => pg_constraint(storage, txid, arena),
         (false, "pg_index") => pg_index(storage, txid, arena),
         (false, "pg_stats") => pg_stats(storage, txid, arena),
@@ -1265,18 +1297,18 @@ pub fn synthesize<'a>(
             def_of(
                 "pg_transform",
                 &[
-                    ("tableoid", ColType::Int4),
-                    ("oid", ColType::Int4),
-                    ("trftype", ColType::Int4),
-                    ("trflang", ColType::Int4),
-                    ("trffromsql", ColType::Int4),
-                    ("trftosql", ColType::Int4),
+                    ("tableoid", ColType::Oid),
+                    ("oid", ColType::Oid),
+                    ("trftype", ColType::Oid),
+                    ("trflang", ColType::Oid),
+                    ("trffromsql", ColType::Regproc),
+                    ("trftosql", ColType::Regproc),
                 ],
             ),
             &[],
             arena,
         ),
-        (false, "pg_language") => pg_language(arena),
+        (false, "pg_language") => pg_language(storage, txid, arena),
         (false, "pg_auth_members") => pg_auth_members(storage, txid, arena),
         (false, "pg_db_role_setting") => pg_db_role_setting(storage, txid, arena),
         (false, "pg_parameter_acl") => pg_parameter_acl(storage, txid, arena),
@@ -1874,6 +1906,7 @@ fn acl<'a>(
                     crate::storage::AccessClass::Domain
                         | crate::storage::AccessClass::Enum
                         | crate::storage::AccessClass::Routine
+                        | crate::storage::AccessClass::Language
                 ) && grantee == crate::storage::PUBLIC_ROLE))
     });
     if !has_entries {
@@ -1887,15 +1920,15 @@ fn acl<'a>(
         | crate::storage::AccessClass::MaterializedView => crate::storage::PrivilegeSet::TABLE_ALL,
         crate::storage::AccessClass::Sequence => crate::storage::PrivilegeSet::SEQUENCE_ALL,
         crate::storage::AccessClass::Schema => crate::storage::PrivilegeSet::SCHEMA_ALL,
-        crate::storage::AccessClass::Domain | crate::storage::AccessClass::Enum => {
-            crate::storage::PrivilegeSet::TYPE_ALL
-        }
+        crate::storage::AccessClass::Domain
+        | crate::storage::AccessClass::Enum
+        | crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
         crate::storage::AccessClass::Index => crate::storage::PrivilegeSet::NONE,
         crate::storage::AccessClass::Routine => crate::storage::PrivilegeSet::FUNCTION_ALL,
         crate::storage::AccessClass::LargeObject => crate::storage::PrivilegeSet::LARGE_OBJECT_ALL,
         crate::storage::AccessClass::ForeignDataWrapper
-        | crate::storage::AccessClass::ForeignServer => crate::storage::PrivilegeSet::USAGE,
-        crate::storage::AccessClass::Composite => crate::storage::PrivilegeSet::TYPE_ALL,
+        | crate::storage::AccessClass::ForeignServer
+        | crate::storage::AccessClass::Language => crate::storage::PrivilegeSet::USAGE,
         crate::storage::AccessClass::Tablespace => crate::storage::PrivilegeSet::CREATE,
         crate::storage::AccessClass::Database => crate::storage::PrivilegeSet::DATABASE_ALL,
         crate::storage::AccessClass::Statistics
@@ -3412,7 +3445,7 @@ mod routine_name_tests {
 
     #[test]
     fn static_comment_catalog_identities_round_trip() {
-        for (name, oid) in ACCESS_METHODS {
+        for (name, oid, _, _, _) in ACCESS_METHODS {
             assert_eq!(access_method_oid(name), Some(oid));
             assert_eq!(access_method_name(oid), Some(name));
         }
@@ -4854,7 +4887,7 @@ fn pg_description<'a>(
                 let Ok(oid) = i32::try_from(subid) else {
                     continue;
                 };
-                if access_method_name(oid) != Some(name) {
+                if access_method_name_in(storage, txid, oid) != Some(name) {
                     continue;
                 }
                 (oid, PG_AM_OID)
@@ -5474,7 +5507,7 @@ pub fn comment_text_for<'a>(
                     && subid == 0
                     && signed_oid.is_some_and(|access_method_oid| {
                         csub == access_method_oid as u32
-                            && access_method_name(access_method_oid) == Some(name)
+                            && access_method_name_in(storage, txid, access_method_oid) == Some(name)
                     })
             }
             "pg_language" => {
@@ -6683,7 +6716,7 @@ pub(crate) fn describe_view<'a>(
             (candidate.schema == view.schema && candidate.name == view.name).then_some(slot)
         })
         .ok_or_else(|| sql_err!(sqlstate::UNDEFINED_TABLE, "view does not exist"))?;
-    super::query::describe_stored_query(
+    let count = super::query::describe_stored_query(
         storage.view_sql_for(view),
         storage,
         txid,
@@ -6691,7 +6724,31 @@ pub(crate) fn describe_view<'a>(
         storage.view_dependencies(slot),
         arena,
         out,
-    )
+    )?;
+    overlay_view_column_names(view, txid, out, count)
+}
+
+/// A view's body supplies types; its stored output relation supplies names.
+/// Keeping that overlay here makes SQL descriptions, catalogs, and wire
+/// metadata consume exactly the same identity.
+pub(crate) fn overlay_view_column_names<'a>(
+    view: &'a crate::storage::ViewDef,
+    txid: u32,
+    out: &mut [super::types::ColDesc<'a>],
+    count: usize,
+) -> Result<usize, SqlError> {
+    let columns = view.columns_for(txid);
+    if columns.len() != count {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "view \"{}\" has an invalid output-column definition",
+            view.name.as_str()
+        ));
+    }
+    for (column, name) in out[..count].iter_mut().zip(columns.names()) {
+        column.name = name.as_str();
+    }
+    Ok(count)
 }
 
 fn describe_stored_view<'a>(
@@ -6703,7 +6760,7 @@ fn describe_stored_view<'a>(
 ) -> Result<usize, SqlError> {
     let user = crate::sql::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(storage.view_creation_path(slot), user.as_str(), txid);
-    super::query::describe_stored_query(
+    let count = super::query::describe_stored_query(
         storage.view_sql(slot),
         storage,
         txid,
@@ -6711,7 +6768,8 @@ fn describe_stored_view<'a>(
         storage.view_dependencies(slot),
         arena,
         out,
-    )
+    )?;
+    overlay_view_column_names(storage.view(slot), txid, out, count)
 }
 
 fn pg_stats<'a>(
@@ -6883,7 +6941,7 @@ fn extended_statistics_kinds<'a>(
         ),
     ] {
         if enabled {
-            values[count] = Datum::Bpchar(code);
+            values[count] = Datum::Char(code.as_bytes()[0]);
             count += 1;
         }
     }
@@ -8209,6 +8267,7 @@ fn pg_class<'a>(
                 Datum::Int4(relpages),
                 Datum::Int4(match table_def.access_method {
                     crate::storage::TableAccessMethod::Heap => 2,
+                    crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
                 }),
                 Datum::Int4(relation_owner),
                 Datum::Int4(n_checks), // relchecks
@@ -8539,13 +8598,24 @@ fn pg_class<'a>(
         }
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
         let n_columns = describe_view(storage, txid, view, arena, &mut columns)?;
-        let mut option_values = [Datum::Null; 2];
+        let mut option_values = [Datum::Null; 3];
         let mut option_count = 0;
         if matches!(
             view.security_for(txid),
             crate::storage::ViewSecurity::Invoker
         ) {
             option_values[option_count] = text("security_invoker=true", arena)?;
+            option_count += 1;
+        }
+        if let Some(enabled) = view.security_barrier_for(txid).reloption() {
+            option_values[option_count] = text(
+                if enabled {
+                    "security_barrier=true"
+                } else {
+                    "security_barrier=false"
+                },
+                arena,
+            )?;
             option_count += 1;
         }
         if let Some(option) = view.check_option_for(txid) {
@@ -9682,6 +9752,7 @@ fn extension_dependency_catalog_identity(
         ),
         AccessClass::ForeignDataWrapper => (2328, foreign_data_wrapper_oid(slot)),
         AccessClass::ForeignServer => (1417, foreign_server_oid(slot)),
+        AccessClass::Language => (PG_LANGUAGE_OID, object.slot.into()),
     })
 }
 
@@ -11054,6 +11125,7 @@ fn pg_attribute<'a>(
     for (slot, view) in storage.views_visible_to(txid) {
         let mut columns = [super::types::ColDesc::new("", 0, 0); super::exec::MAX_PROJ];
         let count = describe_view(storage, txid, view, arena, &mut columns)?;
+        let defaults = view.columns_for(txid);
         for (attribute, column) in columns[..count].iter().enumerate() {
             if n == out.len() {
                 return Err(catalog_capacity_exceeded("pg_attribute"));
@@ -11072,7 +11144,10 @@ fn pg_attribute<'a>(
                     } else {
                         column.type_mod
                     }),
-                    Datum::Bool(false),
+                    Datum::Bool(!matches!(
+                        defaults.default_at(attribute),
+                        Some(crate::storage::ColumnDefault::None) | None
+                    )),
                     Datum::Int4(0),
                     text("", arena)?,
                     text("", arena)?,
@@ -11232,6 +11307,30 @@ fn pg_attrdef<'a>(
                     Datum::Int4(relid),
                     Datum::Int4(ci as i32 + 1),
                     text(text_expr.as_str(), arena)?,
+                    Datum::Int4(2604),
+                ],
+                arena,
+            )?;
+            n += 1;
+        }
+    }
+    for (slot, view) in storage.views_visible_to(txid) {
+        let columns = view.columns_for(txid);
+        for (column, default) in (0..columns.len()).filter_map(|index| {
+            columns
+                .default_at_ref(index)
+                .and_then(|default| default.expression().map(|expression| (index, expression)))
+        }) {
+            if n == out.len() {
+                return Err(catalog_capacity_exceeded("pg_attrdef"));
+            }
+            let relid = view_oid(slot);
+            out[n] = row(
+                &[
+                    Datum::Int4(relid * 100 + column as i32 + 1),
+                    Datum::Int4(relid),
+                    Datum::Int4(column as i32 + 1),
+                    text(default.as_str(), arena)?,
                     Datum::Int4(2604),
                 ],
                 arena,
@@ -12024,34 +12123,84 @@ fn pg_event_trigger<'a>(
     finish(definition, &rows[..count], arena)
 }
 
-fn pg_am<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn pg_am<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_am",
         &[
-            ("tableoid", ColType::Int4),
-            ("oid", ColType::Int4),
-            ("amname", ColType::Text),
-            ("amhandler", ColType::Int4),
-            ("amtype", ColType::Bpchar),
+            ("tableoid", ColType::Oid),
+            ("oid", ColType::Oid),
+            ("amname", ColType::Name),
+            ("amhandler", ColType::Regproc),
+            ("amtype", ColType::Char),
         ],
     );
-    let mut rows: [&[Datum]; ACCESS_METHODS.len()] = [&[]; ACCESS_METHODS.len()];
-    for (index, (name, oid)) in ACCESS_METHODS.iter().enumerate() {
-        rows[index] = row(
+    let mut rows: [&[Datum]; ACCESS_METHODS.len() + crate::storage::MAX_ACCESS_METHODS] =
+        [&[]; ACCESS_METHODS.len() + crate::storage::MAX_ACCESS_METHODS];
+    let mut count = 0usize;
+    for (name, oid, handler, handler_name, method_type) in ACCESS_METHODS {
+        rows[count] = row(
             &[
                 Datum::Int4(PG_AM_OID),
-                Datum::Int4(*oid),
+                Datum::Int4(oid),
                 text(name, arena)?,
-                Datum::Int4(0),
-                text("i", arena)?,
+                Datum::RegObject {
+                    type_oid: super::types::oid::REGPROC,
+                    referenced_oid: handler,
+                    name: arena.alloc_str(handler_name).map_err(|_| arena_full())?,
+                },
+                Datum::Char(method_type.as_bytes()[0]),
             ],
             arena,
         )?;
+        count += 1;
     }
-    finish(definition, &rows, arena)
+    for (_, method) in storage.access_methods_visible_to(txid) {
+        if count == rows.len() {
+            return Err(catalog_capacity_exceeded("pg_am"));
+        }
+        rows[count] = row(
+            &[
+                Datum::Int4(PG_AM_OID),
+                Datum::Int4(method.oid().get()),
+                text(method.definition.name.as_str(), arena)?,
+                access_method_handler_regproc(method.definition.handler, arena)?,
+                Datum::Char(b't'),
+            ],
+            arena,
+        )?;
+        count += 1;
+    }
+    finish(definition, &rows[..count], arena)
 }
 
-fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
+fn access_method_handler_regproc<'a>(
+    handler: crate::storage::TableAccessMethodHandler,
+    arena: &'a Arena,
+) -> Result<Datum<'a>, SqlError> {
+    let oid = handler.postgres_handler_oid();
+    let name = ACCESS_METHODS
+        .iter()
+        .find_map(|(_, _, candidate_oid, candidate_name, _)| {
+            (*candidate_oid == oid).then_some(*candidate_name)
+        })
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "catalog access method handler identity is unavailable"
+            )
+        })?;
+    Ok(Datum::RegObject {
+        type_oid: super::types::oid::REGPROC,
+        referenced_oid: oid,
+        name: arena.alloc_str(name).map_err(|_| arena_full())?,
+    })
+}
+
+fn pg_language<'a>(
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<SynthTable<'a>, SqlError> {
     let definition = def_of(
         "pg_language",
         &[
@@ -12078,7 +12227,15 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Int4(0),
             Datum::Int4(2246),
             Datum::Int4(0),
-            Datum::Null,
+            acl(
+                storage,
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Language,
+                    slot: INTERNAL_LANGUAGE_OID as u16,
+                },
+                txid,
+                arena,
+            )?,
         ],
         arena,
     )?;
@@ -12093,7 +12250,15 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Int4(0),
             Datum::Int4(2247),
             Datum::Int4(0),
-            Datum::Null,
+            acl(
+                storage,
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Language,
+                    slot: C_LANGUAGE_OID as u16,
+                },
+                txid,
+                arena,
+            )?,
         ],
         arena,
     )?;
@@ -12108,7 +12273,15 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Int4(0),
             Datum::Int4(2248),
             Datum::Int4(0),
-            Datum::Null,
+            acl(
+                storage,
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Language,
+                    slot: SQL_LANGUAGE_OID as u16,
+                },
+                txid,
+                arena,
+            )?,
         ],
         arena,
     )?;
@@ -12123,7 +12296,15 @@ fn pg_language<'a>(arena: &'a Arena) -> Result<SynthTable<'a>, SqlError> {
             Datum::Int4(13644),
             Datum::Int4(13646),
             Datum::Int4(13645),
-            Datum::Null,
+            acl(
+                storage,
+                crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Language,
+                    slot: PLPGSQL_LANGUAGE_OID as u16,
+                },
+                txid,
+                arena,
+            )?,
         ],
         arena,
     )?;
@@ -12197,7 +12378,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
         if let Some((output_oids, output_names)) = record_outputs {
             for output in 0..output_oids.len() {
                 all_types[output] = Datum::Oid(output_oids[output] as u32);
-                modes[output] = Datum::Bpchar("o");
+                modes[output] = Datum::Char(b'o');
                 names[output] = Datum::Text(output_names[output]);
             }
         }
@@ -12329,7 +12510,7 @@ fn pg_proc<'a>(storage: &Storage, txid: u32, arena: &'a Arena) -> Result<SynthTa
                     "v"
                 }
             };
-            argument_modes[index] = Datum::Bpchar(mode);
+            argument_modes[index] = Datum::Char(mode.as_bytes()[0]);
             if !parameter.name.as_str().is_empty() {
                 has_names = true;
             }
@@ -14289,6 +14470,7 @@ fn pg_roles<'a>(
             ("rolcreatedb", ColType::Bool),
             ("rolcanlogin", ColType::Bool),
             ("rolconnlimit", ColType::Int4),
+            ("rolpassword", ColType::Text),
             ("rolvaliduntil", ColType::Timestamptz),
             ("rolreplication", ColType::Bool),
             ("rolbypassrls", ColType::Bool),
@@ -14308,6 +14490,7 @@ fn pg_roles<'a>(
                 Datum::Bool(false),
                 Datum::Bool(false),
                 Datum::Int4(-1),
+                text("********", arena)?,
                 Datum::Null,
                 Datum::Bool(false),
                 Datum::Bool(false),
@@ -14324,7 +14507,6 @@ fn pg_roles<'a>(
         let attributes = role.attributes_to(txid);
         let valid_until = match attributes.valid_until.as_ref() {
             None => Datum::Null,
-            Some(value) if value.as_str().eq_ignore_ascii_case("infinity") => Datum::Null,
             Some(value) => {
                 Datum::Timestamptz(crate::sql::datetime::parse_timestamp(value.as_str(), true)?)
             }
@@ -14344,6 +14526,7 @@ fn pg_roles<'a>(
                 Datum::Bool(attributes.create_database),
                 Datum::Bool(attributes.can_login),
                 Datum::Int4(attributes.connection_limit),
+                text("********", arena)?,
                 valid_until,
                 Datum::Bool(attributes.replication),
                 Datum::Bool(attributes.bypass_row_level_security),
@@ -14446,17 +14629,28 @@ fn pg_authid<'a>(
         let attributes = role.attributes_to(txid);
         let password = if let Some(password) = attributes.password {
             use core::fmt::Write;
-            let mut verifier = StackStr::<192>::new();
-            let _ = write!(verifier, "SCRAM-SHA-256${}:", password.iterations);
-            append_base64(&password.salt, &mut verifier);
-            let _ = verifier.write_char('$');
-            append_base64(&password.stored_key, &mut verifier);
-            let _ = verifier.write_char(':');
-            append_base64(&password.server_key, &mut verifier);
+            let mut verifier = StackStr::<256>::new();
+            match password {
+                crate::storage::RoleCredential::Scram(password) => {
+                    let _ = verifier.write_str("SCRAM-SHA-256$");
+                    let _ = write!(verifier, "{}:", password.iterations);
+                    append_base64(password.salt.as_bytes(), &mut verifier);
+                    let _ = verifier.write_char('$');
+                    append_base64(&password.stored_key, &mut verifier);
+                    let _ = verifier.write_char(':');
+                    append_base64(&password.server_key, &mut verifier);
+                }
+                crate::storage::RoleCredential::Md5(password) => {
+                    let _ = verifier.write_str("md5");
+                    let _ = verifier.write_str(
+                        core::str::from_utf8(&password.hash).expect("MD5 verifier is ASCII"),
+                    );
+                }
+            }
             if verifier.is_truncated() {
                 return Err(sql_err!(
                     sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "SCRAM verifier exceeds catalog rendering limit"
+                    "role verifier exceeds catalog rendering limit"
                 ));
             }
             Datum::Text(
@@ -14469,7 +14663,6 @@ fn pg_authid<'a>(
         };
         let valid_until = match attributes.valid_until.as_ref() {
             None => Datum::Null,
-            Some(value) if value.as_str().eq_ignore_ascii_case("infinity") => Datum::Null,
             Some(value) => {
                 Datum::Timestamptz(crate::sql::datetime::parse_timestamp(value.as_str(), true)?)
             }

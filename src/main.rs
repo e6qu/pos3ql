@@ -5,11 +5,30 @@ use pos3ql::io::reactor::Reactor;
 use pos3ql::mem;
 use pos3ql::server::Server;
 
+/// Server construction traverses fixed-capacity catalog state before runtime
+/// allocation freezes. Keep its stack an explicit startup resource instead of
+/// inheriting an OS- and build-mode-dependent main-thread limit.
+const SERVER_STARTUP_STACK_BYTES: usize = 64 << 20;
+
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            eprintln!("pos3ql: {message}");
+    let worker = std::thread::Builder::new()
+        .name("pos3ql-server".to_string())
+        .stack_size(SERVER_STARTUP_STACK_BYTES)
+        .spawn(run);
+    match worker {
+        Ok(worker) => match worker.join() {
+            Ok(Ok(())) => ExitCode::SUCCESS,
+            Ok(Err(message)) => {
+                eprintln!("pos3ql: {message}");
+                ExitCode::FAILURE
+            }
+            Err(_) => {
+                eprintln!("pos3ql: server thread panicked");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("pos3ql: could not start server thread: {error}");
             ExitCode::FAILURE
         }
     }

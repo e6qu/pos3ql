@@ -4,11 +4,36 @@ DROP VIEW IF EXISTS view_catalog_joined;
 DROP VIEW IF EXISTS view_catalog_predicate;
 DROP VIEW IF EXISTS view_catalog_simple;
 DROP VIEW IF EXISTS view_check_option;
+DROP VIEW IF EXISTS view_security_barrier;
+DROP VIEW IF EXISTS view_catalog_alias;
 DROP TABLE IF EXISTS view_catalog_source;
 DROP TABLE IF EXISTS view_check_option_source;
 
 CREATE TABLE view_catalog_source (id integer, value text);
 CREATE VIEW view_catalog_simple AS SELECT id, value FROM view_catalog_source;
+CREATE VIEW view_catalog_alias (published_id, published_value) AS
+  SELECT id, value FROM view_catalog_source;
+CREATE VIEW view_security_barrier WITH (security_barrier = true) AS
+  SELECT id, value FROM view_catalog_source;
+SELECT reloptions FROM pg_class WHERE relname = 'view_security_barrier';
+ALTER VIEW view_security_barrier
+  SET (security_invoker = true, security_barrier = false);
+SELECT reloptions FROM pg_class WHERE relname = 'view_security_barrier';
+ALTER VIEW view_security_barrier RESET (security_invoker, security_barrier);
+SELECT reloptions FROM pg_class WHERE relname = 'view_security_barrier';
+INSERT INTO view_catalog_alias (published_id, published_value) VALUES (1, 'one');
+UPDATE view_catalog_alias SET published_value = 'updated' WHERE published_id = 1;
+ALTER VIEW view_catalog_alias RENAME COLUMN published_value TO current_value;
+ALTER VIEW view_catalog_alias ALTER COLUMN current_value SET DEFAULT 'view default';
+INSERT INTO view_catalog_alias (published_id) VALUES (2);
+INSERT INTO view_catalog_alias (published_id, current_value) VALUES (3, DEFAULT);
+SELECT published_id, current_value FROM view_catalog_alias;
+SELECT attname FROM pg_attribute
+ WHERE attrelid = 'view_catalog_alias'::regclass AND attnum > 0
+ ORDER BY attnum;
+SELECT atthasdef FROM pg_attribute
+ WHERE attrelid = 'view_catalog_alias'::regclass AND attname = 'current_value';
+ALTER VIEW view_catalog_alias ALTER COLUMN current_value DROP DEFAULT;
 CREATE VIEW view_catalog_predicate AS
   SELECT value || value AS doubled FROM view_catalog_source WHERE id > 0;
 CREATE VIEW view_catalog_joined AS
@@ -72,6 +97,8 @@ SELECT d.deptype, c.relname
 DROP VIEW view_catalog_joined;
 DROP VIEW view_catalog_predicate;
 DROP VIEW view_catalog_simple;
+DROP VIEW view_catalog_alias;
 DROP VIEW view_check_option;
+DROP VIEW view_security_barrier;
 DROP TABLE view_catalog_source;
 DROP TABLE view_check_option_source;

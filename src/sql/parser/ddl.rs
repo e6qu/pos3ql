@@ -20,7 +20,7 @@ use crate::sql::ast::{
     CreateEventTrigger, CreateForeignDataWrapper, CreateForeignServer, CreateForeignTable,
     CreateOperator, CreateOperatorClass, CreateRoutine, CreateRule, CreateSchemaElement,
     CreateStatistics, CreateTextSearchConfiguration, CreateTextSearchDictionary,
-    CreateTextSearchParser, CreateTextSearchTemplate, CreateTrigger, DomainCheck,
+    CreateTextSearchParser, CreateTextSearchTemplate, CreateTransform, CreateTrigger, DomainCheck,
     EventTriggerEvent, ExclusionOperator, Expr, ExtensionMemberIdentity, ExtensionRelationKind,
     ForeignDataHandler, ForeignDataValidator, ForeignOption, ForeignOptionAction,
     ForeignSchemaSelection, ForeignUser, ImportForeignSchema, IndexAccessMethod, IndexBuildMode,
@@ -30,14 +30,14 @@ use crate::sql::ast::{
     PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget,
     RelationPersistence, RelationStorageOptionNames, RelationStorageOptions, RoleOptions,
     RoutineArgument, RoutineArgumentMode, RoutineCreateKind, RoutineIdentity, RoutineParallel,
-    RoutineResultColumn, RoutineTargetKind, RuleAction, RuleEvent, RuleMode, StatisticsExpression,
-    StatisticsKey, StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget,
-    SubscriptionBehavior, SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin,
-    SubscriptionSlotName, SubscriptionSlotPlan, SubscriptionStreaming,
-    SubscriptionSynchronousCommit, TableAccessMethod, TableMembership, TablespaceOptionNames,
-    TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind, TextSearchOption,
-    TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming, TriggerTransitionTables,
-    ViewSecurity,
+    RoutineResultColumn, RoutineTargetKind, RuleAction, RuleEvent, RuleMode, SchemaAuthorization,
+    SchemaName, StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds,
+    StatisticsName, StatisticsTarget, SubscriptionBehavior, SubscriptionConnect,
+    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
+    SubscriptionStreaming, SubscriptionSynchronousCommit, TableAccessMethod, TableMembership,
+    TablespaceOptionNames, TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind,
+    TextSearchOption, TransformFunction, TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming,
+    TriggerTransitionTables, ViewSecurity, ViewSecurityBarrier,
 };
 use crate::sql::eval::sqlstate;
 
@@ -1383,6 +1383,9 @@ impl<'a> Parser<'a> {
             if self.eat_ident("trigger")? {
                 return self.create_trigger(true, false);
             }
+            if self.eat_ident("transform")? {
+                return self.create_transform(true);
+            }
             let trusted = self.eat_ident("trusted")?;
             let _procedural = self.eat_ident("procedural")?;
             if trusted || _procedural || self.eat_ident("language")? {
@@ -1392,7 +1395,7 @@ impl<'a> Parser<'a> {
                 return self.create_language(true, trusted);
             }
             return Err(self.unexpected(
-                "expected RULE, VIEW, FUNCTION, PROCEDURE, AGGREGATE, or TRIGGER after CREATE OR REPLACE",
+                "expected RULE, VIEW, FUNCTION, PROCEDURE, AGGREGATE, TRANSFORM, or TRIGGER after CREATE OR REPLACE",
             ));
         }
         if self.eat_ident("unique")? {
@@ -1455,6 +1458,9 @@ impl<'a> Parser<'a> {
         if self.eat_ident("cast")? {
             return self.create_cast();
         }
+        if self.eat_ident("transform")? {
+            return self.create_transform(false);
+        }
         if self.eat_ident("operator")? {
             if self.eat_ident("family")? {
                 return self.create_operator_family();
@@ -1499,6 +1505,10 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("tablespace")? {
             return self.create_tablespace();
+        }
+        if self.eat_ident("access")? {
+            self.expect_ident("method")?;
+            return self.create_access_method();
         }
         if self.eat_ident("database")? {
             return self.create_database();
@@ -1678,6 +1688,55 @@ impl<'a> Parser<'a> {
             target_type,
             method,
             context,
+        }))
+    }
+
+    fn transform_function(&mut self) -> Result<TransformFunction<'a>, ParseError> {
+        self.expect_ident("with")?;
+        self.expect_ident("function")?;
+        Ok(TransformFunction {
+            name: self.qual_name("transform function")?,
+            argument_types: self.optional_type_signature()?,
+        })
+    }
+
+    fn create_transform(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("for")?;
+        let type_name = self.unmodified_type_name()?;
+        self.expect_ident("language")?;
+        let language = self.col_ident("language name")?;
+        self.expect_op("(")?;
+        let mut from_sql = None;
+        let mut to_sql = None;
+        loop {
+            if self.eat_ident("from")? {
+                self.expect_ident("sql")?;
+                if from_sql.is_some() {
+                    return Err(
+                        self.err_here("FROM SQL transform function specified more than once")
+                    );
+                }
+                from_sql = Some(self.transform_function()?);
+            } else if self.eat_ident("to")? {
+                self.expect_ident("sql")?;
+                if to_sql.is_some() {
+                    return Err(self.err_here("TO SQL transform function specified more than once"));
+                }
+                to_sql = Some(self.transform_function()?);
+            } else {
+                return Err(self.err_here("expected FROM SQL or TO SQL transform function"));
+            }
+            if !self.eat_op(",")? {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(Stmt::CreateTransform(CreateTransform {
+            type_name,
+            language,
+            from_sql,
+            to_sql,
+            or_replace,
         }))
     }
 
@@ -2283,7 +2342,10 @@ impl<'a> Parser<'a> {
         let mark = self.lexer.mark();
         let (saved_peeked, saved_peek_at) = (self.peeked, self.peek_at);
         let candidate_type = self.type_name()?;
-        let argument_type = if matches!(self.peeked, Tok::Op(",") | Tok::Op(")")) {
+        let argument_type = if matches!(
+            self.peeked,
+            Tok::Op(",") | Tok::Op(")") | Tok::Ident("order")
+        ) {
             candidate_type
         } else {
             self.lexer.reset(mark);
@@ -2625,6 +2687,24 @@ impl<'a> Parser<'a> {
             owner,
             location,
             options,
+        })
+    }
+
+    fn create_access_method(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let name = self.col_ident("access method name")?;
+        self.expect_ident("type")?;
+        let method_type = if self.eat_ident("table")? {
+            crate::sql::ast::AccessMethodType::Table
+        } else if self.eat_ident("index")? {
+            crate::sql::ast::AccessMethodType::Index
+        } else {
+            return Err(self.err_here("access method type must be TABLE or INDEX"));
+        };
+        self.expect_ident("handler")?;
+        Ok(Stmt::CreateAccessMethod {
+            name,
+            method_type,
+            handler: self.qual_name("access method handler")?,
         })
     }
 
@@ -3854,17 +3934,26 @@ impl<'a> Parser<'a> {
         let mut role_members: &'a [&'a str] = &[];
         let mut admin_members: &'a [&'a str] = &[];
         loop {
-            if self.role_option(&mut options)? {
+            if self.role_option(&mut options, true)? {
                 continue;
             }
             if self.eat_ident("in")? {
                 if !self.eat_ident("role")? {
                     self.expect_ident("group")?;
                 }
+                if !in_roles.is_empty() {
+                    return Err(self.err_here("conflicting or redundant options"));
+                }
                 in_roles = self.role_name_list("role name")?;
-            } else if self.eat_ident("role")? {
+            } else if self.eat_ident("role")? || self.eat_ident("user")? {
+                if !role_members.is_empty() {
+                    return Err(self.err_here("conflicting or redundant options"));
+                }
                 role_members = self.role_name_list("member role name")?;
             } else if self.eat_ident("admin")? {
+                if !admin_members.is_empty() {
+                    return Err(self.err_here("conflicting or redundant options"));
+                }
                 admin_members = self.role_name_list("member role name")?;
             } else {
                 break;
@@ -3885,8 +3974,11 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn alter_role(&mut self) -> Result<Stmt<'a>, ParseError> {
-        let written_name = self.any_ident("role name")?;
-        let role = (!written_name.eq_ignore_ascii_case("all")).then_some(written_name);
+        let role = if self.eat_ident("all")? {
+            None
+        } else {
+            Some(self.role_specification()?)
+        };
         let database = if self.eat_ident("in")? {
             self.expect_ident("database")?;
             Some(self.any_ident("database name")?)
@@ -3929,7 +4021,7 @@ impl<'a> Parser<'a> {
                 ),
             });
         }
-        let Some(name) = role else {
+        let Some(role) = role else {
             return Err(self.unexpected("expected SET or RESET for ALTER ROLE ALL"));
         };
         if database.is_some() {
@@ -3938,7 +4030,7 @@ impl<'a> Parser<'a> {
         if self.eat_ident("rename")? {
             self.expect_ident("to")?;
             return Ok(Stmt::AlterRoleRename {
-                name,
+                role,
                 new_name: self.any_ident("new role name")?,
             });
         }
@@ -3947,44 +4039,85 @@ impl<'a> Parser<'a> {
         if options == RoleOptions::EMPTY {
             return Err(self.unexpected("expected a role option"));
         }
-        Ok(Stmt::AlterRole { name, options })
+        Ok(Stmt::AlterRole { role, options })
+    }
+
+    /// Parse PostgreSQL's legacy membership-only ALTER GROUP grammar into the
+    /// canonical role membership statements used by execution.
+    pub(super) fn alter_group(&mut self) -> Result<Stmt<'a>, ParseError> {
+        let group = self.any_ident("group name")?;
+        if self.eat_ident("add")? {
+            self.expect_ident("user")?;
+            let members = self.role_name_list("user name")?;
+            let roles = self.arena_slice(&[group])?;
+            return Ok(Stmt::GrantRole {
+                roles,
+                members,
+                options: crate::sql::ast::RoleMembershipPatch::EMPTY,
+                grantor: None,
+            });
+        }
+        if self.eat_ident("drop")? {
+            self.expect_ident("user")?;
+            let members = self.role_name_list("user name")?;
+            let roles = self.arena_slice(&[group])?;
+            return Ok(Stmt::RevokeRole {
+                roles,
+                members,
+                option: None,
+                grantor: None,
+                cascade: false,
+            });
+        }
+        if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            return Ok(Stmt::AlterRoleRename {
+                role: crate::sql::ast::RoleSpecification::Name(group),
+                new_name: self.any_ident("new group name")?,
+            });
+        }
+        Err(self.unexpected("expected ADD USER, DROP USER, or RENAME TO"))
     }
 
     fn role_options(&mut self) -> Result<RoleOptions<'a>, ParseError> {
         let mut options = RoleOptions::EMPTY;
-        while self.role_option(&mut options)? {}
+        while self.role_option(&mut options, false)? {}
         Ok(options)
     }
 
-    fn role_option(&mut self, options: &mut RoleOptions<'a>) -> Result<bool, ParseError> {
+    fn role_option(
+        &mut self,
+        options: &mut RoleOptions<'a>,
+        allow_sysid: bool,
+    ) -> Result<bool, ParseError> {
         if self.eat_ident("superuser")? {
-            options.superuser = Some(true);
+            self.set_role_option(&mut options.superuser, true)?;
         } else if self.eat_ident("nosuperuser")? {
-            options.superuser = Some(false);
+            self.set_role_option(&mut options.superuser, false)?;
         } else if self.eat_ident("inherit")? {
-            options.inherit = Some(true);
+            self.set_role_option(&mut options.inherit, true)?;
         } else if self.eat_ident("noinherit")? {
-            options.inherit = Some(false);
+            self.set_role_option(&mut options.inherit, false)?;
         } else if self.eat_ident("createrole")? {
-            options.create_role = Some(true);
+            self.set_role_option(&mut options.create_role, true)?;
         } else if self.eat_ident("nocreaterole")? {
-            options.create_role = Some(false);
+            self.set_role_option(&mut options.create_role, false)?;
         } else if self.eat_ident("createdb")? {
-            options.create_database = Some(true);
+            self.set_role_option(&mut options.create_database, true)?;
         } else if self.eat_ident("nocreatedb")? {
-            options.create_database = Some(false);
+            self.set_role_option(&mut options.create_database, false)?;
         } else if self.eat_ident("login")? {
-            options.can_login = Some(true);
+            self.set_role_option(&mut options.can_login, true)?;
         } else if self.eat_ident("nologin")? {
-            options.can_login = Some(false);
+            self.set_role_option(&mut options.can_login, false)?;
         } else if self.eat_ident("replication")? {
-            options.replication = Some(true);
+            self.set_role_option(&mut options.replication, true)?;
         } else if self.eat_ident("noreplication")? {
-            options.replication = Some(false);
+            self.set_role_option(&mut options.replication, false)?;
         } else if self.eat_ident("bypassrls")? {
-            options.bypass_row_level_security = Some(true);
+            self.set_role_option(&mut options.bypass_row_level_security, true)?;
         } else if self.eat_ident("nobypassrls")? {
-            options.bypass_row_level_security = Some(false);
+            self.set_role_option(&mut options.bypass_row_level_security, false)?;
         } else if self.eat_ident("connection")? {
             self.expect_ident("limit")?;
             let negative = self.eat_op("-")?;
@@ -3995,24 +4128,118 @@ impl<'a> Parser<'a> {
                 .parse::<i32>()
                 .map_err(|_| self.unexpected("connection limit is out of range"))?;
             self.advance()?;
-            options.connection_limit = Some(if negative { -parsed } else { parsed });
+            self.set_role_option(
+                &mut options.connection_limit,
+                if negative { -parsed } else { parsed },
+            )?;
+        } else if allow_sysid && self.eat_ident("sysid")? {
+            let negative = self.eat_op("-")?;
+            let Tok::Num(raw) = self.peeked else {
+                return Err(self.unexpected("expected SYSID"));
+            };
+            let parsed = raw
+                .parse::<i32>()
+                .map_err(|_| self.unexpected("SYSID is out of range"))?;
+            self.advance()?;
+            self.set_role_option(&mut options.sysid, if negative { -parsed } else { parsed })?;
         } else if self.eat_ident("password")? {
-            options.password = Some(if self.eat_ident("null")? {
-                None
-            } else {
-                Some(self.str_literal("password")?)
+            let password = self.role_password_spec()?;
+            self.set_role_option(&mut options.password, password)?;
+        } else if self.eat_ident("encrypted")? {
+            self.expect_ident("password")?;
+            let password = self.role_password_spec()?;
+            self.set_role_option(&mut options.password, password)?;
+        } else if self.eat_ident("unencrypted")? {
+            self.expect_ident("password")?;
+            return Err(ParseError {
+                at: self.peek_at,
+                message: crate::stack_format!(96, "UNENCRYPTED PASSWORD is no longer supported"),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
             });
         } else if self.eat_ident("valid")? {
             self.expect_ident("until")?;
-            options.valid_until = Some(if self.eat_ident("null")? {
-                None
-            } else {
-                Some(self.str_literal("VALID UNTIL")?)
-            });
+            let valid_until = self.str_literal("VALID UNTIL")?;
+            self.set_role_option(&mut options.valid_until, valid_until)?;
         } else {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    fn set_role_option<T>(&self, destination: &mut Option<T>, value: T) -> Result<(), ParseError> {
+        if destination.is_some() {
+            return Err(self.err_here("conflicting or redundant options"));
+        }
+        *destination = Some(value);
+        Ok(())
+    }
+
+    fn role_password_spec(
+        &mut self,
+    ) -> Result<Option<crate::sql::ast::RolePasswordSpec<'a>>, ParseError> {
+        if self.eat_ident("null")? {
+            return Ok(None);
+        }
+        let password = self.str_literal("password")?;
+        match crate::pg::auth::ScramServer::parse_verifier(password) {
+            Ok(Some(verifier)) => {
+                return Ok(Some(crate::sql::ast::RolePasswordSpec::ScramVerifier(
+                    verifier,
+                )));
+            }
+            Ok(None) => {}
+            Err(crate::pg::auth::ScramVerifierError::SaltTooLong) => {
+                return Err(ParseError {
+                    at: self.peek_at,
+                    message: crate::stack_format!(
+                        96,
+                        "SCRAM verifier salt exceeds {} bytes",
+                        crate::pg::auth::SCRAM_SALT_MAX
+                    ),
+                    sqlstate: sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                });
+            }
+        }
+        if let Some(verifier) = Self::parse_md5_verifier(password) {
+            return Ok(Some(crate::sql::ast::RolePasswordSpec::Md5Verifier(
+                verifier,
+            )));
+        }
+        Ok(
+            (!password.is_empty())
+                .then_some(crate::sql::ast::RolePasswordSpec::Plaintext(password)),
+        )
+    }
+
+    /// PostgreSQL MD5 verifier input is the literal md5 prefix plus its
+    /// 32-byte hexadecimal catalog digest.
+    fn parse_md5_verifier(password: &str) -> Option<crate::storage::Md5Verifier> {
+        let bytes = password.as_bytes();
+        if bytes.len() != 35 || &bytes[..3] != b"md5" {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        for (at, byte) in bytes[3..].iter().copied().enumerate() {
+            if !byte.is_ascii_hexdigit() {
+                return None;
+            }
+            hash[at] = byte;
+        }
+        Some(crate::storage::Md5Verifier { hash })
+    }
+
+    fn role_specification(&mut self) -> Result<crate::sql::ast::RoleSpecification<'a>, ParseError> {
+        if self.eat_ident("current_role")? {
+            Ok(crate::sql::ast::RoleSpecification::CurrentRole)
+        } else if self.eat_ident("current_user")? {
+            Ok(crate::sql::ast::RoleSpecification::CurrentUser)
+        } else if self.eat_ident("session_user")? {
+            Ok(crate::sql::ast::RoleSpecification::SessionUser)
+        } else {
+            Ok(crate::sql::ast::RoleSpecification::Name(
+                self.any_ident("role name")?,
+            ))
+        }
     }
 
     /// The shared tail of `CREATE TABLE ... AS` / `CREATE MATERIALIZED VIEW`:
@@ -4024,6 +4251,7 @@ impl<'a> Parser<'a> {
         columns: &'a [&'a str],
         if_not_exists: bool,
         kind: crate::sql::ast::CreateTableAsKind,
+        options: crate::sql::ast::TableAsOptions<'a>,
     ) -> Result<Stmt<'a>, ParseError> {
         let start = self.peek_at;
         let _ = self.query_select()?;
@@ -4043,6 +4271,39 @@ impl<'a> Parser<'a> {
             with_data,
             if_not_exists,
             kind,
+            options,
+        })
+    }
+
+    /// Parses the relation metadata shared by CREATE TABLE AS and CREATE
+    /// MATERIALIZED VIEW before their AS query. The closed output is consumed
+    /// directly by the durable backing relation definition.
+    fn table_as_options(&mut self) -> Result<crate::sql::ast::TableAsOptions<'a>, ParseError> {
+        let mut access_method = TableAccessMethod::Heap;
+        let mut tablespace = None;
+        let mut storage_options = RelationStorageOptions::DEFAULT;
+        loop {
+            if self.eat_ident("using")? {
+                let method = self.any_ident("table access method")?;
+                access_method = if method == "heap" {
+                    TableAccessMethod::Heap
+                } else {
+                    TableAccessMethod::Named(method)
+                };
+            } else if self.eat_ident("with")? {
+                self.expect_op("(")?;
+                storage_options = self.relation_storage_options()?;
+                self.expect_op(")")?;
+            } else if self.eat_ident("tablespace")? {
+                tablespace = Some(self.col_ident("tablespace name")?);
+            } else {
+                break;
+            }
+        }
+        Ok(crate::sql::ast::TableAsOptions {
+            access_method,
+            tablespace,
+            storage_options,
         })
     }
 
@@ -4453,8 +4714,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `ALTER SEQUENCE [IF EXISTS] name [options] [RESTART [WITH n]]` ("alter
-    /// sequence" consumed).
+    /// `ALTER SEQUENCE [IF EXISTS] name { options | RENAME TO | SET SCHEMA }`
+    /// ("alter sequence" consumed).
     pub(super) fn alter_sequence(&mut self) -> Result<Stmt<'a>, ParseError> {
         let if_exists = if self.eat_ident("if")? {
             self.expect_ident("exists")?;
@@ -4466,21 +4727,30 @@ impl<'a> Parser<'a> {
         if self.peeked == Tok::Ident("owner") {
             return self.alter_owner(crate::sql::ast::AlterOwnerKind::Sequence, name, if_exists);
         }
+        if self.eat_ident("rename")? {
+            self.expect_ident("to")?;
+            return Ok(Stmt::AlterSequence {
+                name,
+                if_exists,
+                action: crate::sql::ast::AlterSequenceAction::RenameTo(
+                    self.col_ident("new sequence name")?,
+                ),
+            });
+        }
         if self.eat_ident("set")? {
             self.expect_ident("schema")?;
             return Ok(Stmt::AlterSequence {
                 name,
                 if_exists,
-                options: crate::sql::ast::SeqOptions::EMPTY,
-                set_schema: Some(self.col_ident("schema name")?),
+                action: crate::sql::ast::AlterSequenceAction::SetSchema(
+                    self.col_ident("schema name")?,
+                ),
             });
         }
-        let options = self.seq_options(true)?;
         Ok(Stmt::AlterSequence {
             name,
             if_exists,
-            options,
-            set_schema: None,
+            action: crate::sql::ast::AlterSequenceAction::Options(self.seq_options(true)?),
         })
     }
 
@@ -4680,12 +4950,14 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             columns = self.arena_slice(&list[..m])?;
         }
+        let options = self.table_as_options()?;
         self.expect_ident("as")?;
         self.create_table_as(
             name,
             columns,
             if_not_exists,
             crate::sql::ast::CreateTableAsKind::MaterializedView,
+            options,
         )
     }
 
@@ -4708,15 +4980,18 @@ impl<'a> Parser<'a> {
         };
         let mut authorization = None;
         let name = if self.eat_ident("authorization")? {
-            let role = self.col_ident("role name")?;
+            let role = self.schema_authorization()?;
             authorization = Some(role);
-            // An omitted name defaults to the role's name, as PostgreSQL.
-            name.unwrap_or(role)
+            // PostgreSQL resolves an omitted name from the authorization role.
+            match (name, role) {
+                (Some(name), _) => SchemaName::Explicit(name),
+                (None, _) => SchemaName::Authorization,
+            }
         } else {
             let Some(n) = name else {
                 return Err(self.err_here("expected schema name or AUTHORIZATION"));
             };
-            n
+            SchemaName::Explicit(n)
         };
         static EMPTY_SCHEMA_ELEMENT: CreateSchemaElement<'static> =
             CreateSchemaElement::Table(CreateTable {
@@ -4737,73 +5012,96 @@ impl<'a> Parser<'a> {
             });
         let mut elements: [&'a CreateSchemaElement<'a>; 16] = [&EMPTY_SCHEMA_ELEMENT; 16];
         let mut n = 0usize;
-        while self.peeked == Tok::Ident("create") {
+        while matches!(self.peeked, Tok::Ident("create") | Tok::Ident("grant")) {
             if n == elements.len() {
                 return Err(self.limit("schema elements", elements.len()));
             }
-            let element = match self.create()? {
-                Stmt::CreateTable(table) => CreateSchemaElement::Table(table),
-                Stmt::CreateView {
-                    name,
-                    or_replace,
-                    security,
-                    check_option,
-                    sql,
-                } => CreateSchemaElement::View {
-                    name,
-                    or_replace,
-                    security,
-                    check_option,
-                    sql,
+            let element = match self.peeked {
+                Tok::Ident("grant") => match self.grant_statement()? {
+                    Stmt::GrantPrivileges {
+                        privileges,
+                        target,
+                        grantees,
+                        grant_option,
+                        grantor,
+                    } => CreateSchemaElement::Grant {
+                        privileges,
+                        target,
+                        grantees,
+                        grant_option,
+                        grantor,
+                    },
+                    _ => {
+                        return Err(
+                            self.err_here("CREATE SCHEMA permits only privilege GRANT clauses")
+                        );
+                    }
                 },
-                Stmt::CreateIndex {
-                    name,
-                    table,
-                    build,
-                    scope,
-                    if_not_exists,
-                    columns,
-                    include_columns,
-                    nulls_not_distinct,
-                    predicate,
-                    predicate_text,
-                    options,
-                    tablespace,
-                    unique,
-                } => CreateSchemaElement::Index {
-                    name,
-                    table,
-                    build,
-                    scope,
-                    if_not_exists,
-                    columns,
-                    include_columns,
-                    nulls_not_distinct,
-                    predicate,
-                    predicate_text,
-                    options,
-                    tablespace,
-                    unique,
-                },
-                Stmt::CreateSequence {
-                    name,
-                    if_not_exists,
-                    options,
-                } => CreateSchemaElement::Sequence {
-                    name,
-                    if_not_exists,
-                    options,
-                },
-                Stmt::CreateDomain(domain) => CreateSchemaElement::Domain(domain),
-                Stmt::CreateEnum { name, labels } => CreateSchemaElement::Enum { name, labels },
-                Stmt::CreateComposite { name, fields } => {
-                    CreateSchemaElement::Composite { name, fields }
-                }
-                _ => {
-                    return Err(self.err_here(
-                        "CREATE SCHEMA elements may be CREATE TABLE, VIEW, INDEX, SEQUENCE, DOMAIN, or TYPE",
+                Tok::Ident("create") => match self.create()? {
+                    Stmt::CreateTable(table) => CreateSchemaElement::Table(table),
+                    Stmt::CreateView {
+                        name,
+                        columns,
+                        or_replace,
+                        security,
+                        security_barrier,
+                        check_option,
+                        sql,
+                    } => CreateSchemaElement::View {
+                        name,
+                        columns,
+                        or_replace,
+                        security,
+                        security_barrier,
+                        check_option,
+                        sql,
+                    },
+                    Stmt::CreateIndex {
+                        name,
+                        table,
+                        build,
+                        scope,
+                        if_not_exists,
+                        columns,
+                        include_columns,
+                        nulls_not_distinct,
+                        predicate,
+                        predicate_text,
+                        options,
+                        tablespace,
+                        unique,
+                    } => CreateSchemaElement::Index {
+                        name,
+                        table,
+                        build,
+                        scope,
+                        if_not_exists,
+                        columns,
+                        include_columns,
+                        nulls_not_distinct,
+                        predicate,
+                        predicate_text,
+                        options,
+                        tablespace,
+                        unique,
+                    },
+                    Stmt::CreateSequence {
+                        name,
+                        if_not_exists,
+                        options,
+                    } => CreateSchemaElement::Sequence {
+                        name,
+                        if_not_exists,
+                        options,
+                    },
+                    Stmt::CreateTrigger(trigger) => CreateSchemaElement::Trigger(trigger),
+                    _ => {
+                        return Err(self.err_here(
+                        "CREATE SCHEMA elements may be CREATE TABLE, VIEW, INDEX, SEQUENCE, TRIGGER, or GRANT",
                     ));
-                }
+                    }
+                },
+                _ => unreachable!("CREATE SCHEMA loop admits only CREATE or GRANT"),
             };
             elements[n] = self
                 .arena
@@ -4811,12 +5109,34 @@ impl<'a> Parser<'a> {
                 .map_err(|_| self.err_here("statement too large for SQL arena"))?;
             n += 1;
         }
+        if if_not_exists && n != 0 {
+            return Err(ParseError {
+                at: self.peek_at,
+                message: stack_format!(
+                    96,
+                    "CREATE SCHEMA IF NOT EXISTS cannot include schema elements"
+                ),
+                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+            });
+        }
         Ok(Stmt::CreateSchema {
             name,
             authorization,
             if_not_exists,
             elements: self.arena_slice(&elements[..n])?,
         })
+    }
+
+    fn schema_authorization(&mut self) -> Result<SchemaAuthorization<'a>, ParseError> {
+        if self.eat_ident("current_role")? {
+            Ok(SchemaAuthorization::CurrentRole)
+        } else if self.eat_ident("current_user")? {
+            Ok(SchemaAuthorization::CurrentUser)
+        } else if self.eat_ident("session_user")? {
+            Ok(SchemaAuthorization::SessionUser)
+        } else {
+            Ok(SchemaAuthorization::Name(self.col_ident("role name")?))
+        }
     }
 
     /// CREATE INDEX after the INDEX keyword. Syntax defaults become explicit
@@ -5159,7 +5479,27 @@ impl<'a> Parser<'a> {
     /// CREATE VIEW name AS <select> ("create [or replace] view" consumed).
     fn create_view(&mut self, or_replace: bool) -> Result<Stmt<'a>, ParseError> {
         let name = self.qual_name("view name")?;
+        let columns = if self.peeked == Tok::Op("(") {
+            let mut names = [""; crate::storage::MAX_COLUMNS];
+            self.expect_op("(")?;
+            let mut count = 0;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("view column list", names.len()));
+                }
+                names[count] = self.col_ident("view column name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            self.expect_op(")")?;
+            self.arena_slice(&names[..count])?
+        } else {
+            &[]
+        };
         let mut security = ViewSecurity::Definer;
+        let mut security_barrier = ViewSecurityBarrier::Default;
         let mut check_option = None;
         if self.eat_ident("with")? {
             self.expect_op("(")?;
@@ -5175,11 +5515,9 @@ impl<'a> Parser<'a> {
                     crate::sql::ast::ViewOption::CheckOption(option) => {
                         check_option = Some(*option);
                     }
-                    crate::sql::ast::ViewOption::SecurityBarrier(true) => {
-                        return Err(self
-                            .err_here("security_barrier requires a predicate-ordering boundary"));
+                    crate::sql::ast::ViewOption::SecurityBarrier(enabled) => {
+                        security_barrier = ViewSecurityBarrier::from_enabled(*enabled);
                     }
-                    crate::sql::ast::ViewOption::SecurityBarrier(false) => {}
                 }
             }
         }
@@ -5192,8 +5530,10 @@ impl<'a> Parser<'a> {
         let sql = self.text[start..end].trim();
         Ok(Stmt::CreateView {
             name,
+            columns,
             or_replace,
             security,
+            security_barrier,
             check_option,
             sql,
         })
@@ -5829,6 +6169,38 @@ impl<'a> Parser<'a> {
     /// Dispatches DROP: `VIEW` or `TABLE` ("drop" consumed here).
     pub(super) fn drop_stmt(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("drop")?;
+        if self.eat_ident("access")? {
+            self.expect_ident("method")?;
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            let mut names = [""; MAX_LIST];
+            let mut count = 0usize;
+            loop {
+                if count == names.len() {
+                    return Err(self.limit("access methods", names.len()));
+                }
+                names[count] = self.col_ident("access method name")?;
+                count += 1;
+                if !self.eat_op(",")? {
+                    break;
+                }
+            }
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropAccessMethod {
+                names: self.arena_slice(&names[..count])?,
+                if_exists,
+                cascade,
+            });
+        }
         if self.eat_ident("foreign")? {
             if self.eat_ident("data")? {
                 self.expect_ident("wrapper")?;
@@ -6043,6 +6415,30 @@ impl<'a> Parser<'a> {
             return Ok(Stmt::DropCast(crate::sql::ast::DropCast {
                 source_type,
                 target_type,
+                if_exists,
+                cascade,
+            }));
+        }
+        if self.eat_ident("transform")? {
+            let if_exists = if self.eat_ident("if")? {
+                self.expect_ident("exists")?;
+                true
+            } else {
+                false
+            };
+            self.expect_ident("for")?;
+            let type_name = self.unmodified_type_name()?;
+            self.expect_ident("language")?;
+            let language = self.col_ident("language name")?;
+            let cascade = if self.eat_ident("cascade")? {
+                true
+            } else {
+                let _ = self.eat_ident("restrict")?;
+                false
+            };
+            return Ok(Stmt::DropTransform(crate::sql::ast::DropTransform {
+                type_name,
+                language,
                 if_exists,
                 cascade,
             }));
@@ -6491,7 +6887,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn aggregate_identity(&mut self) -> Result<AggregateIdentity<'a>, ParseError> {
+    pub(super) fn aggregate_identity(&mut self) -> Result<AggregateIdentity<'a>, ParseError> {
         let name = self.qual_name("aggregate name")?;
         self.expect_op("(")?;
         let mut direct = [""; crate::storage::MAX_ROUTINE_ARGUMENTS];
@@ -6511,8 +6907,7 @@ impl<'a> Parser<'a> {
                     }
                     continue;
                 }
-                let _ = self.eat_ident("in")?;
-                let _ = self.eat_ident("variadic")?;
+                let (argument_type, input) = self.routine_identity_argument()?;
                 let target = if ordered_set {
                     &mut aggregated
                 } else {
@@ -6523,11 +6918,13 @@ impl<'a> Parser<'a> {
                 } else {
                     &mut direct_count
                 };
-                if *count == target.len() {
-                    return Err(self.limit("aggregate arguments", target.len()));
+                if input {
+                    if *count == target.len() {
+                        return Err(self.limit("aggregate arguments", target.len()));
+                    }
+                    target[*count] = argument_type;
+                    *count += 1;
                 }
-                target[*count] = self.type_name()?;
-                *count += 1;
                 if self.eat_op(")")? {
                     break;
                 }
@@ -6941,7 +7338,7 @@ impl<'a> Parser<'a> {
             };
             let access_method = if self.eat_ident("using")? {
                 let method = self.any_ident("table access method")?;
-                if method.eq_ignore_ascii_case("heap") {
+                if method == "heap" {
                     TableAccessMethod::Heap
                 } else {
                     TableAccessMethod::Named(method)
@@ -6997,6 +7394,21 @@ impl<'a> Parser<'a> {
                 &[],
                 if_not_exists,
                 crate::sql::ast::CreateTableAsKind::Table,
+                crate::sql::ast::TableAsOptions::DEFAULT,
+            );
+        }
+        if matches!(self.peeked, Tok::Ident("using" | "with" | "tablespace")) {
+            if foreign {
+                return Err(self.err_here("CREATE FOREIGN TABLE AS is not supported by PostgreSQL"));
+            }
+            let options = self.table_as_options()?;
+            self.expect_ident("as")?;
+            return self.create_table_as(
+                name,
+                &[],
+                if_not_exists,
+                crate::sql::ast::CreateTableAsKind::Table,
+                options,
             );
         }
         if matches!(membership, TableMembership::OfType(_)) && self.peeked != Tok::Op("(") {
@@ -7013,7 +7425,7 @@ impl<'a> Parser<'a> {
                     self.expect_op(")")?;
                 } else if self.eat_ident("using")? {
                     let method = self.any_ident("table access method")?;
-                    access_method = if method.eq_ignore_ascii_case("heap") {
+                    access_method = if method == "heap" {
                         TableAccessMethod::Heap
                     } else {
                         TableAccessMethod::Named(method)
@@ -7061,6 +7473,7 @@ impl<'a> Parser<'a> {
                     m += 1;
                 }
                 self.expect_op(")")?;
+                let options = self.table_as_options()?;
                 self.expect_ident("as")?;
                 if foreign {
                     return Err(
@@ -7073,6 +7486,7 @@ impl<'a> Parser<'a> {
                     cols,
                     if_not_exists,
                     crate::sql::ast::CreateTableAsKind::Table,
+                    options,
                 );
             }
             // Otherwise it is a column definition whose name we already read.
@@ -7319,7 +7733,7 @@ impl<'a> Parser<'a> {
                 self.expect_op(")")?;
             } else if self.eat_ident("using")? {
                 let method = self.any_ident("table access method")?;
-                access_method = if method.eq_ignore_ascii_case("heap") {
+                access_method = if method == "heap" {
                     TableAccessMethod::Heap
                 } else {
                     TableAccessMethod::Named(method)

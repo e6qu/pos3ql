@@ -1110,6 +1110,14 @@ pub trait CatalogAccess {
     ) -> Result<Option<bool>, SqlError> {
         Ok(None)
     }
+    fn has_language_privilege(
+        &self,
+        _role: Option<&str>,
+        _language: &str,
+        _privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        Ok(None)
+    }
     fn has_function_privilege(
         &self,
         _role: Option<&str>,
@@ -1150,6 +1158,9 @@ pub trait CatalogAccess {
         _oid: i32,
         _arena: &'a Arena,
     ) -> Result<Option<&'a str>, SqlError> {
+        Ok(None)
+    }
+    fn language_name<'a>(&self, _oid: i32, _arena: &'a Arena) -> Result<Option<&'a str>, SqlError> {
         Ok(None)
     }
     /// The comment text on the object with this OID and column `subid` (0 for
@@ -6106,6 +6117,7 @@ fn type_name_of(d: &Datum) -> &'static str {
         Datum::Int8(_) => "bigint",
         Datum::Float4(_) => "real",
         Datum::Float8(_) => "double precision",
+        Datum::Char(_) => "\"char\"",
         Datum::Numeric(_) => "numeric",
         Datum::Text(_) => "text",
         Datum::Bpchar(_) => "character",

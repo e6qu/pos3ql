@@ -732,7 +732,7 @@ enum Mutation {
     Drop,
 }
 
-fn mutation(undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
+fn mutation(storage: &Storage, undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
     use DdlUndo::*;
     Some(match undo {
         Created(slot) => (ObjectRef::Table(slot as usize), Mutation::Create),
@@ -824,6 +824,14 @@ fn mutation(undo: DdlUndo) -> Option<(ObjectRef, Mutation)> {
         IndexRenamed { slot, .. } | IndexAltered { slot, .. } => {
             (ObjectRef::Index(slot as usize), Mutation::Alter)
         }
+        AccessMethodCreated(slot) => (
+            ObjectRef::AccessMethod(storage.access_method_oid_at(slot as usize)?),
+            Mutation::Create,
+        ),
+        AccessMethodDropped(slot) => (
+            ObjectRef::AccessMethod(storage.access_method_oid_at(slot as usize)?),
+            Mutation::Drop,
+        ),
         SchemaCreated(slot) => (ObjectRef::Schema(slot as usize), Mutation::Create),
         SchemaDropped(slot) => (ObjectRef::Schema(slot as usize), Mutation::Drop),
         ExtensionCreated(slot) => (ObjectRef::Extension(slot as usize), Mutation::Create),
@@ -871,7 +879,10 @@ fn utility_command_object_type(statement: &Stmt<'_>) -> Option<&'static str> {
                 }
                 PrivilegeObjectKind::Schema => "SCHEMA",
                 PrivilegeObjectKind::Type => "TYPE",
+                PrivilegeObjectKind::ProceduralLanguage => "LANGUAGE",
                 PrivilegeObjectKind::AllFunctionsInSchema => "FUNCTION",
+                PrivilegeObjectKind::AllProceduresInSchema => "PROCEDURE",
+                PrivilegeObjectKind::AllRoutinesInSchema => "ROUTINE",
                 PrivilegeObjectKind::ForeignDataWrapper => "FOREIGN DATA WRAPPER",
                 PrivilegeObjectKind::ForeignServer => "FOREIGN SERVER",
                 PrivilegeObjectKind::Tablespace | PrivilegeObjectKind::Database => return None,
@@ -921,6 +932,7 @@ fn access_reference(object: crate::storage::AccessObject) -> Option<ObjectRef> {
         AccessClass::Extension => ObjectRef::Extension(slot),
         AccessClass::Trigger => ObjectRef::Trigger(slot),
         AccessClass::LargeObject => ObjectRef::LargeObject(slot),
+        AccessClass::Language => return None,
         AccessClass::Tablespace
         | AccessClass::Database
         | AccessClass::EventTrigger
@@ -1161,7 +1173,7 @@ fn comment_reference(
         )),
         CommentClass::AccessMethod => {
             let oid = i32::try_from(subid).map_err(|_| graph_full())?;
-            (catalog::access_method_name(oid) == Some(name.as_str()))
+            (catalog::access_method_name_in(storage, txid, oid) == Some(name.as_str()))
                 .then_some(EventObjectRef::Primary(ObjectRef::AccessMethod(oid)))
                 .ok_or_else(graph_full)?
         }
@@ -1975,7 +1987,9 @@ fn primary_object(
             )
         }
         ObjectRef::AccessMethod(oid) => {
-            let name = catalog::access_method_name(oid).ok_or_else(graph_full)?;
+            let name = catalog::access_method_name(oid)
+                .or_else(|| storage.access_method_name_by_oid(oid))
+                .ok_or_else(graph_full)?;
             base_object(
                 catalog::PG_AM_OID,
                 oid,
@@ -2202,7 +2216,8 @@ fn is_original(
         }
         (Stmt::DropPublication { names, .. }, ObjectRef::Publication(_))
         | (Stmt::DropSubscription { names, .. }, ObjectRef::Subscription(_))
-        | (Stmt::DropExtension { names, .. }, ObjectRef::Extension(_)) => {
+        | (Stmt::DropExtension { names, .. }, ObjectRef::Extension(_))
+        | (Stmt::DropAccessMethod { names, .. }, ObjectRef::AccessMethod(_)) => {
             names.iter().any(|name| {
                 *name
                     == object
@@ -3117,7 +3132,7 @@ pub(crate) fn collect(
             if entry_origin != origin {
                 continue;
             }
-            let Some((reference, Mutation::Drop)) = mutation(entry) else {
+            let Some((reference, Mutation::Drop)) = mutation(storage, entry) else {
                 continue;
             };
             let object = primary_object(storage, txid, reference)?;
@@ -3160,7 +3175,7 @@ pub(crate) fn collect(
             push_command(commands, &mut command_count, reference, tag, in_extension)?;
             continue;
         }
-        let Some((reference, mutation)) = mutation(entry) else {
+        let Some((reference, mutation)) = mutation(storage, entry) else {
             continue;
         };
         if mutation != Mutation::Drop {

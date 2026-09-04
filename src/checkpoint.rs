@@ -1185,6 +1185,42 @@ impl Checkpointer {
                         .select_database_for_recovery(database)
                         .map_err(|_| CheckpointSetupError::Corrupt("unknown database context"))?;
                 }
+                Some("am") => {
+                    finish_pending(storage, &mut slot_of, pending_def.take())?;
+                    let created_at: u64 = parse_field(words.next(), "access method sequence")?;
+                    let name = decode_hex_name(
+                        words
+                            .next()
+                            .ok_or(CheckpointSetupError::Corrupt("access method name missing"))?,
+                    )?;
+                    let handler: u8 = parse_field(words.next(), "access method handler")?;
+                    if words.next().is_some() || created_at == 0 {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid access method record",
+                        ));
+                    }
+                    let slot = storage
+                        .create_access_method(
+                            created_at,
+                            crate::storage::AccessMethodDefinition {
+                                name: sql_name(&name)?,
+                                handler: crate::storage::TableAccessMethodHandler::from_code(
+                                    handler,
+                                )
+                                .ok_or(
+                                    CheckpointSetupError::Corrupt("invalid access method handler"),
+                                )?,
+                            },
+                            0,
+                        )
+                        .map_err(|error| {
+                            CheckpointSetupError::ObjectStore(format!(
+                                "manifest access method rejected: {}",
+                                error.message.as_str()
+                            ))
+                        })?;
+                    storage.commit_access_method_create(slot);
+                }
                 Some("table") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let mindex: usize = parse_field(words.next(), "table index")?;
@@ -1201,11 +1237,21 @@ impl Checkpointer {
                         _ => return Err(CheckpointSetupError::Corrupt("invalid table kind")),
                     };
                     let tablespace: u16 = parse_field(words.next(), "table tablespace")?;
-                    let access_method = crate::storage::TableAccessMethod::from_code(parse_field(
-                        words.next(),
-                        "table access method",
-                    )?)
-                    .ok_or(CheckpointSetupError::Corrupt("invalid table access method"))?;
+                    let access_method: i32 = parse_field(words.next(), "table access method")?;
+                    let access_method = if access_method == 2 {
+                        crate::storage::TableAccessMethod::Heap
+                    } else {
+                        crate::storage::TableAccessMethod::Catalog(
+                            crate::storage::AccessMethodOid::parse(access_method).ok_or(
+                                CheckpointSetupError::Corrupt("invalid table access method"),
+                            )?,
+                        )
+                    };
+                    if storage.table_access_method_name(access_method, 0).is_none() {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "table references an unknown access method",
+                        ));
+                    }
                     let inheritance_count: usize =
                         parse_field(words.next(), "table inheritance count")?;
                     if inheritance_count > crate::storage::MAX_TABLE_INHERITANCE_PARENTS {
@@ -1722,32 +1768,65 @@ impl Checkpointer {
                     )?;
                     let flags: u16 = parse_field(words.next(), "rol flags")?;
                     let connection_limit: i32 = parse_field(words.next(), "rol connection limit")?;
-                    let salt = parse_hex_array::<16>(
-                        words
-                            .next()
-                            .ok_or(CheckpointSetupError::Corrupt("rol salt missing"))?,
-                    )?;
-                    let stored_key = parse_hex_array::<32>(
-                        words
-                            .next()
-                            .ok_or(CheckpointSetupError::Corrupt("rol stored key missing"))?,
-                    )?;
-                    let server_key = parse_hex_array::<32>(
-                        words
-                            .next()
-                            .ok_or(CheckpointSetupError::Corrupt("rol server key missing"))?,
-                    )?;
+                    let credential_kind = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rol credential kind missing"))?;
+                    let credential_value = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rol credential missing"))?;
+                    let stored_key_encoded = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rol stored key missing"))?;
+                    let server_key_encoded = words
+                        .next()
+                        .ok_or(CheckpointSetupError::Corrupt("rol server key missing"))?;
                     let iterations: u32 = parse_field(words.next(), "rol iterations")?;
                     let valid_until_encoded = words
                         .next()
                         .ok_or(CheckpointSetupError::Corrupt("rol valid-until missing"))?;
                     let password_present = flags & (1 << 7) != 0;
                     let valid_until_present = flags & (1 << 8) != 0;
-                    let password = crate::storage::RolePassword {
-                        salt,
-                        stored_key,
-                        server_key,
-                        iterations,
+                    let password = match credential_kind {
+                        "-" if credential_value == "-"
+                            && stored_key_encoded == "-"
+                            && server_key_encoded == "-"
+                            && iterations == 0 =>
+                        {
+                            None
+                        }
+                        "s" => {
+                            let salt = parse_hex_salt(credential_value)?;
+                            let stored_key = parse_hex_array::<32>(stored_key_encoded)?;
+                            let server_key = parse_hex_array::<32>(server_key_encoded)?;
+                            if iterations == 0 {
+                                return Err(CheckpointSetupError::Corrupt(
+                                    "invalid SCRAM verifier",
+                                ));
+                            }
+                            Some(crate::storage::RoleCredential::Scram(
+                                crate::pg::auth::ScramServer {
+                                    salt,
+                                    stored_key,
+                                    server_key,
+                                    iterations,
+                                },
+                            ))
+                        }
+                        "m" if stored_key_encoded == "-"
+                            && server_key_encoded == "-"
+                            && iterations == 0 =>
+                        {
+                            let bytes = credential_value.as_bytes();
+                            if bytes.len() != 32 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+                                return Err(CheckpointSetupError::Corrupt("invalid MD5 verifier"));
+                            }
+                            let mut hash = [0; 32];
+                            hash.copy_from_slice(bytes);
+                            Some(crate::storage::RoleCredential::Md5(
+                                crate::storage::Md5Verifier { hash },
+                            ))
+                        }
+                        _ => return Err(CheckpointSetupError::Corrupt("invalid rol credential")),
                     };
                     let valid_until = match (valid_until_present, valid_until_encoded) {
                         (false, "-") => None,
@@ -1765,8 +1844,7 @@ impl Checkpointer {
                     };
                     if words.next().is_some()
                         || flags & !0x01ff != 0
-                        || (password_present && iterations == 0)
-                        || (!password_present && password != crate::storage::RolePassword::EMPTY)
+                        || (password_present != password.is_some())
                     {
                         return Err(CheckpointSetupError::Corrupt("invalid rol record"));
                     }
@@ -1782,7 +1860,7 @@ impl Checkpointer {
                                 replication: flags & (1 << 5) != 0,
                                 bypass_row_level_security: flags & (1 << 6) != 0,
                                 connection_limit,
-                                password: password_present.then_some(password),
+                                password,
                                 valid_until,
                             },
                         )
@@ -2833,7 +2911,7 @@ impl Checkpointer {
                         )
                         .map_err(|_| CheckpointSetupError::Corrupt("invalid foreign table"))?;
                 }
-                Some("vw7") => {
+                Some("vw11") => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_view(storage, line)?;
                 }
@@ -5640,29 +5718,48 @@ impl Checkpointer {
         )?;
         let mut database_context = None;
 
-        // Roles are durable catalog authority. Only SCRAM verifier material
-        // crosses this object-backed manifest; plaintext passwords never do.
+        // Roles are durable catalog authority. Parsed verifier material crosses
+        // this object-backed manifest; plaintext passwords never do.
         for (_, role) in storage.live_roles() {
             use core::fmt::Write;
             let attributes = role.attributes;
-            let password = attributes
-                .password
-                .unwrap_or(crate::storage::RolePassword::EMPTY);
             let mut name = StackStr::<130>::new();
             for byte in role.name.as_str().as_bytes() {
                 let _ = write!(name, "{byte:02x}");
             }
-            let mut salt = StackStr::<32>::new();
+            let mut credential_kind = StackStr::<1>::new();
+            let mut salt = StackStr::<{ 2 * crate::pg::auth::SCRAM_SALT_MAX }>::new();
             let mut stored_key = StackStr::<64>::new();
             let mut server_key = StackStr::<64>::new();
-            for byte in password.salt {
-                let _ = write!(salt, "{byte:02x}");
-            }
-            for byte in password.stored_key {
-                let _ = write!(stored_key, "{byte:02x}");
-            }
-            for byte in password.server_key {
-                let _ = write!(server_key, "{byte:02x}");
+            let mut iterations = 0u32;
+            match attributes.password {
+                None => {
+                    let _ = write!(credential_kind, "-");
+                    let _ = write!(salt, "-");
+                    let _ = write!(stored_key, "-");
+                    let _ = write!(server_key, "-");
+                }
+                Some(crate::storage::RoleCredential::Scram(password)) => {
+                    let _ = write!(credential_kind, "s");
+                    for byte in password.salt.as_bytes() {
+                        let _ = write!(salt, "{byte:02x}");
+                    }
+                    for byte in password.stored_key {
+                        let _ = write!(stored_key, "{byte:02x}");
+                    }
+                    for byte in password.server_key {
+                        let _ = write!(server_key, "{byte:02x}");
+                    }
+                    iterations = password.iterations;
+                }
+                Some(crate::storage::RoleCredential::Md5(password)) => {
+                    let _ = write!(credential_kind, "m");
+                    let _ = salt.write_str(
+                        core::str::from_utf8(&password.hash).expect("MD5 verifier is ASCII"),
+                    );
+                    let _ = write!(stored_key, "-");
+                    let _ = write!(server_key, "-");
+                }
             }
             let mut valid_until = StackStr::<{ 2 * crate::storage::ROLE_VALID_UNTIL_MAX }>::new();
             if let Some(value) = attributes.valid_until.as_ref() {
@@ -5688,14 +5785,15 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "rol {} {} {} {} {} {} {} {}",
+                    "rol {} {} {} {} {} {} {} {} {}",
                     name.as_str(),
                     flags,
                     attributes.connection_limit,
+                    credential_kind.as_str(),
                     salt.as_str(),
                     stored_key.as_str(),
                     server_key.as_str(),
-                    password.iterations,
+                    iterations,
                     valid_until.as_str()
                 ),
             )?;
@@ -6096,6 +6194,27 @@ impl Checkpointer {
             }
             write_manifest(&mut self.manifest_buf, format_args!("{}", line.as_str()))?;
         }
+        for (_, method) in storage.checkpoint_access_methods() {
+            write_database_context(
+                &mut self.manifest_buf,
+                &mut database_context,
+                method.database,
+            )?;
+            use core::fmt::Write;
+            let mut name = StackStr::<130>::new();
+            for byte in method.definition.name.as_str().as_bytes() {
+                let _ = write!(name, "{byte:02x}");
+            }
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!(
+                    "am {} {} {}",
+                    method.created_at,
+                    name.as_str(),
+                    method.definition.handler.code(),
+                ),
+            )?;
+        }
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
             if !table.live {
@@ -6125,7 +6244,10 @@ impl Checkpointer {
                     crate::storage::TableKind::Foreign => 1,
                 },
                 table.def.tablespace,
-                table.def.access_method.code(),
+                match table.def.access_method {
+                    crate::storage::TableAccessMethod::Heap => 2,
+                    crate::storage::TableAccessMethod::Catalog(oid) => oid.get(),
+                },
                 table.def.inheritance.parents_ref().len(),
             )
             .map_err(|_| {
@@ -6827,22 +6949,25 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "vw7 {} {} {} {} {} {} {}",
+                    "vw11 {} {} {} {} {} {} {} {} {}",
                     hex.as_str(),
                     hschema.as_str(),
                     hpath.as_str(),
                     hname.as_str(),
                     u8::from(matches!(
-                        view.security,
+                        view.options.security,
                         crate::storage::ViewSecurity::Invoker
                     )),
-                    view.check_option
+                    view.options.security_barrier.code(),
+                    view.options
+                        .check_option
                         .map_or(0, crate::storage::ViewCheckOption::code),
+                    ManifestViewColumns(view.columns),
                     ManifestDependencies(storage.view_dependencies(view_slot))
                 ),
             )?;
         }
-        // Materialized views: like `vw2`, plus a trailing populated flag (0/1).
+        // Materialized views persist their backing relation separately.
         // Publications: database-scoped names plus explicit table slots.
         for (_, publication) in storage.checkpoint_publications() {
             write_database_context(
@@ -9310,8 +9435,18 @@ fn append_uploaded_wal_record(
 }
 
 fn parse_hex_array<const N: usize>(hex: &str) -> Result<[u8; N], CheckpointSetupError> {
+    let (output, len) = parse_hex_bytes(hex)?;
+    if len != N {
+        return Err(CheckpointSetupError::Corrupt(
+            "fixed byte field has the wrong hex length",
+        ));
+    }
+    Ok(output)
+}
+
+fn parse_hex_bytes<const N: usize>(hex: &str) -> Result<([u8; N], usize), CheckpointSetupError> {
     let bytes = hex.as_bytes();
-    if bytes.len() != 2 * N {
+    if !bytes.len().is_multiple_of(2) || bytes.len() > 2 * N {
         return Err(CheckpointSetupError::Corrupt(
             "fixed byte field has the wrong hex length",
         ));
@@ -9329,7 +9464,16 @@ fn parse_hex_array<const N: usize>(hex: &str) -> Result<[u8; N], CheckpointSetup
     for (i, pair) in bytes.chunks(2).enumerate() {
         output[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
-    Ok(output)
+    Ok((output, bytes.len() / 2))
+}
+
+fn parse_hex_salt(hex: &str) -> Result<crate::pg::auth::ScramSalt, CheckpointSetupError> {
+    if hex == "-" {
+        return Ok(crate::pg::auth::ScramSalt::EMPTY);
+    }
+    let (bytes, len) = parse_hex_bytes::<{ crate::pg::auth::SCRAM_SALT_MAX }>(hex)?;
+    crate::pg::auth::ScramSalt::from_bytes(&bytes[..len])
+        .ok_or(CheckpointSetupError::Corrupt("invalid SCRAM salt"))
 }
 
 fn parse_block_id(hex: &str) -> Result<BlockId, CheckpointSetupError> {
@@ -10762,21 +10906,114 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
         word.ok_or(CheckpointSetupError::Corrupt(what))
             .and_then(decode_hex_name)
     };
-    let sql = read_hex(words.next(), "vw2 sql missing")?;
-    let schema = read_hex(words.next(), "vw2 schema missing")?;
-    let path = read_hex(words.next(), "vw2 path missing")?;
-    let name = read_hex(words.next(), "vw2 name missing")?;
+    let sql = read_hex(words.next(), "view sql missing")?;
+    let schema = read_hex(words.next(), "view schema missing")?;
+    let path = read_hex(words.next(), "view path missing")?;
+    let name = read_hex(words.next(), "view name missing")?;
     let security = match parse_field::<u8>(words.next(), "view security missing")? {
         0 => crate::storage::ViewSecurity::Definer,
         1 => crate::storage::ViewSecurity::Invoker,
         _ => return Err(CheckpointSetupError::Corrupt("invalid view security")),
     };
+    let security_barrier = crate::storage::ViewSecurityBarrier::from_code(parse_field(
+        words.next(),
+        "view security barrier missing",
+    )?)
+    .ok_or(CheckpointSetupError::Corrupt(
+        "invalid view security barrier",
+    ))?;
     let check_option = match parse_field::<u8>(words.next(), "view check option missing")? {
         0 => None,
         code => crate::storage::ViewCheckOption::from_code(code)
             .ok_or(CheckpointSetupError::Corrupt("invalid view check option"))
             .map(Some)?,
     };
+    let encoded_columns = words
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("view columns missing"))?;
+    let mut encoded_columns = encoded_columns.splitn(3, ':');
+    let aliases = match parse_field::<u8>(encoded_columns.next(), "view column aliases")? {
+        0 => false,
+        1 => true,
+        _ => return Err(CheckpointSetupError::Corrupt("invalid view column aliases")),
+    };
+    let count = encoded_columns
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("invalid view columns"))?;
+    let encoded_entries = encoded_columns
+        .next()
+        .ok_or(CheckpointSetupError::Corrupt("invalid view columns"))?;
+    let count = parse_field::<usize>(Some(count), "view column count")?;
+    if count > crate::storage::MAX_COLUMNS {
+        return Err(CheckpointSetupError::Corrupt("view column count"));
+    }
+    let mut names = [crate::storage::SqlName::EMPTY; crate::storage::MAX_COLUMNS];
+    let mut defaults = [ColumnDefault::NONE; crate::storage::MAX_COLUMNS];
+    if count == 0 {
+        if !encoded_entries.is_empty() {
+            return Err(CheckpointSetupError::Corrupt("invalid empty view columns"));
+        }
+    } else {
+        let mut entries = encoded_entries.split(',');
+        for index in 0..count {
+            let entry = entries
+                .next()
+                .ok_or(CheckpointSetupError::Corrupt("view column missing"))?;
+            let mut fields = entry.splitn(4, '/');
+            names[index] =
+                sql_name(&decode_hex_name(fields.next().ok_or(
+                    CheckpointSetupError::Corrupt("view column name missing"),
+                )?)?)?;
+            let tag = parse_field::<u8>(fields.next(), "view column default kind")?;
+            let value = fields.next().ok_or(CheckpointSetupError::Corrupt(
+                "view column default value missing",
+            ))?;
+            let expression = fields.next().ok_or(CheckpointSetupError::Corrupt(
+                "view column default expression missing",
+            ))?;
+            let expression = if expression == "0" {
+                None
+            } else {
+                let source = decode_hex_name(expression)?;
+                let expression = StackStr::from_str(&source);
+                if expression.is_truncated() {
+                    return Err(CheckpointSetupError::Corrupt(
+                        "view column default expression exceeds limit",
+                    ));
+                }
+                Some(expression)
+            };
+            defaults[index] = match tag {
+                0 if value == "0" && expression.is_none() => ColumnDefault::NONE,
+                1 => ColumnDefault::from_parts(default_from_hex(value)?, expression, false).ok_or(
+                    CheckpointSetupError::Corrupt("invalid view constant default"),
+                )?,
+                2 if value == "0" => ColumnDefault::from_parts(None, expression, false).ok_or(
+                    CheckpointSetupError::Corrupt("invalid view expression default"),
+                )?,
+                _ => return Err(CheckpointSetupError::Corrupt("invalid view column default")),
+            };
+        }
+        if entries.next().is_some() {
+            return Err(CheckpointSetupError::Corrupt("trailing view columns"));
+        }
+    }
+    let mut columns = crate::storage::ViewColumns::from_sql_names(&names[..count])
+        .map(|columns| columns.with_aliases(aliases))
+        .map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest view columns rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+    for (index, default) in defaults[..count].iter().copied().enumerate() {
+        columns = columns.with_default(index, default).map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!(
+                "manifest view default rejected: {}",
+                error.message.as_str()
+            ))
+        })?;
+    }
     let dependencies = parse_stored_query_dependencies(&mut words)?;
     use core::fmt::Write;
     let mut buffer = StackStr::<{ crate::storage::VIEW_SQL_MAX }>::new();
@@ -10787,14 +11024,18 @@ fn load_view(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetupErr
         .create_view(
             sql_name(&schema)?,
             sql_name(&name)?,
-            crate::storage::StoredQueryDefinition {
-                sql: buffer,
-                creation_path: path_buffer,
-                dependencies,
-            },
-            crate::storage::ViewOptions {
-                security,
-                check_option,
+            crate::storage::ViewDefinition {
+                columns,
+                query: crate::storage::StoredQueryDefinition {
+                    sql: buffer,
+                    creation_path: path_buffer,
+                    dependencies,
+                },
+                options: crate::storage::ViewOptions {
+                    security,
+                    security_barrier,
+                    check_option,
+                },
             },
             true,
             0,
@@ -10860,6 +11101,8 @@ fn load_matview(storage: &mut Storage, line: &str) -> Result<(), CheckpointSetup
 
 struct ManifestDependencies<'a>(&'a crate::storage::StoredQueryDependencies);
 
+struct ManifestViewColumns(crate::storage::ViewColumns);
+
 struct ManifestName<'a>(&'a str);
 
 fn text_search_behavior_code(behavior: crate::storage::TextSearchDictionaryBehavior) -> u8 {
@@ -10892,6 +11135,48 @@ impl core::fmt::Display for ManifestName<'_> {
         }
         for byte in self.0.as_bytes() {
             write!(output, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl core::fmt::Display for ManifestViewColumns {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            output,
+            "{}:{}:",
+            u8::from(self.0.has_aliases()),
+            self.0.len()
+        )?;
+        for (index, name) in self.0.names().iter().enumerate() {
+            if index != 0 {
+                output.write_str(",")?;
+            }
+            for byte in name.as_str().as_bytes() {
+                write!(output, "{byte:02x}")?;
+            }
+            let default = self
+                .0
+                .default_at(index)
+                .expect("view column index is bounded by its name slice");
+            match default {
+                ColumnDefault::None => output.write_str("/0/0/0")?,
+                ColumnDefault::Constant { value, expression } => {
+                    write!(output, "/1/{}/", default_to_hex(&Some(value)).as_str())?;
+                    for byte in expression.as_str().as_bytes() {
+                        write!(output, "{byte:02x}")?;
+                    }
+                }
+                ColumnDefault::Expression(expression) => {
+                    output.write_str("/2/0/")?;
+                    for byte in expression.as_str().as_bytes() {
+                        write!(output, "{byte:02x}")?;
+                    }
+                }
+                ColumnDefault::Generated(_) => {
+                    return Err(core::fmt::Error);
+                }
+            }
         }
         Ok(())
     }

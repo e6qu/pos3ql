@@ -87,6 +87,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         | AlterAction::DropIdentity { .. }
         | AlterAction::SetIdentityMode { .. }
         | AlterAction::SetGeneratedExpression { .. }
+        | AlterAction::DropGeneratedExpression { .. }
         | AlterAction::AlterIdentitySequence { .. } => 4,
         AlterAction::SetForeignOptions(_)
         | AlterAction::SetColumnForeignOptions { .. }
@@ -954,6 +955,8 @@ impl<'a> Parser<'a> {
             Tok::Ident("call") => self.call_procedure(),
             Tok::Ident("do") => self.do_block(),
             Tok::Ident("comment") => self.comment(),
+            Tok::Ident("security") => self.security_label(),
+            Tok::Ident("load") => self.load(),
             Tok::Ident("truncate") => self.truncate(),
             Tok::Ident("lock") => self.lock_table(),
             Tok::Ident("declare") => self.declare_cursor(),
@@ -2201,6 +2204,7 @@ impl<'a> Parser<'a> {
                 with_data: true,
                 if_not_exists: false,
                 kind: CreateTableAsKind::SelectInto,
+                options: crate::sql::ast::TableAsOptions::DEFAULT,
             });
         }
         if let SetTree::Select(s) = body {
@@ -3846,8 +3850,18 @@ impl<'a> Parser<'a> {
                 self.expect_ident("in")?;
                 self.expect_ident("schema")?;
                 PrivilegeObjectKind::AllFunctionsInSchema
+            } else if self.eat_ident("procedures")? {
+                self.expect_ident("in")?;
+                self.expect_ident("schema")?;
+                PrivilegeObjectKind::AllProceduresInSchema
+            } else if self.eat_ident("routines")? {
+                self.expect_ident("in")?;
+                self.expect_ident("schema")?;
+                PrivilegeObjectKind::AllRoutinesInSchema
             } else {
-                return Err(self.unexpected("expected TABLES, SEQUENCES, or FUNCTIONS after ALL"));
+                return Err(self.unexpected(
+                    "expected TABLES, SEQUENCES, FUNCTIONS, PROCEDURES, or ROUTINES after ALL",
+                ));
             }
         } else if self.eat_ident("function")? {
             return self.routine_privilege_target(RoutineTargetKind::Function);
@@ -3867,6 +3881,8 @@ impl<'a> Parser<'a> {
             PrivilegeObjectKind::Database
         } else if self.eat_ident("type")? || self.eat_ident("domain")? {
             PrivilegeObjectKind::Type
+        } else if self.eat_ident("language")? {
+            PrivilegeObjectKind::ProceduralLanguage
         } else if self.eat_ident("foreign")? {
             if self.eat_ident("data")? {
                 self.expect_ident("wrapper")?;
@@ -3895,6 +3911,9 @@ impl<'a> Parser<'a> {
                     | PrivilegeObjectKind::AllTablesInSchema
                     | PrivilegeObjectKind::AllSequencesInSchema
                     | PrivilegeObjectKind::AllFunctionsInSchema
+                    | PrivilegeObjectKind::AllProceduresInSchema
+                    | PrivilegeObjectKind::AllRoutinesInSchema
+                    | PrivilegeObjectKind::ProceduralLanguage
             ) {
                 QualName::bare(self.col_ident("schema name")?)
             } else {
@@ -4343,7 +4362,6 @@ impl<'a> Parser<'a> {
 
     fn alter_table(&mut self) -> Result<Stmt<'a>, ParseError> {
         self.expect_ident("alter")?;
-        use crate::sql::ast::AlterOwnerKind;
         if self.eat_ident("large")? {
             self.expect_ident("object")?;
             let oid = self.large_object_id()?;
@@ -4413,8 +4431,11 @@ impl<'a> Parser<'a> {
             }
             return self.alter_role();
         }
-        if self.eat_ident("role")? || self.eat_ident("group")? {
+        if self.eat_ident("role")? {
             return self.alter_role();
+        }
+        if self.eat_ident("group")? {
+            return self.alter_group();
         }
         if self.eat_ident("collation")? {
             let name = self.qual_name("collation name")?;
@@ -4597,11 +4618,16 @@ impl<'a> Parser<'a> {
             return self.alter_routine(crate::sql::ast::RoutineTargetKind::Either);
         }
         if self.eat_ident("schema")? {
-            let name = QualName {
-                schema: None,
-                name: self.col_ident("schema name")?,
+            let name = self.col_ident("schema name")?;
+            let action = if self.eat_ident("rename")? {
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterSchemaAction::RenameTo(self.col_ident("new schema name")?)
+            } else {
+                self.expect_ident("owner")?;
+                self.expect_ident("to")?;
+                crate::sql::ast::AlterSchemaAction::OwnerTo(self.any_ident("role name")?)
             };
-            return self.alter_owner(AlterOwnerKind::Schema, name, false);
+            return Ok(Stmt::AlterSchema { name, action });
         }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
@@ -4715,28 +4741,104 @@ impl<'a> Parser<'a> {
             return self.alter_owner(AlterOwnerKind::MaterializedView, name, if_exists);
         }
         let action = if self.eat_ident("rename")? {
-            self.expect_ident("to")?;
-            crate::sql::ast::AlterMaterializedViewAction::RenameTo(
-                self.col_ident("new materialized view name")?,
-            )
-        } else {
-            self.expect_ident("set")?;
-            if self.eat_ident("schema")? {
-                crate::sql::ast::AlterMaterializedViewAction::SetSchema(
-                    self.col_ident("schema name")?,
+            if self.eat_ident("to")? {
+                crate::sql::ast::AlterMaterializedViewAction::RenameTo(
+                    self.col_ident("new materialized view name")?,
                 )
             } else {
-                self.expect_ident("tablespace")?;
-                crate::sql::ast::AlterMaterializedViewAction::SetTablespace(
-                    self.col_ident("tablespace name")?,
+                let _ = self.eat_ident("column")?;
+                let from = self.col_ident("materialized view column name")?;
+                self.expect_ident("to")?;
+                let to = self.col_ident("new materialized view column name")?;
+                crate::sql::ast::AlterMaterializedViewAction::TableActions(
+                    self.arena_slice(&[crate::sql::ast::AlterAction::RenameColumn { from, to }])?,
                 )
             }
+        } else {
+            let first = if self.eat_ident("set")? {
+                if self.eat_ident("schema")? {
+                    return Ok(Stmt::AlterMaterializedView {
+                        name,
+                        if_exists,
+                        action: crate::sql::ast::AlterMaterializedViewAction::SetSchema(
+                            self.col_ident("schema name")?,
+                        ),
+                    });
+                }
+                self.materialized_view_table_action_after_set()?
+            } else {
+                self.materialized_view_table_action()?
+            };
+            let mut actions = [crate::sql::ast::AlterAction::SetTablespace(""); MAX_LIST];
+            actions[0] = first;
+            let mut count = 1usize;
+            while self.eat_op(",")? {
+                if count == actions.len() {
+                    return Err(self.limit("ALTER MATERIALIZED VIEW actions", actions.len()));
+                }
+                actions[count] = self.materialized_view_table_action()?;
+                count += 1;
+            }
+            crate::sql::ast::AlterMaterializedViewAction::TableActions(
+                self.arena_slice(&actions[..count])?,
+            )
         };
         Ok(Stmt::AlterMaterializedView {
             name,
             if_exists,
             action,
         })
+    }
+
+    fn materialized_view_table_action_after_set(
+        &mut self,
+    ) -> Result<crate::sql::ast::AlterAction<'a>, ParseError> {
+        if self.eat_ident("tablespace")? {
+            return Ok(crate::sql::ast::AlterAction::SetTablespace(
+                self.col_ident("tablespace name")?,
+            ));
+        }
+        if self.eat_ident("access")? {
+            self.expect_ident("method")?;
+            let method = self.any_ident("table access method")?;
+            return Ok(crate::sql::ast::AlterAction::SetAccessMethod(
+                if method == "heap" {
+                    crate::sql::ast::TableAccessMethod::Heap
+                } else {
+                    crate::sql::ast::TableAccessMethod::Named(method)
+                },
+            ));
+        }
+        self.expect_op("(")?;
+        let options = self.relation_storage_options()?;
+        self.expect_op(")")?;
+        Ok(crate::sql::ast::AlterAction::SetStorageOptions(options))
+    }
+
+    fn materialized_view_table_action(
+        &mut self,
+    ) -> Result<crate::sql::ast::AlterAction<'a>, ParseError> {
+        if self.eat_ident("set")? {
+            return self.materialized_view_table_action_after_set();
+        }
+        if self.eat_ident("reset")? {
+            self.expect_op("(")?;
+            let options = self.relation_storage_option_names()?;
+            self.expect_op(")")?;
+            return Ok(crate::sql::ast::AlterAction::ResetStorageOptions(options));
+        }
+        self.expect_ident("alter")?;
+        let _ = self.eat_ident("column")?;
+        let column = self.col_ident("materialized view column name")?;
+        self.expect_ident("set")?;
+        self.expect_ident("statistics")?;
+        let target = if self.eat_ident("default")? {
+            -1
+        } else {
+            i16::try_from(self.seq_int()?)
+                .map_err(|_| self.err_here("statistics target is out of range"))?
+        };
+        Ok(crate::sql::ast::AlterAction::SetStatistics { column, target })
     }
 
     fn view_options(&mut self) -> Result<&'a [crate::sql::ast::ViewOption], ParseError> {
@@ -4858,7 +4960,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("access")?;
                 self.expect_ident("method")?;
                 let method = self.any_ident("table access method")?;
-                AlterAction::SetAccessMethod(if method.eq_ignore_ascii_case("heap") {
+                AlterAction::SetAccessMethod(if method == "heap" {
                     crate::sql::ast::TableAccessMethod::Heap
                 } else {
                     crate::sql::ast::TableAccessMethod::Named(method)
@@ -5360,13 +5462,11 @@ impl<'a> Parser<'a> {
                 self.expect_ident("access")?;
                 self.expect_ident("method")?;
                 let method = self.any_ident("table access method")?;
-                Ok(AlterAction::SetAccessMethod(
-                    if method.eq_ignore_ascii_case("heap") {
-                        crate::sql::ast::TableAccessMethod::Heap
-                    } else {
-                        crate::sql::ast::TableAccessMethod::Named(method)
-                    },
-                ))
+                Ok(AlterAction::SetAccessMethod(if method == "heap" {
+                    crate::sql::ast::TableAccessMethod::Heap
+                } else {
+                    crate::sql::ast::TableAccessMethod::Named(method)
+                }))
             }
         } else if self.eat_ident("reset")? {
             self.expect_op("(")?;
@@ -5659,6 +5759,14 @@ impl<'a> Parser<'a> {
             } else if self.eat_ident("drop")? {
                 if self.eat_ident("default")? {
                     Ok(AlterAction::DropDefault { column })
+                } else if self.eat_ident("expression")? {
+                    let if_exists = if self.eat_ident("if")? {
+                        self.expect_ident("exists")?;
+                        true
+                    } else {
+                        false
+                    };
+                    Ok(AlterAction::DropGeneratedExpression { column, if_exists })
                 } else if self.eat_ident("identity")? {
                     let if_exists = if self.eat_ident("if")? {
                         self.expect_ident("exists")?;
@@ -6238,11 +6346,8 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `COMMENT ON <object> IS { 'text' | NULL }`.
-    fn comment(&mut self) -> Result<Stmt<'a>, ParseError> {
+    fn comment_target(&mut self) -> Result<crate::sql::ast::CommentTarget<'a>, ParseError> {
         use crate::sql::ast::{CommentRelKind, CommentTarget, RoutineTargetKind};
-        self.expect_ident("comment")?;
-        self.expect_ident("on")?;
         let target = if self.eat_ident("table")? {
             CommentTarget::Relation {
                 kind: CommentRelKind::Table,
@@ -6442,13 +6547,158 @@ impl<'a> Parser<'a> {
         } else {
             return Err(self.err_here("unsupported COMMENT ON object type"));
         };
+        Ok(target)
+    }
+
+    fn comment_text(&mut self) -> Result<Option<&'a str>, ParseError> {
         self.expect_ident("is")?;
         let text = match self.expression(0)? {
             Expr::Str(s) => Some(*s),
             Expr::Null => None,
             _ => return Err(self.err_here("COMMENT value must be a string literal or NULL")),
         };
+        Ok(text)
+    }
+
+    /// `COMMENT ON <object> IS { 'text' | NULL }`.
+    fn comment(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("comment")?;
+        self.expect_ident("on")?;
+        let target = self.comment_target()?;
+        let text = self.comment_text()?;
         Ok(Stmt::Comment { target, text })
+    }
+
+    fn security_label_target(
+        &mut self,
+    ) -> Result<crate::sql::ast::SecurityLabelTarget<'a>, ParseError> {
+        use crate::sql::ast::{SecurityLabelRelationKind, SecurityLabelTarget};
+        let target = if self.eat_ident("table")? {
+            SecurityLabelTarget::Relation {
+                kind: SecurityLabelRelationKind::Table,
+                name: self.qual_name("table name")?,
+            }
+        } else if self.eat_ident("column")? {
+            let first = self.col_ident("column reference")?;
+            self.expect_op(".")?;
+            let second = self.col_ident("column reference")?;
+            if self.eat_op(".")? {
+                let third = self.col_ident("column reference")?;
+                SecurityLabelTarget::Column {
+                    relation: QualName {
+                        schema: Some(first),
+                        name: second,
+                    },
+                    column: third,
+                }
+            } else {
+                SecurityLabelTarget::Column {
+                    relation: QualName::bare(first),
+                    column: second,
+                }
+            }
+        } else if self.eat_ident("aggregate")? {
+            SecurityLabelTarget::Aggregate(self.aggregate_identity()?)
+        } else if self.eat_ident("database")? {
+            SecurityLabelTarget::Database(self.col_ident("database name")?)
+        } else if self.eat_ident("domain")? {
+            SecurityLabelTarget::Type {
+                name: self.comment_type_name()?,
+                domain_only: true,
+            }
+        } else if self.eat_ident("event")? {
+            self.expect_ident("trigger")?;
+            SecurityLabelTarget::EventTrigger(self.col_ident("event trigger name")?)
+        } else if self.eat_ident("foreign")? {
+            self.expect_ident("table")?;
+            SecurityLabelTarget::Relation {
+                kind: SecurityLabelRelationKind::ForeignTable,
+                name: self.qual_name("foreign table name")?,
+            }
+        } else if self.eat_ident("function")? {
+            SecurityLabelTarget::Routine {
+                kind: RoutineTargetKind::Function,
+                identity: self.routine_identity()?,
+            }
+        } else if self.eat_ident("large")? {
+            self.expect_ident("object")?;
+            SecurityLabelTarget::LargeObject(self.large_object_id()?)
+        } else if self.eat_ident("materialized")? {
+            self.expect_ident("view")?;
+            SecurityLabelTarget::Relation {
+                kind: SecurityLabelRelationKind::MaterializedView,
+                name: self.qual_name("materialized view name")?,
+            }
+        } else if self.eat_ident("procedural")? {
+            self.expect_ident("language")?;
+            SecurityLabelTarget::ProceduralLanguage(self.col_ident("procedural language name")?)
+        } else if self.eat_ident("language")? {
+            SecurityLabelTarget::ProceduralLanguage(self.col_ident("procedural language name")?)
+        } else if self.eat_ident("procedure")? {
+            SecurityLabelTarget::Routine {
+                kind: RoutineTargetKind::Procedure,
+                identity: self.routine_identity()?,
+            }
+        } else if self.eat_ident("publication")? {
+            SecurityLabelTarget::Publication(self.col_ident("publication name")?)
+        } else if self.eat_ident("role")? {
+            SecurityLabelTarget::Role(self.col_ident("role name")?)
+        } else if self.eat_ident("routine")? {
+            SecurityLabelTarget::Routine {
+                kind: RoutineTargetKind::Either,
+                identity: self.routine_identity()?,
+            }
+        } else if self.eat_ident("schema")? {
+            SecurityLabelTarget::Schema(self.col_ident("schema name")?)
+        } else if self.eat_ident("sequence")? {
+            SecurityLabelTarget::Relation {
+                kind: SecurityLabelRelationKind::Sequence,
+                name: self.qual_name("sequence name")?,
+            }
+        } else if self.eat_ident("subscription")? {
+            SecurityLabelTarget::Subscription(self.col_ident("subscription name")?)
+        } else if self.eat_ident("tablespace")? {
+            SecurityLabelTarget::Tablespace(self.col_ident("tablespace name")?)
+        } else if self.eat_ident("type")? {
+            SecurityLabelTarget::Type {
+                name: self.comment_type_name()?,
+                domain_only: false,
+            }
+        } else if self.eat_ident("view")? {
+            SecurityLabelTarget::Relation {
+                kind: SecurityLabelRelationKind::View,
+                name: self.qual_name("view name")?,
+            }
+        } else {
+            return Err(self.err_here("unsupported SECURITY LABEL ON object type"));
+        };
+        Ok(target)
+    }
+
+    fn security_label(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("security")?;
+        self.expect_ident("label")?;
+        let provider = if self.eat_ident("for")? {
+            Some(self.col_ident("security label provider")?)
+        } else {
+            None
+        };
+        self.expect_ident("on")?;
+        let target = self.security_label_target()?;
+        let label = self.comment_text()?;
+        Ok(Stmt::SecurityLabel {
+            provider,
+            target,
+            label,
+        })
+    }
+
+    fn load(&mut self) -> Result<Stmt<'a>, ParseError> {
+        self.expect_ident("load")?;
+        let Expr::Str(path) = self.expression(0)? else {
+            return Err(self.err_here("LOAD path must be a string literal"));
+        };
+        Ok(Stmt::Load(path))
     }
 
     /// A type name in `COMMENT ON TYPE/DOMAIN`: keep a user schema qualifier,
@@ -7725,6 +7975,67 @@ mod tests {
     }
 
     #[test]
+    fn create_schema_keeps_its_closed_element_grammar_and_role_identity_typed() {
+        with_parser(
+            "CREATE SCHEMA AUTHORIZATION CURRENT_ROLE \
+             CREATE TABLE entries(value integer) \
+             CREATE TRIGGER audit AFTER INSERT ON entries FOR EACH ROW \
+               EXECUTE FUNCTION public.audit_fn() \
+             GRANT SELECT ON TABLE entries TO public",
+            |parser| {
+                let Some(Stmt::CreateSchema {
+                    name,
+                    authorization,
+                    elements,
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("CREATE SCHEMA did not retain its typed statement")
+                };
+                assert_eq!(name, SchemaName::Authorization);
+                assert_eq!(authorization, Some(SchemaAuthorization::CurrentRole));
+                assert!(matches!(
+                    elements,
+                    [
+                        CreateSchemaElement::Table(_),
+                        CreateSchemaElement::Trigger(_),
+                        CreateSchemaElement::Grant { .. },
+                    ]
+                ));
+            },
+        );
+
+        with_parser(
+            "CREATE SCHEMA invalid CREATE DOMAIN value AS integer",
+            |parser| assert!(parser.next_stmt().is_err()),
+        );
+        with_parser(
+            "CREATE SCHEMA IF NOT EXISTS invalid CREATE TABLE value(id integer)",
+            |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    sqlstate::FEATURE_NOT_SUPPORTED
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn aggregate_extension_dependencies_are_rejected_at_parse_time() {
+        for input in [
+            "ALTER AGGREGATE public.total(integer) DEPENDS ON EXTENSION reporting",
+            "ALTER AGGREGATE public.total(integer) NO DEPENDS ON EXTENSION reporting",
+        ] {
+            with_parser(input, |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    sqlstate::SYNTAX_ERROR
+                );
+            });
+        }
+    }
+
+    #[test]
     fn publication_options_parse_without_heap_allocation() {
         let mut budget = Budget::new(1 << 20);
         let arena = Arena::new(&mut budget, "publication parser", 1 << 18).unwrap();
@@ -7945,13 +8256,43 @@ mod tests {
                 };
                 assert_eq!(
                     action,
-                    crate::sql::ast::AlterMaterializedViewAction::SetTablespace("cold_store")
+                    crate::sql::ast::AlterMaterializedViewAction::TableActions(&[
+                        crate::sql::ast::AlterAction::SetTablespace("cold_store")
+                    ])
                 );
             },
         );
         with_parser(
-            "ALTER MATERIALIZED VIEW snapshot SET (fillfactor = 90)",
-            |parser| assert!(parser.next_stmt().is_err()),
+            "ALTER MATERIALIZED VIEW snapshot ALTER COLUMN value SET STATISTICS 77, \
+             SET (fillfactor = 90), RESET (fillfactor)",
+            |parser| {
+                let Some(Stmt::AlterMaterializedView { action, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER MATERIALIZED VIEW metadata actions did not parse")
+                };
+                let crate::sql::ast::AlterMaterializedViewAction::TableActions(actions) = action
+                else {
+                    panic!("ALTER MATERIALIZED VIEW metadata lost its typed action list")
+                };
+                assert_eq!(actions.len(), 3);
+                assert!(matches!(
+                    actions[0],
+                    crate::sql::ast::AlterAction::SetStatistics {
+                        column: "value",
+                        target: 77
+                    }
+                ));
+                assert!(matches!(
+                    actions[1],
+                    crate::sql::ast::AlterAction::SetStorageOptions(options)
+                    if options.fillfactor == Some(90)
+                ));
+                assert!(matches!(
+                    actions[2],
+                    crate::sql::ast::AlterAction::ResetStorageOptions(options)
+                    if options.fillfactor
+                ));
+            },
         );
     }
 
@@ -8119,17 +8460,19 @@ mod tests {
     fn table_producing_ddl_keeps_its_postgresql_command_kind() {
         with_parser(
             "CREATE TABLE from_query AS SELECT 1; \
-             CREATE MATERIALIZED VIEW materialized_query AS SELECT 1; \
+             CREATE MATERIALIZED VIEW materialized_query USING heap WITH (fillfactor = 75) AS SELECT 1; \
              SELECT 1 INTO selected_query",
             |parser| {
                 let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
                     panic!("CREATE TABLE AS did not parse")
                 };
                 assert_eq!(kind, crate::sql::ast::CreateTableAsKind::Table);
-                let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
+                let Some(Stmt::CreateTableAs { kind, options, .. }) = parser.next_stmt().unwrap()
+                else {
                     panic!("CREATE MATERIALIZED VIEW did not parse")
                 };
                 assert_eq!(kind, crate::sql::ast::CreateTableAsKind::MaterializedView);
+                assert_eq!(options.storage_options.fillfactor, Some(75));
                 let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
                     panic!("SELECT INTO did not parse")
                 };
@@ -8285,7 +8628,10 @@ mod tests {
                 else {
                     panic!("role setting did not parse")
                 };
-                assert_eq!(role, Some("child"));
+                assert_eq!(
+                    role,
+                    Some(crate::sql::ast::RoleSpecification::Name("child"))
+                );
                 assert_eq!(database, Some("postgres"));
                 assert_eq!(name, "search_path");
                 assert_eq!(
@@ -8315,6 +8661,234 @@ mod tests {
         );
         with_parser("GRANT DELETE (id) ON orders TO child", |parser| {
             assert!(parser.next_stmt().is_err());
+        });
+    }
+
+    #[test]
+    fn legacy_alter_group_is_typed_as_role_membership() {
+        with_parser(
+            "ALTER GROUP parent ADD USER child, other; \
+             ALTER GROUP parent DROP USER child; \
+             ALTER GROUP parent RENAME TO renamed",
+            |parser| {
+                let Some(Stmt::GrantRole {
+                    roles,
+                    members,
+                    options,
+                    grantor,
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER GROUP ADD USER did not parse")
+                };
+                assert_eq!(roles, ["parent"]);
+                assert_eq!(members, ["child", "other"]);
+                assert_eq!(options, crate::sql::ast::RoleMembershipPatch::EMPTY);
+                assert_eq!(grantor, None);
+
+                let Some(Stmt::RevokeRole {
+                    roles,
+                    members,
+                    option,
+                    grantor,
+                    cascade,
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER GROUP DROP USER did not parse")
+                };
+                assert_eq!(roles, ["parent"]);
+                assert_eq!(members, ["child"]);
+                assert_eq!(option, None);
+                assert_eq!(grantor, None);
+                assert!(!cascade);
+
+                let Some(Stmt::AlterRoleRename { role, new_name }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ALTER GROUP RENAME did not parse")
+                };
+                assert_eq!(
+                    (role, new_name),
+                    (
+                        crate::sql::ast::RoleSpecification::Name("parent"),
+                        "renamed"
+                    )
+                );
+            },
+        );
+        with_parser("ALTER GROUP parent NOLOGIN", |parser| {
+            assert!(parser.next_stmt().is_err());
+        });
+    }
+
+    #[test]
+    fn role_aliases_and_special_targets_are_closed_parse_states() {
+        with_parser(
+            "CREATE GROUP bundle IN GROUP parent USER member ADMIN administrator; \
+             ALTER ROLE CURRENT_ROLE SET application_name TO role_default; \
+             ALTER USER SESSION_USER RESET application_name; \
+             ALTER ROLE \"current_user\" NOLOGIN; \
+             ALTER ROLE \"all\" LOGIN",
+            |parser| {
+                let Some(Stmt::CreateRole { memberships, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("CREATE GROUP aliases did not parse")
+                };
+                assert_eq!(memberships.in_roles, ["parent"]);
+                assert_eq!(memberships.role_members, ["member"]);
+                assert_eq!(memberships.admin_members, ["administrator"]);
+
+                let Some(Stmt::AlterRoleSetting {
+                    role: Some(crate::sql::ast::RoleSpecification::CurrentRole),
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("CURRENT_ROLE did not parse as a role specification")
+                };
+                let Some(Stmt::AlterRoleSetting {
+                    role: Some(crate::sql::ast::RoleSpecification::SessionUser),
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("SESSION_USER did not parse as a role specification")
+                };
+                let Some(Stmt::AlterRole {
+                    role: crate::sql::ast::RoleSpecification::Name("current_user"),
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("quoted current_user did not remain a named role")
+                };
+                let Some(Stmt::AlterRole {
+                    role: crate::sql::ast::RoleSpecification::Name("all"),
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("quoted all did not remain a named role")
+                };
+            },
+        );
+    }
+
+    #[test]
+    fn role_password_forms_are_typed_at_the_parse_boundary() {
+        let server = crate::pg::auth::ScramServer::derive("imported-password", [9; 16], 4096);
+        let mut salt = crate::util::StackStr::<512>::new();
+        let mut stored_key = crate::util::StackStr::<512>::new();
+        let mut server_key = crate::util::StackStr::<512>::new();
+        crate::pg::auth::b64_encode(server.salt.as_bytes(), &mut salt);
+        crate::pg::auth::b64_encode(&server.stored_key, &mut stored_key);
+        crate::pg::auth::b64_encode(&server.server_key, &mut server_key);
+        let verifier = format!(
+            "SCRAM-SHA-256${}:{}${}:{}",
+            server.iterations,
+            salt.as_str(),
+            stored_key.as_str(),
+            server_key.as_str()
+        );
+        with_parser(
+            &format!(
+                "CREATE USER imported LOGIN ENCRYPTED PASSWORD '{verifier}'; ALTER USER imported ENCRYPTED PASSWORD '{verifier}'"
+            ),
+            |parser| {
+                let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("CREATE USER did not parse")
+                };
+                assert!(matches!(
+                    options.password,
+                    Some(Some(crate::sql::ast::RolePasswordSpec::ScramVerifier(_)))
+                ));
+                let Some(Stmt::AlterRole { options, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("ALTER USER did not parse")
+                };
+                assert!(matches!(
+                    options.password,
+                    Some(Some(crate::sql::ast::RolePasswordSpec::ScramVerifier(_)))
+                ));
+            },
+        );
+        with_parser(
+            "CREATE ROLE malformed PASSWORD 'SCRAM-SHA-256$4096:not-base64$bad:bad'",
+            |parser| {
+                let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("malformed verifier did not parse as plaintext")
+                };
+                assert!(matches!(
+                    options.password,
+                    Some(Some(crate::sql::ast::RolePasswordSpec::Plaintext(_)))
+                ));
+            },
+        );
+        with_parser(
+            "CREATE ROLE imported_md5 PASSWORD 'md547fcb6615d41c53cd39822141eb05da2'",
+            |parser| {
+                let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("MD5 verifier did not parse")
+                };
+                assert_eq!(
+                    options.password,
+                    Some(Some(crate::sql::ast::RolePasswordSpec::Md5Verifier(
+                        crate::storage::Md5Verifier {
+                            hash: *b"47fcb6615d41c53cd39822141eb05da2",
+                        },
+                    )))
+                );
+            },
+        );
+        with_parser(
+            "ALTER ROLE imported UNENCRYPTED PASSWORD 'secret'",
+            |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    crate::sql::eval::sqlstate::FEATURE_NOT_SUPPORTED
+                );
+            },
+        );
+        let too_long_salt = [9; crate::pg::auth::SCRAM_SALT_MAX + 1];
+        let mut encoded_salt = crate::util::StackStr::<512>::new();
+        crate::pg::auth::b64_encode(&too_long_salt, &mut encoded_salt);
+        let too_long_verifier = format!(
+            "SCRAM-SHA-256$4096:{}${}:{}",
+            encoded_salt.as_str(),
+            stored_key.as_str(),
+            server_key.as_str()
+        );
+        with_parser(
+            &format!("CREATE ROLE oversized PASSWORD '{too_long_verifier}'"),
+            |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    crate::sql::eval::sqlstate::PROGRAM_LIMIT_EXCEEDED
+                );
+            },
+        );
+        with_parser("CREATE ROLE old_sysid SYSID 7", |parser| {
+            let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
+                panic!("obsolete SYSID did not parse")
+            };
+            assert_eq!(options.sysid, Some(7));
+        });
+        with_parser("CREATE ROLE invalid_expiry VALID UNTIL NULL", |parser| {
+            assert!(parser.next_stmt().is_err());
+        });
+        for source in [
+            "CREATE ROLE duplicate_role_options LOGIN NOLOGIN",
+            "ALTER ROLE duplicate_role_options PASSWORD 'one' ENCRYPTED PASSWORD 'two'",
+            "CREATE ROLE duplicate_role_options VALID UNTIL 'infinity' VALID UNTIL 'infinity'",
+            "CREATE ROLE duplicate_role_options IN ROLE parent IN GROUP parent",
+            "CREATE ROLE duplicate_role_options ROLE member ROLE member",
+            "CREATE ROLE duplicate_role_options ADMIN member ADMIN member",
+        ] {
+            with_parser(source, |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    crate::sql::eval::sqlstate::SYNTAX_ERROR,
+                    "{source}"
+                );
+            });
+        }
+        with_parser("CREATE ROLE empty_password PASSWORD ''", |parser| {
+            let Some(Stmt::CreateRole { options, .. }) = parser.next_stmt().unwrap() else {
+                panic!("empty password did not parse")
+            };
+            assert_eq!(options.password, Some(None));
         });
     }
 
@@ -8776,6 +9350,30 @@ mod tests {
     }
 
     #[test]
+    fn view_security_barrier_keeps_default_and_explicit_false_distinct() {
+        with_parser(
+            "CREATE VIEW default_barrier AS SELECT 1; \
+             CREATE VIEW disabled_barrier WITH (security_barrier = false) AS SELECT 1; \
+             CREATE VIEW enabled_barrier WITH (security_barrier = true) AS SELECT 1",
+            |parser| {
+                for expected in [
+                    crate::sql::ast::ViewSecurityBarrier::Default,
+                    crate::sql::ast::ViewSecurityBarrier::Disabled,
+                    crate::sql::ast::ViewSecurityBarrier::Enabled,
+                ] {
+                    let Some(Stmt::CreateView {
+                        security_barrier, ..
+                    }) = parser.next_stmt().unwrap()
+                    else {
+                        panic!("CREATE VIEW did not parse into a typed view statement")
+                    };
+                    assert_eq!(security_barrier, expected);
+                }
+            },
+        );
+    }
+
+    #[test]
     fn constraint_attributes_reject_unrepresentable_states_at_parse_time() {
         for sql in [
             "CREATE TABLE t (id integer UNIQUE ENFORCED)",
@@ -8902,6 +9500,115 @@ mod tests {
                 assert!(matches!(p.next_stmt().unwrap().unwrap(), Stmt::Rollback));
             },
         );
+    }
+
+    #[test]
+    fn transforms_keep_direction_and_function_identity_typed() {
+        with_parser(
+            "CREATE OR REPLACE TRANSFORM FOR public.payload LANGUAGE plpgsql \
+             (TO SQL WITH FUNCTION public.to_payload(internal), \
+              FROM SQL WITH FUNCTION public.from_payload(internal)); \
+             CREATE TRANSFORM FOR public.payload LANGUAGE plpgsql \
+             (TO SQL WITH FUNCTION public.to_payload(internal)); \
+             DROP TRANSFORM IF EXISTS FOR public.payload LANGUAGE plpgsql CASCADE",
+            |parser| {
+                let Some(Stmt::CreateTransform(create)) = parser.next_stmt().unwrap() else {
+                    panic!("CREATE OR REPLACE TRANSFORM did not parse")
+                };
+                assert!(create.or_replace);
+                assert_eq!(create.type_name, "public.payload");
+                assert_eq!(create.language, "plpgsql");
+                let from = create.from_sql.expect("missing FROM SQL function");
+                assert_eq!(from.name.schema, Some("public"));
+                assert_eq!(from.name.name, "from_payload");
+                assert_eq!(from.argument_types, ["internal"]);
+                let to = create.to_sql.expect("missing TO SQL function");
+                assert_eq!(to.name.schema, Some("public"));
+                assert_eq!(to.name.name, "to_payload");
+                assert_eq!(to.argument_types, ["internal"]);
+
+                let Some(Stmt::CreateTransform(create)) = parser.next_stmt().unwrap() else {
+                    panic!("one-direction CREATE TRANSFORM did not parse")
+                };
+                assert!(!create.or_replace);
+                assert!(create.from_sql.is_none());
+                assert!(create.to_sql.is_some());
+
+                let Some(Stmt::DropTransform(drop)) = parser.next_stmt().unwrap() else {
+                    panic!("DROP TRANSFORM did not parse")
+                };
+                assert!(drop.if_exists);
+                assert!(drop.cascade);
+                assert_eq!(drop.type_name, "public.payload");
+                assert_eq!(drop.language, "plpgsql");
+                assert!(parser.next_stmt().unwrap().is_none());
+            },
+        );
+        with_parser(
+            "CREATE TRANSFORM FOR payload LANGUAGE plpgsql (FROM SQL WITHOUT FUNCTION)",
+            |parser| {
+                assert_eq!(
+                    parser.next_stmt().unwrap_err().sqlstate,
+                    sqlstate::SYNTAX_ERROR
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn security_labels_use_their_own_closed_object_grammar() {
+        with_parser(
+            "SECURITY LABEL FOR selinux ON PROCEDURAL LANGUAGE plpgsql IS 'label'; \
+             SECURITY LABEL ON COLUMN public.items.label IS NULL; \
+             SECURITY LABEL ON AGGREGATE public.percentile(IN fraction float8 ORDER BY value float8) IS 'label'",
+            |parser| {
+                let Some(Stmt::SecurityLabel {
+                    provider,
+                    target,
+                    label,
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("procedural language security label did not parse")
+                };
+                assert_eq!(provider, Some("selinux"));
+                assert_eq!(label, Some("label"));
+                assert_eq!(
+                    target,
+                    crate::sql::ast::SecurityLabelTarget::ProceduralLanguage("plpgsql")
+                );
+                let Some(Stmt::SecurityLabel { target, label, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("column security label did not parse")
+                };
+                assert_eq!(label, None);
+                assert_eq!(
+                    target,
+                    crate::sql::ast::SecurityLabelTarget::Column {
+                        relation: QualName {
+                            schema: Some("public"),
+                            name: "items",
+                        },
+                        column: "label",
+                    }
+                );
+                let Some(Stmt::SecurityLabel {
+                    target: crate::sql::ast::SecurityLabelTarget::Aggregate(identity),
+                    ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("ordered aggregate security label did not parse")
+                };
+                assert_eq!(identity.name.name, "percentile");
+                assert_eq!(identity.direct_argument_types, ["float8"]);
+                assert_eq!(identity.aggregated_argument_types, ["float8"]);
+            },
+        );
+        with_parser("SECURITY LABEL ON INDEX items_index IS 'label'", |parser| {
+            assert_eq!(
+                parser.next_stmt().unwrap_err().sqlstate,
+                sqlstate::SYNTAX_ERROR
+            );
+        });
     }
 
     #[test]

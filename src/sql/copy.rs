@@ -162,11 +162,16 @@ pub fn decode_row_text<'a>(
 
 /// Appends one value's COPY-escaped text to `out`; `None` writes `\N`.
 pub fn encode_field(out: &mut dyn FnMut(&[u8]), value: Option<&str>) {
-    let Some(text) = value else {
+    encode_field_bytes(out, value.map(str::as_bytes));
+}
+
+/// Byte-preserving form used by PostgreSQL types whose output is not UTF-8
+/// text, notably the internal one-byte `"char"` type.
+pub fn encode_field_bytes(out: &mut dyn FnMut(&[u8]), value: Option<&[u8]>) {
+    let Some(bytes) = value else {
         out(b"\\N");
         return;
     };
-    let bytes = text.as_bytes();
     let mut plain_from = 0usize;
     for (i, &b) in bytes.iter().enumerate() {
         let escape: Option<&[u8]> = match b {
@@ -301,13 +306,35 @@ pub fn encode_field_csv(
     escape: u8,
     force_quote: bool,
 ) {
-    let Some(text) = value else {
-        out(null_str.as_bytes());
+    encode_field_csv_bytes(
+        out,
+        value.map(str::as_bytes),
+        null_str.as_bytes(),
+        delimiter,
+        quote,
+        escape,
+        force_quote,
+    );
+}
+
+/// Byte-preserving CSV form for wire values. Input remains UTF-8 validated at
+/// the COPY parse boundary; this only preserves server output bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_field_csv_bytes(
+    out: &mut dyn FnMut(&[u8]),
+    value: Option<&[u8]>,
+    null: &[u8],
+    delimiter: u8,
+    quote: u8,
+    escape: u8,
+    force_quote: bool,
+) {
+    let Some(bytes) = value else {
+        out(null);
         return;
     };
-    let bytes = text.as_bytes();
     let needs_quote = force_quote
-        || text == null_str
+        || bytes == null
         || bytes
             .iter()
             .any(|&b| b == delimiter || b == quote || b == b'\n' || b == b'\r');
@@ -589,6 +616,25 @@ mod tests {
             assert_eq!(decoded, vec![Some(text.to_string())], "via {encoded:?}");
         }
         assert_eq!(encode(None), "\\N");
+    }
+
+    #[test]
+    fn byte_output_preserves_non_utf8_char_values() {
+        let mut out = Vec::new();
+        encode_field_bytes(&mut |bytes| out.extend_from_slice(bytes), Some(&[0xff]));
+        assert_eq!(out, [0xff]);
+
+        out.clear();
+        encode_field_csv_bytes(
+            &mut |bytes| out.extend_from_slice(bytes),
+            Some(&[0xff]),
+            b"\\N",
+            b',',
+            b'"',
+            b'"',
+            false,
+        );
+        assert_eq!(out, [0xff]);
     }
 
     #[test]

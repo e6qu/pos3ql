@@ -281,12 +281,12 @@ jobs:
           COVERAGE_SHARDS: "run:diff"
         run: |
           COVERAGE_SHARD="$COVERAGE_SHARDS" \
-          COVERAGE_LCOV="${{ github.workspace }}/coverage-run-diff.lcov" \
+          COVERAGE_LCOV="${{ github.workspace }}/coverage-run-diff-${{ matrix.name }}.lcov" \
           sh tools/coverage.sh
       - uses: actions/upload-artifact@v6
         with:
           name: lcov-diff-${{ matrix.name }}
-          path: coverage-run-diff.lcov
+          path: coverage-run-diff-${{ matrix.name }}.lcov
 
   merge-and-gate:
     needs: [shard, reference-diff]

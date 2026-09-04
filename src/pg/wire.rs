@@ -20,6 +20,7 @@ pub const REQUEST_CANCEL: i32 = 80877102;
 pub const MSG_AUTHENTICATION: u8 = b'R';
 pub const AUTH_OK: i32 = 0;
 pub const AUTH_CLEARTEXT: i32 = 3;
+pub const AUTH_MD5: i32 = 5;
 pub const AUTH_SASL: i32 = 10;
 pub const AUTH_SASL_CONTINUE: i32 = 11;
 pub const AUTH_SASL_FINAL: i32 = 12;

@@ -47,6 +47,30 @@ fn reject_replication_login(mode: ReplicationMode, role: crate::sql::RoleLogin) 
     mode != ReplicationMode::None && !role.superuser && !role.replication
 }
 
+fn md5_inner(password: &str, role: &str) -> Option<[u8; 32]> {
+    crate::storage::Md5Verifier::derive(password, role).map(|verifier| verifier.hash)
+}
+
+fn md5_response(hash: &[u8; 32], salt: &[u8; 4]) -> [u8; 35] {
+    let mut source = [0u8; 36];
+    source[..32].copy_from_slice(hash);
+    source[32..].copy_from_slice(salt);
+    let mut response = *b"md500000000000000000000000000000000";
+    let mut encoded = [0u8; 32];
+    crate::sql::md5::hex(&crate::sql::md5::digest(&source), &mut encoded);
+    response[3..].copy_from_slice(&encoded);
+    response
+}
+
+fn fixed_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+}
+
 fn apply_startup_options(guc: &GucState, options: &str, superuser: bool) -> Result<(), SqlError> {
     let mut words = options.split_ascii_whitespace();
     while let Some(word) = words.next() {
@@ -133,6 +157,8 @@ pub enum Phase {
     Startup,
     /// Cleartext password requested; waiting for PasswordMessage.
     AwaitPassword,
+    /// MD5 password requested; waiting for PasswordMessage.
+    AwaitMd5,
     /// SASL requested; waiting for SASLInitialResponse.
     AwaitSaslInit,
     /// SASL in flight; waiting for SASLResponse (client-final).
@@ -158,7 +184,7 @@ enum ReplicationMode {
 enum LoginVerifier {
     Rejected,
     Bootstrap,
-    Role(crate::storage::RolePassword),
+    Role(crate::storage::RoleCredential),
 }
 
 impl LoginVerifier {
@@ -290,6 +316,7 @@ pub struct Conn {
     authenticated_database: Option<u16>,
     database: StackStr<64>,
     auth_password: StackStr<256>,
+    auth_md5_salt: [u8; 4],
     auth_reject: bool,
     replication: ReplicationMode,
     replication_stream: Option<ReplicationStream>,
@@ -392,6 +419,7 @@ impl Conn {
             authenticated_database: None,
             database: StackStr::new(),
             auth_password: StackStr::new(),
+            auth_md5_salt: [0; 4],
             auth_reject: false,
             replication: ReplicationMode::None,
             replication_stream: None,
@@ -694,9 +722,10 @@ impl Conn {
             }
             let after = match self.phase {
                 Phase::Startup => self.process_startup(engine, cancel_key, auth, tls_config),
-                Phase::AwaitPassword | Phase::AwaitSaslInit | Phase::AwaitSaslFinal => {
-                    self.process_auth(engine, cancel_key, auth)
-                }
+                Phase::AwaitPassword
+                | Phase::AwaitMd5
+                | Phase::AwaitSaslInit
+                | Phase::AwaitSaslFinal => self.process_auth(engine, cancel_key, auth),
                 Phase::Ready | Phase::SkipToSync => self.process_message(engine),
             };
             match after {
@@ -978,6 +1007,7 @@ impl Conn {
 
         self.minor = requested_minor.min(wire::NEWEST_MINOR as u16);
         self.auth_password = StackStr::new();
+        self.auth_md5_salt = [0; 4];
         self.auth_reject = false;
         self.role_scram = None;
         self.login_verifier = LoginVerifier::Rejected;
@@ -988,13 +1018,10 @@ impl Conn {
                 login_verifier_for(session_user.as_str(), role, !auth.password.is_empty());
             self.auth_reject = reject_role_login(auth.mode, role, self.login_verifier)
                 || reject_replication_login(self.replication, role);
-            if let LoginVerifier::Role(password) = self.login_verifier {
-                self.role_scram = Some(ScramServer {
-                    salt: password.salt,
-                    stored_key: password.stored_key,
-                    server_key: password.server_key,
-                    iterations: password.iterations,
-                });
+            if let LoginVerifier::Role(crate::storage::RoleCredential::Scram(password)) =
+                self.login_verifier
+            {
+                self.role_scram = Some(password);
             } else if matches!(self.login_verifier, LoginVerifier::Bootstrap) {
                 self.auth_password = StackStr::from_str(&auth.password);
             }
@@ -1034,6 +1061,36 @@ impl Conn {
                 }
                 self.phase = Phase::AwaitPassword;
                 Step::Continue
+            }
+            AuthMode::Md5 => {
+                if matches!(
+                    self.login_verifier,
+                    LoginVerifier::Role(crate::storage::RoleCredential::Scram(_))
+                ) {
+                    let mut responder = Responder::new(&mut self.send);
+                    if responder.auth_sasl_mechanisms().is_err() {
+                        return Step::Close;
+                    }
+                    self.scram = ScramFlow::new();
+                    self.phase = Phase::AwaitSaslInit;
+                    Step::Continue
+                } else {
+                    if unsafe {
+                        libc::getentropy(
+                            self.auth_md5_salt.as_mut_ptr().cast(),
+                            self.auth_md5_salt.len(),
+                        )
+                    } != 0
+                    {
+                        return Step::Close;
+                    }
+                    let mut responder = Responder::new(&mut self.send);
+                    if responder.auth_md5_password(&self.auth_md5_salt).is_err() {
+                        return Step::Close;
+                    }
+                    self.phase = Phase::AwaitMd5;
+                    Step::Continue
+                }
             }
             AuthMode::ScramSha256 => {
                 let mut responder = Responder::new(&mut self.send);
@@ -1201,24 +1258,48 @@ impl Conn {
                 let Ok(pass) = MsgIn::new(payload).cstr() else {
                     return Step::Close;
                 };
-                // Fixed-pattern comparison over both strings.
                 let expected = self.auth_password.as_str();
-                let ok = if let LoginVerifier::Role(verifier) = self.login_verifier {
-                    let candidate = ScramServer::derive(pass, verifier.salt, verifier.iterations);
-                    candidate
-                        .stored_key
-                        .iter()
-                        .zip(verifier.stored_key)
-                        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
-                        == 0
-                } else {
-                    pass.len() == expected.len()
-                        && pass
-                            .bytes()
-                            .zip(expected.bytes())
-                            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                            == 0
+                let role = self.guc.session_user();
+                let ok = match self.login_verifier {
+                    LoginVerifier::Role(crate::storage::RoleCredential::Scram(verifier)) => {
+                        let candidate =
+                            ScramServer::derive_with_salt(pass, verifier.salt, verifier.iterations);
+                        fixed_eq(&candidate.stored_key, &verifier.stored_key)
+                    }
+                    LoginVerifier::Role(crate::storage::RoleCredential::Md5(verifier)) => {
+                        md5_inner(pass, role.as_str())
+                            .is_some_and(|candidate| fixed_eq(&candidate, &verifier.hash))
+                    }
+                    LoginVerifier::Bootstrap | LoginVerifier::Rejected => {
+                        fixed_eq(pass.as_bytes(), expected.as_bytes())
+                    }
                 } && !self.auth_reject;
+                if ok {
+                    self.finish_startup(engine, cancel_key)
+                } else {
+                    auth_failed(&mut self.send)
+                }
+            }
+            Phase::AwaitMd5 => {
+                let Ok(response) = MsgIn::new(payload).cstr() else {
+                    return Step::Close;
+                };
+                let role = self.guc.session_user();
+                let inner = match self.login_verifier {
+                    LoginVerifier::Role(crate::storage::RoleCredential::Md5(verifier)) => {
+                        Some(verifier.hash)
+                    }
+                    LoginVerifier::Bootstrap | LoginVerifier::Rejected => {
+                        md5_inner(self.auth_password.as_str(), role.as_str())
+                    }
+                    LoginVerifier::Role(crate::storage::RoleCredential::Scram(_)) => None,
+                };
+                let ok = inner.is_some_and(|inner| {
+                    fixed_eq(
+                        response.as_bytes(),
+                        &md5_response(&inner, &self.auth_md5_salt),
+                    )
+                }) && !self.auth_reject;
                 if ok {
                     self.finish_startup(engine, cancel_key)
                 } else {
@@ -1227,11 +1308,14 @@ impl Conn {
             }
             Phase::AwaitSaslInit => {
                 let server = match self.login_verifier {
-                    LoginVerifier::Role(_) => self.role_scram.as_ref(),
+                    LoginVerifier::Role(crate::storage::RoleCredential::Scram(_)) => {
+                        self.role_scram.as_ref()
+                    }
+                    LoginVerifier::Role(crate::storage::RoleCredential::Md5(_)) => None,
                     LoginVerifier::Bootstrap | LoginVerifier::Rejected => auth.scram.as_ref(),
                 };
                 let Some(server) = server else {
-                    return Step::Close;
+                    return auth_failed(&mut self.send);
                 };
                 let mut m = MsgIn::new(payload);
                 let (Ok(mechanism), Ok(resp_len)) = (m.cstr(), m.i32()) else {
@@ -1265,11 +1349,14 @@ impl Conn {
             }
             Phase::AwaitSaslFinal => {
                 let server = match self.login_verifier {
-                    LoginVerifier::Role(_) => self.role_scram.as_ref(),
+                    LoginVerifier::Role(crate::storage::RoleCredential::Scram(_)) => {
+                        self.role_scram.as_ref()
+                    }
+                    LoginVerifier::Role(crate::storage::RoleCredential::Md5(_)) => None,
                     LoginVerifier::Bootstrap | LoginVerifier::Rejected => auth.scram.as_ref(),
                 };
                 let Some(server) = server else {
-                    return Step::Close;
+                    return auth_failed(&mut self.send);
                 };
                 let Ok(client_final) = core::str::from_utf8(payload) else {
                     return Step::Close;
@@ -4549,6 +4636,14 @@ fn ext_err<S: AsRef<str>>(send: &mut FixedBuf, phase: &mut Phase, code: S, messa
 mod tests {
     use super::*;
 
+    fn frontend(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut message = Vec::with_capacity(payload.len() + 5);
+        message.push(kind);
+        message.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        message.extend_from_slice(payload);
+        message
+    }
+
     fn function_call(function: i32, arguments: &[&[u8]], binary_result: bool) -> Vec<u8> {
         let payload_len = 4
             + 2
@@ -4663,6 +4758,98 @@ mod tests {
             &response[18..],
             &[wire::MSG_READY_FOR_QUERY, 0, 0, 0, 5, b'I']
         );
+
+        drop(connection);
+        drop(engine);
+        crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn extended_binary_char_bind_and_result_preserve_the_raw_byte() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "pos3ql-binary-char-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.object_store_on = true;
+        config.object_store_sim = true;
+        config.wal_upload = true;
+        config.wal_upload_sync = true;
+        config.block_cache_bytes = 0;
+        config.disk_cache_bytes = 0;
+        config.object_store_namespace = format!("binary-char-{}-{suffix}", std::process::id());
+        crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        config.max_tables = 8;
+        config.table_rows = 256;
+        config.wal_bytes = 1 << 20;
+        config.wal_buffer_bytes = 1 << 16;
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).expect("engine");
+        let mut connection = Conn::new(&config, &mut budget).expect("connection");
+        connection.phase = Phase::Ready;
+
+        let mut parse = Vec::new();
+        parse.extend_from_slice(b"char\0SELECT $1\0");
+        parse.extend_from_slice(&1i16.to_be_bytes());
+        parse.extend_from_slice(&crate::sql::types::oid::CHAR.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_PARSE, &parse));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut bind = Vec::new();
+        bind.extend_from_slice(b"char_portal\0char\0");
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i32.to_be_bytes());
+        bind.push(0xff);
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_BIND, &bind));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut execute = Vec::new();
+        execute.extend_from_slice(b"char_portal\0");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_EXECUTE, &execute));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(
+            connection.send.readable().windows(12).any(|frame| {
+                frame == [wire::MSG_DATA_ROW, 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, 0xff]
+            })
+        );
+
+        connection.recv.append(&frontend(wire::FMSG_SYNC, b""));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(connection.send.readable().ends_with(&[
+            wire::MSG_READY_FOR_QUERY,
+            0,
+            0,
+            0,
+            5,
+            b'I'
+        ]));
 
         drop(connection);
         drop(engine);
@@ -4985,12 +5172,8 @@ mod tests {
             login_verifier_for("application", login, true),
             LoginVerifier::Rejected
         ));
-        let role_verifier = crate::storage::RolePassword {
-            salt: [7; 16],
-            stored_key: [8; 32],
-            server_key: [9; 32],
-            iterations: 4096,
-        };
+        let server = ScramServer::derive("role-password", [7; 16], 4096);
+        let role_verifier = crate::storage::RoleCredential::Scram(server);
         assert!(!reject_role_login(
             AuthMode::ScramSha256,
             login,
@@ -5004,6 +5187,16 @@ mod tests {
             login_verifier_for("postgres", role_login, true),
             LoginVerifier::Role(_)
         ));
+    }
+
+    #[test]
+    fn md5_challenge_uses_postgresqls_two_stage_wire_digest() {
+        let inner = md5_inner("credential-secret", "credential_md5").unwrap();
+        assert_eq!(&inner, b"47fcb6615d41c53cd39822141eb05da2");
+        assert_eq!(
+            &md5_response(&inner, &[1, 2, 3, 4]),
+            b"md54e4a86766f5d975b640c2b33fb27afd8"
+        );
     }
 
     #[test]

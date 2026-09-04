@@ -31,6 +31,30 @@ SELECT relkind FROM pg_class WHERE relname = 'mv';
 SELECT matviewname, ispopulated FROM pg_matviews WHERE matviewname = 'mv';
 SELECT tablespace IS NULL, hasindexes FROM pg_matviews WHERE matviewname = 'mv';
 
+-- Creation and ALTER share the backing relation's typed metadata. Column
+-- identity remains positional for REFRESH while its exposed spelling, stats,
+-- and fillfactor survive every catalog read.
+CREATE MATERIALIZED VIEW mv_metadata (raw_value)
+  USING heap WITH (fillfactor = 75) AS SELECT v FROM base WHERE id > 1;
+SELECT reloptions::text FROM pg_class WHERE oid = 'mv_metadata'::regclass;
+ALTER MATERIALIZED VIEW mv_metadata
+  ALTER COLUMN raw_value SET STATISTICS 61, SET (fillfactor = 80);
+ALTER MATERIALIZED VIEW mv_metadata RENAME COLUMN raw_value TO measured;
+SELECT measured FROM mv_metadata ORDER BY measured;
+INSERT INTO base VALUES (5, 50);
+REFRESH MATERIALIZED VIEW mv_metadata;
+SELECT measured FROM mv_metadata ORDER BY measured;
+SELECT attname, attstattarget FROM pg_attribute
+ WHERE attrelid = 'mv_metadata'::regclass AND attnum > 0;
+SELECT reloptions::text FROM pg_class WHERE oid = 'mv_metadata'::regclass;
+BEGIN;
+ALTER MATERIALIZED VIEW mv_metadata SET (fillfactor = 90);
+ROLLBACK;
+SELECT reloptions::text FROM pg_class WHERE oid = 'mv_metadata'::regclass;
+ALTER MATERIALIZED VIEW mv_metadata RESET (fillfactor);
+SELECT reloptions IS NULL FROM pg_class WHERE oid = 'mv_metadata'::regclass;
+DROP MATERIALIZED VIEW mv_metadata;
+
 -- Materialized-view identity is the backing relation identity. ALTER keeps
 -- rows, comments, catalogs, and transaction visibility together.
 CREATE SCHEMA mv_life_source;

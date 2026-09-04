@@ -256,13 +256,13 @@ pub(crate) enum DdlUndo {
         slot: u32,
         prior: Option<crate::storage::PendingViewName>,
     },
-    ViewSecurityChanged {
+    ViewOptionsChanged {
         slot: u32,
-        prior: Option<crate::storage::PendingViewSecurity>,
+        prior: Option<crate::storage::PendingViewOptions>,
     },
-    ViewCheckOptionChanged {
+    ViewColumnsChanged {
         slot: u32,
-        prior: Option<crate::storage::PendingViewCheckOption>,
+        prior: Option<crate::storage::PendingViewColumns>,
     },
     RuleCreated {
         slot: u32,
@@ -499,6 +499,8 @@ pub(crate) enum DdlUndo {
         prior_owner: Option<crate::storage::PendingOwnership>,
     },
     TablespaceDropped(u32),
+    AccessMethodCreated(u32),
+    AccessMethodDropped(u32),
     DatabaseCreated(u32),
     DatabaseAltered {
         slot: u32,
@@ -525,6 +527,11 @@ pub(crate) enum DdlUndo {
     SchemaCreated(u32),
     /// DROP SCHEMA at this slot — undo by reviving it.
     SchemaDropped(u32),
+    /// ALTER SCHEMA ... RENAME TO changed a schema identity in place.
+    SchemaRenamed {
+        slot: u32,
+        prior: crate::storage::SqlName,
+    },
     ExtensionCreated(u32),
     ExtensionDropped(u32),
     ExtensionAltered {

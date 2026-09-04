@@ -187,6 +187,8 @@ fn privilege_object_name<'a>(
                 .0;
             if function == "has_type_privilege" {
                 catalog.type_name(oid, arena)
+            } else if function == "has_language_privilege" {
+                catalog.language_name(oid, arena)
             } else if function == "has_schema_privilege" {
                 catalog.schema_name(oid, arena)
             } else if function == "has_database_privilege" {
@@ -508,6 +510,7 @@ pub(crate) fn dispatch<'a>(
             | "has_sequence_privilege"
             | "has_schema_privilege"
             | "has_type_privilege"
+            | "has_language_privilege"
             | "has_function_privilege"
             | "has_database_privilege"
             | "has_tablespace_privilege"
@@ -601,6 +604,22 @@ pub(crate) fn dispatch<'a>(
                 arity(2)?;
                 let object_type = match eval_full(args[0], arena, params, row, hooks)? {
                     Datum::Text(value) => value,
+                    Datum::Char(value) => match value {
+                        b'c' => "c",
+                        b'd' => "d",
+                        b'F' => "F",
+                        b'S' => "S",
+                        b'f' => "f",
+                        b'l' => "l",
+                        b'L' => "L",
+                        b'p' => "p",
+                        b'r' => "r",
+                        b'n' => "n",
+                        b's' => "s",
+                        b't' => "t",
+                        b'T' => "T",
+                        _ => "",
+                    },
                     Datum::Null => return Ok(Datum::Null),
                     _ => {
                         return Err(sql_err!(
@@ -838,6 +857,7 @@ pub(crate) fn dispatch<'a>(
             | "has_sequence_privilege"
             | "has_schema_privilege"
             | "has_type_privilege"
+            | "has_language_privilege"
             | "has_function_privilege"
             | "has_database_privilege"
             | "has_tablespace_privilege"
@@ -931,6 +951,9 @@ pub(crate) fn dispatch<'a>(
                     }
                     "has_schema_privilege" => cat.has_schema_privilege(role, object, privilege)?,
                     "has_type_privilege" => cat.has_type_privilege(role, object, privilege)?,
+                    "has_language_privilege" => {
+                        cat.has_language_privilege(role, object, privilege)?
+                    }
                     "has_function_privilege" => {
                         cat.has_function_privilege(role, object, privilege)?
                     }
@@ -1555,6 +1578,7 @@ pub(crate) fn dispatch<'a>(
                     Datum::Int8(_) => "bigint",
                     Datum::Float4(_) => "real",
                     Datum::Float8(_) => "double precision",
+                    Datum::Char(_) => "\"char\"",
                     Datum::Text(_) => "text",
                     Datum::Bpchar(_) => "character",
                     Datum::Regtype { .. } => "regtype",

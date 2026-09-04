@@ -266,7 +266,7 @@ pub(crate) struct RoleLogin {
     pub superuser: bool,
     pub replication: bool,
     pub connection_limit: i32,
-    pub password: Option<crate::storage::RolePassword>,
+    pub password: Option<crate::storage::RoleCredential>,
 }
 
 #[derive(Clone, Copy)]
@@ -356,6 +356,8 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::CreateAggregate(_)
         | Stmt::CreateCast(_)
         | Stmt::DropCast { .. }
+        | Stmt::CreateTransform(_)
+        | Stmt::DropTransform(_)
         | Stmt::CreateOperator(_)
         | Stmt::AlterOperator { .. }
         | Stmt::DropOperator { .. }
@@ -439,6 +441,8 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterIndex { .. }
         | Stmt::AlterIndexesTablespace { .. }
         | Stmt::DropIndex { .. }
+        | Stmt::CreateAccessMethod { .. }
+        | Stmt::DropAccessMethod { .. }
         | Stmt::Reindex { .. }
         | Stmt::Cluster { .. }
         | Stmt::Checkpoint
@@ -446,9 +450,12 @@ fn statement_writes(statement: &Stmt<'_>) -> bool {
         | Stmt::AlterTable(_)
         | Stmt::CreateSchema { .. }
         | Stmt::DropSchema { .. }
+        | Stmt::AlterSchema { .. }
         | Stmt::Vacuum { .. }
         | Stmt::Notify { .. }
         | Stmt::Comment { .. }
+        | Stmt::SecurityLabel { .. }
+        | Stmt::Load(_)
         | Stmt::AlterOwner { .. }
         | Stmt::AlterLargeObjectOwner { .. }
         | Stmt::CreateRole { .. }
@@ -820,10 +827,13 @@ fn event_trigger_tag(statement: &Stmt<'_>) -> Option<&'static str> {
         Stmt::CreateIndex { .. } => "CREATE INDEX",
         Stmt::AlterIndex { .. } | Stmt::AlterIndexesTablespace { .. } => "ALTER INDEX",
         Stmt::DropIndex { .. } => "DROP INDEX",
+        Stmt::CreateAccessMethod { .. } => "CREATE ACCESS METHOD",
+        Stmt::DropAccessMethod { .. } => "DROP ACCESS METHOD",
         Stmt::Cluster { .. } => "CLUSTER",
         Stmt::Reindex { .. } => "REINDEX",
         Stmt::CreateSchema { .. } => "CREATE SCHEMA",
         Stmt::DropSchema { .. } => "DROP SCHEMA",
+        Stmt::AlterSchema { .. } => "ALTER SCHEMA",
         Stmt::Comment { target, .. }
             if !matches!(
                 target,
@@ -901,6 +911,7 @@ fn event_trigger_drop_command(statement: &Stmt<'_>) -> bool {
                 | Stmt::DropDomain { .. }
                 | Stmt::DropType { .. }
                 | Stmt::DropIndex { .. }
+                | Stmt::DropAccessMethod { .. }
                 | Stmt::DropSchema { .. }
         ),
     }
@@ -1159,6 +1170,7 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
         "ALTER TYPE",
         "COMMENT",
         "CREATE AGGREGATE",
+        "CREATE ACCESS METHOD",
         "CREATE CAST",
         "CREATE COLLATION",
         "CREATE CONVERSION",
@@ -1185,6 +1197,7 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
         "CREATE TYPE",
         "CREATE VIEW",
         "DROP AGGREGATE",
+        "DROP ACCESS METHOD",
         "DROP CAST",
         "DROP COLLATION",
         "DROP CONVERSION",
@@ -4824,12 +4837,12 @@ impl Engine {
                 DdlUndo::ViewRenamed { slot, .. } => {
                     self.storage.commit_view_rename(*slot as usize, txn.txid)
                 }
-                DdlUndo::ViewSecurityChanged { slot, .. } => {
-                    self.storage.commit_view_security(*slot as usize, txn.txid)
+                DdlUndo::ViewOptionsChanged { slot, .. } => {
+                    self.storage.commit_view_options(*slot as usize, txn.txid)
                 }
-                DdlUndo::ViewCheckOptionChanged { slot, .. } => self
-                    .storage
-                    .commit_view_check_option(*slot as usize, txn.txid),
+                DdlUndo::ViewColumnsChanged { slot, .. } => {
+                    self.storage.commit_view_columns(*slot as usize, txn.txid)
+                }
                 DdlUndo::RuleCreated { slot, .. } => {
                     self.storage.commit_rule_create(*slot as usize)
                 }
@@ -5167,6 +5180,12 @@ impl Engine {
                 DdlUndo::TablespaceDropped(slot) => {
                     self.storage.commit_tablespace_drop(*slot as usize)
                 }
+                DdlUndo::AccessMethodCreated(slot) => {
+                    self.storage.commit_access_method_create(*slot as usize)
+                }
+                DdlUndo::AccessMethodDropped(slot) => {
+                    self.storage.commit_access_method_drop(*slot as usize)
+                }
                 DdlUndo::DatabaseCreated(slot) => {
                     self.storage.commit_database_create(*slot as usize)
                 }
@@ -5187,6 +5206,7 @@ impl Engine {
                     );
                 }
                 DdlUndo::SchemaDropped(slot) => self.storage.commit_schema_drop(*slot as usize),
+                DdlUndo::SchemaRenamed { .. } => {}
                 DdlUndo::ExtensionCreated(slot) => self
                     .storage
                     .commit_extension_create(*slot as usize, txn.txid),
@@ -5710,12 +5730,12 @@ impl Engine {
             DdlUndo::ViewRenamed { slot, prior } => {
                 self.storage.rollback_view_rename(slot as usize, prior)
             }
-            DdlUndo::ViewSecurityChanged { slot, prior } => {
-                self.storage.rollback_view_security(slot as usize, prior)
+            DdlUndo::ViewOptionsChanged { slot, prior } => {
+                self.storage.rollback_view_options(slot as usize, prior)
             }
-            DdlUndo::ViewCheckOptionChanged { slot, prior } => self
-                .storage
-                .rollback_view_check_option(slot as usize, prior),
+            DdlUndo::ViewColumnsChanged { slot, prior } => {
+                self.storage.rollback_view_columns(slot as usize, prior)
+            }
             DdlUndo::PublicationCreated(slot) => {
                 self.storage.rollback_publication_create(slot as usize)
             }
@@ -5888,6 +5908,12 @@ impl Engine {
             DdlUndo::TablespaceDropped(slot) => {
                 self.storage.rollback_tablespace_drop(slot as usize, txid)
             }
+            DdlUndo::AccessMethodCreated(slot) => {
+                self.storage.rollback_access_method_create(slot as usize)
+            }
+            DdlUndo::AccessMethodDropped(slot) => self
+                .storage
+                .rollback_access_method_drop(slot as usize, txid),
             DdlUndo::DatabaseCreated(slot) => self.storage.rollback_database_create(slot as usize),
             DdlUndo::DatabaseAltered {
                 slot,
@@ -5920,6 +5946,9 @@ impl Engine {
             }
             DdlUndo::SchemaCreated(slot) => self.storage.rollback_schema_create(slot as usize),
             DdlUndo::SchemaDropped(slot) => self.storage.rollback_schema_drop(slot as usize, txid),
+            DdlUndo::SchemaRenamed { slot, prior } => {
+                let _ = self.storage.rename_schema(slot as usize, prior);
+            }
             DdlUndo::ExtensionCreated(slot) => {
                 self.storage.rollback_extension_create(slot as usize)
             }
@@ -6792,9 +6821,9 @@ impl Engine {
                 return Ok(ExecutionStatus::Complete);
             }
         };
-        // The whole message runs in one implicit transaction unless an
-        // explicit block is open — an error undoes the entire message,
-        // matching PostgreSQL's implicit-transaction rule.
+        // One Query message owns an implicit transaction until an explicit
+        // BEGIN boundary. PostgreSQL commits preceding simple-query commands
+        // before opening that block, so ROLLBACK cannot erase them.
         // Freeze this statement's clock before anything anchors a transaction
         // to it, so `now()` and `statement_timestamp()` agree on a lone
         // statement as they do in PostgreSQL.
@@ -6863,6 +6892,13 @@ impl Engine {
                     "COPY FROM STDIN must be the last statement in a query string"
                 );
                 responder.error(e.sqlstate, e.message.as_str())?;
+                return Ok(ExecutionStatus::Complete);
+            }
+            if matches!(statement, Stmt::Begin(_))
+                && txn.mode == TxnMode::Implicit
+                && let Err(error) = self.commit_txn(txn, guc)
+            {
+                responder.error(error.sqlstate, error.message.as_str())?;
                 return Ok(ExecutionStatus::Complete);
             }
             executed_any = true;
@@ -7828,6 +7864,7 @@ impl Engine {
                         view.base.name,
                         view.base.schema.expect("view base is qualified"),
                         view.columns,
+                        view.base_columns,
                         &self.storage,
                         txn.txid,
                         arena,
@@ -9273,9 +9310,13 @@ impl Engine {
                 let (insert, view_check) =
                     match query::resolve_view_for_dml(storage, insert.table, txn.txid, arena) {
                         Ok(Some(view)) => {
-                            let view_check = view.check_option.map(|_| exec::ViewCheck {
-                                predicate: view.where_clause,
+                            let view_check = Some(exec::ViewCheck {
+                                predicate: view.check_option.and(view.where_clause),
                                 view_name: insert.table.name,
+                                defaults: exec::ViewInsertDefaults {
+                                    base_columns: view.base_columns,
+                                    columns: view.defaults,
+                                },
                             });
                             let rewritten = match query::rewrite_view_dml(
                                 statement,
@@ -9283,6 +9324,7 @@ impl Engine {
                                 view.base.name,
                                 view.base.schema.expect("view base is qualified"),
                                 view.columns,
+                                view.base_columns,
                                 storage,
                                 txn.txid,
                                 arena,
@@ -9292,7 +9334,7 @@ impl Engine {
                                 Err(error) => return Ok(Err(error)),
                             };
                             let columns = if rewritten.columns.is_empty() {
-                                view.columns
+                                view.base_columns
                             } else {
                                 rewritten.columns
                             };
@@ -9361,6 +9403,10 @@ impl Engine {
                             let view_check = view.check_option.map(|_| exec::ViewCheck {
                                 predicate: view.where_clause,
                                 view_name: update.table.name,
+                                defaults: exec::ViewInsertDefaults {
+                                    base_columns: view.base_columns,
+                                    columns: view.defaults,
+                                },
                             });
                             let rewritten = match query::rewrite_view_dml(
                                 statement,
@@ -9368,6 +9414,7 @@ impl Engine {
                                 view.base.name,
                                 view.base.schema.expect("view base is qualified"),
                                 view.columns,
+                                view.base_columns,
                                 storage,
                                 txn.txid,
                                 arena,
@@ -9448,6 +9495,7 @@ impl Engine {
                                 view.base.name,
                                 view.base.schema.expect("view base is qualified"),
                                 view.columns,
+                                view.base_columns,
                                 storage,
                                 txn.txid,
                                 arena,
@@ -10703,6 +10751,9 @@ impl Engine {
         transaction_context: exec::PlpgsqlTransactionContext,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) = self.storage.require_language_usage("plpgsql", txn.txid) {
+            return Ok(Err(error));
+        }
         match exec::execute_anonymous_plpgsql(
             self,
             txn,
@@ -11993,8 +12044,10 @@ impl Engine {
             }
             Stmt::CreateView {
                 name,
+                columns,
                 or_replace,
                 security,
+                security_barrier,
                 check_option,
                 sql,
             } => exec::create_view(
@@ -12003,8 +12056,10 @@ impl Engine {
                 txn,
                 exec::CreateViewCommand {
                     name,
+                    columns,
                     or_replace: *or_replace,
                     security: *security,
+                    security_barrier: *security_barrier,
                     check_option: *check_option,
                     sql,
                     raw_path: guc.search_path().as_str(),
@@ -12092,6 +12147,18 @@ impl Engine {
             Stmt::DropCast(cast) => {
                 exec::drop_cast(&mut self.storage, &mut self.wal, txn, *cast, responder)
             }
+            Stmt::CreateTransform(_) | Stmt::DropTransform(_) => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "transforms require procedural-language type hooks, which pos3ql does not host"
+            ))),
+            Stmt::Load(_) => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "LOAD is not supported; pos3ql does not load native shared libraries"
+            ))),
+            Stmt::SecurityLabel { .. } => Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "SECURITY LABEL requires a native security label provider, which pos3ql does not host"
+            ))),
             Stmt::CreateOperator(operator) => {
                 exec::create_operator(&mut self.storage, &mut self.wal, txn, operator, responder)
             }
@@ -12803,6 +12870,7 @@ impl Engine {
                 with_data,
                 if_not_exists,
                 kind,
+                options,
             } => exec::create_table_as(
                 &mut self.storage,
                 &mut self.wal,
@@ -12813,6 +12881,7 @@ impl Engine {
                 *with_data,
                 *if_not_exists,
                 *kind == ast::CreateTableAsKind::MaterializedView,
+                *options,
                 guc.search_path().as_str(),
                 guc.seq_session(),
                 arena,
@@ -12858,8 +12927,7 @@ impl Engine {
             Stmt::AlterSequence {
                 name,
                 if_exists,
-                options,
-                set_schema,
+                action,
             } => exec::alter_sequence(
                 &mut self.storage,
                 &mut self.wal,
@@ -12867,10 +12935,10 @@ impl Engine {
                 exec::AlterSequenceCommand {
                     name,
                     if_exists: *if_exists,
-                    options,
-                    set_schema: *set_schema,
+                    action: *action,
                 },
                 guc.seq_session(),
+                arena,
                 responder,
             ),
             Stmt::DropSequence {
@@ -13098,6 +13166,32 @@ impl Engine {
                 *if_exists,
                 responder,
             ),
+            Stmt::CreateAccessMethod {
+                name,
+                method_type,
+                handler,
+            } => exec::create_access_method(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *method_type,
+                *handler,
+                responder,
+            ),
+            Stmt::DropAccessMethod {
+                names,
+                if_exists,
+                cascade,
+            } => exec::drop_access_method(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                names,
+                *if_exists,
+                *cascade,
+                responder,
+            ),
             Stmt::CreateDatabase { name, options } => {
                 let template = options.template.unwrap_or("template1");
                 let mut connections = self.database_connection_count(template, txn.txid);
@@ -13216,82 +13310,104 @@ impl Engine {
                 if_not_exists,
                 elements,
             } => {
+                let resolved = match resolve_create_schema(*name, *authorization, guc) {
+                    Ok(resolved) => resolved,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let name = resolved.name.as_str();
                 let out = exec::create_schema(
                     &mut self.storage,
                     &mut self.wal,
                     txn,
                     name,
-                    *authorization,
+                    resolved.authorization.as_ref().map(|role| role.as_str()),
                     *if_not_exists,
                     responder,
                 )?;
                 if let Err(e) = out {
                     return Ok(Err(e));
                 }
+                let prior_role = guc.current_role();
+                let prior_user = eval::funcs::system::current_user_owned();
+                if let Some(owner) = resolved.authorization.as_ref() {
+                    guc.set_role(owner.as_str(), true);
+                    eval::funcs::system::set_current_user(owner.as_str());
+                }
                 // Schema elements run with the new schema as their creation
                 // target; an element naming a different schema is refused, as
                 // PostgreSQL has it (42P15).
-                for element in *elements {
-                    let requalified = match requalify_schema_element(element, name, arena) {
-                        Ok(r) => r,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                    let result = if let Stmt::CreateView {
-                        name,
-                        or_replace,
-                        security,
-                        check_option,
-                        sql,
-                    } = requalified
-                    {
-                        let schema = name
-                            .schema
-                            .expect("CREATE SCHEMA requalification assigns a schema");
-                        let schema_path = match eval::quote_ident_str(schema, arena) {
-                            Ok(path) => path,
+                let elements_result = (|| {
+                    for element in *elements {
+                        let requalified = match requalify_schema_element(element, name, arena) {
+                            Ok(r) => r,
                             Err(e) => return Ok(Err(e)),
                         };
-                        let role = guc.current_role();
-                        let path = self
-                            .storage
-                            .compute_path(schema_path, role.as_str(), txn.txid);
-                        let old_path = self.storage.swap_path(path);
-                        let result = exec::create_view(
-                            &mut self.storage,
-                            &mut self.wal,
-                            txn,
-                            exec::CreateViewCommand {
-                                name,
-                                or_replace: *or_replace,
-                                security: *security,
-                                check_option: *check_option,
-                                sql,
-                                raw_path: schema_path,
-                            },
-                            arena,
-                            responder,
-                        );
-                        self.storage.swap_path(old_path);
-                        result
-                    } else {
-                        self.execute_stmt(
-                            requalified,
-                            arena,
-                            params,
-                            txn,
-                            sqlprep,
-                            cursors,
-                            guc,
-                            exec::PlpgsqlTransactionContext::Atomic,
-                            responder,
-                        )
-                    };
-                    let result = result?;
-                    if let Err(e) = result {
-                        return Ok(Err(e));
+                        let result = if let Stmt::CreateView {
+                            name,
+                            columns,
+                            or_replace,
+                            security,
+                            security_barrier,
+                            check_option,
+                            sql,
+                        } = requalified
+                        {
+                            let schema = name
+                                .schema
+                                .expect("CREATE SCHEMA requalification assigns a schema");
+                            let schema_path = match eval::quote_ident_str(schema, arena) {
+                                Ok(path) => path,
+                                Err(e) => return Ok(Err(e)),
+                            };
+                            let role = guc.current_role();
+                            let path =
+                                self.storage
+                                    .compute_path(schema_path, role.as_str(), txn.txid);
+                            let old_path = self.storage.swap_path(path);
+                            let result = exec::create_view(
+                                &mut self.storage,
+                                &mut self.wal,
+                                txn,
+                                exec::CreateViewCommand {
+                                    name,
+                                    columns,
+                                    or_replace: *or_replace,
+                                    security: *security,
+                                    security_barrier: *security_barrier,
+                                    check_option: *check_option,
+                                    sql,
+                                    raw_path: schema_path,
+                                },
+                                arena,
+                                responder,
+                            );
+                            self.storage.swap_path(old_path);
+                            result
+                        } else {
+                            self.execute_stmt(
+                                requalified,
+                                arena,
+                                params,
+                                txn,
+                                sqlprep,
+                                cursors,
+                                guc,
+                                exec::PlpgsqlTransactionContext::Atomic,
+                                responder,
+                            )
+                        };
+                        let result = result?;
+                        if let Err(e) = result {
+                            return Ok(Err(e));
+                        }
                     }
+                    Ok(Ok(()))
+                })();
+                if resolved.authorization.is_some() {
+                    guc.set_role(prior_role.as_str(), true);
+                    eval::funcs::system::set_current_user(prior_user.as_str());
                 }
-                Ok(Ok(()))
+                elements_result
             }
             Stmt::DropSchema {
                 names,
@@ -13307,6 +13423,15 @@ impl Engine {
                 *cascade,
                 arena,
                 guc.seq_session(),
+                responder,
+            ),
+            Stmt::AlterSchema { name, action } => exec::alter_schema(
+                &mut self.storage,
+                &mut self.wal,
+                txn,
+                name,
+                *action,
+                arena,
                 responder,
             ),
             Stmt::AlterOwner {
@@ -13334,24 +13459,28 @@ impl Engine {
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                name,
-                options,
-                memberships,
+                exec::CreateRoleRequest {
+                    name,
+                    options,
+                    memberships,
+                },
+                guc,
                 responder,
             ),
-            Stmt::AlterRole { name, options } => exec::alter_role(
+            Stmt::AlterRole { role, options } => exec::alter_role(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                name,
+                *role,
                 options,
+                guc,
                 responder,
             ),
-            Stmt::AlterRoleRename { name, new_name } => exec::rename_role(
+            Stmt::AlterRoleRename { role, new_name } => exec::rename_role(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                name,
+                *role,
                 new_name,
                 responder,
             ),
@@ -15357,7 +15486,8 @@ impl Engine {
             | crate::storage::AccessClass::Database
             | crate::storage::AccessClass::LargeObject
             | crate::storage::AccessClass::ForeignDataWrapper
-            | crate::storage::AccessClass::ForeignServer => {
+            | crate::storage::AccessClass::ForeignServer
+            | crate::storage::AccessClass::Language => {
                 return Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "unsupported extension member class"
@@ -16118,14 +16248,18 @@ pub(crate) fn requalify_schema_element<'a>(
         }),
         ast::CreateSchemaElement::View {
             name,
+            columns,
             or_replace,
             security,
+            security_barrier,
             check_option,
             sql,
         } => Stmt::CreateView {
             name: requalify(*name)?,
+            columns,
             or_replace: *or_replace,
             security: *security,
+            security_barrier: *security_barrier,
             check_option: *check_option,
             sql,
         },
@@ -16167,23 +16301,97 @@ pub(crate) fn requalify_schema_element<'a>(
             if_not_exists: *if_not_exists,
             options: *options,
         },
-        ast::CreateSchemaElement::Domain(domain) => Stmt::CreateDomain(ast::CreateDomain {
-            name: requalify(domain.name)?,
-            ..*domain
-        }),
-        ast::CreateSchemaElement::Enum { name, labels } => Stmt::CreateEnum {
-            name: requalify(*name)?,
-            labels,
-        },
-        ast::CreateSchemaElement::Composite { name, fields } => Stmt::CreateComposite {
-            name: requalify(*name)?,
-            fields,
-        },
+        ast::CreateSchemaElement::Trigger(trigger) => {
+            let kind = match trigger.kind {
+                ast::TriggerKind::Ordinary => ast::TriggerKind::Ordinary,
+                ast::TriggerKind::Constraint {
+                    referenced_table,
+                    timing,
+                } => ast::TriggerKind::Constraint {
+                    referenced_table: referenced_table.map(requalify).transpose()?,
+                    timing,
+                },
+            };
+            Stmt::CreateTrigger(ast::CreateTrigger {
+                table: requalify(trigger.table)?,
+                kind,
+                ..*trigger
+            })
+        }
+        ast::CreateSchemaElement::Grant {
+            privileges,
+            target,
+            grantees,
+            grant_option,
+            grantor,
+        } => {
+            let target = match target {
+                ast::PrivilegeTarget::Objects {
+                    kind:
+                        kind @ (ast::PrivilegeObjectKind::Table | ast::PrivilegeObjectKind::Sequence),
+                    names,
+                } => {
+                    for name in names.iter().copied() {
+                        requalify(name)?;
+                    }
+                    let names = arena
+                        .alloc_slice_with(names.len(), |index| {
+                            requalify(names[index])
+                                .expect("schema grant names were validated before allocation")
+                        })
+                        .map_err(|_| query::arena_full_pub())?;
+                    ast::PrivilegeTarget::Objects { kind: *kind, names }
+                }
+                _ => *target,
+            };
+            Stmt::GrantPrivileges {
+                privileges,
+                target,
+                grantees,
+                grant_option: *grant_option,
+                grantor: *grantor,
+            }
+        }
     };
     arena
         .alloc(rewritten)
         .map(|r| &*r)
         .map_err(|_| query::arena_full_pub())
+}
+
+/// The runtime form of a parsed `CREATE SCHEMA` identity. Role keywords are
+/// resolved once against the session before any catalog mutation begins.
+pub(crate) struct ResolvedCreateSchema {
+    pub name: crate::util::StackStr<64>,
+    pub authorization: Option<crate::util::StackStr<64>>,
+}
+
+pub(crate) fn resolve_create_schema(
+    name: ast::SchemaName<'_>,
+    authorization: Option<ast::SchemaAuthorization<'_>>,
+    guc: &guc::GucState,
+) -> Result<ResolvedCreateSchema, SqlError> {
+    let authorization = match authorization {
+        Some(ast::SchemaAuthorization::Name(role)) => Some(crate::util::StackStr::from_str(role)),
+        Some(ast::SchemaAuthorization::CurrentRole | ast::SchemaAuthorization::CurrentUser) => {
+            Some(guc.current_role())
+        }
+        Some(ast::SchemaAuthorization::SessionUser) => Some(guc.session_user()),
+        None => None,
+    };
+    let name = match name {
+        ast::SchemaName::Explicit(name) => crate::util::StackStr::from_str(name),
+        ast::SchemaName::Authorization => authorization.ok_or_else(|| {
+            sql_err!(
+                crate::sql::eval::sqlstate::SYNTAX_ERROR,
+                "CREATE SCHEMA AUTHORIZATION requires a role"
+            )
+        })?,
+    };
+    Ok(ResolvedCreateSchema {
+        name,
+        authorization,
+    })
 }
 
 /// Reapplies one journal record to storage during recovery.
@@ -16362,6 +16570,15 @@ fn replay_transaction_batches(
                     })? {
                         WalOp::CreateTable(definition) => {
                             if storage
+                                .table_access_method_name(definition.access_method, transaction_id)
+                                .is_none()
+                            {
+                                return Err(sql_err!(
+                                    sqlstate::INTERNAL_ERROR,
+                                    "prepared transaction references an unknown table access method"
+                                ));
+                            }
+                            if storage
                                 .find_visible(
                                     definition.schema.as_str(),
                                     definition.name.as_str(),
@@ -16405,6 +16622,7 @@ fn replay_transaction_batches(
                                     sequence,
                                     crate::storage::SequenceAlteration {
                                         schema: crate::storage::SqlName::parse(schema)?,
+                                        name: crate::storage::SqlName::parse(name)?,
                                         spec,
                                         owner,
                                         generator_for,
@@ -17095,6 +17313,15 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             // A journal written before its schema existed cannot occur going
             // forward (CreateSchema precedes in LSN order), but a pre-schema
             // journal names only public, which always exists.
+            if storage
+                .table_access_method_name(def.access_method, 0)
+                .is_none()
+            {
+                return Err(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "journal table references an unknown access method"
+                ));
+            }
             if !storage.complete_replay_table_rewrite(def)? {
                 storage.create_table(def)?;
             }
@@ -17282,9 +17509,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         WalOp::CreateView {
             schema,
             name,
+            columns,
             sql,
             path,
             security_invoker,
+            security_barrier,
             check_option,
             dependencies,
         } => {
@@ -17299,27 +17528,41 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             let (new_slot, old_slot) = storage.create_view(
                 crate::storage::SqlName::parse(schema)?,
                 crate::storage::SqlName::parse(name)?,
-                crate::storage::StoredQueryDefinition {
-                    sql: buffer,
-                    creation_path,
-                    dependencies,
-                },
-                crate::storage::ViewOptions {
-                    security: if security_invoker {
-                        crate::storage::ViewSecurity::Invoker
-                    } else {
-                        crate::storage::ViewSecurity::Definer
+                crate::storage::ViewDefinition {
+                    columns,
+                    query: crate::storage::StoredQueryDefinition {
+                        sql: buffer,
+                        creation_path,
+                        dependencies,
                     },
-                    check_option: match check_option {
-                        0 => None,
-                        code => Some(crate::storage::ViewCheckOption::from_code(code).ok_or_else(
-                            || {
-                                sql_err!(
-                                    sqlstate::DATA_EXCEPTION,
-                                    "journal has invalid view check option"
-                                )
-                            },
-                        )?),
+                    options: crate::storage::ViewOptions {
+                        security: if security_invoker {
+                            crate::storage::ViewSecurity::Invoker
+                        } else {
+                            crate::storage::ViewSecurity::Definer
+                        },
+                        security_barrier: crate::storage::ViewSecurityBarrier::from_code(
+                            security_barrier,
+                        )
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::DATA_EXCEPTION,
+                                "journal has invalid view security barrier"
+                            )
+                        })?,
+                        check_option: match check_option {
+                            0 => None,
+                            code => {
+                                Some(crate::storage::ViewCheckOption::from_code(code).ok_or_else(
+                                    || {
+                                        sql_err!(
+                                            sqlstate::DATA_EXCEPTION,
+                                            "journal has invalid view check option"
+                                        )
+                                    },
+                                )?)
+                            }
+                        },
                     },
                 },
                 true,
@@ -17335,35 +17578,11 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_view_drop(slot);
             }
         }
-        WalOp::SetViewSecurity {
+        WalOp::SetViewOptions {
             schema,
             name,
             security_invoker,
-        } => {
-            let slot = storage
-                .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
-                .map(|object| object.slot as usize)
-                .ok_or_else(|| {
-                    sql_err!(
-                        sqlstate::UNDEFINED_TABLE,
-                        "journal changes unknown view \"{}\"",
-                        name
-                    )
-                })?;
-            storage.stage_view_security(
-                slot,
-                if security_invoker {
-                    crate::storage::ViewSecurity::Invoker
-                } else {
-                    crate::storage::ViewSecurity::Definer
-                },
-                0,
-            )?;
-            storage.commit_view_security(slot, 0);
-        }
-        WalOp::SetViewCheckOption {
-            schema,
-            name,
+            security_barrier,
             check_option,
         } => {
             let slot = storage
@@ -17387,8 +17606,46 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     },
                 )?),
             };
-            storage.stage_view_check_option(slot, check_option, 0)?;
-            storage.commit_view_check_option(slot, 0);
+            storage.stage_view_options(
+                slot,
+                crate::storage::ViewOptions {
+                    security: if security_invoker {
+                        crate::storage::ViewSecurity::Invoker
+                    } else {
+                        crate::storage::ViewSecurity::Definer
+                    },
+                    security_barrier: crate::storage::ViewSecurityBarrier::from_code(
+                        security_barrier,
+                    )
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::DATA_EXCEPTION,
+                            "journal has invalid view security barrier"
+                        )
+                    })?,
+                    check_option,
+                },
+                0,
+            )?;
+            storage.commit_view_options(slot, 0);
+        }
+        WalOp::SetViewColumns {
+            schema,
+            name,
+            columns,
+        } => {
+            let slot = storage
+                .resolve_access_object(crate::storage::AccessClass::View, schema, name, 0)
+                .map(|object| object.slot as usize)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "journal changes unknown view \"{}\"",
+                        name
+                    )
+                })?;
+            storage.stage_view_columns(slot, columns, 0)?;
+            storage.commit_view_columns(slot, 0);
         }
         WalOp::RenameView {
             schema,
@@ -17949,6 +18206,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     slot,
                     crate::storage::SequenceAlteration {
                         schema: crate::storage::SqlName::parse(schema)?,
+                        name: crate::storage::SqlName::parse(name)?,
                         spec,
                         owner,
                         generator_for,
@@ -18316,6 +18574,32 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             storage.drop_tablespace(slot, 0)?;
             storage.commit_tablespace_drop(slot);
         }
+        WalOp::CreateAccessMethod {
+            created_at,
+            name,
+            handler,
+        } => {
+            let slot = storage.create_access_method(
+                created_at,
+                crate::storage::AccessMethodDefinition {
+                    name: crate::storage::SqlName::parse(name)?,
+                    handler,
+                },
+                0,
+            )?;
+            storage.commit_access_method_create(slot);
+        }
+        WalOp::DropAccessMethod { name } => {
+            let slot = storage.access_method_slot(name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "journal access method \"{}\" does not exist",
+                    name
+                )
+            })?;
+            storage.drop_access_method(slot, 0);
+            storage.commit_access_method_drop(slot);
+        }
         WalOp::CreateDatabase {
             oid,
             template_oid,
@@ -18382,6 +18666,12 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             if let Some(slot) = storage.find_schema(name) {
                 storage.drop_schema(slot);
             }
+        }
+        WalOp::RenameSchema { name, new_name } => {
+            let slot = storage.find_schema(name).ok_or_else(|| {
+                sql_err!(sqlstate::INTERNAL_ERROR, "journal schema does not exist")
+            })?;
+            storage.rename_schema(slot, crate::storage::SqlName::parse(new_name)?)?;
         }
         WalOp::UpsertExtension {
             name,
@@ -18532,6 +18822,43 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 slot,
                 crate::storage::SequenceAlteration {
                     schema: crate::storage::SqlName::parse(new_schema)?,
+                    name: current.name,
+                    spec,
+                    owner: current.owner,
+                    generator_for: current.generator_for,
+                    restart: None,
+                },
+                0,
+            )?;
+            storage.commit_sequence_alter(slot, 0);
+        }
+        WalOp::RenameSequence {
+            schema,
+            name,
+            new_name,
+        } => {
+            let slot = storage.sequence_slot(schema, name, 0).ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_TABLE,
+                    "journal renames unknown sequence \"{}\"",
+                    name
+                )
+            })?;
+            let current = storage.sequence_for(slot, 0);
+            let spec = crate::storage::SeqSpec {
+                data_type: current.data_type,
+                increment: current.increment,
+                min_value: current.min_value,
+                max_value: current.max_value,
+                start_value: current.start_value,
+                cache: current.cache,
+                cycle: current.cycle,
+            };
+            storage.stage_sequence_alter(
+                slot,
+                crate::storage::SequenceAlteration {
+                    schema: current.schema,
+                    name: crate::storage::SqlName::parse(new_name)?,
                     spec,
                     owner: current.owner,
                     generator_for: current.generator_for,

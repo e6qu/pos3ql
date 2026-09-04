@@ -2702,6 +2702,10 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             Some(schema) => self.storage.enum_slot(schema, name, self.txid),
             None => self.storage.resolve_enum_slot(name, self.txid),
         };
+        let composite = match written_schema {
+            Some(schema) => self.storage.composite_slot(schema, name, self.txid),
+            None => self.storage.resolve_composite_slot(name, self.txid),
+        };
         let object = domain
             .map(|slot| crate::storage::AccessObject {
                 class: crate::storage::AccessClass::Domain,
@@ -2710,6 +2714,12 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             .or_else(|| {
                 enumeration.map(|slot| crate::storage::AccessObject {
                     class: crate::storage::AccessClass::Enum,
+                    slot: slot as u16,
+                })
+            })
+            .or_else(|| {
+                composite.map(|slot| crate::storage::AccessObject {
+                    class: crate::storage::AccessClass::Composite,
                     slot: slot as u16,
                 })
             });
@@ -2730,6 +2740,50 @@ impl super::eval::CatalogAccess for StorageCatalog<'_, '_, '_, '_> {
             },
         )
         .map(Some)
+    }
+
+    fn has_language_privilege(
+        &self,
+        role: Option<&str>,
+        language: &str,
+        privileges: &str,
+    ) -> Result<Option<bool>, SqlError> {
+        let role = match privilege_role(self.storage, role, self.txid) {
+            Some(role) => role,
+            None => return Ok(None),
+        };
+        let Some(oid) = super::catalog::procedural_language_oid(language) else {
+            return Ok(None);
+        };
+        let Some(slot) = u16::try_from(oid).ok() else {
+            return Ok(None);
+        };
+        let object = crate::storage::AccessObject {
+            class: crate::storage::AccessClass::Language,
+            slot,
+        };
+        privilege_query(
+            privileges,
+            crate::storage::PrivilegeSet::NONE,
+            crate::storage::PrivilegeSet::USAGE,
+            |privilege| {
+                self.storage
+                    .has_object_privilege(object, role, privilege, self.txid)
+            },
+            |privilege| {
+                self.storage
+                    .has_object_grant_option(object, role, privilege, self.txid)
+            },
+        )
+        .map(Some)
+    }
+
+    fn language_name<'a>(
+        &self,
+        oid: i32,
+        _arena: &'a crate::mem::arena::Arena,
+    ) -> Result<Option<&'a str>, SqlError> {
+        Ok(super::catalog::procedural_language_name(oid))
     }
 
     fn has_function_privilege(
@@ -3770,14 +3824,19 @@ fn common_using_type(a: ColType, b: ColType) -> Option<ColType> {
 
 /// A view that PostgreSQL treats as auto-updatable: a single base table, no
 /// aggregation/DISTINCT/GROUP BY/HAVING/LIMIT/joins, and every output column a
-/// plain (un-aliased) base column. `where_clause` is the view's own filter, to
-/// be AND-ed into any DML on the view; `columns` are the exposed base columns.
+/// plain base column. `where_clause` is the view's own filter, to be AND-ed
+/// into DML; `columns` are the exposed base columns.
 pub struct UpdatableView<'a> {
     /// The base table, fully qualified from the view's own resolution so the
     /// rewritten DML binds the same table regardless of the session's path.
     pub base: QualName<'a>,
     pub where_clause: Option<&'a Expr<'a>>,
     pub columns: &'a [&'a str],
+    /// Base relation names in the same ordinal positions as `columns`.
+    pub base_columns: &'a [&'a str],
+    /// Durable defaults for the exposed columns, applied before base-table
+    /// defaults when INSERT leaves a view column unspecified.
+    pub defaults: crate::storage::ViewColumns,
     pub check_option: Option<crate::storage::ViewCheckOption>,
 }
 
@@ -3852,7 +3911,7 @@ pub fn resolve_view_for_dml<'a>(
             .alloc_str(base_def.name.as_str())
             .map_err(|_| arena_full())?,
     };
-    let mut columns = [""; MAX_PROJ];
+    let mut base_columns = [""; MAX_PROJ];
     let mut n = 0;
     for it in sel.items {
         match it {
@@ -3862,35 +3921,56 @@ pub fn resolve_view_for_dml<'a>(
                         return Err(not_updatable());
                     }
                     // Copy into the arena so it does not borrow storage.
-                    columns[n] = arena.alloc_str(c.name.as_str()).map_err(|_| arena_full())?;
+                    let base_column = arena.alloc_str(c.name.as_str()).map_err(|_| arena_full())?;
+                    if base_columns[..n].contains(&base_column) {
+                        return Err(not_updatable());
+                    }
+                    base_columns[n] = base_column;
                     n += 1;
                 }
             }
-            // Only a plain, un-aliased base column keeps view and base names in
-            // sync (so the view's/DML's WHERE resolve directly against the base).
+            // The output must be a plain base column; catalog aliases map it
+            // back to the same base name at the DML boundary.
             SelectItem::Expr {
                 expression: Expr::Column { name: cn, .. },
-                alias,
+                alias: _,
             } => {
-                if alias.is_some_and(|a| a != *cn) {
-                    return Err(not_updatable());
-                }
                 if n == MAX_PROJ {
                     return Err(not_updatable());
                 }
-                columns[n] = cn;
+                if base_columns[..n].contains(cn) {
+                    return Err(not_updatable());
+                }
+                base_columns[n] = cn;
                 n += 1;
             }
             _ => return Err(not_updatable()),
         }
     }
+    let columns = storage.view(view_slot).columns_for(txid);
+    if columns.len() != n {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "view \"{}\" has an invalid output-column definition",
+            name
+        ));
+    }
+    let mut exposed_columns = [""; MAX_PROJ];
+    for (target, column) in exposed_columns.iter_mut().zip(columns.names()) {
+        *target = arena.alloc_str(column.as_str()).map_err(|_| arena_full())?;
+    }
     let columns = arena
-        .alloc_slice_copy(&columns[..n])
+        .alloc_slice_copy(&exposed_columns[..n])
+        .map_err(|_| arena_full())?;
+    let base_columns = arena
+        .alloc_slice_copy(&base_columns[..n])
         .map_err(|_| arena_full())?;
     Ok(Some(UpdatableView {
         base,
         where_clause: sel.where_clause,
         columns,
+        base_columns,
+        defaults: *storage.view(view_slot).columns_for(txid),
         check_option,
     }))
 }
@@ -3940,20 +4020,9 @@ pub fn and_where<'a>(
     }
 }
 
-/// Validates a view definition at CREATE VIEW time, as PostgreSQL does: the
-/// SELECT must parse, its tables/views must exist, and its output columns must
-/// resolve. Surfaces the same errors (42P01 / 42703) a query would.
-pub fn validate_view<'a>(
-    sql: &'a str,
-    storage: &'a Storage,
-    txid: u32,
-    arena: &'a Arena,
-) -> Result<(), SqlError> {
-    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
-    // A view may reference a table/view created earlier in this transaction;
-    // other sessions still cannot see either pending object.
-    let count = describe_query(sql, storage, txid, arena, &mut columns)?;
-    for column in &columns[..count] {
+/// Rejects pseudo-type view outputs after the query-descriptor boundary.
+pub fn validate_view_columns(columns: &[ColDesc<'_>]) -> Result<(), SqlError> {
+    for column in columns {
         if matches!(
             column.type_oid,
             super::types::oid::RECORD | super::types::oid::RECORD_ARRAY

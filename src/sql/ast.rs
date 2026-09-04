@@ -97,6 +97,25 @@ pub enum ViewSecurity {
     Invoker,
 }
 
+/// The view option keeps an explicit `false` distinct from the PostgreSQL
+/// default, because `pg_class.reloptions` exposes that distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewSecurityBarrier {
+    Default,
+    Enabled,
+    Disabled,
+}
+
+impl ViewSecurityBarrier {
+    pub const fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
 /// PostgreSQL's three view options.  Parsing them as a closed state keeps a
 /// later executor from treating a misspelled option as inert catalog text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,11 +164,14 @@ pub enum AlterViewAction<'a> {
 
 /// `ALTER MATERIALIZED VIEW` deliberately exposes only operations whose
 /// backing-relation effects have one durable implementation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AlterMaterializedViewAction<'a> {
     RenameTo(&'a str),
     SetSchema(&'a str),
-    SetTablespace(&'a str),
+    /// The table-like metadata actions PostgreSQL permits on a materialized
+    /// view. They are already typed `ALTER TABLE` states, so the backing
+    /// relation cannot acquire an unparsed second definition.
+    TableActions(&'a [AlterAction<'a>]),
 }
 
 /// One explicitly named relation in a publication.  An empty `columns` slice
@@ -257,6 +279,23 @@ impl Collation {
     }
 }
 
+/// A role specification accepted by `CREATE SCHEMA AUTHORIZATION`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaAuthorization<'a> {
+    Name(&'a str),
+    CurrentRole,
+    CurrentUser,
+    SessionUser,
+}
+
+/// A `CREATE SCHEMA` name is either written explicitly or derived from the
+/// resolved authorization role at execution time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaName<'a> {
+    Explicit(&'a str),
+    Authorization,
+}
+
 /// A statement PostgreSQL permits inside CREATE SCHEMA. Keeping this distinct
 /// from [`Stmt`] makes the parser's grammar guarantee available to execution.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -264,8 +303,10 @@ pub enum CreateSchemaElement<'a> {
     Table(CreateTable<'a>),
     View {
         name: QualName<'a>,
+        columns: &'a [&'a str],
         or_replace: bool,
         security: ViewSecurity,
+        security_barrier: ViewSecurityBarrier,
         check_option: Option<ViewCheckOption>,
         sql: &'a str,
     },
@@ -289,14 +330,13 @@ pub enum CreateSchemaElement<'a> {
         if_not_exists: bool,
         options: SeqOptions<'a>,
     },
-    Domain(CreateDomain<'a>),
-    Enum {
-        name: QualName<'a>,
-        labels: &'a [&'a str],
-    },
-    Composite {
-        name: QualName<'a>,
-        fields: &'a [CompositeField<'a>],
+    Trigger(CreateTrigger<'a>),
+    Grant {
+        privileges: &'a [PrivilegeSpec<'a>],
+        target: PrivilegeTarget<'a>,
+        grantees: &'a [&'a str],
+        grant_option: bool,
+        grantor: Option<&'a str>,
     },
 }
 
@@ -486,8 +526,12 @@ pub enum Stmt<'a> {
     /// stored and re-expanded as a derived table at query time.
     CreateView {
         name: QualName<'a>,
+        /// Output names are part of the view's durable relation identity, not
+        /// aliases discarded after parsing the SELECT body.
+        columns: &'a [&'a str],
         or_replace: bool,
         security: ViewSecurity,
+        security_barrier: ViewSecurityBarrier,
         check_option: Option<ViewCheckOption>,
         sql: &'a str,
     },
@@ -521,6 +565,8 @@ pub enum Stmt<'a> {
     CreateAggregate(CreateAggregate<'a>),
     CreateCast(CreateCast<'a>),
     DropCast(DropCast<'a>),
+    CreateTransform(CreateTransform<'a>),
+    DropTransform(DropTransform<'a>),
     CreateOperator(CreateOperator<'a>),
     AlterOperator {
         identity: OperatorIdentity<'a>,
@@ -801,6 +847,7 @@ pub enum Stmt<'a> {
         with_data: bool,
         if_not_exists: bool,
         kind: CreateTableAsKind,
+        options: TableAsOptions<'a>,
     },
     /// REFRESH MATERIALIZED VIEW name — re-run the stored query, replacing rows.
     RefreshMaterializedView {
@@ -818,12 +865,12 @@ pub enum Stmt<'a> {
         if_not_exists: bool,
         options: SeqOptions<'a>,
     },
-    /// ALTER SEQUENCE [IF EXISTS] name [options] [RESTART [WITH n]].
+    /// ALTER SEQUENCE has exactly one typed action.  A rename cannot carry
+    /// parameter options or a schema move into execution.
     AlterSequence {
         name: QualName<'a>,
         if_exists: bool,
-        options: SeqOptions<'a>,
-        set_schema: Option<&'a str>,
+        action: AlterSequenceAction<'a>,
     },
     /// DROP SEQUENCE [IF EXISTS] name [, ...].
     DropSequence {
@@ -990,8 +1037,8 @@ pub enum Stmt<'a> {
     /// Elements are the grammar-permitted CREATE forms, executed with the new
     /// schema as their creation target.
     CreateSchema {
-        name: &'a str,
-        authorization: Option<&'a str>,
+        name: SchemaName<'a>,
+        authorization: Option<SchemaAuthorization<'a>>,
         if_not_exists: bool,
         elements: &'a [&'a CreateSchemaElement<'a>],
     },
@@ -1000,6 +1047,11 @@ pub enum Stmt<'a> {
         names: &'a [&'a str],
         if_exists: bool,
         cascade: bool,
+    },
+    /// ALTER SCHEMA has a closed identity or ownership transition.
+    AlterSchema {
+        name: &'a str,
+        action: AlterSchemaAction<'a>,
     },
     CreateDatabase {
         name: &'a str,
@@ -1027,6 +1079,20 @@ pub enum Stmt<'a> {
     DropTablespace {
         name: &'a str,
         if_exists: bool,
+    },
+    /// CREATE ACCESS METHOD defines a database-local relation implementation.
+    /// The handler kind is parsed separately from its spelling so execution
+    /// cannot accidentally install an index handler on a table method.
+    CreateAccessMethod {
+        name: &'a str,
+        method_type: AccessMethodType,
+        handler: QualName<'a>,
+    },
+    /// DROP ACCESS METHOD [IF EXISTS] name [CASCADE | RESTRICT].
+    DropAccessMethod {
+        names: &'a [&'a str],
+        if_exists: bool,
+        cascade: bool,
     },
     /// DECLARE name [BINARY] [SCROLL|NO SCROLL] CURSOR [WITH|WITHOUT HOLD] FOR select.
     /// `sql` is the raw SELECT text, materialized at DECLARE.
@@ -1069,6 +1135,16 @@ pub enum Stmt<'a> {
         target: CommentTarget<'a>,
         text: Option<&'a str>,
     },
+    /// A parsed provider, target, and label prevent malformed security-label
+    /// syntax from being hidden by the absent native provider boundary.
+    SecurityLabel {
+        provider: Option<&'a str>,
+        target: SecurityLabelTarget<'a>,
+        label: Option<&'a str>,
+    },
+    /// LOAD is intentionally not an application extension point: object-store
+    /// durability cannot safely host a session-loaded native library.
+    Load(&'a str),
     /// ALTER <supported object> name OWNER TO role. Every catalog object is
     /// owned by the one modeled role, but the target and requested role are
     /// still validated exactly.
@@ -1089,17 +1165,17 @@ pub enum Stmt<'a> {
         options: RoleOptions<'a>,
         memberships: RoleMembershipClauses<'a>,
     },
-    /// ALTER ROLE / USER / GROUP name [WITH] role-option ...
+    /// ALTER ROLE / USER role-specification [WITH] role-option ...
     AlterRole {
-        name: &'a str,
+        role: RoleSpecification<'a>,
         options: RoleOptions<'a>,
     },
     AlterRoleRename {
-        name: &'a str,
+        role: RoleSpecification<'a>,
         new_name: &'a str,
     },
     AlterRoleSetting {
-        role: Option<&'a str>,
+        role: Option<RoleSpecification<'a>>,
         database: Option<&'a str>,
         action: RoleSettingAction<'a>,
     },
@@ -2164,11 +2240,14 @@ pub enum PrivilegeObjectKind {
     Tablespace,
     Database,
     Type,
+    ProceduralLanguage,
     ForeignDataWrapper,
     ForeignServer,
     AllTablesInSchema,
     AllSequencesInSchema,
     AllFunctionsInSchema,
+    AllProceduresInSchema,
+    AllRoutinesInSchema,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2226,6 +2305,16 @@ pub enum RoleMembershipOption {
     Set,
 }
 
+/// PostgreSQL role specifications keep session identities distinct from quoted
+/// role names with the same spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleSpecification<'a> {
+    Name(&'a str),
+    CurrentRole,
+    CurrentUser,
+    SessionUser,
+}
+
 /// Membership option changes are patches. PostgreSQL preserves an existing
 /// option when it is omitted; defaults are applied only to a new edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2275,10 +2364,20 @@ pub struct RoleOptions<'a> {
     pub replication: Option<bool>,
     pub bypass_row_level_security: Option<bool>,
     pub connection_limit: Option<i32>,
+    /// Obsolete PostgreSQL spelling retained as an explicit no-state option.
+    pub sysid: Option<i32>,
     /// `Some(None)` is PASSWORD NULL; `None` means no PASSWORD clause.
-    pub password: Option<Option<&'a str>>,
-    /// Canonical source text of VALID UNTIL, or NULL for infinity.
-    pub valid_until: Option<Option<&'a str>>,
+    pub password: Option<Option<RolePasswordSpec<'a>>>,
+    /// Canonical source text of a PostgreSQL VALID UNTIL timestamp literal.
+    pub valid_until: Option<&'a str>,
+}
+
+/// A password is either plaintext or a complete imported PostgreSQL verifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolePasswordSpec<'a> {
+    Plaintext(&'a str),
+    ScramVerifier(crate::pg::auth::ScramServer),
+    Md5Verifier(crate::storage::Md5Verifier),
 }
 
 impl RoleOptions<'_> {
@@ -2291,6 +2390,7 @@ impl RoleOptions<'_> {
         replication: None,
         bypass_row_level_security: None,
         connection_limit: None,
+        sysid: None,
         password: None,
         valid_until: None,
     };
@@ -2329,11 +2429,45 @@ pub struct DropCast<'a> {
     pub cascade: bool,
 }
 
+/// A transform function retains its optional signature, so an omitted
+/// signature cannot be confused with an unqualified function name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransformFunction<'a> {
+    pub name: QualName<'a>,
+    pub argument_types: &'a [&'a str],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTransform<'a> {
+    pub type_name: &'a str,
+    pub language: &'a str,
+    pub from_sql: Option<TransformFunction<'a>>,
+    pub to_sql: Option<TransformFunction<'a>>,
+    pub or_replace: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTransform<'a> {
+    pub type_name: &'a str,
+    pub language: &'a str,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
 /// PostgreSQL exposes only the btree access method in pos3ql's modeled index
 /// runtime. Parsing produces this closed value before catalog mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexAccessMethod {
     Btree,
+}
+
+/// The PostgreSQL relation class implemented by an access-method handler.
+/// This is a closed parser boundary: a handler cannot reach catalog mutation
+/// until its table/index contract is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessMethodType {
+    Table,
+    Index,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2529,6 +2663,15 @@ pub enum AlterOwnerKind {
     Statistics,
 }
 
+/// `ALTER SCHEMA` accepts only these two transitions. Keeping ownership here
+/// rather than in the generic owner form prevents a schema rename from being
+/// represented as an unrelated relation operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterSchemaAction<'a> {
+    RenameTo(&'a str),
+    OwnerTo(&'a str),
+}
+
 /// Which kind of relation a `COMMENT ON` names — PostgreSQL rejects a comment
 /// whose keyword does not match the object's actual kind (42809).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2634,6 +2777,47 @@ pub enum CommentTarget<'a> {
         name: &'a str,
         domain_only: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityLabelRelationKind {
+    Table,
+    View,
+    MaterializedView,
+    Sequence,
+    ForeignTable,
+}
+
+/// The PostgreSQL object classes accepted by `SECURITY LABEL`. This is kept
+/// separate from `COMMENT` because their surface grammars differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityLabelTarget<'a> {
+    Aggregate(AggregateIdentity<'a>),
+    Relation {
+        kind: SecurityLabelRelationKind,
+        name: QualName<'a>,
+    },
+    Column {
+        relation: QualName<'a>,
+        column: &'a str,
+    },
+    Routine {
+        kind: RoutineTargetKind,
+        identity: RoutineIdentity<'a>,
+    },
+    Database(&'a str),
+    Type {
+        name: &'a str,
+        domain_only: bool,
+    },
+    EventTrigger(&'a str),
+    LargeObject(LargeObjectId),
+    ProceduralLanguage(&'a str),
+    Publication(&'a str),
+    Role(&'a str),
+    Schema(&'a str),
+    Subscription(&'a str),
+    Tablespace(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3179,6 +3363,24 @@ pub enum TableAccessMethod<'a> {
     Named(&'a str),
 }
 
+/// The relation metadata accepted before the AS query of a table-producing
+/// command. Keeping it whole avoids a parser/executor boundary where one
+/// option can be carried without the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableAsOptions<'a> {
+    pub access_method: TableAccessMethod<'a>,
+    pub tablespace: Option<&'a str>,
+    pub storage_options: RelationStorageOptions,
+}
+
+impl<'a> TableAsOptions<'a> {
+    pub const DEFAULT: Self = Self {
+        access_method: TableAccessMethod::Heap,
+        tablespace: None,
+        storage_options: RelationStorageOptions::DEFAULT,
+    };
+}
+
 /// PostgreSQL's table-persistence grammar, parsed before execution decides
 /// whether the object-native durability contract can realize it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3401,6 +3603,14 @@ pub struct SeqOptions<'a> {
     /// None = omitted; Some(None) = OWNED BY NONE; Some(Some(owner)) assigns
     /// the sequence to a table column.
     pub owned_by: Option<Option<SeqOwner<'a>>>,
+}
+
+/// One `ALTER SEQUENCE` action after its target has been parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlterSequenceAction<'a> {
+    Options(SeqOptions<'a>),
+    RenameTo(&'a str),
+    SetSchema(&'a str),
 }
 
 impl<'a> SeqOptions<'a> {
@@ -4345,6 +4555,13 @@ pub enum AlterAction<'a> {
     SetGeneratedExpression {
         column: &'a str,
         expression_text: &'a str,
+    },
+    /// ALTER [COLUMN] col DROP EXPRESSION [IF EXISTS]. This changes a stored
+    /// generated column back into an ordinary writable column while retaining
+    /// its already-materialized values.
+    DropGeneratedExpression {
+        column: &'a str,
+        if_exists: bool,
     },
     /// ALTER [COLUMN] col SET identity-sequence options.
     AlterIdentitySequence {

@@ -492,6 +492,15 @@ struct GucValues {
     default_transaction_isolation: TransactionIsolation,
     default_transaction_read_only: bool,
     default_transaction_deferrable: bool,
+    password_encryption: PasswordEncryption,
+}
+
+/// PostgreSQL's closed credential format choice for new plaintext role
+/// passwords. Imported verifier strings remain their own typed input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PasswordEncryption {
+    ScramSha256,
+    Md5,
 }
 
 impl GucValues {
@@ -519,6 +528,7 @@ impl GucValues {
             default_transaction_isolation: TransactionIsolation::ReadCommitted,
             default_transaction_read_only: false,
             default_transaction_deferrable: false,
+            password_encryption: PasswordEncryption::ScramSha256,
         };
         let _ = write!(values.datestyle, "ISO, MDY");
         let _ = write!(values.timezone, "UTC");
@@ -558,7 +568,8 @@ const GUC_IDLE_IN_TRANSACTION_SESSION_TIMEOUT: u32 = 1 << 21;
 const GUC_TRANSACTION_TIMEOUT: u32 = 1 << 22;
 const GUC_EVENT_TRIGGERS: u32 = 1 << 23;
 const GUC_DEFAULT_TEXT_SEARCH_CONFIG: u32 = 1 << 24;
-const GUC_ALL: u32 = (1 << 25) - 1;
+const GUC_PASSWORD_ENCRYPTION: u32 = 1 << 25;
+const GUC_ALL: u32 = (1 << 26) - 1;
 
 fn guc_bit(name: &str) -> u32 {
     if name.eq_ignore_ascii_case("datestyle") {
@@ -611,6 +622,8 @@ fn guc_bit(name: &str) -> u32 {
         GUC_TRANSACTION_TIMEOUT
     } else if name.eq_ignore_ascii_case("event_triggers") {
         GUC_EVENT_TRIGGERS
+    } else if name.eq_ignore_ascii_case("password_encryption") {
+        GUC_PASSWORD_ENCRYPTION
     } else {
         0
     }
@@ -663,6 +676,7 @@ fn copy_guc_values(target: &mut GucValues, source: &GucValues, mask: u32) {
         GUC_DEFAULT_TRANSACTION_DEFERRABLE,
         default_transaction_deferrable
     );
+    copy!(GUC_PASSWORD_ENCRYPTION, password_encryption);
 }
 
 fn finish_setting_change(
@@ -809,6 +823,7 @@ fn merge_session_changes(target: &mut GucValues, before: &GucValues, after: &Guc
     changed!(default_transaction_isolation);
     changed!(default_transaction_read_only);
     changed!(default_transaction_deferrable);
+    changed!(password_encryption);
 }
 
 impl Default for GucState {
@@ -907,6 +922,11 @@ impl GucState {
                     "off"
                 },
             ))
+        } else if name.eq_ignore_ascii_case("password_encryption") {
+            Some(StackStr::from_str(match values.password_encryption {
+                PasswordEncryption::ScramSha256 => "scram-sha-256",
+                PasswordEncryption::Md5 => "md5",
+            }))
         } else {
             None
         }
@@ -950,6 +970,10 @@ impl GucState {
 
     pub fn default_tablespace(&self) -> StackStr<64> {
         self.store.borrow().current.default_tablespace
+    }
+
+    pub(crate) fn password_encryption(&self) -> PasswordEncryption {
+        self.store.borrow().current.password_encryption
     }
 
     pub fn seq_session(&self) -> &SeqSession {
@@ -1651,6 +1675,8 @@ fn reset_setting(values: &mut GucValues, defaults: &GucValues, name: &str) -> Re
         values.default_transaction_read_only = defaults.default_transaction_read_only;
     } else if name.eq_ignore_ascii_case("default_transaction_deferrable") {
         values.default_transaction_deferrable = defaults.default_transaction_deferrable;
+    } else if name.eq_ignore_ascii_case("password_encryption") {
+        values.password_encryption = defaults.password_encryption;
     } else if name.eq_ignore_ascii_case("synchronize_seqscans") {
         // Storage scans are deterministic and never synchronize their starts.
     } else if name.eq_ignore_ascii_case("standard_conforming_strings")
@@ -1963,6 +1989,20 @@ fn apply_setting(values: &mut GucValues, name: &str, raw: &str) -> Result<(), Sq
         };
         return Ok(());
     }
+    if name.eq_ignore_ascii_case("password_encryption") {
+        values.password_encryption = if is_default || v.eq_ignore_ascii_case("scram-sha-256") {
+            PasswordEncryption::ScramSha256
+        } else if v.eq_ignore_ascii_case("md5") {
+            PasswordEncryption::Md5
+        } else {
+            return Err(sql_err!(
+                sqlstate::INVALID_PARAMETER_VALUE,
+                "invalid value for parameter \"password_encryption\": \"{}\"",
+                v
+            ));
+        };
+        return Ok(());
+    }
     // Read-only parameters cannot be assigned.
     if is_read_only(name) {
         return Err(sql_err!(
@@ -2060,6 +2100,11 @@ impl GucState {
                     "off"
                 },
             ))
+        } else if name.eq_ignore_ascii_case("password_encryption") {
+            Some(StackStr::from_str(match values.password_encryption {
+                PasswordEncryption::ScramSha256 => "scram-sha-256",
+                PasswordEncryption::Md5 => "md5",
+            }))
         } else if name.eq_ignore_ascii_case("seed") {
             Some(StackStr::from_str("unavailable"))
         } else {

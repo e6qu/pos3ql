@@ -166,10 +166,14 @@ const KIND_SET_FOREIGN_DATA_WRAPPER: u8 = 115;
 const KIND_SET_FOREIGN_SERVER: u8 = 116;
 const KIND_SET_USER_MAPPING: u8 = 117;
 const KIND_SET_FOREIGN_TABLE: u8 = 118;
-const KIND_SET_VIEW_SECURITY: u8 = 119;
+const KIND_CREATE_ACCESS_METHOD: u8 = 119;
 const KIND_RENAME_VIEW: u8 = 120;
-const KIND_SET_VIEW_CHECK_OPTION: u8 = 121;
+const KIND_DROP_ACCESS_METHOD: u8 = 121;
 const KIND_RENAME_ROLE: u8 = 122;
+const KIND_RENAME_SEQUENCE: u8 = 124;
+const KIND_RENAME_SCHEMA: u8 = 125;
+const KIND_SET_VIEW_COLUMNS: u8 = 126;
+const KIND_SET_VIEW_OPTIONS: u8 = 127;
 /// A durable transaction boundary. Logical replication may expose only the
 /// records preceding one of these markers.
 const KIND_COMMIT: u8 = 37;
@@ -177,7 +181,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_SET_PARAMETER_ACL;
+const LAST_KIND: u8 = KIND_SET_VIEW_OPTIONS;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -542,10 +546,12 @@ pub(crate) enum WalOp<'a> {
     CreateView {
         schema: &'a str,
         name: &'a str,
+        columns: crate::storage::ViewColumns,
         sql: &'a str,
         /// The creator's search_path, under which the body re-resolves.
         path: &'a str,
         security_invoker: bool,
+        security_barrier: u8,
         check_option: u8,
         dependencies: WalStoredQueryDependencies<'a>,
     },
@@ -553,15 +559,17 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
     },
-    SetViewSecurity {
+    SetViewOptions {
         schema: &'a str,
         name: &'a str,
         security_invoker: bool,
+        security_barrier: u8,
+        check_option: u8,
     },
-    SetViewCheckOption {
+    SetViewColumns {
         schema: &'a str,
         name: &'a str,
-        check_option: u8,
+        columns: crate::storage::ViewColumns,
     },
     RenameView {
         schema: &'a str,
@@ -849,6 +857,14 @@ pub(crate) enum WalOp<'a> {
     DropTablespace {
         name: &'a str,
     },
+    CreateAccessMethod {
+        created_at: u64,
+        name: &'a str,
+        handler: crate::storage::TableAccessMethodHandler,
+    },
+    DropAccessMethod {
+        name: &'a str,
+    },
     CreateDatabase {
         oid: i32,
         template_oid: i32,
@@ -883,6 +899,10 @@ pub(crate) enum WalOp<'a> {
     },
     CreateSchema(&'a str),
     DropSchema(&'a str),
+    RenameSchema {
+        name: &'a str,
+        new_name: &'a str,
+    },
     UpsertExtension {
         name: &'a str,
         schema: &'a str,
@@ -924,6 +944,11 @@ pub(crate) enum WalOp<'a> {
         schema: &'a str,
         name: &'a str,
         new_schema: &'a str,
+    },
+    RenameSequence {
+        schema: &'a str,
+        name: &'a str,
+        new_name: &'a str,
     },
     SetViewSchema {
         schema: &'a str,
@@ -1988,8 +2013,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::Truncate { .. } => KIND_TRUNCATE,
         WalOp::CreateView { .. } => KIND_CREATE_VIEW,
         WalOp::DropView { .. } => KIND_DROP_VIEW,
-        WalOp::SetViewSecurity { .. } => KIND_SET_VIEW_SECURITY,
-        WalOp::SetViewCheckOption { .. } => KIND_SET_VIEW_CHECK_OPTION,
+        WalOp::SetViewOptions { .. } => KIND_SET_VIEW_OPTIONS,
+        WalOp::SetViewColumns { .. } => KIND_SET_VIEW_COLUMNS,
         WalOp::RenameView { .. } => KIND_RENAME_VIEW,
         WalOp::SetRule { .. } => KIND_SET_RULE,
         WalOp::DropRule { .. } => KIND_DROP_RULE,
@@ -2029,6 +2054,8 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::CreateTablespace { .. } => KIND_CREATE_TABLESPACE,
         WalOp::AlterTablespace { .. } => KIND_ALTER_TABLESPACE,
         WalOp::DropTablespace { .. } => KIND_DROP_TABLESPACE,
+        WalOp::CreateAccessMethod { .. } => KIND_CREATE_ACCESS_METHOD,
+        WalOp::DropAccessMethod { .. } => KIND_DROP_ACCESS_METHOD,
         WalOp::CreateDatabase { .. } => KIND_CREATE_DATABASE,
         WalOp::AlterDatabase { .. } => KIND_ALTER_DATABASE,
         WalOp::DropDatabase { .. } => KIND_DROP_DATABASE,
@@ -2037,11 +2064,13 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::SequenceSet { .. } => KIND_SEQUENCE_SET,
         WalOp::CreateSchema(_) => KIND_CREATE_SCHEMA,
         WalOp::DropSchema(_) => KIND_DROP_SCHEMA,
+        WalOp::RenameSchema { .. } => KIND_RENAME_SCHEMA,
         WalOp::UpsertExtension { .. } => KIND_UPSERT_EXTENSION,
         WalOp::DropExtension { .. } => KIND_DROP_EXTENSION,
         WalOp::SetExtensionDependency { .. } => KIND_SET_EXTENSION_DEPENDENCY,
         WalOp::SetTableSchema { .. } => KIND_SET_TABLE_SCHEMA,
         WalOp::SetSequenceSchema { .. } => KIND_SET_SEQUENCE_SCHEMA,
+        WalOp::RenameSequence { .. } => KIND_RENAME_SEQUENCE,
         WalOp::SetViewSchema { .. } => KIND_SET_VIEW_SCHEMA,
         WalOp::SetExtensionConfig { .. } => KIND_SET_EXTENSION_CONFIG,
         WalOp::DropTableFk { .. } => KIND_DROP_FK,
@@ -2182,7 +2211,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             })
         }
         WalOp::CreateTable(def) => {
-            let mut n = 1 + def.name.as_str().len() + 2 + 2 + 3;
+            let mut n = 1 + def.name.as_str().len() + 2 + 2 + 2;
+            n += match def.access_method {
+                crate::storage::TableAccessMethod::Heap => 1,
+                crate::storage::TableAccessMethod::Catalog(_) => 5,
+            };
             for c in def.columns() {
                 let default_value = c.default.constant().copied();
                 n += 1 + c.name.as_str().len() + 3 + 4 + encoded_default_len(&default_value);
@@ -2287,14 +2320,31 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         WalOp::CreateView {
             schema,
             name,
+            columns,
             sql,
             path,
             security_invoker: _,
+            security_barrier: _,
             check_option: _,
             dependencies,
         } => {
             1 + name.len()
-                + 2
+                + 1
+                + 1
+                + columns
+                    .names()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        1 + name.as_str().len()
+                            + encoded_view_default_len(
+                                columns
+                                    .default_at(index)
+                                    .expect("view column index is bounded by its name slice"),
+                            )
+                    })
+                    .sum::<usize>()
+                + 3
                 + sql.len()
                 + 1
                 + schema.len()
@@ -2304,8 +2354,31 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + dependencies.encoded_len()
         }
         WalOp::DropView { schema, name } => 1 + name.len() + 1 + schema.len(),
-        WalOp::SetViewSecurity { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 1,
-        WalOp::SetViewCheckOption { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 1,
+        WalOp::SetViewOptions { schema, name, .. } => 1 + name.len() + 1 + schema.len() + 3,
+        WalOp::SetViewColumns {
+            schema,
+            name,
+            columns,
+        } => {
+            1 + name.len()
+                + 1
+                + schema.len()
+                + 1
+                + 1
+                + columns
+                    .names()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        1 + column.as_str().len()
+                            + encoded_view_default_len(
+                                columns
+                                    .default_at(index)
+                                    .expect("view column index is bounded by its name slice"),
+                            )
+                    })
+                    .sum::<usize>()
+        }
         WalOp::RenameView {
             schema,
             name,
@@ -2604,6 +2677,8 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             1 + name.len() + 1 + new_name.len() + 24 + 2
         }
         WalOp::DropTablespace { name } => 1 + name.len(),
+        WalOp::CreateAccessMethod { name, .. } => 8 + 1 + name.len() + 1,
+        WalOp::DropAccessMethod { name } => 1 + name.len(),
         WalOp::CreateDatabase { definition, .. } => 10 + database_definition_len(*definition),
         WalOp::AlterDatabase { definition, .. } => 6 + database_definition_len(*definition),
         WalOp::DropDatabase { .. } => 4,
@@ -2615,6 +2690,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
         } => 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
         WalOp::SequenceSet { schema, table, .. } => 1 + table.len() + 2 + 8 + 1 + schema.len(),
         WalOp::CreateSchema(name) | WalOp::DropSchema(name) => 1 + name.len(),
+        WalOp::RenameSchema { name, new_name } => 1 + name.len() + 1 + new_name.len(),
         WalOp::UpsertExtension {
             name,
             schema,
@@ -2672,6 +2748,11 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             name,
             new_schema,
         } => 1 + schema.len() + 1 + name.len() + 1 + new_schema.len(),
+        WalOp::RenameSequence {
+            schema,
+            name,
+            new_name,
+        } => 1 + schema.len() + 1 + name.len() + 1 + new_name.len(),
         WalOp::DropTableFk {
             schema,
             table,
@@ -3119,13 +3200,18 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             statistics,
         } => 1 + schema.len() + 1 + name.len() + statistics.encoded_len(),
         WalOp::UpsertRole { name, attributes } => {
+            let credential_len = match attributes.password {
+                None => 0,
+                Some(crate::storage::RoleCredential::Scram(password)) => {
+                    1 + password.salt.as_bytes().len() + 32 + 32 + 4
+                }
+                Some(crate::storage::RoleCredential::Md5(_)) => 32,
+            };
             1 + name.len()
                 + 2
                 + 4
-                + 16
-                + 32
-                + 32
-                + 4
+                + 1
+                + credential_len
                 + 1
                 + attributes
                     .valid_until
@@ -3713,7 +3799,12 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 },
             ]);
             ok &= buffer.append(&def.tablespace.to_le_bytes());
-            ok &= buffer.append(&[def.access_method.code()]);
+            ok &= match def.access_method {
+                crate::storage::TableAccessMethod::Heap => buffer.append(&[0]),
+                crate::storage::TableAccessMethod::Catalog(oid) => {
+                    buffer.append(&[1]) && buffer.append(&oid.get().to_le_bytes())
+                }
+            };
             for c in def.columns() {
                 ok &= name_bytes(buffer, c.name.as_str());
                 // Bit 7 (the last free per-column flag bit) marks a domain-typed
@@ -3890,39 +3981,72 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         WalOp::CreateView {
             schema,
             name,
+            columns,
             sql,
             path,
             security_invoker,
+            security_barrier,
             check_option,
             dependencies,
         } => {
             name_bytes(buffer, name)
+                && buffer.append(&[columns.len() as u8])
+                && buffer.append(&[u8::from(columns.has_aliases())])
+                && columns.names().iter().enumerate().all(|(index, name)| {
+                    name_bytes(buffer, name.as_str())
+                        && append_view_default(
+                            buffer,
+                            columns
+                                .default_at(index)
+                                .expect("view column index is bounded by its name slice"),
+                        )
+                })
                 && buffer.append(&(sql.len() as u16).to_le_bytes())
                 && buffer.append(sql.as_bytes())
                 && name_bytes(buffer, schema)
                 && buffer.append(&(path.len() as u16).to_le_bytes())
                 && buffer.append(path.as_bytes())
-                && buffer.append(&[u8::from(*security_invoker), *check_option])
+                && buffer.append(&[
+                    u8::from(*security_invoker),
+                    *security_barrier,
+                    *check_option,
+                ])
                 && dependencies.append(buffer)
         }
         WalOp::DropView { schema, name } => name_bytes(buffer, name) && name_bytes(buffer, schema),
-        WalOp::SetViewSecurity {
+        WalOp::SetViewOptions {
             schema,
             name,
             security_invoker,
-        } => {
-            name_bytes(buffer, name)
-                && name_bytes(buffer, schema)
-                && buffer.append(&[u8::from(*security_invoker)])
-        }
-        WalOp::SetViewCheckOption {
-            schema,
-            name,
+            security_barrier,
             check_option,
         } => {
             name_bytes(buffer, name)
                 && name_bytes(buffer, schema)
-                && buffer.append(&[*check_option])
+                && buffer.append(&[
+                    u8::from(*security_invoker),
+                    *security_barrier,
+                    *check_option,
+                ])
+        }
+        WalOp::SetViewColumns {
+            schema,
+            name,
+            columns,
+        } => {
+            name_bytes(buffer, name)
+                && name_bytes(buffer, schema)
+                && buffer.append(&[columns.len() as u8])
+                && buffer.append(&[u8::from(columns.has_aliases())])
+                && columns.names().iter().enumerate().all(|(index, column)| {
+                    name_bytes(buffer, column.as_str())
+                        && append_view_default(
+                            buffer,
+                            columns
+                                .default_at(index)
+                                .expect("view column index is bounded by its name slice"),
+                        )
+                })
         }
         WalOp::RenameView {
             schema,
@@ -4376,6 +4500,16 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                 && buffer.append(&owner.to_le_bytes())
         }
         WalOp::DropTablespace { name } => name_bytes(buffer, name),
+        WalOp::CreateAccessMethod {
+            created_at,
+            name,
+            handler,
+        } => {
+            buffer.append(&created_at.to_le_bytes())
+                && name_bytes(buffer, name)
+                && buffer.append(&[handler.code()])
+        }
+        WalOp::DropAccessMethod { name } => name_bytes(buffer, name),
         WalOp::CreateDatabase {
             oid,
             template_oid,
@@ -4416,6 +4550,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::CreateSchema(name) | WalOp::DropSchema(name) => name_bytes(buffer, name),
+        WalOp::RenameSchema { name, new_name } => {
+            name_bytes(buffer, name) && name_bytes(buffer, new_name)
+        }
         WalOp::UpsertExtension {
             name,
             schema,
@@ -4485,6 +4622,11 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
         } => {
             name_bytes(buffer, schema) && name_bytes(buffer, name) && name_bytes(buffer, new_schema)
         }
+        WalOp::RenameSequence {
+            schema,
+            name,
+            new_name,
+        } => name_bytes(buffer, schema) && name_bytes(buffer, name) && name_bytes(buffer, new_name),
         WalOp::DropTableFk {
             schema,
             table,
@@ -5055,9 +5197,6 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             ok
         }
         WalOp::UpsertRole { name, attributes } => {
-            let password = attributes
-                .password
-                .unwrap_or(crate::storage::RolePassword::EMPTY);
             let flags = u16::from(attributes.superuser)
                 | (u16::from(attributes.inherit) << 1)
                 | (u16::from(attributes.create_role) << 2)
@@ -5070,10 +5209,20 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             name_bytes(buffer, name)
                 && buffer.append(&flags.to_le_bytes())
                 && buffer.append(&attributes.connection_limit.to_le_bytes())
-                && buffer.append(&password.salt)
-                && buffer.append(&password.stored_key)
-                && buffer.append(&password.server_key)
-                && buffer.append(&password.iterations.to_le_bytes())
+                && match attributes.password {
+                    None => buffer.append(&[0]),
+                    Some(crate::storage::RoleCredential::Scram(password)) => {
+                        buffer.append(&[1])
+                            && buffer.append(&[password.salt.as_bytes().len() as u8])
+                            && buffer.append(password.salt.as_bytes())
+                            && buffer.append(&password.stored_key)
+                            && buffer.append(&password.server_key)
+                            && buffer.append(&password.iterations.to_le_bytes())
+                    }
+                    Some(crate::storage::RoleCredential::Md5(password)) => {
+                        buffer.append(&[2]) && buffer.append(&password.hash)
+                    }
+                }
                 && name_bytes(
                     buffer,
                     attributes
@@ -6131,8 +6280,23 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             at += 1;
             let tablespace = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
-            let access_method = crate::storage::TableAccessMethod::from_code(*payload.get(at)?)?;
-            at += 1;
+            let access_method = match *payload.get(at)? {
+                0 => {
+                    at += 1;
+                    crate::storage::TableAccessMethod::Heap
+                }
+                1 => {
+                    at += 1;
+                    let access_method = crate::storage::TableAccessMethod::Catalog(
+                        crate::storage::AccessMethodOid::parse(i32::from_le_bytes(
+                            payload.get(at..at + 4)?.try_into().ok()?,
+                        ))?,
+                    );
+                    at += 4;
+                    access_method
+                }
+                _ => return None,
+            };
             let mut def = TableDef {
                 name: SqlName::parse(name).ok()?,
                 columns: [ColumnMeta {
@@ -6541,6 +6705,30 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
         }
         KIND_CREATE_VIEW => {
             let name = take_name(&mut at)?;
+            let column_count = *payload.get(at)? as usize;
+            at += 1;
+            let aliases = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            if column_count > crate::storage::MAX_COLUMNS {
+                return None;
+            }
+            let mut column_names = [""; crate::storage::MAX_COLUMNS];
+            let mut defaults = [crate::storage::ColumnDefault::NONE; crate::storage::MAX_COLUMNS];
+            for index in 0..column_count {
+                column_names[index] = take_name(&mut at)?;
+                defaults[index] = decode_view_default(payload, &mut at)?;
+            }
+            let mut columns =
+                crate::storage::ViewColumns::from_names(&column_names[..column_count])
+                    .ok()?
+                    .with_aliases(aliases);
+            for (index, default) in defaults[..column_count].iter().copied().enumerate() {
+                columns = columns.with_default(index, default).ok()?;
+            }
             let sql_len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().unwrap()) as usize;
             at += 2;
             let raw = payload.get(at..at + sql_len)?;
@@ -6558,6 +6746,9 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 _ => return None,
             };
             at += 1;
+            let security_barrier = *payload.get(at)?;
+            crate::storage::ViewSecurityBarrier::from_code(security_barrier)?;
+            at += 1;
             let check_option = match *payload.get(at)? {
                 0..=2 => *payload.get(at)?,
                 _ => return None,
@@ -6572,9 +6763,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             (at == payload.len()).then_some(WalOp::CreateView {
                 schema,
                 name,
+                columns,
                 sql,
                 path,
                 security_invoker,
+                security_barrier,
                 check_option,
                 dependencies,
             })
@@ -6584,7 +6777,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let schema = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropView { schema, name })
         }
-        KIND_SET_VIEW_SECURITY => {
+        KIND_SET_VIEW_OPTIONS => {
             let name = take_name(&mut at)?;
             let schema = take_name(&mut at)?;
             let security_invoker = match *payload.get(at)? {
@@ -6593,24 +6786,52 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 _ => return None,
             };
             at += 1;
-            (at == payload.len()).then_some(WalOp::SetViewSecurity {
-                schema,
-                name,
-                security_invoker,
-            })
-        }
-        KIND_SET_VIEW_CHECK_OPTION => {
-            let name = take_name(&mut at)?;
-            let schema = take_name(&mut at)?;
+            let security_barrier = *payload.get(at)?;
+            crate::storage::ViewSecurityBarrier::from_code(security_barrier)?;
+            at += 1;
             let check_option = *payload.get(at)?;
             if check_option > 2 {
                 return None;
             }
             at += 1;
-            (at == payload.len()).then_some(WalOp::SetViewCheckOption {
+            (at == payload.len()).then_some(WalOp::SetViewOptions {
                 schema,
                 name,
+                security_invoker,
+                security_barrier,
                 check_option,
+            })
+        }
+        KIND_SET_VIEW_COLUMNS => {
+            let name = take_name(&mut at)?;
+            let schema = take_name(&mut at)?;
+            let count = *payload.get(at)? as usize;
+            at += 1;
+            let aliases = match *payload.get(at)? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            at += 1;
+            if count > crate::storage::MAX_COLUMNS {
+                return None;
+            }
+            let mut names = [""; crate::storage::MAX_COLUMNS];
+            let mut defaults = [crate::storage::ColumnDefault::NONE; crate::storage::MAX_COLUMNS];
+            for index in 0..count {
+                names[index] = take_name(&mut at)?;
+                defaults[index] = decode_view_default(payload, &mut at)?;
+            }
+            let mut columns = crate::storage::ViewColumns::from_names(&names[..count])
+                .ok()?
+                .with_aliases(aliases);
+            for (index, default) in defaults[..count].iter().copied().enumerate() {
+                columns = columns.with_default(index, default).ok()?;
+            }
+            (at == payload.len()).then_some(WalOp::SetViewColumns {
+                schema,
+                name,
+                columns,
             })
         }
         KIND_RENAME_VIEW => {
@@ -7611,6 +7832,22 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropTablespace { name })
         }
+        KIND_CREATE_ACCESS_METHOD => {
+            let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
+            at += 8;
+            let name = take_name(&mut at)?;
+            let handler = crate::storage::TableAccessMethodHandler::from_code(*payload.get(at)?)?;
+            at += 1;
+            (at == payload.len()).then_some(WalOp::CreateAccessMethod {
+                created_at,
+                name,
+                handler,
+            })
+        }
+        KIND_DROP_ACCESS_METHOD => {
+            let name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::DropAccessMethod { name })
+        }
         KIND_CREATE_DATABASE => {
             let oid = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
@@ -7689,38 +7926,28 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let cache = take_i64(&mut at)?;
             let cycle = *payload.get(at)? != 0;
             at += 1;
-            // Ownership was added as an optional suffix; old journals end
-            // after `cycle` and replay as unowned sequences.
-            let owner = if at == payload.len() {
-                None
-            } else {
-                let has_owner = *payload.get(at)? != 0;
-                at += 1;
-                if has_owner {
+            let has_owner = *payload.get(at)? != 0;
+            at += 1;
+            let owner = has_owner
+                .then(|| {
                     Some(crate::storage::SequenceOwner {
                         table_schema: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                         table: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                         column: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                     })
-                } else {
-                    None
-                }
-            };
-            let generator_for = if at == payload.len() {
-                None
-            } else {
-                let has_generator = *payload.get(at)? != 0;
-                at += 1;
-                if has_generator {
+                })
+                .flatten();
+            let has_generator = *payload.get(at)? != 0;
+            at += 1;
+            let generator_for = has_generator
+                .then(|| {
                     Some(crate::storage::SequenceOwner {
                         table_schema: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                         table: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                         column: crate::storage::SqlName::parse(take_name(&mut at)?).ok()?,
                     })
-                } else {
-                    None
-                }
-            };
+                })
+                .flatten();
             (at == payload.len()).then_some(WalOp::CreateSequence {
                 schema,
                 name,
@@ -8907,6 +9134,11 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropSchema(name))
         }
+        KIND_RENAME_SCHEMA => {
+            let name = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RenameSchema { name, new_name })
+        }
         KIND_UPSERT_EXTENSION => {
             let created_at = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
             at += 8;
@@ -8982,6 +9214,16 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 schema,
                 name,
                 new_schema,
+            })
+        }
+        KIND_RENAME_SEQUENCE => {
+            let schema = take_name(&mut at)?;
+            let name = take_name(&mut at)?;
+            let new_name = take_name(&mut at)?;
+            (at == payload.len()).then_some(WalOp::RenameSequence {
+                schema,
+                name,
+                new_name,
             })
         }
         KIND_SET_VIEW_SCHEMA => {
@@ -9138,27 +9380,46 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             }
             let connection_limit = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
             at += 4;
-            let salt = payload.get(at..at + 16)?.try_into().ok()?;
-            at += 16;
-            let stored_key = payload.get(at..at + 32)?.try_into().ok()?;
-            at += 32;
-            let server_key = payload.get(at..at + 32)?.try_into().ok()?;
-            at += 32;
-            let iterations = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
-            at += 4;
+            let credential_kind = *payload.get(at)?;
+            at += 1;
+            let password = match credential_kind {
+                0 => None,
+                1 => {
+                    let salt_len = usize::from(*payload.get(at)?);
+                    at += 1;
+                    let salt =
+                        crate::pg::auth::ScramSalt::from_bytes(payload.get(at..at + salt_len)?)?;
+                    at += salt_len;
+                    let stored_key = payload.get(at..at + 32)?.try_into().ok()?;
+                    at += 32;
+                    let server_key = payload.get(at..at + 32)?.try_into().ok()?;
+                    at += 32;
+                    let iterations = u32::from_le_bytes(payload.get(at..at + 4)?.try_into().ok()?);
+                    at += 4;
+                    (iterations != 0).then_some(crate::storage::RoleCredential::Scram(
+                        crate::pg::auth::ScramServer {
+                            salt,
+                            stored_key,
+                            server_key,
+                            iterations,
+                        },
+                    ))
+                }
+                2 => {
+                    let hash: [u8; 32] = payload.get(at..at + 32)?.try_into().ok()?;
+                    at += 32;
+                    hash.iter().all(u8::is_ascii_hexdigit).then_some(
+                        crate::storage::RoleCredential::Md5(crate::storage::Md5Verifier { hash }),
+                    )
+                }
+                _ => return None,
+            };
             let valid_until = take_name(&mut at)?;
             let password_present = flags & (1 << 7) != 0;
             let valid_until_present = flags & (1 << 8) != 0;
-            let password = crate::storage::RolePassword {
-                salt,
-                stored_key,
-                server_key,
-                iterations,
-            };
             if at != payload.len()
                 || valid_until.len() > crate::storage::ROLE_VALID_UNTIL_MAX
-                || (password_present && iterations == 0)
-                || (!password_present && password != crate::storage::RolePassword::EMPTY)
+                || (password_present != password.is_some())
                 || (valid_until_present == valid_until.is_empty())
             {
                 return None;
@@ -9174,7 +9435,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     replication: flags & (1 << 5) != 0,
                     bypass_row_level_security: flags & (1 << 6) != 0,
                     connection_limit,
-                    password: password_present.then_some(password),
+                    password,
                     valid_until: valid_until_present
                         .then(|| crate::util::StackStr::from_str(valid_until)),
                 },
@@ -9423,6 +9684,7 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
     1 + match d {
         None | Some(OwnedDatum::Null) => 0,
         Some(OwnedDatum::Bool(_)) => 1,
+        Some(OwnedDatum::Char(_)) => 1,
         Some(OwnedDatum::Int4(_)) | Some(OwnedDatum::Oid(_)) => 4,
         Some(OwnedDatum::Int8(_)) | Some(OwnedDatum::Float8(_)) => 8,
         Some(OwnedDatum::Regtype { len, .. }) => 5 + *len as usize,
@@ -9446,6 +9708,67 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Array { len, .. }) => 5 + *len as usize,
         Some(OwnedDatum::Range { len, .. }) => 3 + *len as usize,
+    }
+}
+
+fn encoded_view_default_len(default: crate::storage::ColumnDefault) -> usize {
+    match default {
+        crate::storage::ColumnDefault::None => 1,
+        crate::storage::ColumnDefault::Constant { value, expression } => {
+            1 + encoded_default_len(&Some(value)) + 2 + expression.as_str().len()
+        }
+        crate::storage::ColumnDefault::Expression(expression) => 1 + 2 + expression.as_str().len(),
+        crate::storage::ColumnDefault::Generated(_) => {
+            unreachable!("view columns cannot carry generated expressions")
+        }
+    }
+}
+
+fn append_view_default(buffer: &mut FixedBuf, default: crate::storage::ColumnDefault) -> bool {
+    match default {
+        crate::storage::ColumnDefault::None => buffer.append(&[0]),
+        crate::storage::ColumnDefault::Constant { value, expression } => {
+            let bytes = expression.as_str().as_bytes();
+            buffer.append(&[1])
+                && append_default(buffer, &Some(value))
+                && buffer.append(&(bytes.len() as u16).to_le_bytes())
+                && buffer.append(bytes)
+        }
+        crate::storage::ColumnDefault::Expression(expression) => {
+            let bytes = expression.as_str().as_bytes();
+            buffer.append(&[2])
+                && buffer.append(&(bytes.len() as u16).to_le_bytes())
+                && buffer.append(bytes)
+        }
+        crate::storage::ColumnDefault::Generated(_) => {
+            unreachable!("view columns cannot carry generated expressions")
+        }
+    }
+}
+
+fn decode_view_default(payload: &[u8], at: &mut usize) -> Option<crate::storage::ColumnDefault> {
+    let tag = *payload.get(*at)?;
+    *at += 1;
+    let expression = |at: &mut usize| {
+        let len = u16::from_le_bytes(payload.get(*at..*at + 2)?.try_into().ok()?) as usize;
+        *at += 2;
+        if len > crate::storage::DEFAULT_EXPR_MAX {
+            return None;
+        }
+        let bytes = payload.get(*at..*at + len)?;
+        *at += len;
+        let source = core::str::from_utf8(bytes).ok()?;
+        let stored = StackStr::from_str(source);
+        (!stored.is_truncated()).then_some(stored)
+    };
+    match tag {
+        0 => Some(crate::storage::ColumnDefault::NONE),
+        1 => {
+            let value = decode_default(payload, at)??;
+            crate::storage::ColumnDefault::from_parts(Some(value), Some(expression(at)?), false)
+        }
+        2 => crate::storage::ColumnDefault::from_parts(None, Some(expression(at)?), false),
+        _ => None,
     }
 }
 
@@ -9473,6 +9796,11 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
         Some(OwnedDatum::Bool(b)) => {
             out[0] = 2;
             out[1] = u8::from(*b);
+            2
+        }
+        Some(OwnedDatum::Char(byte)) => {
+            out[0] = 30;
+            out[1] = *byte;
             2
         }
         Some(OwnedDatum::Int4(v)) => {
@@ -9698,6 +10026,11 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             let b = *payload.get(*at)?;
             *at += 1;
             Some(OwnedDatum::Bool(b != 0))
+        }
+        30 => {
+            let byte = *payload.get(*at)?;
+            *at += 1;
+            Some(OwnedDatum::Char(byte))
         }
         3 => {
             let b = payload.get(*at..*at + 4)?;
@@ -10338,6 +10671,7 @@ mod tests {
         text[..3].copy_from_slice(b"101");
         let defaults = [
             None,
+            Some(OwnedDatum::Char(0xff)),
             Some(OwnedDatum::Date(8_767)),
             Some(OwnedDatum::Interval(crate::sql::types::Interval {
                 months: 1,
@@ -11178,6 +11512,13 @@ mod tests {
         let mut roles = [SqlName::EMPTY; crate::storage::MAX_POLICY_ROLES];
         roles[0] = SqlName::parse("reader").unwrap();
         let dependencies = crate::storage::StoredQueryDependencies::EMPTY;
+        let create_columns = crate::storage::ViewColumns::from_derived_names(&["value"])
+            .unwrap()
+            .with_default(
+                0,
+                crate::storage::ColumnDefault::Expression(StackStr::from_str("random()")),
+            )
+            .unwrap();
         assert!(append_payload(
             &mut payload,
             &WalOp::SetPolicy {
@@ -11218,33 +11559,93 @@ mod tests {
             &WalOp::CreateView {
                 schema: "public",
                 name: "reader_view",
+                columns: create_columns,
                 sql: "SELECT * FROM protected",
                 path: "public",
                 security_invoker: true,
+                security_barrier: 1,
                 check_option: 2,
                 dependencies: WalStoredQueryDependencies::Captured(&dependencies),
             },
         ));
+        let Some(WalOp::CreateView {
+            security_invoker,
+            security_barrier,
+            check_option,
+            columns,
+            ..
+        }) = decode_op(KIND_CREATE_VIEW, payload.readable())
+        else {
+            panic!("view payload did not decode");
+        };
+        assert!(security_invoker);
+        assert_eq!(security_barrier, 1);
+        assert_eq!(check_option, 2);
+        assert!(!columns.has_aliases());
+        assert_eq!(columns.names()[0].as_str(), "value");
         assert!(matches!(
-            decode_op(KIND_CREATE_VIEW, payload.readable()),
-            Some(WalOp::CreateView {
-                security_invoker: true,
-                check_option: 2,
+            columns.default_at(0),
+            Some(crate::storage::ColumnDefault::Expression(source)) if source.as_str() == "random()"
+        ));
+        payload.clear();
+        let columns = crate::storage::ViewColumns::from_names(&["published_value", "live_value"])
+            .unwrap()
+            .with_default(
+                0,
+                crate::storage::ColumnDefault::Constant {
+                    value: OwnedDatum::Int4(22),
+                    expression: StackStr::from_str("22"),
+                },
+            )
+            .and_then(|columns| {
+                columns.with_default(
+                    1,
+                    crate::storage::ColumnDefault::Expression(StackStr::from_str("random()")),
+                )
+            })
+            .unwrap();
+        assert!(append_payload(
+            &mut payload,
+            &WalOp::SetViewColumns {
+                schema: "public",
+                name: "reader_view",
+                columns,
+            },
+        ));
+        let Some(WalOp::SetViewColumns { columns, .. }) =
+            decode_op(KIND_SET_VIEW_COLUMNS, payload.readable())
+        else {
+            panic!("view-column payload did not decode");
+        };
+        assert!(columns.has_aliases());
+        assert_eq!(columns.names()[0].as_str(), "published_value");
+        assert!(matches!(
+            columns.default_at(0),
+            Some(crate::storage::ColumnDefault::Constant {
+                value: OwnedDatum::Int4(22),
                 ..
             })
+        ));
+        assert!(matches!(
+            columns.default_at(1),
+            Some(crate::storage::ColumnDefault::Expression(source)) if source.as_str() == "random()"
         ));
         payload.clear();
         assert!(append_payload(
             &mut payload,
-            &WalOp::SetViewCheckOption {
+            &WalOp::SetViewOptions {
                 schema: "public",
                 name: "reader_view",
+                security_invoker: true,
+                security_barrier: 1,
                 check_option: 1,
             },
         ));
         assert!(matches!(
-            decode_op(KIND_SET_VIEW_CHECK_OPTION, payload.readable()),
-            Some(WalOp::SetViewCheckOption {
+            decode_op(KIND_SET_VIEW_OPTIONS, payload.readable()),
+            Some(WalOp::SetViewOptions {
+                security_invoker: true,
+                security_barrier: 1,
                 check_option: 1,
                 ..
             })

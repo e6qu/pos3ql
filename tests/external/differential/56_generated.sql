@@ -54,6 +54,27 @@ SELECT a, d FROM gen_h ORDER BY a;
 INSERT INTO gen_h (a) VALUES (9);
 SELECT a, d FROM gen_h ORDER BY a;
 
+-- SET EXPRESSION rewrites existing values. DROP EXPRESSION is a distinct
+-- transition: it preserves those values, clears attgenerated, and makes the
+-- column writable. Defaults cannot silently replace a generated expression.
+CREATE TABLE gen_evolution (a int, b int GENERATED ALWAYS AS (a + 1) STORED);
+INSERT INTO gen_evolution (a) VALUES (2), (4);
+ALTER TABLE gen_evolution ALTER COLUMN b SET EXPRESSION AS (a * 10);
+SELECT a, b FROM gen_evolution ORDER BY a;
+ALTER TABLE gen_evolution ALTER COLUMN b SET DEFAULT 7;
+ALTER TABLE gen_evolution ALTER COLUMN b DROP DEFAULT;
+ALTER TABLE gen_evolution ALTER COLUMN b SET NOT NULL;
+ALTER TABLE gen_evolution ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY;
+ALTER TABLE gen_evolution ALTER COLUMN b DROP EXPRESSION;
+SELECT a, b, attgenerated FROM gen_evolution
+  CROSS JOIN pg_attribute
+ WHERE attrelid = 'gen_evolution'::regclass AND attname = 'b'
+ ORDER BY a;
+UPDATE gen_evolution SET b = 99 WHERE a = 2;
+INSERT INTO gen_evolution VALUES (7, 8);
+SELECT a, b FROM gen_evolution ORDER BY a;
+ALTER TABLE gen_evolution ALTER COLUMN b DROP EXPRESSION IF EXISTS;
+
 -- LIKE copies a generated column as plain by default, keeps it with INCLUDING
 -- GENERATED.
 DROP TABLE IF EXISTS gen_cp1;
@@ -68,3 +89,4 @@ DROP TABLE gen_cp1;
 DROP TABLE gen_cp2;
 DROP TABLE gen_g;
 DROP TABLE gen_h;
+DROP TABLE gen_evolution;

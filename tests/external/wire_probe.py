@@ -4972,6 +4972,310 @@ def test_catalog_comments_over_raw_wire():
     s.close()
 
 
+def test_privilege_targets_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE ROLE wire_privilege_owner; "
+        "CREATE ROLE wire_privilege_reader; "
+        "CREATE SCHEMA wire_privilege_schema; "
+        "GRANT USAGE, CREATE ON SCHEMA wire_privilege_schema "
+        "TO wire_privilege_owner, wire_privilege_reader; "
+        "SET ROLE wire_privilege_owner; "
+        "CREATE TYPE wire_privilege_schema.wire_privilege_pair AS (value integer); "
+        "CREATE FUNCTION wire_privilege_schema.wire_privilege_function() "
+        "RETURNS integer LANGUAGE sql AS 'SELECT 7'; "
+        "CREATE PROCEDURE wire_privilege_schema.wire_privilege_procedure() "
+        "LANGUAGE sql AS 'SELECT 1'; "
+        "RESET ROLE; "
+        "REVOKE USAGE ON LANGUAGE sql FROM PUBLIC; "
+        "GRANT USAGE ON LANGUAGE sql TO wire_privilege_reader; "
+        "GRANT USAGE ON TYPE wire_privilege_schema.wire_privilege_pair TO wire_privilege_reader; "
+        "REVOKE EXECUTE ON FUNCTION wire_privilege_schema.wire_privilege_function() FROM PUBLIC; "
+        "REVOKE EXECUTE ON PROCEDURE wire_privilege_schema.wire_privilege_procedure() FROM PUBLIC; "
+        "GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA wire_privilege_schema "
+        "TO wire_privilege_reader",
+    )
+    initial = simple_query(
+        s,
+        "SELECT has_language_privilege('wire_privilege_reader', 14::oid, 'USAGE'), "
+        "has_type_privilege('wire_privilege_reader', 'wire_privilege_schema.wire_privilege_pair', 'USAGE'), "
+        "has_function_privilege('wire_privilege_reader', "
+        "'wire_privilege_schema.wire_privilege_function()', 'EXECUTE'), "
+        "has_function_privilege('wire_privilege_reader', "
+        "'wire_privilege_schema.wire_privilege_procedure()', 'EXECUTE'), "
+        "lanacl IS NOT NULL FROM pg_language WHERE lanname = 'sql'",
+    )
+    reader_ddl = simple_query(
+        s,
+        "SET ROLE wire_privilege_reader; "
+        "CREATE FUNCTION wire_privilege_schema.wire_privilege_sql_allowed() "
+        "RETURNS integer LANGUAGE sql AS 'SELECT 9'; "
+        "CREATE TABLE wire_privilege_schema.wire_privilege_values "
+        "(value wire_privilege_schema.wire_privilege_pair); "
+        "RESET ROLE; "
+    )
+    routine_changes = simple_query(
+        s,
+        "GRANT EXECUTE ON ALL ROUTINES IN SCHEMA wire_privilege_schema TO wire_privilege_reader; "
+        "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA wire_privilege_schema "
+        "FROM wire_privilege_reader; "
+        "SELECT has_function_privilege('wire_privilege_reader', "
+        "'wire_privilege_schema.wire_privilege_function()', 'EXECUTE'), "
+        "has_function_privilege('wire_privilege_reader', "
+        "'wire_privilege_schema.wire_privilege_procedure()', 'EXECUTE')",
+    )
+    cleanup = simple_query(
+        s,
+        "DROP TABLE wire_privilege_schema.wire_privilege_values; "
+        "DROP FUNCTION wire_privilege_schema.wire_privilege_sql_allowed(); "
+        "DROP FUNCTION wire_privilege_schema.wire_privilege_function(); "
+        "DROP PROCEDURE wire_privilege_schema.wire_privilege_procedure(); "
+        "DROP TYPE wire_privilege_schema.wire_privilege_pair; "
+        "REVOKE USAGE ON LANGUAGE sql FROM wire_privilege_reader; "
+        "GRANT USAGE ON LANGUAGE sql TO PUBLIC; "
+        "REVOKE USAGE, CREATE ON SCHEMA wire_privilege_schema "
+        "FROM wire_privilege_owner, wire_privilege_reader; "
+        "DROP SCHEMA wire_privilege_schema; "
+        "DROP ROLE wire_privilege_reader; "
+        "DROP ROLE wire_privilege_owner",
+    )
+    initial_rows = [text_row_fields(payload) for kind, payload in initial if kind == b"D"]
+    routine_rows = [
+        text_row_fields(payload) for kind, payload in routine_changes if kind == b"D"
+    ]
+    results = (setup, initial, reader_ddl, routine_changes, cleanup)
+    check(
+        "privilege targets: raw simple-query wire preserves language, composite, and routine ACLs",
+        not any(kind == b"E" for result in results for kind, _ in result)
+        and initial_rows == [["t", "t", "f", "t", "t"]]
+        and routine_rows == [["f", "t"]],
+        results,
+    )
+    s.close()
+
+
+def test_generated_expression_lifecycle_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_generated_lifecycle "
+        "(a integer, b integer GENERATED ALWAYS AS (a + 1) STORED); "
+        "INSERT INTO wire_generated_lifecycle (a) VALUES (2), (4); "
+        "ALTER TABLE wire_generated_lifecycle "
+        "ALTER COLUMN b SET EXPRESSION AS (a * 10)",
+    )
+    rewritten = simple_query(
+        s,
+        "SELECT a, b FROM wire_generated_lifecycle ORDER BY a",
+    )
+    set_default = simple_query(
+        s,
+        "ALTER TABLE wire_generated_lifecycle ALTER COLUMN b SET DEFAULT 7",
+    )
+    drop_default = simple_query(
+        s,
+        "ALTER TABLE wire_generated_lifecycle ALTER COLUMN b DROP DEFAULT",
+    )
+    add_identity = simple_query(
+        s,
+        "ALTER TABLE wire_generated_lifecycle ALTER COLUMN b SET NOT NULL; "
+        "ALTER TABLE wire_generated_lifecycle "
+        "ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY",
+    )
+    drop_expression = simple_query(
+        s,
+        "ALTER TABLE wire_generated_lifecycle ALTER COLUMN b DROP EXPRESSION; "
+        "UPDATE wire_generated_lifecycle SET b = 99 WHERE a = 2; "
+        "INSERT INTO wire_generated_lifecycle VALUES (7, 8); "
+        "SELECT a, b, attgenerated FROM wire_generated_lifecycle "
+        "CROSS JOIN pg_attribute "
+        "WHERE attrelid = 'wire_generated_lifecycle'::regclass AND attname = 'b' "
+        "ORDER BY a; "
+        "ALTER TABLE wire_generated_lifecycle ALTER COLUMN b DROP EXPRESSION IF EXISTS",
+    )
+    cleanup = simple_query(s, "DROP TABLE wire_generated_lifecycle")
+    rewritten_rows = [text_row_fields(payload) for kind, payload in rewritten if kind == b"D"]
+    dropped_rows = [
+        text_row_fields(payload) for kind, payload in drop_expression if kind == b"D"
+    ]
+    results = (
+        setup,
+        rewritten,
+        set_default,
+        drop_default,
+        add_identity,
+        drop_expression,
+        cleanup,
+    )
+    check(
+        "generated expressions: raw wire preserves rewrites and typed DROP EXPRESSION transition",
+        not any(kind == b"E" for result in (setup, rewritten, drop_expression, cleanup) for kind, _ in result)
+        and has_sqlstate(set_default, "42601")
+        and has_sqlstate(drop_default, "42601")
+        and has_sqlstate(add_identity, "55000")
+        and rewritten_rows == [["2", "20"], ["4", "40"]]
+        and dropped_rows == [["2", "99", ""], ["4", "40", ""], ["7", "8", ""]]
+        and any(kind == b"N" and b"not a stored generated column, skipping" in payload for kind, payload in drop_expression),
+        results,
+    )
+    s.close()
+
+
+def test_sequence_rename_lifecycle_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE SCHEMA wire_sequence_rename_schema; "
+        "CREATE SEQUENCE wire_sequence_rename_source START WITH 10 INCREMENT BY 2; "
+        "CREATE TABLE wire_sequence_rename_default (id bigint DEFAULT nextval('wire_sequence_rename_source')); "
+        "CREATE VIEW wire_sequence_rename_view AS WITH value AS MATERIALIZED (SELECT nextval('wire_sequence_rename_source') AS id) SELECT id FROM value; "
+        "COMMENT ON SEQUENCE wire_sequence_rename_source IS 'wire renamed sequence'; "
+        "SELECT nextval('wire_sequence_rename_source'); "
+        "ALTER SEQUENCE wire_sequence_rename_source RENAME TO wire_sequence_rename_target; "
+        "SELECT nextval('wire_sequence_rename_target'); "
+        "INSERT INTO wire_sequence_rename_default DEFAULT VALUES RETURNING id; "
+        "SELECT id FROM wire_sequence_rename_view; "
+        "SELECT nextval('wire_sequence_rename_target'); "
+        "BEGIN; "
+        "ALTER SEQUENCE wire_sequence_rename_target RENAME TO wire_sequence_rename_rollback; "
+        "SELECT nextval('wire_sequence_rename_rollback'); "
+        "ROLLBACK; "
+        "SELECT nextval('wire_sequence_rename_target'); "
+        "BEGIN; "
+        "ALTER SEQUENCE wire_sequence_rename_target RESTART WITH 100; "
+        "SELECT nextval('wire_sequence_rename_target'); "
+        "ROLLBACK; "
+        "SELECT nextval('wire_sequence_rename_target'); "
+        "ALTER SEQUENCE wire_sequence_rename_target SET SCHEMA wire_sequence_rename_schema; "
+        "ALTER SEQUENCE wire_sequence_rename_schema.wire_sequence_rename_target "
+        "RENAME TO wire_sequence_rename_durable; "
+        "SELECT nextval('wire_sequence_rename_schema.wire_sequence_rename_durable'); "
+        "INSERT INTO wire_sequence_rename_default DEFAULT VALUES RETURNING id; "
+        "SELECT obj_description('wire_sequence_rename_schema.wire_sequence_rename_durable'::regclass); "
+        "DROP VIEW wire_sequence_rename_view; "
+        "DROP TABLE wire_sequence_rename_default; "
+        "DROP SEQUENCE wire_sequence_rename_schema.wire_sequence_rename_durable; "
+        "DROP SCHEMA wire_sequence_rename_schema",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "sequence rename: raw wire preserves identity, rollback gaps, and comments",
+        not any(kind == b"E" for kind, _ in result)
+        and rows == [["10"], ["12"], ["14"], ["16"], ["18"], ["20"], ["22"], ["100"], ["24"], ["26"], ["28"], ["wire renamed sequence"]],
+        result,
+    )
+    s.close()
+
+
+def test_schema_rename_lifecycle_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE SCHEMA wire_schema_rename_source; "
+        "CREATE TYPE wire_schema_rename_source.mood AS ENUM ('calm', 'storm'); "
+        "CREATE SEQUENCE wire_schema_rename_source.ticket; "
+        "CREATE TABLE wire_schema_rename_source.items ("
+        "id bigint DEFAULT nextval('wire_schema_rename_source.ticket'), "
+        "state wire_schema_rename_source.mood); "
+        "CREATE VIEW wire_schema_rename_source.item_view AS "
+        "SELECT id, state FROM wire_schema_rename_source.items; "
+        "COMMENT ON SEQUENCE wire_schema_rename_source.ticket IS 'wire schema sequence'; "
+        "ALTER SCHEMA wire_schema_rename_source RENAME TO wire_schema_rename_target; "
+        "ALTER SCHEMA wire_schema_rename_target OWNER TO postgres; "
+        "INSERT INTO wire_schema_rename_target.items(state) VALUES ('calm') RETURNING id; "
+        "SELECT id, state FROM wire_schema_rename_target.item_view; "
+        "SELECT 'storm'::wire_schema_rename_target.mood; "
+        "SELECT obj_description('wire_schema_rename_target.ticket'::regclass); "
+        "BEGIN; "
+        "ALTER SCHEMA wire_schema_rename_target RENAME TO wire_schema_rename_rollback; "
+        "INSERT INTO wire_schema_rename_rollback.items(state) VALUES ('storm'); "
+        "ROLLBACK; "
+        "INSERT INTO wire_schema_rename_target.items(state) VALUES ('storm') RETURNING id; "
+        "DROP SCHEMA wire_schema_rename_target CASCADE",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "schema rename: raw wire preserves dependent catalog identities and rollback",
+        not any(kind == b"E" for kind, _ in result)
+        and rows == [["1"], ["1", "calm"], ["storm"], ["wire schema sequence"], ["3"]],
+        result,
+    )
+    s.close()
+
+
+def test_materialized_view_metadata_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE TABLE wire_matview_metadata_source (value integer); "
+        "INSERT INTO wire_matview_metadata_source VALUES (7), (9); "
+        "CREATE MATERIALIZED VIEW wire_matview_metadata (raw_value) "
+        "USING heap WITH (fillfactor = 75) "
+        "AS SELECT value FROM wire_matview_metadata_source; "
+        "ALTER MATERIALIZED VIEW wire_matview_metadata "
+        "ALTER COLUMN raw_value SET STATISTICS 61, SET (fillfactor = 80); "
+        "ALTER MATERIALIZED VIEW wire_matview_metadata "
+        "RENAME COLUMN raw_value TO measured; "
+        "SELECT measured FROM wire_matview_metadata ORDER BY measured; "
+        "SELECT attname, attstattarget FROM pg_attribute "
+        "WHERE attrelid = 'wire_matview_metadata'::regclass AND attnum > 0; "
+        "SELECT reloptions::text FROM pg_class "
+        "WHERE oid = 'wire_matview_metadata'::regclass; "
+        "BEGIN; ALTER MATERIALIZED VIEW wire_matview_metadata "
+        "SET (fillfactor = 90); ROLLBACK; "
+        "SELECT reloptions::text FROM pg_class "
+        "WHERE oid = 'wire_matview_metadata'::regclass; "
+        "DROP MATERIALIZED VIEW wire_matview_metadata; "
+        "DROP TABLE wire_matview_metadata_source",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "materialized view: raw wire retains typed metadata and rollback",
+        not any(kind == b"E" for kind, _ in result)
+        and rows == [["7"], ["9"], ["measured", "61"], ["{fillfactor=80}"], ["{fillfactor=80}"]],
+        result,
+    )
+    s.close()
+
+
+def test_view_output_columns_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    result = simple_query(
+        s,
+        "CREATE TABLE wire_view_output_source (value integer); "
+        "INSERT INTO wire_view_output_source VALUES (7); "
+        "CREATE VIEW wire_view_output (published_value) AS "
+        "SELECT value FROM wire_view_output_source; "
+        "INSERT INTO wire_view_output (published_value) VALUES (8); "
+        "ALTER VIEW wire_view_output RENAME COLUMN published_value TO current_value; "
+        "SELECT current_value FROM wire_view_output ORDER BY current_value; "
+        "SELECT attname FROM pg_attribute "
+        "WHERE attrelid = 'wire_view_output'::regclass AND attnum = 1; "
+        "DROP VIEW wire_view_output; DROP TABLE wire_view_output_source",
+    )
+    rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
+    check(
+        "view output columns: raw wire retains declared names through DML and rename",
+        not any(kind == b"E" for kind, _ in result)
+        and rows == [["7"], ["8"], ["current_value"]],
+        result,
+    )
+    s.close()
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

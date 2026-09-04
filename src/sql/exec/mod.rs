@@ -116,6 +116,16 @@ pub struct RowCtx<'s, 'v, 'd> {
 pub(crate) struct ViewCheck<'a> {
     pub predicate: Option<&'a Expr<'a>>,
     pub view_name: &'a str,
+    pub defaults: ViewInsertDefaults<'a>,
+}
+
+/// View-column defaults paired with the base columns reached by an
+/// auto-updatable view.  Keeping this mapping with the view rewrite avoids
+/// treating catalog aliases as table-column names at the INSERT boundary.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewInsertDefaults<'a> {
+    pub base_columns: &'a [&'a str],
+    pub columns: crate::storage::ViewColumns,
 }
 
 struct ViewCheckContext<'storage, 'arena, 'params, 'sequence> {
@@ -623,11 +633,16 @@ fn create_table_kind(
     def.access_method = match statement.access_method {
         crate::sql::ast::TableAccessMethod::Heap => crate::storage::TableAccessMethod::Heap,
         crate::sql::ast::TableAccessMethod::Named(name) => {
-            return sql_fail(sql_err!(
-                sqlstate::UNDEFINED_OBJECT,
-                "access method \"{}\" does not exist",
-                name
-            ));
+            match storage.table_access_method(name, txn.txid) {
+                Some(method) => method,
+                None => {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "access method \"{}\" does not exist",
+                        name
+                    ));
+                }
+            }
         }
     };
     def.storage_options = crate::storage::TableStorageOptions {
@@ -5014,6 +5029,111 @@ pub fn create_schema(
     sql_ok()
 }
 
+/// ALTER SCHEMA keeps the object identity at its catalog slot. Ownership uses
+/// the shared ACL transition; rename is journaled as a distinct namespace
+/// operation so recovery never expresses it as a drop/create pair.
+pub fn alter_schema(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    action: crate::sql::ast::AlterSchemaAction<'_>,
+    arena: &Arena,
+    responder: &mut Responder,
+) -> Outcome {
+    match action {
+        crate::sql::ast::AlterSchemaAction::OwnerTo(role) => alter_owner(
+            storage,
+            txn,
+            crate::sql::ast::AlterOwnerKind::Schema,
+            &QualName::bare(name),
+            role,
+            false,
+            responder,
+        ),
+        crate::sql::ast::AlterSchemaAction::RenameTo(new_name) => {
+            if new_name.starts_with("pg_") {
+                return sql_fail(sql_err!(
+                    sqlstate::RESERVED_NAME,
+                    "unacceptable schema name \"{}\"",
+                    new_name
+                ));
+            }
+            let Some(slot) = storage.find_schema_visible(name, txn.txid) else {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_SCHEMA_NAME,
+                    "schema \"{}\" does not exist",
+                    name
+                ));
+            };
+            let object = crate::storage::AccessObject {
+                class: crate::storage::AccessClass::Schema,
+                slot: slot as u16,
+            };
+            if let Err(error) = storage.require_owner(object, txn.txid, "schema") {
+                return sql_fail(error);
+            }
+            let new_name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            let prior_name = storage.schema_def(slot).name;
+            // Sequence literals in column defaults are textual at the SQL
+            // boundary. Rebind them while the old namespace still resolves,
+            // then move the whole catalog identity as one WAL operation.
+            for sequence_slot in 0..storage.sequence_count() {
+                let (schema, sequence_name, visible) = {
+                    let sequence = storage.sequence_for(sequence_slot, txn.txid);
+                    (
+                        sequence.schema,
+                        sequence.name,
+                        sequence.visible_to(txn.txid),
+                    )
+                };
+                if schema != prior_name || !visible {
+                    continue;
+                }
+                if let Err(error) = rewrite_sequence_default_references(
+                    storage,
+                    wal,
+                    txn,
+                    sequence_slot,
+                    new_name,
+                    sequence_name,
+                    arena,
+                ) {
+                    return sql_fail(error);
+                }
+            }
+            let prior = match storage.rename_schema(slot, new_name) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::RenameSchema {
+                    name: prior.as_str(),
+                    new_name: new_name.as_str(),
+                },
+            ) {
+                let _ = storage.rename_schema(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::SchemaRenamed {
+                slot: slot as u32,
+                prior,
+            }) {
+                let _ = storage.rename_schema(slot, prior);
+                return sql_fail(error);
+            }
+            responder.command_complete("ALTER SCHEMA")?;
+            sql_ok()
+        }
+    }
+}
+
 fn rewrite_object_acl_owner(
     storage: &mut Storage,
     txn: &mut TxnState,
@@ -5316,8 +5436,27 @@ pub fn alter_materialized_view(
         crate::sql::ast::AlterMaterializedViewAction::SetSchema(schema) => {
             crate::sql::ast::AlterAction::SetSchema(schema)
         }
-        crate::sql::ast::AlterMaterializedViewAction::SetTablespace(tablespace) => {
-            crate::sql::ast::AlterAction::SetTablespace(tablespace)
+        crate::sql::ast::AlterMaterializedViewAction::TableActions(actions) => {
+            let statement = crate::sql::ast::AlterTable {
+                table: name,
+                if_exists: false,
+                only: false,
+                actions,
+            };
+            return alter_table_inner(
+                storage,
+                wal,
+                txn,
+                scratch,
+                &statement,
+                arena,
+                seq_session,
+                responder,
+                true,
+                Some(crate::storage::TableKind::Local),
+                "ALTER MATERIALIZED VIEW",
+                AlterInheritanceScope::Direct,
+            );
         }
     };
     let statement = crate::sql::ast::AlterTable {
@@ -5649,6 +5788,21 @@ fn resolve_role_name(written: &str) -> crate::util::StackStr<64> {
     }
 }
 
+fn resolve_role_specification(
+    specification: crate::sql::ast::RoleSpecification<'_>,
+) -> crate::util::StackStr<64> {
+    match specification {
+        crate::sql::ast::RoleSpecification::Name(name) => crate::util::StackStr::from_str(name),
+        crate::sql::ast::RoleSpecification::CurrentRole
+        | crate::sql::ast::RoleSpecification::CurrentUser => {
+            super::eval::funcs::system::current_user_owned()
+        }
+        crate::sql::ast::RoleSpecification::SessionUser => {
+            super::eval::funcs::system::session_user_owned()
+        }
+    }
+}
+
 fn require_create_role(storage: &Storage, txid: u32) -> Result<(), SqlError> {
     let current = super::eval::funcs::system::current_user_owned();
     let allowed = storage
@@ -5705,6 +5859,8 @@ fn require_role_attribute_authority(
 
 fn apply_role_options(
     mut attributes: crate::storage::RoleAttributes,
+    role_name: &str,
+    password_encryption: crate::sql::guc::PasswordEncryption,
     options: &crate::sql::ast::RoleOptions<'_>,
 ) -> Result<crate::storage::RoleAttributes, SqlError> {
     if let Some(value) = options.superuser {
@@ -5740,76 +5896,103 @@ fn apply_role_options(
     }
     if let Some(password) = options.password {
         attributes.password = if let Some(password) = password {
-            if password.len() > crate::storage::ROLE_PASSWORD_MAX {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "role password exceeds {} bytes",
-                    crate::storage::ROLE_PASSWORD_MAX
-                ));
-            }
-            let mut salt = [0u8; 16];
-            if unsafe { libc::getentropy(salt.as_mut_ptr().cast(), salt.len()) } != 0 {
-                return Err(sql_err!(
-                    sqlstate::IO_ERROR,
-                    "could not generate role password salt"
-                ));
-            }
-            let verifier = crate::pg::auth::ScramServer::derive(
-                password,
-                salt,
-                crate::pg::auth::SCRAM_ITERATIONS,
-            );
-            Some(crate::storage::RolePassword {
-                salt: verifier.salt,
-                stored_key: verifier.stored_key,
-                server_key: verifier.server_key,
-                iterations: verifier.iterations,
-            })
+            let credential = match password {
+                crate::sql::ast::RolePasswordSpec::Plaintext(password) => {
+                    if password.len() > crate::storage::ROLE_PASSWORD_MAX {
+                        return Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "role password exceeds {} bytes",
+                            crate::storage::ROLE_PASSWORD_MAX
+                        ));
+                    }
+                    match password_encryption {
+                        crate::sql::guc::PasswordEncryption::ScramSha256 => {
+                            let mut salt = [0u8; 16];
+                            if unsafe { libc::getentropy(salt.as_mut_ptr().cast(), salt.len()) }
+                                != 0
+                            {
+                                return Err(sql_err!(
+                                    sqlstate::IO_ERROR,
+                                    "could not generate role password salt"
+                                ));
+                            }
+                            crate::storage::RoleCredential::Scram(
+                                crate::pg::auth::ScramServer::derive(
+                                    password,
+                                    salt,
+                                    crate::pg::auth::SCRAM_ITERATIONS,
+                                ),
+                            )
+                        }
+                        crate::sql::guc::PasswordEncryption::Md5 => {
+                            let verifier = crate::storage::Md5Verifier::derive(password, role_name)
+                                .ok_or_else(|| {
+                                    sql_err!(
+                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                        "role password exceeds bounded MD5 input"
+                                    )
+                                })?;
+                            crate::storage::RoleCredential::Md5(verifier)
+                        }
+                    }
+                }
+                crate::sql::ast::RolePasswordSpec::ScramVerifier(verifier) => {
+                    crate::storage::RoleCredential::Scram(verifier)
+                }
+                crate::sql::ast::RolePasswordSpec::Md5Verifier(verifier) => {
+                    crate::storage::RoleCredential::Md5(verifier)
+                }
+            };
+            Some(credential)
         } else {
             None
         };
     }
     if let Some(valid_until) = options.valid_until {
-        attributes.valid_until = if let Some(valid_until) = valid_until {
-            if !valid_until.eq_ignore_ascii_case("infinity") {
-                crate::sql::datetime::parse_timestamp(valid_until, true)?;
-            }
-            let value = crate::util::StackStr::from_str(valid_until);
-            if value.is_truncated() {
-                return Err(sql_err!(
-                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                    "VALID UNTIL value exceeds {} bytes",
-                    crate::storage::ROLE_VALID_UNTIL_MAX
-                ));
-            }
-            Some(value)
-        } else {
-            None
-        };
+        crate::sql::datetime::parse_timestamp(valid_until, true)?;
+        let value = crate::util::StackStr::from_str(valid_until);
+        if value.is_truncated() {
+            return Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "VALID UNTIL value exceeds {} bytes",
+                crate::storage::ROLE_VALID_UNTIL_MAX
+            ));
+        }
+        attributes.valid_until = Some(value);
     }
     Ok(attributes)
+}
+
+pub struct CreateRoleRequest<'a> {
+    pub name: &'a str,
+    pub options: &'a crate::sql::ast::RoleOptions<'a>,
+    pub memberships: &'a crate::sql::ast::RoleMembershipClauses<'a>,
 }
 
 pub fn create_role(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    name: &str,
-    options: &crate::sql::ast::RoleOptions<'_>,
-    memberships: &crate::sql::ast::RoleMembershipClauses<'_>,
+    request: CreateRoleRequest<'_>,
+    guc: &crate::sql::guc::GucState,
     responder: &mut Responder,
 ) -> Outcome {
     if let Err(error) = require_create_role(storage, txn.txid) {
         return sql_fail(error);
     }
-    if let Err(error) = require_role_attribute_authority(storage, txn.txid, options) {
+    if let Err(error) = require_role_attribute_authority(storage, txn.txid, request.options) {
         return sql_fail(error);
     }
-    let name = match SqlName::parse(name) {
+    let name = match SqlName::parse(request.name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
     };
-    let attributes = match apply_role_options(crate::storage::RoleAttributes::ORDINARY, options) {
+    let attributes = match apply_role_options(
+        crate::storage::RoleAttributes::ORDINARY,
+        name.as_str(),
+        guc.password_encryption(),
+        request.options,
+    ) {
         Ok(attributes) => attributes,
         Err(error) => return sql_fail(error),
     };
@@ -5836,20 +6019,49 @@ pub fn create_role(
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
-    let membership_count = memberships
+    if request.options.sysid.is_some() {
+        responder.notice(
+            sqlstate::SUCCESSFUL_COMPLETION,
+            "SYSID can no longer be specified",
+        )?;
+    }
+    let current = storage
+        .current_role_slot(txn.txid)
+        .expect("CREATE ROLE privilege check resolved current role");
+    let current_is_superuser = storage.role(current).attributes_to(txn.txid).superuser;
+    let membership_count = request
+        .memberships
         .in_roles
         .len()
-        .saturating_add(memberships.role_members.len())
-        .saturating_add(memberships.admin_members.len());
+        .saturating_add(request.memberships.role_members.len())
+        .saturating_add(request.memberships.admin_members.len())
+        .saturating_add(usize::from(!current_is_superuser));
     if membership_count >= super::txn::MAX_TXN_DDL {
         return sql_fail(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
             "too many role memberships in one statement"
         ));
     }
-    let grantor = storage.current_role_slot(txn.txid).unwrap_or(0);
-    for written in memberships.in_roles {
-        let resolved = resolve_role_name(written);
+    if !current_is_superuser
+        && let Err(error) = stage_role_membership(
+            storage,
+            wal,
+            txn,
+            slot,
+            current,
+            usize::from(crate::storage::BOOTSTRAP_ROLE),
+            crate::storage::RoleMembershipOptions {
+                admin: true,
+                inherit: false,
+                set: false,
+            },
+        )
+    {
+        return sql_fail(error);
+    }
+    let grantor = current;
+    for written in request.memberships.in_roles {
+        let resolved = crate::util::StackStr::<64>::from_str(written);
         let Some(parent) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -5882,11 +6094,11 @@ pub fn create_role(
         }
     }
     for (members, admin) in [
-        (memberships.role_members, false),
-        (memberships.admin_members, true),
+        (request.memberships.role_members, false),
+        (request.memberships.admin_members, true),
     ] {
         for written in members {
-            let resolved = resolve_role_name(written);
+            let resolved = crate::util::StackStr::<64>::from_str(written);
             let Some(member) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
@@ -5910,6 +6122,14 @@ pub fn create_role(
                 return sql_fail(error);
             }
         }
+    }
+    if request.options.password.is_some()
+        && matches!(
+            attributes.password,
+            Some(crate::storage::RoleCredential::Md5(_))
+        )
+    {
+        responder.warning("01P01", "setting an MD5-encrypted password")?;
     }
     responder.command_complete("CREATE ROLE")?;
     sql_ok()
@@ -5965,11 +6185,12 @@ pub fn alter_role(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    name: &str,
+    specification: crate::sql::ast::RoleSpecification<'_>,
     options: &crate::sql::ast::RoleOptions<'_>,
+    guc: &crate::sql::guc::GucState,
     responder: &mut Responder,
 ) -> Outcome {
-    let resolved = resolve_role_name(name);
+    let resolved = resolve_role_specification(specification);
     let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -6014,7 +6235,12 @@ pub fn alter_role(
     if let Err(error) = require_role_attribute_authority(storage, txn.txid, options) {
         return sql_fail(error);
     }
-    let attributes = match apply_role_options(storage.role(slot).attributes_to(txn.txid), options) {
+    let attributes = match apply_role_options(
+        storage.role(slot).attributes_to(txn.txid),
+        storage.role_name(slot, txn.txid).as_str(),
+        guc.password_encryption(),
+        options,
+    ) {
         Ok(attributes) => attributes,
         Err(error) => return sql_fail(error),
     };
@@ -6041,6 +6267,14 @@ pub fn alter_role(
         storage.rollback_role_change(slot, prior);
         return sql_fail(error);
     }
+    if options.password.is_some()
+        && matches!(
+            attributes.password,
+            Some(crate::storage::RoleCredential::Md5(_))
+        )
+    {
+        responder.warning("01P01", "setting an MD5-encrypted password")?;
+    }
     responder.command_complete("ALTER ROLE")?;
     sql_ok()
 }
@@ -6050,7 +6284,7 @@ pub fn alter_role_setting(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    written_role: Option<&str>,
+    written_role: Option<crate::sql::ast::RoleSpecification<'_>>,
     written_database: Option<&str>,
     action: crate::sql::ast::RoleSettingAction<'_>,
     guc: &crate::sql::guc::GucState,
@@ -6080,8 +6314,8 @@ pub fn alter_role_setting(
         .find_role_visible(current_name.as_str(), txn.txid)
         .expect("current SQL role exists");
     let current_attributes = storage.role(current).attributes_to(txn.txid);
-    let scope = if let Some(written) = written_role {
-        let resolved = resolve_role_name(written);
+    let scope = if let Some(specification) = written_role {
+        let resolved = resolve_role_specification(specification);
         let Some(role) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
             return sql_fail(sql_err!(
                 sqlstate::UNDEFINED_OBJECT,
@@ -6365,14 +6599,14 @@ pub fn rename_role(
     storage: &mut Storage,
     wal: &mut Wal,
     txn: &mut TxnState,
-    name: &str,
+    specification: crate::sql::ast::RoleSpecification<'_>,
     new_name: &str,
     responder: &mut Responder,
 ) -> Outcome {
     if let Err(error) = require_create_role(storage, txn.txid) {
         return sql_fail(error);
     }
-    let resolved = resolve_role_name(name);
+    let resolved = resolve_role_specification(specification);
     let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
         return sql_fail(sql_err!(
             sqlstate::UNDEFINED_OBJECT,
@@ -6431,7 +6665,7 @@ pub fn drop_role(
     }
     let current = super::eval::funcs::system::session_user_owned();
     for written in names {
-        let resolved = resolve_role_name(written);
+        let resolved = crate::util::StackStr::<64>::from_str(written);
         let Some(slot) = storage.find_role_visible(resolved.as_str(), txn.txid) else {
             if if_exists {
                 responder.notice(
@@ -6591,6 +6825,8 @@ pub fn set_role(
 ) -> Outcome {
     let Some(written) = role else {
         guc.reset_role(local);
+        let current_role = guc.current_role();
+        super::eval::funcs::system::set_current_user(current_role.as_str());
         responder.command_complete(if reset { "RESET" } else { "SET" })?;
         return sql_ok();
     };
@@ -6616,7 +6852,9 @@ pub fn set_role(
             resolved.as_str()
         ));
     }
-    guc.set_role(storage.role_name(target, txn.txid).as_str(), local);
+    let target_name = storage.role_name(target, txn.txid);
+    guc.set_role(target_name.as_str(), local);
+    super::eval::funcs::system::set_current_user(target_name.as_str());
     responder.command_complete("SET")?;
     sql_ok()
 }
@@ -6632,6 +6870,10 @@ pub fn set_session_authorization(
 ) -> Outcome {
     if role.is_none() {
         guc.reset_session_authorization(local);
+        let session_user = guc.session_user();
+        let current_role = guc.current_role();
+        super::eval::funcs::system::set_session_user(session_user.as_str());
+        super::eval::funcs::system::set_current_user(current_role.as_str());
         responder.command_complete(if reset { "RESET" } else { "SET" })?;
         return sql_ok();
     }
@@ -6670,6 +6912,10 @@ pub fn set_session_authorization(
         let canonical = storage.role_name(target, txn.txid);
         guc.set_session_authorization(canonical.as_str(), local);
     }
+    let session_user = guc.session_user();
+    let current_role = guc.current_role();
+    super::eval::funcs::system::set_session_user(session_user.as_str());
+    super::eval::funcs::system::set_current_user(current_role.as_str());
     responder.command_complete(if reset { "RESET" } else { "SET" })?;
     sql_ok()
 }
@@ -7101,12 +7347,13 @@ fn privilege_mask(
         }
         AccessClass::Sequence => PrivilegeSet::SEQUENCE_ALL,
         AccessClass::Schema => PrivilegeSet::SCHEMA_ALL,
-        AccessClass::Domain | AccessClass::Enum => PrivilegeSet::TYPE_ALL,
+        AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => PrivilegeSet::TYPE_ALL,
         AccessClass::Index => PrivilegeSet::NONE,
         AccessClass::Routine => PrivilegeSet::FUNCTION_ALL,
         AccessClass::LargeObject => PrivilegeSet::LARGE_OBJECT_ALL,
-        AccessClass::ForeignDataWrapper | AccessClass::ForeignServer => PrivilegeSet::USAGE,
-        AccessClass::Composite => PrivilegeSet::TYPE_ALL,
+        AccessClass::ForeignDataWrapper | AccessClass::ForeignServer | AccessClass::Language => {
+            PrivilegeSet::USAGE
+        }
         AccessClass::Tablespace => PrivilegeSet::CREATE,
         AccessClass::Database => PrivilegeSet::DATABASE_ALL,
         AccessClass::Statistics
@@ -7173,6 +7420,7 @@ fn privilege_object_noun(class: crate::storage::AccessClass) -> &'static str {
         AccessClass::Routine => "function",
         AccessClass::LargeObject => "large object",
         AccessClass::Domain | AccessClass::Enum | AccessClass::Composite => "type",
+        AccessClass::Language => "language",
         AccessClass::Tablespace => "tablespace",
         _ => "relation",
     }
@@ -7426,7 +7674,8 @@ fn apply_default_privileges_to_new_object(
         | AccessClass::EventTrigger
         | AccessClass::LargeObject
         | AccessClass::ForeignDataWrapper
-        | AccessClass::ForeignServer => return Ok(()),
+        | AccessClass::ForeignServer
+        | AccessClass::Language => return Ok(()),
     };
     let owner = storage.object_owner(object, txn.txid) as u16;
     let schema = if object.class == AccessClass::Schema {
@@ -8942,6 +9191,10 @@ fn resolve_privilege_objects(
                             Some(schema) => storage.enum_slot(schema, name.name, txid),
                             None => storage.resolve_enum_slot(name.name, txid),
                         };
+                        let composite = match name.schema {
+                            Some(schema) => storage.composite_slot(schema, name.name, txid),
+                            None => storage.resolve_composite_slot(name.name, txid),
+                        };
                         let object = domain
                             .map(|slot| AccessObject {
                                 class: AccessClass::Domain,
@@ -8953,6 +9206,12 @@ fn resolve_privilege_objects(
                                     slot: slot as u16,
                                 })
                             })
+                            .or_else(|| {
+                                composite.map(|slot| AccessObject {
+                                    class: AccessClass::Composite,
+                                    slot: slot as u16,
+                                })
+                            })
                             .ok_or_else(|| {
                                 sql_err!(
                                     sqlstate::UNDEFINED_OBJECT,
@@ -8961,6 +9220,31 @@ fn resolve_privilege_objects(
                                 )
                             })?;
                         add_privilege_object(objects, &mut count, object)?;
+                    }
+                    PrivilegeObjectKind::ProceduralLanguage => {
+                        let Some(oid) = crate::sql::catalog::procedural_language_oid(name.name)
+                        else {
+                            return Err(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "language \"{}\" does not exist",
+                                name.name
+                            ));
+                        };
+                        let slot = u16::try_from(oid).map_err(|_| {
+                            sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "language OID {} cannot be represented by the fixed ACL identity",
+                                oid
+                            )
+                        })?;
+                        add_privilege_object(
+                            objects,
+                            &mut count,
+                            AccessObject {
+                                class: AccessClass::Language,
+                                slot,
+                            },
+                        )?;
                     }
                     PrivilegeObjectKind::ForeignDataWrapper => {
                         let Some((slot, _)) = storage.foreign_wrapper(name.name, txid) else {
@@ -9063,7 +9347,9 @@ fn resolve_privilege_objects(
                             }
                         }
                     }
-                    PrivilegeObjectKind::AllFunctionsInSchema => {
+                    PrivilegeObjectKind::AllFunctionsInSchema
+                    | PrivilegeObjectKind::AllProceduresInSchema
+                    | PrivilegeObjectKind::AllRoutinesInSchema => {
                         let schema = name.name;
                         if storage.find_schema_visible(schema, txid).is_none() {
                             return Err(sql_err!(
@@ -9074,7 +9360,18 @@ fn resolve_privilege_objects(
                         }
                         for slot in 0..storage.routine_count() {
                             let routine = storage.routine(slot);
-                            if routine.visible_to(txid)
+                            let selected = match kind {
+                                PrivilegeObjectKind::AllFunctionsInSchema => {
+                                    !matches!(routine.kind, crate::storage::RoutineKind::Procedure)
+                                }
+                                PrivilegeObjectKind::AllProceduresInSchema => {
+                                    matches!(routine.kind, crate::storage::RoutineKind::Procedure)
+                                }
+                                PrivilegeObjectKind::AllRoutinesInSchema => true,
+                                _ => unreachable!("schema routine target is closed"),
+                            };
+                            if selected
+                                && routine.visible_to(txid)
                                 && routine.schema_for(txid).as_str() == schema
                             {
                                 add_privilege_object(
@@ -9486,8 +9783,15 @@ pub fn revoke_privileges(
             ));
         }
     }
+    let revokes_public = grantees
+        .iter()
+        .any(|grantee| grantee.eq_ignore_ascii_case("public"));
     for object in &objects[..object_count] {
-        if let Err(error) = materialize_public_acl_default(storage, txn, *object) {
+        // Only a PUBLIC revocation changes PostgreSQL's implicit default ACL.
+        // Materializing it for another grantee consumes a durable ACL entry and
+        // transaction undo record for an otherwise untouched object.
+        if revokes_public && let Err(error) = materialize_public_acl_default(storage, txn, *object)
+        {
             return sql_fail(error);
         }
         let requested = match privilege_mask(privileges, object.class, false) {
@@ -9639,13 +9943,15 @@ pub fn revoke_privileges(
             } else {
                 old_privileges.without(requested)
             };
-            if requested.0 != 0 {
+            let new_options = old_options.without(requested);
+            if requested.0 != 0 && (new_privileges != old_privileges || new_options != old_options)
+            {
                 let (slot, prior) = match storage.change_acl(
                     *object,
                     grantee,
                     acl_grantor as u16,
                     new_privileges,
-                    old_options.without(requested),
+                    new_options,
                     txn.txid,
                 ) {
                     Ok(change) => change,
@@ -11191,6 +11497,18 @@ pub fn drop_schema(
                 .count()
         })
         .sum::<usize>();
+    let table_trigger_undo = storage
+        .triggers_with_slots_visible_to(txn.txid)
+        .filter(|(_, trigger)| {
+            matches!(
+                trigger.target,
+                crate::storage::TriggerTarget::Table(table)
+                    if objects[..n_objects].iter().flatten().any(|object| {
+                        matches!(object, SchemaObject::Table(selected) if *selected == usize::from(table))
+                    })
+            )
+        })
+        .count();
     let routine_trigger_undo = storage
         .triggers_with_slots_visible_to(txn.txid)
         .filter(|(_, trigger)| {
@@ -11210,6 +11528,7 @@ pub fn drop_schema(
             .filter(|object| matches!(object, SchemaObject::Matview { .. }))
             .count()
         + owned_sequence_undo
+        + table_trigger_undo
         + routine_trigger_undo
         + n_slots;
     if txn.ddl().len() + undo_needed > super::txn::MAX_TXN_DDL {
@@ -11648,6 +11967,20 @@ pub fn drop_schema(
                         }
                         Ok(None) => {}
                         Err(error) => return sql_fail(error),
+                    }
+                }
+                let trigger_target = crate::storage::TriggerTarget::Table(*t as u16);
+                loop {
+                    let trigger = storage.triggers_with_slots_visible_to(txn.txid).find_map(
+                        |(slot, trigger)| (trigger.target == trigger_target).then_some(slot),
+                    );
+                    let Some(slot) = trigger else { break };
+                    storage.drop_trigger(slot, txn.txid);
+                    if let Err(error) =
+                        txn.record_ddl(super::txn::DdlUndo::TriggerDropped(slot as u32))
+                    {
+                        storage.rollback_trigger_drop(slot, txn.txid);
+                        return sql_fail(error);
                     }
                 }
                 let lsn = storage.bump_lsn();
@@ -13197,8 +13530,10 @@ fn replica_identity_columns(
 /// transaction and response dependencies distinct from statement input.
 pub struct CreateViewCommand<'a> {
     pub name: &'a QualName<'a>,
+    pub columns: &'a [&'a str],
     pub or_replace: bool,
     pub security: super::ast::ViewSecurity,
+    pub security_barrier: super::ast::ViewSecurityBarrier,
     pub check_option: Option<super::ast::ViewCheckOption>,
     pub sql: &'a str,
     pub raw_path: &'a str,
@@ -18457,6 +18792,22 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
         elements,
     } = query.statement
     {
+        let resolved = match &context.host {
+            PlpgsqlExecHost::Routine { guc, .. } => {
+                super::resolve_create_schema(*name, *authorization, guc)?
+            }
+            PlpgsqlExecHost::Atomic { .. } => {
+                return Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "PL/pgSQL dynamic utility commands are not valid in trigger execution"
+                ));
+            }
+        };
+        let authorization = resolved.authorization.as_ref().map(|role| role.as_str());
+        let name = context
+            .arena
+            .alloc_str(resolved.name.as_str())
+            .map_err(|_| super::query::arena_full_pub())?;
         let outcome = {
             let PlpgsqlExecHost::Routine {
                 engine,
@@ -18485,7 +18836,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                             &mut engine.wal,
                             txn,
                             name,
-                            *authorization,
+                            authorization,
                             *if_not_exists,
                             responder,
                         )
@@ -18495,78 +18846,106 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
         };
         dynamic_utility_outcome(outcome)?;
 
+        let prior_user = crate::sql::eval::funcs::system::current_user_owned();
+        let prior_role = {
+            let PlpgsqlExecHost::Routine { guc, .. } = &mut context.host else {
+                unreachable!("schema creation requires a routine execution host")
+            };
+            let prior_role = guc.current_role();
+            if let Some(owner) = resolved.authorization.as_ref() {
+                guc.set_role(owner.as_str(), true);
+                crate::sql::eval::funcs::system::set_current_user(owner.as_str());
+            }
+            prior_role
+        };
+
         // CREATE SCHEMA elements retain their static, typed qualification and
         // durable utility execution path instead of reconstructing SQL text.
-        for element in *elements {
-            let requalified = super::requalify_schema_element(element, name, context.arena)?;
-            if let Stmt::CreateView {
-                name: view_name,
-                or_replace,
-                security,
-                check_option,
-                sql,
-            } = requalified
-            {
-                let outcome = {
-                    let PlpgsqlExecHost::Routine {
-                        engine,
-                        guc,
-                        cursors,
-                        transaction_context,
-                    } = &mut context.host
-                    else {
-                        unreachable!("schema creation requires a routine execution host")
-                    };
-                    let schema_path = crate::sql::eval::quote_ident_str(name, context.arena)?;
-                    let role = guc.current_role();
-                    let path =
-                        engine
-                            .storage
-                            .compute_path(schema_path, role.as_str(), context.txn.txid);
-                    let old_path = engine.storage.swap_path(path);
-                    let outcome = context.responder.without_query_output(|responder| {
-                        engine.execute_dynamic_utility(
-                            requalified,
-                            context.txn,
-                            cursors,
+        let elements_result = (|| {
+            for element in *elements {
+                let requalified = super::requalify_schema_element(element, name, context.arena)?;
+                if let Stmt::CreateView {
+                    name: view_name,
+                    columns,
+                    or_replace,
+                    security,
+                    security_barrier,
+                    check_option,
+                    sql,
+                } = requalified
+                {
+                    let outcome = {
+                        let PlpgsqlExecHost::Routine {
+                            engine,
                             guc,
-                            *transaction_context,
-                            context.arena,
-                            responder,
-                            |engine, txn, responder| {
-                                super::exec::create_view(
-                                    &mut engine.storage,
-                                    &mut engine.wal,
-                                    txn,
-                                    super::exec::CreateViewCommand {
-                                        name: view_name,
-                                        or_replace: *or_replace,
-                                        security: *security,
-                                        check_option: *check_option,
-                                        sql,
-                                        raw_path: schema_path,
-                                    },
-                                    context.arena,
-                                    responder,
-                                )
-                            },
-                        )
-                    });
-                    engine.storage.swap_path(old_path);
-                    outcome
-                };
-                dynamic_utility_outcome(outcome)?;
-            } else {
-                execute_bound_plpgsql_dynamic_utility(
-                    context,
-                    BoundPlpgsqlDynamicQuery {
-                        statement: requalified,
-                        arguments: &[],
-                    },
-                )?;
+                            cursors,
+                            transaction_context,
+                        } = &mut context.host
+                        else {
+                            unreachable!("schema creation requires a routine execution host")
+                        };
+                        let schema_path = crate::sql::eval::quote_ident_str(name, context.arena)?;
+                        let role = guc.current_role();
+                        let path = engine.storage.compute_path(
+                            schema_path,
+                            role.as_str(),
+                            context.txn.txid,
+                        );
+                        let old_path = engine.storage.swap_path(path);
+                        let outcome = context.responder.without_query_output(|responder| {
+                            engine.execute_dynamic_utility(
+                                requalified,
+                                context.txn,
+                                cursors,
+                                guc,
+                                *transaction_context,
+                                context.arena,
+                                responder,
+                                |engine, txn, responder| {
+                                    super::exec::create_view(
+                                        &mut engine.storage,
+                                        &mut engine.wal,
+                                        txn,
+                                        super::exec::CreateViewCommand {
+                                            name: view_name,
+                                            columns,
+                                            or_replace: *or_replace,
+                                            security: *security,
+                                            security_barrier: *security_barrier,
+                                            check_option: *check_option,
+                                            sql,
+                                            raw_path: schema_path,
+                                        },
+                                        context.arena,
+                                        responder,
+                                    )
+                                },
+                            )
+                        });
+                        engine.storage.swap_path(old_path);
+                        outcome
+                    };
+                    dynamic_utility_outcome(outcome)?;
+                } else {
+                    execute_bound_plpgsql_dynamic_utility(
+                        context,
+                        BoundPlpgsqlDynamicQuery {
+                            statement: requalified,
+                            arguments: &[],
+                        },
+                    )?;
+                }
             }
+            Ok(())
+        })();
+        if resolved.authorization.is_some() {
+            let PlpgsqlExecHost::Routine { guc, .. } = &mut context.host else {
+                unreachable!("schema creation requires a routine execution host")
+            };
+            guc.set_role(prior_role.as_str(), true);
+            crate::sql::eval::funcs::system::set_current_user(prior_user.as_str());
         }
-        return Ok(());
+        return elements_result;
     }
     let PlpgsqlExecHost::Routine {
         engine,
@@ -18723,8 +19102,10 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 }
                 Stmt::CreateView {
                     name,
+                    columns,
                     or_replace,
                     security,
+                    security_barrier,
                     check_option,
                     sql,
                 } => super::exec::create_view(
@@ -18733,8 +19114,10 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     txn,
                     super::exec::CreateViewCommand {
                         name,
+                        columns,
                         or_replace: *or_replace,
                         security: *security,
+                        security_barrier: *security_barrier,
                         check_option: *check_option,
                         sql,
                         raw_path: guc.search_path().as_str(),
@@ -19015,24 +19398,28 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
-                    name,
-                    options,
-                    memberships,
+                    super::exec::CreateRoleRequest {
+                        name,
+                        options,
+                        memberships,
+                    },
+                    guc,
                     responder,
                 ),
-                Stmt::AlterRole { name, options } => super::exec::alter_role(
+                Stmt::AlterRole { role, options } => super::exec::alter_role(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
-                    name,
+                    *role,
                     options,
+                    guc,
                     responder,
                 ),
-                Stmt::AlterRoleRename { name, new_name } => super::exec::rename_role(
+                Stmt::AlterRoleRename { role, new_name } => super::exec::rename_role(
                     &mut engine.storage,
                     &mut engine.wal,
                     txn,
-                    name,
+                    *role,
                     new_name,
                     responder,
                 ),
@@ -19573,6 +19960,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     with_data,
                     if_not_exists,
                     kind,
+                    options,
                 } => super::exec::create_table_as(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -19583,6 +19971,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *with_data,
                     *if_not_exists,
                     *kind == crate::sql::ast::CreateTableAsKind::MaterializedView,
+                    *options,
                     guc.search_path().as_str(),
                     context.seq_session,
                     context.arena,
@@ -19628,8 +20017,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 Stmt::AlterSequence {
                     name,
                     if_exists,
-                    options,
-                    set_schema,
+                    action,
                 } => super::exec::alter_sequence(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -19637,10 +20025,10 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     super::exec::AlterSequenceCommand {
                         name,
                         if_exists: *if_exists,
-                        options,
-                        set_schema: *set_schema,
+                        action: *action,
                     },
                     context.seq_session,
+                    context.arena,
                     responder,
                 ),
                 Stmt::DropSequence {
@@ -28599,6 +28987,13 @@ pub fn create_routine(
         RoutineLanguage::Sql => crate::storage::RoutineLanguage::Sql,
         RoutineLanguage::PlPgSql => crate::storage::RoutineLanguage::PlPgSql,
     };
+    let language_name = match routine.language {
+        RoutineLanguage::Sql => "sql",
+        RoutineLanguage::PlPgSql => "plpgsql",
+    };
+    if let Err(error) = storage.require_language_usage(language_name, txn.txid) {
+        return sql_fail(error);
+    }
     if matches!(routine.kind, super::ast::RoutineCreateKind::Trigger)
         && routine.language != RoutineLanguage::PlPgSql
     {
@@ -31871,8 +32266,10 @@ pub fn create_view(
 ) -> Outcome {
     let CreateViewCommand {
         name,
+        columns,
         or_replace,
         security,
+        security_barrier,
         check_option,
         sql,
         raw_path,
@@ -31887,13 +32284,114 @@ pub fn create_view(
             crate::storage::VIEW_SQL_MAX
         ));
     }
-    // Validate the definition now (tables/views exist, columns resolve), as
-    // PostgreSQL does at CREATE VIEW time.
-    if let Err(e) = super::query::validate_view(buffer.as_str(), storage, txn.txid, arena) {
-        return sql_fail(e);
-    }
     let user = super::eval::funcs::system::session_user_owned();
     let path = storage.compute_path(raw_path, user.as_str(), txn.txid);
+    let mut described = [ColDesc::new("", 0, 0); MAX_PROJ];
+    let described_count = match super::query::describe_query_under(
+        buffer.as_str(),
+        storage,
+        txn.txid,
+        path,
+        arena,
+        &mut described,
+    ) {
+        Ok(count) => count,
+        Err(error) => return sql_fail(error),
+    };
+    if let Err(error) = super::query::validate_view_columns(&described[..described_count]) {
+        return sql_fail(error);
+    }
+    let mut derived_names = [""; MAX_COLUMNS];
+    if described_count > derived_names.len() {
+        return sql_fail(sql_err!(
+            sqlstate::TOO_MANY_COLUMNS,
+            "view has more than {} columns",
+            MAX_COLUMNS
+        ));
+    }
+    if !columns.is_empty() && columns.len() != described_count {
+        return sql_fail(sql_err!(
+            sqlstate::SYNTAX_ERROR,
+            "CREATE VIEW specifies {} column names, but query has {} columns",
+            columns.len(),
+            described_count
+        ));
+    }
+    let mut columns = if columns.is_empty() {
+        for (slot, description) in derived_names.iter_mut().zip(&described[..described_count]) {
+            *slot = description.name;
+        }
+        match crate::storage::ViewColumns::from_derived_names(&derived_names[..described_count]) {
+            Ok(columns) => columns,
+            Err(error) => return sql_fail(error),
+        }
+    } else {
+        match crate::storage::ViewColumns::from_names(columns) {
+            Ok(columns) => columns,
+            Err(error) => return sql_fail(error),
+        }
+    };
+    if or_replace
+        && let Some(crate::storage::ResolvedRelation::View(slot)) =
+            storage.resolve_relation(name.schema, name.name, txn.txid)
+    {
+        let prior = *storage.view(slot).columns_for(txn.txid);
+        if prior.len() > columns.len() {
+            return sql_fail(sql_err!(
+                sqlstate::INVALID_TABLE_DEFINITION,
+                "cannot drop columns from view \"{}\"",
+                name.name
+            ));
+        }
+        let mut prior_description = [ColDesc::new("", 0, 0); MAX_PROJ];
+        let prior_count = match super::catalog::describe_view(
+            storage,
+            txn.txid,
+            storage.view(slot),
+            arena,
+            &mut prior_description,
+        ) {
+            Ok(count) => count,
+            Err(error) => return sql_fail(error),
+        };
+        if prior_count != prior.len() {
+            return sql_fail(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view output-column catalog state does not match its definition"
+            ));
+        }
+        for index in 0..prior.len() {
+            if prior.names()[index] != columns.names()[index] {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "cannot change name of view column \"{}\" to \"{}\"",
+                    prior.names()[index].as_str(),
+                    columns.names()[index].as_str()
+                ));
+            }
+            let old = prior_description[index];
+            let new = described[index];
+            if old.type_oid != new.type_oid
+                || old.type_mod != new.type_mod
+                || old.collation != new.collation
+            {
+                return sql_fail(sql_err!(
+                    sqlstate::INVALID_TABLE_DEFINITION,
+                    "cannot change data type of view column \"{}\"",
+                    prior.names()[index].as_str()
+                ));
+            }
+            columns = match columns.with_default(
+                index,
+                prior
+                    .default_at(index)
+                    .expect("view column index is bounded"),
+            ) {
+                Ok(columns) => columns,
+                Err(error) => return sql_fail(error),
+            };
+        }
+    }
     let dependencies = match super::query::stored_query_dependencies(
         buffer.as_str(),
         storage,
@@ -31923,20 +32421,36 @@ pub fn create_view(
     match storage.create_view(
         schema,
         sqlname,
-        crate::storage::StoredQueryDefinition {
-            sql: buffer,
-            creation_path,
-            dependencies,
-        },
-        crate::storage::ViewOptions {
-            security: match security {
-                super::ast::ViewSecurity::Definer => crate::storage::ViewSecurity::Definer,
-                super::ast::ViewSecurity::Invoker => crate::storage::ViewSecurity::Invoker,
+        crate::storage::ViewDefinition {
+            columns,
+            query: crate::storage::StoredQueryDefinition {
+                sql: buffer,
+                creation_path,
+                dependencies,
             },
-            check_option: check_option.map(|option| match option {
-                super::ast::ViewCheckOption::Local => crate::storage::ViewCheckOption::Local,
-                super::ast::ViewCheckOption::Cascaded => crate::storage::ViewCheckOption::Cascaded,
-            }),
+            options: crate::storage::ViewOptions {
+                security: match security {
+                    super::ast::ViewSecurity::Definer => crate::storage::ViewSecurity::Definer,
+                    super::ast::ViewSecurity::Invoker => crate::storage::ViewSecurity::Invoker,
+                },
+                security_barrier: match security_barrier {
+                    super::ast::ViewSecurityBarrier::Default => {
+                        crate::storage::ViewSecurityBarrier::Default
+                    }
+                    super::ast::ViewSecurityBarrier::Enabled => {
+                        crate::storage::ViewSecurityBarrier::Enabled
+                    }
+                    super::ast::ViewSecurityBarrier::Disabled => {
+                        crate::storage::ViewSecurityBarrier::Disabled
+                    }
+                },
+                check_option: check_option.map(|option| match option {
+                    super::ast::ViewCheckOption::Local => crate::storage::ViewCheckOption::Local,
+                    super::ast::ViewCheckOption::Cascaded => {
+                        crate::storage::ViewCheckOption::Cascaded
+                    }
+                }),
+            },
         },
         or_replace,
         txn.txid,
@@ -31971,9 +32485,15 @@ pub fn create_view(
                 &WalOp::CreateView {
                     schema: schema.as_str(),
                     name: name.name,
+                    columns,
                     sql,
                     path: raw_path,
                     security_invoker: matches!(security, super::ast::ViewSecurity::Invoker),
+                    security_barrier: match security_barrier {
+                        super::ast::ViewSecurityBarrier::Default => 0,
+                        super::ast::ViewSecurityBarrier::Enabled => 1,
+                        super::ast::ViewSecurityBarrier::Disabled => 2,
+                    },
                     check_option: check_option.map_or(0, |option| match option {
                         super::ast::ViewCheckOption::Local => 1,
                         super::ast::ViewCheckOption::Cascaded => 2,
@@ -32139,26 +32659,22 @@ pub fn alter_view(
         responder.command_complete("ALTER VIEW")?;
         return sql_ok();
     }
-    let mut security = storage.view(slot).security_for(txn.txid);
-    let mut check_option = storage.view(slot).check_option_for(txn.txid);
+    let mut options = storage.view(slot).options_for(txn.txid);
     match action {
-        AlterViewAction::SetOptions(options) => {
-            for option in options {
+        AlterViewAction::SetOptions(view_options) => {
+            for option in view_options {
                 match option {
                     ViewOption::SecurityInvoker(enabled) => {
-                        security = if *enabled {
+                        options.security = if *enabled {
                             crate::storage::ViewSecurity::Invoker
                         } else {
                             crate::storage::ViewSecurity::Definer
                         };
                     }
-                    ViewOption::SecurityBarrier(true) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::FEATURE_NOT_SUPPORTED,
-                            "security_barrier requires a predicate-ordering boundary"
-                        ));
+                    ViewOption::SecurityBarrier(enabled) => {
+                        options.security_barrier =
+                            crate::storage::ViewSecurityBarrier::from_enabled(*enabled);
                     }
-                    ViewOption::SecurityBarrier(false) => {}
                     ViewOption::CheckOption(option) => {
                         match super::query::resolve_view_for_dml(storage, name, txn.txid, arena) {
                             Ok(Some(_)) => {}
@@ -32170,7 +32686,7 @@ pub fn alter_view(
                             }
                             Err(error) => return sql_fail(error),
                         }
-                        check_option = Some(match option {
+                        options.check_option = Some(match option {
                             crate::sql::ast::ViewCheckOption::Local => {
                                 crate::storage::ViewCheckOption::Local
                             }
@@ -32182,28 +32698,198 @@ pub fn alter_view(
                 }
             }
         }
-        AlterViewAction::ResetOptions(options) => {
-            for option in options {
+        AlterViewAction::ResetOptions(view_options) => {
+            for option in view_options {
                 match option {
                     ViewOptionName::SecurityInvoker => {
-                        security = crate::storage::ViewSecurity::Definer;
+                        options.security = crate::storage::ViewSecurity::Definer;
                     }
-                    ViewOptionName::SecurityBarrier => {}
-                    ViewOptionName::CheckOption => check_option = None,
+                    ViewOptionName::SecurityBarrier => {
+                        options.security_barrier = crate::storage::ViewSecurityBarrier::Default;
+                    }
+                    ViewOptionName::CheckOption => options.check_option = None,
                 }
             }
         }
-        AlterViewAction::SetDefault { .. } | AlterViewAction::DropDefault { .. } => {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "view column defaults require automatically updatable view enforcement"
-            ));
+        AlterViewAction::SetDefault { column, expression } => {
+            let current = *storage.view(slot).columns_for(txn.txid);
+            let Some(index) = current
+                .names()
+                .iter()
+                .position(|name| name.as_str() == column)
+            else {
+                return sql_fail(undefined_column(column));
+            };
+            if let Err(error) = super::query::resolve_view_for_dml(storage, name, txn.txid, arena) {
+                return sql_fail(error);
+            }
+            let mut descriptions = [ColDesc::new("", 0, 0); MAX_PROJ];
+            let count = match super::catalog::describe_view(
+                storage,
+                txn.txid,
+                storage.view(slot),
+                arena,
+                &mut descriptions,
+            ) {
+                Ok(count) => count,
+                Err(error) => return sql_fail(error),
+            };
+            if index >= count {
+                return sql_fail(sql_err!(
+                    sqlstate::INTERNAL_ERROR,
+                    "view column definition does not match its query output"
+                ));
+            }
+            let Some((ctype, _)) =
+                catalog_column_type(storage, txn.txid, descriptions[index].type_oid)
+            else {
+                return sql_fail(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "view column type identity is unavailable"
+                ));
+            };
+            let parsed = match crate::sql::parser::parse_expr(expression, arena) {
+                Ok(expression) => expression,
+                Err(error) => return sql_fail(error),
+            };
+            let default = match ddl::resolve_default(
+                Some(parsed),
+                Some(expression),
+                ctype,
+                descriptions[index].type_mod,
+                storage,
+                txn.txid,
+                arena,
+            ) {
+                Ok(default) => default,
+                Err(error) => return sql_fail(error),
+            };
+            let columns = match current.with_default(index, default) {
+                Ok(columns) => columns,
+                Err(error) => return sql_fail(error),
+            };
+            let (schema, view_name) = {
+                let view = storage.view(slot);
+                (view.schema_for(txn.txid), view.name_for(txn.txid))
+            };
+            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetViewColumns {
+                    schema: schema.as_str(),
+                    name: view_name.as_str(),
+                    columns,
+                },
+            ) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            responder.command_complete("ALTER VIEW")?;
+            return sql_ok();
         }
-        AlterViewAction::RenameColumn { .. } => {
-            return sql_fail(sql_err!(
-                sqlstate::FEATURE_NOT_SUPPORTED,
-                "view column renames require a durable output-column identity"
-            ));
+        AlterViewAction::DropDefault { column } => {
+            let current = *storage.view(slot).columns_for(txn.txid);
+            let Some(index) = current
+                .names()
+                .iter()
+                .position(|name| name.as_str() == column)
+            else {
+                return sql_fail(undefined_column(column));
+            };
+            let columns = match current.with_default(index, crate::storage::ColumnDefault::NONE) {
+                Ok(columns) => columns,
+                Err(error) => return sql_fail(error),
+            };
+            let (schema, view_name) = {
+                let view = storage.view(slot);
+                (view.schema_for(txn.txid), view.name_for(txn.txid))
+            };
+            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetViewColumns {
+                    schema: schema.as_str(),
+                    name: view_name.as_str(),
+                    columns,
+                },
+            ) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            responder.command_complete("ALTER VIEW")?;
+            return sql_ok();
+        }
+        AlterViewAction::RenameColumn { from, to } => {
+            let current = storage.view(slot).columns_for(txn.txid);
+            let Some(index) = current
+                .names()
+                .iter()
+                .position(|name| name.as_str() == from)
+            else {
+                return sql_fail(undefined_column(from));
+            };
+            let name = match SqlName::parse(to) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            let columns = match (*current).with_name(index, name) {
+                Ok(columns) => columns,
+                Err(error) => return sql_fail(error),
+            };
+            let (schema, view_name) = {
+                let view = storage.view(slot);
+                (view.schema_for(txn.txid), view.name_for(txn.txid))
+            };
+            let prior = match storage.stage_view_columns(slot, columns, txn.txid) {
+                Ok(prior) => prior,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::SetViewColumns {
+                    schema: schema.as_str(),
+                    name: view_name.as_str(),
+                    columns,
+                },
+            ) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewColumnsChanged {
+                slot: slot as u32,
+                prior,
+            }) {
+                storage.rollback_view_columns(slot, prior);
+                return sql_fail(error);
+            }
+            responder.command_complete("ALTER VIEW")?;
+            return sql_ok();
         }
         AlterViewAction::RenameTo(new_name) => {
             let (schema, current_name) = {
@@ -32254,9 +32940,7 @@ pub fn alter_view(
         }
         AlterViewAction::SetSchema(_) => unreachable!("handled before option staging"),
     }
-    let current_security = storage.view(slot).security_for(txn.txid);
-    let current_check_option = storage.view(slot).check_option_for(txn.txid);
-    if security == current_security && check_option == current_check_option {
+    if options == storage.view(slot).options_for(txn.txid) {
         responder.command_complete("ALTER VIEW")?;
         return sql_ok();
     }
@@ -32264,57 +32948,33 @@ pub fn alter_view(
         let view = storage.view(slot);
         (view.schema, view.name)
     };
-    if security != current_security {
-        let prior = match storage.stage_view_security(slot, security, txn.txid) {
-            Ok(prior) => prior,
-            Err(error) => return sql_fail(error),
-        };
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::SetViewSecurity {
-                schema: schema.as_str(),
-                name: view_name.as_str(),
-                security_invoker: matches!(security, crate::storage::ViewSecurity::Invoker),
-            },
-        ) {
-            storage.rollback_view_security(slot, prior);
-            return sql_fail(error);
-        }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewSecurityChanged {
-            slot: slot as u32,
-            prior,
-        }) {
-            storage.rollback_view_security(slot, prior);
-            return sql_fail(error);
-        }
+    let prior = match storage.stage_view_options(slot, options, txn.txid) {
+        Ok(prior) => prior,
+        Err(error) => return sql_fail(error),
+    };
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::SetViewOptions {
+            schema: schema.as_str(),
+            name: view_name.as_str(),
+            security_invoker: matches!(options.security, crate::storage::ViewSecurity::Invoker),
+            security_barrier: options.security_barrier.code(),
+            check_option: options
+                .check_option
+                .map_or(0, crate::storage::ViewCheckOption::code),
+        },
+    ) {
+        storage.rollback_view_options(slot, prior);
+        return sql_fail(error);
     }
-    if check_option != current_check_option {
-        let prior = match storage.stage_view_check_option(slot, check_option, txn.txid) {
-            Ok(prior) => prior,
-            Err(error) => return sql_fail(error),
-        };
-        let lsn = storage.bump_lsn();
-        if let Err(error) = wal.stage(
-            txn.txid,
-            lsn,
-            &WalOp::SetViewCheckOption {
-                schema: schema.as_str(),
-                name: view_name.as_str(),
-                check_option: check_option.map_or(0, crate::storage::ViewCheckOption::code),
-            },
-        ) {
-            storage.rollback_view_check_option(slot, prior);
-            return sql_fail(error);
-        }
-        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewCheckOptionChanged {
-            slot: slot as u32,
-            prior,
-        }) {
-            storage.rollback_view_check_option(slot, prior);
-            return sql_fail(error);
-        }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::ViewOptionsChanged {
+        slot: slot as u32,
+        prior,
+    }) {
+        storage.rollback_view_options(slot, prior);
+        return sql_fail(error);
     }
     responder.command_complete("ALTER VIEW")?;
     sql_ok()
@@ -33565,7 +34225,8 @@ pub fn comment(
             )
         }
         CommentTarget::AccessMethod(access_method_name) => {
-            let Some(oid) = super::catalog::access_method_oid(access_method_name) else {
+            let Some(oid) = super::catalog::access_method_oid_in(storage, txid, access_method_name)
+            else {
                 return sql_fail(sql_err!(
                     sqlstate::UNDEFINED_OBJECT,
                     "access method \"{}\" does not exist",
@@ -33962,6 +34623,7 @@ pub fn create_table_as(
     with_data: bool,
     if_not_exists: bool,
     materialized: bool,
+    options: crate::sql::ast::TableAsOptions<'_>,
     raw_path: &str,
     seq_session: &crate::sql::guc::SeqSession,
     arena: &Arena,
@@ -33969,6 +34631,11 @@ pub fn create_table_as(
     responder: &mut Responder,
 ) -> Outcome {
     use crate::storage::{ColumnMeta, SqlName, TableDef};
+    let crate::sql::ast::TableAsOptions {
+        access_method,
+        tablespace,
+        storage_options,
+    } = options;
     // Resolve the query's output columns without running it.
     let mut columns = [crate::sql::types::ColDesc::new("", 0, 0); MAX_PROJ];
     let n_cols = match super::query::describe_query(sql, storage, txn.txid, arena, &mut columns) {
@@ -34001,6 +34668,28 @@ pub fn create_table_as(
     def.name = match SqlName::parse(name.name) {
         Ok(n) => n,
         Err(e) => return sql_fail(e),
+    };
+    def.access_method = match access_method {
+        crate::sql::ast::TableAccessMethod::Heap => crate::storage::TableAccessMethod::Heap,
+        crate::sql::ast::TableAccessMethod::Named(method) => {
+            match storage.table_access_method(method, txn.txid) {
+                Some(method) => method,
+                None => {
+                    return sql_fail(sql_err!(
+                        sqlstate::UNDEFINED_OBJECT,
+                        "access method \"{}\" does not exist",
+                        method
+                    ));
+                }
+            }
+        }
+    };
+    def.tablespace = match resolve_relation_tablespace(storage, tablespace, txn.txid) {
+        Ok(tablespace) => tablespace,
+        Err(error) => return sql_fail(error),
+    };
+    def.storage_options = crate::storage::TableStorageOptions {
+        fillfactor: storage_options.fillfactor,
     };
     def.n_columns = n_cols;
     for i in 0..n_cols {
@@ -34931,12 +35620,192 @@ pub fn create_sequence(
     sql_ok()
 }
 
-/// ALTER SEQUENCE [IF EXISTS] — redefine parameters (and optionally RESTART).
+/// ALTER SEQUENCE [IF EXISTS] — a typed parameter, name, or schema change.
 pub struct AlterSequenceCommand<'a> {
     pub name: &'a QualName<'a>,
     pub if_exists: bool,
-    pub options: &'a crate::sql::ast::SeqOptions<'a>,
-    pub set_schema: Option<&'a str>,
+    pub action: crate::sql::ast::AlterSequenceAction<'a>,
+}
+
+/// Rebind direct sequence literals in a persisted column default before the
+/// sequence identity changes.  The lexer supplies the replacement boundary,
+/// so comments, unrelated strings, and dynamic expressions remain untouched.
+fn rewrite_sequence_default_reference<const N: usize>(
+    text: &str,
+    storage: &Storage,
+    txid: u32,
+    sequence_slot: usize,
+    schema: SqlName,
+    name: SqlName,
+    arena: &Arena,
+) -> Result<StackStr<N>, SqlError> {
+    use crate::sql::lexer::{Lexer, Tok};
+    use core::fmt::Write;
+
+    crate::sql::parser::parse_expr(text, arena)?;
+    let mut output = StackStr::<N>::new();
+    let mut lexer = Lexer::new(text, arena);
+    let mut copied = 0usize;
+    loop {
+        let token = lexer.next_token().map_err(|error| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid stored expression at byte {}: {}",
+                error.at,
+                error.message
+            )
+        })?;
+        if token == Tok::Eof {
+            break;
+        }
+        let Tok::Ident(function) = token else {
+            continue;
+        };
+        if !matches!(function, "nextval" | "currval" | "setval") {
+            continue;
+        }
+        let mut arguments = lexer.clone();
+        if arguments.next_token().map_err(|error| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid stored expression at byte {}: {}",
+                error.at,
+                error.message
+            )
+        })? != Tok::Op("(")
+        {
+            continue;
+        }
+        let Tok::Str(written) = arguments.next_token().map_err(|error| {
+            sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "invalid stored expression at byte {}: {}",
+                error.at,
+                error.message
+            )
+        })?
+        else {
+            continue;
+        };
+        let literal_start = arguments.token_start();
+        let (qualifier, base) = written
+            .rsplit_once('.')
+            .map_or((None, written), |(schema, name)| (Some(schema), name));
+        if storage.sequence_on_path(qualifier, base, txid) != Some(sequence_slot) {
+            continue;
+        }
+        let _ = output.write_str(&text[copied..literal_start]);
+        let _ = output.write_char('\'');
+        write_identifier(&mut output, schema.as_str());
+        let _ = output.write_char('.');
+        write_identifier(&mut output, name.as_str());
+        let _ = output.write_char('\'');
+        copied = arguments.token_end();
+    }
+    let _ = output.write_str(&text[copied..]);
+    if output.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "rewritten stored expression exceeds {} bytes",
+            N
+        ));
+    }
+    crate::sql::parser::parse_expr(output.as_str(), arena)?;
+    Ok(output)
+}
+
+fn rewrite_sequence_default_references(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    sequence_slot: usize,
+    schema: SqlName,
+    name: SqlName,
+    arena: &Arena,
+) -> Result<(), SqlError> {
+    for table_slot in 0..storage.table_count() {
+        if !storage.table(table_slot).visible_to(txn.txid) {
+            continue;
+        }
+        let current = *storage.table_def(table_slot, txn.txid);
+        let mut altered = current;
+        let mut changed = false;
+        for column in altered.columns.iter_mut().take(altered.n_columns) {
+            column.default = match column.default {
+                crate::storage::ColumnDefault::None => column.default,
+                crate::storage::ColumnDefault::Constant { value, expression } => {
+                    let rewritten = rewrite_sequence_default_reference(
+                        expression.as_str(),
+                        storage,
+                        txn.txid,
+                        sequence_slot,
+                        schema,
+                        name,
+                        arena,
+                    )?;
+                    changed |= rewritten != expression;
+                    crate::storage::ColumnDefault::Constant {
+                        value,
+                        expression: rewritten,
+                    }
+                }
+                crate::storage::ColumnDefault::Expression(expression) => {
+                    let rewritten = rewrite_sequence_default_reference(
+                        expression.as_str(),
+                        storage,
+                        txn.txid,
+                        sequence_slot,
+                        schema,
+                        name,
+                        arena,
+                    )?;
+                    changed |= rewritten != expression;
+                    crate::storage::ColumnDefault::Expression(rewritten)
+                }
+                crate::storage::ColumnDefault::Generated(expression) => {
+                    let rewritten = rewrite_sequence_default_reference(
+                        expression.as_str(),
+                        storage,
+                        txn.txid,
+                        sequence_slot,
+                        schema,
+                        name,
+                        arena,
+                    )?;
+                    changed |= rewritten != expression;
+                    crate::storage::ColumnDefault::Generated(rewritten)
+                }
+            };
+        }
+        if !changed {
+            continue;
+        }
+        let mut mapping = [None; MAX_COLUMNS];
+        let mut wal_mapping = [u16::MAX; MAX_COLUMNS];
+        for (position, column) in current.columns().iter().enumerate() {
+            mapping[position] = Some(column.name);
+            wal_mapping[position] = position as u16;
+        }
+        storage.write_table_def(table_slot, txn.txid, altered, &mapping, false)?;
+        let lsn = storage.bump_lsn();
+        wal.stage(
+            txn.txid,
+            lsn,
+            &WalOp::BeginTableRewrite {
+                previous_schema: current.schema.as_str(),
+                previous_name: current.name.as_str(),
+                preserve_rows: true,
+                column_mapping: wal_mapping,
+            },
+        )?;
+        let lsn = storage.bump_lsn();
+        wal.stage(txn.txid, lsn, &WalOp::CreateTable(altered))?;
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::TableAltered(table_slot as u32)) {
+            storage.rollback_table_def(table_slot, txn.txid);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 pub fn alter_sequence(
@@ -34945,13 +35814,13 @@ pub fn alter_sequence(
     txn: &mut TxnState,
     command: AlterSequenceCommand<'_>,
     seq_session: &crate::sql::guc::SeqSession,
+    arena: &Arena,
     responder: &mut Responder,
 ) -> Outcome {
     let AlterSequenceCommand {
         name,
         if_exists,
-        options,
-        set_schema,
+        action,
     } = command;
     let slot = match resolve_sequence(storage, name, txn.txid) {
         Ok(Some(slot)) => slot,
@@ -34977,8 +35846,17 @@ pub fn alter_sequence(
         return sql_fail(error);
     }
     let prior = storage.sequence_for(slot, txn.txid);
-    let target_schema = match set_schema {
-        Some(schema) => {
+    let base = SeqSpec {
+        data_type: prior.data_type,
+        increment: prior.increment,
+        min_value: prior.min_value,
+        max_value: prior.max_value,
+        start_value: prior.start_value,
+        cache: prior.cache,
+        cycle: prior.cycle,
+    };
+    let (target_schema, target_name, options, schema_move, rename) = match action {
+        crate::sql::ast::AlterSequenceAction::SetSchema(schema) => {
             if storage.find_schema_visible(schema, txn.txid).is_none() {
                 return sql_fail(sql_err!(
                     sqlstate::INVALID_SCHEMA_NAME,
@@ -34999,27 +35877,38 @@ pub fn alter_sequence(
                     schema
                 ));
             }
-            match SqlName::parse(schema) {
+            let schema = match SqlName::parse(schema) {
                 Ok(schema) => schema,
                 Err(error) => return sql_fail(error),
-            }
+            };
+            (schema, prior.name, None, true, false)
         }
-        None => prior.schema,
+        crate::sql::ast::AlterSequenceAction::RenameTo(new_name) => {
+            let new_name = match SqlName::parse(new_name) {
+                Ok(name) => name,
+                Err(error) => return sql_fail(error),
+            };
+            if storage.relation_name_taken(prior.schema.as_str(), new_name.as_str(), txn.txid) {
+                return sql_fail(sql_err!(
+                    sqlstate::DUPLICATE_TABLE,
+                    "relation \"{}\" already exists",
+                    new_name.as_str()
+                ));
+            }
+            (prior.schema, new_name, None, false, true)
+        }
+        crate::sql::ast::AlterSequenceAction::Options(options) => {
+            (prior.schema, prior.name, Some(options), false, false)
+        }
     };
-    let base = SeqSpec {
-        data_type: prior.data_type,
-        increment: prior.increment,
-        min_value: prior.min_value,
-        max_value: prior.max_value,
-        start_value: prior.start_value,
-        cache: prior.cache,
-        cycle: prior.cycle,
+    let (spec, restart) = match options {
+        Some(options) => match resolve_seq_spec(&options, Some(base)) {
+            Ok(v) => v,
+            Err(error) => return sql_fail(error),
+        },
+        None => (base, None),
     };
-    let (spec, restart) = match resolve_seq_spec(options, Some(base)) {
-        Ok(v) => v,
-        Err(e) => return sql_fail(e),
-    };
-    if options.owned_by.is_some()
+    if options.is_some_and(|options| options.owned_by.is_some())
         && let Some(generator) = prior.generator_for
         && let Some(table_slot) = storage.find_visible(
             generator.table_schema.as_str(),
@@ -35036,7 +35925,7 @@ pub fn alter_sequence(
             "cannot change ownership of identity sequence"
         ));
     }
-    let owner = match options.owned_by {
+    let owner = match options.and_then(|options| options.owned_by) {
         None => prior.owner,
         Some(None) => None,
         Some(Some(requested)) => {
@@ -35048,10 +35937,24 @@ pub fn alter_sequence(
         }
     };
     let generator_for = prior.generator_for;
+    if (schema_move || rename)
+        && let Err(error) = rewrite_sequence_default_references(
+            storage,
+            wal,
+            txn,
+            slot,
+            target_schema,
+            target_name,
+            arena,
+        )
+    {
+        return sql_fail(error);
+    }
     let prior_definition = match storage.stage_sequence_alter(
         slot,
         crate::storage::SequenceAlteration {
             schema: target_schema,
+            name: target_name,
             spec,
             owner,
             generator_for,
@@ -35066,14 +35969,21 @@ pub fn alter_sequence(
         let s = storage.sequence_for(slot, txn.txid);
         (s.schema, s.name)
     };
-    // Parameter changes are absolute definitions; namespace changes preserve
-    // the sequence identity through their dedicated operation.
+    // Each identity change has a dedicated WAL operation.  Parameter changes
+    // remain absolute definitions, so replay never guesses which prior image
+    // a partial ALTER was based on.
     let lsn = storage.bump_lsn();
-    let operation = if set_schema.is_some() {
+    let operation = if schema_move {
         WalOp::SetSequenceSchema {
             schema: prior.schema.as_str(),
             name: prior.name.as_str(),
             new_schema: schema.as_str(),
+        }
+    } else if rename {
+        WalOp::RenameSequence {
+            schema: prior.schema.as_str(),
+            name: prior.name.as_str(),
+            new_name: sname.as_str(),
         }
     } else {
         WalOp::CreateSequence {
@@ -40800,14 +41710,16 @@ fn rewrite_composite_dependent_views(
         let (new_slot, old_slot) = storage.create_view(
             view.schema,
             view.name,
-            crate::storage::StoredQueryDefinition {
-                sql: rewritten,
-                creation_path,
-                dependencies,
-            },
-            crate::storage::ViewOptions {
-                security: view.security_for(txn.txid),
-                check_option: view.check_option_for(txn.txid),
+            crate::storage::ViewDefinition {
+                columns: view.columns,
+                query: crate::storage::StoredQueryDefinition {
+                    sql: rewritten,
+                    creation_path,
+                    dependencies,
+                },
+                options: crate::storage::ViewOptions {
+                    ..view.options_for(txn.txid)
+                },
             },
             true,
             txn.txid,
@@ -40819,12 +41731,14 @@ fn rewrite_composite_dependent_views(
             &WalOp::CreateView {
                 schema: view.schema.as_str(),
                 name: view.name.as_str(),
+                columns: view.columns,
                 sql: rewritten.as_str(),
                 path: creation_path.as_str(),
                 security_invoker: matches!(
                     view.security_for(txn.txid),
                     crate::storage::ViewSecurity::Invoker
                 ),
+                security_barrier: view.security_barrier_for(txn.txid).code(),
                 check_option: view
                     .check_option_for(txn.txid)
                     .map_or(0, |option| option.code()),
@@ -44062,6 +44976,225 @@ pub fn drop_database(
     sql_ok()
 }
 
+pub fn create_access_method(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    name: &str,
+    method_type: crate::sql::ast::AccessMethodType,
+    handler: crate::sql::ast::QualName<'_>,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some(current) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to create access methods"
+        ));
+    };
+    if !storage.role(current).attributes_to(txn.txid).superuser {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to create access methods"
+        ));
+    }
+    let handler = match method_type {
+        crate::sql::ast::AccessMethodType::Table
+            if handler.schema.is_none_or(|schema| schema == "pg_catalog")
+                && handler.name == "heap_tableam_handler" =>
+        {
+            crate::storage::TableAccessMethodHandler::Heap
+        }
+        crate::sql::ast::AccessMethodType::Table => {
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_FUNCTION,
+                "function {} does not exist",
+                handler.name
+            ));
+        }
+        crate::sql::ast::AccessMethodType::Index => {
+            return sql_fail(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "index access method handlers are unavailable without a bounded executable index implementation"
+            ));
+        }
+    };
+    let name = match SqlName::parse(name) {
+        Ok(name) => name,
+        Err(error) => return sql_fail(error),
+    };
+    let slot = match storage.create_access_method(
+        0,
+        crate::storage::AccessMethodDefinition { name, handler },
+        txn.txid,
+    ) {
+        Ok(slot) => slot,
+        Err(error) => return sql_fail(error),
+    };
+    let created_at = storage
+        .access_methods_visible_to(txn.txid)
+        .find(|(candidate, _)| *candidate == slot)
+        .map(|(_, method)| method.created_at)
+        .expect("new access method is visible to its creator");
+    let lsn = storage.bump_lsn();
+    if let Err(error) = wal.stage(
+        txn.txid,
+        lsn,
+        &WalOp::CreateAccessMethod {
+            created_at,
+            name: name.as_str(),
+            handler,
+        },
+    ) {
+        storage.rollback_access_method_create(slot);
+        return sql_fail(error);
+    }
+    if let Err(error) = txn.record_ddl(super::txn::DdlUndo::AccessMethodCreated(slot as u32)) {
+        storage.rollback_access_method_create(slot);
+        return sql_fail(error);
+    }
+    responder.command_complete("CREATE ACCESS METHOD")?;
+    sql_ok()
+}
+
+pub fn drop_access_method(
+    storage: &mut Storage,
+    wal: &mut Wal,
+    txn: &mut TxnState,
+    names: &[&str],
+    if_exists: bool,
+    cascade: bool,
+    responder: &mut Responder,
+) -> Outcome {
+    let Some(current) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to drop access methods"
+        ));
+    };
+    if !storage.role(current).attributes_to(txn.txid).superuser {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to drop access methods"
+        ));
+    }
+    for name in names {
+        let Some(slot) = storage.access_method_slot(name, txn.txid) else {
+            if if_exists {
+                responder.notice(
+                    sqlstate::UNDEFINED_OBJECT,
+                    stack_format!(128, "access method \"{}\" does not exist, skipping", name)
+                        .as_str(),
+                )?;
+                continue;
+            }
+            return sql_fail(sql_err!(
+                sqlstate::UNDEFINED_OBJECT,
+                "access method \"{}\" does not exist",
+                name
+            ));
+        };
+        let method = storage
+            .access_methods_visible_to(txn.txid)
+            .find(|(candidate, _)| *candidate == slot)
+            .map(|(_, method)| *method)
+            .expect("resolved access method is visible");
+        while let Some((schema, table)) =
+            storage.access_method_table_dependency(method.oid(), txn.txid)
+        {
+            if !cascade {
+                return sql_fail(sql_err!(
+                    sqlstate::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "cannot drop access method {} because other objects depend on it\nDETAIL:  table {} depends on access method {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                    name,
+                    table.as_str(),
+                    name
+                ));
+            }
+            let relation = QualName {
+                schema: Some(schema.as_str()),
+                name: table.as_str(),
+            };
+            let statement = DropTable {
+                names: core::slice::from_ref(&relation),
+                if_exists: false,
+                cascade: true,
+            };
+            let outcome = responder.without_command_complete(|responder| {
+                drop_table_kind(
+                    storage,
+                    wal,
+                    txn,
+                    &statement,
+                    Some(crate::storage::TableKind::Local),
+                    "DROP TABLE",
+                    responder,
+                )
+            });
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return sql_fail(error),
+                Err(error) => return Err(error),
+            }
+        }
+        if storage
+            .comment_text(
+                crate::storage::CommentClass::AccessMethod,
+                "",
+                method.definition.name.as_str(),
+                method.oid().get() as u32,
+                txn.txid,
+            )
+            .is_some()
+        {
+            let (comment_slot, prior) = match storage.set_comment(
+                crate::storage::CommentClass::AccessMethod,
+                SqlName::EMPTY,
+                method.definition.name,
+                method.oid().get() as u32,
+                None,
+                txn.txid,
+            ) {
+                Ok(comment) => comment,
+                Err(error) => return sql_fail(error),
+            };
+            let lsn = storage.bump_lsn();
+            if let Err(error) = wal.stage(
+                txn.txid,
+                lsn,
+                &WalOp::Comment {
+                    class: crate::storage::CommentClass::AccessMethod.to_u8(),
+                    schema: "",
+                    name: method.definition.name.as_str(),
+                    subid: method.oid().get() as u32,
+                    text: None,
+                },
+            ) {
+                storage.restore_comment_pending(comment_slot, prior);
+                return sql_fail(error);
+            }
+            if let Err(error) = txn.record_ddl(super::txn::DdlUndo::CommentSet {
+                slot: comment_slot as u32,
+                prior,
+            }) {
+                storage.restore_comment_pending(comment_slot, prior);
+                return sql_fail(error);
+            }
+        }
+        storage.drop_access_method(slot, txn.txid);
+        let lsn = storage.bump_lsn();
+        if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropAccessMethod { name }) {
+            storage.rollback_access_method_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+        if let Err(error) = txn.record_ddl(super::txn::DdlUndo::AccessMethodDropped(slot as u32)) {
+            storage.rollback_access_method_drop(slot, txn.txid);
+            return sql_fail(error);
+        }
+    }
+    responder.command_complete("DROP ACCESS METHOD")?;
+    sql_ok()
+}
+
 pub fn create_tablespace(
     storage: &mut Storage,
     wal: &mut Wal,
@@ -47168,18 +48301,7 @@ fn decode_binary_field_with_context<'a>(
         ColType::Float8 => via(oids::FLOAT8),
         ColType::Char => {
             let [byte]: [u8; 1] = bytes.try_into().map_err(|_| bad())?;
-            if byte == 0 {
-                Ok(Datum::Text(""))
-            } else if byte.is_ascii() {
-                core::str::from_utf8(bytes)
-                    .map(Datum::Text)
-                    .map_err(|_| bad())
-            } else {
-                Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "non-ASCII binary input for type \"char\" is not supported"
-                ))
-            }
+            Ok(Datum::Char(byte))
         }
         ColType::Text | ColType::Varchar | ColType::Bpchar | ColType::Name => {
             core::str::from_utf8(bytes)
@@ -47721,17 +48843,17 @@ pub fn copy_out(
                     }
                     let name = def.columns()[setup.targets[i]].name.as_str();
                     if fmt.csv {
-                        crate::sql::copy::encode_field_csv(
+                        crate::sql::copy::encode_field_csv_bytes(
                             out,
-                            Some(name),
-                            fmt.null.as_str(),
+                            Some(name.as_bytes()),
+                            fmt.null.as_str().as_bytes(),
                             fmt.delimiter,
                             fmt.quote,
                             fmt.escape,
                             false,
                         );
                     } else {
-                        crate::sql::copy::encode_field(out, Some(name));
+                        crate::sql::copy::encode_field_bytes(out, Some(name.as_bytes()));
                     }
                 }
             })
@@ -47857,7 +48979,7 @@ pub fn copy_out(
             // Render each target into the arena first (fallible), so the
             // wire write below is a deterministic, retry-safe emission.
             let render = responder.render_context();
-            let mut texts: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+            let mut texts: [Option<&[u8]>; MAX_COLUMNS] = [None; MAX_COLUMNS];
             for (i, texts_slot) in texts.iter_mut().enumerate().take(setup.n_targets) {
                 // The wire-text output function, exactly as a SELECT would
                 // render it — styled timestamps, GUC-honoring bytea, `t`
@@ -47879,17 +49001,17 @@ pub fn copy_out(
                         if fmt.csv {
                             let force = fmt.force_quote_all
                                 || CopyFmt::forced(fmt.force_quote, setup.targets[i]);
-                            crate::sql::copy::encode_field_csv(
+                            crate::sql::copy::encode_field_csv_bytes(
                                 out,
                                 *text,
-                                fmt.null.as_str(),
+                                fmt.null.as_str().as_bytes(),
                                 fmt.delimiter,
                                 fmt.quote,
                                 fmt.escape,
                                 force,
                             );
                         } else if let Some(value) = text {
-                            crate::sql::copy::encode_field(out, Some(value));
+                            crate::sql::copy::encode_field_bytes(out, Some(value));
                         } else {
                             out(fmt.null.as_str().as_bytes());
                         }
@@ -48040,17 +49162,17 @@ pub fn copy_out_query(
                         out(&[fmt.delimiter]);
                     }
                     if fmt.csv {
-                        crate::sql::copy::encode_field_csv(
+                        crate::sql::copy::encode_field_csv_bytes(
                             out,
-                            Some(c.name),
-                            fmt.null.as_str(),
+                            Some(c.name.as_bytes()),
+                            fmt.null.as_str().as_bytes(),
                             fmt.delimiter,
                             fmt.quote,
                             fmt.escape,
                             false,
                         );
                     } else {
-                        crate::sql::copy::encode_field(out, Some(c.name));
+                        crate::sql::copy::encode_field_bytes(out, Some(c.name.as_bytes()));
                     }
                 }
             })
@@ -48075,7 +49197,7 @@ pub fn copy_out_query(
                 })
                 .map_err(wire_to_sql)?;
         } else {
-            let mut texts: [Option<&str>; MAX_COLUMNS] = [None; MAX_COLUMNS];
+            let mut texts: [Option<&[u8]>; MAX_COLUMNS] = [None; MAX_COLUMNS];
             let catalog = super::query::storage_catalog(storage, arena, txid);
             for (i, slot) in texts.iter_mut().enumerate().take(n) {
                 let output =
@@ -48090,17 +49212,17 @@ pub fn copy_out_query(
                         }
                         if fmt.csv {
                             let force = fmt.force_quote_all || CopyFmt::forced(fmt.force_quote, i);
-                            crate::sql::copy::encode_field_csv(
+                            crate::sql::copy::encode_field_csv_bytes(
                                 out,
                                 *text,
-                                fmt.null.as_str(),
+                                fmt.null.as_str().as_bytes(),
                                 fmt.delimiter,
                                 fmt.quote,
                                 fmt.escape,
                                 force,
                             );
                         } else if let Some(value) = text {
-                            crate::sql::copy::encode_field(out, Some(value));
+                            crate::sql::copy::encode_field_bytes(out, Some(value));
                         } else {
                             out(fmt.null.as_str().as_bytes());
                         }
@@ -48398,6 +49520,108 @@ where
 {
     if let Some(default) = column.default.constant() {
         return Ok(default.as_datum());
+    }
+    let Some(expression) = expression else {
+        return Ok(Datum::Null);
+    };
+    let value = super::eval::eval_full(
+        expression,
+        arena,
+        crate::sql::eval::NO_PARAMS,
+        &NoColumns,
+        hooks,
+    )?;
+    coerce(value, column, storage, txid, arena)
+}
+
+/// Parses only expression-backed defaults installed on an auto-updatable view.
+/// The catalog already stores constants in typed form, so execution never
+/// reparses or re-coerces those values.
+fn parse_view_defaults<'a>(
+    view: Option<ViewCheck<'_>>,
+    definition: &TableDef,
+    arena: &'a Arena,
+) -> Result<constraints::ParsedDefaults<'a>, SqlError> {
+    let mut parsed = [None; MAX_COLUMNS];
+    let Some(view) = view else {
+        return Ok(parsed);
+    };
+    for (view_index, base_name) in view.defaults.base_columns.iter().enumerate() {
+        let Some(default) = view.defaults.columns.default_at(view_index) else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view default columns do not match the view output"
+            ));
+        };
+        let Some(source) = default.expression() else {
+            continue;
+        };
+        if default.constant().is_some() {
+            continue;
+        }
+        if default.is_generated() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view column default is a generated expression"
+            ));
+        }
+        let Some(base_index) = definition.column_index(base_name) else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "view default target is absent from its base relation"
+            ));
+        };
+        let source = arena.alloc_str(source.as_str()).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "view default expression exceeds the statement arena"
+            )
+        })?;
+        parsed[base_index] = Some(crate::sql::parser::parse_expr(source, arena)?);
+    }
+    Ok(parsed)
+}
+
+fn view_default_for(
+    view: Option<ViewCheck<'_>>,
+    definition: &TableDef,
+    base_index: usize,
+) -> Option<crate::storage::ColumnDefault> {
+    let view = view?;
+    let base_name = definition.columns().get(base_index)?.name.as_str();
+    let view_index = view
+        .defaults
+        .base_columns
+        .iter()
+        .position(|candidate| *candidate == base_name)?;
+    view.defaults
+        .columns
+        .default_at(view_index)
+        .filter(|default| !matches!(default, crate::storage::ColumnDefault::None))
+}
+
+#[expect(clippy::too_many_arguments, reason = "default evaluation context")]
+fn insert_default_value<'values, 'arena>(
+    storage: &Storage,
+    txid: u32,
+    view: Option<ViewCheck<'_>>,
+    definition: &'values TableDef,
+    base_index: usize,
+    table_expression: Option<&'arena Expr<'arena>>,
+    view_expression: Option<&'arena Expr<'arena>>,
+    arena: &'arena Arena,
+    hooks: &super::eval::EvalHooks<'_, 'arena>,
+) -> Result<Datum<'values>, SqlError>
+where
+    'arena: 'values,
+{
+    let column = &definition.columns()[base_index];
+    let (default, expression) = match view_default_for(view, definition, base_index) {
+        Some(default) => (default, view_expression),
+        None => (column.default, table_expression),
+    };
+    if let Some(constant) = default.constant() {
+        return detach_routine_datum(constant.as_datum(), arena);
     }
     let Some(expression) = expression else {
         return Ok(Datum::Null);
@@ -50701,6 +51925,7 @@ pub(crate) fn view_trigger_definition(
         arena,
         &mut columns,
     )?;
+    let n_columns = super::catalog::overlay_view_column_names(view, txid, &mut columns, n_columns)?;
     if n_columns > MAX_COLUMNS {
         return Err(sql_err!(
             sqlstate::PROGRAM_LIMIT_EXCEEDED,
@@ -51860,6 +53085,10 @@ where
             Ok(d) => d,
             Err(e) => return sql_fail(e),
         };
+        let view_default_exprs = match parse_view_defaults(view_check, &def, arena) {
+            Ok(d) => d,
+            Err(e) => return sql_fail(e),
+        };
         let generated_exprs = match parse_generated(&def, arena) {
             Ok(g) => g,
             Err(e) => return sql_fail(e),
@@ -51938,28 +53167,24 @@ where
                     sequences: Some(&seq),
                     ..super::eval::NO_HOOKS
                 };
-                for (i, col) in def.columns().iter().enumerate() {
+                for i in 0..def.n_columns {
                     if explicit[i] {
                         continue;
                     }
-                    if let Some(d) = col.default.constant() {
-                        values[i] = d.as_datum();
-                    } else if let Some(expr) = default_exprs[i] {
-                        let v = match super::eval::eval_full(
-                            expr,
-                            arena,
-                            crate::sql::eval::NO_PARAMS,
-                            &NoColumns,
-                            &hooks,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => return sql_fail(e),
-                        };
-                        match coerce(v, col, storage, txn.txid, arena) {
-                            Ok(v) => values[i] = v,
-                            Err(e) => return sql_fail(e),
-                        }
-                    }
+                    values[i] = match insert_default_value(
+                        storage,
+                        txn.txid,
+                        view_check,
+                        &def,
+                        i,
+                        default_exprs[i],
+                        view_default_exprs[i],
+                        arena,
+                        &hooks,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => return sql_fail(error),
+                    };
                 }
             }
             if let Err(e) = fill_auto_increment(
@@ -52064,6 +53289,10 @@ where
     // Non-constant DEFAULT expressions (now(), nextval(...), …) and GENERATED
     // expressions, re-parsed once and evaluated per row below.
     let default_exprs = match parse_defaults(&def, arena) {
+        Ok(d) => d,
+        Err(e) => return sql_fail(e),
+    };
+    let view_default_exprs = match parse_view_defaults(view_check, &def, arena) {
         Ok(d) => d,
         Err(e) => return sql_fail(e),
     };
@@ -52173,28 +53402,24 @@ where
                 }
             }
             // Defaults for the columns the row did not set explicitly.
-            for (i, col) in def.columns().iter().enumerate() {
+            for i in 0..def.n_columns {
                 if explicit[i] {
                     continue;
                 }
-                if let Some(d) = col.default.constant() {
-                    values[i] = d.as_datum();
-                } else if let Some(expr) = default_exprs[i] {
-                    let v = match super::eval::eval_full(
-                        expr,
-                        arena,
-                        crate::sql::eval::NO_PARAMS,
-                        &NoColumns,
-                        &hooks,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => return sql_fail(e),
-                    };
-                    match coerce(v, col, storage, txn.txid, arena) {
-                        Ok(v) => values[i] = v,
-                        Err(e) => return sql_fail(e),
-                    }
-                }
+                values[i] = match insert_default_value(
+                    storage,
+                    txn.txid,
+                    view_check,
+                    &def,
+                    i,
+                    default_exprs[i],
+                    view_default_exprs[i],
+                    arena,
+                    &hooks,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return sql_fail(error),
+                };
             }
         }
         if let Err(e) = fill_auto_increment(
@@ -56894,11 +58119,16 @@ fn alter_table_inner(
                     new_def.access_method = crate::storage::TableAccessMethod::Heap;
                 }
                 AlterAction::SetAccessMethod(crate::sql::ast::TableAccessMethod::Named(name)) => {
-                    return sql_fail(sql_err!(
-                        sqlstate::UNDEFINED_OBJECT,
-                        "access method \"{}\" does not exist",
-                        name
-                    ));
+                    new_def.access_method = match storage.table_access_method(name, txn.txid) {
+                        Some(method) => method,
+                        None => {
+                            return sql_fail(sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "access method \"{}\" does not exist",
+                                name
+                            ));
+                        }
+                    };
                 }
                 AlterAction::SetPersistence(crate::sql::ast::RelationPersistence::Permanent) => {}
                 AlterAction::SetPersistence(_) => {
@@ -57020,6 +58250,7 @@ fn alter_table_inner(
                 alteration.slot,
                 crate::storage::SequenceAlteration {
                     schema: sequence.schema,
+                    name: sequence.name,
                     spec: alteration.spec,
                     owner: sequence.owner,
                     generator_for: sequence.generator_for,
@@ -57206,11 +58437,16 @@ fn alter_table_inner(
                         crate::storage::TableAccessMethod::Heap
                     }
                     crate::sql::ast::TableAccessMethod::Named(name) => {
-                        return sql_fail(sql_err!(
-                            sqlstate::UNDEFINED_OBJECT,
-                            "access method \"{}\" does not exist",
-                            name
-                        ));
+                        match storage.table_access_method(name, txn.txid) {
+                            Some(method) => method,
+                            None => {
+                                return sql_fail(sql_err!(
+                                    sqlstate::UNDEFINED_OBJECT,
+                                    "access method \"{}\" does not exist",
+                                    name
+                                ));
+                            }
+                        }
                     }
                 };
             }
@@ -57434,6 +58670,14 @@ fn alter_table_inner(
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
+                if new_def.columns[i].default.is_generated() {
+                    return sql_fail(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "column \"{}\" of relation \"{}\" is a generated column",
+                        column,
+                        statement.table.name
+                    ));
+                }
                 let ctype = new_def.columns[i].ctype;
                 let type_mod = new_def.columns[i].type_mod;
                 // A literal-only default folds to a constant; a call-bearing one
@@ -57456,6 +58700,14 @@ fn alter_table_inner(
                 let Some(i) = new_def.column_index(column) else {
                     return sql_fail(undefined_column(column));
                 };
+                if new_def.columns[i].default.is_generated() {
+                    return sql_fail(sql_err!(
+                        sqlstate::SYNTAX_ERROR,
+                        "column \"{}\" of relation \"{}\" is a generated column; use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead",
+                        column,
+                        statement.table.name
+                    ));
+                }
                 new_def.columns[i].default = crate::storage::ColumnDefault::NONE;
                 // Dropping a serial column's default detaches its auto-increment.
                 new_def.columns[i].auto_increment = false;
@@ -57469,6 +58721,14 @@ fn alter_table_inner(
                     return sql_fail(sql_err!(
                         sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
                         "column \"{}\" of relation \"{}\" is already an identity column",
+                        column,
+                        statement.table.name
+                    ));
+                }
+                if !matches!(col.default, crate::storage::ColumnDefault::None) {
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" already has a default value",
                         column,
                         statement.table.name
                     ));
@@ -57641,6 +58901,36 @@ fn alter_table_inner(
                 new_def.columns[i].default = crate::storage::ColumnDefault::Generated(expression);
                 generated_changed = true;
                 validate_definition = true;
+            }
+            AlterAction::DropGeneratedExpression { column, if_exists } => {
+                let Some(i) = new_def.column_index(column) else {
+                    return sql_fail(undefined_column(column));
+                };
+                if !new_def.columns[i].default.is_generated() {
+                    if *if_exists {
+                        responder.notice(
+                            crate::sql::eval::sqlstate::SUCCESSFUL_COMPLETION,
+                            stack_format!(
+                                192,
+                                "column \"{}\" of relation \"{}\" is not a stored generated column, skipping",
+                                column,
+                                statement.table.name
+                            )
+                            .as_str(),
+                        )?;
+                        continue;
+                    }
+                    return sql_fail(sql_err!(
+                        sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                        "column \"{}\" of relation \"{}\" is not a stored generated column",
+                        column,
+                        statement.table.name
+                    ));
+                }
+                // PostgreSQL preserves the already-materialized datum. Only
+                // the catalog expression changes, so later writes use the
+                // ordinary-column path without a recomputing rewrite.
+                new_def.columns[i].default = crate::storage::ColumnDefault::NONE;
             }
             AlterAction::SetNotNull { column } => {
                 let Some(i) = new_def.column_index(column) else {
@@ -58502,6 +59792,7 @@ fn alter_table_inner(
             alteration.slot,
             crate::storage::SequenceAlteration {
                 schema: sequence.schema,
+                name: sequence.name,
                 spec: alteration.spec,
                 owner: sequence.owner,
                 generator_for: sequence.generator_for,
@@ -61253,6 +62544,7 @@ fn enforce_view_check<'a>(
     let Some(ViewCheck {
         predicate: Some(predicate),
         view_name,
+        ..
     }) = check
     else {
         return Ok(());
@@ -61675,6 +62967,22 @@ mod tests {
         let datum = decode_binary_field(ColType::OidVector, &bytes, &arena).unwrap();
         assert_eq!(datum, Datum::OidVector(&[23, 0, 0, 0, 54, 12, 0, 0]));
         assert_eq!(datum.to_string(), "23 3126");
+    }
+
+    #[test]
+    fn binary_char_is_a_raw_byte_not_utf8_text() {
+        let mut budget = Budget::new(1 << 16);
+        let arena = Arena::new(&mut budget, "binary char", 1 << 12).unwrap();
+        assert_eq!(
+            decode_binary_field(ColType::Char, &[0xff], &arena).unwrap(),
+            Datum::Char(0xff)
+        );
+        assert_eq!(
+            decode_binary_field(ColType::Char, &[], &arena)
+                .unwrap_err()
+                .sqlstate,
+            sqlstate::BAD_COPY_FILE_FORMAT
+        );
     }
 
     #[test]

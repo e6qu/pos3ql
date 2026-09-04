@@ -320,10 +320,21 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
              EXECUTE ''CREATE PUBLICATION plpgsql_dynamic_catalog_publication \
                FOR TABLE plpgsql_dynamic_catalog_rows'';
            END'; \
+         CREATE ROLE plpgsql_dynamic_schema_reader; \
+         CREATE TABLE plpgsql_dynamic_schema_audit(value integer); \
+         CREATE FUNCTION public.plpgsql_dynamic_schema_audit_fn() RETURNS trigger
+           LANGUAGE plpgsql AS 'BEGIN
+             INSERT INTO plpgsql_dynamic_schema_audit VALUES (NEW.value);
+             RETURN NEW;
+           END'; \
          CREATE FUNCTION plpgsql_dynamic_catalog_schema() RETURNS void
            LANGUAGE plpgsql AS 'BEGIN
              EXECUTE ''CREATE SCHEMA plpgsql_dynamic_catalog_ns \
                CREATE TABLE schema_rows (value integer) \
+               CREATE SEQUENCE schema_sequence \
+               CREATE TRIGGER schema_audit AFTER INSERT ON schema_rows FOR EACH ROW \
+                 EXECUTE FUNCTION public.plpgsql_dynamic_schema_audit_fn() \
+               GRANT SELECT ON TABLE schema_rows TO plpgsql_dynamic_schema_reader \
                CREATE VIEW schema_view AS SELECT value FROM schema_rows'';
            END'; \
          CREATE FUNCTION plpgsql_dynamic_catalog_drop_schema() RETURNS void
@@ -353,6 +364,9 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
          SELECT plpgsql_dynamic_catalog_schema(); \
          INSERT INTO plpgsql_dynamic_catalog_ns.schema_rows VALUES (11); \
          SELECT * FROM plpgsql_dynamic_catalog_ns.schema_view; \
+         SELECT * FROM plpgsql_dynamic_schema_audit; \
+         SELECT nextval('plpgsql_dynamic_catalog_ns.schema_sequence'); \
+         SELECT has_table_privilege('plpgsql_dynamic_schema_reader', 'plpgsql_dynamic_catalog_ns.schema_rows', 'SELECT'); \
          INSERT INTO plpgsql_dynamic_catalog_rows VALUES \
            (nextval('plpgsql_dynamic_catalog_sequence'), 'nine'); \
          SELECT plpgsql_dynamic_catalog_lifecycle(); \
@@ -377,6 +391,9 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
             "NULL",
             "NULL",
             "11",
+            "11",
+            "1",
+            "t",
             "NULL",
             "9|nine",
             "9|nine",
@@ -404,6 +421,9 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
         "SELECT * FROM plpgsql_dynamic_catalog_view; \
          SELECT * FROM plpgsql_dynamic_catalog_materialized; \
          SELECT * FROM plpgsql_dynamic_catalog_ns.schema_view; \
+         SELECT * FROM plpgsql_dynamic_schema_audit; \
+         SELECT nextval('plpgsql_dynamic_catalog_ns.schema_sequence'); \
+         SELECT has_table_privilege('plpgsql_dynamic_schema_reader', 'plpgsql_dynamic_catalog_ns.schema_rows', 'SELECT'); \
          SELECT obj_description('plpgsql_dynamic_catalog_rows'::regclass, 'pg_class'); \
          SELECT enumlabel FROM pg_enum \
            WHERE enumtypid = 'plpgsql_dynamic_catalog_state'::regtype \
@@ -421,6 +441,9 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
             "9|nine",
             "9|nine",
             "11",
+            "11",
+            "2",
+            "t",
             "dynamic catalog table",
             "ready",
             "blocked",
@@ -439,6 +462,9 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
         "SELECT plpgsql_dynamic_catalog_drop_schema(); \
          DROP FUNCTION plpgsql_dynamic_catalog_drop_schema(); \
          DROP FUNCTION plpgsql_dynamic_catalog_schema(); \
+         DROP FUNCTION plpgsql_dynamic_schema_audit_fn(); \
+         DROP TABLE plpgsql_dynamic_schema_audit; \
+         DROP ROLE plpgsql_dynamic_schema_reader; \
          DROP FUNCTION plpgsql_dynamic_catalog_lifecycle(); \
          DROP MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized; \
          DROP STATISTICS plpgsql_dynamic_catalog_stats; \
@@ -1748,7 +1774,7 @@ fn prepare_transaction_is_strictly_configured_and_eligible() {
 
     let mut config = test_config("prepared-eligibility");
     config.max_prepared_transactions = 1;
-    let mut budget = Budget::new(1 << 28);
+    let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for statement in [
         "PREPARE TRANSACTION 'outside'",
@@ -4089,6 +4115,64 @@ fn collation_and_conversion_survive_wal_checkpoint_and_cold_object_recovery() {
 }
 
 #[test]
+fn native_hook_ddl_rejects_before_catalog_publication() {
+    let config = test_config("native-hook-ddl");
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    for sql in [
+        "CREATE OR REPLACE TRANSFORM FOR integer LANGUAGE plpgsql (TO SQL WITH FUNCTION pg_catalog.int4recv(internal), FROM SQL WITH FUNCTION pg_catalog.int4recv(internal))",
+        "DROP TRANSFORM IF EXISTS FOR integer LANGUAGE plpgsql",
+        "LOAD 'untrusted-library'",
+        "SECURITY LABEL ON TABLE untrusted_target IS 'label'",
+    ] {
+        let output = run_with(&mut engine, &mut budget, sql);
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("0A000"), "{sql}: {text}");
+    }
+    let malformed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRANSFORM FOR integer LANGUAGE plpgsql (FROM SQL WITH FUNCTION pg_catalog.int4recv(internal) TO SQL WITH FUNCTION pg_catalog.int4recv(internal))",
+    );
+    let malformed = String::from_utf8_lossy(&malformed);
+    assert!(
+        malformed.contains("42601"),
+        "transform clauses must retain PostgreSQL's comma boundary: {malformed}"
+    );
+    let malformed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TRANSFORM FOR integer LANGUAGE plpgsql (FROM SQL WITHOUT FUNCTION)",
+    );
+    let malformed = String::from_utf8_lossy(&malformed);
+    assert!(
+        malformed.contains("42601"),
+        "a transform direction must retain its PostgreSQL WITH FUNCTION contract: {malformed}"
+    );
+    let malformed = run_with(
+        &mut engine,
+        &mut budget,
+        "SECURITY LABEL ON TABLE IS 'label'",
+    );
+    let malformed = String::from_utf8_lossy(&malformed);
+    assert!(
+        malformed.contains("42601"),
+        "security-label targets must parse before the provider boundary: {malformed}"
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT tableoid, oid, trftype, trflang, trffromsql, trftosql FROM pg_transform",
+    );
+    assert_eq!(
+        row_description_type_oids(&output),
+        [26, 26, 26, 26, 24, 24],
+        "pg_transform must retain PostgreSQL's oid/regproc wire shape"
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
     let config = test_config("cast-operator-ddl");
     let mut budget = Budget::new(1 << 29);
@@ -4725,6 +4809,13 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
          CREATE SCHEMA moved_extensions; \
          ALTER EXTENSION typed_ext SET SCHEMA moved_extensions; \
          ALTER EXTENSION typed_ext UPDATE TO '2.0'; \
+         CREATE FUNCTION aggregate_dependency_state(state bigint, value integer) \
+           RETURNS bigint LANGUAGE SQL AS 'SELECT coalesce(state, 0) + coalesce(value, 0)'; \
+         CREATE AGGREGATE aggregate_dependency_total(integer) ( \
+           SFUNC = aggregate_dependency_state, STYPE = bigint, INITCOND = '0' \
+         ); \
+         ALTER ROUTINE aggregate_dependency_total(integer) DEPENDS ON EXTENSION typed_ext; \
+         SELECT aggregate_dependency_total(value) FROM (VALUES (2), (3)) rows(value); \
          INSERT INTO moved_extensions.typed_values(id,value) VALUES (1,'kept'); \
          SELECT value, enabled FROM moved_extensions.typed_values; \
          SELECT nextval('moved_extensions.typed_sequence'); \
@@ -4738,6 +4829,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
             "typed_ext|1.0|extensions|t",
             "10",
             "t|{\"WHERE NOT built_in\",\"\"}",
+            "5",
             "kept|t",
             "1",
             "42",
@@ -4755,6 +4847,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
             &mut recovered,
             &mut recovered_budget,
             "SELECT extname, extversion FROM pg_extension ORDER BY extname; \
+             SELECT aggregate_dependency_total(value) FROM (VALUES (2), (3)) rows(value); \
              SELECT value, enabled FROM moved_extensions.typed_values; \
              SELECT nextval('moved_extensions.typed_sequence'); \
              SELECT value FROM moved_extensions.typed_snapshot; \
@@ -4766,6 +4859,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         [
             "base_ext|1.0",
             "typed_ext|2.0",
+            "5",
             "kept|t",
             "2",
             "42",
@@ -4787,6 +4881,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
             &mut recovered,
             &mut recovered_budget,
             "SELECT extname, extversion FROM pg_extension ORDER BY extname; \
+             SELECT aggregate_dependency_total(value) FROM (VALUES (2), (3)) rows(value); \
              SELECT value, enabled FROM moved_extensions.typed_values; \
              SELECT value FROM moved_extensions.typed_snapshot; \
              SELECT count(*) FROM moved_extensions.typed_view; \
@@ -4801,6 +4896,7 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         [
             "base_ext|1.0",
             "typed_ext|2.0",
+            "5",
             "kept|t",
             "42",
             "1",
@@ -4849,11 +4945,12 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
         "DROP EXTENSION base_ext CASCADE; \
          SELECT count(*) FROM pg_extension; \
          SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
-         SELECT count(*) FROM pg_proc WHERE proname='typed_identity'",
+         SELECT count(*) FROM pg_proc WHERE proname='typed_identity'; \
+         SELECT count(*) FROM pg_proc WHERE proname='aggregate_dependency_total'",
     );
     assert_eq!(
         data_rows(&dropped),
-        ["0", "0", "0"],
+        ["0", "0", "0", "0"],
         "{}",
         String::from_utf8_lossy(&dropped)
     );
@@ -6314,6 +6411,37 @@ fn role_catalog_is_transactional_and_attribute_complete() {
 }
 
 #[test]
+fn duplicate_role_options_fail_before_catalog_mutation() {
+    let (mut engine, mut budget) = test_engine();
+    for source in [
+        "CREATE ROLE rejected_role LOGIN NOLOGIN",
+        "CREATE ROLE rejected_role PASSWORD 'one' ENCRYPTED PASSWORD 'two'",
+        "CREATE ROLE rejected_role VALID UNTIL 'infinity' VALID UNTIL 'infinity'",
+        "CREATE ROLE rejected_role IN ROLE parent IN GROUP parent",
+        "CREATE ROLE rejected_role ROLE member USER member",
+        "CREATE ROLE rejected_role ADMIN member ADMIN member",
+    ] {
+        let output = run_with(&mut engine, &mut budget, source);
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("42601") && output.contains("conflicting or redundant options"),
+            "{source}: {output}"
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT count(*) FROM pg_roles WHERE rolname = 'rejected_role'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
 fn role_connection_limit_is_reserved_and_released_exactly() {
     let (mut engine, mut budget) = test_engine();
     let output = run_with(
@@ -6359,10 +6487,20 @@ fn create_role_authority_cannot_escalate_attributes_or_alter_unmanaged_roles() {
         "SET ROLE role_administrator;
          ALTER ROLE managed_role LOGIN;
          ALTER ROLE role_administrator PASSWORD 'changed';
-         CREATE ROLE ordinary_child;",
+         CREATE ROLE ordinary_child;
+         ALTER ROLE ordinary_child LOGIN;
+         RESET ROLE;
+         SELECT parent.rolname, member.rolname, membership.admin_option,
+                membership.inherit_option, membership.set_option, grantor.rolname
+           FROM pg_auth_members membership
+           JOIN pg_roles parent ON parent.oid = membership.roleid
+           JOIN pg_roles member ON member.oid = membership.member
+           JOIN pg_roles grantor ON grantor.oid = membership.grantor
+          WHERE parent.rolname = 'ordinary_child';",
     );
-    assert!(
-        !String::from_utf8_lossy(&allowed).contains("ERROR"),
+    assert_eq!(
+        data_rows(&allowed),
+        ["ordinary_child|role_administrator|t|f|f|postgres"],
         "{}",
         String::from_utf8_lossy(&allowed)
     );
@@ -6390,23 +6528,71 @@ fn create_role_authority_cannot_escalate_attributes_or_alter_unmanaged_roles() {
 
 #[test]
 fn role_catalog_replays_from_wal() {
-    let config = test_config("role-wal-replay");
+    let mut config = test_config("role-wal-replay");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("role-wal-replay-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new(1 << 30);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let verifier = crate::pg::auth::ScramServer::derive_with_salt(
+        "precomputed-role-password",
+        crate::pg::auth::ScramSalt::from_bytes(&[9; crate::pg::auth::SCRAM_SALT_MAX]).unwrap(),
+        8192,
+    );
+    let verifier_text = {
+        use core::fmt::Write;
+        let mut salt = crate::util::StackStr::<512>::new();
+        let mut stored_key = crate::util::StackStr::<512>::new();
+        let mut server_key = crate::util::StackStr::<512>::new();
+        crate::pg::auth::b64_encode(verifier.salt.as_bytes(), &mut salt);
+        crate::pg::auth::b64_encode(&verifier.stored_key, &mut stored_key);
+        crate::pg::auth::b64_encode(&verifier.server_key, &mut server_key);
+        let mut rendered = crate::util::StackStr::<256>::new();
+        let _ = write!(
+            rendered,
+            "SCRAM-SHA-256${}:{}${}:{}",
+            verifier.iterations,
+            salt.as_str(),
+            stored_key.as_str(),
+            server_key.as_str()
+        );
+        rendered
+    };
     let output = run_with(
         &mut engine,
         &mut budget,
-        "CREATE ROLE durable LOGIN CREATEROLE CONNECTION LIMIT 7 \
+        &format!(
+            "CREATE ROLE durable LOGIN CREATEROLE CONNECTION LIMIT 7 \
            PASSWORD 'never-store-this' VALID UNTIL 'infinity';
+         CREATE USER durable_precomputed LOGIN ENCRYPTED PASSWORD '{}';
+         ALTER USER durable_precomputed ENCRYPTED PASSWORD '{}';
+         CREATE ROLE durable_md5 LOGIN PASSWORD 'md547fcb6615d41c53cd39822141eb05da2';
+         CREATE ROLE durable_md5_rename LOGIN PASSWORD 'md547fcb6615d41c53cd39822141eb05da2';
+         ALTER ROLE durable_md5_rename RENAME TO durable_md5_renamed;
          ALTER ROLE durable NOINHERIT CREATEDB;
          COMMENT ON ROLE durable IS 'durable role comment';
          ALTER ROLE durable RENAME TO durable_renamed;
          CREATE ROLE durable_member;
          GRANT durable_renamed TO durable_member WITH ADMIN OPTION;
+         CREATE ROLE durable_creator CREATEROLE;
+         GRANT durable_creator TO postgres;
+         SET ROLE durable_creator;
+         CREATE ROLE durable_created;
+         RESET ROLE;
          CREATE TABLE durable_column_acl (id integer, visible text, secret text);
          GRANT SELECT (visible) ON durable_column_acl TO durable_member;",
+            verifier_text.as_str(),
+            verifier_text.as_str(),
+        ),
     );
     assert!(!output.is_empty());
+    let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+    assert!(
+        String::from_utf8_lossy(&checkpoint).contains("CHECKPOINT"),
+        "{}",
+        String::from_utf8_lossy(&checkpoint)
+    );
     drop(engine);
     let wal_bytes =
         std::fs::read(std::path::Path::new(&config.data_dir).join("journal.wal")).unwrap();
@@ -6417,31 +6603,53 @@ fn role_catalog_replays_from_wal() {
         "role password leaked into WAL"
     );
 
-    let mut restarted_budget = Budget::new(1 << 27);
+    let mut restarted_budget = Budget::new(1 << 30);
     let mut restarted = Engine::new(&config, &mut restarted_budget).unwrap();
     let output = run_with(
         &mut restarted,
         &mut restarted_budget,
-        "SELECT rolname, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolconnlimit
+        &format!(
+            "SELECT rolname, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolconnlimit
            FROM pg_roles WHERE rolname = 'durable_renamed';
          SELECT parent.rolname, child.rolname, membership.admin_option
            FROM pg_auth_members membership
            JOIN pg_roles parent ON parent.oid = membership.roleid
            JOIN pg_roles child ON child.oid = membership.member;
+         SELECT parent.rolname, child.rolname, membership.admin_option,
+                membership.inherit_option, membership.set_option, grantor.rolname
+           FROM pg_auth_members membership
+           JOIN pg_roles parent ON parent.oid = membership.roleid
+           JOIN pg_roles child ON child.oid = membership.member
+           JOIN pg_roles grantor ON grantor.oid = membership.grantor
+          WHERE parent.rolname = 'durable_created';
          SELECT rolpassword LIKE 'SCRAM-SHA-256$%', rolvaliduntil IS NULL,
                 shobj_description(oid, 'pg_authid')
            FROM pg_authid WHERE rolname = 'durable_renamed';
+         SELECT rolpassword = '{}'
+           FROM pg_authid WHERE rolname = 'durable_precomputed';
+         SELECT rolpassword = 'md547fcb6615d41c53cd39822141eb05da2'
+           FROM pg_authid WHERE rolname = 'durable_md5';
+         SELECT rolpassword IS NULL
+           FROM pg_authid WHERE rolname = 'durable_md5_renamed';
          SELECT has_column_privilege(
                   'durable_member', 'durable_column_acl', 'visible', 'SELECT'),
                 has_column_privilege(
                   'durable_member', 'durable_column_acl', 'secret', 'SELECT')",
+            verifier_text.as_str(),
+        ),
     );
     assert_eq!(
         data_rows(&output),
         [
             "durable_renamed|f|t|t|t|7",
             "durable_renamed|durable_member|t",
-            "t|t|durable role comment",
+            "durable_creator|postgres|f",
+            "durable_created|durable_creator|t",
+            "durable_created|durable_creator|t|f|f|postgres",
+            "t|f|durable role comment",
+            "t",
+            "t",
+            "t",
             "t|f"
         ],
         "{}",
@@ -6725,7 +6933,11 @@ fn row_level_security_composes_and_survives_recovery() {
 
 #[test]
 fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
-    let config = test_config("alter-view-security-invoker");
+    let mut config = test_config("alter-view-security-invoker");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("alter-view-options-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     let setup = run_with(
@@ -6737,7 +6949,8 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
          SET ROLE view_owner;
          CREATE TABLE view_secret (value integer);
          INSERT INTO view_secret VALUES (7);
-         CREATE VIEW view_gateway AS SELECT value FROM view_secret;
+         CREATE VIEW view_gateway WITH (security_barrier = true) AS
+           SELECT value FROM view_secret;
          RESET ROLE;
          GRANT SELECT ON view_gateway TO view_reader;",
     );
@@ -6746,18 +6959,26 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
         "{}",
         String::from_utf8_lossy(&setup)
     );
-    let default_barrier = run_with(
+    let barrier_state = run_with(
         &mut engine,
         &mut budget,
         "SET ROLE view_owner;
+         SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
          ALTER VIEW view_gateway SET (security_barrier = false);
          ALTER VIEW view_gateway RESET (security_barrier);
+         SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
+         ALTER VIEW view_gateway SET (security_barrier = true);
+         SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
          RESET ROLE;",
     );
     assert!(
-        !String::from_utf8_lossy(&default_barrier).contains("ERROR"),
+        !String::from_utf8_lossy(&barrier_state).contains("ERROR"),
         "{}",
-        String::from_utf8_lossy(&default_barrier)
+        String::from_utf8_lossy(&barrier_state)
+    );
+    assert_eq!(
+        data_rows(&barrier_state),
+        ["{security_barrier=true}", "NULL", "{security_barrier=true}"]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -6782,19 +7003,27 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
         &mut budget,
         "RESET ROLE; SET ROLE view_owner;
          BEGIN;
-         ALTER VIEW view_gateway SET (security_invoker = true);
+         ALTER VIEW view_gateway SET (security_invoker = true, security_barrier = false);
          SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
          ROLLBACK;
+         SELECT reloptions FROM pg_class WHERE relname = 'view_gateway';
          RESET ROLE;
          SET ROLE view_reader;
          SELECT value FROM view_gateway;",
     );
-    assert_eq!(data_rows(&changed), ["{security_invoker=true}", "7"]);
+    assert_eq!(
+        data_rows(&changed),
+        [
+            "{security_invoker=true,security_barrier=false}",
+            "{security_barrier=true}",
+            "7"
+        ]
+    );
     let committed = run_with(
         &mut engine,
         &mut budget,
         "RESET ROLE; SET ROLE view_owner;
-         ALTER VIEW view_gateway SET (security_invoker = true)",
+         ALTER VIEW view_gateway SET (security_invoker = true, security_barrier = true)",
     );
     assert!(
         !String::from_utf8_lossy(&committed).contains("ERROR"),
@@ -6814,7 +7043,9 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
         "{}",
         String::from_utf8_lossy(&denied_after_commit)
     );
+    assert!(engine.checkpoint().unwrap());
     drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 
     let mut recovered_budget = Budget::new(1 << 29);
     let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
@@ -6823,7 +7054,10 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
         &mut recovered_budget,
         "SELECT reloptions FROM pg_class WHERE relname = 'view_gateway'",
     );
-    assert_eq!(data_rows(&recovered_state), ["{security_invoker=true}"]);
+    assert_eq!(
+        data_rows(&recovered_state),
+        ["{security_invoker=true,security_barrier=true}"]
+    );
     let recovered_denied = run_with(
         &mut recovered,
         &mut recovered_budget,
@@ -6839,12 +7073,14 @@ fn alter_view_security_invoker_is_transactional_durable_and_authoritative() {
         &mut recovered,
         &mut recovered_budget,
         "RESET ROLE; SET ROLE view_owner;
-         ALTER VIEW view_gateway RESET (security_invoker);
+         ALTER VIEW view_gateway RESET (security_invoker, security_barrier);
          RESET ROLE;
          SET ROLE view_reader;
          SELECT value FROM view_gateway;",
     );
     assert_eq!(data_rows(&reset), ["7"]);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
 #[test]
@@ -7066,6 +7302,170 @@ fn alter_view_set_schema_preserves_identity_dependencies_and_comments() {
         "{}",
         String::from_utf8_lossy(&after_recovery)
     );
+}
+
+#[test]
+fn view_output_columns_are_typed_catalog_identity_and_durable() {
+    let mut config = test_config("view-output-columns");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("view-output-columns-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE view_output_source (value integer);
+         INSERT INTO view_output_source VALUES (9);
+         CREATE VIEW view_output_gateway (published_value) AS
+           SELECT value FROM view_output_source;
+         SELECT published_value FROM view_output_gateway;
+         INSERT INTO view_output_gateway (published_value) VALUES (10);
+         UPDATE view_output_gateway SET published_value = published_value + 1
+          WHERE published_value = 10;
+         SELECT value FROM view_output_source ORDER BY value;
+         SELECT attname FROM pg_attribute
+          WHERE attrelid = 'view_output_gateway'::regclass AND attnum = 1;
+         ALTER VIEW view_output_gateway RENAME COLUMN published_value TO current_value;
+         SELECT current_value FROM view_output_gateway;
+         BEGIN;
+         ALTER VIEW view_output_gateway RENAME COLUMN current_value TO temporary_value;
+         SELECT temporary_value FROM view_output_gateway;
+         ROLLBACK;
+         SELECT current_value FROM view_output_gateway;",
+    );
+    assert_eq!(
+        data_rows(&created),
+        [
+            "9",
+            "9",
+            "11",
+            "published_value",
+            "9",
+            "11",
+            "9",
+            "11",
+            "9",
+            "11"
+        ],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let recovered_rows = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT current_value FROM view_output_gateway;
+             SELECT attname FROM pg_attribute
+              WHERE attrelid = 'view_output_gateway'::regclass AND attnum = 1;",
+    );
+    assert_eq!(
+        data_rows(&recovered_rows),
+        ["9", "11", "current_value"],
+        "{}",
+        String::from_utf8_lossy(&recovered_rows)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn view_defaults_are_typed_catalog_state_and_survive_object_recovery() {
+    let mut config = test_config("view-defaults");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("view-defaults-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE view_default_source (value integer DEFAULT 7);
+         CREATE VIEW view_default_gateway (published_value) AS
+           SELECT value FROM view_default_source;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER VIEW view_default_gateway ALTER COLUMN published_value
+           SET DEFAULT value + random();",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected).contains("0A000"),
+        "{}",
+        String::from_utf8_lossy(&rejected)
+    );
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER VIEW view_default_gateway ALTER COLUMN published_value SET DEFAULT 22;
+         INSERT INTO view_default_gateway DEFAULT VALUES;
+         INSERT INTO view_default_gateway (published_value) VALUES (DEFAULT);
+         INSERT INTO view_default_gateway (published_value) SELECT 24;
+         SELECT value FROM view_default_source ORDER BY value;
+         SELECT atthasdef FROM pg_attribute
+          WHERE attrelid = 'view_default_gateway'::regclass AND attnum = 1;
+         SELECT adbin FROM pg_attrdef
+          WHERE adrelid = 'view_default_gateway'::regclass AND adnum = 1;",
+    );
+    assert_eq!(
+        data_rows(&created),
+        ["22", "22", "24", "t", "22"],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    let replaced = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE OR REPLACE VIEW view_default_gateway (published_value) AS
+           SELECT value FROM view_default_source;
+         INSERT INTO view_default_gateway DEFAULT VALUES;
+         SELECT value FROM view_default_source ORDER BY value;",
+    );
+    assert_eq!(
+        data_rows(&replaced),
+        ["22", "22", "22", "24"],
+        "{}",
+        String::from_utf8_lossy(&replaced)
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let after_recovery = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "INSERT INTO view_default_gateway DEFAULT VALUES;
+         ALTER VIEW view_default_gateway ALTER COLUMN published_value DROP DEFAULT;
+         INSERT INTO view_default_gateway DEFAULT VALUES;
+         SELECT value FROM view_default_source ORDER BY value;
+         SELECT atthasdef FROM pg_attribute
+          WHERE attrelid = 'view_default_gateway'::regclass AND attnum = 1;",
+    );
+    assert_eq!(
+        data_rows(&after_recovery),
+        ["7", "22", "22", "22", "22", "24", "f"],
+        "{}",
+        String::from_utf8_lossy(&after_recovery)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
 
 #[test]
@@ -26906,6 +27306,216 @@ fn routine_acls_are_signature_typed_enforced_and_durable() {
 }
 
 #[test]
+fn revoke_all_functions_does_not_materialize_unrelated_public_acls() {
+    let mut config = test_config("revoke-all-functions-public-acl");
+    config.max_tables = crate::sql::txn::MAX_TXN_DDL + 1;
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE routine_acl_unrelated_reader;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    for index in 0..=crate::sql::txn::MAX_TXN_DDL {
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "CREATE FUNCTION routine_acl_unrelated_{index}() RETURNS integer LANGUAGE SQL AS 'SELECT {index}'"
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+    }
+    let revoked = run_with(
+        &mut engine,
+        &mut budget,
+        "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM routine_acl_unrelated_reader;
+         SELECT has_function_privilege(
+             'routine_acl_unrelated_reader',
+             'routine_acl_unrelated_0()',
+             'EXECUTE'
+         );",
+    );
+    assert_eq!(
+        data_rows(&revoked),
+        ["t"],
+        "{}",
+        String::from_utf8_lossy(&revoked)
+    );
+}
+
+#[test]
+fn privilege_targets_keep_language_composite_and_routine_kinds_distinct() {
+    let (mut engine, mut budget) = test_engine();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE privilege_target_owner;
+         CREATE ROLE privilege_target_reader;
+         GRANT CREATE ON SCHEMA public TO privilege_target_owner, privilege_target_reader;
+         SET ROLE privilege_target_owner;
+         CREATE TYPE privilege_target_pair AS (left_value integer, right_value integer);
+         CREATE FUNCTION privilege_target_function() RETURNS integer LANGUAGE SQL AS 'SELECT 7';
+         CREATE PROCEDURE privilege_target_procedure() LANGUAGE SQL AS 'SELECT 1';
+         RESET ROLE;
+         REVOKE USAGE ON LANGUAGE sql FROM PUBLIC;
+         REVOKE USAGE ON LANGUAGE plpgsql FROM PUBLIC;
+         GRANT USAGE ON LANGUAGE sql TO privilege_target_reader WITH GRANT OPTION;
+         GRANT USAGE ON TYPE privilege_target_pair TO privilege_target_reader;
+         REVOKE EXECUTE ON FUNCTION privilege_target_function() FROM PUBLIC;
+         REVOKE EXECUTE ON PROCEDURE privilege_target_procedure() FROM PUBLIC;
+         GRANT EXECUTE ON ALL PROCEDURES IN SCHEMA public TO privilege_target_reader;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT has_language_privilege('privilege_target_reader', 'sql', 'USAGE'),
+                    has_language_privilege('privilege_target_reader', 14::oid, 'USAGE'),
+                    has_type_privilege('privilege_target_reader', 'privilege_target_pair', 'USAGE'),
+                    has_function_privilege('privilege_target_reader', 'privilege_target_function()', 'EXECUTE'),
+                    has_function_privilege('privilege_target_reader', 'privilege_target_procedure()', 'EXECUTE'),
+                    lanacl IS NOT NULL
+               FROM pg_language WHERE lanname = 'sql';"
+        )),
+        ["t|t|t|f|t|t"]
+    );
+    let allowed = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE privilege_target_reader;
+         CREATE FUNCTION privilege_target_sql_allowed() RETURNS integer LANGUAGE sql AS 'SELECT 9';
+         CREATE TABLE privilege_target_composite_values (value privilege_target_pair);
+         RESET ROLE;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&allowed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&allowed)
+    );
+    let denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE privilege_target_reader;
+         CREATE FUNCTION privilege_target_plpgsql_denied() RETURNS integer LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;",
+    );
+    assert!(
+        String::from_utf8_lossy(&denied).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&denied)
+    );
+    let do_denied = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE privilege_target_reader; DO $$ BEGIN NULL; END $$;",
+    );
+    assert!(
+        String::from_utf8_lossy(&do_denied).contains("42501"),
+        "{}",
+        String::from_utf8_lossy(&do_denied)
+    );
+    let routine_scopes = run_with(
+        &mut engine,
+        &mut budget,
+        "RESET ROLE;
+         GRANT EXECUTE ON ALL ROUTINES IN SCHEMA public TO privilege_target_reader;
+         REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM privilege_target_reader;
+         SELECT has_function_privilege('privilege_target_reader', 'privilege_target_function()', 'EXECUTE'),
+                has_function_privilege('privilege_target_reader', 'privilege_target_procedure()', 'EXECUTE');
+         REVOKE EXECUTE ON ALL PROCEDURES IN SCHEMA public FROM privilege_target_reader;
+         SELECT has_function_privilege('privilege_target_reader', 'privilege_target_procedure()', 'EXECUTE');",
+    );
+    assert_eq!(data_rows(&routine_scopes), ["f|t", "f"]);
+}
+
+#[test]
+fn language_and_composite_privileges_survive_wal_checkpoint_and_cold_recovery() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    static NEXT_NAMESPACE: AtomicU32 = AtomicU32::new(0);
+    let sequence = NEXT_NAMESPACE.fetch_add(1, Ordering::SeqCst);
+    let mut config = test_config(&format!("language-acl-recovery-{sequence}"));
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("language-acl-recovery-{}-{sequence}", std::process::id());
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.wal_upload_buffer_bytes = 256 * 1024;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE ROLE language_acl_owner;
+             CREATE ROLE language_acl_reader;
+             GRANT CREATE ON SCHEMA public TO language_acl_owner, language_acl_reader;
+             SET ROLE language_acl_owner;
+             CREATE TYPE language_acl_pair AS (value integer);
+             RESET ROLE;
+             REVOKE USAGE ON LANGUAGE sql FROM PUBLIC;
+             GRANT USAGE ON LANGUAGE sql TO language_acl_reader;
+             GRANT USAGE ON TYPE language_acl_pair TO language_acl_reader;",
+        );
+        assert!(
+            !String::from_utf8_lossy(&setup).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        engine.commit_wal().unwrap();
+        assert!(engine.checkpoint().unwrap());
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT has_language_privilege('language_acl_reader', 'sql', 'USAGE'),
+                    has_type_privilege('language_acl_reader', 'language_acl_pair', 'USAGE'),
+                    lanacl IS NOT NULL
+               FROM pg_language WHERE lanname = 'sql';"
+        )),
+        ["t|t|t"]
+    );
+    let allowed = run_with(
+        &mut engine,
+        &mut budget,
+        "SET ROLE language_acl_reader;
+         CREATE FUNCTION language_acl_after_recovery() RETURNS integer LANGUAGE sql AS 'SELECT 4';
+         CREATE TABLE language_acl_values (value language_acl_pair);
+         RESET ROLE;",
+    );
+    assert!(
+        !String::from_utf8_lossy(&allowed).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&allowed)
+    );
+    drop(engine);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn routine_acl_checkpoint_recovery_uses_overload_safe_identity() {
     use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -27095,21 +27705,6 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
     let config = test_config("alter-materialized-view-lifecycle");
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
-    let setup = run_with(
-        &mut engine,
-        &mut budget,
-        "CREATE SCHEMA materialized_target;
-         CREATE TABLE materialized_source (value integer);
-         INSERT INTO materialized_source VALUES (7);
-         CREATE MATERIALIZED VIEW materialized_old AS SELECT value FROM materialized_source;
-         COMMENT ON MATERIALIZED VIEW materialized_old IS 'durable materialized view';
-         CREATE ROLE materialized_owner;",
-    );
-    assert!(
-        !message_types(&setup).contains(&b'E'),
-        "{}",
-        String::from_utf8_lossy(&setup)
-    );
     let tablespace = run_with(
         &mut engine,
         &mut budget,
@@ -27119,6 +27714,23 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
         !message_types(&tablespace).contains(&b'E'),
         "{}",
         String::from_utf8_lossy(&tablespace)
+    );
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA materialized_target;
+         CREATE TABLE materialized_source (value integer);
+         INSERT INTO materialized_source VALUES (7);
+         CREATE MATERIALIZED VIEW materialized_old
+           USING heap WITH (fillfactor = 75) TABLESPACE materialized_space
+           AS SELECT value FROM materialized_source;
+         COMMENT ON MATERIALIZED VIEW materialized_old IS 'durable materialized view';
+         CREATE ROLE materialized_owner;",
+    );
+    assert!(
+        !message_types(&setup).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&setup)
     );
     let old_oid = data_rows(&run_with(
         &mut engine,
@@ -27167,6 +27779,13 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
         "ALTER MATERIALIZED VIEW materialized_old SET SCHEMA materialized_target;
          ALTER MATERIALIZED VIEW materialized_target.materialized_old RENAME TO materialized_new;
          ALTER MATERIALIZED VIEW materialized_target.materialized_new SET TABLESPACE materialized_space;
+         ALTER MATERIALIZED VIEW materialized_target.materialized_new
+           ALTER COLUMN value SET STATISTICS 61, SET (fillfactor = 80);
+         BEGIN;
+         ALTER MATERIALIZED VIEW materialized_target.materialized_new SET (fillfactor = 90);
+         ROLLBACK;
+         ALTER MATERIALIZED VIEW materialized_target.materialized_new
+           RENAME COLUMN value TO measured;
          ALTER MATERIALIZED VIEW materialized_target.materialized_new OWNER TO materialized_owner;
          GRANT USAGE ON SCHEMA materialized_target TO materialized_owner;
          GRANT SELECT ON materialized_source TO materialized_owner;
@@ -27177,8 +27796,13 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
            WHERE schemaname = 'materialized_target' AND matviewname = 'materialized_new';
          SELECT obj_description('materialized_target.materialized_new'::regclass);
          SET ROLE materialized_owner;
-         SELECT value FROM materialized_target.materialized_new;
+         SELECT measured FROM materialized_target.materialized_new;
          REFRESH MATERIALIZED VIEW materialized_target.materialized_new;
+         SELECT attname, attstattarget FROM pg_attribute
+           WHERE attrelid = 'materialized_target.materialized_new'::regclass
+             AND attnum > 0;
+         SELECT reloptions::text FROM pg_class
+           WHERE oid = 'materialized_target.materialized_new'::regclass;
          RESET ROLE;",
     );
     let rows = data_rows(&altered);
@@ -27187,7 +27811,7 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
         "{}",
         String::from_utf8_lossy(&altered)
     );
-    assert_eq!(rows.len(), 5, "{}", String::from_utf8_lossy(&altered));
+    assert_eq!(rows.len(), 7, "{}", String::from_utf8_lossy(&altered));
     assert_eq!(rows[0], format!("{old_oid}|materialized_new|m"));
     assert_eq!(
         rows[1],
@@ -27196,6 +27820,8 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
     assert_eq!(rows[2], "materialized_space|f");
     assert_eq!(rows[3], "durable materialized view");
     assert_eq!(rows[4], "7");
+    assert_eq!(rows[5], "measured|61");
+    assert_eq!(rows[6], "{fillfactor=80}");
     engine.commit_wal().unwrap();
     drop(engine);
 
@@ -27204,7 +27830,7 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
     let recovered_values = run_with(
         &mut recovered,
         &mut recovered_budget,
-        "SELECT value FROM materialized_target.materialized_new",
+        "SELECT measured FROM materialized_target.materialized_new",
     );
     assert_eq!(
         data_rows(&recovered_values),
@@ -27230,6 +27856,25 @@ fn alter_materialized_view_identity_owner_comments_and_recovery() {
                WHERE schemaname = 'materialized_target' AND matviewname = 'materialized_new'",
         )),
         ["materialized_space|f"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT attname, attstattarget FROM pg_attribute
+               WHERE attrelid = 'materialized_target.materialized_new'::regclass
+                 AND attnum > 0",
+        )),
+        ["measured|61"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovered_budget,
+            "SELECT reloptions::text FROM pg_class
+               WHERE oid = 'materialized_target.materialized_new'::regclass",
+        )),
+        ["{fillfactor=80}"]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -27383,6 +28028,265 @@ fn sequence_basics() {
     run_with(&mut e, &mut b, "DROP SEQUENCE s");
     assert!(
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "SELECT nextval('s')")).contains("42P01")
+    );
+}
+
+#[test]
+fn sequence_rename_preserves_value_comment_transaction_and_cold_recovery() {
+    let mut config = test_config("sequence-rename-lifecycle");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("sequence-rename-lifecycle-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SCHEMA sequence_rename_lifecycle_schema; \
+         CREATE SEQUENCE sequence_rename_lifecycle_source START WITH 40 INCREMENT BY 3; \
+         CREATE TABLE sequence_rename_lifecycle_default (id bigint DEFAULT nextval('sequence_rename_lifecycle_source')); \
+         CREATE VIEW sequence_rename_lifecycle_view AS WITH value AS MATERIALIZED (SELECT nextval('sequence_rename_lifecycle_source') AS id) SELECT id FROM value; \
+         COMMENT ON SEQUENCE sequence_rename_lifecycle_source IS 'renamed sequence'; \
+         SELECT nextval('sequence_rename_lifecycle_source'); \
+         ALTER SEQUENCE sequence_rename_lifecycle_source RENAME TO sequence_rename_lifecycle_target; \
+         SELECT nextval('sequence_rename_lifecycle_target')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT relname FROM pg_class WHERE relname = 'sequence_rename_lifecycle_target'; \
+             SELECT obj_description('sequence_rename_lifecycle_target'::regclass)",
+        )),
+        ["sequence_rename_lifecycle_target", "renamed sequence"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('sequence_rename_lifecycle_source')",
+        ))
+        .contains("42P01")
+    );
+    let rebound = run_with(
+        &mut engine,
+        &mut budget,
+        "INSERT INTO sequence_rename_lifecycle_default DEFAULT VALUES RETURNING id; \
+             SELECT id FROM sequence_rename_lifecycle_view; \
+             SELECT nextval('sequence_rename_lifecycle_target')",
+    );
+    assert_eq!(
+        data_rows(&rebound),
+        ["46", "49", "52"],
+        "{}",
+        String::from_utf8_lossy(&rebound)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         ALTER SEQUENCE sequence_rename_lifecycle_target RENAME TO sequence_rename_lifecycle_rollback; \
+         SELECT nextval('sequence_rename_lifecycle_rollback'); \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('sequence_rename_lifecycle_target')",
+        )),
+        ["58"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         ALTER SEQUENCE sequence_rename_lifecycle_target RESTART WITH 100; \
+         SELECT nextval('sequence_rename_lifecycle_target'); \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('sequence_rename_lifecycle_target')",
+        )),
+        ["61"]
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SEQUENCE sequence_rename_lifecycle_target \
+           SET SCHEMA sequence_rename_lifecycle_schema; \
+         ALTER SEQUENCE sequence_rename_lifecycle_schema.sequence_rename_lifecycle_target \
+           RENAME TO sequence_rename_lifecycle_durable; \
+         INSERT INTO sequence_rename_lifecycle_default DEFAULT VALUES RETURNING id",
+    );
+    engine.commit_wal().unwrap();
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "INSERT INTO sequence_rename_lifecycle_default DEFAULT VALUES RETURNING id; \
+             SELECT obj_description('sequence_rename_lifecycle_schema.sequence_rename_lifecycle_durable'::regclass)",
+        )),
+        ["67", "renamed sequence"]
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn schema_rename_moves_catalog_identity_and_replays_from_object_storage() {
+    let mut config = test_config("schema-rename-lifecycle");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("schema-rename-lifecycle-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE SCHEMA schema_rename_source; \
+             CREATE TYPE schema_rename_source.mood AS ENUM ('calm', 'storm'); \
+             CREATE SEQUENCE schema_rename_source.ticket; \
+             CREATE TABLE schema_rename_source.items (\
+                 id bigint DEFAULT nextval('schema_rename_source.ticket'), \
+                 state schema_rename_source.mood\
+             ); \
+             CREATE VIEW schema_rename_source.item_view AS \
+                 SELECT id, state FROM schema_rename_source.items; \
+             COMMENT ON SCHEMA schema_rename_source IS 'renamed namespace'; \
+             COMMENT ON TABLE schema_rename_source.items IS 'renamed relation'; \
+             COMMENT ON SEQUENCE schema_rename_source.ticket IS 'renamed sequence'",
+        );
+        assert!(
+            !String::from_utf8_lossy(&setup).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        let checkpoint = run_with(&mut engine, &mut budget, "CHECKPOINT");
+        assert!(
+            !String::from_utf8_lossy(&checkpoint).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&checkpoint)
+        );
+
+        let renamed = run_with(
+            &mut engine,
+            &mut budget,
+            "ALTER SCHEMA schema_rename_source RENAME TO schema_rename_target; \
+             ALTER SCHEMA schema_rename_target OWNER TO postgres; \
+             INSERT INTO schema_rename_target.items(state) VALUES ('calm') RETURNING id; \
+             SELECT id, state FROM schema_rename_target.item_view; \
+             SELECT 'storm'::schema_rename_target.mood; \
+             SELECT obj_description('schema_rename_target.ticket'::regclass); \
+             SELECT obj_description('schema_rename_target.items'::regclass)",
+        );
+        assert_eq!(
+            data_rows(&renamed),
+            [
+                "1",
+                "1|calm",
+                "storm",
+                "renamed sequence",
+                "renamed relation"
+            ],
+            "{}",
+            String::from_utf8_lossy(&renamed)
+        );
+        let stale = run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nextval('schema_rename_source.ticket')",
+        );
+        assert!(String::from_utf8_lossy(&stale).contains("42P01"));
+
+        let rollback = run_with(
+            &mut engine,
+            &mut budget,
+            "BEGIN; \
+             ALTER SCHEMA schema_rename_target RENAME TO schema_rename_rolled_back; \
+             INSERT INTO schema_rename_rolled_back.items(state) VALUES ('storm'); \
+             ROLLBACK; \
+             INSERT INTO schema_rename_target.items(state) VALUES ('storm') RETURNING id",
+        );
+        assert_eq!(
+            data_rows(&rollback),
+            ["3"],
+            "{}",
+            String::from_utf8_lossy(&rollback)
+        );
+        engine.commit_wal().unwrap();
+    }
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "INSERT INTO schema_rename_target.items(state) VALUES ('calm') RETURNING id; \
+         SELECT id, state FROM schema_rename_target.item_view ORDER BY id; \
+         SELECT 'storm'::schema_rename_target.mood; \
+         SELECT obj_description('schema_rename_target.ticket'::regclass)",
+    );
+    assert_eq!(
+        data_rows(&recovered),
+        [
+            "4",
+            "1|calm",
+            "3|storm",
+            "4|calm",
+            "storm",
+            "renamed sequence"
+        ],
+        "{}",
+        String::from_utf8_lossy(&recovered)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn simple_query_begin_commits_prior_sequence_rename() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SEQUENCE simple_query_sequence; \
+         ALTER SEQUENCE simple_query_sequence RENAME TO simple_query_target; \
+         BEGIN; \
+         ALTER SEQUENCE simple_query_target RENAME TO simple_query_rollback; \
+         ROLLBACK; \
+         SELECT nextval('simple_query_target')",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["1"],
+        "{}",
+        String::from_utf8_lossy(&output)
     );
 }
 
@@ -27986,7 +28890,99 @@ fn generated_expression_evolution_rewrites_rows_and_survives_cold_recovery() {
         )),
         ["3|30", "4|40", "5|50"]
     );
+    // A rollback restores the typed generated definition. Once committed,
+    // DROP EXPRESSION keeps the materialized values and makes the column
+    // writable without retaining a stale generation expression.
+    run_with(
+        &mut cold,
+        &mut cold_budget,
+        "BEGIN; \
+         ALTER TABLE generated_expression_evolution ALTER COLUMN b DROP EXPRESSION; \
+         ROLLBACK",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT attgenerated FROM pg_attribute \
+             WHERE attrelid = 'generated_expression_evolution'::regclass AND attname = 'b'"
+        )),
+        ["s"]
+    );
+    for statement in [
+        "ALTER TABLE generated_expression_evolution ALTER COLUMN b SET DEFAULT 1",
+        "ALTER TABLE generated_expression_evolution ALTER COLUMN b DROP DEFAULT",
+    ] {
+        assert!(
+            String::from_utf8_lossy(&run_with(&mut cold, &mut cold_budget, statement))
+                .contains("42601"),
+            "{statement}"
+        );
+    }
+    run_with(
+        &mut cold,
+        &mut cold_budget,
+        "ALTER TABLE generated_expression_evolution ALTER COLUMN b SET NOT NULL",
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "ALTER TABLE generated_expression_evolution \
+             ALTER COLUMN b ADD GENERATED ALWAYS AS IDENTITY"
+        ))
+        .contains("55000")
+    );
+    run_with(
+        &mut cold,
+        &mut cold_budget,
+        "ALTER TABLE generated_expression_evolution ALTER COLUMN b DROP EXPRESSION; \
+         UPDATE generated_expression_evolution SET b = 99 WHERE a = 3; \
+         INSERT INTO generated_expression_evolution VALUES (6, 8)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT a, b, attgenerated \
+             FROM generated_expression_evolution \
+             CROSS JOIN pg_attribute \
+             WHERE attrelid = 'generated_expression_evolution'::regclass \
+               AND attname = 'b' \
+             ORDER BY a"
+        )),
+        ["3|99|", "4|40|", "5|50|", "6|8|"]
+    );
+    assert!(
+        String::from_utf8_lossy(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "ALTER TABLE generated_expression_evolution \
+             ALTER COLUMN b DROP EXPRESSION IF EXISTS"
+        ))
+        .contains("not a stored generated column, skipping")
+    );
+    cold.commit_wal().unwrap();
+    assert!(cold.checkpoint().unwrap());
     drop(cold);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut final_budget = Budget::new(1 << 29);
+    let mut final_cold = Engine::new(&config, &mut final_budget).unwrap();
+    run_with(
+        &mut final_cold,
+        &mut final_budget,
+        "INSERT INTO generated_expression_evolution VALUES (7, 11)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut final_cold,
+            &mut final_budget,
+            "SELECT a, b FROM generated_expression_evolution ORDER BY a"
+        )),
+        ["3|99", "4|40", "5|50", "6|8", "7|11"]
+    );
+    drop(final_cold);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();
 }
@@ -31452,12 +32448,12 @@ fn create_schema_embedded_elements_are_typed_and_requalified() {
         &mut engine,
         &mut budget,
         "CREATE SCHEMA typed_schema
-           CREATE DOMAIN positive AS integer CHECK (VALUE > 0)
-           CREATE TYPE mood AS ENUM ('ready', 'done')
            CREATE TABLE rows (id integer)
            CREATE VIEW row_view AS SELECT id FROM rows
            CREATE INDEX rows_id ON rows (id)
-           CREATE SEQUENCE row_ids;",
+           CREATE SEQUENCE row_ids;
+         CREATE DOMAIN typed_schema.positive AS integer CHECK (VALUE > 0);
+         CREATE TYPE typed_schema.mood AS ENUM ('ready', 'done');",
     );
     assert!(
         !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -31479,7 +32475,7 @@ fn create_schema_embedded_elements_are_typed_and_requalified() {
     let rejected = run_with(
         &mut engine,
         &mut budget,
-        "CREATE SCHEMA invalid_schema CREATE MATERIALIZED VIEW view_inside_schema AS SELECT 1",
+        "CREATE SCHEMA invalid_schema CREATE DOMAIN positive AS integer CHECK (VALUE > 0)",
     );
     assert!(
         String::from_utf8_lossy(&rejected).contains("42601"),
@@ -39324,6 +40320,177 @@ fn table_tablespace_and_heap_access_method_are_typed_catalog_state() {
 }
 
 #[test]
+fn table_access_methods_are_catalogued_typed_and_transactional() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ACCESS METHOD catalogued_heap TYPE TABLE HANDLER heap_tableam_handler",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT amtype, amhandler = 3 \
+             FROM pg_am WHERE amname = 'catalogued_heap'",
+        )),
+        ["t|t"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT amname, amhandler::text, pg_typeof(amhandler)::text FROM pg_am \
+             WHERE amname IN ('gist', 'gin', 'brin', 'spgist') ORDER BY amname",
+        )),
+        [
+            "brin|brinhandler|regproc",
+            "gin|ginhandler|regproc",
+            "gist|gisthandler|regproc",
+            "spgist|spghandler|regproc",
+        ]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT pg_typeof(oid)::text, pg_typeof(amname)::text, \
+                    pg_typeof(amhandler)::text, pg_typeof(amtype)::text \
+             FROM pg_am WHERE amname = 'heap'",
+        )),
+        ["oid|name|regproc|\"char\""]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE catalogued_heap_rows (id integer) USING catalogued_heap; \
+         INSERT INTO catalogued_heap_rows VALUES (42)",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT a.amname, r.id FROM pg_class c \
+             JOIN pg_am a ON a.oid = c.relam \
+             JOIN catalogued_heap_rows r ON true \
+             WHERE c.relname = 'catalogued_heap_rows'",
+        )),
+        ["catalogued_heap|42"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "COMMENT ON ACCESS METHOD catalogued_heap IS 'typed heap alias'; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'catalogued_heap'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["typed heap alias"]);
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; DROP ACCESS METHOD catalogued_heap CASCADE; ROLLBACK; \
+         SELECT obj_description(oid, 'pg_am') FROM pg_am WHERE amname = 'catalogued_heap'; \
+         SELECT id FROM catalogued_heap_rows",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(data_rows(&output), ["typed heap alias", "42"]);
+    for statement in [
+        "CREATE TABLE quoted_builtin_access_method (id integer) USING \"HEAP\"",
+        "CREATE ACCESS METHOD unavailable_index TYPE INDEX HANDLER bthandler",
+    ] {
+        let output = run_with(&mut engine, &mut budget, statement);
+        assert!(
+            String::from_utf8_lossy(&output).contains(if statement.contains("INDEX") {
+                "0A000"
+            } else {
+                "42704"
+            }),
+            "{statement}: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP ACCESS METHOD catalogued_heap",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("2BP01"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "DROP ACCESS METHOD catalogued_heap CASCADE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_class WHERE relname = 'catalogued_heap_rows'; \
+             SELECT count(*) FROM pg_am WHERE amname = 'catalogued_heap'",
+        )),
+        ["0", "0"]
+    );
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "BEGIN; \
+         CREATE ACCESS METHOD rolled_back_heap TYPE TABLE HANDLER heap_tableam_handler; \
+         ROLLBACK; \
+         CREATE TABLE rolled_back_heap_rows (id integer) USING rolled_back_heap",
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains("42704"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+}
+
+#[test]
+fn access_method_event_trigger_identity_is_dynamic_catalog_identity() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE access_method_ddl_log(tag text, kind text, identity text); \
+         CREATE FUNCTION capture_access_method_ddl() RETURNS event_trigger LANGUAGE plpgsql AS \
+           'BEGIN INSERT INTO access_method_ddl_log \
+              SELECT command_tag,object_type,object_identity \
+              FROM pg_event_trigger_ddl_commands(); RETURN; END'; \
+         CREATE EVENT TRIGGER capture_access_method_ddl_end ON ddl_command_end \
+           WHEN TAG IN ('CREATE ACCESS METHOD') \
+           EXECUTE FUNCTION capture_access_method_ddl(); \
+         CREATE ACCESS METHOD event_catalogued_heap TYPE TABLE HANDLER heap_tableam_handler; \
+         SELECT tag,kind,identity FROM access_method_ddl_log",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        ["CREATE ACCESS METHOD|access method|event_catalogued_heap"]
+    );
+}
+
+#[test]
 fn unimplemented_table_lifecycle_forms_are_typed_and_loud() {
     let (mut engine, mut budget) = test_engine();
     for statement in [
@@ -40220,14 +41387,17 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
     for statement in [
+        "CREATE ACCESS METHOD table_definition_recovery_heap TYPE TABLE HANDLER heap_tableam_handler",
         "CREATE TABLESPACE table_definition_recovery_space LOCATION '/object/table-definition-recovery'",
         "CREATE TABLE table_definition_recovery_rows (id integer NOT NULL CHECK (id > 0)) USING heap WITH (fillfactor = 70) TABLESPACE table_definition_recovery_space",
+        "CREATE TABLE table_definition_custom_rows (id integer) USING table_definition_recovery_heap",
         "CREATE TABLE table_definition_recovery_child (extra text) INHERITS (table_definition_recovery_rows)",
         "CREATE TYPE table_definition_recovery_type AS (id integer, label text)",
         "CREATE TABLE table_definition_typed_rows OF table_definition_recovery_type",
         "CREATE TABLE table_definition_detach_parent (id integer) PARTITION BY RANGE (id)",
         "CREATE TABLE table_definition_detach_child PARTITION OF table_definition_detach_parent FOR VALUES FROM (0) TO (10)",
         "INSERT INTO table_definition_recovery_child VALUES (1, 'child')",
+        "INSERT INTO table_definition_custom_rows VALUES (3)",
         "INSERT INTO table_definition_typed_rows VALUES (2, 'typed')",
         "INSERT INTO table_definition_detach_parent VALUES (4)",
         "ALTER TABLE table_definition_recovery_rows ADD COLUMN inherited_amount integer DEFAULT 7 NOT NULL",
@@ -40259,6 +41429,17 @@ fn table_tablespace_and_access_method_survive_wal_checkpoint_and_cold_recovery()
                ON s.oid = c.reltablespace WHERE c.relname = 'table_definition_recovery_rows'",
         )),
         ["2|table_definition_recovery_space"]
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut restarted,
+            &mut restarted_budget,
+            "SELECT a.amname, r.id FROM pg_class c \
+             JOIN pg_am a ON a.oid = c.relam \
+             JOIN table_definition_custom_rows r ON true \
+             WHERE c.relname = 'table_definition_custom_rows'",
+        )),
+        ["table_definition_recovery_heap|3"]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -45937,10 +47118,20 @@ fn create_view_basic() {
         String::from_utf8_lossy(&run_with(&mut e, &mut b, "CREATE VIEW big AS SELECT 1"))
             .contains("42P07")
     );
-    run_with(
+    let incompatible_replace = run_with(
         &mut e,
         &mut b,
         "CREATE OR REPLACE VIEW big AS SELECT id FROM t WHERE id = 1",
+    );
+    assert!(
+        String::from_utf8_lossy(&incompatible_replace).contains("42P16"),
+        "{}",
+        String::from_utf8_lossy(&incompatible_replace)
+    );
+    run_with(
+        &mut e,
+        &mut b,
+        "CREATE OR REPLACE VIEW big AS SELECT id, v FROM t WHERE id = 1",
     );
     assert_eq!(
         data_rows(&run_with(&mut e, &mut b, "SELECT id FROM big")),

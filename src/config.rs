@@ -15,9 +15,9 @@ pub struct Config {
     pub data_dir: String,
     /// Fixed number of client connection slots.
     pub max_connections: u32,
-    /// Authentication: trust | password | scram-sha-256.
+    /// Authentication: trust | password | md5 | scram-sha-256.
     pub auth: String,
-    /// Initial `postgres` role credential for password/scram authentication.
+    /// Initial `postgres` role credential for password, MD5, or SCRAM authentication.
     /// Other LOGIN roles authenticate only with their stored role credential.
     pub password: String,
     /// Per-connection receive buffer (wire protocol messages are bounded
@@ -342,15 +342,28 @@ impl Config {
                 }
                 "subscription_tls_ca_file" => config.subscription_tls_ca_file = value.to_string(),
                 "auth" => {
-                    if !matches!(value, "trust" | "password" | "scram-sha-256") {
+                    if !matches!(value, "trust" | "password" | "md5" | "scram-sha-256") {
                         return Err(ConfigError::at(
                             line_no,
-                            format!("auth must be trust, password or scram-sha-256, got '{value}'"),
+                            format!(
+                                "auth must be trust, password, md5 or scram-sha-256, got '{value}'"
+                            ),
                         ));
                     }
                     config.auth = value.to_string();
                 }
-                "password" => config.password = value.to_string(),
+                "password" => {
+                    if value.len() > crate::storage::ROLE_PASSWORD_MAX {
+                        return Err(ConfigError::at(
+                            line_no,
+                            format!(
+                                "password exceeds {} bytes",
+                                crate::storage::ROLE_PASSWORD_MAX
+                            ),
+                        ));
+                    }
+                    config.password = value.to_string();
+                }
                 "conn_recv_buffer_bytes" => {
                     config.conn_recv_buffer_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
@@ -930,6 +943,15 @@ sql_arena_bytes = 4096
         assert!(Config::parse("just some words\n").is_err());
         assert!(Config::parse("database_collation_locale = \n").is_err());
         assert!(Config::parse("collation_scratch_bytes = 0\n").is_err());
+        assert!(Config::parse("auth = unknown\n").is_err());
+        assert_eq!(Config::parse("auth = md5\n").unwrap().auth, "md5");
+        assert!(
+            Config::parse(&format!(
+                "password = {}\n",
+                "x".repeat(crate::storage::ROLE_PASSWORD_MAX + 1)
+            ))
+            .is_err()
+        );
     }
 
     #[test]

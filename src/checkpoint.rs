@@ -1311,6 +1311,13 @@ impl Checkpointer {
                     };
                     let type_code: u8 = parse_field(words.next(), "col type")?;
                     let not_null: u8 = parse_field(words.next(), "col notnull")?;
+                    let not_null_inheritable: u8 =
+                        parse_field(words.next(), "col not-null inheritable")?;
+                    if not_null_inheritable > 1 {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid NOT NULL inheritance",
+                        ));
+                    }
                     let type_mod: i32 = parse_field(words.next(), "col typmod")?;
                     let default_hex = words
                         .next()
@@ -1391,7 +1398,7 @@ impl Checkpointer {
                             ));
                         }
                     };
-                    let name = rest_of(line, 16)?;
+                    let name = rest_of(line, 17)?;
                     if *seen >= def.n_columns {
                         return Err(CheckpointSetupError::Corrupt("too many col lines"));
                     }
@@ -1413,6 +1420,7 @@ impl Checkpointer {
                         compression,
                         not_null: crate::storage::NotNullOrigin::from_code(not_null & 3)
                             .ok_or(CheckpointSetupError::Corrupt("invalid NOT NULL provenance"))?,
+                        not_null_inheritable: not_null_inheritable != 0,
                         unique: not_null & 4 != 0,
                         primary: not_null & 8 != 0,
                         auto_increment: not_null & 16 != 0,
@@ -6401,9 +6409,10 @@ impl Checkpointer {
                 write_manifest(
                     &mut self.manifest_buf,
                     format_args!(
-                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                        "col4 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                         c.ctype.code(),
                         flags,
+                        u8::from(c.not_null_inheritable),
                         c.type_mod,
                         default_hex.as_str(),
                         dexpr_hex.as_str(),
@@ -11357,6 +11366,7 @@ fn empty_column() -> ColumnMeta {
         storage: crate::sql::ast::ColumnStorage::Plain,
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: crate::storage::NotNullOrigin::Nullable,
+        not_null_inheritable: true,
         unique: false,
         primary: false,
         auto_increment: false,

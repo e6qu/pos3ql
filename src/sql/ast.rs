@@ -4266,6 +4266,9 @@ pub struct ColumnDef<'a> {
     /// explicit algorithm in `pg_attribute.attcompression`.
     pub compression: ColumnCompression,
     pub not_null: bool,
+    /// `NOT NULL NO INHERIT` is a distinct constraint state, not a later
+    /// executor-side exception to ordinary table inheritance.
+    pub not_null_inheritable: bool,
     pub unique: bool,
     pub primary: bool,
     /// DEFAULT expression. A literal-only default is folded to a constant at
@@ -4837,6 +4840,12 @@ pub enum AlterAction<'a> {
         name: &'a str,
         alteration: ConstraintAlteration,
     },
+    /// Executor-generated descendant update for a named NOT NULL constraint.
+    /// SQL input always reaches this through `AlterConstraint`.
+    SetNotNullInheritance {
+        column: &'a str,
+        inherit: bool,
+    },
     ValidateConstraint(&'a str),
     /// ALTER TABLE trigger-state command with a parser-classified target.
     SetTriggerEnabled {
@@ -4904,14 +4913,22 @@ pub enum ReplicaIdentityTarget<'a> {
     Index(QualName<'a>),
 }
 
-/// The independently optional attributes of `ALTER CONSTRAINT`. Execution
-/// combines them with the existing typed definition before accepting the new
-/// state.
+/// The independently optional foreign-key attributes of `ALTER CONSTRAINT`.
+/// Execution combines them with the existing typed definition before
+/// accepting the new state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConstraintAlteration {
+pub struct ForeignKeyConstraintAlteration {
     pub deferrable: Option<bool>,
     pub initially: Option<ConstraintMode>,
     pub enforced: Option<bool>,
+}
+
+/// `ALTER CONSTRAINT` has disjoint foreign-key and NOT NULL inheritance
+/// grammars, so mixed forms cannot reach execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintAlteration {
+    ForeignKey(ForeignKeyConstraintAlteration),
+    NotNullInheritance { inherit: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

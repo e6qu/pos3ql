@@ -7501,6 +7501,7 @@ impl<'a> Parser<'a> {
             storage: None,
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: false,
+            not_null_inheritable: true,
             unique: false,
             primary: false,
             default: None,
@@ -7622,6 +7623,7 @@ impl<'a> Parser<'a> {
             let mut not_null = false;
             let mut unique = false;
             let mut primary = false;
+            let mut not_null_inheritable = true;
             let mut default = None;
             let mut default_text = None;
             let mut generated_text = None;
@@ -7636,6 +7638,10 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
                     not_null = true;
+                    if self.eat_ident("no")? {
+                        self.expect_ident("inherit")?;
+                        not_null_inheritable = false;
+                    }
                 } else if self.eat_ident("null")? {
                     not_null = false;
                 } else if self.eat_ident("default")? {
@@ -7720,6 +7726,7 @@ impl<'a> Parser<'a> {
                 storage,
                 compression,
                 not_null,
+                not_null_inheritable,
                 unique,
                 primary,
                 default,

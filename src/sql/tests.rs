@@ -41759,6 +41759,149 @@ fn table_inheritance_is_durable_typed_and_visible_to_parent_dml() {
 }
 
 #[test]
+fn not_null_constraint_inheritance_is_typed_transactional_and_catalog_visible() {
+    let (mut engine, mut budget) = test_engine();
+    let output = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE not_null_inherit_parent (id integer NOT NULL); \
+         CREATE TABLE not_null_inherit_child (extra integer) \
+           INHERITS (not_null_inherit_parent); \
+         SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_child'::regclass \
+            AND conname = 'not_null_inherit_child_id_not_null'; \
+         ALTER TABLE not_null_inherit_parent \
+           ALTER CONSTRAINT not_null_inherit_parent_id_not_null NO INHERIT; \
+         SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_parent'::regclass \
+            AND conname = 'not_null_inherit_parent_id_not_null'; \
+         SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_child'::regclass \
+            AND conname = 'not_null_inherit_child_id_not_null'; \
+         ALTER TABLE not_null_inherit_parent \
+           ALTER CONSTRAINT not_null_inherit_parent_id_not_null INHERIT; \
+         SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_child'::regclass \
+            AND conname = 'not_null_inherit_child_id_not_null'; \
+         BEGIN; ALTER TABLE not_null_inherit_parent \
+           ALTER CONSTRAINT not_null_inherit_parent_id_not_null NO INHERIT; ROLLBACK; \
+         SELECT connoinherit FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_parent'::regclass \
+            AND conname = 'not_null_inherit_parent_id_not_null'",
+    );
+    let text = String::from_utf8_lossy(&output);
+    assert!(!text.contains("ERROR"), "{text}");
+    assert_eq!(
+        data_rows(&output),
+        ["f|1|f", "t|0|t", "t|0|f", "t|1|f", "f"],
+        "{text}"
+    );
+    let only = run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER TABLE ONLY not_null_inherit_parent \
+           ALTER CONSTRAINT not_null_inherit_parent_id_not_null NO INHERIT",
+    );
+    assert!(String::from_utf8_lossy(&only).contains("42P16"));
+    let no_inherit_at_creation = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE not_null_creation_parent (id integer NOT NULL NO INHERIT); \
+         CREATE TABLE not_null_creation_child (extra integer) \
+           INHERITS (not_null_creation_parent); \
+         SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'not_null_creation_child'::regclass \
+            AND contype = 'n'",
+    );
+    assert_eq!(
+        data_rows(&no_inherit_at_creation),
+        ["0"],
+        "{}",
+        String::from_utf8_lossy(&no_inherit_at_creation)
+    );
+}
+
+#[test]
+fn not_null_constraint_inheritance_survives_wal_checkpoint_and_object_cold_recovery() {
+    let mut config = test_config("not-null-inheritance-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("not-null-inheritance-recovery-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let created = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE durable_not_null_parent (id integer NOT NULL); \
+         CREATE TABLE durable_not_null_child (extra integer) \
+           INHERITS (durable_not_null_parent); \
+         ALTER TABLE durable_not_null_parent \
+           ALTER CONSTRAINT durable_not_null_parent_id_not_null NO INHERIT; \
+         SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
+          WHERE conrelid = 'durable_not_null_child'::regclass \
+            AND conname = 'durable_not_null_child_id_not_null'",
+    );
+    assert_eq!(
+        data_rows(&created),
+        ["t|0|f"],
+        "{}",
+        String::from_utf8_lossy(&created)
+    );
+    engine.commit_wal().unwrap();
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut recovered_budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut recovered_budget).unwrap();
+    let wal_output = run_with(
+        &mut recovered,
+        &mut recovered_budget,
+        "SELECT connoinherit FROM pg_constraint \
+          WHERE conrelid = 'durable_not_null_parent'::regclass \
+            AND conname = 'durable_not_null_parent_id_not_null'; \
+         SELECT conislocal, coninhcount FROM pg_constraint \
+          WHERE conrelid = 'durable_not_null_child'::regclass \
+            AND conname = 'durable_not_null_child_id_not_null'",
+    );
+    assert_eq!(
+        data_rows(&wal_output),
+        ["t", "t|0"],
+        "{}",
+        String::from_utf8_lossy(&wal_output)
+    );
+    assert!(recovered.checkpoint().unwrap());
+    recovered.commit_wal().unwrap();
+    drop(recovered);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let output = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT connoinherit FROM pg_constraint \
+          WHERE conrelid = 'durable_not_null_parent'::regclass \
+            AND conname = 'durable_not_null_parent_id_not_null'; \
+         SELECT conislocal, coninhcount FROM pg_constraint \
+          WHERE conrelid = 'durable_not_null_child'::regclass \
+            AND conname = 'durable_not_null_child_id_not_null'",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["t", "t|0"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn ordinary_inheritance_parent_alter_rewrites_every_descendant() {
     let (mut engine, mut budget) = test_engine();
     for statement in [

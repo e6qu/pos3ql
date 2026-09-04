@@ -100,6 +100,7 @@ fn alter_pass(action: &AlterAction) -> u8 {
         AlterAction::RenameTable(_)
         | AlterAction::RenameColumn { .. }
         | AlterAction::RenameConstraint { .. }
+        | AlterAction::SetNotNullInheritance { .. }
         | AlterAction::SetTriggerEnabled { .. }
         | AlterAction::SetRuleEnabled { .. }
         | AlterAction::SetRowLevelSecurity(_)
@@ -5655,6 +5656,7 @@ impl<'a> Parser<'a> {
                 crate::sql::ast::ParsedCollation::DEFAULT
             };
             let mut not_null = false;
+            let mut not_null_inheritable = true;
             let mut unique = false;
             let mut default = None;
             let mut default_text = None;
@@ -5664,6 +5666,10 @@ impl<'a> Parser<'a> {
                 if self.eat_ident("not")? {
                     self.expect_ident("null")?;
                     not_null = true;
+                    if self.eat_ident("no")? {
+                        self.expect_ident("inherit")?;
+                        not_null_inheritable = false;
+                    }
                 } else if self.eat_ident("null")? {
                     not_null = false;
                 } else if self.eat_ident("default")? {
@@ -5691,6 +5697,7 @@ impl<'a> Parser<'a> {
                     storage,
                     compression,
                     not_null,
+                    not_null_inheritable,
                     unique,
                     primary: false,
                     default,
@@ -5745,26 +5752,36 @@ impl<'a> Parser<'a> {
         } else if self.eat_ident("alter")? {
             if self.eat_ident("constraint")? {
                 let name = self.col_ident("constraint name")?;
-                let mut alteration = ConstraintAlteration {
+                if self.eat_ident("inherit")? {
+                    return Ok(AlterAction::AlterConstraint {
+                        name,
+                        alteration: ConstraintAlteration::NotNullInheritance { inherit: true },
+                    });
+                }
+                let mut alteration = crate::sql::ast::ForeignKeyConstraintAlteration {
                     deferrable: None,
                     initially: None,
                     enforced: None,
                 };
+                if self.eat_ident("no")? {
+                    if self.eat_ident("inherit")? {
+                        return Ok(AlterAction::AlterConstraint {
+                            name,
+                            alteration: ConstraintAlteration::NotNullInheritance { inherit: false },
+                        });
+                    }
+                    self.expect_ident("deferrable")?;
+                    alteration.deferrable = Some(false);
+                }
                 loop {
                     if self.eat_ident("deferrable")? {
                         if alteration.deferrable.replace(true).is_some() {
                             return Err(self.err_here("duplicate DEFERRABLE clause"));
                         }
                     } else if self.eat_ident("not")? {
-                        if self.eat_ident("deferrable")? {
-                            if alteration.deferrable.replace(false).is_some() {
-                                return Err(self.err_here("duplicate NOT DEFERRABLE clause"));
-                            }
-                        } else {
-                            self.expect_ident("enforced")?;
-                            if alteration.enforced.replace(false).is_some() {
-                                return Err(self.err_here("duplicate NOT ENFORCED clause"));
-                            }
+                        self.expect_ident("enforced")?;
+                        if alteration.enforced.replace(false).is_some() {
+                            return Err(self.err_here("duplicate NOT ENFORCED clause"));
                         }
                     } else if self.eat_ident("initially")? {
                         let mode = if self.eat_ident("deferred")? {
@@ -5797,7 +5814,10 @@ impl<'a> Parser<'a> {
                         self.err_here("constraint declared INITIALLY DEFERRED must be DEFERRABLE")
                     );
                 }
-                return Ok(AlterAction::AlterConstraint { name, alteration });
+                return Ok(AlterAction::AlterConstraint {
+                    name,
+                    alteration: ConstraintAlteration::ForeignKey(alteration),
+                });
             }
             // ALTER [COLUMN] col { SET DEFAULT e | DROP DEFAULT | SET NOT NULL
             // | DROP NOT NULL }.
@@ -9766,6 +9786,32 @@ mod tests {
         with_parser(
             "ALTER TABLE t ADD CONSTRAINT positive CHECK (id > 0) NOT VALID",
             |parser| assert!(parser.next_stmt().unwrap().is_some()),
+        );
+        with_parser(
+            "ALTER TABLE t ALTER CONSTRAINT t_id_not_null NO INHERIT; \
+             ALTER TABLE t ALTER CONSTRAINT t_id_not_null INHERIT",
+            |parser| {
+                assert!(matches!(
+                    parser.next_stmt().unwrap().unwrap(),
+                    Stmt::AlterTable(AlterTable {
+                        actions: [AlterAction::AlterConstraint {
+                            alteration: ConstraintAlteration::NotNullInheritance { inherit: false },
+                            ..
+                        }],
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    parser.next_stmt().unwrap().unwrap(),
+                    Stmt::AlterTable(AlterTable {
+                        actions: [AlterAction::AlterConstraint {
+                            alteration: ConstraintAlteration::NotNullInheritance { inherit: true },
+                            ..
+                        }],
+                        ..
+                    })
+                ));
+            },
         );
     }
 

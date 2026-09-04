@@ -156,7 +156,7 @@ const KIND_DROP_RULE: u8 = 106;
 /// A table definition is an independently versioned payload inside the
 /// object-native logical WAL. Replays reject a definition from an incompatible
 /// schema instead of assigning later bytes to a different column property.
-const TABLE_DEF_PAYLOAD_VERSION: u8 = 2;
+const TABLE_DEF_PAYLOAD_VERSION: u8 = 3;
 const KIND_SET_PARAMETER_ACL: u8 = 123;
 const KIND_PREPARE_TRANSACTION: u8 = 107;
 const KIND_COMMIT_PREPARED: u8 = 108;
@@ -2223,7 +2223,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
             };
             for c in def.columns() {
                 let default_value = c.default.constant().copied();
-                n += 1 + c.name.as_str().len() + 3 + 4 + encoded_default_len(&default_value);
+                n += 1 + c.name.as_str().len() + 4 + 4 + encoded_default_len(&default_value);
                 // Non-constant DEFAULT text: 2-byte length prefix + bytes.
                 n += 2 + c
                     .default
@@ -3827,6 +3827,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
                     | (u8::from(c.user_type.is_some()) << 7);
                 ok &= buffer.append(&[c.ctype.code(), flags]);
                 ok &= buffer.append(&[c.not_null.code()]);
+                ok &= buffer.append(&[u8::from(c.not_null_inheritable)]);
                 ok &= buffer.append(&c.type_mod.to_le_bytes());
                 let default_value = c.default.constant().copied();
                 ok &= append_default(buffer, &default_value);
@@ -6332,6 +6333,12 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 at += 2;
                 let not_null = crate::storage::NotNullOrigin::from_code(*payload.get(at)?)?;
                 at += 1;
+                let not_null_inheritable = match *payload.get(at)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                at += 1;
                 let type_mod = i32::from_le_bytes(payload.get(at..at + 4)?.try_into().unwrap());
                 at += 4;
                 let default_value = decode_default(payload, &mut at)?;
@@ -6393,6 +6400,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                     storage,
                     compression,
                     not_null,
+                    not_null_inheritable,
                     unique: meta[1] & 2 != 0,
                     primary: meta[1] & 4 != 0,
                     auto_increment: meta[1] & 8 != 0,
@@ -11181,6 +11189,7 @@ mod tests {
             storage: crate::sql::ast::ColumnStorage::Plain,
             compression: crate::sql::ast::ColumnCompression::Default,
             not_null: crate::storage::NotNullOrigin::Local,
+            not_null_inheritable: true,
             unique: true,
             primary: true,
             auto_increment: false,
@@ -11200,6 +11209,7 @@ mod tests {
             storage: crate::sql::ast::ColumnStorage::Extended,
             compression: crate::sql::ast::ColumnCompression::Lz4,
             not_null: crate::storage::NotNullOrigin::Nullable,
+            not_null_inheritable: true,
             unique: false,
             primary: false,
             auto_increment: false,

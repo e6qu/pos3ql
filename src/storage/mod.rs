@@ -863,6 +863,9 @@ pub struct ColumnMeta {
     /// catalog). It is retained separately from the object block codec.
     pub compression: crate::sql::ast::ColumnCompression,
     pub not_null: NotNullOrigin,
+    /// Whether this column's local NOT NULL constraint participates in
+    /// ordinary table inheritance. It is irrelevant for a nullable column.
+    pub not_null_inheritable: bool,
     pub unique: bool,
     pub primary: bool,
     /// `serial`/`bigserial`/`smallserial` or GENERATED AS IDENTITY: when the
@@ -1059,6 +1062,7 @@ impl ColumnMeta {
         storage: crate::sql::ast::ColumnStorage::Plain,
         compression: crate::sql::ast::ColumnCompression::Default,
         not_null: NotNullOrigin::Nullable,
+        not_null_inheritable: true,
         unique: false,
         primary: false,
         auto_increment: false,
@@ -37741,6 +37745,7 @@ mod tests {
                 storage: crate::sql::ast::ColumnStorage::Plain,
                 compression: crate::sql::ast::ColumnCompression::Default,
                 not_null: NotNullOrigin::local(*nn),
+                not_null_inheritable: true,
                 unique: false,
                 primary: false,
                 auto_increment: false,

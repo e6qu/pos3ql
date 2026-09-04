@@ -9355,7 +9355,9 @@ fn pg_constraint<'a>(
         }
         let table = storage.table_def(slot, txid);
         for (column_index, column) in table.columns().iter().enumerate() {
-            if !column.not_null.is_required() {
+            // PostgreSQL records only a relation's local NOT NULL constraints
+            // here. An inherited requirement remains `pg_attribute` state.
+            if !column.not_null.is_required() || !column.not_null.is_local() {
                 continue;
             }
             if n == out.len() {

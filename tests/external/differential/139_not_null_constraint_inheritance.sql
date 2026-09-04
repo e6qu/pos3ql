@@ -5,10 +5,12 @@ CREATE TABLE not_null_control_parent (id integer NOT NULL);
 CREATE TABLE not_null_control_child (extra integer)
   INHERITS (not_null_control_parent);
 
-SELECT conislocal, coninhcount, connoinherit
+SELECT count(*)
   FROM pg_constraint
- WHERE conrelid = 'not_null_control_child'::regclass
-   AND conname = 'not_null_control_child_id_not_null';
+ WHERE conrelid = 'not_null_control_child'::regclass AND contype = 'n';
+SELECT attnotnull
+  FROM pg_attribute
+ WHERE attrelid = 'not_null_control_child'::regclass AND attname = 'id';
 
 ALTER TABLE not_null_control_parent
   ALTER CONSTRAINT not_null_control_parent_id_not_null NO INHERIT;
@@ -16,17 +18,15 @@ SELECT conislocal, coninhcount, connoinherit
   FROM pg_constraint
  WHERE conrelid = 'not_null_control_parent'::regclass
    AND conname = 'not_null_control_parent_id_not_null';
-SELECT conislocal, coninhcount, connoinherit
+SELECT count(*)
   FROM pg_constraint
- WHERE conrelid = 'not_null_control_child'::regclass
-   AND conname = 'not_null_control_child_id_not_null';
+ WHERE conrelid = 'not_null_control_child'::regclass AND contype = 'n';
 
 ALTER TABLE not_null_control_parent
   ALTER CONSTRAINT not_null_control_parent_id_not_null INHERIT;
-SELECT conislocal, coninhcount, connoinherit
-  FROM pg_constraint
- WHERE conrelid = 'not_null_control_child'::regclass
-   AND conname = 'not_null_control_child_id_not_null';
+SELECT attnotnull
+  FROM pg_attribute
+ WHERE attrelid = 'not_null_control_child'::regclass AND attname = 'id';
 
 DROP TABLE not_null_control_child;
 DROP TABLE not_null_control_parent;

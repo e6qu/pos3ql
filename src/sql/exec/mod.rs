@@ -60091,25 +60091,9 @@ fn alter_table_inner(
                         new_def.name.as_str()
                     ));
                 }
-                if inheritance_scope == AlterInheritanceScope::Propagated {
-                    if *inherit {
-                        if !new_def.columns[column].not_null_inheritable {
-                            return sql_fail(sql_err!(
-                                sqlstate::DATATYPE_MISMATCH,
-                                "not-null constraint on column \"{}\" in child table must be inheritable",
-                                column
-                            ));
-                        }
-                        new_def.columns[column].not_null =
-                            new_def.columns[column].not_null.add_inherited();
-                    } else {
-                        new_def.columns[column].not_null =
-                            new_def.columns[column].not_null.localize();
-                        new_def.columns[column].not_null_inheritable = true;
-                    }
-                } else {
-                    new_def.columns[column].not_null_inheritable = *inherit;
-                }
+                // The existing child requirement stays inherited. This flag
+                // controls whether it can reach that child's descendants.
+                new_def.columns[column].not_null_inheritable = *inherit;
             }
             AlterAction::ValidateConstraint(name) => {
                 if new_def

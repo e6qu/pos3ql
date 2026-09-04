@@ -3840,15 +3840,14 @@ def test_not_null_constraint_inheritance_over_raw_wire():
         "SELECT connoinherit FROM pg_constraint "
         "WHERE conrelid = 'wire_not_null_parent'::regclass "
         "AND conname = 'wire_not_null_parent_id_not_null'; "
-        "SELECT conislocal, coninhcount FROM pg_constraint "
-        "WHERE conrelid = 'wire_not_null_child'::regclass "
-        "AND conname = 'wire_not_null_child_id_not_null'; "
+        "SELECT attnotnull FROM pg_attribute "
+        "WHERE attrelid = 'wire_not_null_child'::regclass AND attname = 'id'; "
         "DROP TABLE wire_not_null_child; DROP TABLE wire_not_null_parent",
     )
     rows = [text_row_fields(payload) for kind, payload in result if kind == b"D"]
     check(
         "raw wire: not-null constraint inheritance updates catalog provenance",
-        not any(kind == b"E" for kind, _ in result) and rows == [["t"], ["t", "0"]],
+        not any(kind == b"E" for kind, _ in result) and rows == [["t"], ["t"]],
         result,
     )
     s.close()

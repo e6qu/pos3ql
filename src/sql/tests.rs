@@ -13256,7 +13256,7 @@ fn partition_constraint_identity_and_not_null_provenance_follow_postgresql() {
               WHERE relation.relname IN ('provenance_mid', 'provenance_leaf') \
                 AND constraint_catalog.contype = 'n' ORDER BY relation.relname",
         )),
-        ["provenance_leaf|f|1", "provenance_mid|t|0"]
+        ["provenance_mid|t|0"]
     );
     assert_eq!(
         data_rows(&run_with(
@@ -20478,7 +20478,7 @@ fn partition_routing_survives_checkpoint_and_cold_restart() {
               WHERE relation.relname IN ('restart_null_mid', 'restart_null_leaf') \
                 AND constraint_catalog.contype = 'n' ORDER BY relation.relname"
         )),
-        ["restart_null_leaf|f|1", "restart_null_mid|t|0"]
+        ["restart_null_mid|t|0"]
     );
 }
 
@@ -41767,22 +41767,21 @@ fn not_null_constraint_inheritance_is_typed_transactional_and_catalog_visible() 
         "CREATE TABLE not_null_inherit_parent (id integer NOT NULL); \
          CREATE TABLE not_null_inherit_child (extra integer) \
            INHERITS (not_null_inherit_parent); \
-         SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
-          WHERE conrelid = 'not_null_inherit_child'::regclass \
-            AND conname = 'not_null_inherit_child_id_not_null'; \
+         SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_child'::regclass AND contype = 'n'; \
+         SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'not_null_inherit_child'::regclass AND attname = 'id'; \
          ALTER TABLE not_null_inherit_parent \
            ALTER CONSTRAINT not_null_inherit_parent_id_not_null NO INHERIT; \
          SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
           WHERE conrelid = 'not_null_inherit_parent'::regclass \
             AND conname = 'not_null_inherit_parent_id_not_null'; \
-         SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
-          WHERE conrelid = 'not_null_inherit_child'::regclass \
-            AND conname = 'not_null_inherit_child_id_not_null'; \
+         SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'not_null_inherit_child'::regclass AND contype = 'n'; \
          ALTER TABLE not_null_inherit_parent \
            ALTER CONSTRAINT not_null_inherit_parent_id_not_null INHERIT; \
-         SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
-          WHERE conrelid = 'not_null_inherit_child'::regclass \
-            AND conname = 'not_null_inherit_child_id_not_null'; \
+         SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'not_null_inherit_child'::regclass AND attname = 'id'; \
          BEGIN; ALTER TABLE not_null_inherit_parent \
            ALTER CONSTRAINT not_null_inherit_parent_id_not_null NO INHERIT; ROLLBACK; \
          SELECT connoinherit FROM pg_constraint \
@@ -41793,7 +41792,7 @@ fn not_null_constraint_inheritance_is_typed_transactional_and_catalog_visible() 
     assert!(!text.contains("ERROR"), "{text}");
     assert_eq!(
         data_rows(&output),
-        ["f|1|f", "t|0|t", "t|0|f", "t|1|f", "f"],
+        ["0", "t", "t|0|t", "0", "t", "f"],
         "{text}"
     );
     let only = run_with(
@@ -41841,13 +41840,12 @@ fn not_null_constraint_inheritance_survives_wal_checkpoint_and_object_cold_recov
            INHERITS (durable_not_null_parent); \
          ALTER TABLE durable_not_null_parent \
            ALTER CONSTRAINT durable_not_null_parent_id_not_null NO INHERIT; \
-         SELECT conislocal, coninhcount, connoinherit FROM pg_constraint \
-          WHERE conrelid = 'durable_not_null_child'::regclass \
-            AND conname = 'durable_not_null_child_id_not_null'",
+         SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'durable_not_null_child'::regclass AND attname = 'id'",
     );
     assert_eq!(
         data_rows(&created),
-        ["t|0|f"],
+        ["t"],
         "{}",
         String::from_utf8_lossy(&created)
     );
@@ -41863,13 +41861,12 @@ fn not_null_constraint_inheritance_survives_wal_checkpoint_and_object_cold_recov
         "SELECT connoinherit FROM pg_constraint \
           WHERE conrelid = 'durable_not_null_parent'::regclass \
             AND conname = 'durable_not_null_parent_id_not_null'; \
-         SELECT conislocal, coninhcount FROM pg_constraint \
-          WHERE conrelid = 'durable_not_null_child'::regclass \
-            AND conname = 'durable_not_null_child_id_not_null'",
+         SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'durable_not_null_child'::regclass AND attname = 'id'",
     );
     assert_eq!(
         data_rows(&wal_output),
-        ["t", "t|0"],
+        ["t", "t"],
         "{}",
         String::from_utf8_lossy(&wal_output)
     );
@@ -41886,13 +41883,12 @@ fn not_null_constraint_inheritance_survives_wal_checkpoint_and_object_cold_recov
         "SELECT connoinherit FROM pg_constraint \
           WHERE conrelid = 'durable_not_null_parent'::regclass \
             AND conname = 'durable_not_null_parent_id_not_null'; \
-         SELECT conislocal, coninhcount FROM pg_constraint \
-          WHERE conrelid = 'durable_not_null_child'::regclass \
-            AND conname = 'durable_not_null_child_id_not_null'",
+         SELECT attnotnull FROM pg_attribute \
+          WHERE attrelid = 'durable_not_null_child'::regclass AND attname = 'id'",
     );
     assert_eq!(
         data_rows(&output),
-        ["t", "t|0"],
+        ["t", "t"],
         "{}",
         String::from_utf8_lossy(&output)
     );

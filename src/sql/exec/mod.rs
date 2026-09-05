@@ -9367,6 +9367,7 @@ fn resolve_privilege_objects(
                             | crate::storage::RoutineKind::SetFunction { .. }
                             | crate::storage::RoutineKind::TableFunction
                             | crate::storage::RoutineKind::Trigger
+                            | crate::storage::RoutineKind::Aggregate(_)
                     ),
                     RoutineTargetKind::Procedure => {
                         matches!(actual, crate::storage::RoutineKind::Procedure)
@@ -28504,7 +28505,7 @@ pub(crate) fn alter_operator(
     action: crate::sql::ast::AlterOperatorAction<'_>,
     responder: &mut Responder,
 ) -> Outcome {
-    let (slot, signature) = match resolve_operator_identity(storage, txn.txid, identity) {
+    let (slot, _signature) = match resolve_operator_identity(storage, txn.txid, identity) {
         Ok(found) => found,
         Err(error) => return sql_fail(error),
     };
@@ -28549,96 +28550,10 @@ pub(crate) fn alter_operator(
                 Err(error) => return sql_fail(error),
             };
         }
-        crate::sql::ast::AlterOperatorAction::Set {
-            commutator,
-            negator,
-            hashes,
-            merges,
-        } => {
-            if (hashes || merges)
-                && (signature.arity() != 2
-                    || definition
-                        .implementation
-                        .result()
-                        .is_none_or(|result| result.ctype != ColType::Bool))
-            {
-                return sql_fail(sql_err!(
-                    sqlstate::INVALID_OBJECT_DEFINITION,
-                    "HASHES and MERGES require a binary boolean operator"
-                ));
-            }
-            if let Some(name) = commutator {
-                if definition.commutator.is_some() {
-                    return sql_fail(sql_err!(
-                        sqlstate::INVALID_OBJECT_DEFINITION,
-                        "operator already has a commutator"
-                    ));
-                }
-                let swapped = crate::storage::OperatorSignature {
-                    left: signature.right,
-                    right: signature.left,
-                };
-                let link = match operator_link_slot(storage, txn.txid, name, swapped) {
-                    Ok(link) => link,
-                    Err(error) => return sql_fail(error),
-                };
-                let mut linked = storage.operator_for(link, txn.txid);
-                if let Err(error) = storage.require_catalog_owner(
-                    linked.owner,
-                    txn.txid,
-                    "operator",
-                    linked.name.as_str(),
-                ) {
-                    return sql_fail(error);
-                }
-                let source_oid = storage.operator(slot).oid();
-                if linked.commutator.is_some() && linked.commutator != Some(source_oid) {
-                    return sql_fail(sql_err!(
-                        sqlstate::INVALID_OBJECT_DEFINITION,
-                        "commutator operator already has a different commutator"
-                    ));
-                }
-                linked.commutator = Some(source_oid);
-                if let Err(error) = stage_operator(storage, wal, txn, link, linked) {
-                    return sql_fail(error);
-                }
-                definition.commutator = Some(storage.operator(link).oid());
-            }
-            if let Some(name) = negator {
-                if definition.negator.is_some() {
-                    return sql_fail(sql_err!(
-                        sqlstate::INVALID_OBJECT_DEFINITION,
-                        "operator already has a negator"
-                    ));
-                }
-                let link = match operator_link_slot(storage, txn.txid, name, signature) {
-                    Ok(link) => link,
-                    Err(error) => return sql_fail(error),
-                };
-                let mut linked = storage.operator_for(link, txn.txid);
-                if let Err(error) = storage.require_catalog_owner(
-                    linked.owner,
-                    txn.txid,
-                    "operator",
-                    linked.name.as_str(),
-                ) {
-                    return sql_fail(error);
-                }
-                let source_oid = storage.operator(slot).oid();
-                if linked.negator.is_some() && linked.negator != Some(source_oid) {
-                    return sql_fail(sql_err!(
-                        sqlstate::INVALID_OBJECT_DEFINITION,
-                        "negator operator already has a different negator"
-                    ));
-                }
-                linked.negator = Some(source_oid);
-                if let Err(error) = stage_operator(storage, wal, txn, link, linked) {
-                    return sql_fail(error);
-                }
-                definition.negator = Some(storage.operator(link).oid());
-            }
-            definition.hashes |= hashes;
-            definition.merges |= merges;
+        crate::sql::ast::AlterOperatorAction::ResetSelectivity(_) => {
+            // The bounded planner admits no custom selectivity hooks. Parsing
+            // `NONE` explicitly proves the requested catalog state is already
+            // represented rather than silently accepting an unknown option.
         }
     }
     if storage

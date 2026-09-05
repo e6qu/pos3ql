@@ -45,6 +45,7 @@ CREATE OPERATOR === (
   HASHES,
   MERGES
 );
+ALTER OPERATOR === (integer, integer) SET (RESTRICT = NONE, JOIN = NONE);
 CREATE OPERATOR ## (
   FUNCTION = differential_int_same,
   LEFTARG = integer,

@@ -119,7 +119,31 @@ SELECT proparallel, agginitval
   FROM pg_proc p JOIN pg_aggregate a ON a.aggfnoid = p.oid
  WHERE p.proname = 'differential_total';
 
-DROP AGGREGATE differential_total(integer);
+-- Aggregate identity is a routine identity: rename, schema move, and owner
+-- changes preserve its executable definition rather than rebuilding it.
+CREATE SCHEMA differential_aggregate_schema;
+CREATE ROLE differential_aggregate_owner;
+GRANT CREATE ON SCHEMA differential_aggregate_schema TO differential_aggregate_owner;
+ALTER AGGREGATE differential_total(integer) RENAME TO differential_total_moved;
+ALTER AGGREGATE differential_total_moved(integer)
+  SET SCHEMA differential_aggregate_schema;
+ALTER AGGREGATE differential_aggregate_schema.differential_total_moved(integer)
+  OWNER TO differential_aggregate_owner;
+SELECT differential_aggregate_schema.differential_total_moved(value)
+  FROM differential_aggregate_input;
+SELECT namespace.nspname, pg_get_userbyid(procedure.proowner),
+       aggregate.agginitval
+  FROM pg_proc procedure
+  JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+  JOIN pg_aggregate aggregate ON aggregate.aggfnoid = procedure.oid
+ WHERE procedure.proname = 'differential_total_moved';
+ALTER AGGREGATE differential_aggregate_schema.differential_total_moved(integer)
+  OWNER TO postgres;
+DROP AGGREGATE differential_aggregate_schema.differential_total_moved(integer);
+REVOKE CREATE ON SCHEMA differential_aggregate_schema FROM differential_aggregate_owner;
+DROP SCHEMA differential_aggregate_schema;
+DROP ROLE differential_aggregate_owner;
+
 DROP AGGREGATE differential_offset(integer ORDER BY integer);
 DROP AGGREGATE differential_hypothetical(integer ORDER BY integer);
 DROP FUNCTION differential_total_state(bigint, integer);

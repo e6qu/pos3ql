@@ -30,6 +30,8 @@ DROP FUNCTION IF EXISTS plpgsql_dynamic_catalog_publication();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_catalog_schema();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_catalog_drop_schema();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_catalog_lifecycle();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_session_commands();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_session_reset();
 DROP PUBLICATION IF EXISTS plpgsql_dynamic_catalog_publication;
 DROP MATERIALIZED VIEW IF EXISTS plpgsql_dynamic_catalog_materialized;
 DROP STATISTICS IF EXISTS plpgsql_dynamic_catalog_stats;
@@ -37,6 +39,7 @@ DROP SEQUENCE IF EXISTS plpgsql_dynamic_command_sequence;
 DROP SEQUENCE IF EXISTS plpgsql_dynamic_catalog_sequence;
 DROP VIEW IF EXISTS plpgsql_dynamic_catalog_view;
 DROP TABLE IF EXISTS plpgsql_dynamic_catalog_rows;
+DROP TABLE IF EXISTS plpgsql_dynamic_session_rows;
 DROP SCHEMA IF EXISTS plpgsql_dynamic_catalog_ns CASCADE;
 DROP DOMAIN IF EXISTS plpgsql_dynamic_catalog_positive;
 DROP TYPE IF EXISTS plpgsql_dynamic_catalog_state;
@@ -279,6 +282,22 @@ BEGIN
   EXECUTE 'REFRESH MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized';
 END
 $$;
+CREATE TABLE plpgsql_dynamic_session_rows (value integer);
+INSERT INTO plpgsql_dynamic_session_rows VALUES (1), (2);
+CREATE FUNCTION plpgsql_dynamic_session_commands() RETURNS void
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'SET application_name TO ''dynamic-session''';
+  EXECUTE 'SET ROLE postgres';
+  EXECUTE 'LISTEN plpgsql_dynamic_session';
+  EXECUTE 'NOTIFY plpgsql_dynamic_session, ''ready''';
+  EXECUTE 'UNLISTEN plpgsql_dynamic_session';
+  EXECUTE 'ANALYZE plpgsql_dynamic_session_rows';
+  EXECUTE 'CHECKPOINT';
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_session_reset() RETURNS void
+  LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'RESET application_name'; END $$;
 CREATE FUNCTION plpgsql_function_no_return() RETURNS integer
   LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
 CREATE FUNCTION plpgsql_function_void_return() RETURNS void
@@ -320,6 +339,10 @@ INSERT INTO plpgsql_dynamic_catalog_ns.schema_rows VALUES (11);
 SELECT * FROM plpgsql_dynamic_catalog_ns.schema_view;
 INSERT INTO plpgsql_dynamic_catalog_rows VALUES (nextval('plpgsql_dynamic_catalog_sequence'), 'nine');
 SELECT plpgsql_dynamic_catalog_lifecycle();
+SELECT plpgsql_dynamic_session_commands();
+SELECT current_setting('application_name');
+SELECT reltuples::integer FROM pg_class WHERE relname = 'plpgsql_dynamic_session_rows';
+SELECT plpgsql_dynamic_session_reset();
 SELECT * FROM plpgsql_dynamic_catalog_view;
 SELECT * FROM plpgsql_dynamic_catalog_materialized;
 SELECT obj_description('plpgsql_dynamic_catalog_rows'::regclass, 'pg_class');
@@ -416,6 +439,8 @@ SELECT plpgsql_dynamic_catalog_drop_schema();
 DROP FUNCTION plpgsql_dynamic_catalog_drop_schema();
 DROP FUNCTION plpgsql_dynamic_catalog_schema();
 DROP FUNCTION plpgsql_dynamic_catalog_lifecycle();
+DROP FUNCTION plpgsql_dynamic_session_commands();
+DROP FUNCTION plpgsql_dynamic_session_reset();
 DROP PUBLICATION plpgsql_dynamic_catalog_publication;
 DROP MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized;
 DROP STATISTICS plpgsql_dynamic_catalog_stats;
@@ -427,6 +452,7 @@ DROP TABLE plpgsql_dynamic_dml_audit;
 DROP TABLE plpgsql_dynamic_utility_rows;
 DROP VIEW plpgsql_dynamic_catalog_view;
 DROP TABLE plpgsql_dynamic_catalog_rows;
+DROP TABLE plpgsql_dynamic_session_rows;
 DROP DOMAIN plpgsql_dynamic_catalog_positive;
 DROP TYPE plpgsql_dynamic_catalog_state;
 DROP FUNCTION plpgsql_dynamic_administration_revoke();

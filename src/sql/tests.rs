@@ -699,6 +699,88 @@ fn plpgsql_dynamic_utility_rejections_match_static_boundaries() {
 }
 
 #[test]
+fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
+    let mut config = test_config("plpgsql_dynamic_session_and_maintenance");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("plpgsql-dynamic-session-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE plpgsql_dynamic_session_rows (value integer); \
+         INSERT INTO plpgsql_dynamic_session_rows VALUES (1), (2); \
+         CREATE FUNCTION plpgsql_dynamic_session_commands() RETURNS void LANGUAGE plpgsql AS '
+           BEGIN
+             EXECUTE ''SET application_name TO ''''dynamic-session'''''';
+             EXECUTE ''SET ROLE postgres'';
+             EXECUTE ''LISTEN plpgsql_dynamic_session'';
+             EXECUTE ''NOTIFY plpgsql_dynamic_session, ''''ready'''''';
+             EXECUTE ''UNLISTEN plpgsql_dynamic_session'';
+             EXECUTE ''ANALYZE plpgsql_dynamic_session_rows'';
+             EXECUTE ''CHECKPOINT'';
+           END'; \
+         CREATE FUNCTION plpgsql_dynamic_session_reset() RETURNS void LANGUAGE plpgsql AS '
+           BEGIN EXECUTE ''RESET application_name''; END'; \
+         CREATE FUNCTION plpgsql_dynamic_session_vacuum() RETURNS void LANGUAGE plpgsql AS '
+           BEGIN EXECUTE ''VACUUM plpgsql_dynamic_session_rows''; END'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    let observed = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT plpgsql_dynamic_session_commands(); \
+         SELECT current_setting('application_name'); \
+         SELECT reltuples::integer FROM pg_class WHERE relname = 'plpgsql_dynamic_session_rows'",
+    );
+    assert_eq!(
+        data_rows(&observed),
+        ["NULL", "dynamic-session", "2"],
+        "{}",
+        String::from_utf8_lossy(&observed)
+    );
+    let rejected = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT plpgsql_dynamic_session_vacuum()",
+    );
+    let rejected = String::from_utf8_lossy(&rejected);
+    assert!(
+        rejected.contains("25001")
+            && rejected.contains("VACUUM cannot run inside a transaction block"),
+        "{rejected}"
+    );
+    let reset = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT plpgsql_dynamic_session_reset(); SELECT current_setting('application_name')",
+    );
+    assert!(
+        !String::from_utf8_lossy(&reset).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&reset)
+    );
+    drop(engine);
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    let recovered = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT reltuples::integer FROM pg_class WHERE relname = 'plpgsql_dynamic_session_rows'",
+    );
+    assert_eq!(data_rows(&recovered), ["2"]);
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn plpgsql_scalar_functions_honor_acl_security_and_configuration_scopes() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
@@ -20595,10 +20677,10 @@ fn ddl_rolls_back_with_implicit_transaction() {
         "SELECT id FROM txn_ddl",
     ));
     assert_eq!(rows, ["7"], "dropped table must revive with its rows");
-    // CHECKPOINT stays outside transaction blocks.
+    // PostgreSQL permits CHECKPOINT inside a transaction block.
     run_txn(&mut e, &mut b, &mut t, "BEGIN");
     let out = run_txn(&mut e, &mut b, &mut t, "CHECKPOINT");
-    assert!(out.contains("0A000") || out.contains("25001"), "{out}");
+    assert!(out.contains("CHECKPOINT"), "{out}");
     run_txn(&mut e, &mut b, &mut t, "ROLLBACK");
 }
 

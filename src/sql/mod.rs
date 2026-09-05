@@ -1238,7 +1238,6 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
 
 fn top_level_only_command(statement: &Stmt<'_>) -> Option<&'static str> {
     match statement {
-        Stmt::Checkpoint => Some("CHECKPOINT"),
         Stmt::Vacuum { .. } => Some("VACUUM"),
         // A relation-specific CLUSTER is transactional; the all-relations
         // form controls its own work across relations and is not.
@@ -6416,6 +6415,316 @@ impl Engine {
         Ok(total_rows)
     }
 
+    pub(crate) fn execute_checkpoint_statement(
+        &mut self,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        match self.checkpoint() {
+            Ok(_) => {
+                responder.command_complete("CHECKPOINT")?;
+                Ok(Ok(()))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    pub(crate) fn execute_vacuum_statement(
+        &mut self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        options: ast::VacuumOptions,
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let mode = if options.full {
+            ast::TableLockMode::AccessExclusive
+        } else {
+            ast::TableLockMode::ShareUpdateExclusive
+        };
+        if let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode) {
+            return Ok(Err(error));
+        }
+        let validation = if options.analyze {
+            self.analyze_targets(targets, txn).map(|_| ())
+        } else {
+            self.validate_maintenance_targets(targets, txn.txid)
+        };
+        if let Err(error) = validation {
+            return Ok(Err(error));
+        }
+        if self.ckpt.is_some()
+            && let Err(error) = self.checkpoint()
+        {
+            return Ok(Err(error));
+        }
+        responder.command_complete("VACUUM")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_analyze_statement(
+        &mut self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) = self.lock_maintenance_targets(
+            targets,
+            txn.txid,
+            ast::TableLockMode::ShareUpdateExclusive,
+        ) {
+            return Ok(Err(error));
+        }
+        if let Err(error) = self.analyze_targets(targets, txn) {
+            return Ok(Err(error));
+        }
+        responder.command_complete("ANALYZE")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_listen_statement(
+        &mut self,
+        channel: &str,
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let operation = notify::ListenOp::Listen {
+            conn_id: self.current_conn_id,
+            channel: notify::channel(channel),
+        };
+        if let Err(error) = txn.buffer_listen_op(operation) {
+            return Ok(Err(error));
+        }
+        responder.command_complete("LISTEN")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_unlisten_statement(
+        &mut self,
+        channel: Option<&str>,
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let operation = match channel {
+            Some(name) => notify::ListenOp::Unlisten {
+                conn_id: self.current_conn_id,
+                channel: notify::channel(name),
+            },
+            None => notify::ListenOp::UnlistenAll {
+                conn_id: self.current_conn_id,
+            },
+        };
+        if let Err(error) = txn.buffer_listen_op(operation) {
+            return Ok(Err(error));
+        }
+        responder.command_complete("UNLISTEN")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_notify_statement(
+        &mut self,
+        channel: &str,
+        text: Option<&str>,
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let payload = match text {
+            Some(text) => match notify::payload(text) {
+                Ok(payload) => payload,
+                Err(error) => return Ok(Err(error)),
+            },
+            None => notify::Payload::new(),
+        };
+        if let Err(error) = txn.buffer_notify(
+            self.current_conn_id,
+            notify::channel(channel),
+            payload.as_str(),
+        ) {
+            return Ok(Err(error));
+        }
+        responder.command_complete("NOTIFY")?;
+        Ok(Ok(()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_set_statement(
+        &mut self,
+        name: &str,
+        value: &str,
+        local: bool,
+        syntax: ast::SettingSyntax,
+        txn: &mut TxnState,
+        guc: &GucState,
+        arena: &Arena,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if crate::sql::guc::requires_set_privilege(name)
+            && self
+                .storage
+                .current_role_slot(txn.txid)
+                .is_some_and(|role| {
+                    !self.storage.role(role).attributes_to(txn.txid).superuser
+                        && crate::sql::ast::ParameterName::parse(name).is_none_or(|parameter| {
+                            !self.storage.has_parameter_privilege(
+                                parameter,
+                                role,
+                                crate::sql::ast::ParameterPrivileges::SET,
+                                txn.txid,
+                            )
+                        })
+                })
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to set parameter \"{}\"",
+                name
+            )));
+        }
+        if local && !txn.is_explicit() {
+            responder.warning(
+                sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                "SET LOCAL can only be used in transaction blocks",
+            )?;
+        }
+        if syntax == ast::SettingSyntax::FromCurrent {
+            if let Some(characteristics) = guc.current_transaction_setting_from_current(
+                name,
+                txn.isolation,
+                txn.read_only,
+                txn.deferrable,
+            ) {
+                let characteristics = match characteristics {
+                    Ok(characteristics) => characteristics,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if let Err(error) = apply_current_transaction_setting(txn, characteristics) {
+                    return Ok(Err(error));
+                }
+            } else if let Err(error) = guc.set_from_current(name, local) {
+                return Ok(Err(error));
+            }
+            guc::publish_active_setting(guc, name);
+            responder.command_complete("SET")?;
+            return Ok(Ok(()));
+        }
+        if let Some(characteristics) = guc.current_transaction_setting(name, value) {
+            let characteristics = match characteristics {
+                Ok(characteristics) => characteristics,
+                Err(error) => return Ok(Err(error)),
+            };
+            if let Err(error) = apply_current_transaction_setting(txn, characteristics) {
+                return Ok(Err(error));
+            }
+            responder.command_complete("SET")?;
+            return Ok(Ok(()));
+        }
+        let changed = match syntax {
+            ast::SettingSyntax::Generic => guc.set(name, value, local),
+            ast::SettingSyntax::FromCurrent => {
+                unreachable!("FROM CURRENT is handled before value application")
+            }
+            ast::SettingSyntax::TimeZone => guc.set_time_zone_sql(value, local),
+            ast::SettingSyntax::TimeZoneInterval(type_mod) => {
+                let interval = match datetime::parse_interval(value) {
+                    Ok(interval) => interval,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let interval = match exec::apply_typmod(
+                    Datum::Interval(interval),
+                    types::ColType::Interval,
+                    type_mod,
+                    arena,
+                ) {
+                    Ok(Datum::Interval(interval)) => interval,
+                    Ok(_) => unreachable!("interval typmod preserves its type"),
+                    Err(error) => return Ok(Err(error)),
+                };
+                guc.set_time_zone_interval(interval, local)
+            }
+        };
+        match changed {
+            Ok(()) => {
+                if name.eq_ignore_ascii_case("default_tablespace") {
+                    let tablespace = guc.default_tablespace();
+                    let tablespace_name = tablespace.as_str();
+                    if !tablespace_name.is_empty()
+                        && !tablespace_name.eq_ignore_ascii_case("pg_default")
+                        && !tablespace_name.eq_ignore_ascii_case("pg_global")
+                        && self
+                            .storage
+                            .tablespace_slot(tablespace_name, txn.txid)
+                            .is_none()
+                    {
+                        return Ok(Err(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "invalid value for parameter \"default_tablespace\": \"{}\": tablespace does not exist",
+                            tablespace_name
+                        )));
+                    }
+                }
+                guc::publish_active_setting(guc, name);
+                responder.set_render(guc.render());
+                responder.command_complete("SET")?;
+                Ok(Ok(()))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    pub(crate) fn execute_reset_statement(
+        &mut self,
+        name: Option<&str>,
+        txn: &TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if name.is_some_and(crate::sql::guc::requires_set_privilege)
+            && self
+                .storage
+                .current_role_slot(txn.txid)
+                .is_some_and(|role| {
+                    !self.storage.role(role).attributes_to(txn.txid).superuser
+                        && name
+                            .and_then(crate::sql::ast::ParameterName::parse)
+                            .is_none_or(|parameter| {
+                                !self.storage.has_parameter_privilege(
+                                    parameter,
+                                    role,
+                                    crate::sql::ast::ParameterPrivileges::SET,
+                                    txn.txid,
+                                )
+                            })
+                })
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to set parameter \"{}\"",
+                name.unwrap_or("")
+            )));
+        }
+        if let Some(name) = name
+            && guc.transaction_reset_owned(name).is_some()
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "parameter \"{}\" cannot be reset",
+                name
+            )));
+        }
+        let result = match name {
+            Some(name) => guc.reset(name),
+            None => {
+                guc.reset_all();
+                Ok(())
+            }
+        };
+        match result {
+            Ok(()) => {
+                responder.command_complete("RESET")?;
+                Ok(Ok(()))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
         self.retry_pending_wal_upload()?;
         if self.post_publish_cleanup.is_some() {
@@ -6423,10 +6732,10 @@ impl Engine {
         }
         self.refresh_prepared_transaction_catalog();
         let Some(ckpt) = self.ckpt.as_mut() else {
-            return Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::FEATURE_NOT_SUPPORTED),
-                message: stack_format!(192, "no object storage configured (object_store = off)"),
-            });
+            // The explicit non-durable test mode has no publication target.
+            // PostgreSQL still treats CHECKPOINT as a successful maintenance
+            // command, so it is a no-op rather than a client-visible error.
+            return Ok(false);
         };
         // Everything the snapshot will contain must be journal-durable
         // first, so an interrupted checkpoint never strands acked writes.
@@ -14519,13 +14828,7 @@ impl Engine {
                     Ok(Ok(()))
                 }
             }
-            Stmt::Checkpoint => match self.checkpoint() {
-                Ok(_) => {
-                    responder.command_complete("CHECKPOINT")?;
-                    Ok(Ok(()))
-                }
-                Err(e) => Ok(Err(e)),
-            },
+            Stmt::Checkpoint => self.execute_checkpoint_statement(responder),
             // VACUUM reclaims space; in this LSM that is a checkpoint (flush +
             // compaction, pruning superseded versions and tombstones). The
             // options and per-table targets are parsed; a checkpoint compacts
@@ -14533,93 +14836,16 @@ impl Engine {
             // storage there is nothing to compact to, and — as VACUUM on a
             // table with nothing to reclaim does in PostgreSQL — it succeeds.
             Stmt::Vacuum { targets, options } => {
-                let mode = if options.full {
-                    ast::TableLockMode::AccessExclusive
-                } else {
-                    ast::TableLockMode::ShareUpdateExclusive
-                };
-                if let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode) {
-                    return Ok(Err(error));
-                }
-                let validation = if options.analyze {
-                    self.analyze_targets(targets, txn).map(|_| ())
-                } else {
-                    self.validate_maintenance_targets(targets, txn.txid)
-                };
-                if let Err(error) = validation {
-                    return Ok(Err(error));
-                }
-                if self.ckpt.is_some()
-                    && let Err(e) = self.checkpoint()
-                {
-                    return Ok(Err(e));
-                }
-                responder.command_complete("VACUUM")?;
-                Ok(Ok(()))
+                self.execute_vacuum_statement(targets, *options, txn, responder)
             }
             // ANALYZE resolves every requested relation/column and walks its
             // MVCC-visible row state. Cardinality and widths are exact for that
             // snapshot; distinct counts use the fixed-size estimator.
-            Stmt::Analyze(targets) => {
-                if let Err(error) = self.lock_maintenance_targets(
-                    targets,
-                    txn.txid,
-                    ast::TableLockMode::ShareUpdateExclusive,
-                ) {
-                    return Ok(Err(error));
-                }
-                if let Err(error) = self.analyze_targets(targets, txn) {
-                    return Ok(Err(error));
-                }
-                responder.command_complete("ANALYZE")?;
-                Ok(Ok(()))
-            }
-            Stmt::Listen(channel) => {
-                let op = notify::ListenOp::Listen {
-                    conn_id: self.current_conn_id,
-                    channel: notify::channel(channel),
-                };
-                if let Err(e) = txn.buffer_listen_op(op) {
-                    return Ok(Err(e));
-                }
-                responder.command_complete("LISTEN")?;
-                Ok(Ok(()))
-            }
-            Stmt::Unlisten(channel) => {
-                let op = match channel {
-                    Some(name) => notify::ListenOp::Unlisten {
-                        conn_id: self.current_conn_id,
-                        channel: notify::channel(name),
-                    },
-                    None => notify::ListenOp::UnlistenAll {
-                        conn_id: self.current_conn_id,
-                    },
-                };
-                if let Err(e) = txn.buffer_listen_op(op) {
-                    return Ok(Err(e));
-                }
-                responder.command_complete("UNLISTEN")?;
-                Ok(Ok(()))
-            }
+            Stmt::Analyze(targets) => self.execute_analyze_statement(targets, txn, responder),
+            Stmt::Listen(channel) => self.execute_listen_statement(channel, txn, responder),
+            Stmt::Unlisten(channel) => self.execute_unlisten_statement(*channel, txn, responder),
             Stmt::Notify { channel, payload } => {
-                // Validate the payload length (PostgreSQL's 8000-byte limit)
-                // before buffering the raw text.
-                let payload = match payload {
-                    Some(text) => match notify::payload(text) {
-                        Ok(p) => p,
-                        Err(e) => return Ok(Err(e)),
-                    },
-                    None => notify::Payload::new(),
-                };
-                if let Err(e) = txn.buffer_notify(
-                    self.current_conn_id,
-                    notify::channel(channel),
-                    payload.as_str(),
-                ) {
-                    return Ok(Err(e));
-                }
-                responder.command_complete("NOTIFY")?;
-                Ok(Ok(()))
+                self.execute_notify_statement(channel, *payload, txn, responder)
             }
             Stmt::AlterTable(a) => exec::alter_table(
                 &mut self.storage,

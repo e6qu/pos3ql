@@ -704,6 +704,7 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
     config.object_store_on = true;
     config.object_store_sim = true;
     config.object_store_namespace = format!("plpgsql-dynamic-session-{}", std::process::id());
+    config.max_tables = 9;
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -741,7 +742,7 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
              RETURN result;
            END'; \
          CREATE FUNCTION plpgsql_dynamic_portal() RETURNS integer LANGUAGE plpgsql AS '
-           DECLARE result integer; setting text; plan text; setting_name text; setting_value text; setting_description text;
+           DECLARE result integer; setting text; plan text; analyze_plan text; setting_name text; setting_value text; setting_description text;
            BEGIN
              EXECUTE ''SHOW application_name'' INTO STRICT setting;
              IF setting <> ''dynamic-session'' THEN RAISE EXCEPTION ''SHOW result mismatch''; END IF;
@@ -749,6 +750,16 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
              IF setting_name IS NULL THEN RAISE EXCEPTION ''SHOW ALL result mismatch''; END IF;
              EXECUTE ''EXPLAIN SELECT value FROM plpgsql_dynamic_session_rows'' INTO STRICT plan;
              IF plan IS NULL THEN RAISE EXCEPTION ''EXPLAIN result mismatch''; END IF;
+             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows'' INTO analyze_plan;
+             IF analyze_plan IS NULL OR position(''actual time'' IN analyze_plan) = 0 THEN
+               RAISE EXCEPTION ''EXPLAIN ANALYZE result mismatch'';
+             END IF;
+             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) INSERT INTO plpgsql_dynamic_session_rows \
+               VALUES (4) RETURNING value'' INTO analyze_plan;
+             IF analyze_plan IS NULL OR position(''actual time'' IN analyze_plan) = 0 THEN
+               RAISE EXCEPTION ''EXPLAIN ANALYZE DML result mismatch'';
+             END IF;
+             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows'';
              EXECUTE ''DECLARE plpgsql_dynamic_cursor SCROLL CURSOR FOR \
                SELECT value FROM plpgsql_dynamic_session_rows ORDER BY value'';
              EXECUTE ''MOVE FORWARD 1 FROM plpgsql_dynamic_cursor'';
@@ -759,6 +770,13 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
            END'; \
          CREATE FUNCTION plpgsql_dynamic_lock() RETURNS void LANGUAGE plpgsql AS '
            BEGIN EXECUTE ''LOCK TABLE plpgsql_dynamic_session_rows IN SHARE MODE''; END'; \
+         CREATE FUNCTION plpgsql_dynamic_analyze_json() RETURNS void LANGUAGE plpgsql AS '
+           DECLARE plan text;
+           BEGIN
+             EXECUTE ''EXPLAIN (ANALYZE, FORMAT JSON) SELECT value FROM plpgsql_dynamic_session_rows''
+               INTO STRICT plan;
+             IF plan IS NULL THEN RAISE EXCEPTION ''EXPLAIN ANALYZE JSON result mismatch''; END IF;
+           END'; \
          CREATE FUNCTION plpgsql_dynamic_constraints() RETURNS void LANGUAGE plpgsql AS '
            BEGIN EXECUTE ''SET CONSTRAINTS ALL IMMEDIATE''; END'; \
          CREATE FUNCTION plpgsql_dynamic_discard_all() RETURNS void LANGUAGE plpgsql AS '
@@ -778,11 +796,12 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
          SELECT plpgsql_dynamic_prepare(); \
          EXECUTE plpgsql_dynamic_plan(41); \
          BEGIN; SELECT plpgsql_dynamic_portal(); COMMIT; \
+         SELECT count(*) FROM plpgsql_dynamic_session_rows; \
          EXECUTE plpgsql_dynamic_plan(41)",
     );
     assert_eq!(
         data_rows(&observed),
-        ["NULL", "dynamic-session", "2", "3", "42", "2"],
+        ["NULL", "dynamic-session", "2", "3", "42", "2", "4"],
         "{}",
         String::from_utf8_lossy(&observed)
     );
@@ -814,6 +833,16 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
         String::from_utf8_lossy(&strict_none).contains("P0002"),
         "{}",
         String::from_utf8_lossy(&strict_none)
+    );
+    let analyze_json = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT plpgsql_dynamic_analyze_json()",
+    );
+    assert!(
+        !String::from_utf8_lossy(&analyze_json).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&analyze_json)
     );
     let locked = run_with(
         &mut engine,
@@ -4465,7 +4494,7 @@ fn login_event_triggers_commit_or_reject_the_login_atomically() {
     );
     assert!(!String::from_utf8_lossy(&setup).contains("ERROR"));
 
-    let guc = GucState::new();
+    let mut guc = GucState::new();
     let arena = Arena::new(&mut budget, "login event test", 1 << 18).unwrap();
     let mut txn = TxnState::new(&mut budget, 1024).unwrap();
     let mut sqlprep = test_pool(&mut budget);
@@ -4477,7 +4506,7 @@ fn login_event_triggers_commit_or_reject_the_login_atomically() {
             &mut txn,
             &mut sqlprep,
             &mut cursors,
-            &guc,
+            &mut guc,
             &arena,
             &mut Responder::new(&mut buffer),
         )
@@ -4511,7 +4540,7 @@ fn login_event_triggers_commit_or_reject_the_login_atomically() {
             &mut txn,
             &mut sqlprep,
             &mut cursors,
-            &guc,
+            &mut guc,
             &arena,
             &mut Responder::new(&mut buffer),
         )

@@ -676,7 +676,7 @@ fn write_extension_qualified_identifier<const N: usize>(
     write_extension_identifier(output, name)
 }
 
-fn explained_root_rows(statement: &Stmt<'_>, emitted_rows: u64) -> u64 {
+pub(crate) fn explained_root_rows(statement: &Stmt<'_>, emitted_rows: u64) -> u64 {
     match statement {
         // PostgreSQL's ModifyTable node reports zero output rows even when its
         // RETURNING projection sends rows to the client.
@@ -951,7 +951,7 @@ struct EventTriggerExecution<'a, 'response> {
     txn: &'a mut TxnState,
     sqlprep: &'a mut SqlPreparedPool,
     cursors: &'a mut cursor::CursorPool,
-    guc: &'a GucState,
+    guc: &'a mut GucState,
     arena: &'a Arena,
     responder: &'a mut Responder<'response>,
 }
@@ -11189,7 +11189,7 @@ impl Engine {
         }))
     }
 
-    fn execute_explained_statement(
+    pub(crate) fn execute_explained_statement(
         &mut self,
         statement: &Stmt<'_>,
         arena: &Arena,
@@ -11320,7 +11320,7 @@ impl Engine {
     /// immediately. Measuring the final row images through the production WAL
     /// codec reports those real pending bytes without changing publication or
     /// object-store durability semantics.
-    fn explained_row_wal_stats(
+    pub(crate) fn explained_row_wal_stats(
         &self,
         txn: &TxnState,
         touched_mark: usize,
@@ -11985,7 +11985,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &GucState,
+        guc: &mut GucState,
         arena: &Arena,
         responder: &mut Responder,
     ) -> Result<(), SqlError> {
@@ -12105,7 +12105,7 @@ impl Engine {
         txn: &mut TxnState,
         sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
-        guc: &GucState,
+        guc: &mut GucState,
         transaction_context: exec::PlpgsqlTransactionContext,
         arena: &Arena,
         responder: &mut Responder,
@@ -12117,7 +12117,7 @@ impl Engine {
             &mut TxnState,
             &mut SqlPreparedPool,
             &mut cursor::CursorPool,
-            &GucState,
+            &mut GucState,
             &mut Responder,
         ) -> Result<Result<(), SqlError>, WireFull>,
     {

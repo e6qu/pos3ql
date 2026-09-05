@@ -1178,7 +1178,7 @@ impl Conn {
             &mut self.txn,
             &mut self.sqlprep,
             &mut self.cursors,
-            &self.guc,
+            &mut self.guc,
             &self.arena,
             &mut responder,
         ) {

@@ -36,6 +36,7 @@ DROP FUNCTION IF EXISTS plpgsql_dynamic_session_prepare();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_deallocate();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_portal();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_lock();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_analyze_json();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_constraints();
 DROP PUBLICATION IF EXISTS plpgsql_dynamic_catalog_publication;
 DROP MATERIALIZED VIEW IF EXISTS plpgsql_dynamic_catalog_materialized;
@@ -328,7 +329,7 @@ END
 $$;
 CREATE FUNCTION plpgsql_dynamic_session_portal() RETURNS integer
   LANGUAGE plpgsql AS $$
-DECLARE result_value integer; setting text; plan text;
+DECLARE result_value integer; setting text; plan text; analyze_plan text;
   setting_name text; setting_value text; setting_description text;
 BEGIN
   EXECUTE 'SHOW application_name' INTO STRICT setting;
@@ -337,6 +338,16 @@ BEGIN
   IF setting_name IS NULL THEN RAISE EXCEPTION 'SHOW ALL result mismatch'; END IF;
   EXECUTE 'EXPLAIN SELECT value FROM plpgsql_dynamic_session_rows' INTO STRICT plan;
   IF plan IS NULL THEN RAISE EXCEPTION 'EXPLAIN result mismatch'; END IF;
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows' INTO analyze_plan;
+  IF analyze_plan IS NULL OR position('actual time' IN analyze_plan) = 0 THEN
+    RAISE EXCEPTION 'EXPLAIN ANALYZE result mismatch';
+  END IF;
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) INSERT INTO plpgsql_dynamic_session_rows
+    VALUES (4) RETURNING value' INTO analyze_plan;
+  IF analyze_plan IS NULL OR position('actual time' IN analyze_plan) = 0 THEN
+    RAISE EXCEPTION 'EXPLAIN ANALYZE DML result mismatch';
+  END IF;
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows';
   EXECUTE 'DECLARE plpgsql_dynamic_session_cursor SCROLL CURSOR FOR
     SELECT value FROM plpgsql_dynamic_session_rows ORDER BY value';
   EXECUTE 'MOVE FORWARD 1 FROM plpgsql_dynamic_session_cursor';
@@ -349,6 +360,15 @@ CREATE FUNCTION plpgsql_dynamic_session_lock() RETURNS void
   LANGUAGE plpgsql AS $$
 BEGIN
   EXECUTE 'LOCK TABLE plpgsql_dynamic_session_rows IN SHARE MODE';
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_analyze_json() RETURNS void
+  LANGUAGE plpgsql AS $$
+DECLARE plan text;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON) SELECT value FROM plpgsql_dynamic_session_rows'
+    INTO STRICT plan;
+  IF plan IS NULL THEN RAISE EXCEPTION 'EXPLAIN ANALYZE JSON result mismatch'; END IF;
 END
 $$;
 CREATE FUNCTION plpgsql_dynamic_session_constraints() RETURNS void
@@ -407,7 +427,9 @@ EXECUTE plpgsql_dynamic_session_plan(41);
 BEGIN;
 SELECT plpgsql_dynamic_session_portal();
 COMMIT;
+SELECT count(*) FROM plpgsql_dynamic_session_rows;
 SELECT plpgsql_dynamic_session_deallocate();
+SELECT plpgsql_dynamic_analyze_json();
 BEGIN;
 SELECT plpgsql_dynamic_session_lock();
 COMMIT;
@@ -516,6 +538,7 @@ DROP FUNCTION plpgsql_dynamic_session_prepare();
 DROP FUNCTION plpgsql_dynamic_session_deallocate();
 DROP FUNCTION plpgsql_dynamic_session_portal();
 DROP FUNCTION plpgsql_dynamic_session_lock();
+DROP FUNCTION plpgsql_dynamic_analyze_json();
 DROP FUNCTION plpgsql_dynamic_session_constraints();
 DROP PUBLICATION plpgsql_dynamic_catalog_publication;
 DROP MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized;

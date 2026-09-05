@@ -103,9 +103,15 @@ pub(crate) fn dispatch<'a>(
                 }
             }
             "array_position" => {
-                // 1-based index of the first element equal to the target (NULL-safe),
-                // or NULL if absent.
-                arity(2)?;
+                // Finds the first matching PostgreSQL subscript, rather than a
+                // storage offset. The optional start is a subscript too.
+                if !(2..=3).contains(&args.len()) || star {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_FUNCTION,
+                        "function array_position(...) with {} arguments does not exist",
+                        if star { 1 } else { args.len() }
+                    ));
+                }
                 let a = eval_full(args[0], arena, params, row, hooks)?;
                 let target = eval_full(args[1], arena, params, row, hooks)?;
                 let (element, raw) = match a {
@@ -113,7 +119,38 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Err(type_mismatch("array_position requires an array", &a)),
                 };
-                for i in 0..array::len(raw) {
+                let shape = array::shape(raw).expect("array datum invariant");
+                if shape.dimension_count() > 1 {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "searching for elements in multidimensional arrays is not supported"
+                    ));
+                }
+                let lower = shape.lower_bound(0).unwrap_or(1);
+                let start = if args.len() == 3 {
+                    match eval_full(args[2], arena, params, row, hooks)? {
+                        Datum::Int2(value) => i64::from(value),
+                        Datum::Int4(value) => i64::from(value),
+                        Datum::Int8(value) => value,
+                        Datum::Null => {
+                            return Err(sql_err!(
+                                sqlstate::NULL_VALUE_NOT_ALLOWED,
+                                "initial position must not be null"
+                            ));
+                        }
+                        value => {
+                            return Err(type_mismatch(
+                                "array_position initial position must be an integer",
+                                &value,
+                            ));
+                        }
+                    }
+                } else {
+                    i64::from(lower)
+                };
+                let first = usize::try_from(start.saturating_sub(i64::from(lower)).max(0))
+                    .unwrap_or(usize::MAX);
+                for i in first..array::len(raw) {
                     let el = array::get(raw, element, i).unwrap_or(Datum::Null);
                     let hit = if target.is_null() {
                         el.is_null()
@@ -123,7 +160,15 @@ pub(crate) fn dispatch<'a>(
                         compare_datums(&el, &target)?.is_eq()
                     };
                     if hit {
-                        return Ok(Datum::Int4((i + 1) as i32));
+                        let index = i32::try_from(i).map_err(|_| {
+                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value too large")
+                        })?;
+                        return Ok(Datum::Int4(lower.checked_add(index).ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::NUMERIC_OUT_OF_RANGE,
+                                "array subscript out of range"
+                            )
+                        })?));
                     }
                 }
                 Ok(Datum::Null)
@@ -139,6 +184,14 @@ pub(crate) fn dispatch<'a>(
                     Datum::Null => return Ok(Datum::Null),
                     _ => return Err(type_mismatch("array_positions requires an array", &a)),
                 };
+                let shape = array::shape(raw).expect("array datum invariant");
+                if shape.dimension_count() > 1 {
+                    return Err(sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "searching for elements in multidimensional arrays is not supported"
+                    ));
+                }
+                let lower = shape.lower_bound(0).unwrap_or(1);
                 let matches = |el: &Datum| -> Result<bool, SqlError> {
                     Ok(if target.is_null() {
                         el.is_null()
@@ -161,7 +214,15 @@ pub(crate) fn dispatch<'a>(
                 let mut at = 0usize;
                 for i in 0..len {
                     if matches(&array::get(raw, element, i).unwrap_or(Datum::Null))? {
-                        positions[at] = Datum::Int4((i + 1) as i32);
+                        let index = i32::try_from(i).map_err(|_| {
+                            sql_err!(sqlstate::PROGRAM_LIMIT_EXCEEDED, "array value too large")
+                        })?;
+                        positions[at] = Datum::Int4(lower.checked_add(index).ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::NUMERIC_OUT_OF_RANGE,
+                                "array subscript out of range"
+                            )
+                        })?);
                         at += 1;
                     }
                 }
@@ -327,7 +388,11 @@ pub(crate) fn dispatch<'a>(
                     raw: if is_replace {
                         array::build_shaped(&items[..n], shape, arena)?
                     } else {
-                        array::build(&items[..n], arena)?
+                        array::build_shaped(
+                            &items[..n],
+                            array::Shape::new(&[n], &[shape.lower_bound(0).unwrap_or(1)])?,
+                            arena,
+                        )?
                     },
                 })
             }

@@ -4869,6 +4869,110 @@ mod tests {
     }
 
     #[test]
+    fn extended_binary_array_bind_and_result_preserve_declared_subscripts() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "pos3ql-binary-array-subscripts-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.max_tables = 8;
+        config.table_rows = 256;
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).expect("engine");
+        let mut connection = Conn::new(&config, &mut budget).expect("connection");
+        connection.phase = Phase::Ready;
+
+        let mut parse = Vec::new();
+        parse.extend_from_slice(b"array_subscripts\0SELECT array_remove($1::int[], 10)\0");
+        parse.extend_from_slice(&1i16.to_be_bytes());
+        parse.extend_from_slice(&crate::sql::types::ArrElem::Int4.array_oid().to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_PARSE, &parse));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut binary = Vec::new();
+        binary.extend_from_slice(&1i32.to_be_bytes());
+        binary.extend_from_slice(&0i32.to_be_bytes());
+        binary.extend_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
+        binary.extend_from_slice(&3i32.to_be_bytes());
+        binary.extend_from_slice(&4i32.to_be_bytes());
+        for value in [10i32, 20, 10] {
+            binary.extend_from_slice(&4i32.to_be_bytes());
+            binary.extend_from_slice(&value.to_be_bytes());
+        }
+        let mut bind = Vec::new();
+        bind.extend_from_slice(b"array_subscripts_portal\0array_subscripts\0");
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&(binary.len() as i32).to_be_bytes());
+        bind.extend_from_slice(&binary);
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_BIND, &bind));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut execute = Vec::new();
+        execute.extend_from_slice(b"array_subscripts_portal\0");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_EXECUTE, &execute));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+
+        let mut expected = vec![wire::MSG_DATA_ROW, 0, 0, 0, 38, 0, 1, 0, 0, 0, 28];
+        expected.extend_from_slice(&1i32.to_be_bytes());
+        expected.extend_from_slice(&0i32.to_be_bytes());
+        expected.extend_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
+        expected.extend_from_slice(&1i32.to_be_bytes());
+        expected.extend_from_slice(&4i32.to_be_bytes());
+        expected.extend_from_slice(&4i32.to_be_bytes());
+        expected.extend_from_slice(&20i32.to_be_bytes());
+        assert!(
+            connection
+                .send
+                .readable()
+                .windows(expected.len())
+                .any(|frame| frame == expected),
+            "{:?}",
+            connection.send.readable()
+        );
+
+        connection.recv.append(&frontend(wire::FMSG_SYNC, b""));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(connection.send.readable().ends_with(&[
+            wire::MSG_READY_FOR_QUERY,
+            0,
+            0,
+            0,
+            5,
+            b'I'
+        ]));
+
+        drop(connection);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn extended_portal_returns_dynamic_explain_analyze_result() {
         use core::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);

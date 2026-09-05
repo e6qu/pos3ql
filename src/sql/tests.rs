@@ -16950,6 +16950,14 @@ fn array_type() {
         run("SELECT array_fill(7, ARRAY[2,3], ARRAY[4,8])")
             .contains("[4:5][8:10]={{7,7,7},{7,7,7}}")
     );
+    // Search APIs operate in declared array subscripts, never packed storage
+    // offsets. Their result values and removal preserve lower bounds.
+    assert!(run("SELECT array_position('[4:6]={10,20,10}'::int[], 10)").contains('4'));
+    assert!(run("SELECT array_position('[4:6]={10,20,10}'::int[], 10, 5)").contains('6'));
+    assert!(run("SELECT array_position('[4:6]={10,20,10}'::int[], 10, 7) IS NULL").contains('t'));
+    assert!(run("SELECT array_positions('[4:6]={10,20,10}'::int[], 10)").contains("{4,6}"));
+    assert!(run("SELECT array_remove('[4:6]={10,20,10}'::int[], 10)").contains("[4:4]={20}"));
+    assert!(run("SELECT array_position('{{1,2},{3,1}}'::int[], 1)").contains("0A000"));
     // `array_agg(anyarray)` adds a leading dimension; NULL, empty, and
     // mismatched members are distinct PostgreSQL errors.
     assert!(
@@ -16976,6 +16984,36 @@ fn array_type() {
     assert!(run("SELECT array_agg(a) FROM (VALUES (NULL::int[])) AS v(a)").contains("22004"));
     assert!(run("SELECT ARRAY(SELECT a FROM (VALUES (ARRAY[]::int[])) AS v(a))").contains("2202E"));
     assert!(run("SELECT ARRAY(SELECT a FROM (VALUES (NULL::int[])) AS v(a))").contains("22004"));
+}
+
+#[test]
+fn array_subscripts_survive_dml_wal_checkpoint_and_cold_recovery() {
+    let config = test_config("array-subscripts-restart");
+    {
+        let mut budget = Budget::new(1 << 26);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_array_subscripts (values integer[]); \
+             INSERT INTO durable_array_subscripts VALUES ('[4:6]={10,20,10}'); \
+             UPDATE durable_array_subscripts SET values = array_remove(values, 10)",
+        );
+        run_with(&mut engine, &mut budget, "CHECKPOINT");
+        engine.commit_wal().unwrap();
+    }
+    let mut budget = Budget::new(1 << 26);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT values::text, array_position(values, 20), \
+                    array_positions(values, 20)::text, array_lower(values, 1) \
+               FROM durable_array_subscripts",
+        )),
+        ["[4:4]={20}|4|{4}|4"]
+    );
 }
 
 #[test]

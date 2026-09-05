@@ -38,6 +38,7 @@ DROP FUNCTION IF EXISTS plpgsql_dynamic_session_portal();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_lock();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_analyze_json();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_analyze_compound();
+DROP FUNCTION IF EXISTS plpgsql_array_subscripts();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_constraints();
 DROP PUBLICATION IF EXISTS plpgsql_dynamic_catalog_publication;
 DROP MATERIALIZED VIEW IF EXISTS plpgsql_dynamic_catalog_materialized;
@@ -168,6 +169,20 @@ BEGIN
     RETURN item.value + item.next_value;
   END LOOP;
   RETURN 0;
+END
+$$;
+CREATE FUNCTION plpgsql_array_subscripts() RETURNS text
+  LANGUAGE plpgsql AS $$
+DECLARE
+  values integer[] := '[4:6]={10,20,10}'::integer[];
+  positions integer[];
+  found integer;
+BEGIN
+  EXECUTE 'SELECT array_positions($1::integer[], 10)'
+    INTO STRICT positions USING values;
+  EXECUTE 'SELECT array_position($1::integer[], 10, 5)'
+    INTO STRICT found USING values;
+  RETURN array_to_string(positions, ',') || ':' || found || ':' || array_remove(values, 10)::text;
 END
 $$;
 CREATE SEQUENCE plpgsql_dynamic_command_sequence;
@@ -420,6 +435,7 @@ SELECT (plpgsql_function_pair(7)).next_value, (plpgsql_function_pair(7)).label;
 SELECT * FROM plpgsql_function_series(3);
 SELECT * FROM plpgsql_function_table_series(2);
 SELECT plpgsql_dynamic_scalar(14), plpgsql_dynamic_loop(14), plpgsql_dynamic_record_loop(14);
+SELECT plpgsql_array_subscripts();
 SELECT * FROM plpgsql_dynamic_series(14);
 SELECT plpgsql_dynamic_command_once(), plpgsql_dynamic_command_once();
 INSERT INTO plpgsql_dynamic_rows VALUES (14);
@@ -534,6 +550,7 @@ DROP TRIGGER plpgsql_dynamic_rows_before_insert ON plpgsql_dynamic_rows;
 DROP FUNCTION plpgsql_dynamic_trigger();
 DROP FUNCTION plpgsql_dynamic_loop(integer);
 DROP FUNCTION plpgsql_dynamic_record_loop(integer);
+DROP FUNCTION plpgsql_array_subscripts();
 DROP FUNCTION plpgsql_dynamic_series(integer);
 DROP FUNCTION plpgsql_dynamic_scalar(integer);
 DROP FUNCTION plpgsql_dynamic_command_once();

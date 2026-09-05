@@ -122,6 +122,71 @@ fn seal_capture(
     Ok(())
 }
 
+fn decode_text_row<'a>(row: &'a [u8], fields: &mut [Option<&'a str>]) -> Result<usize, SqlError> {
+    if row.len() < 7 || row[0] != b'D' {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cursor row is not a complete DataRow message"
+        ));
+    }
+    let declared = u32::from_be_bytes(row[1..5].try_into().unwrap()) as usize;
+    if declared + 1 != row.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cursor row has an invalid DataRow length"
+        ));
+    }
+    let count = u16::from_be_bytes(row[5..7].try_into().unwrap()) as usize;
+    if count > fields.len() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "cursor row has more than {} columns",
+            fields.len()
+        ));
+    }
+    let mut at = 7usize;
+    for field in fields.iter_mut().take(count) {
+        if at + 4 > row.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor row has a truncated field length"
+            ));
+        }
+        let length = i32::from_be_bytes(row[at..at + 4].try_into().unwrap());
+        at += 4;
+        if length == -1 {
+            *field = None;
+            continue;
+        }
+        let length = usize::try_from(length).map_err(|_| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor row has an invalid field length"
+            )
+        })?;
+        let Some(value) = row.get(at..at + length) else {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor row has a truncated field"
+            ));
+        };
+        *field = Some(core::str::from_utf8(value).map_err(|_| {
+            sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "cursor text row contains invalid UTF-8"
+            )
+        })?);
+        at += length;
+    }
+    if at != row.len() {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "cursor row has trailing bytes"
+        ));
+    }
+    Ok(count)
+}
+
 impl CursorPool {
     pub fn budget_bytes(config: &Config) -> usize {
         config.max_cursors
@@ -371,6 +436,32 @@ impl CursorPool {
     /// The row indexes selected by the last [`Self::fetch`].
     pub fn emitted(&self) -> &[u32] {
         &self.emit
+    }
+
+    /// Decodes one emitted text row at the cursor boundary. Values remain text
+    /// until the procedural target's typed assignment casts them.
+    pub fn emitted_text_row<'a>(
+        &'a self,
+        name: &str,
+        row: u32,
+        fields: &mut [Option<&'a str>],
+    ) -> Result<usize, SqlError> {
+        let Some(at) = self.find(name) else {
+            return Err(sql_err!(
+                sqlstate::UNDEFINED_CURSOR,
+                "cursor \"{}\" does not exist",
+                name
+            ));
+        };
+        let slot = &self.slots[at];
+        let (offset, length) = *slot
+            .spans_text
+            .get(row as usize)
+            .ok_or_else(|| sql_err!(sqlstate::INTERNAL_ERROR, "cursor row index is invalid"))?;
+        decode_text_row(
+            &slot.rows_text.readable()[offset as usize..(offset + length) as usize],
+            fields,
+        )
     }
 
     /// The stored representations used to assemble FETCH output.

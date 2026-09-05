@@ -224,6 +224,15 @@ pub struct Engine {
     discard_protocol_state: bool,
 }
 
+pub(crate) struct CursorStatementContext<'a, 'response> {
+    pub arena: &'a Arena,
+    pub params: &'a [Datum<'a>],
+    pub txn: &'a mut TxnState,
+    pub cursors: &'a mut cursor::CursorPool,
+    pub guc: &'a GucState,
+    pub responder: &'a mut Responder<'response>,
+}
+
 #[derive(Clone, Copy)]
 struct ActiveSystemSetting {
     name: crate::storage::SqlName,
@@ -12565,47 +12574,7 @@ impl Engine {
         };
         let outcome = match statement {
             Stmt::Explain { options, statement } => {
-                let plan = match statement {
-                    Stmt::Select(select) => {
-                        let planned_select = if select.with.is_empty() {
-                            select
-                        } else {
-                            match query::expand_ctes(select, &self.storage, txn.txid, arena) {
-                                Ok(expanded) => expanded,
-                                Err(error) => return Ok(Err(error)),
-                            }
-                        };
-                        explain::plan_select(&self.storage, txn.txid, planned_select, arena)
-                    }
-                    Stmt::SetQuery(set_query) => {
-                        let body = match query::expand_set_tree(
-                            set_query.with,
-                            set_query.body,
-                            &self.storage,
-                            txn.txid,
-                            arena,
-                        ) {
-                            Ok(body) => body,
-                            Err(error) => return Ok(Err(error)),
-                        };
-                        let planned = ast::SetQuery {
-                            with: &[],
-                            body,
-                            ..*set_query
-                        };
-                        explain::plan_set_query(&self.storage, txn.txid, &planned, arena)
-                    }
-                    Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
-                        explain::plan_modification(&self.storage, txn.txid, statement, arena)
-                    }
-                    Stmt::With { statement, .. } => {
-                        explain::plan_modification(&self.storage, txn.txid, statement, arena)
-                    }
-                    _ => Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "EXPLAIN does not support this statement type"
-                    )),
-                };
+                let plan = explain::plan_statement(&self.storage, txn.txid, statement, arena);
                 let plan = match plan {
                     Ok(plan) => plan,
                     Err(error) => return Ok(Err(error)),
@@ -14318,187 +14287,18 @@ impl Engine {
                 guc.seq_session(),
                 responder,
             ),
-            Stmt::DeclareCursor {
-                name,
-                binary,
-                scroll,
-                hold,
-                sql,
-            } => {
-                if !txn.is_explicit() {
-                    return Ok(Err(sql_err!(
-                        crate::sql::eval::sqlstate::NO_ACTIVE_SQL_TRANSACTION,
-                        "DECLARE CURSOR can only be used in transaction blocks"
-                    )));
-                }
-                let at = match cursors.open(name, *scroll, *hold, *binary) {
-                    Ok(at) => at,
-                    Err(e) => return Ok(Err(e)),
-                };
-                // Materialize the whole result now — PostgreSQL's insensitive
-                // cursor snapshot — by running the SELECT with a responder
-                // aimed at the cursor's own buffer.
-                let out = {
-                    let mut inner = match Parser::new(sql, arena) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            cursors.abandon(at);
-                            return Ok(Err(SqlError {
-                                sqlstate: SqlState::known(e.sqlstate),
-                                message: stack_format!(192, "{}", e.message.as_str()),
-                            }));
-                        }
-                    };
-                    let parsed = match inner.next_stmt() {
-                        Ok(Some(p)) => p,
-                        _ => {
-                            cursors.abandon(at);
-                            return Ok(Err(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "DECLARE CURSOR requires a SELECT"
-                            )));
-                        }
-                    };
-                    let (text, binary) = cursors.result_buffers(at);
-                    let mut capture = Responder::for_cursor(text, binary);
-                    capture.set_render(guc.render());
-                    let sequence_state = sequence::SequenceReplayState::new();
-                    let sequence = sequence::ReplaySeqEval::new(
-                        sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
-                        &sequence_state,
-                    );
-                    match &parsed {
-                        Stmt::Select(sel) => {
-                            let sel = match query::expand_ctes_exec(
-                                sel,
-                                &self.storage,
-                                txn.txid,
-                                &self.work,
-                                params,
-                                &[],
-                                Some(&sequence),
-                            ) {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    cursors.abandon(at);
-                                    return Ok(Err(e));
-                                }
-                            };
-                            if let Err(e) = query::validate_locking(sel) {
-                                cursors.abandon(at);
-                                return Ok(Err(e));
-                            }
-                            if sel.from.is_none() {
-                                query::constant_select(
-                                    &self.storage,
-                                    txn.txid,
-                                    sel,
-                                    &self.work,
-                                    params,
-                                    Some(&sequence),
-                                    &mut capture,
-                                )
-                            } else {
-                                query::select_query(
-                                    &self.storage,
-                                    txn.txid,
-                                    sel,
-                                    &self.work,
-                                    params,
-                                    Some(&sequence),
-                                    &mut capture,
-                                )
-                            }
-                        }
-                        Stmt::SetQuery(q) => query::set_query(
-                            &self.storage,
-                            txn.txid,
-                            q,
-                            &self.work,
-                            params,
-                            Some(&sequence),
-                            &mut capture,
-                        ),
-                        _ => {
-                            cursors.abandon(at);
-                            return Ok(Err(sql_err!(
-                                sqlstate::SYNTAX_ERROR,
-                                "DECLARE CURSOR requires a SELECT"
-                            )));
-                        }
-                    }
-                };
-                match out {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        cursors.abandon(at);
-                        return Ok(Err(e));
-                    }
-                    Err(WireFull) => {
-                        cursors.abandon(at);
-                        return Ok(Err(sql_err!(
-                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                            "cursor result exceeds cursor_bytes; raise it or narrow the query"
-                        )));
-                    }
-                }
-                if let Err(e) = cursors.seal(at) {
-                    cursors.abandon(at);
-                    return Ok(Err(e));
-                }
-                responder.command_complete("DECLARE CURSOR")?;
-                Ok(Ok(()))
-            }
-            Stmt::FetchCursor {
-                name,
-                motion,
-                move_only,
-            } => {
-                let count = match cursors.fetch(name, *motion) {
-                    Ok(c) => c,
-                    Err(e) => return Ok(Err(e)),
-                };
-                if !*move_only {
-                    let requested = responder.result_formats();
-                    let wire = cursors.wire_parts(name).expect("fetch found it");
-                    let formats = if requested.count() == 0 && wire.declared_binary {
-                        crate::pg::respond::ResultFmt::ALL_BINARY
-                    } else {
-                        requested
-                    };
-                    responder.cursor_row_description(wire.description, formats)?;
-                    for &row in cursors.emitted() {
-                        let (text_offset, text_len) = wire.text_spans[row as usize];
-                        let (binary_offset, binary_len) = wire.binary_spans[row as usize];
-                        responder.cursor_data_row(
-                            &wire.text[text_offset as usize..(text_offset + text_len) as usize],
-                            &wire.binary
-                                [binary_offset as usize..(binary_offset + binary_len) as usize],
-                            formats,
-                        )?;
-                    }
-                    responder.command_complete(stack_format!(32, "FETCH {}", count).as_str())?;
-                } else {
-                    responder.command_complete(stack_format!(32, "MOVE {}", count).as_str())?;
-                }
-                Ok(Ok(()))
-            }
-            Stmt::CloseCursor(name) => {
-                match name {
-                    Some(n) => {
-                        if !cursors.close(n) {
-                            return Ok(Err(sql_err!(
-                                crate::sql::eval::sqlstate::UNDEFINED_CURSOR,
-                                "cursor \"{}\" does not exist",
-                                n
-                            )));
-                        }
-                    }
-                    None => cursors.close_all(),
-                }
-                responder.command_complete("CLOSE CURSOR")?;
-                Ok(Ok(()))
-            }
+            Stmt::DeclareCursor { .. } | Stmt::FetchCursor { .. } | Stmt::CloseCursor(_) => self
+                .execute_cursor_statement(
+                    statement,
+                    &mut CursorStatementContext {
+                        arena,
+                        params,
+                        txn,
+                        cursors,
+                        guc,
+                        responder,
+                    },
+                ),
             Stmt::Begin(characteristics) => {
                 if txn.is_explicit() {
                     // PostgreSQL warns and continues.
@@ -16234,25 +16034,211 @@ impl Engine {
         Ok(Ok(()))
     }
 
-    fn show(
+    pub(crate) fn execute_cursor_statement(
+        &mut self,
+        statement: &Stmt,
+        context: &mut CursorStatementContext<'_, '_>,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let CursorStatementContext {
+            arena,
+            params,
+            txn,
+            cursors,
+            guc,
+            responder,
+        } = context;
+        match statement {
+            Stmt::DeclareCursor {
+                name,
+                binary,
+                scroll,
+                hold,
+                sql,
+            } => {
+                if !txn.is_explicit() {
+                    return Ok(Err(sql_err!(
+                        crate::sql::eval::sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                        "DECLARE CURSOR can only be used in transaction blocks"
+                    )));
+                }
+                let at = match cursors.open(name, *scroll, *hold, *binary) {
+                    Ok(at) => at,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let out = {
+                    let mut parser = match Parser::new(sql, arena) {
+                        Ok(parser) => parser,
+                        Err(error) => {
+                            cursors.abandon(at);
+                            return Ok(Err(SqlError {
+                                sqlstate: SqlState::known(error.sqlstate),
+                                message: stack_format!(192, "{}", error.message.as_str()),
+                            }));
+                        }
+                    };
+                    let parsed = match parser.next_stmt() {
+                        Ok(Some(statement)) => statement,
+                        _ => {
+                            cursors.abandon(at);
+                            return Ok(Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "DECLARE CURSOR requires a SELECT"
+                            )));
+                        }
+                    };
+                    let (text, binary) = cursors.result_buffers(at);
+                    let mut capture = Responder::for_cursor(text, binary);
+                    capture.set_render(guc.render());
+                    let sequence_state = sequence::SequenceReplayState::new();
+                    let sequence = sequence::ReplaySeqEval::new(
+                        sequence::SeqEval::new(&self.storage, guc.seq_session(), txn.txid),
+                        &sequence_state,
+                    );
+                    match &parsed {
+                        Stmt::Select(select) => {
+                            let select = match query::expand_ctes_exec(
+                                select,
+                                &self.storage,
+                                txn.txid,
+                                &self.work,
+                                params,
+                                &[],
+                                Some(&sequence),
+                            ) {
+                                Ok(select) => select,
+                                Err(error) => {
+                                    cursors.abandon(at);
+                                    return Ok(Err(error));
+                                }
+                            };
+                            if let Err(error) = query::validate_locking(select) {
+                                cursors.abandon(at);
+                                return Ok(Err(error));
+                            }
+                            if select.from.is_none() {
+                                query::constant_select(
+                                    &self.storage,
+                                    txn.txid,
+                                    select,
+                                    &self.work,
+                                    params,
+                                    Some(&sequence),
+                                    &mut capture,
+                                )
+                            } else {
+                                query::select_query(
+                                    &self.storage,
+                                    txn.txid,
+                                    select,
+                                    &self.work,
+                                    params,
+                                    Some(&sequence),
+                                    &mut capture,
+                                )
+                            }
+                        }
+                        Stmt::SetQuery(query) => query::set_query(
+                            &self.storage,
+                            txn.txid,
+                            query,
+                            &self.work,
+                            params,
+                            Some(&sequence),
+                            &mut capture,
+                        ),
+                        _ => {
+                            cursors.abandon(at);
+                            return Ok(Err(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "DECLARE CURSOR requires a SELECT"
+                            )));
+                        }
+                    }
+                };
+                match out {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        cursors.abandon(at);
+                        return Ok(Err(error));
+                    }
+                    Err(WireFull) => {
+                        cursors.abandon(at);
+                        return Ok(Err(sql_err!(
+                            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                            "cursor result exceeds cursor_bytes; raise it or narrow the query"
+                        )));
+                    }
+                }
+                if let Err(error) = cursors.seal(at) {
+                    cursors.abandon(at);
+                    return Ok(Err(error));
+                }
+                responder.command_complete("DECLARE CURSOR")?;
+                Ok(Ok(()))
+            }
+            Stmt::FetchCursor {
+                name,
+                motion,
+                move_only,
+            } => {
+                let count = match cursors.fetch(name, *motion) {
+                    Ok(count) => count,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if !*move_only {
+                    let requested = responder.result_formats();
+                    let wire = cursors.wire_parts(name).expect("fetch found it");
+                    let formats = if requested.count() == 0 && wire.declared_binary {
+                        crate::pg::respond::ResultFmt::ALL_BINARY
+                    } else {
+                        requested
+                    };
+                    responder.cursor_row_description(wire.description, formats)?;
+                    for &row in cursors.emitted() {
+                        let (text_offset, text_len) = wire.text_spans[row as usize];
+                        let (binary_offset, binary_len) = wire.binary_spans[row as usize];
+                        responder.cursor_data_row(
+                            &wire.text[text_offset as usize..(text_offset + text_len) as usize],
+                            &wire.binary
+                                [binary_offset as usize..(binary_offset + binary_len) as usize],
+                            formats,
+                        )?;
+                    }
+                    responder.command_complete(stack_format!(32, "FETCH {}", count).as_str())?;
+                } else {
+                    responder.command_complete(stack_format!(32, "MOVE {}", count).as_str())?;
+                }
+                Ok(Ok(()))
+            }
+            Stmt::CloseCursor(name) => {
+                match name {
+                    Some(name) if !cursors.close(name) => {
+                        return Ok(Err(sql_err!(
+                            crate::sql::eval::sqlstate::UNDEFINED_CURSOR,
+                            "cursor \"{}\" does not exist",
+                            name
+                        )));
+                    }
+                    Some(_) => {}
+                    None => cursors.close_all(),
+                }
+                responder.command_complete("CLOSE CURSOR")?;
+                Ok(Ok(()))
+            }
+            _ => unreachable!("cursor executor requires a cursor statement"),
+        }
+    }
+
+    pub(crate) fn show(
         &mut self,
         name: &str,
         guc: &GucState,
         txn: &TxnState,
         responder: &mut Responder,
     ) -> Result<Result<(), SqlError>, WireFull> {
-        // Session GUCs come from the per-session store; the rest are fixed
-        // server parameters.
-        let value = if let Some(value) = self
-            .fixed_setting_for(name, txn)
-            .or_else(|| guc.get_owned(name))
-        {
-            value
-        } else {
-            return Ok(Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
-                message: stack_format!(192, "unrecognized configuration parameter \"{}\"", name),
-            }));
+        let value = match self.show_setting_value(name, guc, txn) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
         };
         // The column titles as PostgreSQL canonicalizes them: most parameters
         // are lowercase, but a few keep their registered mixed case.
@@ -16273,7 +16259,7 @@ impl Engine {
 
     /// SHOW ALL: every readable setting as (name, setting, description). Tools
     /// read name/setting; descriptions are left empty.
-    fn show_all(
+    pub(crate) fn show_all(
         &mut self,
         guc: &GucState,
         txn: &TxnState,
@@ -16284,20 +16270,28 @@ impl Engine {
             ColDesc::new("setting", types::oid::TEXT, -1),
             ColDesc::new("description", types::oid::TEXT, -1),
         ])?;
+        self.visit_show_all_rows(guc, txn, |name, value| {
+            responder.data_row(&[Datum::Text(name), Datum::Text(value), Datum::Text("")])
+        })?;
+        responder.command_complete("SHOW")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn visit_show_all_rows<E>(
+        &self,
+        guc: &GucState,
+        txn: &TxnState,
+        mut emit: impl FnMut(&str, &str) -> Result<(), E>,
+    ) -> Result<(), E> {
         for &name in SETTING_NAMES {
             if let Some(value) = self
                 .fixed_setting_for(name, txn)
                 .or_else(|| guc.get_owned(name))
             {
-                responder.data_row(&[
-                    Datum::Text(name),
-                    Datum::Text(value.as_str()),
-                    Datum::Text(""),
-                ])?;
+                emit(name, value.as_str())?;
             }
         }
-        responder.command_complete("SHOW")?;
-        Ok(Ok(()))
+        Ok(())
     }
 
     fn fixed_setting_for(&self, name: &str, txn: &TxnState) -> Option<crate::util::StackStr<256>> {
@@ -16337,6 +16331,20 @@ impl Engine {
             return Some(stack_format!(256, "{}", self.max_prepared_transactions));
         }
         fixed_setting(name).map(crate::util::StackStr::from_str)
+    }
+
+    pub(crate) fn show_setting_value(
+        &self,
+        name: &str,
+        guc: &GucState,
+        txn: &TxnState,
+    ) -> Result<crate::util::StackStr<256>, SqlError> {
+        self.fixed_setting_for(name, txn)
+            .or_else(|| guc.get_owned(name))
+            .ok_or_else(|| SqlError {
+                sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
+                message: stack_format!(192, "unrecognized configuration parameter \"{}\"", name),
+            })
     }
 }
 

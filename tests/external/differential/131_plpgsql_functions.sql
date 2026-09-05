@@ -34,6 +34,7 @@ DROP FUNCTION IF EXISTS plpgsql_dynamic_session_commands();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_reset();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_prepare();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_deallocate();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_session_portal();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_lock();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_constraints();
 DROP PUBLICATION IF EXISTS plpgsql_dynamic_catalog_publication;
@@ -305,17 +306,43 @@ END
 $$;
 CREATE FUNCTION plpgsql_dynamic_session_reset() RETURNS void
   LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'RESET application_name'; END $$;
-CREATE FUNCTION plpgsql_dynamic_session_prepare() RETURNS void
+CREATE FUNCTION plpgsql_dynamic_session_prepare() RETURNS integer
   LANGUAGE plpgsql AS $$
+DECLARE result_value integer;
 BEGIN
   EXECUTE 'PREPARE plpgsql_dynamic_session_plan(integer) AS SELECT $1 + 1';
+  EXECUTE 'EXECUTE plpgsql_dynamic_session_plan(41)' INTO STRICT result_value;
+  EXECUTE 'PREPARE plpgsql_dynamic_session_dml(integer) AS
+    INSERT INTO plpgsql_dynamic_session_rows VALUES ($1) RETURNING value';
+  EXECUTE 'EXECUTE plpgsql_dynamic_session_dml(3)' INTO STRICT result_value;
+  EXECUTE 'DEALLOCATE plpgsql_dynamic_session_dml';
   EXECUTE 'DISCARD PLANS';
+  RETURN result_value;
 END
 $$;
 CREATE FUNCTION plpgsql_dynamic_session_deallocate() RETURNS void
   LANGUAGE plpgsql AS $$
 BEGIN
   EXECUTE 'DEALLOCATE plpgsql_dynamic_session_plan';
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_session_portal() RETURNS integer
+  LANGUAGE plpgsql AS $$
+DECLARE result_value integer; setting text; plan text;
+  setting_name text; setting_value text; setting_description text;
+BEGIN
+  EXECUTE 'SHOW application_name' INTO STRICT setting;
+  IF setting <> 'dynamic-session' THEN RAISE EXCEPTION 'SHOW result mismatch'; END IF;
+  EXECUTE 'SHOW ALL' INTO setting_name, setting_value, setting_description;
+  IF setting_name IS NULL THEN RAISE EXCEPTION 'SHOW ALL result mismatch'; END IF;
+  EXECUTE 'EXPLAIN SELECT value FROM plpgsql_dynamic_session_rows' INTO STRICT plan;
+  IF plan IS NULL THEN RAISE EXCEPTION 'EXPLAIN result mismatch'; END IF;
+  EXECUTE 'DECLARE plpgsql_dynamic_session_cursor SCROLL CURSOR FOR
+    SELECT value FROM plpgsql_dynamic_session_rows ORDER BY value';
+  EXECUTE 'MOVE FORWARD 1 FROM plpgsql_dynamic_session_cursor';
+  EXECUTE 'FETCH NEXT FROM plpgsql_dynamic_session_cursor' INTO STRICT result_value;
+  EXECUTE 'CLOSE plpgsql_dynamic_session_cursor';
+  RETURN result_value;
 END
 $$;
 CREATE FUNCTION plpgsql_dynamic_session_lock() RETURNS void
@@ -377,6 +404,9 @@ SELECT reltuples::integer FROM pg_class WHERE relname = 'plpgsql_dynamic_session
 SELECT plpgsql_dynamic_session_reset();
 SELECT plpgsql_dynamic_session_prepare();
 EXECUTE plpgsql_dynamic_session_plan(41);
+BEGIN;
+SELECT plpgsql_dynamic_session_portal();
+COMMIT;
 SELECT plpgsql_dynamic_session_deallocate();
 BEGIN;
 SELECT plpgsql_dynamic_session_lock();
@@ -484,6 +514,7 @@ DROP FUNCTION plpgsql_dynamic_session_commands();
 DROP FUNCTION plpgsql_dynamic_session_reset();
 DROP FUNCTION plpgsql_dynamic_session_prepare();
 DROP FUNCTION plpgsql_dynamic_session_deallocate();
+DROP FUNCTION plpgsql_dynamic_session_portal();
 DROP FUNCTION plpgsql_dynamic_session_lock();
 DROP FUNCTION plpgsql_dynamic_session_constraints();
 DROP PUBLICATION plpgsql_dynamic_catalog_publication;

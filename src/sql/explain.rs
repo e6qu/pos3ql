@@ -1286,16 +1286,28 @@ fn emit_text(
     responder: &mut Responder,
 ) -> Result<(), WireFull> {
     responder.row_description(&[ColDesc::new("QUERY PLAN", oid::TEXT, -1)])?;
+    visit_text_rows(plan, options, actual, |line| {
+        responder.data_row(&[Datum::Text(line)])
+    })?;
+    responder.command_complete("EXPLAIN")
+}
+
+pub(super) fn visit_text_rows<E>(
+    plan: &Plan,
+    options: ExplainOptions,
+    actual: Option<ExplainActual>,
+    mut emit: impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
     for (index, node) in plan.nodes[..plan.count].iter().enumerate() {
         let line = text_line(node, options, actual, index == 0);
-        responder.data_row(&[Datum::Text(line.as_str())])?;
+        emit(line.as_str())?;
         if options.verbose && !node.output.as_str().is_empty() {
             let mut output = StackStr::<512>::new();
             for _ in 0..=node.depth {
                 let _ = write!(output, "  ");
             }
             let _ = write!(output, "Output: {}", node.output.as_str());
-            responder.data_row(&[Datum::Text(output.as_str())])?;
+            emit(output.as_str())?;
         }
         if index == 0 && options.buffers {
             let actual = actual.expect("BUFFERS requires ANALYZE");
@@ -1306,7 +1318,7 @@ fn emit_text(
                 "  Buffers: shared hit={} read={}",
                 hits, actual.io.object_gets
             );
-            responder.data_row(&[Datum::Text(buffers.as_str())])?;
+            emit(buffers.as_str())?;
         }
         if index == 0
             && options.wal
@@ -1319,11 +1331,11 @@ fn emit_text(
                 "  WAL: records={} fpi=0 bytes={}",
                 actual.wal_records, actual.wal_bytes
             );
-            responder.data_row(&[Datum::Text(wal.as_str())])?;
+            emit(wal.as_str())?;
         }
     }
     if options.memory {
-        responder.data_row(&[Datum::Text("Planning:")])?;
+        emit("Planning:")?;
         let used = core::mem::size_of::<Plan>()
             .saturating_sub(
                 (MAX_PLAN_NODES - plan.count).saturating_mul(core::mem::size_of::<PlanNode>()),
@@ -1336,7 +1348,7 @@ fn emit_text(
             "  Memory: used={}kB  allocated={}kB",
             used, allocated
         );
-        responder.data_row(&[Datum::Text(memory.as_str())])?;
+        emit(memory.as_str())?;
     }
     if options.summary {
         let mut planning = StackStr::<512>::new();
@@ -1345,7 +1357,7 @@ fn emit_text(
             "Planning Time: {:.3} ms",
             plan.planning_micros as f64 / 1_000.0
         );
-        responder.data_row(&[Datum::Text(planning.as_str())])?;
+        emit(planning.as_str())?;
         if let Some(actual) = actual {
             if options.serialize != ExplainSerialize::None {
                 let mut serialization = StackStr::<512>::new();
@@ -1361,7 +1373,7 @@ fn emit_text(
                     actual.serialized_bytes.div_ceil(1024),
                     format
                 );
-                responder.data_row(&[Datum::Text(serialization.as_str())])?;
+                emit(serialization.as_str())?;
             }
             let mut execution = StackStr::<512>::new();
             let _ = write!(
@@ -1369,10 +1381,46 @@ fn emit_text(
                 "Execution Time: {:.3} ms",
                 actual.elapsed_micros as f64 / 1_000.0
             );
-            responder.data_row(&[Datum::Text(execution.as_str())])?;
+            emit(execution.as_str())?;
         }
     }
-    responder.command_complete("EXPLAIN")
+    Ok(())
+}
+
+pub(super) fn plan_statement<'a>(
+    storage: &'a Storage,
+    txid: u32,
+    statement: &'a Stmt<'a>,
+    arena: &'a Arena,
+) -> Result<Plan, SqlError> {
+    match statement {
+        Stmt::Select(select) => {
+            let select = if select.with.is_empty() {
+                select
+            } else {
+                query::expand_ctes(select, storage, txid, arena)?
+            };
+            plan_select(storage, txid, select, arena)
+        }
+        Stmt::SetQuery(set_query) => {
+            let body =
+                query::expand_set_tree(set_query.with, set_query.body, storage, txid, arena)?;
+            let planned = SetQuery {
+                with: &[],
+                body,
+                ..*set_query
+            };
+            plan_set_query(storage, txid, &planned, arena)
+        }
+        Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_) | Stmt::Merge(_) => {
+            plan_modification(storage, txid, statement, arena)
+        }
+        Stmt::With { statement, .. } => plan_modification(storage, txid, statement, arena),
+        _ => Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "EXPLAIN does not support this statement type"
+        )),
+    }
 }
 
 fn json_string(out: &mut StackStr<16_384>, value: &str) {
@@ -1746,6 +1794,19 @@ fn render_document(
         ));
     }
     Ok(out)
+}
+
+pub(super) fn visit_plan_rows(
+    plan: &Plan,
+    options: ExplainOptions,
+    actual: Option<ExplainActual>,
+    mut emit: impl FnMut(&str) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    if options.format == ExplainFormat::Text {
+        return visit_text_rows(plan, options, actual, |line| emit(line));
+    }
+    let document = render_document(plan, options, actual)?;
+    emit(document.as_str())
 }
 
 pub(super) fn emit_plan(

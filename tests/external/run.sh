@@ -738,8 +738,8 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
   SUB_PSQL="$SUB_PGBIN/psql"
   if ! "$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -q \
     -c "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'subscription_apply%' OR slot_name LIKE 'pos3ql_%_sync'" \
-    -c "DROP PUBLICATION IF EXISTS subscription_apply_pub, subscription_apply_pub_after_alter" \
-    -c "DROP TABLE IF EXISTS subscription_target, subscription_refresh_target, subscription_typed" \
+    -c "DROP PUBLICATION IF EXISTS subscription_apply_pub, subscription_apply_pub_after_alter, subscription_apply_pub_columns_left, subscription_apply_pub_columns_right" \
+    -c "DROP TABLE IF EXISTS subscription_target, subscription_refresh_target, subscription_typed, subscription_union_target" \
     -c "DROP TYPE IF EXISTS subscription_pair" \
     -c "DROP TYPE IF EXISTS subscription_state" \
     -c "DROP DOMAIN IF EXISTS subscription_positive" \
@@ -749,10 +749,14 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     -c "CREATE TABLE subscription_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text)" \
     -c "CREATE TABLE subscription_refresh_target (id int PRIMARY KEY, body text NOT NULL)" \
     -c "CREATE TABLE subscription_typed (id int PRIMARY KEY, state subscription_state, positive subscription_positive, labels text[], span int4range, spans int4multirange, pair subscription_pair)" \
+    -c "CREATE TABLE subscription_union_target (id int PRIMARY KEY, left_value text NOT NULL, right_value text NOT NULL, publisher_only text)" \
     -c "INSERT INTO subscription_target VALUES (-1, 'filtered', 'publisher'), (1, 'first', 'publisher'), (2, 'second', 'publisher')" \
     -c "INSERT INTO subscription_refresh_target VALUES (10, 'refresh-copy')" \
     -c "INSERT INTO subscription_typed VALUES (1, 'ready', 7, ARRAY['left','right'], '[1,4)', '{[1,3),[5,8)}', ROW('first', 9))" \
+    -c "INSERT INTO subscription_union_target VALUES (-1, 'left-negative', 'right-negative', 'publisher'), (1, 'left-one', 'right-one', 'publisher')" \
     -c "CREATE PUBLICATION subscription_apply_pub FOR TABLE subscription_target (id, body) WHERE (id > 0), subscription_typed" \
+    -c "CREATE PUBLICATION subscription_apply_pub_columns_left FOR TABLE subscription_union_target (id, left_value, right_value) WHERE (id > 0)" \
+    -c "CREATE PUBLICATION subscription_apply_pub_columns_right FOR TABLE subscription_union_target (id, left_value, right_value) WHERE (id < 0)" \
     -c "CREATE PUBLICATION subscription_apply_pub_after_alter FOR TABLE subscription_refresh_target" \
     >/dev/null 2>&1; then
     bad "logical subscription publisher setup"
@@ -763,11 +767,12 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     -c "CREATE TABLE subscription_target (id int PRIMARY KEY, body text NOT NULL, publisher_only text DEFAULT 'subscriber-default')" \
     -c "CREATE TABLE subscription_refresh_target (id int PRIMARY KEY, body text NOT NULL)" \
     -c "CREATE TABLE subscription_typed (id int PRIMARY KEY, state subscription_state, positive subscription_positive, labels text[], span int4range, spans int4multirange, pair subscription_pair)" \
+    -c "CREATE TABLE subscription_union_target (id int PRIMARY KEY, left_value text NOT NULL, right_value text NOT NULL, publisher_only text DEFAULT 'subscriber-default')" \
     -c "CREATE TABLE subscription_trigger_audit (id int)" \
     -c "CREATE FUNCTION audit_subscription_copy() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN INSERT INTO subscription_trigger_audit VALUES (NEW.id); RETURN NEW; END'" \
     -c "CREATE TRIGGER subscription_copy_trigger BEFORE INSERT ON subscription_target FOR EACH ROW EXECUTE FUNCTION audit_subscription_copy()" \
     -c "ALTER TABLE subscription_target ENABLE REPLICA TRIGGER subscription_copy_trigger" \
-    -c "CREATE SUBSCRIPTION subscription_apply CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres application_name=pos3ql_subscription_apply sslmode=disable' PUBLICATION subscription_apply_pub WITH (binary = true, streaming = parallel, failover = true)" \
+    -c "CREATE SUBSCRIPTION subscription_apply CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres application_name=pos3ql_subscription_apply sslmode=disable' PUBLICATION subscription_apply_pub, subscription_apply_pub_columns_left, subscription_apply_pub_columns_right WITH (binary = true, streaming = parallel, failover = true)" \
     >/dev/null 2>&1; then
     bad "logical subscription subscriber setup"
   else
@@ -795,6 +800,20 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
       -c "SELECT id, state, positive, labels, span, spans, pair FROM subscription_typed ORDER BY id" 2>&1
   }
+  subscription_union_rows() {
+    "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
+      -c "SELECT id, left_value, right_value, publisher_only FROM subscription_union_target ORDER BY id" 2>&1
+  }
+  subscription_union_wait() { # <expected rows>
+    local expected=$1 actual=""
+    for _ in {1..100}; do
+      actual=$(subscription_union_rows)
+      [[ "$actual" == "$expected" ]] && return 0
+      sleep 0.1
+    done
+    printf '%s\n' "$actual"
+    return 1
+  }
   if subscription_wait $'1|first\n2|second'; then
     copied_default=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A \
       -c "SELECT string_agg(publisher_only, ',' ORDER BY id) FROM subscription_target")
@@ -805,7 +824,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     [[ "$copied_default" == "subscriber-default,subscriber-default" ]] \
       && ok "initial COPY applies publication projection and subscriber defaults" \
       || bad "initial COPY subscriber defaults (got $copied_default)"
-    [[ "$relation_state" == "2|r|t" ]] \
+    [[ "$relation_state" == "3|r|t" ]] \
       && ok "initial COPY publishes durable ready table states" \
       || bad "initial COPY table state (got $relation_state)"
     [[ "$trigger_rows" == "1,2" ]] \
@@ -815,6 +834,12 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     [[ "$typed_row" == '1|ready|7|{left,right}|[1,4)|{[1,3),[5,8)}|(first,9)' ]] \
       && ok "binary initial COPY preserves enum, domain, array, range, multirange, and composite values" \
       || bad "binary initial COPY typed values (got $typed_row)"
+    if subscription_union_wait $'-1|left-negative|right-negative|subscriber-default\n1|left-one|right-one|subscriber-default'; then
+      ok "initial COPY combines filters across overlapping publications"
+    else
+      bad "initial COPY overlapping publication filters (got $(subscription_union_rows))"
+      subscription_diagnostics
+    fi
     slot_flags=$("$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -t -A -F'|' \
       -c "SELECT two_phase, failover FROM pg_replication_slots WHERE slot_name = 'subscription_apply'")
     [[ "$slot_flags" == "f|t" ]] \
@@ -840,10 +865,11 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
       || bad "binary pgoutput typed update (got $typed_row)"
   fi
   if ! "$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -q \
-    -c "BEGIN; INSERT INTO subscription_target VALUES (-2, 'also-filtered', 'publisher'), (3, 'streamed', 'publisher'); SAVEPOINT rolled_back; INSERT INTO subscription_target VALUES (6, 'aborted-subtransaction', 'publisher'); ROLLBACK TO SAVEPOINT rolled_back; INSERT INTO subscription_target VALUES (7, 'committed-subtransaction', 'publisher'); COMMIT" \
+    -c "BEGIN; INSERT INTO subscription_target VALUES (-2, 'also-filtered', 'publisher'), (3, 'streamed', 'publisher'); INSERT INTO subscription_union_target VALUES (2, 'left-two', 'right-two', 'publisher'); SAVEPOINT rolled_back; INSERT INTO subscription_target VALUES (6, 'aborted-subtransaction', 'publisher'); ROLLBACK TO SAVEPOINT rolled_back; INSERT INTO subscription_target VALUES (7, 'committed-subtransaction', 'publisher'); COMMIT" \
     >/dev/null 2>&1; then
     bad "logical subscription publisher transaction"
-  elif subscription_wait $'1|first\n2|second\n3|streamed\n7|committed-subtransaction'; then
+  elif subscription_wait $'1|first\n2|second\n3|streamed\n7|committed-subtransaction' \
+    && subscription_union_wait $'-1|left-negative|right-negative|subscriber-default\n1|left-one|right-one|subscriber-default\n2|left-two|right-two|subscriber-default'; then
     trigger_rows=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A \
       -c "SELECT string_agg(id::text, ',' ORDER BY id) FROM subscription_trigger_audit")
     [[ "$trigger_rows" == "1,2,3,7" ]] \
@@ -854,7 +880,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     subscription_diagnostics
   fi
   if ! "$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -q \
-    -c "ALTER SUBSCRIPTION subscription_apply SET PUBLICATION subscription_apply_pub, subscription_apply_pub_after_alter" \
+    -c "ALTER SUBSCRIPTION subscription_apply SET PUBLICATION subscription_apply_pub, subscription_apply_pub_columns_left, subscription_apply_pub_columns_right, subscription_apply_pub_after_alter" \
     -c "ALTER SUBSCRIPTION subscription_apply CONNECTION 'host=127.0.0.1 port=$SUB_PG_PORT user=postgres dbname=postgres application_name=pos3ql_subscription_rebound sslmode=disable'" \
     >/dev/null 2>&1; then
     bad "logical subscription definition alteration"
@@ -868,7 +894,7 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
     done
     relation_state=$("$PSQL" -h 127.0.0.1 -p "$PG_PORT" -U postgres -X -t -A -F'|' \
       -c "SELECT count(*), min(srsubstate), bool_and(srsublsn IS NOT NULL) FROM pg_subscription_rel")
-    [[ "$refresh_rows" == "10|refresh-copy" && "$relation_state" == "3|r|t" ]] \
+    [[ "$refresh_rows" == "10|refresh-copy" && "$relation_state" == "4|r|t" ]] \
       && ok "publication refresh copies only the newly subscribed table and records both states" \
       || bad "publication refresh (rows $refresh_rows, state $relation_state)"
   fi
@@ -886,9 +912,10 @@ if [[ -x "$SUB_PGBIN/postgres" ]]; then
   SERVER_PID=$START_PID
   if subscription_wait $'1|first\n2|second\n3|streamed\n4|after-alter\n7|committed-subtransaction'; then
     if ! "$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -q \
-      -c "INSERT INTO subscription_target VALUES (5, 'after-crash', 'publisher')" >/dev/null 2>&1; then
+      -c "INSERT INTO subscription_target VALUES (5, 'after-crash', 'publisher'); INSERT INTO subscription_union_target VALUES (3, 'left-three', 'right-three', 'publisher')" >/dev/null 2>&1; then
     bad "logical subscription post-crash publisher transaction"
-    elif subscription_wait $'1|first\n2|second\n3|streamed\n4|after-alter\n5|after-crash\n7|committed-subtransaction'; then
+    elif subscription_wait $'1|first\n2|second\n3|streamed\n4|after-alter\n5|after-crash\n7|committed-subtransaction' \
+      && subscription_union_wait $'-1|left-negative|right-negative|subscriber-default\n1|left-one|right-one|subscriber-default\n2|left-two|right-two|subscriber-default\n3|left-three|right-three|subscriber-default'; then
       slot_lsn=$("$SUB_PSQL" -h 127.0.0.1 -p "$SUB_PG_PORT" -U postgres -X -t -A \
         -c "SELECT confirmed_flush_lsn <> '0/0'::pg_lsn FROM pg_replication_slots WHERE slot_name = 'subscription_apply'")
       [[ "$slot_lsn" == "t" ]] && ok "subscription crash recovery resumes from durable acknowledgement" \

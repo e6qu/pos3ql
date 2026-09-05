@@ -1437,12 +1437,15 @@ def test_pgoutput_startup_options_and_default_text_tuples():
         setup,
         "DROP PUBLICATION IF EXISTS \"wire, replication\"; "
         "DROP PUBLICATION IF EXISTS wire_replication_pub; "
+        "DROP PUBLICATION IF EXISTS wire_replication_projection_left, wire_replication_projection_right; "
         "DROP TABLE IF EXISTS wire_replication_two; "
         "DROP TABLE IF EXISTS wire_replication; "
+        "DROP TABLE IF EXISTS wire_replication_projection; "
         "DROP TYPE IF EXISTS wire_replication_state; "
         "CREATE TYPE wire_replication_state AS ENUM ('ready'); "
         "CREATE TABLE wire_replication (id integer); "
         "CREATE TABLE wire_replication_two (id integer, state wire_replication_state); "
+        "CREATE TABLE wire_replication_projection (id integer PRIMARY KEY, left_value text, right_value text); "
         "CREATE PUBLICATION wire_replication_pub FOR TABLE wire_replication WHERE (id > 0) "
         "WITH (publish = 'insert'); "
         "CREATE PUBLICATION \"wire, replication\" FOR TABLE wire_replication_two",
@@ -1548,6 +1551,42 @@ def test_pgoutput_startup_options_and_default_text_tuples():
             (kind, payload),
         )
         stream.close()
+
+    projection_publications = simple_query(
+        setup,
+        "CREATE PUBLICATION wire_replication_projection_left "
+        "FOR TABLE wire_replication_projection (id, left_value); "
+        "CREATE PUBLICATION wire_replication_projection_right "
+        "FOR TABLE wire_replication_projection (id, right_value)",
+    )
+    check(
+        "pgoutput projection-publication setup succeeds",
+        not any(kind == b"E" for kind, _ in projection_publications),
+        projection_publications,
+    )
+    rejected = connect()
+    rejected.sendall(startup_payload(0, parameters=(("replication", "database"),)))
+    drain_startup(rejected)
+    simple_query(
+        rejected,
+        "CREATE_REPLICATION_SLOT wire_replication_projection_slot LOGICAL pgoutput NOEXPORT_SNAPSHOT",
+    )
+    rejected.sendall(
+        frontend_message(
+            b"Q",
+            b"START_REPLICATION SLOT wire_replication_projection_slot LOGICAL 0/0 "
+            b"(proto_version '4', publication_names 'wire_replication_projection_left,wire_replication_projection_right')\x00",
+        )
+    )
+    rejection = [read_message(rejected), read_message(rejected)]
+    check(
+        "pgoutput rejects mismatched publication column lists before CopyBoth",
+        [kind for kind, _ in rejection] == [b"E", b"Z"]
+        and has_sqlstate(rejection, "0A000")
+        and b"cannot use different column lists" in rejection[0][1],
+        rejection,
+    )
+    rejected.close()
     setup.close()
 
 
@@ -5331,6 +5370,13 @@ def test_view_output_columns_over_raw_wire():
 
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    selected = os.environ.get("POS3QL_WIRE_PROBE")
+    if selected:
+        requested = frozenset(selected.split(","))
+        tests = [test for test in tests if test.__name__ in requested]
+        unknown = requested - {test.__name__ for test in tests}
+        if unknown:
+            raise SystemExit(f"unknown wire probe(s): {', '.join(sorted(unknown))}")
     for t in tests:
         print(t.__name__)
         t()

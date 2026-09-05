@@ -3316,6 +3316,16 @@ impl Conn {
                         self.recv.consume(total);
                         return Step::Continue;
                     }
+                    if let Err(error) = engine
+                        .validate_replication_publications(self.replication_publications.as_slice())
+                    {
+                        let mut responder = Responder::new(&mut self.send);
+                        let _ = responder
+                            .error(error.sqlstate, error.message.as_str())
+                            .and_then(|()| responder.ready_for_query(b'I'));
+                        self.recv.consume(total);
+                        return Step::Continue;
+                    }
                     let cursor_lsn = match engine.activate_replication_slot(name.as_str()) {
                         Ok(lsn) => lsn,
                         Err(error) => {

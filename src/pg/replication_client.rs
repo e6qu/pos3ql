@@ -413,6 +413,17 @@ impl<'a> SqlDataRow<'a> {
     pub fn columns(&self) -> &[Option<&'a [u8]>] {
         &self.columns[..self.count]
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(columns: &[Option<&'a [u8]>]) -> Self {
+        assert!(columns.len() <= crate::storage::MAX_COLUMNS);
+        let mut values = [None; crate::storage::MAX_COLUMNS];
+        values[..columns.len()].copy_from_slice(columns);
+        Self {
+            columns: values,
+            count: columns.len(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

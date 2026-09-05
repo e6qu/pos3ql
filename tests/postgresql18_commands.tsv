@@ -15,7 +15,7 @@
 # tools/check-pg18-surface.sh passes. Individual fat PRs advance the measured
 # states without pretending that the remaining surface is complete.
 ABORT	complete	05_transactions.sql
-ALTER AGGREGATE	partial	110_user_defined_aggregates.sql
+ALTER AGGREGATE	partial	110_user_defined_aggregates.sql and 140_catalog_schema_evolution.sql
 ALTER COLLATION	complete	120_collation_conversion.sql
 ALTER CONVERSION	complete	120_collation_conversion.sql
 ALTER DATABASE	complete	118_database_configuration.sql
@@ -25,13 +25,13 @@ ALTER EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
 ALTER EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native-library update execution is outside the architecture
 ALTER FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh (native handlers are rejected)
 ALTER FOREIGN TABLE	complete	tests/external/ci_diff.sh
-ALTER FUNCTION	partial	90_routine_lifecycle.sql, 111_extension_lifecycle.sql, and 112_routine_bodies_attributes_do.sql
+ALTER FUNCTION	partial	90_routine_lifecycle.sql, 111_extension_lifecycle.sql, 112_routine_bodies_attributes_do.sql, and 140_catalog_schema_evolution.sql
 ALTER GROUP	complete	100_role_credentials.sql
-ALTER INDEX	partial	107_index_lifecycle.sql and 111_extension_lifecycle.sql
+ALTER INDEX	partial	107_index_lifecycle.sql, 111_extension_lifecycle.sql, and 140_catalog_schema_evolution.sql
 ALTER LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; custom executable handlers are outside the architecture)
 ALTER LARGE OBJECT	complete	tests/external/differential/121_large_objects.sql
 ALTER MATERIALIZED VIEW	partial	53_materialized_view.sql covers identity, metadata, rollback, and recovery; typed extension dependencies in 111_extension_lifecycle.sql
-ALTER OPERATOR	partial	117_cast_operator_catalog.sql (typed owner/schema and optimization links; selectivity estimators rejected)
+ALTER OPERATOR	partial	117_cast_operator_catalog.sql and 140_catalog_schema_evolution.sql (typed owner/schema and RESTRICT/JOIN NONE resets; custom selectivity estimators rejected)
 ALTER OPERATOR CLASS	complete	117_cast_operator_catalog.sql
 ALTER OPERATOR FAMILY	complete	117_cast_operator_catalog.sql
 ALTER POLICY	complete	106_row_level_security.sql
@@ -46,17 +46,17 @@ ALTER SERVER	complete	tests/external/ci_diff.sh
 ALTER STATISTICS	complete	109_extended_statistics.sql
 ALTER SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard
 ALTER SYSTEM	complete	118_database_configuration.sql
-ALTER TABLE	partial	45_alter_column.sql, 125_replica_identity.sql, 132_ordinary_inheritance_alter.sql, 135_table_column_metadata.sql, 137_alter_table_control_plane.sql, 138_rewrite_rule_enablement.sql, and 139_not_null_constraint_inheritance.sql cover typed metadata, duplicate-safe columns, clustering, typed-table membership, tablespace moves, durable rewrite-rule firing modes, and NOT NULL inheritance controls
+ALTER TABLE	partial	45_alter_column.sql, 125_replica_identity.sql, 132_ordinary_inheritance_alter.sql, 135_table_column_metadata.sql, 137_alter_table_control_plane.sql, 138_rewrite_rule_enablement.sql, 139_not_null_constraint_inheritance.sql, and 140_catalog_schema_evolution.sql cover typed metadata, duplicate-safe columns, clustering, typed-table membership, tablespace moves, durable rewrite-rule firing modes, and NOT NULL inheritance controls
 ALTER TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 ALTER TEXT SEARCH CONFIGURATION	complete	tests/external/differential/123_full_text_search.sql
 ALTER TEXT SEARCH DICTIONARY	complete	tests/external/differential/123_full_text_search.sql
 ALTER TEXT SEARCH PARSER	complete	tests/external/differential/123_full_text_search.sql
 ALTER TEXT SEARCH TEMPLATE	complete	tests/external/differential/123_full_text_search.sql
 ALTER TRIGGER	complete	101_trigger_timing.sql
-ALTER TYPE	partial	63_enums.sql
+ALTER TYPE	partial	63_enums.sql and 140_catalog_schema_evolution.sql
 ALTER USER	complete	83_roles_acl.sql and 100_role_credentials.sql
 ALTER USER MAPPING	complete	tests/external/ci_diff.sh
-ALTER VIEW	partial	76_stored_dependencies.sql and typed output-column identity, auto-updatable DML, rollback, WAL, checkpoints, and recovery
+ALTER VIEW	partial	76_stored_dependencies.sql and 140_catalog_schema_evolution.sql cover typed output-column identity, auto-updatable DML, rollback, WAL, checkpoints, and recovery
 ANALYZE	complete	48_vacuum_analyze.sql
 BEGIN	complete	05_transactions.sql
 CALL	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql (lone top-level PL/pgSQL transaction control, typed outputs, SQL procedures, and explicit rejection of post-boundary suspension)
@@ -78,9 +78,9 @@ CREATE EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
 CREATE EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native libraries are rejected
 CREATE FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh (native handlers are rejected)
 CREATE FOREIGN TABLE	complete	tests/external/ci_diff.sh
-CREATE FUNCTION	partial	87_sql_routines.sql and 112_routine_bodies_attributes_do.sql
+CREATE FUNCTION	partial	87_sql_routines.sql, 112_routine_bodies_attributes_do.sql, and 140_catalog_schema_evolution.sql
 CREATE GROUP	complete	83_roles_acl.sql and 100_role_credentials.sql
-CREATE INDEX	partial	43_indexes.sql, 107_index_lifecycle.sql, and 108_index_operator_classes.sql
+CREATE INDEX	partial	43_indexes.sql, 107_index_lifecycle.sql, 108_index_operator_classes.sql, and 140_catalog_schema_evolution.sql
 CREATE LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; native handlers are outside the architecture)
 CREATE MATERIALIZED VIEW	complete	53_materialized_view.sql
 CREATE OPERATOR	partial	117_cast_operator_catalog.sql (typed binary operators and durable forward shells)
@@ -89,14 +89,14 @@ CREATE OPERATOR FAMILY	complete	117_cast_operator_catalog.sql (btree; unsupporte
 CREATE POLICY	complete	106_row_level_security.sql
 CREATE PROCEDURE	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql
 CREATE PUBLICATION	partial	84_publication.sql
-CREATE ROLE	partial	83_roles_acl.sql and 100_role_credentials.sql cover attributes, SCRAM/MD5 credentials, aliases, initial memberships, and recovery
+CREATE ROLE	partial	83_roles_acl.sql, 100_role_credentials.sql, and 140_catalog_schema_evolution.sql cover attributes, SCRAM/MD5 credentials, aliases, initial memberships, and recovery
 CREATE RULE	complete	tests/external/differential/122_rewrite_rules.sql
 CREATE SCHEMA	complete	37_schemas.sql and typed dynamic-utility checkpoint/cold-recovery coverage
 CREATE SEQUENCE	partial	54_sequence.sql (permanent sequences; temporary and unlogged variants remain object-native durability boundaries)
 CREATE SERVER	complete	tests/external/ci_diff.sh
 CREATE STATISTICS	complete	109_extended_statistics.sql
 CREATE SUBSCRIPTION	complete	98_subscription.sql, raw-wire lifecycle probe, and subscription shard
-CREATE TABLE	partial	14_surface.sql, 135_table_column_metadata.sql, and 136_like_metadata.sql
+CREATE TABLE	partial	14_surface.sql, 135_table_column_metadata.sql, 136_like_metadata.sql, and 140_catalog_schema_evolution.sql
 CREATE TABLE AS	complete	52_create_table_as.sql
 CREATE TABLESPACE	complete	118_database_configuration.sql and provider-neutral object-cold lifecycle tests
 CREATE TEXT SEARCH CONFIGURATION	complete	tests/external/differential/123_full_text_search.sql
@@ -105,7 +105,7 @@ CREATE TEXT SEARCH PARSER	complete	tests/external/differential/123_full_text_sea
 CREATE TEXT SEARCH TEMPLATE	complete	tests/external/differential/123_full_text_search.sql
 CREATE TRANSFORM	complete	sql::tests::native_hook_ddl_rejects_before_catalog_publication
 CREATE TRIGGER	complete	101_trigger_timing.sql
-CREATE TYPE	partial	63_enums.sql
+CREATE TYPE	partial	63_enums.sql and 140_catalog_schema_evolution.sql
 CREATE USER	complete	83_roles_acl.sql and 100_role_credentials.sql
 CREATE USER MAPPING	complete	tests/external/ci_diff.sh
 CREATE VIEW	complete	76_stored_dependencies.sql

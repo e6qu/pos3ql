@@ -46,8 +46,8 @@ SELECT routine_attribute_schema.scalar_value(5);
 CALL routine_attribute_schema.record_value(6);
 RESET ROLE;
 
-DROP FUNCTION routine_attribute_schema.scalar_value(integer);
-DROP PROCEDURE routine_attribute_schema.record_value(integer);
+DROP ROUTINE routine_attribute_schema.scalar_value(integer),
+  routine_attribute_schema.record_value(integer);
 REVOKE USAGE, CREATE ON SCHEMA routine_attribute_schema
   FROM routine_attribute_owner, routine_attribute_reader;
 DROP SCHEMA routine_attribute_schema;

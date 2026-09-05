@@ -138,7 +138,7 @@ DROP POLICY	complete	106_row_level_security.sql
 DROP PROCEDURE	partial	89_sql_procedures.sql and 141_routine_attribute_evolution.sql
 DROP PUBLICATION	partial	84_publication.sql
 DROP ROLE	partial	83_roles_acl.sql and 100_role_credentials.sql cover dependencies, aliases, quoted special names, and recovery
-DROP ROUTINE	partial	90_routine_lifecycle.sql
+DROP ROUTINE	partial	90_routine_lifecycle.sql and 141_routine_attribute_evolution.sql
 DROP RULE	complete	tests/external/differential/122_rewrite_rules.sql
 DROP SCHEMA	complete	37_schemas.sql
 DROP SEQUENCE	complete	54_sequence.sql

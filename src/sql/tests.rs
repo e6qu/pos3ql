@@ -728,13 +728,33 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
            BEGIN EXECUTE ''RESET application_name''; END'; \
          CREATE FUNCTION plpgsql_dynamic_session_vacuum() RETURNS void LANGUAGE plpgsql AS '
            BEGIN EXECUTE ''VACUUM plpgsql_dynamic_session_rows''; END'; \
-         CREATE FUNCTION plpgsql_dynamic_prepare() RETURNS void LANGUAGE plpgsql AS '
+         CREATE FUNCTION plpgsql_dynamic_prepare() RETURNS integer LANGUAGE plpgsql AS '
+           DECLARE result integer;
            BEGIN
              EXECUTE ''PREPARE plpgsql_dynamic_plan(integer) AS SELECT $1 + 1'';
+             EXECUTE ''EXECUTE plpgsql_dynamic_plan(41)'' INTO result;
+             EXECUTE ''PREPARE plpgsql_dynamic_dml(integer) AS \
+               INSERT INTO plpgsql_dynamic_session_rows VALUES ($1) RETURNING value'';
+             EXECUTE ''EXECUTE plpgsql_dynamic_dml(3)'' INTO result;
+             EXECUTE ''DEALLOCATE plpgsql_dynamic_dml'';
              EXECUTE ''DISCARD PLANS'';
+             RETURN result;
            END'; \
-         CREATE FUNCTION plpgsql_dynamic_deallocate() RETURNS void LANGUAGE plpgsql AS '
-           BEGIN EXECUTE ''DEALLOCATE plpgsql_dynamic_plan''; END'; \
+         CREATE FUNCTION plpgsql_dynamic_portal() RETURNS integer LANGUAGE plpgsql AS '
+           DECLARE result integer; setting text; plan text;
+           BEGIN
+             EXECUTE ''SHOW application_name'' INTO STRICT setting;
+             IF setting <> ''dynamic-session'' THEN RAISE EXCEPTION ''SHOW result mismatch''; END IF;
+             EXECUTE ''EXPLAIN SELECT value FROM plpgsql_dynamic_session_rows'' INTO STRICT plan;
+             IF plan IS NULL THEN RAISE EXCEPTION ''EXPLAIN result mismatch''; END IF;
+             EXECUTE ''DECLARE plpgsql_dynamic_cursor SCROLL CURSOR FOR \
+               SELECT value FROM plpgsql_dynamic_session_rows ORDER BY value'';
+             EXECUTE ''MOVE FORWARD 1 FROM plpgsql_dynamic_cursor'';
+             EXECUTE ''FETCH NEXT FROM plpgsql_dynamic_cursor'' INTO result;
+             EXECUTE ''CLOSE plpgsql_dynamic_cursor'';
+             EXECUTE ''DEALLOCATE plpgsql_dynamic_plan'';
+             RETURN result;
+           END'; \
          CREATE FUNCTION plpgsql_dynamic_lock() RETURNS void LANGUAGE plpgsql AS '
            BEGIN EXECUTE ''LOCK TABLE plpgsql_dynamic_session_rows IN SHARE MODE''; END'; \
          CREATE FUNCTION plpgsql_dynamic_constraints() RETURNS void LANGUAGE plpgsql AS '
@@ -755,12 +775,12 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
          SELECT reltuples::integer FROM pg_class WHERE relname = 'plpgsql_dynamic_session_rows'; \
          SELECT plpgsql_dynamic_prepare(); \
          EXECUTE plpgsql_dynamic_plan(41); \
-         SELECT plpgsql_dynamic_deallocate(); \
+         BEGIN; SELECT plpgsql_dynamic_portal(); COMMIT; \
          EXECUTE plpgsql_dynamic_plan(41)",
     );
     assert_eq!(
         data_rows(&observed),
-        ["NULL", "dynamic-session", "2", "NULL", "42", "NULL"],
+        ["NULL", "dynamic-session", "2", "3", "42", "2"],
         "{}",
         String::from_utf8_lossy(&observed)
     );
@@ -768,6 +788,30 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
         String::from_utf8_lossy(&observed).contains("26000"),
         "{}",
         String::from_utf8_lossy(&observed)
+    );
+    let strict_many = run_with(
+        &mut engine,
+        &mut budget,
+        "DO 'DECLARE result integer; BEGIN \
+           EXECUTE ''PREPARE plpgsql_dynamic_strict_many AS VALUES (1), (2)''; \
+           EXECUTE ''EXECUTE plpgsql_dynamic_strict_many'' INTO STRICT result; END'",
+    );
+    assert!(
+        String::from_utf8_lossy(&strict_many).contains("P0003"),
+        "{}",
+        String::from_utf8_lossy(&strict_many)
+    );
+    let strict_none = run_with(
+        &mut engine,
+        &mut budget,
+        "DO 'DECLARE result integer; BEGIN \
+           EXECUTE ''PREPARE plpgsql_dynamic_strict_none AS SELECT 1 WHERE false''; \
+           EXECUTE ''EXECUTE plpgsql_dynamic_strict_none'' INTO STRICT result; END'",
+    );
+    assert!(
+        String::from_utf8_lossy(&strict_none).contains("P0002"),
+        "{}",
+        String::from_utf8_lossy(&strict_none)
     );
     let locked = run_with(
         &mut engine,

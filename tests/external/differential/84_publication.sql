@@ -10,6 +10,11 @@ CREATE TABLE publication_generated (
 );
 CREATE SCHEMA publication_schema;
 CREATE TABLE publication_schema.schema_selected (id integer PRIMARY KEY);
+CREATE TABLE publication_union_columns (
+  id integer PRIMARY KEY,
+  left_value text,
+  right_value text
+);
 
 CREATE PUBLICATION publication_changes
   FOR TABLE publication_source (id, value), publication_second
@@ -21,6 +26,13 @@ SELECT obj_description(oid, 'pg_publication') FROM pg_publication
  WHERE pubname = 'publication_empty';
 CREATE PUBLICATION publication_generated_changes FOR TABLE publication_generated
   WITH (publish_generated_columns = 'stored');
+CREATE PUBLICATION publication_union_left
+  FOR TABLE publication_union_columns (id, left_value);
+CREATE PUBLICATION publication_union_right
+  FOR TABLE publication_union_columns (id, right_value);
+SELECT pubname, attnames::text FROM pg_publication_tables
+ WHERE pubname IN ('publication_union_left', 'publication_union_right')
+ ORDER BY pubname;
 SELECT pubgencols FROM pg_publication WHERE pubname = 'publication_generated_changes';
 ALTER PUBLICATION publication_generated_changes SET (publish_generated_columns = 'none');
 SELECT pubgencols FROM pg_publication WHERE pubname = 'publication_generated_changes';
@@ -112,11 +124,13 @@ DROP PUBLICATION publication_filter_rename_changes, publication_projection_drop_
 DROP TABLE publication_filter_rename, publication_projection_drop;
 
 DROP PUBLICATION publication_changes, publication_all, publication_empty_renamed,
-  publication_schema_changes, publication_generated_changes;
+  publication_schema_changes, publication_generated_changes, publication_union_left,
+  publication_union_right;
 DROP TABLE publication_generated;
 DROP TABLE publication_third;
 DROP PUBLICATION IF EXISTS publication_missing;
 DROP TABLE publication_second;
 DROP TABLE publication_source;
+DROP TABLE publication_union_columns;
 DROP SCHEMA publication_schema CASCADE;
 DROP ROLE publication_owner_target;

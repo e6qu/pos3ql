@@ -178,7 +178,11 @@ fn subscription_name_array(
         {
             return Err(());
         }
-        names[count] = crate::storage::SqlName::parse(value.as_str()).map_err(|_| ())?;
+        let value = crate::storage::SqlName::parse(value.as_str()).map_err(|_| ())?;
+        if names[..count].contains(&value) {
+            return Err(());
+        }
+        names[count] = value;
         count += 1;
         match bytes.get(at) {
             Some(b',') => at += 1,
@@ -2182,7 +2186,123 @@ mod tests {
     use std::io::Read;
     use std::net::TcpStream;
 
-    use super::{SubscriptionBinding, bind_listener};
+    use super::{
+        SubscriptionBinding, SubscriptionBootstrapStage, SubscriptionBootstrapWork, bind_listener,
+    };
+
+    fn discovery_row<'a>(
+        publication: &'a [u8],
+        schema: &'a [u8],
+        table: &'a [u8],
+        columns: &'a [u8],
+        filter: Option<&'a [u8]>,
+    ) -> crate::pg::replication_client::SqlDataRow<'a> {
+        crate::pg::replication_client::SqlDataRow::for_test(&[
+            Some(publication),
+            Some(schema),
+            Some(table),
+            Some(columns),
+            filter,
+        ])
+    }
+
+    fn bootstrap_work(budget: &mut crate::mem::budget::Budget) -> SubscriptionBootstrapWork {
+        SubscriptionBootstrapWork {
+            stage: SubscriptionBootstrapStage::Idle,
+            snapshot: None,
+            tables: crate::mem::fixed_vec::FixedVec::new(budget, "test_subscription_tables", 2)
+                .unwrap(),
+            table: 0,
+            copy_setup: None,
+            line: crate::mem::buffer::FixedBuf::new(budget, "test_subscription_copy", 256).unwrap(),
+            binary_header_pending: false,
+            binary_end_seen: false,
+        }
+    }
+
+    #[test]
+    fn subscription_bootstrap_requires_matching_columns_and_ors_filters() {
+        let mut budget = crate::mem::budget::Budget::new(1 << 20);
+        let mut work = bootstrap_work(&mut budget);
+        work.absorb_discovery_row(discovery_row(
+            b"left_changes",
+            b"public",
+            b"items",
+            b"{id,left_value}",
+            Some(b"id > 0"),
+        ))
+        .unwrap();
+        work.absorb_discovery_row(discovery_row(
+            b"right_changes",
+            b"public",
+            b"items",
+            b"{id,left_value}",
+            Some(b"id < 0"),
+        ))
+        .unwrap();
+
+        assert_eq!(work.tables.len(), 1);
+        let table = work.tables[0];
+        assert_eq!(table.column_count, 2);
+        assert_eq!(table.columns[0].as_str(), "id");
+        assert_eq!(table.columns[1].as_str(), "left_value");
+        assert_eq!(table.filter.as_str(), "(id > 0) OR (id < 0)");
+        assert!(!table.filter_all);
+
+        work.absorb_discovery_row(discovery_row(
+            b"all_rows",
+            b"public",
+            b"items",
+            b"{id,left_value}",
+            None,
+        ))
+        .unwrap();
+        let table = work.tables[0];
+        assert!(table.filter_all);
+        assert!(table.filter.as_str().is_empty());
+    }
+
+    #[test]
+    fn subscription_bootstrap_rejects_duplicate_remote_columns() {
+        let mut budget = crate::mem::budget::Budget::new(1 << 20);
+        let mut work = bootstrap_work(&mut budget);
+        assert!(
+            work.absorb_discovery_row(discovery_row(
+                b"changes", b"public", b"items", b"{id,id}", None,
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subscription_bootstrap_rejects_different_publication_column_lists() {
+        let mut budget = crate::mem::budget::Budget::new(1 << 20);
+        let mut work = bootstrap_work(&mut budget);
+        work.absorb_discovery_row(discovery_row(
+            b"left_changes",
+            b"public",
+            b"items",
+            b"{id,left_value}",
+            None,
+        ))
+        .unwrap();
+        assert!(
+            work.absorb_discovery_row(discovery_row(
+                b"right_changes",
+                b"public",
+                b"items",
+                b"{id,right_value}",
+                None,
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subscription_name_array_rejects_duplicate_remote_columns() {
+        assert!(super::subscription_name_array(b"{id,id}").is_err());
+        assert!(super::subscription_name_array(b"{id,\"id\"}").is_err());
+    }
 
     #[test]
     fn subscription_binding_reconnects_only_for_stream_definition_changes() {

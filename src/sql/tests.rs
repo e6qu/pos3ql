@@ -12300,6 +12300,31 @@ fn logical_replication_unions_multiple_publications_on_sized_stack() {
     );
 }
 
+#[test]
+fn logical_replication_rejects_different_publication_column_lists() {
+    let (mut engine, mut budget) = test_engine();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "CREATE TABLE mismatched_projection (id int PRIMARY KEY, left_value text, right_value text); \
+         CREATE PUBLICATION left_projection FOR TABLE mismatched_projection (id, left_value); \
+         CREATE PUBLICATION right_projection FOR TABLE mismatched_projection (id, right_value)",
+    );
+    let error = engine
+        .validate_replication_publications(&[
+            crate::storage::SqlName::parse("left_projection").unwrap(),
+            crate::storage::SqlName::parse("right_projection").unwrap(),
+        ])
+        .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::FEATURE_NOT_SUPPORTED);
+    assert_eq!(
+        error.message.as_str(),
+        "cannot use different column lists for table \"public.mismatched_projection\" in different publications"
+    );
+}
+
 fn logical_replication_publication_column_lists_project_relation_and_tuple_on_sized_stack() {
     let (mut engine, mut budget) = test_engine();
     let mut transaction = TxnState::new(&mut budget, 256).unwrap();

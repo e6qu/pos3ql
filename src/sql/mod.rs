@@ -1657,9 +1657,52 @@ fn publication_output_relation(
     Ok(table_slot)
 }
 
-/// Computes the pgoutput projection selected by every subscribed publication.
-/// An all-table or schema membership has PostgreSQL's full-row meaning; masks
-/// from explicit relation members are otherwise unioned by attribute number.
+fn publication_projection_mask(
+    storage: &Storage,
+    publication: &crate::storage::PublicationDef,
+    table_slot: usize,
+) -> Option<u64> {
+    let implicit_mask = || {
+        storage
+            .table_def(table_slot, 0)
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| {
+                !column.default.is_generated()
+                    || publication.publish_generated_columns
+                        == crate::storage::PublishGeneratedColumns::Stored
+            })
+            .fold(0u64, |mask, (column, _)| mask | (1u64 << column))
+    };
+    if publication.all_tables
+        || publication_partition_schema_member(storage, publication, table_slot)
+    {
+        return Some(implicit_mask());
+    }
+    let index = publication_partition_member(storage, publication, table_slot)?;
+    if usize::from(publication.tables[index]) != table_slot
+        && !publication.publish_via_partition_root
+    {
+        return Some(implicit_mask());
+    }
+    let mask = publication.table_column_masks[index];
+    Some(if mask == 0 { implicit_mask() } else { mask })
+}
+
+fn mismatched_publication_columns(storage: &Storage, table_slot: usize) -> SqlError {
+    let definition = storage.table_def(table_slot, 0);
+    sql_err!(
+        sqlstate::FEATURE_NOT_SUPPORTED,
+        "cannot use different column lists for table \"{}.{}\" in different publications",
+        definition.schema.as_str(),
+        definition.name.as_str()
+    )
+}
+
+/// Computes the sole pgoutput projection selected by matching publications.
+/// PostgreSQL rejects a stream that assigns different column lists to the
+/// same relation rather than combining them.
 fn publication_column_mask(
     storage: &Storage,
     publication_names: &[SqlName],
@@ -1673,21 +1716,7 @@ fn publication_column_mask(
     {
         return Ok(None);
     }
-    let mut selected = 0u64;
-    let mut matched = false;
-    let implicit_mask = |publication: &crate::storage::PublicationDef| {
-        let definition = storage.table_def(table_slot, 0);
-        definition
-            .columns()
-            .iter()
-            .enumerate()
-            .filter(|(_, column)| {
-                !column.default.is_generated()
-                    || publication.publish_generated_columns
-                        == crate::storage::PublishGeneratedColumns::Stored
-            })
-            .fold(0u64, |mask, (column, _)| mask | (1u64 << column))
-    };
+    let mut selected = None;
     for name in publication_names {
         let publication = storage.publication(name.as_str()).ok_or_else(|| {
             sql_err!(
@@ -1696,8 +1725,6 @@ fn publication_column_mask(
                 name.as_str()
             )
         })?;
-        let explicit = publication_partition_member(storage, publication, table_slot);
-        let schema_member = publication_partition_schema_member(storage, publication, table_slot);
         let publishes = match operation {
             PublicationOperation::Insert => publication.publish_insert,
             PublicationOperation::Update => publication.publish_update,
@@ -1707,31 +1734,14 @@ fn publication_column_mask(
         if !publishes {
             continue;
         }
-        if publication.all_tables || schema_member {
-            matched = true;
-            selected |= implicit_mask(publication);
-            continue;
-        }
-        if let Some(index) = explicit {
-            if usize::from(publication.tables[index]) != table_slot
-                && !publication.publish_via_partition_root
-            {
-                // Default pgoutput identity is the physical leaf, whose
-                // implicit membership has no ancestor column projection.
-                matched = true;
-                selected |= implicit_mask(publication);
-                continue;
+        if let Some(mask) = publication_projection_mask(storage, publication, table_slot) {
+            if selected.is_some_and(|selected| selected != mask) {
+                return Err(mismatched_publication_columns(storage, table_slot));
             }
-            let mask = publication.table_column_masks[index];
-            if mask == 0 {
-                selected |= implicit_mask(publication);
-            } else {
-                selected |= mask;
-            }
-            matched = true;
+            selected = Some(mask);
         }
     }
-    Ok(matched.then_some(selected))
+    Ok(selected)
 }
 
 /// True when the subscribed publication union selects this row.  A missing
@@ -3066,6 +3076,42 @@ impl Engine {
         self.storage.deactivate_replication_slot(name);
     }
 
+    /// Validates pgoutput's publication set before a replication slot is made
+    /// active, so an invalid stream cannot acquire a transport cursor.
+    pub(crate) fn validate_replication_publications(
+        &self,
+        publication_names: &[SqlName],
+    ) -> Result<(), SqlError> {
+        for name in publication_names {
+            if self.storage.publication(name.as_str()).is_none() {
+                return Err(sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "publication \"{}\" does not exist",
+                    name.as_str()
+                ));
+            }
+        }
+        for (table_slot, _) in self.storage.live_tables() {
+            let mut selected = None;
+            for name in publication_names {
+                let publication = self
+                    .storage
+                    .publication(name.as_str())
+                    .expect("publication set was validated");
+                let Some(mask) =
+                    publication_projection_mask(&self.storage, publication, table_slot)
+                else {
+                    continue;
+                };
+                if selected.is_some_and(|selected| selected != mask) {
+                    return Err(mismatched_publication_columns(&self.storage, table_slot));
+                }
+                selected = Some(mask);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn advance_replication_slot(
         &mut self,
         name: &str,
@@ -3140,18 +3186,10 @@ impl Engine {
             origin,
             protocol: proto_version,
         } = emission;
+        self.validate_replication_publications(publication_names)?;
         self.work.reset();
         let storage = &self.storage;
         let filter_arena = &self.work;
-        for name in publication_names {
-            if storage.publication(name.as_str()).is_none() {
-                return Err(sql_err!(
-                    sqlstate::UNDEFINED_OBJECT,
-                    "publication \"{}\" does not exist",
-                    name.as_str()
-                ));
-            }
-        }
         let mut emitted = false;
         let mut encode = |end_lsn, transaction: &[u8]| {
             let mut at = 0usize;

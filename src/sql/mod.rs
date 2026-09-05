@@ -16270,20 +16270,28 @@ impl Engine {
             ColDesc::new("setting", types::oid::TEXT, -1),
             ColDesc::new("description", types::oid::TEXT, -1),
         ])?;
+        self.visit_show_all_rows(guc, txn, |name, value| {
+            responder.data_row(&[Datum::Text(name), Datum::Text(value), Datum::Text("")])
+        })?;
+        responder.command_complete("SHOW")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn visit_show_all_rows<E>(
+        &self,
+        guc: &GucState,
+        txn: &TxnState,
+        mut emit: impl FnMut(&str, &str) -> Result<(), E>,
+    ) -> Result<(), E> {
         for &name in SETTING_NAMES {
             if let Some(value) = self
                 .fixed_setting_for(name, txn)
                 .or_else(|| guc.get_owned(name))
             {
-                responder.data_row(&[
-                    Datum::Text(name),
-                    Datum::Text(value.as_str()),
-                    Datum::Text(""),
-                ])?;
+                emit(name, value.as_str())?;
             }
         }
-        responder.command_complete("SHOW")?;
-        Ok(Ok(()))
+        Ok(())
     }
 
     fn fixed_setting_for(&self, name: &str, txn: &TxnState) -> Option<crate::util::StackStr<256>> {

@@ -329,9 +329,12 @@ $$;
 CREATE FUNCTION plpgsql_dynamic_session_portal() RETURNS integer
   LANGUAGE plpgsql AS $$
 DECLARE result_value integer; setting text; plan text;
+  setting_name text; setting_value text; setting_description text;
 BEGIN
   EXECUTE 'SHOW application_name' INTO STRICT setting;
   IF setting <> 'dynamic-session' THEN RAISE EXCEPTION 'SHOW result mismatch'; END IF;
+  EXECUTE 'SHOW ALL' INTO setting_name, setting_value, setting_description;
+  IF setting_name IS NULL THEN RAISE EXCEPTION 'SHOW ALL result mismatch'; END IF;
   EXECUTE 'EXPLAIN SELECT value FROM plpgsql_dynamic_session_rows' INTO STRICT plan;
   IF plan IS NULL THEN RAISE EXCEPTION 'EXPLAIN result mismatch'; END IF;
   EXECUTE 'DECLARE plpgsql_dynamic_session_cursor SCROLL CURSOR FOR

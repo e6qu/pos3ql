@@ -21939,6 +21939,25 @@ fn execute_trigger_block<'a>(
                             .map_err(|_| super::query::arena_full_pub())?;
                         capture(&[Datum::Text(value)])?;
                     }
+                    Stmt::ShowAll => {
+                        let PlpgsqlExecHost::Routine { engine, guc, .. } = &context.host else {
+                            return Err(sql_err!(
+                                sqlstate::FEATURE_NOT_SUPPORTED,
+                                "SHOW ALL is not available in trigger execution"
+                            ));
+                        };
+                        engine.visit_show_all_rows(guc, context.txn, |name, value| {
+                            let name = context
+                                .arena
+                                .alloc_str(name)
+                                .map_err(|_| super::query::arena_full_pub())?;
+                            let value = context
+                                .arena
+                                .alloc_str(value)
+                                .map_err(|_| super::query::arena_full_pub())?;
+                            capture(&[Datum::Text(name), Datum::Text(value), Datum::Text("")])
+                        })?;
+                    }
                     Stmt::FetchCursor {
                         name,
                         motion,

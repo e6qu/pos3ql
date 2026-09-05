@@ -143,6 +143,18 @@ cur.execute("SELECT drv_dynamic_analyze(%s)", (41,))
 assert cur.fetchone() == (True,)
 print("plpgsql dynamic analyze extended protocol ok")
 
+# Array subscripts are client-visible values, not an internal zero-based
+# representation, across extended Bind and Result.
+array_value = "[4:6]={10,20,10}"
+cur.execute(
+    "SELECT array_position(%s::integer[], 10), "
+    "array_positions(%s::integer[], 10)::text, "
+    "array_remove(%s::integer[], 10)::text",
+    (array_value, array_value, array_value),
+)
+assert cur.fetchone() == (4, "{4,6}", "[4:4]={20}")
+print("array subscript extended protocol ok")
+
 # A lone extended-protocol CALL in autocommit mode is non-atomic: PostgreSQL
 # permits COMMIT/ROLLBACK in the procedure and immediately starts the next
 # transaction while preserving parameters and local execution state.

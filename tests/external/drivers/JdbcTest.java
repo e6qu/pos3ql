@@ -93,6 +93,14 @@ public class JdbcTest {
                 line("plpgsql dynamic analyze " + rs.getBoolean(1));
             }
         }
+        try (Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery(
+                 "SELECT array_position('[4:6]={10,20,10}'::integer[], 10), "
+                 + "array_positions('[4:6]={10,20,10}'::integer[], 10)::text, "
+                 + "array_remove('[4:6]={10,20,10}'::integer[], 10)::text")) {
+            rs.next();
+            line("array subscripts " + rs.getInt(1) + "|" + rs.getString(2) + "|" + rs.getString(3));
+        }
     }
 
     // Prepared-statement CRUD, the core of any driver's use.

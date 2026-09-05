@@ -110,6 +110,12 @@ func main() {
 	var dynamicAnalyze bool
 	must("plpgsql dynamic analyze", conn.QueryRow(ctx, "SELECT pgx_dynamic_analyze($1)", 41).Scan(&dynamicAnalyze))
 	fmt.Printf("plpgsql dynamic analyze %t\n", dynamicAnalyze)
+	var first int
+	var positions, removed string
+	must("array subscripts", conn.QueryRow(ctx,
+		"SELECT array_position('[4:6]={10,20,10}'::integer[], 10), array_positions('[4:6]={10,20,10}'::integer[], 10)::text, array_remove('[4:6]={10,20,10}'::integer[], 10)::text").
+		Scan(&first, &positions, &removed))
+	fmt.Printf("array subscripts %d|%s|%s\n", first, positions, removed)
 
 	// Transaction rollback must not persist.
 	tx, err := conn.Begin(ctx)

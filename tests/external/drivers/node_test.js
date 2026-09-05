@@ -72,6 +72,11 @@ async function main() {
       "INTO STRICT plan USING value; RETURN plan IS NOT NULL; END'");
     const dynamicAnalyze = await c.query('SELECT node_dynamic_analyze($1) AS ok', [41]);
     line(`plpgsql dynamic analyze ${dynamicAnalyze.rows[0].ok}`);
+    const arraySubscripts = await c.query(
+      "SELECT array_position('[4:6]={10,20,10}'::integer[], 10) AS first, " +
+      "array_positions('[4:6]={10,20,10}'::integer[], 10)::text AS positions, " +
+      "array_remove('[4:6]={10,20,10}'::integer[], 10)::text AS removed");
+    line(`array subscripts ${arraySubscripts.rows[0].first}|${arraySubscripts.rows[0].positions}|${arraySubscripts.rows[0].removed}`);
 
     // Transaction rollback must not persist.
     await c.query('BEGIN');

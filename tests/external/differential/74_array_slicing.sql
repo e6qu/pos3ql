@@ -32,6 +32,18 @@ SELECT array_dims('[2:3][4:5]={{1,2},{3,4}}'::int[]), array_lower('[2:3][4:5]={{
 SELECT ('[2:3][4:5]={{1,2},{3,4}}'::int[])[3][5], ('[2:3][4:5]={{1,2},{3,4}}'::int[])[2:2];
 SELECT array_fill(7, ARRAY[2,3], ARRAY[4,8]);
 
+-- Search returns declared subscripts, not physical offsets. The optional
+-- starting point is also a declared subscript; removing elements retains the
+-- array's lower bound.
+SELECT array_position('[4:6]={10,20,10}'::int[], 10),
+       array_position('[4:6]={10,20,10}'::int[], 10, 5),
+       array_position('[4:6]={10,20,10}'::int[], 10, 7) IS NULL;
+SELECT array_positions('[4:6]={10,20,10}'::int[], 10);
+SELECT array_remove('[4:6]={10,20,10}'::int[], 10),
+       array_replace('[4:6]={10,20,10}'::int[], 10, 11);
+SELECT array_position('{{1,2},{3,1}}'::int[], 1);
+SELECT array_positions('{{1,2},{3,1}}'::int[], 1);
+
 -- array_agg(array) appends a leading dimension; arrays cannot be represented
 -- as independent array elements.
 SELECT array_agg(a) FROM (VALUES (ARRAY[1,2]), (ARRAY[3,4])) AS agg_array(a);

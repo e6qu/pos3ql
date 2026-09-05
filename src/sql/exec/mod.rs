@@ -28,10 +28,10 @@ use crate::wal::{Wal, WalOp};
 use core::num::NonZeroU8;
 
 use super::ast::{
-    AlterAction, AlterTable, CreateRoutine, CreateTable, CreateTrigger, Delete, DropTable, Expr,
-    Insert, LikeClause, Overriding, PartitionBound, PartitionClause, PartitionStrategy,
-    PublicationTarget, QualName, RoutineLanguage, Select, SelectItem, Stmt, TriggerEvent,
-    TriggerEvents, TriggerLevel, TriggerTiming, Update,
+    AlterAction, AlterTable, CreateRoutine, CreateTable, CreateTrigger, Delete, DropTable,
+    ExplainOptions, Expr, Insert, LikeClause, Overriding, PartitionBound, PartitionClause,
+    PartitionStrategy, PublicationTarget, QualName, RoutineLanguage, Select, SelectItem, Stmt,
+    TriggerEvent, TriggerEvents, TriggerLevel, TriggerTiming, Update,
 };
 use super::eval::{
     ColumnLookup, EvalHooks, NO_HOOKS, NoColumns, SqlError, arena_full, cast_to, compare_datums,
@@ -17380,7 +17380,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
-    guc: &super::guc::GucState,
+    guc: &mut super::guc::GucState,
     transaction_context: PlpgsqlTransactionContext,
     source: &'a str,
     arena: &'a Arena,
@@ -17400,7 +17400,6 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         txn,
         arena,
         params: crate::sql::eval::NO_PARAMS,
-        seq_session: guc.seq_session(),
         responder,
     };
     let mut local_values = [Datum::Null; MAX_COLUMNS];
@@ -17448,7 +17447,7 @@ pub(crate) fn execute_event_trigger<'a>(
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
-    guc: &super::guc::GucState,
+    guc: &mut super::guc::GucState,
     routine: &crate::storage::RoutineDef,
     event: &'a str,
     tag: &'a str,
@@ -17472,7 +17471,6 @@ pub(crate) fn execute_event_trigger<'a>(
         txn,
         arena,
         params: crate::sql::eval::NO_PARAMS,
-        seq_session: guc.seq_session(),
         responder,
     };
     let mut local_values = [Datum::Null; MAX_COLUMNS];
@@ -17523,7 +17521,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
-    guc: &super::guc::GucState,
+    guc: &mut super::guc::GucState,
     transaction_context: PlpgsqlTransactionContext,
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
@@ -17617,7 +17615,6 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         txn,
         arena,
         params: inputs,
-        seq_session: guc.seq_session(),
         responder,
     };
     let mut local_values = [Datum::Null; MAX_COLUMNS];
@@ -17681,7 +17678,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
-    guc: &super::guc::GucState,
+    guc: &mut super::guc::GucState,
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
@@ -17781,7 +17778,6 @@ pub(crate) fn execute_plpgsql_function<'a>(
         txn,
         arena,
         params: inputs,
-        seq_session: guc.seq_session(),
         responder,
     };
     let mut local_values = [Datum::Null; MAX_COLUMNS];
@@ -17847,7 +17843,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     txn: &mut TxnState,
     sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
-    guc: &super::guc::GucState,
+    guc: &mut super::guc::GucState,
     routine: &crate::storage::RoutineDef,
     inputs: &'a [Datum<'a>],
     arena: &'a Arena,
@@ -17948,7 +17944,6 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         txn,
         arena,
         params: inputs,
-        seq_session: guc.seq_session(),
         responder,
     };
     let mut local_values = [Datum::Null; MAX_COLUMNS];
@@ -18702,10 +18697,11 @@ enum PlpgsqlExecHost<'s> {
         // Nested DML reuses the caller's startup-sized scratch only after the
         // outer scan is detached; the pointer is never borrowed concurrently.
         scratch: *mut DmlScratch,
+        seq_session: &'s crate::sql::guc::SeqSession,
     },
     Routine {
         engine: &'s mut super::Engine,
-        guc: &'s super::guc::GucState,
+        guc: &'s mut super::guc::GucState,
         sqlprep: &'s mut super::prep::SqlPreparedPool,
         cursors: &'s mut super::cursor::CursorPool,
         transaction_context: PlpgsqlTransactionContext,
@@ -18731,6 +18727,13 @@ impl PlpgsqlExecHost<'_> {
         match self {
             Self::Atomic { scratch, .. } => *scratch,
             Self::Routine { engine, .. } => &mut engine.dml_scratch,
+        }
+    }
+
+    fn seq_session(&self) -> &crate::sql::guc::SeqSession {
+        match self {
+            Self::Atomic { seq_session, .. } => seq_session,
+            Self::Routine { guc, .. } => guc.seq_session(),
         }
     }
 
@@ -18787,7 +18790,6 @@ struct TriggerExecContext<'s, 'a, 'b> {
     txn: &'s mut TxnState,
     arena: &'a Arena,
     params: &'a [Datum<'a>],
-    seq_session: &'s crate::sql::guc::SeqSession,
     responder: &'s mut Responder<'b>,
 }
 
@@ -18804,16 +18806,32 @@ impl<'s, 'a, 'b> TriggerExecContext<'s, 'a, 'b> {
         self.host.scratch()
     }
 
-    fn dml_parts<'borrow>(
+    fn seq_session(&self) -> &crate::sql::guc::SeqSession {
+        self.host.seq_session()
+    }
+
+    fn dml_parts_with_sequence<'borrow>(
         &'borrow mut self,
     ) -> (
         &'borrow mut Storage,
         &'borrow mut TxnState,
         *mut DmlScratch,
         &'borrow mut Responder<'b>,
+        &'borrow crate::sql::guc::SeqSession,
     ) {
-        let scratch = self.host.scratch();
-        (self.host.storage_mut(), self.txn, scratch, self.responder)
+        let (storage, scratch, seq_session) = match &mut self.host {
+            PlpgsqlExecHost::Atomic {
+                storage,
+                scratch,
+                seq_session,
+            } => (&mut **storage, *scratch, *seq_session),
+            PlpgsqlExecHost::Routine { engine, guc, .. } => (
+                &mut engine.storage,
+                &mut engine.dml_scratch as *mut _,
+                guc.seq_session(),
+            ),
+        };
+        (storage, self.txn, scratch, self.responder, seq_session)
     }
 }
 
@@ -18825,7 +18843,7 @@ fn eval_trigger_expression<'a>(
     let catalog = super::query::storage_catalog(context.storage(), context.arena, context.txn.txid);
     let sequence = crate::sql::sequence::SeqEval::new(
         context.storage(),
-        context.seq_session,
+        context.seq_session(),
         context.txn.txid,
     );
     let hooks = EvalHooks {
@@ -19008,7 +19026,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                     context.txn.txid,
                     TriggerQueryExecution {
                         params: query.arguments,
-                        seq_session: context.seq_session,
+                        seq_session: context.seq_session(),
                     },
                     scope,
                 )?),
@@ -19028,8 +19046,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
             };
             let arena = context.arena;
             let params = query.arguments;
-            let seq_session = context.seq_session;
-            let (storage, txn, scratch, responder) = context.dml_parts();
+            let (storage, txn, scratch, responder, seq_session) = context.dml_parts_with_sequence();
             let scratch = unsafe { &mut *scratch };
             txn.enter_trigger_sql()?;
             responder.clear_affected_rows();
@@ -19069,8 +19086,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                 })?;
             let arena = context.arena;
             let params = query.arguments;
-            let seq_session = context.seq_session;
-            let (storage, txn, _, responder) = context.dml_parts();
+            let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
             txn.enter_trigger_sql()?;
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -19114,8 +19130,7 @@ fn execute_bound_plpgsql_dynamic_dml<'a>(
                 })?;
             let arena = context.arena;
             let params = query.arguments;
-            let seq_session = context.seq_session;
-            let (storage, txn, _, responder) = context.dml_parts();
+            let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
             txn.enter_trigger_sql()?;
             responder.clear_affected_rows();
             let outcome = responder.without_query_output(|responder| {
@@ -19383,7 +19398,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *if_exists,
                     *cascade,
                     context.arena,
-                    context.seq_session,
+                    guc.seq_session(),
                     responder,
                 ),
                 Stmt::AlterSchema { name, action } => super::exec::alter_schema(
@@ -19423,7 +19438,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.dml_scratch,
                     command,
                     context.arena,
-                    context.seq_session,
+                    guc.seq_session(),
                     responder,
                 ),
                 Stmt::CreateTablespace {
@@ -19596,7 +19611,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *if_exists,
                     *action,
                     context.arena,
-                    context.seq_session,
+                    guc.seq_session(),
                     responder,
                 ),
                 Stmt::CreateRule(rule) => super::exec::create_rule(
@@ -20029,7 +20044,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     roles,
                     *cascade,
                     context.arena,
-                    context.seq_session,
+                    guc.seq_session(),
                     responder,
                 ),
                 Stmt::DropView {
@@ -20073,7 +20088,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *if_exists,
                     *cascade,
                     context.arena,
-                    context.seq_session,
+                    guc.seq_session(),
                     responder,
                 ),
                 Stmt::CreateConversion(command) => super::exec::create_conversion(
@@ -20451,7 +20466,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     super::exec::ForeignTableAlterRuntime {
                         scratch: &mut engine.dml_scratch,
                         arena: context.arena,
-                        sequence: context.seq_session,
+                        sequence: guc.seq_session(),
                     },
                     responder,
                 ),
@@ -20483,7 +20498,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *kind == crate::sql::ast::CreateTableAsKind::MaterializedView,
                     *options,
                     guc.search_path().as_str(),
-                    context.seq_session,
+                    guc.seq_session(),
                     context.arena,
                     query.arguments,
                     responder,
@@ -20493,7 +20508,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     &mut engine.wal,
                     txn,
                     name,
-                    context.seq_session,
+                    guc.seq_session(),
                     context.arena,
                     query.arguments,
                     responder,
@@ -20537,7 +20552,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         if_exists: *if_exists,
                         action: *action,
                     },
-                    context.seq_session,
+                    guc.seq_session(),
                     context.arena,
                     responder,
                 ),
@@ -20584,7 +20599,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *if_exists,
                     *cascade,
                     &engine.work,
-                    context.seq_session,
+                    guc.seq_session(),
                     responder,
                 ),
                 Stmt::CreateEnum { name, labels } => super::exec::create_enum(
@@ -20625,7 +20640,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *if_exists,
                     *cascade,
                     &engine.work,
-                    context.seq_session,
+                    guc.seq_session(),
                     responder,
                 ),
                 Stmt::CreateIndex {
@@ -20764,7 +20779,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     txn,
                     &mut engine.dml_scratch,
                     context.arena,
-                    context.seq_session,
+                    guc.seq_session(),
                     tables,
                     *restart_identity,
                     *cascade,
@@ -20979,6 +20994,76 @@ fn dynamic_dml_outcome(
             command
         )),
     }
+}
+
+/// Runs a dynamic EXPLAIN through the same planner, analyzed executor, and
+/// accounting path as a top-level statement before routing its rendered rows
+/// to the procedural caller.
+fn execute_plpgsql_dynamic_explain(
+    context: &mut TriggerExecContext<'_, '_, '_>,
+    options: ExplainOptions,
+    statement: &Stmt<'_>,
+    arguments: &[Datum],
+    emit: &mut dyn FnMut(&str) -> Result<(), SqlError>,
+) -> Result<(), SqlError> {
+    let plan = super::explain::plan_statement(
+        context.storage(),
+        context.txn.txid,
+        statement,
+        context.arena,
+    )?;
+    let actual = if options.analyze {
+        let TriggerExecContext {
+            host,
+            txn,
+            arena,
+            responder,
+            ..
+        } = context;
+        let PlpgsqlExecHost::Routine { engine, guc, .. } = host else {
+            return Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "EXPLAIN ANALYZE is not available in trigger execution"
+            ));
+        };
+        let before = engine.storage.block_io_stats();
+        let (before_wal_records, before_wal_bytes) = engine.wal.stage_stats(txn.txid);
+        let touched_mark = txn.touched().len();
+        let started = std::time::Instant::now();
+        responder.begin_discard_query_output(options.serialize);
+        let execution =
+            engine.execute_explained_statement(statement, arena, arguments, txn, guc, responder);
+        let output = responder.finish_discard_query_output();
+        match execution {
+            Err(_) => {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "PL/pgSQL EXPLAIN ANALYZE exceeds the response buffer"
+                ));
+            }
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(())) => {}
+        }
+        let elapsed_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        let (after_wal_records, after_wal_bytes) = engine.wal.stage_stats(txn.txid);
+        let (row_wal_records, row_wal_bytes) = engine.explained_row_wal_stats(txn, touched_mark)?;
+        Some(super::explain::ExplainActual {
+            rows: super::explained_root_rows(statement, output.rows),
+            elapsed_micros,
+            io: engine.storage.block_io_stats().saturating_sub(before),
+            serialized_bytes: output.serialized_bytes,
+            serialization_micros: output.serialization_micros,
+            wal_records: after_wal_records
+                .saturating_sub(before_wal_records)
+                .saturating_add(row_wal_records),
+            wal_bytes: after_wal_bytes
+                .saturating_sub(before_wal_bytes)
+                .saturating_add(row_wal_bytes),
+        })
+    } else {
+        None
+    };
+    super::explain::visit_plan_rows(&plan, options, actual, emit)
 }
 
 fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>, index: usize) {
@@ -21323,7 +21408,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
     let mut count = 0usize;
     let dry = crate::sql::sequence::SeqEval::dry(
         context.storage(),
-        context.seq_session,
+        context.seq_session(),
         context.txn.txid,
     );
     execute_bound_plpgsql_dynamic_query(context, query, scope, &dry, &mut |values| {
@@ -21342,7 +21427,7 @@ fn materialize_plpgsql_dynamic_for_query<'a>(
         .map_err(|_| super::query::arena_full_pub())?;
     let live = crate::sql::sequence::SeqEval::new(
         context.storage(),
-        context.seq_session,
+        context.seq_session(),
         context.txn.txid,
     );
     let mut at = 0usize;
@@ -21561,7 +21646,7 @@ fn execute_trigger_block<'a>(
                 };
                 let sequence = crate::sql::sequence::SeqEval::new(
                     context.storage(),
-                    context.seq_session,
+                    context.seq_session(),
                     context.txn.txid,
                 );
                 super::query::select_into_rows(
@@ -21602,7 +21687,7 @@ fn execute_trigger_block<'a>(
                 };
                 let sequence = crate::sql::sequence::SeqEval::new(
                     context.storage(),
-                    context.seq_session,
+                    context.seq_session(),
                     context.txn.txid,
                 );
                 execute_plpgsql_dynamic_query(context, query, &scope, &sequence, &mut |values| {
@@ -21790,7 +21875,7 @@ fn execute_trigger_block<'a>(
                 };
                 let sequence = crate::sql::sequence::SeqEval::new(
                     context.storage(),
-                    context.seq_session,
+                    context.seq_session(),
                     context.txn.txid,
                 );
                 let mut selected = [Datum::Null; MAX_COLUMNS];
@@ -21903,25 +21988,19 @@ fn execute_trigger_block<'a>(
                 };
                 match query.statement {
                     Stmt::Explain { options, statement } => {
-                        let plan = super::explain::plan_statement(
-                            context.storage(),
-                            context.txn.txid,
+                        let arena = context.arena;
+                        execute_plpgsql_dynamic_explain(
+                            context,
+                            *options,
                             statement,
-                            context.arena,
+                            query.arguments,
+                            &mut |line| {
+                                let line = arena
+                                    .alloc_str(line)
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                capture(&[Datum::Text(line)])
+                            },
                         )?;
-                        if options.analyze {
-                            return Err(sql_err!(
-                                sqlstate::FEATURE_NOT_SUPPORTED,
-                                "PL/pgSQL EXECUTE INTO does not support EXPLAIN ANALYZE"
-                            ));
-                        }
-                        super::explain::visit_plan_rows(&plan, *options, None, |line| {
-                            let line = context
-                                .arena
-                                .alloc_str(line)
-                                .map_err(|_| super::query::arena_full_pub())?;
-                            capture(&[Datum::Text(line)])
-                        })?;
                     }
                     Stmt::Show(name) => {
                         let value = {
@@ -22001,7 +22080,7 @@ fn execute_trigger_block<'a>(
                     Stmt::Select(_) | Stmt::SetQuery(_) => {
                         let sequence = crate::sql::sequence::SeqEval::new(
                             context.storage(),
-                            context.seq_session,
+                            context.seq_session(),
                             context.txn.txid,
                         );
                         execute_bound_plpgsql_dynamic_query(
@@ -22079,7 +22158,7 @@ fn execute_trigger_block<'a>(
                     Stmt::Select(_) | Stmt::SetQuery(_) => {
                         let sequence = crate::sql::sequence::SeqEval::new(
                             context.storage(),
-                            context.seq_session,
+                            context.seq_session(),
                             context.txn.txid,
                         );
                         let mut rows = 0u64;
@@ -22108,6 +22187,16 @@ fn execute_trigger_block<'a>(
                             transition_relations,
                             None,
                         )?
+                    }
+                    Stmt::Explain { options, statement } => {
+                        execute_plpgsql_dynamic_explain(
+                            context,
+                            *options,
+                            statement,
+                            query.arguments,
+                            &mut |_| Ok(()),
+                        )?;
+                        0
                     }
                     _ => {
                         execute_bound_plpgsql_dynamic_utility(context, query)?;
@@ -22141,7 +22230,7 @@ fn execute_trigger_block<'a>(
                 };
                 let sequence = crate::sql::sequence::SeqEval::new(
                     context.storage(),
-                    context.seq_session,
+                    context.seq_session(),
                     context.txn.txid,
                 );
                 let mut row_count = 0u64;
@@ -22471,7 +22560,7 @@ fn execute_trigger_block<'a>(
                             context.txn.txid,
                             TriggerQueryExecution {
                                 params: context.params,
-                                seq_session: context.seq_session,
+                                seq_session: context.seq_session(),
                             },
                             &scope,
                         )?)
@@ -22492,8 +22581,8 @@ fn execute_trigger_block<'a>(
                 };
                 let arena = context.arena;
                 let params = context.params;
-                let seq_session = context.seq_session;
-                let (storage, txn, scratch, responder) = context.dml_parts();
+                let (storage, txn, scratch, responder, seq_session) =
+                    context.dml_parts_with_sequence();
                 let scratch = unsafe { &mut *scratch };
                 txn.enter_trigger_sql()?;
                 responder.clear_affected_rows();
@@ -22586,8 +22675,7 @@ fn execute_trigger_block<'a>(
                 };
                 let arena = context.arena;
                 let params = context.params;
-                let seq_session = context.seq_session;
-                let (storage, txn, _, responder) = context.dml_parts();
+                let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
                 txn.enter_trigger_sql()?;
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
@@ -22684,8 +22772,7 @@ fn execute_trigger_block<'a>(
                 };
                 let arena = context.arena;
                 let params = context.params;
-                let seq_session = context.seq_session;
-                let (storage, txn, _, responder) = context.dml_parts();
+                let (storage, txn, _, responder, seq_session) = context.dml_parts_with_sequence();
                 txn.enter_trigger_sql()?;
                 responder.clear_affected_rows();
                 let outcome = responder.without_command_complete(|responder| {
@@ -22880,7 +22967,7 @@ fn execute_trigger_block<'a>(
                                     context.txn.txid,
                                     TriggerQueryExecution {
                                         params: context.params,
-                                        seq_session: context.seq_session,
+                                        seq_session: context.seq_session(),
                                     },
                                     &scope,
                                 )?
@@ -22893,7 +22980,7 @@ fn execute_trigger_block<'a>(
                                     context.txn.txid,
                                     TriggerQueryExecution {
                                         params: context.params,
-                                        seq_session: context.seq_session,
+                                        seq_session: context.seq_session(),
                                     },
                                     &scope,
                                 )?
@@ -23573,16 +23660,18 @@ fn fire_row_triggers<'a, T: Into<crate::storage::TriggerTarget>>(
         );
         let arena = context.arena;
         let params = context.params;
-        let seq_session = context.seq_session;
-        let (storage, txn, scratch, responder) = context.dml_parts();
+        let (storage, txn, scratch, responder, seq_session) = context.dml_parts_with_sequence();
         if matches!(
             fire_row_trigger_slot(
                 TriggerExecContext {
-                    host: PlpgsqlExecHost::Atomic { storage, scratch },
+                    host: PlpgsqlExecHost::Atomic {
+                        storage,
+                        scratch,
+                        seq_session
+                    },
                     txn,
                     arena,
                     params,
-                    seq_session,
                     responder,
                 },
                 target,
@@ -23658,11 +23747,14 @@ fn execute_deferred_trigger_event<'a>(
     // statement and savepoint rewind restore the marker if execution fails.
     txn.complete_deferred_trigger(index)?;
     let mut context = TriggerExecContext {
-        host: PlpgsqlExecHost::Atomic { storage, scratch },
+        host: PlpgsqlExecHost::Atomic {
+            storage,
+            scratch,
+            seq_session,
+        },
         txn,
         arena,
         params: crate::sql::eval::NO_PARAMS,
-        seq_session,
         responder,
     };
     execute_row_trigger_body(
@@ -23729,8 +23821,7 @@ fn fire_statement_row_trigger_events<'a>(
             continue;
         };
         let arena = context.arena;
-        let seq_session = context.seq_session;
-        let (storage, txn, scratch, responder) = context.dml_parts();
+        let (storage, txn, scratch, responder, seq_session) = context.dml_parts_with_sequence();
         execute_deferred_trigger_event(
             storage,
             txn,
@@ -23890,11 +23981,14 @@ fn fire_partition_row_triggers<'a>(
         if matches!(
             fire_row_trigger_slot(
                 TriggerExecContext {
-                    host: PlpgsqlExecHost::Atomic { storage, scratch },
+                    host: PlpgsqlExecHost::Atomic {
+                        storage,
+                        scratch,
+                        seq_session
+                    },
                     txn,
                     arena,
                     params: crate::sql::eval::NO_PARAMS,
-                    seq_session,
                     responder,
                 },
                 crate::storage::TriggerTarget::Table(target as u16),
@@ -24204,15 +24298,17 @@ fn fire_after_triggers_with_rows<'a>(
     let trigger_depth = context.txn.trigger_depth();
     let arena = context.arena;
     let params = context.params;
-    let seq_session = context.seq_session;
-    let (storage, txn, scratch, responder) = context.dml_parts();
+    let (storage, txn, scratch, responder, seq_session) = context.dml_parts_with_sequence();
     fire_statement_row_trigger_events(
         TriggerExecContext {
-            host: PlpgsqlExecHost::Atomic { storage, scratch },
+            host: PlpgsqlExecHost::Atomic {
+                storage,
+                scratch,
+                seq_session,
+            },
             txn,
             arena,
             params,
-            seq_session,
             responder,
         },
         trigger_depth,
@@ -47732,11 +47828,11 @@ pub fn copy_statement_begin(
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 scratch: scratch as *mut _,
+                seq_session,
             },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
-            seq_session,
             responder,
         },
         setup.table_index,
@@ -47788,11 +47884,11 @@ pub fn copy_statement_end(
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 scratch: scratch as *mut _,
+                seq_session,
             },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
-            seq_session,
             responder,
         },
         setup.table_index.into(),
@@ -51489,11 +51585,11 @@ pub fn merge<'a>(
                     host: PlpgsqlExecHost::Atomic {
                         storage,
                         scratch: scratch as *mut _,
+                        seq_session,
                     },
                     txn,
                     arena,
                     params: crate::sql::eval::NO_PARAMS,
-                    seq_session,
                     responder,
                 },
                 table_index,
@@ -52461,11 +52557,11 @@ pub fn merge<'a>(
                     host: PlpgsqlExecHost::Atomic {
                         storage,
                         scratch: scratch as *mut _,
+                        seq_session,
                     },
                     txn,
                     arena,
                     params: crate::sql::eval::NO_PARAMS,
-                    seq_session,
                     responder,
                 },
                 table_index.into(),
@@ -53035,11 +53131,11 @@ pub(crate) fn fire_view_statement_triggers(
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 scratch: scratch as *mut _,
+                seq_session,
             },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
-            seq_session,
             responder,
         },
         crate::storage::TriggerTarget::View(view_slot as u16),
@@ -53671,11 +53767,11 @@ fn fire_view_row_trigger<'a>(
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 scratch: scratch as *mut _,
+                seq_session,
             },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
-            seq_session,
             responder,
         },
         target,
@@ -53983,11 +54079,11 @@ where
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 scratch: scratch as *mut _,
+                seq_session,
             },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
-            seq_session,
             responder,
         },
         table_index,
@@ -54004,11 +54100,11 @@ where
                 host: PlpgsqlExecHost::Atomic {
                     storage,
                     scratch: scratch as *mut _,
+                    seq_session,
                 },
                 txn,
                 arena,
                 params: crate::sql::eval::NO_PARAMS,
-                seq_session,
                 responder,
             },
             table_index,
@@ -54267,11 +54363,11 @@ where
                     host: PlpgsqlExecHost::Atomic {
                         storage,
                         scratch: scratch as *mut _,
+                        seq_session,
                     },
                     txn,
                     arena,
                     params: crate::sql::eval::NO_PARAMS,
-                    seq_session,
                     responder,
                 },
                 table_index.into(),
@@ -54290,11 +54386,11 @@ where
                 host: PlpgsqlExecHost::Atomic {
                     storage,
                     scratch: scratch as *mut _,
+                    seq_session,
                 },
                 txn,
                 arena,
                 params: crate::sql::eval::NO_PARAMS,
-                seq_session,
                 responder,
             },
             table_index.into(),
@@ -54502,11 +54598,11 @@ where
                 host: PlpgsqlExecHost::Atomic {
                     storage,
                     scratch: scratch as *mut _,
+                    seq_session,
                 },
                 txn,
                 arena,
                 params: crate::sql::eval::NO_PARAMS,
-                seq_session,
                 responder,
             },
             table_index.into(),
@@ -54525,11 +54621,11 @@ where
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 scratch: scratch as *mut _,
+                seq_session,
             },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
-            seq_session,
             responder,
         },
         table_index.into(),
@@ -55161,11 +55257,11 @@ pub(crate) fn update<'a>(
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 scratch: scratch as *mut _,
+                seq_session,
             },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
-            seq_session,
             responder,
         },
         table_index,
@@ -55836,11 +55932,11 @@ pub(crate) fn update<'a>(
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 scratch: scratch as *mut _,
+                seq_session,
             },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
-            seq_session,
             responder,
         },
         table_index.into(),
@@ -55953,11 +56049,11 @@ pub(crate) fn delete<'a>(
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 scratch: scratch as *mut _,
+                seq_session,
             },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
-            seq_session,
             responder,
         },
         table_index,
@@ -56279,11 +56375,11 @@ pub(crate) fn delete<'a>(
             host: PlpgsqlExecHost::Atomic {
                 storage,
                 scratch: scratch as *mut _,
+                seq_session,
             },
             txn,
             arena,
             params: crate::sql::eval::NO_PARAMS,
-            seq_session,
             responder,
         },
         table_index.into(),
@@ -56429,11 +56525,11 @@ pub fn truncate(
                 host: PlpgsqlExecHost::Atomic {
                     storage,
                     scratch: scratch as *mut _,
+                    seq_session,
                 },
                 txn,
                 arena,
                 params: crate::sql::eval::NO_PARAMS,
-                seq_session,
                 responder,
             },
             table_index,
@@ -56528,11 +56624,11 @@ pub fn truncate(
                 host: PlpgsqlExecHost::Atomic {
                     storage,
                     scratch: scratch as *mut _,
+                    seq_session,
                 },
                 txn,
                 arena,
                 params: crate::sql::eval::NO_PARAMS,
-                seq_session,
                 responder,
             },
             table_index,

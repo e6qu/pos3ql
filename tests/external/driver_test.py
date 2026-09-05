@@ -131,6 +131,18 @@ cur.execute("SELECT value FROM drv_plpgsql_log")
 assert cur.fetchone() == (42,)
 print("plpgsql procedure ok")
 
+# Dynamic analyzed output crosses an extended Bind/Result boundary as a
+# PostgreSQL value, including the inner EXECUTE parameter.
+cur.execute(
+    "CREATE FUNCTION drv_dynamic_analyze(value integer) RETURNS boolean LANGUAGE plpgsql "
+    "AS 'DECLARE plan text; BEGIN "
+    "EXECUTE ''EXPLAIN (ANALYZE, FORMAT JSON) SELECT $1 + 1'' "
+    "INTO STRICT plan USING value; RETURN plan IS NOT NULL; END'"
+)
+cur.execute("SELECT drv_dynamic_analyze(%s)", (41,))
+assert cur.fetchone() == (True,)
+print("plpgsql dynamic analyze extended protocol ok")
+
 # A lone extended-protocol CALL in autocommit mode is non-atomic: PostgreSQL
 # permits COMMIT/ROLLBACK in the procedure and immediately starts the next
 # transaction while preserving parameters and local execution state.

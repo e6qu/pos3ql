@@ -1395,7 +1395,9 @@ pub(super) fn plan_statement<'a>(
 ) -> Result<Plan, SqlError> {
     match statement {
         Stmt::Select(select) => {
-            let select = if select.with.is_empty() {
+            let select = if select.with.iter().any(|cte| cte.dml.is_some()) {
+                return plan_data_modifying_cte_select(select);
+            } else if select.with.is_empty() {
                 select
             } else {
                 query::expand_ctes(select, storage, txid, arena)?
@@ -1421,6 +1423,35 @@ pub(super) fn plan_statement<'a>(
             "EXPLAIN does not support this statement type"
         )),
     }
+}
+
+/// A data-modifying CTE's result relation exists only while the statement is
+/// executing.  Planning must not run that write merely to discover its rows,
+/// so model the consumer and each producer from the parsed boundary; ANALYZE
+/// then executes the ordinary shared CTE path to obtain the actual metrics.
+fn plan_data_modifying_cte_select(select: &Select<'_>) -> Result<Plan, SqlError> {
+    let started = std::time::Instant::now();
+    let mut plan = Plan::new();
+    plan.push(PlanNode {
+        name: StackStr::from_str("CTE Scan"),
+        rows: 1_000,
+        width: 32,
+        total_cost: 10.0,
+        ..PlanNode::EMPTY
+    })?;
+    for cte in select.with.iter().filter(|cte| cte.dml.is_some()) {
+        plan.push(PlanNode {
+            name: StackStr::from_str("Data-modifying CTE"),
+            relation: StackStr::from_str(cte.name),
+            depth: 1,
+            rows: 1_000,
+            width: 32,
+            total_cost: 10.0,
+            ..PlanNode::EMPTY
+        })?;
+    }
+    plan.planning_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    Ok(plan)
 }
 
 fn json_string(out: &mut StackStr<16_384>, value: &str) {

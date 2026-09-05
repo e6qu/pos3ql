@@ -940,6 +940,7 @@ enum EventTriggerInvocation<'a> {
 
 struct EventTriggerExecution<'a, 'response> {
     txn: &'a mut TxnState,
+    sqlprep: &'a mut SqlPreparedPool,
     cursors: &'a mut cursor::CursorPool,
     guc: &'a GucState,
     arena: &'a Arena,
@@ -1238,7 +1239,6 @@ pub(crate) fn event_trigger_tag_supported(tag: &str) -> bool {
 
 fn top_level_only_command(statement: &Stmt<'_>) -> Option<&'static str> {
     match statement {
-        Stmt::Checkpoint => Some("CHECKPOINT"),
         Stmt::Vacuum { .. } => Some("VACUUM"),
         // A relation-specific CLUSTER is transactional; the all-relations
         // form controls its own work across relations and is not.
@@ -6416,6 +6416,567 @@ impl Engine {
         Ok(total_rows)
     }
 
+    pub(crate) fn execute_checkpoint_statement(
+        &mut self,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        match self.checkpoint() {
+            Ok(_) => {
+                responder.command_complete("CHECKPOINT")?;
+                Ok(Ok(()))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    pub(crate) fn execute_vacuum_statement(
+        &mut self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        options: ast::VacuumOptions,
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let mode = if options.full {
+            ast::TableLockMode::AccessExclusive
+        } else {
+            ast::TableLockMode::ShareUpdateExclusive
+        };
+        if let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode) {
+            return Ok(Err(error));
+        }
+        let validation = if options.analyze {
+            self.analyze_targets(targets, txn).map(|_| ())
+        } else {
+            self.validate_maintenance_targets(targets, txn.txid)
+        };
+        if let Err(error) = validation {
+            return Ok(Err(error));
+        }
+        if self.ckpt.is_some()
+            && let Err(error) = self.checkpoint()
+        {
+            return Ok(Err(error));
+        }
+        responder.command_complete("VACUUM")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_analyze_statement(
+        &mut self,
+        targets: &[ast::MaintenanceTarget<'_>],
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Err(error) = self.lock_maintenance_targets(
+            targets,
+            txn.txid,
+            ast::TableLockMode::ShareUpdateExclusive,
+        ) {
+            return Ok(Err(error));
+        }
+        if let Err(error) = self.analyze_targets(targets, txn) {
+            return Ok(Err(error));
+        }
+        responder.command_complete("ANALYZE")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_listen_statement(
+        &mut self,
+        channel: &str,
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let operation = notify::ListenOp::Listen {
+            conn_id: self.current_conn_id,
+            channel: notify::channel(channel),
+        };
+        if let Err(error) = txn.buffer_listen_op(operation) {
+            return Ok(Err(error));
+        }
+        responder.command_complete("LISTEN")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_unlisten_statement(
+        &mut self,
+        channel: Option<&str>,
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let operation = match channel {
+            Some(name) => notify::ListenOp::Unlisten {
+                conn_id: self.current_conn_id,
+                channel: notify::channel(name),
+            },
+            None => notify::ListenOp::UnlistenAll {
+                conn_id: self.current_conn_id,
+            },
+        };
+        if let Err(error) = txn.buffer_listen_op(operation) {
+            return Ok(Err(error));
+        }
+        responder.command_complete("UNLISTEN")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_notify_statement(
+        &mut self,
+        channel: &str,
+        text: Option<&str>,
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let payload = match text {
+            Some(text) => match notify::payload(text) {
+                Ok(payload) => payload,
+                Err(error) => return Ok(Err(error)),
+            },
+            None => notify::Payload::new(),
+        };
+        if let Err(error) = txn.buffer_notify(
+            self.current_conn_id,
+            notify::channel(channel),
+            payload.as_str(),
+        ) {
+            return Ok(Err(error));
+        }
+        responder.command_complete("NOTIFY")?;
+        Ok(Ok(()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_set_statement(
+        &mut self,
+        name: &str,
+        value: &str,
+        local: bool,
+        syntax: ast::SettingSyntax,
+        txn: &mut TxnState,
+        guc: &GucState,
+        arena: &Arena,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if crate::sql::guc::requires_set_privilege(name)
+            && self
+                .storage
+                .current_role_slot(txn.txid)
+                .is_some_and(|role| {
+                    !self.storage.role(role).attributes_to(txn.txid).superuser
+                        && crate::sql::ast::ParameterName::parse(name).is_none_or(|parameter| {
+                            !self.storage.has_parameter_privilege(
+                                parameter,
+                                role,
+                                crate::sql::ast::ParameterPrivileges::SET,
+                                txn.txid,
+                            )
+                        })
+                })
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to set parameter \"{}\"",
+                name
+            )));
+        }
+        if local && !txn.is_explicit() {
+            responder.warning(
+                sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                "SET LOCAL can only be used in transaction blocks",
+            )?;
+        }
+        if syntax == ast::SettingSyntax::FromCurrent {
+            if let Some(characteristics) = guc.current_transaction_setting_from_current(
+                name,
+                txn.isolation,
+                txn.read_only,
+                txn.deferrable,
+            ) {
+                let characteristics = match characteristics {
+                    Ok(characteristics) => characteristics,
+                    Err(error) => return Ok(Err(error)),
+                };
+                if let Err(error) = apply_current_transaction_setting(txn, characteristics) {
+                    return Ok(Err(error));
+                }
+            } else if let Err(error) = guc.set_from_current(name, local) {
+                return Ok(Err(error));
+            }
+            guc::publish_active_setting(guc, name);
+            responder.command_complete("SET")?;
+            return Ok(Ok(()));
+        }
+        if let Some(characteristics) = guc.current_transaction_setting(name, value) {
+            let characteristics = match characteristics {
+                Ok(characteristics) => characteristics,
+                Err(error) => return Ok(Err(error)),
+            };
+            if let Err(error) = apply_current_transaction_setting(txn, characteristics) {
+                return Ok(Err(error));
+            }
+            responder.command_complete("SET")?;
+            return Ok(Ok(()));
+        }
+        let changed = match syntax {
+            ast::SettingSyntax::Generic => guc.set(name, value, local),
+            ast::SettingSyntax::FromCurrent => {
+                unreachable!("FROM CURRENT is handled before value application")
+            }
+            ast::SettingSyntax::TimeZone => guc.set_time_zone_sql(value, local),
+            ast::SettingSyntax::TimeZoneInterval(type_mod) => {
+                let interval = match datetime::parse_interval(value) {
+                    Ok(interval) => interval,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let interval = match exec::apply_typmod(
+                    Datum::Interval(interval),
+                    types::ColType::Interval,
+                    type_mod,
+                    arena,
+                ) {
+                    Ok(Datum::Interval(interval)) => interval,
+                    Ok(_) => unreachable!("interval typmod preserves its type"),
+                    Err(error) => return Ok(Err(error)),
+                };
+                guc.set_time_zone_interval(interval, local)
+            }
+        };
+        match changed {
+            Ok(()) => {
+                if name.eq_ignore_ascii_case("default_tablespace") {
+                    let tablespace = guc.default_tablespace();
+                    let tablespace_name = tablespace.as_str();
+                    if !tablespace_name.is_empty()
+                        && !tablespace_name.eq_ignore_ascii_case("pg_default")
+                        && !tablespace_name.eq_ignore_ascii_case("pg_global")
+                        && self
+                            .storage
+                            .tablespace_slot(tablespace_name, txn.txid)
+                            .is_none()
+                    {
+                        return Ok(Err(sql_err!(
+                            sqlstate::INVALID_PARAMETER_VALUE,
+                            "invalid value for parameter \"default_tablespace\": \"{}\": tablespace does not exist",
+                            tablespace_name
+                        )));
+                    }
+                }
+                guc::publish_active_setting(guc, name);
+                responder.set_render(guc.render());
+                responder.command_complete("SET")?;
+                Ok(Ok(()))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    pub(crate) fn execute_reset_statement(
+        &mut self,
+        name: Option<&str>,
+        txn: &TxnState,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if name.is_some_and(crate::sql::guc::requires_set_privilege)
+            && self
+                .storage
+                .current_role_slot(txn.txid)
+                .is_some_and(|role| {
+                    !self.storage.role(role).attributes_to(txn.txid).superuser
+                        && name
+                            .and_then(crate::sql::ast::ParameterName::parse)
+                            .is_none_or(|parameter| {
+                                !self.storage.has_parameter_privilege(
+                                    parameter,
+                                    role,
+                                    crate::sql::ast::ParameterPrivileges::SET,
+                                    txn.txid,
+                                )
+                            })
+                })
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::INSUFFICIENT_PRIVILEGE,
+                "permission denied to set parameter \"{}\"",
+                name.unwrap_or("")
+            )));
+        }
+        if let Some(name) = name
+            && guc.transaction_reset_owned(name).is_some()
+        {
+            return Ok(Err(sql_err!(
+                sqlstate::FEATURE_NOT_SUPPORTED,
+                "parameter \"{}\" cannot be reset",
+                name
+            )));
+        }
+        let result = match name {
+            Some(name) => guc.reset(name),
+            None => {
+                guc.reset_all();
+                Ok(())
+            }
+        };
+        match result {
+            Ok(()) => {
+                responder.command_complete("RESET")?;
+                Ok(Ok(()))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    pub(crate) fn execute_lock_table_statement(
+        &mut self,
+        tables: &[ast::QualName<'_>],
+        mode: ast::TableLockMode,
+        nowait: bool,
+        txn: &mut TxnState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if !txn.is_explicit() {
+            return Ok(Err(sql_err!(
+                sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                "LOCK TABLE can only be used in transaction blocks"
+            )));
+        }
+        let mut slots = [usize::MAX; parser::MAX_LOCK_TABLES];
+        for (index, table) in tables.iter().enumerate() {
+            slots[index] = match exec::resolve_dml_table(&self.storage, table, txn.txid) {
+                Ok(slot) => slot,
+                Err(error) => return Ok(Err(error)),
+            };
+        }
+        for &slot in &slots[..tables.len()] {
+            if let Err(error) = self.storage.lock_table(txn.txid, slot, mode, nowait) {
+                return Ok(Err(error));
+            }
+        }
+        responder.command_complete("LOCK TABLE")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_set_constraints_statement(
+        &mut self,
+        targets: ast::ConstraintTargets<'_>,
+        mode: ast::ConstraintMode,
+        txn: &mut TxnState,
+        guc: &GucState,
+        arena: &Arena,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if !txn.is_explicit() {
+            responder.warning(
+                sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                "SET CONSTRAINTS can only be used in transaction blocks",
+            )?;
+            responder.command_complete("SET CONSTRAINTS")?;
+            return Ok(Ok(()));
+        }
+        let empty = txn::ConstraintIdentity::Table {
+            table: 0,
+            name: crate::storage::SqlName::EMPTY,
+            generation: 0,
+        };
+        let mut identities = [empty; txn::MAX_DEFERRED_CONSTRAINTS];
+        let count = match targets {
+            ast::ConstraintTargets::All => 0,
+            ast::ConstraintTargets::Named(names) => {
+                let mut count = 0;
+                for name in names {
+                    let mut matches = [empty; txn::MAX_DEFERRED_CONSTRAINTS];
+                    let matched = match exec::constraints::resolve_constraint_name(
+                        &self.storage,
+                        name,
+                        mode,
+                        txn.txid,
+                        &mut matches,
+                    ) {
+                        Ok(matched) => matched,
+                        Err(error) => return Ok(Err(error)),
+                    };
+                    for identity in matches[..matched].iter().copied() {
+                        let identity = txn.catalog_constraint_identity(identity);
+                        if identities[..count].contains(&identity) {
+                            continue;
+                        }
+                        if count == identities.len() {
+                            return Ok(Err(sql_err!(
+                                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                                "SET CONSTRAINTS matches more than {} constraints",
+                                identities.len()
+                            )));
+                        }
+                        identities[count] = identity;
+                        count += 1;
+                    }
+                }
+                count
+            }
+        };
+        let additional = if matches!(targets, ast::ConstraintTargets::All) {
+            1
+        } else {
+            count
+        };
+        if !txn.can_record_constraint_modes(additional) {
+            return Ok(Err(sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "transaction changes constraint modes more than {} times",
+                txn::MAX_DEFERRED_CONSTRAINTS
+            )));
+        }
+        if mode == ast::ConstraintMode::Immediate {
+            if matches!(targets, ast::ConstraintTargets::All) {
+                if let Err(error) = exec::constraints::validate_deferred_constraints(
+                    &self.storage,
+                    txn,
+                    false,
+                    arena,
+                ) {
+                    return Ok(Err(error));
+                }
+            } else {
+                for identity in identities[..count].iter().copied() {
+                    while let Some((index, obligation)) = txn.deferred_constraint_for(identity) {
+                        if let Err(error) = exec::constraints::validate_constraint_obligation(
+                            &self.storage,
+                            identity,
+                            obligation.rowid,
+                            txn.txid,
+                            arena,
+                        ) {
+                            return Ok(Err(error));
+                        }
+                        if let Err(error) = txn.complete_deferred_constraint(index) {
+                            return Ok(Err(error));
+                        }
+                    }
+                }
+            }
+            if matches!(targets, ast::ConstraintTargets::All) {
+                if let Err(error) = self.fire_constraint_trigger_boundary(
+                    txn,
+                    guc,
+                    arena,
+                    responder,
+                    exec::TriggerQueueBoundary::Constraints(None),
+                ) {
+                    return Ok(Err(error));
+                }
+            } else {
+                for identity in identities[..count].iter().copied() {
+                    if let Err(error) = self.fire_constraint_trigger_boundary(
+                        txn,
+                        guc,
+                        arena,
+                        responder,
+                        exec::TriggerQueueBoundary::Constraints(Some(identity)),
+                    ) {
+                        return Ok(Err(error));
+                    }
+                }
+            }
+        }
+        let result = if matches!(targets, ast::ConstraintTargets::All) {
+            txn.record_constraint_mode(None, mode)
+        } else {
+            let mut result = Ok(());
+            for identity in identities[..count].iter().copied() {
+                if let Err(error) = txn.record_constraint_mode(Some(identity), mode) {
+                    result = Err(error);
+                    break;
+                }
+            }
+            result
+        };
+        if let Err(error) = result {
+            return Ok(Err(error));
+        }
+        responder.command_complete("SET CONSTRAINTS")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_prepare_statement(
+        &mut self,
+        name: &str,
+        sql: &str,
+        param_types: &[&str],
+        sqlprep: &mut SqlPreparedPool,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        let mut types = [ColType::Bool; parser::MAX_LIST];
+        for (index, type_name) in param_types.iter().enumerate() {
+            let Some(ctype) = ColType::from_sql_name(type_name) else {
+                return Ok(Err(SqlError {
+                    sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
+                    message: stack_format!(192, "type \"{}\" does not exist", type_name),
+                }));
+            };
+            types[index] = ctype;
+        }
+        match sqlprep.store(name, sql, &types[..param_types.len()]) {
+            Ok(()) => {
+                responder.command_complete("PREPARE")?;
+                Ok(Ok(()))
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    pub(crate) fn execute_deallocate_statement(
+        &mut self,
+        name: Option<&str>,
+        sqlprep: &mut SqlPreparedPool,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        if let Some(name) = name {
+            if !sqlprep.remove(name) {
+                return Ok(Err(SqlError {
+                    sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
+                    message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
+                }));
+            }
+        } else {
+            sqlprep.clear();
+        }
+        responder.command_complete("DEALLOCATE")?;
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn execute_discard_statement(
+        &mut self,
+        target: ast::DiscardTarget,
+        sqlprep: &mut SqlPreparedPool,
+        cursors: &mut cursor::CursorPool,
+        guc: &GucState,
+        responder: &mut Responder,
+    ) -> Result<Result<(), SqlError>, WireFull> {
+        match target {
+            ast::DiscardTarget::All => {
+                sqlprep.clear();
+                cursors.close_all();
+                guc.discard_all();
+                if let Err(error) = self.apply_system_settings(guc) {
+                    return Ok(Err(error));
+                }
+                let role = self
+                    .storage
+                    .find_role(guc.authenticated_user())
+                    .expect("authenticated role remains present");
+                if let Err(error) = self.apply_role_settings(role as u16, guc) {
+                    return Ok(Err(error));
+                }
+                self.notify.drop_conn(self.current_conn_id);
+                self.discard_protocol_state = true;
+            }
+            ast::DiscardTarget::Sequences => guc.seq_session().discard(),
+            ast::DiscardTarget::Plans | ast::DiscardTarget::Temporary => {}
+        }
+        responder.command_complete("DISCARD")?;
+        Ok(Ok(()))
+    }
+
     pub fn checkpoint(&mut self) -> Result<bool, SqlError> {
         self.retry_pending_wal_upload()?;
         if self.post_publish_cleanup.is_some() {
@@ -6423,10 +6984,10 @@ impl Engine {
         }
         self.refresh_prepared_transaction_catalog();
         let Some(ckpt) = self.ckpt.as_mut() else {
-            return Err(SqlError {
-                sqlstate: SqlState::known(sqlstate::FEATURE_NOT_SUPPORTED),
-                message: stack_format!(192, "no object storage configured (object_store = off)"),
-            });
+            // The explicit non-durable test mode has no publication target.
+            // PostgreSQL still treats CHECKPOINT as a successful maintenance
+            // command, so it is a no-op rather than a client-visible error.
+            return Ok(false);
         };
         // Everything the snapshot will contain must be journal-durable
         // first, so an interrupted checkpoint never strands acked writes.
@@ -10189,6 +10750,7 @@ impl Engine {
             let value = match exec::execute_plpgsql_function(
                 self,
                 txn,
+                sqlprep,
                 cursors,
                 guc,
                 &routine,
@@ -10307,7 +10869,7 @@ impl Engine {
             };
             let _formal_scope = exec::enter_routine_parameter_types(routine.arguments());
             return Ok(exec::execute_plpgsql_table_function(
-                self, txn, cursors, guc, &routine, &*inputs, arena, responder,
+                self, txn, sqlprep, cursors, guc, &routine, &*inputs, arena, responder,
             ));
         }
         let body = match arena.alloc_str(routine.body.as_str()) {
@@ -10802,6 +11364,7 @@ impl Engine {
         body: &str,
         arena: &Arena,
         txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
         guc: &mut GucState,
         transaction_context: exec::PlpgsqlTransactionContext,
@@ -10813,6 +11376,7 @@ impl Engine {
         match exec::execute_anonymous_plpgsql(
             self,
             txn,
+            sqlprep,
             cursors,
             guc,
             transaction_context,
@@ -11066,6 +11630,7 @@ impl Engine {
             let output_count = match exec::execute_plpgsql_procedure(
                 self,
                 txn,
+                sqlprep,
                 cursors,
                 guc,
                 if transaction_context == exec::PlpgsqlTransactionContext::NonAtomic
@@ -11333,6 +11898,7 @@ impl Engine {
     ) -> Result<(), SqlError> {
         let EventTriggerExecution {
             txn,
+            sqlprep,
             cursors,
             guc,
             arena,
@@ -11392,6 +11958,7 @@ impl Engine {
             exec::execute_event_trigger(
                 self,
                 txn,
+                sqlprep,
                 cursors,
                 guc,
                 &routine,
@@ -11407,6 +11974,7 @@ impl Engine {
     pub(crate) fn execute_login_event_triggers(
         &mut self,
         txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         arena: &Arena,
@@ -11437,6 +12005,7 @@ impl Engine {
                 EventTriggerInvocation::Login,
                 EventTriggerExecution {
                     txn,
+                    sqlprep,
                     cursors,
                     guc,
                     arena,
@@ -11525,6 +12094,7 @@ impl Engine {
         &mut self,
         statement: &Stmt,
         txn: &mut TxnState,
+        sqlprep: &mut SqlPreparedPool,
         cursors: &mut cursor::CursorPool,
         guc: &GucState,
         transaction_context: exec::PlpgsqlTransactionContext,
@@ -11536,6 +12106,9 @@ impl Engine {
         F: FnOnce(
             &mut Self,
             &mut TxnState,
+            &mut SqlPreparedPool,
+            &mut cursor::CursorPool,
+            &GucState,
             &mut Responder,
         ) -> Result<Result<(), SqlError>, WireFull>,
     {
@@ -11584,6 +12157,7 @@ impl Engine {
                 EventTriggerInvocation::DdlCommandStart { tag },
                 EventTriggerExecution {
                     txn,
+                    sqlprep,
                     cursors,
                     guc,
                     arena,
@@ -11601,6 +12175,7 @@ impl Engine {
                 },
                 EventTriggerExecution {
                     txn,
+                    sqlprep,
                     cursors,
                     guc,
                     arena,
@@ -11639,7 +12214,7 @@ impl Engine {
         } else {
             event_trigger::BeforeDdl::EMPTY
         };
-        let outcome = execute(self, txn, responder);
+        let outcome = execute(self, txn, sqlprep, cursors, guc, responder);
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
             && let Some(tag) = event_tag
@@ -11672,6 +12247,7 @@ impl Engine {
                     EventTriggerInvocation::SqlDrop { tag },
                     EventTriggerExecution {
                         txn,
+                        sqlprep,
                         cursors,
                         guc,
                         arena,
@@ -11687,6 +12263,7 @@ impl Engine {
                     EventTriggerInvocation::DdlCommandEnd { tag },
                     EventTriggerExecution {
                         txn,
+                        sqlprep,
                         cursors,
                         guc,
                         arena,
@@ -11926,6 +12503,7 @@ impl Engine {
                 EventTriggerInvocation::DdlCommandStart { tag },
                 EventTriggerExecution {
                     txn,
+                    sqlprep,
                     cursors,
                     guc,
                     arena,
@@ -11943,6 +12521,7 @@ impl Engine {
                 },
                 EventTriggerExecution {
                     txn,
+                    sqlprep,
                     cursors,
                     guc,
                     arena,
@@ -12419,6 +12998,7 @@ impl Engine {
                 body,
                 arena,
                 txn,
+                sqlprep,
                 cursors,
                 guc,
                 routine_transaction_context,
@@ -14002,28 +14582,7 @@ impl Engine {
                 tables,
                 mode,
                 nowait,
-            } => {
-                if !txn.is_explicit() {
-                    return Ok(Err(sql_err!(
-                        sqlstate::NO_ACTIVE_SQL_TRANSACTION,
-                        "LOCK TABLE can only be used in transaction blocks"
-                    )));
-                }
-                let mut slots = [usize::MAX; parser::MAX_LOCK_TABLES];
-                for (index, table) in tables.iter().enumerate() {
-                    slots[index] = match exec::resolve_dml_table(&self.storage, table, txn.txid) {
-                        Ok(slot) => slot,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                }
-                for &slot in &slots[..tables.len()] {
-                    if let Err(error) = self.storage.lock_table(txn.txid, slot, *mode, *nowait) {
-                        return Ok(Err(error));
-                    }
-                }
-                responder.command_complete("LOCK TABLE")?;
-                Ok(Ok(()))
-            }
+            } => self.execute_lock_table_statement(tables, *mode, *nowait, txn, responder),
             Stmt::Savepoint(name) => {
                 if !txn.is_explicit() {
                     return Ok(Err(sql_err!(
@@ -14079,140 +14638,7 @@ impl Engine {
                 Ok(Ok(()))
             }
             Stmt::SetConstraints { targets, mode } => {
-                if !txn.is_explicit() {
-                    responder.warning(
-                        sqlstate::NO_ACTIVE_SQL_TRANSACTION,
-                        "SET CONSTRAINTS can only be used in transaction blocks",
-                    )?;
-                    responder.command_complete("SET CONSTRAINTS")?;
-                    return Ok(Ok(()));
-                }
-                let empty = txn::ConstraintIdentity::Table {
-                    table: 0,
-                    name: crate::storage::SqlName::EMPTY,
-                    generation: 0,
-                };
-                let mut identities = [empty; txn::MAX_DEFERRED_CONSTRAINTS];
-                let count = match targets {
-                    crate::sql::ast::ConstraintTargets::All => 0,
-                    crate::sql::ast::ConstraintTargets::Named(names) => {
-                        let mut count = 0;
-                        for name in *names {
-                            let mut matches = [empty; txn::MAX_DEFERRED_CONSTRAINTS];
-                            let matched = match exec::constraints::resolve_constraint_name(
-                                &self.storage,
-                                name,
-                                *mode,
-                                txn.txid,
-                                &mut matches,
-                            ) {
-                                Ok(matched) => matched,
-                                Err(error) => return Ok(Err(error)),
-                            };
-                            for identity in matches[..matched].iter().copied() {
-                                let identity = txn.catalog_constraint_identity(identity);
-                                if identities[..count].contains(&identity) {
-                                    continue;
-                                }
-                                if count == identities.len() {
-                                    return Ok(Err(sql_err!(
-                                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                                        "SET CONSTRAINTS matches more than {} constraints",
-                                        identities.len()
-                                    )));
-                                }
-                                identities[count] = identity;
-                                count += 1;
-                            }
-                        }
-                        count
-                    }
-                };
-                let additional = if matches!(targets, crate::sql::ast::ConstraintTargets::All) {
-                    1
-                } else {
-                    count
-                };
-                if !txn.can_record_constraint_modes(additional) {
-                    return Ok(Err(sql_err!(
-                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
-                        "transaction changes constraint modes more than {} times",
-                        txn::MAX_DEFERRED_CONSTRAINTS
-                    )));
-                }
-                if *mode == crate::sql::ast::ConstraintMode::Immediate {
-                    if matches!(targets, crate::sql::ast::ConstraintTargets::All) {
-                        if let Err(error) = exec::constraints::validate_deferred_constraints(
-                            &self.storage,
-                            txn,
-                            false,
-                            arena,
-                        ) {
-                            return Ok(Err(error));
-                        }
-                    } else {
-                        for identity in identities[..count].iter().copied() {
-                            while let Some((index, obligation)) =
-                                txn.deferred_constraint_for(identity)
-                            {
-                                if let Err(error) =
-                                    exec::constraints::validate_constraint_obligation(
-                                        &self.storage,
-                                        identity,
-                                        obligation.rowid,
-                                        txn.txid,
-                                        arena,
-                                    )
-                                {
-                                    return Ok(Err(error));
-                                }
-                                if let Err(error) = txn.complete_deferred_constraint(index) {
-                                    return Ok(Err(error));
-                                }
-                            }
-                        }
-                    }
-                    if matches!(targets, crate::sql::ast::ConstraintTargets::All) {
-                        if let Err(error) = self.fire_constraint_trigger_boundary(
-                            txn,
-                            guc,
-                            arena,
-                            responder,
-                            exec::TriggerQueueBoundary::Constraints(None),
-                        ) {
-                            return Ok(Err(error));
-                        }
-                    } else {
-                        for identity in identities[..count].iter().copied() {
-                            if let Err(error) = self.fire_constraint_trigger_boundary(
-                                txn,
-                                guc,
-                                arena,
-                                responder,
-                                exec::TriggerQueueBoundary::Constraints(Some(identity)),
-                            ) {
-                                return Ok(Err(error));
-                            }
-                        }
-                    }
-                }
-                let result = if matches!(targets, crate::sql::ast::ConstraintTargets::All) {
-                    txn.record_constraint_mode(None, *mode)
-                } else {
-                    let mut result = Ok(());
-                    for identity in identities[..count].iter().copied() {
-                        if let Err(error) = txn.record_constraint_mode(Some(identity), *mode) {
-                            result = Err(error);
-                            break;
-                        }
-                    }
-                    result
-                };
-                if let Err(error) = result {
-                    return Ok(Err(error));
-                }
-                responder.command_complete("SET CONSTRAINTS")?;
-                Ok(Ok(()))
+                self.execute_set_constraints_statement(*targets, *mode, txn, guc, arena, responder)
             }
             Stmt::Set {
                 name,
@@ -14220,117 +14646,7 @@ impl Engine {
                 local,
                 syntax,
             } => {
-                if crate::sql::guc::requires_set_privilege(name)
-                    && self
-                        .storage
-                        .current_role_slot(txn.txid)
-                        .is_some_and(|role| {
-                            !self.storage.role(role).attributes_to(txn.txid).superuser
-                                && crate::sql::ast::ParameterName::parse(name).is_none_or(
-                                    |parameter| {
-                                        !self.storage.has_parameter_privilege(
-                                            parameter,
-                                            role,
-                                            crate::sql::ast::ParameterPrivileges::SET,
-                                            txn.txid,
-                                        )
-                                    },
-                                )
-                        })
-                {
-                    return Ok(Err(sql_err!(
-                        sqlstate::INSUFFICIENT_PRIVILEGE,
-                        "permission denied to set parameter \"{}\"",
-                        name
-                    )));
-                }
-                if *local && !txn.is_explicit() {
-                    responder.warning(
-                        sqlstate::NO_ACTIVE_SQL_TRANSACTION,
-                        "SET LOCAL can only be used in transaction blocks",
-                    )?;
-                }
-                if *syntax == ast::SettingSyntax::FromCurrent {
-                    if let Some(characteristics) = guc.current_transaction_setting_from_current(
-                        name,
-                        txn.isolation,
-                        txn.read_only,
-                        txn.deferrable,
-                    ) {
-                        let characteristics = match characteristics {
-                            Ok(characteristics) => characteristics,
-                            Err(error) => return Ok(Err(error)),
-                        };
-                        if let Err(error) = apply_current_transaction_setting(txn, characteristics)
-                        {
-                            return Ok(Err(error));
-                        }
-                    } else if let Err(error) = guc.set_from_current(name, *local) {
-                        return Ok(Err(error));
-                    }
-                    guc::publish_active_setting(guc, name);
-                    responder.command_complete("SET")?;
-                    return Ok(Ok(()));
-                }
-                if let Some(characteristics) = guc.current_transaction_setting(name, value) {
-                    let characteristics = match characteristics {
-                        Ok(characteristics) => characteristics,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    if let Err(error) = apply_current_transaction_setting(txn, characteristics) {
-                        return Ok(Err(error));
-                    }
-                    responder.command_complete("SET")?;
-                    return Ok(Ok(()));
-                }
-                let changed = match syntax {
-                    ast::SettingSyntax::Generic => guc.set(name, value, *local),
-                    ast::SettingSyntax::FromCurrent => {
-                        unreachable!("FROM CURRENT is handled before value application")
-                    }
-                    ast::SettingSyntax::TimeZone => guc.set_time_zone_sql(value, *local),
-                    ast::SettingSyntax::TimeZoneInterval(type_mod) => {
-                        let interval = match datetime::parse_interval(value) {
-                            Ok(interval) => interval,
-                            Err(error) => return Ok(Err(error)),
-                        };
-                        let interval = match exec::apply_typmod(
-                            Datum::Interval(interval),
-                            types::ColType::Interval,
-                            *type_mod,
-                            arena,
-                        ) {
-                            Ok(Datum::Interval(interval)) => interval,
-                            Ok(_) => unreachable!("interval typmod preserves its type"),
-                            Err(error) => return Ok(Err(error)),
-                        };
-                        guc.set_time_zone_interval(interval, *local)
-                    }
-                };
-                match changed {
-                    Ok(()) => {
-                        if name.eq_ignore_ascii_case("default_tablespace") {
-                            let tablespace = guc.default_tablespace();
-                            let name = tablespace.as_str();
-                            if !name.is_empty()
-                                && !name.eq_ignore_ascii_case("pg_default")
-                                && !name.eq_ignore_ascii_case("pg_global")
-                                && self.storage.tablespace_slot(name, txn.txid).is_none()
-                            {
-                                return Ok(Err(sql_err!(
-                                    sqlstate::INVALID_PARAMETER_VALUE,
-                                    "invalid value for parameter \"default_tablespace\": \"{}\": tablespace does not exist",
-                                    name
-                                )));
-                            }
-                        }
-                        guc::publish_active_setting(guc, name);
-                        responder.set_render(guc.render());
-                        responder.command_complete("SET")?;
-                        Ok(Ok(()))
-                    }
-                    Err(e) => Ok(Err(e)),
-                }
+                self.execute_set_statement(name, value, *local, *syntax, txn, guc, arena, responder)
             }
             Stmt::SetCatalog(_) => Ok(Err(sql_err!(
                 sqlstate::FEATURE_NOT_SUPPORTED,
@@ -14345,55 +14661,7 @@ impl Engine {
                 guc,
                 responder,
             ),
-            Stmt::Reset(name) => {
-                if name.is_some_and(crate::sql::guc::requires_set_privilege)
-                    && self
-                        .storage
-                        .current_role_slot(txn.txid)
-                        .is_some_and(|role| {
-                            !self.storage.role(role).attributes_to(txn.txid).superuser
-                                && name
-                                    .and_then(crate::sql::ast::ParameterName::parse)
-                                    .is_none_or(|parameter| {
-                                        !self.storage.has_parameter_privilege(
-                                            parameter,
-                                            role,
-                                            crate::sql::ast::ParameterPrivileges::SET,
-                                            txn.txid,
-                                        )
-                                    })
-                        })
-                {
-                    return Ok(Err(sql_err!(
-                        sqlstate::INSUFFICIENT_PRIVILEGE,
-                        "permission denied to set parameter \"{}\"",
-                        name.unwrap_or("")
-                    )));
-                }
-                if let Some(name) = name
-                    && guc.transaction_reset_owned(name).is_some()
-                {
-                    return Ok(Err(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "parameter \"{}\" cannot be reset",
-                        name
-                    )));
-                }
-                let result = match name {
-                    Some(name) => guc.reset(name),
-                    None => {
-                        guc.reset_all();
-                        Ok(())
-                    }
-                };
-                match result {
-                    Ok(()) => {
-                        responder.command_complete("RESET")?;
-                        Ok(Ok(()))
-                    }
-                    Err(e) => Ok(Err(e)),
-                }
-            }
+            Stmt::Reset(name) => self.execute_reset_statement(*name, txn, guc, responder),
             Stmt::SetTransaction {
                 target,
                 characteristics,
@@ -14429,29 +14697,7 @@ impl Engine {
             Stmt::Show(name) => self.show(name, guc, txn, responder),
             Stmt::ShowAll => self.show_all(guc, txn, responder),
             Stmt::Discard(target) => {
-                match target {
-                    ast::DiscardTarget::All => {
-                        sqlprep.clear();
-                        cursors.close_all();
-                        guc.discard_all();
-                        if let Err(error) = self.apply_system_settings(guc) {
-                            return Ok(Err(error));
-                        }
-                        let role = self
-                            .storage
-                            .find_role(guc.authenticated_user())
-                            .expect("authenticated role remains present");
-                        if let Err(error) = self.apply_role_settings(role as u16, guc) {
-                            return Ok(Err(error));
-                        }
-                        self.notify.drop_conn(self.current_conn_id);
-                        self.discard_protocol_state = true;
-                    }
-                    ast::DiscardTarget::Sequences => guc.seq_session().discard(),
-                    ast::DiscardTarget::Plans | ast::DiscardTarget::Temporary => {}
-                }
-                responder.command_complete("DISCARD")?;
-                Ok(Ok(()))
+                self.execute_discard_statement(*target, sqlprep, cursors, guc, responder)
             }
             Stmt::Copy(c) => {
                 // COPY (query) TO STDOUT streams a query's rows, not a table's.
@@ -14519,13 +14765,7 @@ impl Engine {
                     Ok(Ok(()))
                 }
             }
-            Stmt::Checkpoint => match self.checkpoint() {
-                Ok(_) => {
-                    responder.command_complete("CHECKPOINT")?;
-                    Ok(Ok(()))
-                }
-                Err(e) => Ok(Err(e)),
-            },
+            Stmt::Checkpoint => self.execute_checkpoint_statement(responder),
             // VACUUM reclaims space; in this LSM that is a checkpoint (flush +
             // compaction, pruning superseded versions and tombstones). The
             // options and per-table targets are parsed; a checkpoint compacts
@@ -14533,93 +14773,16 @@ impl Engine {
             // storage there is nothing to compact to, and — as VACUUM on a
             // table with nothing to reclaim does in PostgreSQL — it succeeds.
             Stmt::Vacuum { targets, options } => {
-                let mode = if options.full {
-                    ast::TableLockMode::AccessExclusive
-                } else {
-                    ast::TableLockMode::ShareUpdateExclusive
-                };
-                if let Err(error) = self.lock_maintenance_targets(targets, txn.txid, mode) {
-                    return Ok(Err(error));
-                }
-                let validation = if options.analyze {
-                    self.analyze_targets(targets, txn).map(|_| ())
-                } else {
-                    self.validate_maintenance_targets(targets, txn.txid)
-                };
-                if let Err(error) = validation {
-                    return Ok(Err(error));
-                }
-                if self.ckpt.is_some()
-                    && let Err(e) = self.checkpoint()
-                {
-                    return Ok(Err(e));
-                }
-                responder.command_complete("VACUUM")?;
-                Ok(Ok(()))
+                self.execute_vacuum_statement(targets, *options, txn, responder)
             }
             // ANALYZE resolves every requested relation/column and walks its
             // MVCC-visible row state. Cardinality and widths are exact for that
             // snapshot; distinct counts use the fixed-size estimator.
-            Stmt::Analyze(targets) => {
-                if let Err(error) = self.lock_maintenance_targets(
-                    targets,
-                    txn.txid,
-                    ast::TableLockMode::ShareUpdateExclusive,
-                ) {
-                    return Ok(Err(error));
-                }
-                if let Err(error) = self.analyze_targets(targets, txn) {
-                    return Ok(Err(error));
-                }
-                responder.command_complete("ANALYZE")?;
-                Ok(Ok(()))
-            }
-            Stmt::Listen(channel) => {
-                let op = notify::ListenOp::Listen {
-                    conn_id: self.current_conn_id,
-                    channel: notify::channel(channel),
-                };
-                if let Err(e) = txn.buffer_listen_op(op) {
-                    return Ok(Err(e));
-                }
-                responder.command_complete("LISTEN")?;
-                Ok(Ok(()))
-            }
-            Stmt::Unlisten(channel) => {
-                let op = match channel {
-                    Some(name) => notify::ListenOp::Unlisten {
-                        conn_id: self.current_conn_id,
-                        channel: notify::channel(name),
-                    },
-                    None => notify::ListenOp::UnlistenAll {
-                        conn_id: self.current_conn_id,
-                    },
-                };
-                if let Err(e) = txn.buffer_listen_op(op) {
-                    return Ok(Err(e));
-                }
-                responder.command_complete("UNLISTEN")?;
-                Ok(Ok(()))
-            }
+            Stmt::Analyze(targets) => self.execute_analyze_statement(targets, txn, responder),
+            Stmt::Listen(channel) => self.execute_listen_statement(channel, txn, responder),
+            Stmt::Unlisten(channel) => self.execute_unlisten_statement(*channel, txn, responder),
             Stmt::Notify { channel, payload } => {
-                // Validate the payload length (PostgreSQL's 8000-byte limit)
-                // before buffering the raw text.
-                let payload = match payload {
-                    Some(text) => match notify::payload(text) {
-                        Ok(p) => p,
-                        Err(e) => return Ok(Err(e)),
-                    },
-                    None => notify::Payload::new(),
-                };
-                if let Err(e) = txn.buffer_notify(
-                    self.current_conn_id,
-                    notify::channel(channel),
-                    payload.as_str(),
-                ) {
-                    return Ok(Err(e));
-                }
-                responder.command_complete("NOTIFY")?;
-                Ok(Ok(()))
+                self.execute_notify_statement(channel, *payload, txn, responder)
             }
             Stmt::AlterTable(a) => exec::alter_table(
                 &mut self.storage,
@@ -14635,29 +14798,7 @@ impl Engine {
                 name,
                 sql,
                 param_types,
-            } => {
-                // Resolve declared parameter types up front; an unknown type is
-                // an error, never quietly ignored.
-                let mut types = [ColType::Bool; parser::MAX_LIST];
-                for (i, tn) in param_types.iter().enumerate() {
-                    match ColType::from_sql_name(tn) {
-                        Some(ct) => types[i] = ct,
-                        None => {
-                            return Ok(Err(SqlError {
-                                sqlstate: SqlState::known(sqlstate::UNDEFINED_OBJECT),
-                                message: stack_format!(192, "type \"{}\" does not exist", tn),
-                            }));
-                        }
-                    }
-                }
-                match sqlprep.store(name, sql, &types[..param_types.len()]) {
-                    Ok(()) => {
-                        responder.command_complete("PREPARE")?;
-                        Ok(Ok(()))
-                    }
-                    Err(e) => Ok(Err(e)),
-                }
-            }
+            } => self.execute_prepare_statement(name, sql, param_types, sqlprep, responder),
             Stmt::ExecutePrepared { name, args } => {
                 let Some(text) = sqlprep.get(name) else {
                     return Ok(Err(SqlError {
@@ -14749,25 +14890,7 @@ impl Engine {
                     })),
                 }
             }
-            Stmt::Deallocate(name) => {
-                match name {
-                    Some(n) => {
-                        if !sqlprep.remove(n) {
-                            return Ok(Err(SqlError {
-                                sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
-                                message: stack_format!(
-                                    192,
-                                    "prepared statement \"{}\" does not exist",
-                                    n
-                                ),
-                            }));
-                        }
-                    }
-                    None => sqlprep.clear(),
-                }
-                responder.command_complete("DEALLOCATE")?;
-                Ok(Ok(()))
-            }
+            Stmt::Deallocate(name) => self.execute_deallocate_statement(*name, sqlprep, responder),
         };
         if matches!(outcome, Ok(Ok(())))
             && (event_drop || event_end)
@@ -14801,6 +14924,7 @@ impl Engine {
                     EventTriggerInvocation::SqlDrop { tag },
                     EventTriggerExecution {
                         txn,
+                        sqlprep,
                         cursors,
                         guc,
                         arena,
@@ -14816,6 +14940,7 @@ impl Engine {
                     EventTriggerInvocation::DdlCommandEnd { tag },
                     EventTriggerExecution {
                         txn,
+                        sqlprep,
                         cursors,
                         guc,
                         arena,

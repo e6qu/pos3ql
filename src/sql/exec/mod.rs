@@ -17378,6 +17378,7 @@ fn validate_plpgsql_routine_namespace(
 pub(crate) fn execute_anonymous_plpgsql<'a>(
     engine: &mut super::Engine,
     txn: &mut TxnState,
+    sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
     guc: &super::guc::GucState,
     transaction_context: PlpgsqlTransactionContext,
@@ -17392,6 +17393,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
         host: PlpgsqlExecHost::Routine {
             engine,
             guc,
+            sqlprep,
             cursors,
             transaction_context,
         },
@@ -17444,6 +17446,7 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
 pub(crate) fn execute_event_trigger<'a>(
     engine: &mut super::Engine,
     txn: &mut TxnState,
+    sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
     guc: &super::guc::GucState,
     routine: &crate::storage::RoutineDef,
@@ -17462,6 +17465,7 @@ pub(crate) fn execute_event_trigger<'a>(
         host: PlpgsqlExecHost::Routine {
             engine,
             guc,
+            sqlprep,
             cursors,
             transaction_context: PlpgsqlTransactionContext::Atomic,
         },
@@ -17517,6 +17521,7 @@ pub(crate) fn execute_event_trigger<'a>(
 pub(crate) fn execute_plpgsql_procedure<'a>(
     engine: &mut super::Engine,
     txn: &mut TxnState,
+    sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
     guc: &super::guc::GucState,
     transaction_context: PlpgsqlTransactionContext,
@@ -17605,6 +17610,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         host: PlpgsqlExecHost::Routine {
             engine,
             guc,
+            sqlprep,
             cursors,
             transaction_context,
         },
@@ -17673,6 +17679,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
 pub(crate) fn execute_plpgsql_function<'a>(
     engine: &mut super::Engine,
     txn: &mut TxnState,
+    sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
     guc: &super::guc::GucState,
     routine: &crate::storage::RoutineDef,
@@ -17767,6 +17774,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         host: PlpgsqlExecHost::Routine {
             engine,
             guc,
+            sqlprep,
             cursors,
             transaction_context: PlpgsqlTransactionContext::Atomic,
         },
@@ -17837,6 +17845,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
 pub(crate) fn execute_plpgsql_table_function<'a>(
     engine: &mut super::Engine,
     txn: &mut TxnState,
+    sqlprep: &mut super::prep::SqlPreparedPool,
     cursors: &mut super::cursor::CursorPool,
     guc: &super::guc::GucState,
     routine: &crate::storage::RoutineDef,
@@ -17932,6 +17941,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         host: PlpgsqlExecHost::Routine {
             engine,
             guc,
+            sqlprep,
             cursors,
             transaction_context: PlpgsqlTransactionContext::Atomic,
         },
@@ -18696,6 +18706,7 @@ enum PlpgsqlExecHost<'s> {
     Routine {
         engine: &'s mut super::Engine,
         guc: &'s super::guc::GucState,
+        sqlprep: &'s mut super::prep::SqlPreparedPool,
         cursors: &'s mut super::cursor::CursorPool,
         transaction_context: PlpgsqlTransactionContext,
     },
@@ -18735,6 +18746,7 @@ impl PlpgsqlExecHost<'_> {
             guc,
             cursors,
             transaction_context: PlpgsqlTransactionContext::NonAtomic,
+            ..
         } = self
         else {
             return Err(sql_err!(
@@ -19116,6 +19128,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
             let PlpgsqlExecHost::Routine {
                 engine,
                 guc,
+                sqlprep,
                 cursors,
                 transaction_context,
             } = &mut context.host
@@ -19129,12 +19142,13 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                 engine.execute_dynamic_utility(
                     query.statement,
                     context.txn,
+                    sqlprep,
                     cursors,
                     guc,
                     *transaction_context,
                     context.arena,
                     responder,
-                    |engine, txn, responder| {
+                    |engine, txn, _, _, _, responder| {
                         super::exec::create_schema(
                             &mut engine.storage,
                             &mut engine.wal,
@@ -19182,6 +19196,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                         let PlpgsqlExecHost::Routine {
                             engine,
                             guc,
+                            sqlprep,
                             cursors,
                             transaction_context,
                         } = &mut context.host
@@ -19200,12 +19215,13 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                             engine.execute_dynamic_utility(
                                 requalified,
                                 context.txn,
+                                sqlprep,
                                 cursors,
                                 guc,
                                 *transaction_context,
                                 context.arena,
                                 responder,
-                                |engine, txn, responder| {
+                                |engine, txn, _, _, _, responder| {
                                     super::exec::create_view(
                                         &mut engine.storage,
                                         &mut engine.wal,
@@ -19254,6 +19270,7 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
     let PlpgsqlExecHost::Routine {
         engine,
         guc,
+        sqlprep,
         cursors,
         transaction_context,
     } = &mut context.host
@@ -19267,12 +19284,13 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
         engine.execute_dynamic_utility(
             query.statement,
             context.txn,
+            sqlprep,
             cursors,
             guc,
             *transaction_context,
             context.arena,
             responder,
-            |engine, txn, responder| match query.statement {
+            |engine, txn, sqlprep, cursors, guc, responder| match query.statement {
                 Stmt::CreateTable(command) => super::exec::create_table(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -20687,6 +20705,125 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *restart_identity,
                     *cascade,
                     responder,
+                ),
+                Stmt::SetRole { role, local, reset } => super::exec::set_role(
+                    &engine.storage,
+                    txn,
+                    guc,
+                    *role,
+                    *local,
+                    *reset,
+                    responder,
+                ),
+                Stmt::SetSessionAuthorization { role, local, reset } => {
+                    super::exec::set_session_authorization(
+                        &engine.storage,
+                        txn,
+                        guc,
+                        *role,
+                        *local,
+                        *reset,
+                        responder,
+                    )
+                }
+                Stmt::Set {
+                    name,
+                    value,
+                    local,
+                    syntax,
+                } => engine.execute_set_statement(
+                    name,
+                    value,
+                    *local,
+                    *syntax,
+                    txn,
+                    guc,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::Reset(name) => engine.execute_reset_statement(*name, txn, guc, responder),
+                Stmt::SetTransaction {
+                    target,
+                    characteristics,
+                } => {
+                    if *target == crate::sql::ast::TransactionTarget::SessionDefaults {
+                        match guc.set_transaction_defaults(*characteristics) {
+                            Ok(()) => {
+                                responder.command_complete("SET")?;
+                                Ok(Ok(()))
+                            }
+                            Err(error) => Ok(Err(error)),
+                        }
+                    } else if !txn.is_explicit() {
+                        responder.warning(
+                            sqlstate::NO_ACTIVE_SQL_TRANSACTION,
+                            "SET TRANSACTION can only be used in transaction blocks",
+                        )?;
+                        responder.command_complete("SET")?;
+                        Ok(Ok(()))
+                    } else {
+                        match super::apply_current_transaction_setting(txn, *characteristics) {
+                            Ok(()) => {
+                                responder.command_complete("SET")?;
+                                Ok(Ok(()))
+                            }
+                            Err(error) => Ok(Err(error)),
+                        }
+                    }
+                }
+                Stmt::AlterSystem { name, value } => super::exec::alter_system(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *name,
+                    *value,
+                    guc,
+                    responder,
+                ),
+                Stmt::SetTransactionSnapshot(snapshot) => {
+                    match engine.import_replication_snapshot(txn, snapshot) {
+                        Ok(()) => {
+                            responder.command_complete("SET")?;
+                            Ok(Ok(()))
+                        }
+                        Err(error) => Ok(Err(error)),
+                    }
+                }
+                Stmt::Checkpoint => engine.execute_checkpoint_statement(responder),
+                Stmt::Vacuum { targets, options } => {
+                    engine.execute_vacuum_statement(targets, *options, txn, responder)
+                }
+                Stmt::Analyze(targets) => engine.execute_analyze_statement(targets, txn, responder),
+                Stmt::Listen(channel) => engine.execute_listen_statement(channel, txn, responder),
+                Stmt::Unlisten(channel) => {
+                    engine.execute_unlisten_statement(*channel, txn, responder)
+                }
+                Stmt::Notify { channel, payload } => {
+                    engine.execute_notify_statement(channel, *payload, txn, responder)
+                }
+                Stmt::LockTable {
+                    tables,
+                    mode,
+                    nowait,
+                } => engine.execute_lock_table_statement(tables, *mode, *nowait, txn, responder),
+                Stmt::SetConstraints { targets, mode } => engine.execute_set_constraints_statement(
+                    *targets,
+                    *mode,
+                    txn,
+                    guc,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::Prepare {
+                    name,
+                    sql,
+                    param_types,
+                } => engine.execute_prepare_statement(name, sql, param_types, sqlprep, responder),
+                Stmt::Deallocate(name) => {
+                    engine.execute_deallocate_statement(*name, sqlprep, responder)
+                }
+                Stmt::Discard(target) => engine.execute_discard_statement(
+                    *target, sqlprep, cursors, guc, responder,
                 ),
                 Stmt::Comment { target, text } => super::exec::comment(
                     &mut engine.storage,

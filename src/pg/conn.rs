@@ -1176,6 +1176,7 @@ impl Conn {
         self.arena.reset();
         if let Err(error) = engine.execute_login_event_triggers(
             &mut self.txn,
+            &mut self.sqlprep,
             &mut self.cursors,
             &self.guc,
             &self.arena,

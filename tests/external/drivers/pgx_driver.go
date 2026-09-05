@@ -106,6 +106,10 @@ func main() {
 	exec("CALL pgx_plpgsql($1)", 44)
 	must("plpgsql procedure", conn.QueryRow(ctx, "SELECT value FROM pgx_routine_log WHERE value = 45").Scan(&routineValue))
 	fmt.Printf("plpgsql procedure %d\n", routineValue)
+	exec("CREATE OR REPLACE FUNCTION pgx_dynamic_analyze(value integer) RETURNS boolean LANGUAGE plpgsql AS 'DECLARE plan text; BEGIN EXECUTE ''EXPLAIN (ANALYZE, FORMAT JSON) SELECT $1 + 1'' INTO STRICT plan USING value; RETURN plan IS NOT NULL; END'")
+	var dynamicAnalyze bool
+	must("plpgsql dynamic analyze", conn.QueryRow(ctx, "SELECT pgx_dynamic_analyze($1)", 41).Scan(&dynamicAnalyze))
+	fmt.Printf("plpgsql dynamic analyze %t\n", dynamicAnalyze)
 
 	// Transaction rollback must not persist.
 	tx, err := conn.Begin(ctx)

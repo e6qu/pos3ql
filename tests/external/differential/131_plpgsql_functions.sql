@@ -351,6 +351,36 @@ SET ROLE plpgsql_function_denied;
 SELECT plpgsql_function_security_actor();
 RESET ROLE;
 
+SELECT lo_create(92701::oid);
+CREATE ROLE plpgsql_dynamic_admin_owner;
+CREATE FUNCTION plpgsql_dynamic_administration() RETURNS void
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'CREATE SCHEMA plpgsql_dynamic_admin_schema';
+  EXECUTE 'ALTER SCHEMA plpgsql_dynamic_admin_schema RENAME TO plpgsql_dynamic_admin_schema_moved';
+  EXECUTE 'CREATE TABLE plpgsql_dynamic_admin_rows (id integer)';
+  EXECUTE 'ALTER TABLE plpgsql_dynamic_admin_rows OWNER TO plpgsql_dynamic_admin_owner';
+  EXECUTE 'ALTER LARGE OBJECT 92701 OWNER TO plpgsql_dynamic_admin_owner';
+  EXECUTE 'ALTER ROLE plpgsql_dynamic_admin_owner SET application_name TO ''dynamic-admin''';
+  EXECUTE 'GRANT SET ON PARAMETER event_triggers TO plpgsql_dynamic_admin_owner';
+END
+$$;
+CREATE FUNCTION plpgsql_dynamic_administration_revoke() RETURNS void
+  LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'REVOKE SET ON PARAMETER event_triggers FROM plpgsql_dynamic_admin_owner';
+END
+$$;
+SELECT plpgsql_dynamic_administration();
+SELECT nspname FROM pg_namespace
+ WHERE nspname = 'plpgsql_dynamic_admin_schema_moved';
+SELECT relowner::regrole::text FROM pg_class
+ WHERE relname = 'plpgsql_dynamic_admin_rows';
+SELECT lomowner::regrole::text FROM pg_largeobject_metadata WHERE oid = 92701;
+SELECT has_parameter_privilege('plpgsql_dynamic_admin_owner', 'event_triggers', 'SET');
+SELECT plpgsql_dynamic_administration_revoke();
+SELECT has_parameter_privilege('plpgsql_dynamic_admin_owner', 'event_triggers', 'SET');
+
 DROP FUNCTION plpgsql_function_no_return();
 DROP FUNCTION plpgsql_function_void_implicit();
 DROP FUNCTION plpgsql_function_void_return();
@@ -399,6 +429,12 @@ DROP VIEW plpgsql_dynamic_catalog_view;
 DROP TABLE plpgsql_dynamic_catalog_rows;
 DROP DOMAIN plpgsql_dynamic_catalog_positive;
 DROP TYPE plpgsql_dynamic_catalog_state;
+DROP FUNCTION plpgsql_dynamic_administration_revoke();
+DROP FUNCTION plpgsql_dynamic_administration();
+DROP TABLE plpgsql_dynamic_admin_rows;
+DROP SCHEMA plpgsql_dynamic_admin_schema_moved;
+SELECT lo_unlink(92701::oid);
+DROP ROLE plpgsql_dynamic_admin_owner;
 DROP ROLE plpgsql_function_caller;
 DROP ROLE plpgsql_function_denied;
 DROP ROLE plpgsql_function_owner;

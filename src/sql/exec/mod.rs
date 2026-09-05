@@ -19304,6 +19304,36 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     context.seq_session,
                     responder,
                 ),
+                Stmt::AlterSchema { name, action } => super::exec::alter_schema(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *action,
+                    context.arena,
+                    responder,
+                ),
+                Stmt::AlterOwner {
+                    kind,
+                    name,
+                    role,
+                    if_exists,
+                } => super::exec::alter_owner(
+                    &mut engine.storage,
+                    txn,
+                    *kind,
+                    name,
+                    role,
+                    *if_exists,
+                    responder,
+                ),
+                Stmt::AlterLargeObjectOwner { oid, role } => super::exec::alter_large_object_owner(
+                    &mut engine.storage,
+                    txn,
+                    *oid,
+                    role,
+                    responder,
+                ),
                 Stmt::AlterTable(command) => super::exec::alter_table(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -19345,6 +19375,32 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     txn,
                     name,
                     *if_exists,
+                    responder,
+                ),
+                Stmt::CreateAccessMethod {
+                    name,
+                    method_type,
+                    handler,
+                } => super::exec::create_access_method(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    name,
+                    *method_type,
+                    *handler,
+                    responder,
+                ),
+                Stmt::DropAccessMethod {
+                    names,
+                    if_exists,
+                    cascade,
+                } => super::exec::drop_access_method(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    names,
+                    *if_exists,
+                    *cascade,
                     responder,
                 ),
                 Stmt::CreateDatabase { name, options } => {
@@ -19727,6 +19783,20 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     new_name,
                     responder,
                 ),
+                Stmt::AlterRoleSetting {
+                    role,
+                    database,
+                    action,
+                } => super::exec::alter_role_setting(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    *role,
+                    *database,
+                    *action,
+                    guc,
+                    responder,
+                ),
                 Stmt::DropRole { names, if_exists } => super::exec::drop_role(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -19805,6 +19875,48 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     grantees,
                     *grantor,
                     *cascade,
+                    responder,
+                ),
+                Stmt::GrantParameterPrivileges {
+                    privileges,
+                    names,
+                    grantees,
+                    grant_option,
+                    grantor,
+                } => super::exec::grant_parameter_privileges(
+                    &mut engine.storage,
+                    txn,
+                    super::exec::ParameterGrantCommand {
+                        target: super::exec::ParameterPrivilegeTarget {
+                            privileges: *privileges,
+                            names,
+                            grantees,
+                            grantor: *grantor,
+                        },
+                        grant_option: *grant_option,
+                    },
+                    responder,
+                ),
+                Stmt::RevokeParameterPrivileges {
+                    grant_option_only,
+                    privileges,
+                    names,
+                    grantees,
+                    grantor,
+                    cascade,
+                } => super::exec::revoke_parameter_privileges(
+                    &mut engine.storage,
+                    txn,
+                    super::exec::ParameterRevokeCommand {
+                        target: super::exec::ParameterPrivilegeTarget {
+                            privileges: *privileges,
+                            names,
+                            grantees,
+                            grantor: *grantor,
+                        },
+                        grant_option_only: *grant_option_only,
+                        cascade: *cascade,
+                    },
                     responder,
                 ),
                 Stmt::AlterDefaultPrivileges {
@@ -20249,6 +20361,18 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     command,
                     responder,
                 ),
+                Stmt::AlterForeignTable(command) => super::exec::alter_foreign_table(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    command,
+                    super::exec::ForeignTableAlterRuntime {
+                        scratch: &mut engine.dml_scratch,
+                        arena: context.arena,
+                        sequence: context.seq_session,
+                    },
+                    responder,
+                ),
                 Stmt::ImportForeignSchema(command) => super::exec::import_foreign_schema(
                     &mut engine.storage,
                     &mut engine.wal,
@@ -20477,6 +20601,40 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     *action,
                     responder,
                 ),
+                Stmt::AlterIndexesTablespace {
+                    source,
+                    owners,
+                    target,
+                    nowait,
+                } => super::exec::alter_indexes_tablespace(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::AlterIndexesTablespaceCommand {
+                        source,
+                        owners,
+                        target,
+                        nowait: *nowait,
+                    },
+                    responder,
+                ),
+                Stmt::AlterTablesTablespace {
+                    source,
+                    owners,
+                    target,
+                    nowait,
+                } => super::exec::alter_tables_tablespace(
+                    &mut engine.storage,
+                    &mut engine.wal,
+                    txn,
+                    super::exec::AlterTablesTablespaceCommand {
+                        source,
+                        owners,
+                        target,
+                        nowait: *nowait,
+                    },
+                    responder,
+                ),
                 Stmt::DropIndex {
                     names,
                     if_exists,
@@ -20539,6 +20697,31 @@ fn execute_bound_plpgsql_dynamic_utility<'a>(
                     context.arena,
                     responder,
                 ),
+                Stmt::CreateTransform(_) | Stmt::DropTransform(_) => Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "transforms require procedural-language type hooks, which pos3ql does not host"
+                ))),
+                Stmt::Load(_) => Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "LOAD is not supported; pos3ql does not load native shared libraries"
+                ))),
+                Stmt::SecurityLabel { .. } => Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "SECURITY LABEL requires a native security label provider, which pos3ql does not host"
+                ))),
+                Stmt::CreateLanguage(language) => Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "{}",
+                    if language.handler.is_some() {
+                        "native procedural-language handlers are not supported"
+                    } else {
+                        "handlerless CREATE LANGUAGE is not supported"
+                    }
+                ))),
+                Stmt::AlterLanguage { .. } | Stmt::DropLanguage { .. } => Ok(Err(sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "procedural-language catalog mutation is not supported"
+                ))),
                 _ => Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "PL/pgSQL dynamic utility command is not implemented"
@@ -38236,7 +38419,7 @@ fn build_composite_spec(
                     .ok_or_else(|| {
                         sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
-                            "arrays of record-valued domains are not supported"
+                            "domain base type record cannot be an array element"
                         )
                     })?,
                 )
@@ -48579,7 +48762,7 @@ pub(crate) fn resolve_parameter_input_type(
             .ok_or_else(|| {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
-                    "binary input of a record-valued domain is not supported"
+                    "domain base type record cannot be an array element"
                 )
             })?;
         return Ok(ParameterInputType::DomainArray(element));

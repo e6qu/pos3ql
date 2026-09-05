@@ -488,6 +488,217 @@ fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
 }
 
 #[test]
+fn plpgsql_dynamic_administration_uses_static_catalog_boundaries() {
+    let mut config = test_config("plpgsql-dynamic-administration");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace =
+        format!("plpgsql-dynamic-administration-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 29);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    let setup = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT lo_create(90231::oid);
+         CREATE FUNCTION dynamic_catalog_administration() RETURNS void LANGUAGE plpgsql AS '
+           BEGIN
+             EXECUTE ''CREATE ROLE dynamic_catalog_owner'';
+             EXECUTE ''ALTER ROLE dynamic_catalog_owner SET application_name TO ''''dynamic-admin'''''';
+             EXECUTE ''GRANT SET ON PARAMETER event_triggers TO dynamic_catalog_owner'';
+             EXECUTE ''CREATE SCHEMA dynamic_catalog_schema'';
+             EXECUTE ''ALTER SCHEMA dynamic_catalog_schema RENAME TO dynamic_catalog_schema_moved'';
+             EXECUTE ''CREATE ACCESS METHOD dynamic_catalog_heap TYPE TABLE HANDLER heap_tableam_handler'';
+             EXECUTE ''CREATE TABLE dynamic_catalog_rows (id integer) USING dynamic_catalog_heap'';
+             EXECUTE ''ALTER TABLE dynamic_catalog_rows OWNER TO dynamic_catalog_owner'';
+             EXECUTE ''ALTER LARGE OBJECT 90231 OWNER TO dynamic_catalog_owner'';
+             EXECUTE ''CREATE FOREIGN DATA WRAPPER dynamic_catalog_fdw HANDLER postgres_fdw_handler VALIDATOR postgres_fdw_validator'';
+             EXECUTE ''CREATE SERVER dynamic_catalog_server FOREIGN DATA WRAPPER dynamic_catalog_fdw OPTIONS (host ''''127.0.0.1'''', sslmode ''''disable'''')'';
+             EXECUTE ''CREATE FOREIGN TABLE dynamic_catalog_foreign (id integer) SERVER dynamic_catalog_server'';
+             EXECUTE ''ALTER FOREIGN TABLE dynamic_catalog_foreign OPTIONS (ADD schema_name ''''public'''', ADD table_name ''''remote_rows'''')'';
+           END';
+         CREATE FUNCTION dynamic_catalog_administration_drop() RETURNS void LANGUAGE plpgsql AS '
+           BEGIN
+             EXECUTE ''DROP ACCESS METHOD dynamic_catalog_heap CASCADE'';
+           END';
+         SELECT dynamic_catalog_administration()",
+    );
+    assert!(
+        !String::from_utf8_lossy(&setup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&setup)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT nspname FROM pg_namespace WHERE nspname = 'dynamic_catalog_schema_moved'; \
+             SELECT has_parameter_privilege('dynamic_catalog_owner', 'event_triggers', 'SET'); \
+             SELECT lomowner::regrole::text FROM pg_largeobject_metadata WHERE oid = 90231; \
+             SELECT ftoptions::text FROM pg_foreign_table WHERE ftrelid = 'dynamic_catalog_foreign'::regclass; \
+             SELECT a.amname, c.relowner::regrole::text \
+               FROM pg_class c \
+               JOIN pg_am a ON a.oid = c.relam \
+              WHERE c.relname = 'dynamic_catalog_rows'",
+        )),
+        [
+            "dynamic_catalog_schema_moved",
+            "t",
+            "dynamic_catalog_owner",
+            "{schema_name=public,table_name=remote_rows}",
+            "dynamic_catalog_heap|dynamic_catalog_owner",
+        ]
+    );
+    let tablespaces = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE PROCEDURE dynamic_catalog_tablespaces() LANGUAGE plpgsql AS '
+           BEGIN
+             COMMIT;
+             EXECUTE ''CREATE TABLESPACE dynamic_catalog_source LOCATION ''''/object/dynamic-catalog-source'''''';
+             EXECUTE ''CREATE TABLESPACE dynamic_catalog_target LOCATION ''''/object/dynamic-catalog-target'''''';
+             EXECUTE ''ALTER TABLE dynamic_catalog_rows OWNER TO postgres'';
+             EXECUTE ''ALTER TABLE dynamic_catalog_rows SET TABLESPACE dynamic_catalog_source'';
+             EXECUTE ''CREATE INDEX dynamic_catalog_rows_idx ON dynamic_catalog_rows (id) TABLESPACE dynamic_catalog_source'';
+             EXECUTE ''ALTER TABLE ALL IN TABLESPACE dynamic_catalog_source OWNED BY postgres SET TABLESPACE dynamic_catalog_target NOWAIT'';
+             EXECUTE ''ALTER INDEX ALL IN TABLESPACE dynamic_catalog_source OWNED BY postgres SET TABLESPACE dynamic_catalog_target NOWAIT'';
+           END'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&tablespaces).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&tablespaces)
+    );
+    let tablespaces = run_with(
+        &mut engine,
+        &mut budget,
+        "CALL dynamic_catalog_tablespaces()",
+    );
+    assert!(
+        !String::from_utf8_lossy(&tablespaces).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&tablespaces)
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT s.spcname FROM pg_class c JOIN pg_tablespace s ON s.oid = c.reltablespace \
+              WHERE c.relname IN ('dynamic_catalog_rows', 'dynamic_catalog_rows_idx') ORDER BY c.relname",
+        )),
+        ["dynamic_catalog_target", "dynamic_catalog_target"]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut cold_budget = Budget::new(1 << 29);
+    let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut cold,
+            &mut cold_budget,
+            "SELECT nspname FROM pg_namespace WHERE nspname = 'dynamic_catalog_schema_moved'; \
+             SELECT has_parameter_privilege('dynamic_catalog_owner', 'event_triggers', 'SET'); \
+             SELECT lomowner::regrole::text FROM pg_largeobject_metadata WHERE oid = 90231; \
+             SELECT ftoptions::text FROM pg_foreign_table WHERE ftrelid = 'dynamic_catalog_foreign'::regclass; \
+             SELECT a.amname, c.relowner::regrole::text, s.spcname \
+               FROM pg_class c \
+               JOIN pg_am a ON a.oid = c.relam \
+               JOIN pg_tablespace s ON s.oid = c.reltablespace \
+              WHERE c.relname = 'dynamic_catalog_rows'",
+        )),
+        [
+            "dynamic_catalog_schema_moved",
+            "t",
+            "dynamic_catalog_owner",
+            "{schema_name=public,table_name=remote_rows}",
+            "dynamic_catalog_heap|postgres|dynamic_catalog_target",
+        ]
+    );
+    let dropped = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "SELECT dynamic_catalog_administration_drop(); \
+         SELECT count(*) FROM pg_am WHERE amname = 'dynamic_catalog_heap'; \
+         SELECT count(*) FROM pg_class WHERE relname = 'dynamic_catalog_rows'",
+    );
+    assert_eq!(data_rows(&dropped), ["NULL", "0", "0"], "{dropped:?}");
+    let cleanup = run_with(
+        &mut cold,
+        &mut cold_budget,
+        "DROP PROCEDURE dynamic_catalog_tablespaces(); \
+         DROP FUNCTION dynamic_catalog_administration_drop(); \
+         DROP FUNCTION dynamic_catalog_administration(); \
+         DROP FOREIGN TABLE dynamic_catalog_foreign; \
+         DROP SERVER dynamic_catalog_server; \
+         DROP FOREIGN DATA WRAPPER dynamic_catalog_fdw; \
+         SELECT lo_unlink(90231::oid); \
+         REVOKE SET ON PARAMETER event_triggers FROM dynamic_catalog_owner; \
+         DROP ROLE dynamic_catalog_owner; \
+         DROP SCHEMA dynamic_catalog_schema_moved",
+    );
+    assert!(
+        !String::from_utf8_lossy(&cleanup).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&cleanup)
+    );
+    for statement in [
+        "DROP TABLESPACE dynamic_catalog_source",
+        "DROP TABLESPACE dynamic_catalog_target",
+    ] {
+        let cleanup = run_with(&mut cold, &mut cold_budget, statement);
+        assert!(
+            !String::from_utf8_lossy(&cleanup).contains("ERROR"),
+            "{statement}: {}",
+            String::from_utf8_lossy(&cleanup)
+        );
+    }
+    drop(cold);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
+fn plpgsql_dynamic_utility_rejections_match_static_boundaries() {
+    let (mut engine, mut budget) = test_engine();
+    for (name, command, expected) in [
+        (
+            "load",
+            "LOAD 'dynamic_library'",
+            "does not load native shared libraries",
+        ),
+        (
+            "language",
+            "CREATE LANGUAGE dynamic_language",
+            "handlerless CREATE LANGUAGE is not supported",
+        ),
+    ] {
+        let command_in_body = command.replace('\'', "''");
+        let body = format!("BEGIN EXECUTE '{command_in_body}'; END");
+        let body = body.replace('\'', "''");
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "CREATE FUNCTION dynamic_rejection_{name}() RETURNS void LANGUAGE plpgsql AS '{body}'"
+            ),
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{created:?}"
+        );
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!("SELECT dynamic_rejection_{name}()"),
+        );
+        let text = String::from_utf8_lossy(&output);
+        assert!(text.contains("0A000") && text.contains(expected), "{text}");
+    }
+}
+
+#[test]
 fn plpgsql_scalar_functions_honor_acl_security_and_configuration_scopes() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(

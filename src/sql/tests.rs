@@ -704,7 +704,7 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
     config.object_store_on = true;
     config.object_store_sim = true;
     config.object_store_namespace = format!("plpgsql-dynamic-session-{}", std::process::id());
-    config.max_tables = 9;
+    config.max_tables = 10;
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     let mut budget = Budget::new(1 << 29);
     let mut engine = Engine::new(&config, &mut budget).unwrap();
@@ -777,6 +777,21 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
                INTO STRICT plan;
              IF plan IS NULL THEN RAISE EXCEPTION ''EXPLAIN ANALYZE JSON result mismatch''; END IF;
            END'; \
+         CREATE FUNCTION plpgsql_dynamic_analyze_compound() RETURNS void LANGUAGE plpgsql AS '
+           DECLARE plan text;
+           BEGIN
+             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows \
+               UNION ALL SELECT value FROM plpgsql_dynamic_session_rows'' INTO plan;
+             IF plan IS NULL OR position(''actual time'' IN plan) = 0 THEN
+               RAISE EXCEPTION ''EXPLAIN ANALYZE set-query result mismatch'';
+             END IF;
+             EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) WITH inserted AS \
+               (INSERT INTO plpgsql_dynamic_session_rows VALUES (5) RETURNING value) \
+               SELECT value FROM inserted'' INTO plan;
+             IF plan IS NULL OR position(''actual time'' IN plan) = 0 THEN
+               RAISE EXCEPTION ''EXPLAIN ANALYZE data-modifying WITH result mismatch'';
+             END IF;
+           END'; \
          CREATE FUNCTION plpgsql_dynamic_constraints() RETURNS void LANGUAGE plpgsql AS '
            BEGIN EXECUTE ''SET CONSTRAINTS ALL IMMEDIATE''; END'; \
          CREATE FUNCTION plpgsql_dynamic_discard_all() RETURNS void LANGUAGE plpgsql AS '
@@ -796,19 +811,20 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
          SELECT plpgsql_dynamic_prepare(); \
          EXECUTE plpgsql_dynamic_plan(41); \
          BEGIN; SELECT plpgsql_dynamic_portal(); COMMIT; \
-         SELECT count(*) FROM plpgsql_dynamic_session_rows; \
-         EXECUTE plpgsql_dynamic_plan(41)",
+         SELECT plpgsql_dynamic_analyze_compound(); \
+         SELECT count(*) FROM plpgsql_dynamic_session_rows",
     );
     assert_eq!(
         data_rows(&observed),
-        ["NULL", "dynamic-session", "2", "3", "42", "2", "4"],
+        ["NULL", "dynamic-session", "2", "3", "42", "2", "NULL", "5"],
         "{}",
         String::from_utf8_lossy(&observed)
     );
+    let deallocated = run_with(&mut engine, &mut budget, "EXECUTE plpgsql_dynamic_plan(41)");
     assert!(
-        String::from_utf8_lossy(&observed).contains("26000"),
+        String::from_utf8_lossy(&deallocated).contains("26000"),
         "{}",
-        String::from_utf8_lossy(&observed)
+        String::from_utf8_lossy(&deallocated)
     );
     let strict_many = run_with(
         &mut engine,
@@ -821,6 +837,19 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
         String::from_utf8_lossy(&strict_many).contains("P0003"),
         "{}",
         String::from_utf8_lossy(&strict_many)
+    );
+    let strict_analyze_many = run_with(
+        &mut engine,
+        &mut budget,
+        "DO 'DECLARE plan text; BEGIN \
+           EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) SELECT value \
+             FROM plpgsql_dynamic_session_rows UNION ALL SELECT value \
+             FROM plpgsql_dynamic_session_rows'' INTO STRICT plan; END'",
+    );
+    assert!(
+        String::from_utf8_lossy(&strict_analyze_many).contains("P0003"),
+        "{}",
+        String::from_utf8_lossy(&strict_analyze_many)
     );
     let strict_none = run_with(
         &mut engine,
@@ -896,15 +925,17 @@ fn plpgsql_dynamic_session_and_maintenance_commands_use_typed_boundaries() {
         "{}",
         String::from_utf8_lossy(&reset)
     );
+    assert!(engine.checkpoint().unwrap());
     drop(engine);
     let mut cold_budget = Budget::new(1 << 29);
     let mut cold = Engine::new(&config, &mut cold_budget).unwrap();
     let recovered = run_with(
         &mut cold,
         &mut cold_budget,
-        "SELECT reltuples::integer FROM pg_class WHERE relname = 'plpgsql_dynamic_session_rows'",
+        "SELECT count(*) FROM plpgsql_dynamic_session_rows; \
+         SELECT reltuples::integer FROM pg_class WHERE relname = 'plpgsql_dynamic_session_rows'",
     );
-    assert_eq!(data_rows(&recovered), ["2"]);
+    assert_eq!(data_rows(&recovered), ["5", "2"]);
     drop(cold);
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
     std::fs::remove_dir_all(&config.data_dir).unwrap();

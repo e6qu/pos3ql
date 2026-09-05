@@ -37,6 +37,7 @@ DROP FUNCTION IF EXISTS plpgsql_dynamic_session_deallocate();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_portal();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_lock();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_analyze_json();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_analyze_compound();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_constraints();
 DROP PUBLICATION IF EXISTS plpgsql_dynamic_catalog_publication;
 DROP MATERIALIZED VIEW IF EXISTS plpgsql_dynamic_catalog_materialized;
@@ -371,6 +372,23 @@ BEGIN
   IF plan IS NULL THEN RAISE EXCEPTION 'EXPLAIN ANALYZE JSON result mismatch'; END IF;
 END
 $$;
+CREATE FUNCTION plpgsql_dynamic_analyze_compound() RETURNS void
+  LANGUAGE plpgsql AS $$
+DECLARE plan text;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) SELECT value FROM plpgsql_dynamic_session_rows
+    UNION ALL SELECT value FROM plpgsql_dynamic_session_rows' INTO plan;
+  IF plan IS NULL OR position('actual time' IN plan) = 0 THEN
+    RAISE EXCEPTION 'EXPLAIN ANALYZE set-query result mismatch';
+  END IF;
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF) WITH inserted AS
+    (INSERT INTO plpgsql_dynamic_session_rows VALUES (5) RETURNING value)
+    SELECT value FROM inserted' INTO plan;
+  IF plan IS NULL OR position('actual time' IN plan) = 0 THEN
+    RAISE EXCEPTION 'EXPLAIN ANALYZE data-modifying WITH result mismatch';
+  END IF;
+END
+$$;
 CREATE FUNCTION plpgsql_dynamic_session_constraints() RETURNS void
   LANGUAGE plpgsql AS $$
 BEGIN
@@ -427,6 +445,7 @@ EXECUTE plpgsql_dynamic_session_plan(41);
 BEGIN;
 SELECT plpgsql_dynamic_session_portal();
 COMMIT;
+SELECT plpgsql_dynamic_analyze_compound();
 SELECT count(*) FROM plpgsql_dynamic_session_rows;
 SELECT plpgsql_dynamic_session_deallocate();
 SELECT plpgsql_dynamic_analyze_json();

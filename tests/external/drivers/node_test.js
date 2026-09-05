@@ -66,6 +66,12 @@ async function main() {
     await c.query("CALL node_plpgsql($1)", [44]);
     const plpgsql = await c.query("SELECT value FROM node_routine_log WHERE value = 45");
     line(`plpgsql procedure ${plpgsql.rows[0].value}`);
+    await c.query("CREATE OR REPLACE FUNCTION node_dynamic_analyze(value integer) RETURNS boolean " +
+      "LANGUAGE plpgsql AS 'DECLARE plan text; BEGIN " +
+      "EXECUTE ''EXPLAIN (ANALYZE, FORMAT JSON) SELECT $1 + 1'' " +
+      "INTO STRICT plan USING value; RETURN plan IS NOT NULL; END'");
+    const dynamicAnalyze = await c.query('SELECT node_dynamic_analyze($1) AS ok', [41]);
+    line(`plpgsql dynamic analyze ${dynamicAnalyze.rows[0].ok}`);
 
     // Transaction rollback must not persist.
     await c.query('BEGIN');

@@ -80,6 +80,19 @@ public class JdbcTest {
             rs.next();
             line("plpgsql procedure " + rs.getInt(1));
         }
+        try (Statement s = c.createStatement()) {
+            s.execute("CREATE OR REPLACE FUNCTION jdbc_dynamic_analyze(value integer) RETURNS boolean "
+                + "LANGUAGE plpgsql AS 'DECLARE plan text; BEGIN "
+                + "EXECUTE ''EXPLAIN (ANALYZE, FORMAT JSON) SELECT $1 + 1'' "
+                + "INTO STRICT plan USING value; RETURN plan IS NOT NULL; END'");
+        }
+        try (PreparedStatement ps = c.prepareStatement("SELECT jdbc_dynamic_analyze(?)")) {
+            ps.setInt(1, 41);
+            try (ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                line("plpgsql dynamic analyze " + rs.getBoolean(1));
+            }
+        }
     }
 
     // Prepared-statement CRUD, the core of any driver's use.

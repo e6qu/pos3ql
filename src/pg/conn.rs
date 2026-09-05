@@ -1178,7 +1178,7 @@ impl Conn {
             &mut self.txn,
             &mut self.sqlprep,
             &mut self.cursors,
-            &self.guc,
+            &mut self.guc,
             &self.arena,
             &mut responder,
         ) {
@@ -4865,6 +4865,108 @@ mod tests {
         drop(connection);
         drop(engine);
         crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn extended_portal_returns_dynamic_explain_analyze_result() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "pos3ql-dynamic-explain-wire-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.max_tables = 8;
+        config.table_rows = 256;
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).expect("engine");
+        let mut connection = Conn::new(&config, &mut budget).expect("connection");
+        connection.phase = Phase::Ready;
+
+        connection.recv.append(&frontend(
+            wire::FMSG_QUERY,
+            b"CREATE FUNCTION plpgsql_dynamic_wire() RETURNS boolean LANGUAGE plpgsql AS \
+              'DECLARE plan text; BEGIN \
+                 EXECUTE ''EXPLAIN (ANALYZE, COSTS OFF) SELECT 1'' INTO plan; \
+                 RETURN position(''actual time'' IN plan) > 0; \
+               END'\0",
+        ));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(
+            !connection
+                .send
+                .readable()
+                .windows(5)
+                .any(|frame| frame == b"ERROR"),
+            "{}",
+            String::from_utf8_lossy(connection.send.readable())
+        );
+        connection.send.clear();
+
+        let mut parse = Vec::new();
+        parse.extend_from_slice(b"dynamic_explain\0SELECT plpgsql_dynamic_wire()\0");
+        parse.extend_from_slice(&0i16.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_PARSE, &parse));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut bind = Vec::new();
+        bind.extend_from_slice(b"dynamic_explain_portal\0dynamic_explain\0");
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_BIND, &bind));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut execute = Vec::new();
+        execute.extend_from_slice(b"dynamic_explain_portal\0");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_EXECUTE, &execute));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(
+            connection.send.readable().windows(12).any(|frame| {
+                frame == [wire::MSG_DATA_ROW, 0, 0, 0, 11, 0, 1, 0, 0, 0, 1, b't']
+            }),
+            "{:?}",
+            connection.send.readable()
+        );
+
+        connection.recv.append(&frontend(wire::FMSG_SYNC, b""));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(connection.send.readable().ends_with(&[
+            wire::MSG_READY_FOR_QUERY,
+            0,
+            0,
+            0,
+            5,
+            b'I'
+        ]));
+
+        drop(connection);
+        drop(engine);
         let _ = std::fs::remove_dir_all(directory);
     }
 

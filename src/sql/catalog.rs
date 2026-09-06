@@ -7760,7 +7760,10 @@ fn pg_publication_tables<'a>(
                     text(output_definition.name.as_str(), arena)?,
                     attributes,
                     match row_filter {
-                        Some(filter) => text(filter, arena)?,
+                        Some(filter) => {
+                            let rendered = stack_format!(66, "({filter})");
+                            text(rendered.as_str(), arena)?
+                        }
                         None => Datum::Null,
                     },
                 ],

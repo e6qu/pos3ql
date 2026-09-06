@@ -43690,6 +43690,16 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
         ["(id > 0)"],
         "publication filters survive checkpoint recovery"
     );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT attnames::text, rowfilter FROM pg_publication_tables \
+             WHERE pubname = 'projected_changes'"
+        )),
+        ["{id,visible}|(id > 0)"],
+        "publication table projections render PostgreSQL row filters"
+    );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 

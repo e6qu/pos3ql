@@ -43647,8 +43647,10 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
         &mut engine,
         &mut budget,
         "CREATE TABLE publication_projected (id int PRIMARY KEY, visible text, hidden text); \
-         CREATE PUBLICATION projected_changes FOR TABLE publication_projected (id, visible) WHERE (id > 0) \
-         WITH (publish = 'insert, update, delete')",
+         CREATE PUBLICATION projected_changes FOR TABLE publication_projected \
+         WITH (publish = 'insert, update, delete'); \
+         ALTER PUBLICATION projected_changes \
+           SET TABLE publication_projected (id, visible) WHERE (id > 0)",
     );
     assert_eq!(
         data_rows(&run_with(

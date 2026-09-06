@@ -730,6 +730,8 @@ impl ColType {
             "void" => Self::Void,
             "internal" => Self::Internal,
             "pg_ddl_command" => Self::PgDdlCommand,
+            "int2vector" => Self::Int2Vector,
+            "oidvector" => Self::OidVector,
             "bool" | "boolean" => Self::Bool,
             "int" | "int4" | "integer" | "serial" | "serial4" => Self::Int4,
             "smallint" | "int2" | "smallserial" | "serial2" => Self::Int2,

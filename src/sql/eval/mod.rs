@@ -2645,6 +2645,34 @@ pub fn eval_full<'a>(
                         raw: super::array::build_shaped(items, shape.without_first()?, arena)?,
                     })
                 }
+                Datum::Int2Vector(raw) => {
+                    let Some(slot) = index
+                        .checked_sub(1)
+                        .and_then(|value| usize::try_from(value).ok())
+                    else {
+                        return Ok(Datum::Null);
+                    };
+                    Ok(raw
+                        .as_chunks::<2>()
+                        .0
+                        .get(slot)
+                        .map(|value| Datum::Int2(i16::from_le_bytes(*value)))
+                        .unwrap_or(Datum::Null))
+                }
+                Datum::OidVector(raw) => {
+                    let Some(slot) = index
+                        .checked_sub(1)
+                        .and_then(|value| usize::try_from(value).ok())
+                    else {
+                        return Ok(Datum::Null);
+                    };
+                    Ok(raw
+                        .as_chunks::<4>()
+                        .0
+                        .get(slot)
+                        .map(|value| Datum::Oid(u32::from_le_bytes(*value)))
+                        .unwrap_or(Datum::Null))
+                }
                 Datum::Text(value)
                     if matches!(
                         base,
@@ -4350,6 +4378,8 @@ fn static_type<'a>(e: &Expr<'a>, row: &impl ColumnLookup<'a>) -> Option<ColType>
         } => case_result_type(whens, otherwise, row),
         Expr::Subscript { base, .. } => match static_type(base, row) {
             Some(ColType::Array(element)) => Some(element.to_coltype()),
+            Some(ColType::Int2Vector) => Some(ColType::Int2),
+            Some(ColType::OidVector) => Some(ColType::Oid),
             Some(ctype) if matches!(base, Expr::Subscript { .. }) => Some(ctype),
             _ => None,
         },

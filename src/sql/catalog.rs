@@ -7727,6 +7727,11 @@ fn pg_publication_tables<'a>(
                 implicit_mask()
             } else if let Some(index) = effective_explicit.or(explicit) {
                 if usize::from(published.tables[index]) != output
+                    && storage.partition_descends_from(
+                        output,
+                        usize::from(published.tables[index]),
+                        txid,
+                    )
                     && !published.publish_via_partition_root
                 {
                     implicit_mask()

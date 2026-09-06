@@ -15,6 +15,13 @@ CREATE TABLE publication_union_columns (
   left_value text,
   right_value text
 );
+CREATE TABLE publication_inheritance_parent (
+  id integer PRIMARY KEY,
+  value text
+);
+CREATE TABLE publication_inheritance_child (
+  extra integer
+) INHERITS (publication_inheritance_parent);
 
 CREATE PUBLICATION publication_changes
   FOR TABLE publication_source (id, value), publication_second
@@ -34,6 +41,21 @@ SELECT pubname, attnames::text FROM pg_publication_tables
  WHERE pubname IN ('publication_union_left', 'publication_union_right')
  ORDER BY pubname;
 SELECT pubgencols FROM pg_publication WHERE pubname = 'publication_generated_changes';
+CREATE PUBLICATION publication_inheritance_changes
+  FOR TABLE publication_inheritance_parent (id) WHERE (id > 0);
+SELECT tablename, attnames::text, rowfilter FROM pg_publication_tables
+ WHERE pubname = 'publication_inheritance_changes'
+ ORDER BY tablename;
+ALTER PUBLICATION publication_inheritance_changes
+  SET TABLE ONLY publication_inheritance_parent (id) WHERE (id > 0);
+SELECT tablename FROM pg_publication_tables
+ WHERE pubname = 'publication_inheritance_changes'
+ ORDER BY tablename;
+ALTER PUBLICATION publication_inheritance_changes
+  SET TABLE publication_inheritance_parent * (id) WHERE (id > 0);
+SELECT tablename, attnames::text, rowfilter FROM pg_publication_tables
+ WHERE pubname = 'publication_inheritance_changes'
+ ORDER BY tablename;
 ALTER PUBLICATION publication_generated_changes SET (publish_generated_columns = 'none');
 SELECT pubgencols FROM pg_publication WHERE pubname = 'publication_generated_changes';
 CREATE ROLE publication_owner_target;
@@ -129,12 +151,13 @@ DROP TABLE publication_filter_rename, publication_projection_drop;
 
 DROP PUBLICATION publication_changes, publication_all, publication_empty_renamed,
   publication_schema_changes, publication_generated_changes, publication_union_left,
-  publication_union_right;
+  publication_union_right, publication_inheritance_changes;
 DROP TABLE publication_generated;
 DROP TABLE publication_third;
 DROP PUBLICATION IF EXISTS publication_missing;
 DROP TABLE publication_second;
 DROP TABLE publication_source;
 DROP TABLE publication_union_columns;
+DROP TABLE publication_inheritance_child, publication_inheritance_parent;
 DROP SCHEMA publication_schema CASCADE;
 DROP ROLE publication_owner_target;

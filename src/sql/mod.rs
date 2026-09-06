@@ -1573,25 +1573,40 @@ enum PublicationOperation {
 }
 
 /// Finds the explicit publication member that makes `table_slot` publishable.
-/// PostgreSQL makes every partition an implicit member when an ancestor is
-/// published; the leaf itself wins when both appear explicitly.
+/// Partitions are always implicit members. Ordinary inheritance is selected
+/// only by a non-`ONLY` membership record.
 pub(crate) fn publication_partition_member(
     storage: &Storage,
     publication: &crate::storage::PublicationDef,
     table_slot: usize,
 ) -> Option<usize> {
-    let mut current = table_slot;
-    loop {
+    if let Some(index) = publication.tables[..publication.table_count]
+        .iter()
+        .position(|member| usize::from(*member) == table_slot)
+    {
+        return Some(index);
+    }
+    let mut partition = table_slot;
+    while let Some(crate::storage::PartitionAttachment { parent, .. }) =
+        storage.table_def(partition, 0).partition.attachment
+    {
+        partition = usize::from(parent);
         if let Some(index) = publication.tables[..publication.table_count]
             .iter()
-            .position(|member| usize::from(*member) == current)
+            .position(|member| usize::from(*member) == partition)
         {
             return Some(index);
         }
-        let crate::storage::PartitionAttachment { parent, .. } =
-            storage.table_def(current, 0).partition.attachment?;
-        current = usize::from(parent);
     }
+    publication.tables[..publication.table_count]
+        .iter()
+        .enumerate()
+        .find_map(|(index, member)| {
+            let member = usize::from(*member);
+            (publication.table_include_descendants[index]
+                && storage.relation_descends_from(table_slot, member, 0))
+            .then_some(index)
+        })
 }
 
 /// Schema publications inherit through a partition tree too: a parent in the
@@ -1694,6 +1709,7 @@ fn publication_projection_mask(
     }
     let index = publication_partition_member(storage, publication, table_slot)?;
     if usize::from(publication.tables[index]) != table_slot
+        && storage.partition_descends_from(table_slot, usize::from(publication.tables[index]), 0)
         && !publication.publish_via_partition_root
     {
         return Some(implicit_mask());
@@ -1794,10 +1810,15 @@ fn publication_row_matches(
         let Some(index) = publication_partition_member(storage, publication, table_slot) else {
             continue;
         };
-        // With PostgreSQL's default leaf identity, an ancestor's row filter
-        // does not become the leaf's filter.  Only an explicitly named leaf
-        // has a filter in this representation.
+        // With PostgreSQL's default leaf identity, a partition ancestor's
+        // filter does not become the leaf's filter. Ordinary inheritance
+        // keeps the selected parent's contract.
         if usize::from(publication.tables[index]) != table_slot
+            && storage.partition_descends_from(
+                table_slot,
+                usize::from(publication.tables[index]),
+                0,
+            )
             && !publication.publish_via_partition_root
         {
             return Ok(true);
@@ -18152,6 +18173,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             all_tables,
             tables,
             table_column_masks,
+            table_include_descendants,
             table_filter_sql,
             table_count,
             schemas,
@@ -18169,6 +18191,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     all_tables,
                     tables: &tables[..table_count],
                     table_column_masks: &table_column_masks[..table_count],
+                    table_include_descendants: &table_include_descendants[..table_count],
                     table_filter_sql: &table_filter_sql[..table_count],
                     schemas: &schemas[..schema_count],
                     publish_insert,
@@ -18193,6 +18216,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             all_tables,
             tables,
             table_column_masks,
+            table_include_descendants,
             table_filter_sql,
             table_count,
             schemas,
@@ -18208,6 +18232,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 all_tables,
                 tables,
                 table_column_masks,
+                table_include_descendants,
                 table_filters: crate::storage::PublicationFilters::from_sql(
                     &table_filter_sql[..table_count],
                 )?,

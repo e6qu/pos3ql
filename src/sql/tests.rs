@@ -46149,6 +46149,104 @@ fn publication_alterations_are_transactional_catalog_accurate_and_replayable() {
 }
 
 #[test]
+fn publication_descendant_selection_is_typed_durable_and_protocol_visible() {
+    let mut config = test_config("publication-descendants");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("publication-descendants-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_parent (id integer PRIMARY KEY, value text); \
+         CREATE TABLE publication_child (extra integer) INHERITS (publication_parent); \
+         CREATE PUBLICATION publication_descendants \
+           FOR TABLE publication_parent (id) WHERE (id > 0)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT tablename, attnames::text, rowfilter FROM pg_publication_tables \
+             WHERE pubname = 'publication_descendants' ORDER BY tablename",
+        )),
+        [
+            "publication_child|{id}|(id > 0)",
+            "publication_parent|{id}|(id > 0)",
+        ],
+        "the default table target includes ordinary descendants and retains its projection/filter"
+    );
+    let floor = engine.storage.lsn();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO publication_child (id, value, extra) VALUES (1, 'included', 9)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "publication descendant scratch", 1 << 16).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "publication descendant send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("publication_descendants").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("child transaction remains available to a publication cursor");
+    assert!(emitted);
+    assert!(send.readable().contains(&b'I'));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_descendants \
+           SET TABLE ONLY publication_parent (id) WHERE (id > 0)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT tablename FROM pg_publication_tables \
+             WHERE pubname = 'publication_descendants' ORDER BY tablename",
+        )),
+        ["publication_parent"],
+        "ONLY excludes ordinary inheritance descendants"
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_descendants \
+           SET TABLE publication_parent * (id) WHERE (id > 0)",
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut recovery_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovery_budget,
+            "SELECT tablename, attnames::text, rowfilter FROM pg_publication_tables \
+             WHERE pubname = 'publication_descendants' ORDER BY tablename",
+        )),
+        [
+            "publication_child|{id}|(id > 0)",
+            "publication_parent|{id}|(id > 0)",
+        ],
+        "the explicit descendant contract survives the object-store manifest"
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn publication_schema_selection_is_transactional_catalog_accurate_and_replayable() {
     let mut config = test_config("publication-schema-replay");
     config.object_store_on = true;
@@ -46222,6 +46320,7 @@ fn publication_membership_and_lifetime_require_the_right_owner() {
         "CREATE ROLE publication_owner; \
          CREATE ROLE publication_other; \
          GRANT CREATE ON SCHEMA public TO publication_owner; \
+         GRANT CREATE ON DATABASE postgres TO publication_owner; \
          CREATE TABLE other_publication_table (id integer)",
     );
     let mut owner_guc = GucState::new();
@@ -46264,6 +46363,110 @@ fn publication_membership_and_lifetime_require_the_right_owner() {
 }
 
 #[test]
+fn publication_scope_and_column_selection_require_postgresql_privileges() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE publication_limited; \
+         CREATE ROLE publication_owner_target; \
+         GRANT CREATE ON SCHEMA public TO publication_limited; \
+         GRANT publication_owner_target TO publication_limited WITH ADMIN OPTION; \
+         CREATE SCHEMA publication_scope",
+    );
+    let mut limited = GucState::new();
+    limited.set_session_user("publication_limited");
+    run_with_guc(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_scope_target (id integer PRIMARY KEY)",
+        1 << 18,
+        &mut limited,
+    );
+    let no_database_create = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION publication_scope_changes FOR TABLE publication_scope_target",
+        1 << 18,
+        &mut limited,
+    );
+    assert!(
+        String::from_utf8_lossy(&no_database_create).contains("permission denied for database"),
+        "{}",
+        String::from_utf8_lossy(&no_database_create)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT CREATE ON DATABASE postgres TO publication_limited",
+    );
+    let explicit = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION publication_scope_changes FOR TABLE publication_scope_target",
+        1 << 18,
+        &mut limited,
+    );
+    let explicit = String::from_utf8_lossy(&explicit);
+    assert!(explicit.contains("CREATE PUBLICATION"), "{explicit}");
+    let owner_without_database_create = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_scope_changes OWNER TO publication_owner_target",
+        1 << 18,
+        &mut limited,
+    );
+    assert!(
+        String::from_utf8_lossy(&owner_without_database_create)
+            .contains("permission denied for database"),
+        "{}",
+        String::from_utf8_lossy(&owner_without_database_create)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT CREATE ON DATABASE postgres TO publication_owner_target",
+    );
+    let owner_with_database_create = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_scope_changes OWNER TO publication_owner_target",
+        1 << 18,
+        &mut limited,
+    );
+    assert!(
+        String::from_utf8_lossy(&owner_with_database_create).contains("ALTER PUBLICATION"),
+        "{}",
+        String::from_utf8_lossy(&owner_with_database_create)
+    );
+    let all_tables = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION publication_scope_all FOR ALL TABLES",
+        1 << 18,
+        &mut limited,
+    );
+    assert!(
+        String::from_utf8_lossy(&all_tables)
+            .contains("must be superuser to create a FOR ALL TABLES publication"),
+        "{}",
+        String::from_utf8_lossy(&all_tables)
+    );
+    let mixed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION publication_scope_mixed \
+         FOR TABLE publication_scope_target (id), TABLES IN SCHEMA publication_scope",
+    );
+    assert!(
+        String::from_utf8_lossy(&mixed)
+            .contains("cannot specify a column list when publishing tables in a schema"),
+        "{}",
+        String::from_utf8_lossy(&mixed)
+    );
+}
+
+#[test]
 fn publication_owner_changes_are_transactional_and_durable() {
     let mut config = test_config("publication-owner-replay");
     config.object_store_on = true;
@@ -46277,7 +46480,8 @@ fn publication_owner_changes_are_transactional_and_durable() {
         &mut budget,
         "CREATE ROLE publication_first_owner; \
          CREATE ROLE publication_second_owner; \
-         GRANT CREATE ON SCHEMA public TO publication_first_owner",
+         GRANT CREATE ON SCHEMA public TO publication_first_owner; \
+         GRANT CREATE ON DATABASE postgres TO publication_first_owner",
     );
     let mut first_owner = GucState::new();
     first_owner.set_session_user("publication_first_owner");

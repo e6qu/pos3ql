@@ -12378,6 +12378,7 @@ fn remove_schema_from_publications(
                 all_tables: definition.all_tables,
                 tables: definition.tables,
                 table_column_masks: definition.table_column_masks,
+                table_include_descendants: definition.table_include_descendants,
                 table_filter_sql: definition
                     .table_filters
                     .materialize_sql(definition.table_count),
@@ -12428,7 +12429,26 @@ pub fn create_publication(
             "FOR ALL TABLES cannot name tables"
         ));
     }
-    let (members, table_column_masks, table_filter_sql, table_count) =
+    let Some(role) = storage.current_role_slot(txn.txid) else {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "current role is not present in the role catalog"
+        ));
+    };
+    let superuser = storage.role(role).attributes_to(txn.txid).superuser;
+    if !superuser && !storage.has_current_database_create_privilege(role, txn.txid) {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "permission denied for database"
+        ));
+    }
+    if all_tables && !superuser {
+        return sql_fail(sql_err!(
+            sqlstate::INSUFFICIENT_PRIVILEGE,
+            "must be superuser to create a FOR ALL TABLES publication"
+        ));
+    }
+    let (members, table_column_masks, table_include_descendants, table_filter_sql, table_count) =
         match publication_members(storage, txn.txid, tables, publish.update || publish.delete) {
             Ok(members) => members,
             Err(error) => return sql_fail(error),
@@ -12437,6 +12457,11 @@ pub fn create_publication(
         Ok(schemas) => schemas,
         Err(error) => return sql_fail(error),
     };
+    if let Err(error) =
+        validate_publication_target_mix(&table_column_masks[..table_count], schemas.len())
+    {
+        return sql_fail(error);
+    }
     let name = match SqlName::parse(name) {
         Ok(name) => name,
         Err(error) => return sql_fail(error),
@@ -12447,6 +12472,7 @@ pub fn create_publication(
             all_tables,
             tables: &members[..table_count],
             table_column_masks: &table_column_masks[..table_count],
+            table_include_descendants: &table_include_descendants[..table_count],
             table_filter_sql: &table_filter_sql[..table_count],
             schemas: &schema_members[..schemas.len()],
             publish_insert: publish.insert,
@@ -12470,6 +12496,7 @@ pub fn create_publication(
                     all_tables,
                     tables: members,
                     table_column_masks,
+                    table_include_descendants,
                     table_filter_sql,
                     table_count,
                     schemas: schema_members,
@@ -13409,6 +13436,12 @@ pub fn alter_publication(
                     role_name.as_str()
                 ));
             }
+            if !superuser && !storage.has_current_database_create_privilege(new_owner, txn.txid) {
+                return sql_fail(sql_err!(
+                    sqlstate::INSUFFICIENT_PRIVILEGE,
+                    "permission denied for database"
+                ));
+            }
             if !superuser
                 && (current.all_tables || current.schema_count != 0)
                 && !storage.role(new_owner).attributes_to(txn.txid).superuser
@@ -13469,7 +13502,7 @@ pub fn alter_publication(
                     name
                 ));
             }
-            let (members, masks, filters, count) = match publication_members(
+            let (members, masks, descendants, filters, count) = match publication_members(
                 storage,
                 txn.txid,
                 tables,
@@ -13480,12 +13513,16 @@ pub fn alter_publication(
             };
             definition.tables = members;
             definition.table_column_masks = masks;
+            definition.table_include_descendants = descendants;
             definition_filter_sql = filters;
             definition.table_count = count;
             let schema_members = match publication_schemas(storage, txn.txid, schemas) {
                 Ok(schemas) => schemas,
                 Err(error) => return sql_fail(error),
             };
+            if let Err(error) = validate_publication_target_mix(&masks[..count], schemas.len()) {
+                return sql_fail(error);
+            }
             definition.schemas = schema_members;
             definition.schema_count = schemas.len();
         }
@@ -13497,7 +13534,7 @@ pub fn alter_publication(
                     name
                 ));
             }
-            let (members, masks, filters, count) = match publication_members(
+            let (members, masks, descendants, filters, count) = match publication_members(
                 storage,
                 txn.txid,
                 tables,
@@ -13513,6 +13550,18 @@ pub fn alter_publication(
                     crate::storage::MAX_PUBLICATION_TABLES
                 ));
             }
+            if let Err(error) = validate_publication_target_mix(
+                &masks[..count],
+                definition.schema_count + schemas.len(),
+            ) {
+                return sql_fail(error);
+            }
+            if let Err(error) = validate_publication_target_mix(
+                &definition.table_column_masks[..definition.table_count],
+                schemas.len(),
+            ) {
+                return sql_fail(error);
+            }
             for (index, table) in members[..count].iter().enumerate() {
                 if definition.tables[..definition.table_count].contains(table) {
                     return sql_fail(sql_err!(
@@ -13523,6 +13572,7 @@ pub fn alter_publication(
                 }
                 definition.tables[definition.table_count] = *table;
                 definition.table_column_masks[definition.table_count] = masks[index];
+                definition.table_include_descendants[definition.table_count] = descendants[index];
                 definition_filter_sql[definition.table_count] = filters[index];
                 definition.table_count += 1;
             }
@@ -13562,11 +13612,11 @@ pub fn alter_publication(
                     name
                 ));
             }
-            let (members, _, _, count) = match publication_members(storage, txn.txid, tables, false)
-            {
-                Ok(members) => members,
-                Err(error) => return sql_fail(error),
-            };
+            let (members, _, _, _, count) =
+                match publication_members(storage, txn.txid, tables, false) {
+                    Ok(members) => members,
+                    Err(error) => return sql_fail(error),
+                };
             for table in &members[..count] {
                 let Some(index) = definition.tables[..definition.table_count]
                     .iter()
@@ -13584,9 +13634,13 @@ pub fn alter_publication(
                 definition
                     .table_column_masks
                     .copy_within(index + 1..definition.table_count, index);
+                definition
+                    .table_include_descendants
+                    .copy_within(index + 1..definition.table_count, index);
                 definition.table_count -= 1;
                 definition.tables[definition.table_count] = u16::MAX;
                 definition.table_column_masks[definition.table_count] = 0;
+                definition.table_include_descendants[definition.table_count] = false;
                 definition_filter_sql[definition.table_count] = StackStr::new();
             }
             let schema_members = match publication_schemas(storage, txn.txid, schemas) {
@@ -13634,6 +13688,7 @@ pub fn alter_publication(
             all_tables: definition.all_tables,
             tables: definition.tables,
             table_column_masks: definition.table_column_masks,
+            table_include_descendants: definition.table_include_descendants,
             table_filter_sql: definition_filter_sql,
             table_count: definition.table_count,
             schemas: definition.schemas,
@@ -13662,10 +13717,24 @@ pub fn alter_publication(
 type PublicationMembers = (
     [u16; crate::storage::MAX_PUBLICATION_TABLES],
     [u64; crate::storage::MAX_PUBLICATION_TABLES],
+    [bool; crate::storage::MAX_PUBLICATION_TABLES],
     [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
         crate::storage::MAX_PUBLICATION_TABLES],
     usize,
 );
+
+fn validate_publication_target_mix(
+    column_masks: &[u64],
+    schema_count: usize,
+) -> Result<(), SqlError> {
+    if schema_count != 0 && column_masks.iter().any(|mask| *mask != 0) {
+        return Err(sql_err!(
+            sqlstate::FEATURE_NOT_SUPPORTED,
+            "cannot specify a column list when publishing tables in a schema"
+        ));
+    }
+    Ok(())
+}
 
 fn publication_members(
     storage: &Storage,
@@ -13675,6 +13744,7 @@ fn publication_members(
 ) -> Result<PublicationMembers, SqlError> {
     let mut members = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
     let mut masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
+    let mut descendants = [false; crate::storage::MAX_PUBLICATION_TABLES];
     let mut filters = [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES];
     for (index, table) in tables.iter().enumerate() {
         let Some(crate::storage::ResolvedRelation::Table(slot)) =
@@ -13770,8 +13840,12 @@ fn publication_members(
         }
         members[index] = slot as u16;
         masks[index] = mask;
+        descendants[index] = matches!(
+            table.descendants,
+            crate::sql::ast::PublicationDescendants::Include
+        );
     }
-    Ok((members, masks, filters, tables.len()))
+    Ok((members, masks, descendants, filters, tables.len()))
 }
 
 fn validate_publication_replica_identity(
@@ -41098,10 +41172,14 @@ fn stage_publication_column_drop_dependencies(
         definition
             .table_column_masks
             .copy_within(member + 1..definition.table_count, member);
+        definition
+            .table_include_descendants
+            .copy_within(member + 1..definition.table_count, member);
         filters.copy_within(member + 1..definition.table_count, member);
         definition.table_count -= 1;
         definition.tables[definition.table_count] = u16::MAX;
         definition.table_column_masks[definition.table_count] = 0;
+        definition.table_include_descendants[definition.table_count] = false;
         filters[definition.table_count] = StackStr::new();
         definition.table_filters =
             crate::storage::PublicationFilters::from_sql(&filters[..definition.table_count])?;
@@ -41116,6 +41194,7 @@ fn stage_publication_column_drop_dependencies(
                 all_tables: definition.all_tables,
                 tables: definition.tables,
                 table_column_masks: definition.table_column_masks,
+                table_include_descendants: definition.table_include_descendants,
                 table_filter_sql: filters,
                 table_count: definition.table_count,
                 schemas: definition.schemas,
@@ -42851,6 +42930,7 @@ fn remap_publication_column_projections(
                 all_tables: definition.all_tables,
                 tables: definition.tables,
                 table_column_masks: definition.table_column_masks,
+                table_include_descendants: definition.table_include_descendants,
                 table_filter_sql: filters,
                 table_count: definition.table_count,
                 schemas: definition.schemas,
@@ -42940,6 +43020,7 @@ fn rewrite_table_publication_column_references(
                 all_tables: definition.all_tables,
                 tables: definition.tables,
                 table_column_masks: definition.table_column_masks,
+                table_include_descendants: definition.table_include_descendants,
                 table_filter_sql: filters,
                 table_count: definition.table_count,
                 schemas: definition.schemas,

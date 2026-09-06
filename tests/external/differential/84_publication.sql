@@ -53,13 +53,17 @@ SELECT count(*) FROM pg_publication_rel rel
   JOIN pg_publication pub ON pub.oid = rel.prpubid
  WHERE pub.pubname = 'publication_empty';
 SELECT prattrs::text FROM pg_publication_rel rel
- JOIN pg_publication pub ON pub.oid = rel.prpubid
+  JOIN pg_publication pub ON pub.oid = rel.prpubid
  JOIN pg_class cls ON cls.oid = rel.prrelid
  WHERE pub.pubname = 'publication_changes' AND cls.relname = 'publication_source';
 ALTER PUBLICATION publication_empty ADD TABLE publication_source;
 SELECT count(*) FROM pg_publication_rel rel
-  JOIN pg_publication pub ON pub.oid = rel.prpubid
+ JOIN pg_publication pub ON pub.oid = rel.prpubid
  WHERE pub.pubname = 'publication_empty';
+ALTER PUBLICATION publication_empty_renamed
+  ADD TABLE publication_source (id) WHERE (id > 0);
+SELECT attnames::text, rowfilter FROM pg_publication_tables
+ WHERE pubname = 'publication_empty_renamed';
 
 ALTER PUBLICATION publication_changes ADD TABLE publication_third;
 ALTER PUBLICATION publication_changes SET (publish = 'insert, delete');

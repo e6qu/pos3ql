@@ -1152,6 +1152,72 @@ def test_routine_contract_infers_untyped_parse_parameter():
     s.close()
 
 
+def test_plpgsql_catalog_locals_extend_bind_and_result_contracts():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TYPE wire_local_state AS ENUM ('ready', 'done'); "
+        "CREATE TYPE wire_local_pair AS (number integer, label text); "
+        "CREATE DOMAIN wire_local_positive AS integer CHECK (VALUE > 0); "
+        "CREATE FUNCTION wire_catalog_local(value wire_local_positive) RETURNS text "
+        "LANGUAGE plpgsql AS 'DECLARE checked wire_local_positive := value; "
+        "state wire_local_state := ''ready''; pair wire_local_pair; BEGIN "
+        "checked := checked + 1; state := ''done''; "
+        "pair := ROW(checked, state::text); "
+        "RETURN pair.number::text || '':'' || pair.label; END'",
+    )
+    check(
+        "catalog local raw-wire setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    domain_oid = int(
+        first_text_row(
+            simple_query(s, "SELECT oid FROM pg_type WHERE typname = 'wire_local_positive'")
+        )
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_catalog_local_statement\x00SELECT wire_catalog_local($1)\x00"
+        + struct.pack("!h", 0),
+    )
+    describe_statement = frontend_message(b"D", b"Swire_catalog_local_statement\x00")
+    bind_body = b"wire_catalog_local_portal\x00wire_catalog_local_statement\x00"
+    bind_body += struct.pack("!hh", 1, 1)
+    bind_body += struct.pack("!hi", 1, 4) + struct.pack("!i", 4)
+    bind_body += struct.pack("!hh", 1, 1)
+    bind = frontend_message(b"B", bind_body)
+    describe_portal = frontend_message(b"D", b"Pwire_catalog_local_portal\x00")
+    execute = frontend_message(b"E", b"wire_catalog_local_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + describe_statement + bind + describe_portal + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    parameter_description = next((payload for kind, payload in output if kind == b"t"), None)
+    description = next((payload for kind, payload in reversed(output) if kind == b"T"), None)
+    row = next((payload for kind, payload in output if kind == b"D"), None)
+    check(
+        "catalog local Parse infers the domain parameter OID",
+        parameter_description == struct.pack("!hi", 1, domain_oid),
+        output,
+    )
+    check(
+        "catalog local Bind and Result retain binary representations",
+        not any(kind == b"E" for kind, _ in output)
+        and description is not None
+        and row_description_type_oids(description) == [25]
+        and row_description_formats(description) == [1]
+        and row == b"\x00\x01\x00\x00\x00\x065:done",
+        output,
+    )
+    s.close()
+
+
 def test_portal_describe_preserves_type_modifier():
     s = connect()
     s.sendall(startup_payload(0))

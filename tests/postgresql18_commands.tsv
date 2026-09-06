@@ -59,7 +59,7 @@ ALTER USER MAPPING	complete	tests/external/ci_diff.sh
 ALTER VIEW	partial	76_stored_dependencies.sql and 140_catalog_schema_evolution.sql cover typed output-column identity, auto-updatable DML, rollback, WAL, checkpoints, and recovery
 ANALYZE	complete	48_vacuum_analyze.sql
 BEGIN	complete	05_transactions.sql
-CALL	partial	89_sql_procedures.sql and 100_plpgsql_procedures.sql (lone top-level PL/pgSQL transaction control, typed outputs, SQL procedures, and explicit rejection of post-boundary suspension)
+CALL	partial	89_sql_procedures.sql, 100_plpgsql_procedures.sql, and 142_plpgsql_catalog_locals.sql (lone top-level PL/pgSQL transaction control, typed outputs, catalog-typed locals, SQL procedures, and explicit rejection of post-boundary suspension)
 CHECKPOINT	complete	40_copy.sql
 CLOSE	complete	39_cursors.sql
 CLUSTER	complete	tests/external/differential/124_cluster.sql and object-cold recovery
@@ -78,7 +78,7 @@ CREATE EVENT TRIGGER	complete	tests/external/differential/121_event_triggers.sql
 CREATE EXTENSION	partial	111_extension_lifecycle.sql covers SQL packages; native libraries are rejected
 CREATE FOREIGN DATA WRAPPER	complete	tests/external/ci_diff.sh (native handlers are rejected)
 CREATE FOREIGN TABLE	complete	tests/external/ci_diff.sh
-CREATE FUNCTION	partial	87_sql_routines.sql, 112_routine_bodies_attributes_do.sql, 140_catalog_schema_evolution.sql, and 141_routine_attribute_evolution.sql
+CREATE FUNCTION	partial	87_sql_routines.sql, 112_routine_bodies_attributes_do.sql, 140_catalog_schema_evolution.sql, 141_routine_attribute_evolution.sql, and 142_plpgsql_catalog_locals.sql
 CREATE GROUP	complete	83_roles_acl.sql and 100_role_credentials.sql
 CREATE INDEX	partial	43_indexes.sql, 107_index_lifecycle.sql, 108_index_operator_classes.sql, and 140_catalog_schema_evolution.sql
 CREATE LANGUAGE	partial	112_routine_bodies_attributes_do.sql (typed rejection; native handlers are outside the architecture)
@@ -87,7 +87,7 @@ CREATE OPERATOR	partial	117_cast_operator_catalog.sql (typed binary operators an
 CREATE OPERATOR CLASS	complete	117_cast_operator_catalog.sql (btree; unsupported access methods are rejected)
 CREATE OPERATOR FAMILY	complete	117_cast_operator_catalog.sql (btree; unsupported access methods are rejected)
 CREATE POLICY	complete	106_row_level_security.sql
-CREATE PROCEDURE	partial	89_sql_procedures.sql, 100_plpgsql_procedures.sql, and 141_routine_attribute_evolution.sql
+CREATE PROCEDURE	partial	89_sql_procedures.sql, 100_plpgsql_procedures.sql, 141_routine_attribute_evolution.sql, and 142_plpgsql_catalog_locals.sql
 CREATE PUBLICATION	partial	84_publication.sql
 CREATE ROLE	partial	83_roles_acl.sql, 100_role_credentials.sql, and 140_catalog_schema_evolution.sql cover attributes, SCRAM/MD5 credentials, aliases, initial memberships, and recovery
 CREATE RULE	complete	tests/external/differential/122_rewrite_rules.sql
@@ -104,7 +104,7 @@ CREATE TEXT SEARCH DICTIONARY	complete	tests/external/differential/123_full_text
 CREATE TEXT SEARCH PARSER	complete	tests/external/differential/123_full_text_search.sql
 CREATE TEXT SEARCH TEMPLATE	complete	tests/external/differential/123_full_text_search.sql
 CREATE TRANSFORM	complete	sql::tests::native_hook_ddl_rejects_before_catalog_publication
-CREATE TRIGGER	complete	101_trigger_timing.sql
+CREATE TRIGGER	complete	101_trigger_timing.sql and 142_plpgsql_catalog_locals.sql
 CREATE TYPE	partial	63_enums.sql and 140_catalog_schema_evolution.sql
 CREATE USER	complete	83_roles_acl.sql and 100_role_credentials.sql
 CREATE USER MAPPING	complete	tests/external/ci_diff.sh
@@ -113,7 +113,7 @@ DEALLOCATE	complete	14_surface.sql
 DECLARE	partial	39_cursors.sql
 DELETE	complete	02_dml_returning.sql
 DISCARD	complete	118_database_configuration.sql
-DO	partial	100_plpgsql_procedures.sql and 112_routine_bodies_attributes_do.sql (bounded PL/pgSQL declarations, control flow, diagnostics, exceptions, queries, DML, and lone top-level transaction control)
+DO	partial	100_plpgsql_procedures.sql, 112_routine_bodies_attributes_do.sql, and 142_plpgsql_catalog_locals.sql (bounded PL/pgSQL declarations, catalog-typed locals, control flow, diagnostics, exceptions, queries, DML, and lone top-level transaction control)
 DROP ACCESS METHOD	partial	134_access_methods.sql; RESTRICT and transactional CASCADE through dependent table lifecycle, WAL/checkpoint/object recovery, and event-trigger identity
 DROP AGGREGATE	complete	110_user_defined_aggregates.sql
 DROP CAST	partial	117_cast_operator_catalog.sql

@@ -284,6 +284,109 @@ fn plpgsql_set_and_record_functions_are_typed_and_durable() {
 }
 
 #[test]
+fn plpgsql_catalog_typed_locals_are_validated_and_durable() {
+    let mut config = test_config("plpgsql-catalog-typed-locals");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("plpgsql-catalog-typed-locals-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TYPE typed_local_state AS ENUM ('ready', 'done'); \
+             CREATE TYPE typed_local_pair AS (number integer, label text); \
+             CREATE DOMAIN typed_local_positive AS integer CHECK (VALUE > 0); \
+             CREATE TABLE typed_local_audit (label text); \
+             CREATE FUNCTION typed_local_value(input_value typed_local_positive) RETURNS text \
+               LANGUAGE plpgsql AS $$ \
+               DECLARE checked typed_local_positive := input_value; \
+                       state typed_local_state := 'ready'; \
+                       pair typed_local_pair; \
+               BEGIN \
+                 checked := checked + 1; state := 'done'; \
+                 pair := ROW(checked, state::text); \
+                 RETURN pair.number::text || ':' || pair.label; \
+               END $$; \
+             CREATE PROCEDURE typed_local_procedure(IN input_value typed_local_positive, \
+               OUT output_state typed_local_state) LANGUAGE plpgsql AS $$ \
+               DECLARE local_state typed_local_state := 'ready'; \
+               BEGIN local_state := 'done'; output_state := local_state; END $$; \
+             CREATE FUNCTION typed_local_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
+               DECLARE checked typed_local_positive := NEW.value; \
+                       state typed_local_state := 'ready'; \
+               BEGIN state := 'done'; INSERT INTO typed_local_audit VALUES (state::text); \
+                     RETURN NEW; END $$; \
+             CREATE TABLE typed_local_rows (value integer); \
+             CREATE TRIGGER typed_local_rows_audit BEFORE INSERT ON typed_local_rows \
+               FOR EACH ROW EXECUTE FUNCTION typed_local_trigger(); \
+             DO $$ DECLARE state typed_local_state := 'ready'; \
+                BEGIN INSERT INTO typed_local_audit VALUES (state::text); END $$; \
+             SELECT typed_local_value(4::typed_local_positive); \
+             CALL typed_local_procedure(4::typed_local_positive, NULL); \
+             INSERT INTO typed_local_rows VALUES (5); \
+             SELECT label FROM typed_local_audit ORDER BY label",
+        );
+        assert_eq!(
+            data_rows(&setup),
+            ["5:done", "done", "done", "ready"],
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        let missing_type = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION typed_local_missing_type() RETURNS integer LANGUAGE plpgsql AS $$ \
+               DECLARE value typed_local_not_a_type; \
+               BEGIN RETURN 1; END $$",
+        );
+        assert!(
+            String::from_utf8_lossy(&missing_type).contains("42704"),
+            "{}",
+            String::from_utf8_lossy(&missing_type)
+        );
+        let domain_error = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION typed_local_invalid() RETURNS integer LANGUAGE plpgsql AS $$ \
+               DECLARE checked typed_local_positive; \
+               BEGIN checked := 0; RETURN checked; END $$; \
+             SELECT typed_local_invalid()",
+        );
+        assert!(
+            String::from_utf8_lossy(&domain_error).contains("23514"),
+            "{}",
+            String::from_utf8_lossy(&domain_error)
+        );
+        assert!(engine.checkpoint().unwrap());
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut budget,
+        "SELECT typed_local_value(7::typed_local_positive); \
+         CALL typed_local_procedure(7::typed_local_positive, NULL); \
+         INSERT INTO typed_local_rows VALUES (8); \
+         SELECT label FROM typed_local_audit ORDER BY label",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["8:done", "done", "done", "done", "ready"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
     let mut config = test_config("plpgsql_dynamic_catalog_utilities");
     config.object_store_on = true;

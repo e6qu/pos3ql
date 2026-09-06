@@ -51,6 +51,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
         ColType::Int2Vector => match v {
             Datum::Int2Vector(_) => v,
+            Datum::Text(text) => Datum::Int2Vector(parse_int2vector_text(text, arena)?),
             Datum::Array {
                 element: ArrElem::Int2,
                 raw,
@@ -59,6 +60,7 @@ pub fn cast_to<'a>(v: Datum<'a>, target: ColType, arena: &'a Arena) -> Result<Da
         },
         ColType::OidVector => match v {
             Datum::OidVector(_) => v,
+            Datum::Text(text) => Datum::OidVector(parse_oidvector_text(text, arena)?),
             Datum::Array {
                 element: ArrElem::Oid,
                 raw,
@@ -551,6 +553,40 @@ fn vector_array_len(raw: &[u8], name: &'static str) -> Result<usize, SqlError> {
         return Err(invalid_vector(name));
     }
     Ok(shape.element_count())
+}
+
+fn parse_int2vector_text<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlError> {
+    let count = text.split_ascii_whitespace().count();
+    let out = arena
+        .alloc_slice_with(count * 2, |_| 0u8)
+        .map_err(|_| arena_full())?;
+    for (token, chunk) in text
+        .split_ascii_whitespace()
+        .zip(out.as_chunks_mut::<2>().0)
+    {
+        let value = token
+            .parse::<i16>()
+            .map_err(|_| bad_text(text, "int2vector"))?;
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn parse_oidvector_text<'a>(text: &str, arena: &'a Arena) -> Result<&'a [u8], SqlError> {
+    let count = text.split_ascii_whitespace().count();
+    let out = arena
+        .alloc_slice_with(count * 4, |_| 0u8)
+        .map_err(|_| arena_full())?;
+    for (token, chunk) in text
+        .split_ascii_whitespace()
+        .zip(out.as_chunks_mut::<4>().0)
+    {
+        let value = token
+            .parse::<u32>()
+            .map_err(|_| bad_text(text, "oidvector"))?;
+        chunk.copy_from_slice(&value.to_le_bytes());
+    }
+    Ok(out)
 }
 
 fn int2vector_from_array<'a>(raw: &[u8], arena: &'a Arena) -> Result<&'a [u8], SqlError> {
@@ -1084,5 +1120,20 @@ mod tests {
             cast_to(Datum::Array { element, raw }, ColType::OidVector, &arena).unwrap(),
             Datum::OidVector(&[1, 0, 0, 0, 2, 0, 0, 0])
         );
+    }
+
+    #[test]
+    fn catalog_vectors_accept_postgres_text_input() {
+        let mut budget = crate::mem::Budget::new(1 << 20);
+        let arena = Arena::new(&mut budget, "catalog vector input", 1 << 12).unwrap();
+        assert_eq!(
+            cast_to(Datum::Text("1 -2"), ColType::Int2Vector, &arena).unwrap(),
+            Datum::Int2Vector(&[1, 0, 254, 255])
+        );
+        assert_eq!(
+            cast_to(Datum::Text("1 4294967295"), ColType::OidVector, &arena).unwrap(),
+            Datum::OidVector(&[1, 0, 0, 0, 255, 255, 255, 255])
+        );
+        assert!(cast_to(Datum::Text("1,2"), ColType::Int2Vector, &arena).is_err());
     }
 }

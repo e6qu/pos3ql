@@ -24,9 +24,7 @@ pub(crate) fn encoded_len(values: &[Datum]) -> usize {
                 unreachable!("record cannot be a stored column value")
             }
             Datum::CompositeText { text, .. } => 5 + text.len(),
-            Datum::Int2Vector(_) | Datum::OidVector(_) => {
-                unreachable!("catalog vectors cannot be stored column values")
-            }
+            Datum::Int2Vector(raw) | Datum::OidVector(raw) => 4 + raw.len(),
             Datum::Regtype { name, .. } => 8 + name.len(),
             Datum::RegObject { name, .. } => 12 + name.len(),
             Datum::Null => 0,
@@ -97,8 +95,10 @@ pub(crate) fn encode(values: &[Datum], out: &mut [u8]) {
                 rest[5..5 + text.len()].copy_from_slice(text.as_bytes());
                 take = 5 + text.len();
             }
-            Datum::Int2Vector(_) | Datum::OidVector(_) => {
-                unreachable!("catalog vectors cannot be stored column values")
+            Datum::Int2Vector(raw) | Datum::OidVector(raw) => {
+                rest[..4].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+                rest[4..4 + raw.len()].copy_from_slice(raw);
+                take = 4 + raw.len();
             }
             Datum::Regtype {
                 referenced_oid,
@@ -366,11 +366,13 @@ pub(crate) fn encoded_value_len(bytes: &[u8], column: ColType) -> Result<usize, 
             let length = bytes.get(8..12).ok_or_else(corrupt)?;
             Some(12 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
         }
+        ColType::Int2Vector | ColType::OidVector => {
+            let length = bytes.get(..4).ok_or_else(corrupt)?;
+            Some(4 + u32::from_le_bytes(length.try_into().unwrap()) as usize)
+        }
         ColType::Void
         | ColType::Internal
         | ColType::PgDdlCommand
-        | ColType::Int2Vector
-        | ColType::OidVector
         | ColType::PgNodeTree
         | ColType::PgNdistinct
         | ColType::PgDependencies
@@ -421,17 +423,23 @@ pub(crate) fn decode<'a>(
         // type (int4/float8/text), so they decode through the same arm.
         match schema[i] {
             ColType::Void | ColType::Internal | ColType::PgDdlCommand => return Err(corrupt()),
-            ColType::Int2Vector => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "int2vector cannot be decoded as a stored column"
-                ));
-            }
-            ColType::OidVector => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "oidvector cannot be decoded as a stored column"
-                ));
+            ColType::Int2Vector | ColType::OidVector => {
+                let length = bytes.get(at..at + 4).ok_or_else(corrupt)?;
+                let len = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+                at += 4;
+                let raw = bytes.get(at..at + len).ok_or_else(corrupt)?;
+                at += len;
+                out[i] = if matches!(schema[i], ColType::Int2Vector) {
+                    if !raw.len().is_multiple_of(2) {
+                        return Err(corrupt());
+                    }
+                    Datum::Int2Vector(raw)
+                } else {
+                    if !raw.len().is_multiple_of(4) {
+                        return Err(corrupt());
+                    }
+                    Datum::OidVector(raw)
+                };
             }
             ColType::PgNodeTree => {
                 return Err(sql_err!(
@@ -811,6 +819,20 @@ mod tests {
         let mut out = [Datum::Null; MAX_COLUMNS];
         decode(&buffer, &schema, &mut out).unwrap();
         assert_eq!(&out[..8], &values);
+    }
+
+    #[test]
+    fn catalog_vectors_round_trip_as_durable_values() {
+        let schema = [ColType::Int2Vector, ColType::OidVector];
+        let values = [
+            Datum::Int2Vector(&[1, 0, 254, 255]),
+            Datum::OidVector(&[1, 0, 0, 0, 2, 0, 0, 0]),
+        ];
+        let mut buffer = vec![0u8; encoded_len(&values)];
+        encode(&values, &mut buffer);
+        let mut out = [Datum::Null; 2];
+        decode(&buffer, &schema, &mut out).unwrap();
+        assert_eq!(out, values);
     }
 
     #[test]

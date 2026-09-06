@@ -46344,6 +46344,54 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
 }
 
 #[test]
+fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
+    let mut config = test_config("catalog-vectors-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("catalog-vectors-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_catalog_vectors (\
+                 id integer PRIMARY KEY,\
+                 attributes int2vector DEFAULT '3 -4',\
+                 identifiers oidvector DEFAULT '7 8'); \
+             INSERT INTO durable_catalog_vectors VALUES \
+                 (1, ARRAY[1::int2, 2::int2]::int2vector, '9 10'::oidvector), \
+                 (2, DEFAULT, DEFAULT)",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    let rows = run_with(
+        &mut recovered,
+        &mut budget,
+        "SELECT attributes::int2[]::text, identifiers::oid[]::text \
+           FROM durable_catalog_vectors ORDER BY id",
+    );
+    assert_eq!(data_rows(&rows), ["{1,2}|{9,10}", "{3,-4}|{7,8}"]);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn pg_dump_bootstrap_surface() {
     let (mut engine, mut budget) = test_engine();
     assert_eq!(

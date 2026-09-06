@@ -2395,6 +2395,30 @@ impl<'a> Parser<'a> {
         if self.eat_ident("routine")? {
             return self.extension_routine_identity(RoutineTargetKind::Either);
         }
+        if self.eat_ident("event")? {
+            self.expect_ident("trigger")?;
+            return Ok(ExtensionMemberIdentity::EventTrigger(
+                self.col_ident("event trigger name")?,
+            ));
+        }
+        if self.eat_ident("foreign")? {
+            if self.eat_ident("data")? {
+                self.expect_ident("wrapper")?;
+                return Ok(ExtensionMemberIdentity::ForeignDataWrapper(
+                    self.col_ident("foreign-data wrapper name")?,
+                ));
+            }
+            self.expect_ident("table")?;
+            return Ok(ExtensionMemberIdentity::Relation {
+                kind: ExtensionRelationKind::ForeignTable,
+                name: self.qual_name("extension member name")?,
+            });
+        }
+        if self.eat_ident("server")? {
+            return Ok(ExtensionMemberIdentity::ForeignServer(
+                self.col_ident("foreign server name")?,
+            ));
+        }
         let relation = if self.eat_ident("table")? {
             Some(ExtensionRelationKind::Table)
         } else if self.eat_ident("view")? {

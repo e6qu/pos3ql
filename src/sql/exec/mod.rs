@@ -1927,6 +1927,16 @@ fn mark_foreign_server_drop(
     cascade: bool,
     responder: &mut Responder,
 ) -> Outcome {
+    if let Err(error) = storage.require_not_extension_member(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::ForeignServer,
+            slot: slot as u16,
+        },
+        txn.txid,
+        "server",
+    ) {
+        return sql_fail(error);
+    }
     if !cascade {
         if storage
             .first_user_mapping_for_server(slot as u16, txn.txid)
@@ -2047,6 +2057,16 @@ pub fn drop_foreign_data_wrapper(
             storage,
             crate::storage::foreign::ForeignObjectClass::Wrapper,
             slot,
+            txn.txid,
+            "foreign-data wrapper",
+        ) {
+            return sql_fail(error);
+        }
+        if let Err(error) = storage.require_not_extension_member(
+            crate::storage::AccessObject {
+                class: crate::storage::AccessClass::ForeignDataWrapper,
+                slot: slot as u16,
+            },
             txn.txid,
             "foreign-data wrapper",
         ) {
@@ -24583,6 +24603,16 @@ pub fn drop_event_trigger(
             name
         ));
     };
+    if let Err(error) = storage.require_not_extension_member(
+        crate::storage::AccessObject {
+            class: crate::storage::AccessClass::EventTrigger,
+            slot: slot as u16,
+        },
+        txn.txid,
+        "event trigger",
+    ) {
+        return sql_fail(error);
+    }
     storage.drop_event_trigger(slot, txn.txid);
     let lsn = storage.lsn() + 1;
     if let Err(error) = wal.stage(txn.txid, lsn, &WalOp::DropEventTrigger { name }) {
@@ -31846,6 +31876,24 @@ pub(crate) fn resolve_extension_member(
             };
             let class = match (kind, actual) {
                 (ExtensionRelationKind::Table, StoredRelKind::Table) => AccessClass::Table,
+                (ExtensionRelationKind::ForeignTable, StoredRelKind::ForeignTable) => {
+                    let object = storage
+                        .resolve_access_object(AccessClass::Table, schema.as_str(), name.name, txid)
+                        .ok_or_else(|| {
+                            sql_err!(
+                                sqlstate::UNDEFINED_OBJECT,
+                                "extension member does not exist"
+                            )
+                        })?;
+                    if storage.foreign_table(object.slot, txid).is_none() {
+                        return Err(sql_err!(
+                            sqlstate::WRONG_OBJECT_TYPE,
+                            "\"{}\" is not the requested extension member type",
+                            name.name
+                        ));
+                    }
+                    return Ok(object);
+                }
                 (ExtensionRelationKind::View, StoredRelKind::View) => AccessClass::View,
                 (ExtensionRelationKind::MaterializedView, StoredRelKind::Matview) => {
                     AccessClass::MaterializedView
@@ -31907,6 +31955,33 @@ pub(crate) fn resolve_extension_member(
                     )
                 })
         }
+        ExtensionMemberIdentity::EventTrigger(name) => storage
+            .resolve_access_object(AccessClass::EventTrigger, "", name, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "event trigger \"{}\" does not exist",
+                    name
+                )
+            }),
+        ExtensionMemberIdentity::ForeignDataWrapper(name) => storage
+            .resolve_access_object(AccessClass::ForeignDataWrapper, "", name, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "foreign-data wrapper \"{}\" does not exist",
+                    name
+                )
+            }),
+        ExtensionMemberIdentity::ForeignServer(name) => storage
+            .resolve_access_object(AccessClass::ForeignServer, "", name, txid)
+            .ok_or_else(|| {
+                sql_err!(
+                    sqlstate::UNDEFINED_OBJECT,
+                    "server \"{}\" does not exist",
+                    name
+                )
+            }),
     }
 }
 

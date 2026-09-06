@@ -17,3 +17,11 @@ CREATE VIEW extension_view AS
 SELECT id, value FROM extension_rows;
 CREATE MATERIALIZED VIEW extension_snapshot AS
 SELECT 42 AS value;
+CREATE FOREIGN DATA WRAPPER extension_member_wrapper NO HANDLER NO VALIDATOR;
+CREATE SERVER extension_member_server FOREIGN DATA WRAPPER extension_member_wrapper;
+CREATE FOREIGN TABLE extension_member_foreign (id integer)
+SERVER extension_member_server;
+CREATE FUNCTION extension_member_event_function()
+RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;
+CREATE EVENT TRIGGER extension_member_event ON ddl_command_end
+EXECUTE FUNCTION extension_member_event_function();

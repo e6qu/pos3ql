@@ -516,6 +516,9 @@ fn created_access_object(undo: txn::DdlUndo) -> Option<crate::storage::AccessObj
         DdlUndo::IndexCreated(slot) => (AccessClass::Index, slot),
         DdlUndo::StatisticsCreated(slot) => (AccessClass::Statistics, slot),
         DdlUndo::SchemaCreated(slot) => (AccessClass::Schema, slot),
+        DdlUndo::EventTriggerCreated(slot) => (AccessClass::EventTrigger, slot),
+        DdlUndo::ForeignDataWrapperCreated(slot) => (AccessClass::ForeignDataWrapper, slot),
+        DdlUndo::ForeignServerCreated(slot) => (AccessClass::ForeignServer, slot),
         _ => return None,
     };
     Some(AccessObject {
@@ -4126,6 +4129,7 @@ impl Engine {
             }
             self.storage.set_lsn(lsn);
         }
+        self.stage_foreign_catalog_wal(txn, guc)?;
         for (position, undo) in txn.ddl().iter().enumerate() {
             let (slot, dropping) = match *undo {
                 DdlUndo::ExtensionCreated(slot) | DdlUndo::ExtensionAltered { slot, .. } => {
@@ -4273,93 +4277,6 @@ impl Engine {
                     exists: config.visible_to(txn.txid),
                 },
             ) {
-                self.rollback_txn(txn, guc);
-                return Err(error);
-            }
-            self.storage.set_lsn(lsn);
-        }
-        let foreign_target = |undo: DdlUndo| match undo {
-            DdlUndo::ForeignDataWrapperCreated(slot)
-            | DdlUndo::ForeignDataWrapperAltered { slot, .. }
-            | DdlUndo::ForeignDataWrapperDropped(slot) => {
-                Some((crate::storage::foreign::ForeignObjectClass::Wrapper, slot))
-            }
-            DdlUndo::ForeignServerCreated(slot)
-            | DdlUndo::ForeignServerAltered { slot, .. }
-            | DdlUndo::ForeignServerDropped(slot) => {
-                Some((crate::storage::foreign::ForeignObjectClass::Server, slot))
-            }
-            DdlUndo::UserMappingCreated(slot)
-            | DdlUndo::UserMappingAltered { slot, .. }
-            | DdlUndo::UserMappingDropped(slot) => {
-                Some((crate::storage::foreign::ForeignObjectClass::Mapping, slot))
-            }
-            DdlUndo::ForeignTableCreated(slot)
-            | DdlUndo::ForeignTableAltered { slot, .. }
-            | DdlUndo::ForeignTableDropped(slot) => {
-                Some((crate::storage::foreign::ForeignObjectClass::Table, slot))
-            }
-            DdlUndo::ForeignOwnerChanged { class, slot, .. } => Some((class, slot)),
-            _ => None,
-        };
-        for (position, undo) in txn.ddl().iter().copied().enumerate() {
-            let Some((class, slot)) = foreign_target(undo) else {
-                continue;
-            };
-            if txn.ddl()[position + 1..]
-                .iter()
-                .copied()
-                .filter_map(foreign_target)
-                .any(|later| later == (class, slot))
-            {
-                continue;
-            }
-            let operation = match class {
-                crate::storage::foreign::ForeignObjectClass::Wrapper => {
-                    let entry = self.storage.foreign_wrapper_entry(slot as usize);
-                    WalOp::SetForeignDataWrapper {
-                        slot: slot as u16,
-                        created_at: entry.created_at,
-                        owner: entry.ownership.owner_to(txn.txid),
-                        definition: entry
-                            .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
-                    }
-                }
-                crate::storage::foreign::ForeignObjectClass::Server => {
-                    let entry = self.storage.foreign_server_entry(slot as usize);
-                    WalOp::SetForeignServer {
-                        slot: slot as u16,
-                        created_at: entry.created_at,
-                        owner: entry.ownership.owner_to(txn.txid),
-                        definition: entry
-                            .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
-                    }
-                }
-                crate::storage::foreign::ForeignObjectClass::Mapping => {
-                    let entry = self.storage.foreign_mapping_entry(slot as usize);
-                    WalOp::SetUserMapping {
-                        slot: slot as u16,
-                        created_at: entry.created_at,
-                        definition: entry
-                            .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
-                    }
-                }
-                crate::storage::foreign::ForeignObjectClass::Table => {
-                    let entry = self.storage.foreign_table_entry(slot as usize);
-                    WalOp::SetForeignTable {
-                        slot: slot as u16,
-                        created_at: entry.created_at,
-                        definition: entry
-                            .visible_to(txn.txid)
-                            .then(|| entry.definition_for(txn.txid)),
-                    }
-                }
-            };
-            let lsn = self.storage.lsn() + 1;
-            if let Err(error) = self.wal.stage(txn.txid, lsn, &operation) {
                 self.rollback_txn(txn, guc);
                 return Err(error);
             }
@@ -5350,6 +5267,103 @@ impl Engine {
         }
         txn.clear();
         notify_result.and(index_result)
+    }
+
+    /// Publishes foreign-catalog images before any extension edge that names
+    /// one of them. Recovery resolves dependency targets by their typed name.
+    fn stage_foreign_catalog_wal(
+        &mut self,
+        txn: &mut TxnState,
+        guc: &GucState,
+    ) -> Result<(), SqlError> {
+        let foreign_target = |undo: DdlUndo| match undo {
+            DdlUndo::ForeignDataWrapperCreated(slot)
+            | DdlUndo::ForeignDataWrapperAltered { slot, .. }
+            | DdlUndo::ForeignDataWrapperDropped(slot) => {
+                Some((crate::storage::foreign::ForeignObjectClass::Wrapper, slot))
+            }
+            DdlUndo::ForeignServerCreated(slot)
+            | DdlUndo::ForeignServerAltered { slot, .. }
+            | DdlUndo::ForeignServerDropped(slot) => {
+                Some((crate::storage::foreign::ForeignObjectClass::Server, slot))
+            }
+            DdlUndo::UserMappingCreated(slot)
+            | DdlUndo::UserMappingAltered { slot, .. }
+            | DdlUndo::UserMappingDropped(slot) => {
+                Some((crate::storage::foreign::ForeignObjectClass::Mapping, slot))
+            }
+            DdlUndo::ForeignTableCreated(slot)
+            | DdlUndo::ForeignTableAltered { slot, .. }
+            | DdlUndo::ForeignTableDropped(slot) => {
+                Some((crate::storage::foreign::ForeignObjectClass::Table, slot))
+            }
+            DdlUndo::ForeignOwnerChanged { class, slot, .. } => Some((class, slot)),
+            _ => None,
+        };
+        for (position, undo) in txn.ddl().iter().copied().enumerate() {
+            let Some((class, slot)) = foreign_target(undo) else {
+                continue;
+            };
+            if txn.ddl()[position + 1..]
+                .iter()
+                .copied()
+                .filter_map(foreign_target)
+                .any(|later| later == (class, slot))
+            {
+                continue;
+            }
+            let operation = match class {
+                crate::storage::foreign::ForeignObjectClass::Wrapper => {
+                    let entry = self.storage.foreign_wrapper_entry(slot as usize);
+                    WalOp::SetForeignDataWrapper {
+                        slot: slot as u16,
+                        created_at: entry.created_at,
+                        owner: entry.ownership.owner_to(txn.txid),
+                        definition: entry
+                            .visible_to(txn.txid)
+                            .then(|| entry.definition_for(txn.txid)),
+                    }
+                }
+                crate::storage::foreign::ForeignObjectClass::Server => {
+                    let entry = self.storage.foreign_server_entry(slot as usize);
+                    WalOp::SetForeignServer {
+                        slot: slot as u16,
+                        created_at: entry.created_at,
+                        owner: entry.ownership.owner_to(txn.txid),
+                        definition: entry
+                            .visible_to(txn.txid)
+                            .then(|| entry.definition_for(txn.txid)),
+                    }
+                }
+                crate::storage::foreign::ForeignObjectClass::Mapping => {
+                    let entry = self.storage.foreign_mapping_entry(slot as usize);
+                    WalOp::SetUserMapping {
+                        slot: slot as u16,
+                        created_at: entry.created_at,
+                        definition: entry
+                            .visible_to(txn.txid)
+                            .then(|| entry.definition_for(txn.txid)),
+                    }
+                }
+                crate::storage::foreign::ForeignObjectClass::Table => {
+                    let entry = self.storage.foreign_table_entry(slot as usize);
+                    WalOp::SetForeignTable {
+                        slot: slot as u16,
+                        created_at: entry.created_at,
+                        definition: entry
+                            .visible_to(txn.txid)
+                            .then(|| entry.definition_for(txn.txid)),
+                    }
+                }
+            };
+            let lsn = self.storage.lsn() + 1;
+            if let Err(error) = self.wal.stage(txn.txid, lsn, &operation) {
+                self.rollback_txn(txn, guc);
+                return Err(error);
+            }
+            self.storage.set_lsn(lsn);
+        }
+        Ok(())
     }
 
     pub(crate) fn commit_txn_with_triggers(
@@ -15238,6 +15252,14 @@ impl Engine {
             if covered_by_relation_move[index] {
                 continue;
             }
+            if matches!(
+                object.class,
+                crate::storage::AccessClass::EventTrigger
+                    | crate::storage::AccessClass::ForeignDataWrapper
+                    | crate::storage::AccessClass::ForeignServer
+            ) {
+                continue;
+            }
             if object.class == crate::storage::AccessClass::View {
                 let (schema, object_name) = self.storage.access_object_name_to(*object, txn.txid);
                 if self
@@ -15309,7 +15331,13 @@ impl Engine {
             let (schema, object_name) = self.storage.access_object_name_to(*object, txn.txid);
             let mut command = crate::util::StackStr::<1024>::new();
             let keyword = match object.class {
-                crate::storage::AccessClass::Table => "ALTER TABLE ",
+                crate::storage::AccessClass::Table => {
+                    if self.storage.foreign_table(object.slot, txn.txid).is_some() {
+                        "ALTER FOREIGN TABLE "
+                    } else {
+                        "ALTER TABLE "
+                    }
+                }
                 crate::storage::AccessClass::MaterializedView => "ALTER TABLE ",
                 crate::storage::AccessClass::Sequence => "ALTER SEQUENCE ",
                 crate::storage::AccessClass::Domain => "ALTER DOMAIN ",
@@ -15435,7 +15463,13 @@ impl Engine {
         let (schema, name) = self.storage.access_object_name_to(object, txn.txid);
         let mut command = crate::util::StackStr::<1024>::new();
         let keyword = match object.class {
-            crate::storage::AccessClass::Table => "DROP TABLE ",
+            crate::storage::AccessClass::Table => {
+                if self.storage.foreign_table(object.slot, txn.txid).is_some() {
+                    "DROP FOREIGN TABLE "
+                } else {
+                    "DROP TABLE "
+                }
+            }
             crate::storage::AccessClass::View => "DROP VIEW ",
             crate::storage::AccessClass::MaterializedView => "DROP MATERIALIZED VIEW ",
             crate::storage::AccessClass::Sequence => "DROP SEQUENCE ",
@@ -15474,17 +15508,18 @@ impl Engine {
                 ""
             }
             crate::storage::AccessClass::EventTrigger => {
-                return Ok(Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "event triggers cannot be extension members"
-                )));
+                let _ = write!(command, "DROP EVENT TRIGGER ");
+                if let Err(error) = write_extension_identifier(&mut command, name.as_str()) {
+                    return Ok(Err(error));
+                }
+                ""
             }
+            crate::storage::AccessClass::ForeignDataWrapper => "DROP FOREIGN DATA WRAPPER ",
+            crate::storage::AccessClass::ForeignServer => "DROP SERVER ",
             crate::storage::AccessClass::Tablespace
             | crate::storage::AccessClass::Extension
             | crate::storage::AccessClass::Database
             | crate::storage::AccessClass::LargeObject
-            | crate::storage::AccessClass::ForeignDataWrapper
-            | crate::storage::AccessClass::ForeignServer
             | crate::storage::AccessClass::Language => {
                 return Ok(Err(sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
@@ -15493,9 +15528,11 @@ impl Engine {
             }
         };
         let _ = write!(command, "{}", keyword);
-        if object.class != crate::storage::AccessClass::Trigger
-            && let Err(error) =
-                write_extension_qualified_identifier(&mut command, schema.as_str(), name.as_str())
+        if !matches!(
+            object.class,
+            crate::storage::AccessClass::Trigger | crate::storage::AccessClass::EventTrigger
+        ) && let Err(error) =
+            write_extension_qualified_identifier(&mut command, schema.as_str(), name.as_str())
         {
             return Ok(Err(error));
         }

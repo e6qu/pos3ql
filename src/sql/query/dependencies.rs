@@ -1509,6 +1509,86 @@ pub(super) fn stored_routine_dependency_for_call(
     ))
 }
 
+/// Binds an explicit stored operator call by its captured catalog identity.
+pub(super) fn stored_operator_dependency_for_call(
+    name: &str,
+    args: &[&Expr<'_>],
+    storage: &Storage,
+    txid: u32,
+    dependencies: &StoredQueryDependencies,
+) -> Result<Option<StoredQueryDependency>, SqlError> {
+    let Some((schema, operator_name)) = crate::sql::ast::catalog_operator_call(name) else {
+        return Ok(None);
+    };
+    let mut candidates = dependencies.entries().iter().copied().filter(|dependency| {
+        dependency.class == DependencyClass::Operator
+            && dependency.referenced_schema.as_str() == schema.unwrap_or("")
+            && dependency.referenced_name.as_str() == operator_name
+    });
+    let Some(first) = candidates.next() else {
+        return Ok(None);
+    };
+    let Some(second) = candidates.next() else {
+        return Ok(Some(first));
+    };
+    if !(1..=2).contains(&args.len()) {
+        return Err(sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "stored operator call has invalid arity"
+        ));
+    }
+    let resolver = DependencyTypes {
+        scope: None,
+        excluded: None,
+        transition: None,
+        storage,
+        txid,
+        returning_output: None,
+    };
+    let mut argument_oids = [0_i32; 2];
+    for (output, argument) in argument_oids.iter_mut().zip(args.iter().copied()) {
+        *output = match crate::sql::exec::infer_routine_argument_oid(argument, &resolver) {
+            Ok(crate::sql::types::oid::UNKNOWN) if matches!(argument, Expr::Str(_)) => {
+                ColType::Text.oid()
+            }
+            Ok(oid) => oid,
+            Err(_) => {
+                return Err(sql_err!(
+                    sqlstate::INVALID_FUNCTION_DEFINITION,
+                    "stored operator call \"{}\" cannot be rebound without typed operands",
+                    operator_name
+                ));
+            }
+        };
+    }
+    let (left_oid, right_oid) = if args.len() == 1 {
+        (None, Some(argument_oids[0]))
+    } else {
+        (Some(argument_oids[0]), Some(argument_oids[1]))
+    };
+    for dependency in core::iter::once(first)
+        .chain(core::iter::once(second))
+        .chain(candidates)
+    {
+        let definition = storage.operator_for(dependency.slot as usize, txid);
+        let resolved = storage.operator_slot_for_oids(
+            Some(definition.schema.as_str()),
+            definition.name.as_str(),
+            left_oid,
+            right_oid,
+            txid,
+        )?;
+        if resolved == Some(dependency.slot as usize) {
+            return Ok(Some(dependency));
+        }
+    }
+    Err(sql_err!(
+        sqlstate::INVALID_FUNCTION_DEFINITION,
+        "stored operator call \"{}\" no longer has its captured signature",
+        operator_name
+    ))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "routine dependency binding carries call syntax and catalog context"

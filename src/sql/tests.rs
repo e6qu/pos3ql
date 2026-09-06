@@ -5001,9 +5001,20 @@ fn operator_selectivity_ddl_matches_postgresql_and_survives_cold_recovery() {
            LEFTARG = integer, RIGHTARG = integer, HASHES, MERGES); \
          ALTER OPERATOR public.~~~ (integer, integer) \
            SET (RESTRICT = NONE, JOIN = NONE); \
+         CREATE VIEW public.operator_selectivity_view AS \
+           SELECT 1 OPERATOR(public.~~~) 1 AS equivalent; \
+         CREATE ROLE operator_selectivity_owner; \
+         CREATE SCHEMA operator_selectivity_schema; \
+         GRANT USAGE, CREATE ON SCHEMA operator_selectivity_schema \
+           TO operator_selectivity_owner; \
+         ALTER OPERATOR public.~~~ (integer, integer) \
+           SET SCHEMA operator_selectivity_schema; \
+         ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+           OWNER TO operator_selectivity_owner; \
          SELECT oprcanhash, oprcanmerge, oprrest::regprocedure::text, \
                 oprjoin::regprocedure::text \
            FROM pg_operator WHERE oprname = '~~~'; \
+         SELECT equivalent FROM public.operator_selectivity_view; \
          ",
         );
         assert!(
@@ -5011,7 +5022,7 @@ fn operator_selectivity_ddl_matches_postgresql_and_survives_cold_recovery() {
             "{}",
             String::from_utf8_lossy(&setup)
         );
-        assert_eq!(data_rows(&setup), ["t|t|-|-"]);
+        assert_eq!(data_rows(&setup), ["t|t|-|-", "t"]);
         let described = describe_with(
             &mut engine,
             &mut budget,
@@ -5031,32 +5042,52 @@ fn operator_selectivity_ddl_matches_postgresql_and_survives_cold_recovery() {
     let output = run_with(
         &mut recovered,
         &mut budget,
-        "SELECT 1 OPERATOR(public.~~~) 1, oprcanhash, oprcanmerge, \
+        "SELECT 1 OPERATOR(operator_selectivity_schema.~~~) 1, oprcanhash, oprcanmerge, \
                 oprrest::regprocedure::text, oprjoin::regprocedure::text \
-           FROM pg_operator WHERE oprname = '~~~'",
+           FROM pg_operator WHERE oprname = '~~~'; \
+         SELECT equivalent FROM public.operator_selectivity_view; \
+         SELECT namespace.nspname, pg_get_userbyid(op.oprowner) \
+           FROM pg_operator op JOIN pg_namespace namespace \
+             ON namespace.oid = op.oprnamespace \
+          WHERE op.oprname = '~~~'; \
+         SET ROLE operator_selectivity_owner; \
+         SELECT 1 OPERATOR(operator_selectivity_schema.~~~) 1; \
+         RESET ROLE",
     );
     assert!(
         !String::from_utf8_lossy(&output).contains("ERROR"),
         "{}",
         String::from_utf8_lossy(&output)
     );
-    assert_eq!(data_rows(&output), ["t|t|t|-|-"]);
+    assert_eq!(
+        data_rows(&output),
+        [
+            "t|t|t|-|-",
+            "t",
+            "operator_selectivity_schema|operator_selectivity_owner",
+            "t",
+        ]
+    );
 
     for (sql, attribute) in [
         (
-            "ALTER OPERATOR public.~~~ (integer, integer) SET (COMMUTATOR = NONE)",
+            "ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+             SET (COMMUTATOR = NONE)",
             "commutator",
         ),
         (
-            "ALTER OPERATOR public.~~~ (integer, integer) SET (NEGATOR = NONE)",
+            "ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+             SET (NEGATOR = NONE)",
             "negator",
         ),
         (
-            "ALTER OPERATOR public.~~~ (integer, integer) SET (HASHES = false)",
+            "ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+             SET (HASHES = false)",
             "hashes",
         ),
         (
-            "ALTER OPERATOR public.~~~ (integer, integer) SET (MERGES = false)",
+            "ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+             SET (MERGES = false)",
             "merges",
         ),
     ] {
@@ -5068,7 +5099,8 @@ fn operator_selectivity_ddl_matches_postgresql_and_survives_cold_recovery() {
     let output = run_with(
         &mut recovered,
         &mut budget,
-        "ALTER OPERATOR public.~~~ (integer, integer) SET (RESTRICT = public.operator_selectivity_same)",
+        "ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+         SET (RESTRICT = public.operator_selectivity_same)",
     );
     let output = String::from_utf8_lossy(&output);
     assert!(output.contains("0A000"), "{output}");

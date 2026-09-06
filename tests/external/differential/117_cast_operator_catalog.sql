@@ -1,4 +1,6 @@
 DROP VIEW IF EXISTS differential_operator_view CASCADE;
+DROP SCHEMA IF EXISTS differential_operator_schema CASCADE;
+DROP ROLE IF EXISTS differential_operator_owner;
 DROP OPERATOR CLASS IF EXISTS differential_int_class USING btree CASCADE;
 DROP OPERATOR FAMILY IF EXISTS differential_int_family USING btree CASCADE;
 DROP OPERATOR IF EXISTS === (integer, integer) CASCADE;
@@ -45,6 +47,7 @@ CREATE OPERATOR === (
   HASHES,
   MERGES
 );
+ALTER OPERATOR === (integer, integer) SET (RESTRICT = NONE, JOIN = NONE);
 CREATE OPERATOR ## (
   FUNCTION = differential_int_same,
   LEFTARG = integer,
@@ -176,8 +179,24 @@ DROP OPERATOR FAMILY differential_int_family USING btree;
 CREATE VIEW differential_operator_view AS
 SELECT 1 OPERATOR(public.===) 1 AS equivalent;
 SELECT equivalent FROM differential_operator_view;
-DROP OPERATOR === (integer, integer);
-DROP OPERATOR === (integer, integer) CASCADE;
+CREATE ROLE differential_operator_owner;
+CREATE SCHEMA differential_operator_schema;
+GRANT USAGE, CREATE ON SCHEMA differential_operator_schema
+  TO differential_operator_owner;
+ALTER OPERATOR public.=== (integer, integer)
+  SET SCHEMA differential_operator_schema;
+ALTER OPERATOR differential_operator_schema.=== (integer, integer)
+  OWNER TO differential_operator_owner;
+SELECT namespace.nspname, pg_get_userbyid(op.oprowner)
+FROM pg_operator op
+JOIN pg_namespace namespace ON namespace.oid = op.oprnamespace
+WHERE op.oprname = '===' AND op.oprleft = 'integer'::regtype;
+SELECT equivalent FROM differential_operator_view;
+SET ROLE differential_operator_owner;
+SELECT 1 OPERATOR(differential_operator_schema.===) 1;
+RESET ROLE;
+DROP OPERATOR differential_operator_schema.=== (integer, integer);
+DROP OPERATOR differential_operator_schema.=== (integer, integer) CASCADE;
 SELECT count(*) FROM pg_views WHERE viewname = 'differential_operator_view';
 
 DROP OPERATOR ## (integer, integer);
@@ -189,6 +208,10 @@ DROP FUNCTION differential_int_prefix(integer);
 DROP FUNCTION differential_int_same(integer, integer);
 DROP FUNCTION differential_int_compare(integer, integer);
 DROP TYPE differential_mood;
+REVOKE USAGE, CREATE ON SCHEMA differential_operator_schema
+  FROM differential_operator_owner;
+DROP SCHEMA differential_operator_schema;
+DROP ROLE differential_operator_owner;
 
 CREATE TABLE differential_constraint_comment (
   value integer,

@@ -4981,6 +4981,133 @@ fn user_cast_operator_and_btree_catalog_ddl_is_transactional() {
 }
 
 #[test]
+fn operator_selectivity_ddl_matches_postgresql_and_survives_cold_recovery() {
+    let mut config = test_config("operator-selectivity-ddl");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("operator-selectivity-ddl-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let setup = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE FUNCTION public.operator_selectivity_same(integer, integer) RETURNS boolean \
+           LANGUAGE SQL IMMUTABLE RETURN $1 = $2; \
+         CREATE OPERATOR public.~~~ (FUNCTION = public.operator_selectivity_same, \
+           LEFTARG = integer, RIGHTARG = integer, HASHES, MERGES); \
+         ALTER OPERATOR public.~~~ (integer, integer) \
+           SET (RESTRICT = NONE, JOIN = NONE); \
+         CREATE VIEW public.operator_selectivity_view AS \
+           SELECT 1 OPERATOR(public.~~~) 1 AS equivalent; \
+         CREATE ROLE operator_selectivity_owner; \
+         CREATE SCHEMA operator_selectivity_schema; \
+         GRANT USAGE, CREATE ON SCHEMA operator_selectivity_schema \
+           TO operator_selectivity_owner; \
+         ALTER OPERATOR public.~~~ (integer, integer) \
+           SET SCHEMA operator_selectivity_schema; \
+         ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+           OWNER TO operator_selectivity_owner; \
+         SELECT oprcanhash, oprcanmerge, oprrest::regprocedure::text, \
+                oprjoin::regprocedure::text \
+           FROM pg_operator WHERE oprname = '~~~'; \
+         SELECT equivalent FROM public.operator_selectivity_view; \
+         ",
+        );
+        assert!(
+            !String::from_utf8_lossy(&setup).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&setup)
+        );
+        assert_eq!(data_rows(&setup), ["t|t|-|-", "t"]);
+        let described = describe_with(
+            &mut engine,
+            &mut budget,
+            "SELECT public.operator_selectivity_same(1, 1)",
+        );
+        assert_eq!(
+            row_description_names(&described),
+            ["operator_selectivity_same"]
+        );
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut budget,
+        "SELECT 1 OPERATOR(operator_selectivity_schema.~~~) 1, oprcanhash, oprcanmerge, \
+                oprrest::regprocedure::text, oprjoin::regprocedure::text \
+           FROM pg_operator WHERE oprname = '~~~'; \
+         SELECT equivalent FROM public.operator_selectivity_view; \
+         SELECT namespace.nspname, pg_get_userbyid(op.oprowner) \
+           FROM pg_operator op JOIN pg_namespace namespace \
+             ON namespace.oid = op.oprnamespace \
+          WHERE op.oprname = '~~~'; \
+         SET ROLE operator_selectivity_owner; \
+         SELECT 1 OPERATOR(operator_selectivity_schema.~~~) 1; \
+         RESET ROLE",
+    );
+    assert!(
+        !String::from_utf8_lossy(&output).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        data_rows(&output),
+        [
+            "t|t|t|-|-",
+            "t",
+            "operator_selectivity_schema|operator_selectivity_owner",
+            "t",
+        ]
+    );
+
+    for (sql, attribute) in [
+        (
+            "ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+             SET (COMMUTATOR = NONE)",
+            "commutator",
+        ),
+        (
+            "ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+             SET (NEGATOR = NONE)",
+            "negator",
+        ),
+        (
+            "ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+             SET (HASHES = false)",
+            "hashes",
+        ),
+        (
+            "ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+             SET (MERGES = false)",
+            "merges",
+        ),
+    ] {
+        let output = run_with(&mut recovered, &mut budget, sql);
+        let output = String::from_utf8_lossy(&output);
+        assert!(output.contains("42P17"), "{attribute}: {output}");
+        assert!(output.contains(attribute), "{attribute}: {output}");
+    }
+    let output = run_with(
+        &mut recovered,
+        &mut budget,
+        "ALTER OPERATOR operator_selectivity_schema.~~~ (integer, integer) \
+         SET (RESTRICT = public.operator_selectivity_same)",
+    );
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("0A000"), "{output}");
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn cast_function_resolution_matches_postgresql_contracts() {
     let config = test_config("cast-function-contracts");
     let mut budget = Budget::new(1 << 28);
@@ -23218,7 +23345,27 @@ fn user_defined_aggregate_survives_wal_and_checkpoint_recovery() {
              ); \
              CREATE AGGREGATE aggregate_recovery_first(anyelement) ( \
                SFUNC = aggregate_recovery_first, STYPE = anyelement \
-             )",
+             ); \
+             CREATE AGGREGATE aggregate_lifecycle(integer) ( \
+               SFUNC = aggregate_recovery_state, STYPE = bigint \
+             ); \
+             CREATE SCHEMA aggregate_lifecycle_schema; \
+             CREATE ROLE aggregate_lifecycle_owner; \
+             CREATE ROLE aggregate_lifecycle_reader; \
+             GRANT CREATE ON SCHEMA aggregate_lifecycle_schema TO aggregate_lifecycle_owner; \
+             ALTER AGGREGATE aggregate_lifecycle(integer) \
+               RENAME TO aggregate_lifecycle_moved; \
+             ALTER AGGREGATE aggregate_lifecycle_moved(integer) \
+               SET SCHEMA aggregate_lifecycle_schema; \
+             ALTER AGGREGATE aggregate_lifecycle_schema.aggregate_lifecycle_moved(integer) \
+               OWNER TO aggregate_lifecycle_owner; \
+             GRANT USAGE ON SCHEMA aggregate_lifecycle_schema TO aggregate_lifecycle_reader; \
+             GRANT SELECT ON TABLE aggregate_recovery_input TO aggregate_lifecycle_reader; \
+             REVOKE EXECUTE ON FUNCTION \
+               aggregate_lifecycle_schema.aggregate_lifecycle_moved(integer) FROM PUBLIC; \
+             GRANT EXECUTE ON FUNCTION \
+               aggregate_lifecycle_schema.aggregate_lifecycle_moved(integer) \
+               TO aggregate_lifecycle_reader",
         );
         assert!(
             !String::from_utf8_lossy(&created).contains("ERROR"),
@@ -23267,6 +23414,29 @@ fn user_defined_aggregate_survives_wal_and_checkpoint_recovery() {
             "{}",
             String::from_utf8_lossy(&result)
         );
+        let lifecycle = run_with(
+            &mut recovered,
+            &mut budget,
+            "SELECT aggregate_lifecycle_schema.aggregate_lifecycle_moved(value) \
+               FROM aggregate_recovery_input; \
+             SELECT namespace.nspname, pg_get_userbyid(procedure.proowner) \
+               FROM pg_proc procedure \
+               JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace \
+              WHERE procedure.proname = 'aggregate_lifecycle_moved'",
+        );
+        assert_eq!(
+            data_rows(&lifecycle),
+            ["64", "aggregate_lifecycle_schema|aggregate_lifecycle_owner"]
+        );
+        let granted = run_with(
+            &mut recovered,
+            &mut budget,
+            "SET ROLE aggregate_lifecycle_reader; \
+             SELECT aggregate_lifecycle_schema.aggregate_lifecycle_moved(value) \
+               FROM aggregate_recovery_input; \
+             RESET ROLE",
+        );
+        assert_eq!(data_rows(&granted), ["64"]);
         let replaced = run_with(
             &mut recovered,
             &mut budget,

@@ -5236,9 +5236,53 @@ fn rewrite_stored_routine_name<'a>(
         routine.schema_for(context.txid).as_str(),
         routine.name_for(context.txid).as_str()
     );
+    if qualified.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "routine identity is too long"
+        ));
+    }
     arena
         .alloc_str(qualified.as_str())
         .map_err(|_| arena_full())
+}
+
+fn rewrite_stored_operator_name<'a>(
+    name: &'a str,
+    args: &[&Expr<'a>],
+    context: Subst<'_, 'a, '_, '_>,
+    arena: &'a Arena,
+) -> Result<&'a str, SqlError> {
+    let Some(dependencies) = context.dependencies else {
+        return Ok(name);
+    };
+    let Some(dependency) = super::dependencies::stored_operator_dependency_for_call(
+        name,
+        args,
+        context.storage,
+        context.txid,
+        dependencies,
+    )?
+    else {
+        return Ok(name);
+    };
+    let operator = context
+        .storage
+        .operator_for(dependency.slot as usize, context.txid);
+    let encoded = crate::stack_format!(
+        260,
+        "{}{}\u{1f}{}",
+        crate::sql::ast::CATALOG_OPERATOR_CALL_PREFIX,
+        operator.schema.as_str(),
+        operator.name.as_str()
+    );
+    if encoded.is_truncated() {
+        return Err(sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "operator identity is too long"
+        ));
+    }
+    arena.alloc_str(encoded.as_str()).map_err(|_| arena_full())
 }
 
 fn subst_expr<'a>(
@@ -5319,6 +5363,7 @@ fn subst_expr<'a>(
             over,
             filter,
         } => {
+            let name = rewrite_stored_operator_name(name, args, context, arena)?;
             let name =
                 rewrite_stored_routine_name(name, args, argument_names, *variadic, context, arena)?;
             let mut ob = [OrderBy {

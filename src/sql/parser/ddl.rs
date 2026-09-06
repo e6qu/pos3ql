@@ -1949,50 +1949,78 @@ impl<'a> Parser<'a> {
                 AlterOperatorAction::SetSchema(self.col_ident("schema name")?)
             } else {
                 self.expect_op("(")?;
-                let mut commutator = None;
-                let mut negator = None;
-                let mut hashes = false;
-                let mut merges = false;
+                let mut selectivity_reset = crate::sql::ast::OperatorSelectivityReset::NONE;
                 loop {
                     if self.eat_ident("commutator")? {
-                        self.expect_op("=")?;
-                        if commutator
-                            .replace(self.operator_qual_name("commutator name is invalid")?)
-                            .is_some()
-                        {
-                            return Err(self.err_here("COMMUTATOR specified more than once"));
-                        }
-                    } else if self.eat_ident("negator")? {
-                        self.expect_op("=")?;
-                        if negator
-                            .replace(self.operator_qual_name("negator name is invalid")?)
-                            .is_some()
-                        {
-                            return Err(self.err_here("NEGATOR specified more than once"));
-                        }
-                    } else if self.eat_ident("hashes")? {
-                        if hashes {
-                            return Err(self.err_here("HASHES specified more than once"));
-                        }
-                        hashes = true;
-                    } else if self.eat_ident("merges")? {
-                        if merges {
-                            return Err(self.err_here("MERGES specified more than once"));
-                        }
-                        merges = true;
-                    } else if self.eat_ident("restrict")? || self.eat_ident("join")? {
-                        self.expect_op("=")?;
-                        if !self.eat_ident("none")? {
-                            let _ = self.qual_name("selectivity function")?;
-                        }
                         return Err(ParseError {
                             at: self.peek_at,
                             message: stack_format!(
                                 96,
-                                "custom selectivity functions are not supported by the bounded planner"
+                                "operator attribute \"commutator\" cannot be changed"
                             ),
-                            sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                            sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
                         });
+                    } else if self.eat_ident("negator")? {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                96,
+                                "operator attribute \"negator\" cannot be changed"
+                            ),
+                            sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                        });
+                    } else if self.eat_ident("hashes")? {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                96,
+                                "operator attribute \"hashes\" cannot be changed"
+                            ),
+                            sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                        });
+                    } else if self.eat_ident("merges")? {
+                        return Err(ParseError {
+                            at: self.peek_at,
+                            message: stack_format!(
+                                96,
+                                "operator attribute \"merges\" cannot be changed"
+                            ),
+                            sqlstate: sqlstate::INVALID_OBJECT_DEFINITION,
+                        });
+                    } else if self.eat_ident("restrict")? {
+                        self.expect_op("=")?;
+                        if selectivity_reset.restrict {
+                            return Err(self.err_here("operator RESTRICT specified more than once"));
+                        }
+                        if !self.eat_ident("none")? {
+                            let _ = self.qual_name("selectivity function")?;
+                            return Err(ParseError {
+                                at: self.peek_at,
+                                message: stack_format!(
+                                    96,
+                                    "custom selectivity functions are not supported by the bounded planner"
+                                ),
+                                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                            });
+                        }
+                        selectivity_reset.restrict = true;
+                    } else if self.eat_ident("join")? {
+                        self.expect_op("=")?;
+                        if selectivity_reset.join {
+                            return Err(self.err_here("operator JOIN specified more than once"));
+                        }
+                        if !self.eat_ident("none")? {
+                            let _ = self.qual_name("selectivity function")?;
+                            return Err(ParseError {
+                                at: self.peek_at,
+                                message: stack_format!(
+                                    96,
+                                    "custom selectivity functions are not supported by the bounded planner"
+                                ),
+                                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
+                            });
+                        }
+                        selectivity_reset.join = true;
                     } else {
                         return Err(self.err_here("invalid ALTER OPERATOR option"));
                     }
@@ -2001,12 +2029,7 @@ impl<'a> Parser<'a> {
                     }
                     self.expect_op(",")?;
                 }
-                AlterOperatorAction::Set {
-                    commutator,
-                    negator,
-                    hashes,
-                    merges,
-                }
+                AlterOperatorAction::ResetSelectivity(selectivity_reset)
             }
         } else {
             return Err(self.err_here("expected OWNER TO or SET in ALTER OPERATOR"));

@@ -901,7 +901,7 @@ fn name_of<'a>(expression: &Expr<'a>) -> Option<&'a str> {
             ..
         } => Some("overlaps"),
         Expr::Call { name, .. } if crate::sql::ast::catalog_operator_call(name).is_some() => None,
-        Expr::Call { name, .. } => Some(name),
+        Expr::Call { name, .. } => Some(name.rsplit('.').next().unwrap_or(name)),
         // A cast keeps its operand's name when the operand is a column or
         // function call (`count(*)::int` → `count`); otherwise it takes the
         // target type's name (`'x'::int` → `int4`), matching PostgreSQL.

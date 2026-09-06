@@ -9382,6 +9382,59 @@ mod tests {
     }
 
     #[test]
+    fn operator_selectivity_options_are_typed_and_immutable_attributes_reject() {
+        with_parser(
+            "CREATE OPERATOR === (FUNCTION = op_same, LEFTARG = integer, RIGHTARG = integer); \
+             ALTER OPERATOR === (integer, integer) SET (RESTRICT = NONE, JOIN = NONE)",
+            |parser| {
+                let Some(Stmt::CreateOperator(operator)) = parser.next_stmt().unwrap() else {
+                    panic!("CREATE OPERATOR did not parse")
+                };
+                assert_eq!(operator.name.name, "===");
+                let Some(Stmt::AlterOperator { action, .. }) = parser.next_stmt().unwrap() else {
+                    panic!("ALTER OPERATOR did not parse")
+                };
+                assert_eq!(
+                    action,
+                    crate::sql::ast::AlterOperatorAction::ResetSelectivity(
+                        crate::sql::ast::OperatorSelectivityReset {
+                            restrict: true,
+                            join: true,
+                        }
+                    )
+                );
+            },
+        );
+        for (source, expected) in [
+            (
+                "ALTER OPERATOR === (integer, integer) SET (COMMUTATOR = NONE)",
+                "commutator",
+            ),
+            (
+                "ALTER OPERATOR === (integer, integer) SET (NEGATOR = NONE)",
+                "negator",
+            ),
+            (
+                "ALTER OPERATOR === (integer, integer) SET (HASHES = NONE)",
+                "hashes",
+            ),
+            (
+                "ALTER OPERATOR === (integer, integer) SET (MERGES = NONE)",
+                "merges",
+            ),
+        ] {
+            with_parser(source, |parser| {
+                let error = parser.next_stmt().unwrap_err();
+                assert_eq!(
+                    error.sqlstate,
+                    crate::sql::eval::sqlstate::INVALID_OBJECT_DEFINITION
+                );
+                assert!(error.message.as_str().contains(expected), "{error:?}");
+            });
+        }
+    }
+
+    #[test]
     fn index_and_tablespace_lifecycle_is_typed_without_allocation() {
         with_parser(
             "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS value_idx ON ONLY public.items \

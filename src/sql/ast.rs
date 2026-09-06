@@ -2508,16 +2508,27 @@ pub struct CreateOperator<'a> {
     pub merges: bool,
 }
 
+/// The two independently writable selectivity hooks of `ALTER OPERATOR`.
+/// Keeping these separate from immutable operator attributes prevents an
+/// invalid alteration from reaching the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorSelectivityReset {
+    pub restrict: bool,
+    pub join: bool,
+}
+
+impl OperatorSelectivityReset {
+    pub const NONE: Self = Self {
+        restrict: false,
+        join: false,
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlterOperatorAction<'a> {
     Owner(&'a str),
     SetSchema(&'a str),
-    Set {
-        commutator: Option<QualName<'a>>,
-        negator: Option<QualName<'a>>,
-        hashes: bool,
-        merges: bool,
-    },
+    ResetSelectivity(OperatorSelectivityReset),
 }
 
 /// Btree operator strategies are a closed 1..=5 domain. A raw integer can

@@ -3820,6 +3820,62 @@ def test_rewrite_rule_extended_query_returning_and_catalog_lifecycle():
     s.close()
 
 
+def test_merge_extended_portal_preserves_default_and_returning_shape():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TABLE wire_merge_target (id integer PRIMARY KEY, value integer DEFAULT 41); "
+        "INSERT INTO wire_merge_target VALUES (1, 0)",
+    )
+    check("merge wire: setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
+
+    query = (
+        "MERGE INTO wire_merge_target AS target USING (VALUES ($1)) AS source(id) "
+        "ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = DEFAULT "
+        "RETURNING target.id, target.value"
+    )
+    parse = frontend_message(
+        b"P", b"wire_merge_statement\x00" + query.encode() + b"\x00" + struct.pack("!hi", 1, 23)
+    )
+    bind = frontend_message(
+        b"B",
+        b"wire_merge_portal\x00wire_merge_statement\x00"
+        + struct.pack("!hhh", 1, 0, 1)
+        + struct.pack("!i", 1)
+        + b"1"
+        + struct.pack("!h", 0),
+    )
+    s.sendall(
+        parse
+        + bind
+        + frontend_message(b"D", b"Pwire_merge_portal\x00")
+        + frontend_message(b"E", b"wire_merge_portal\x00\x00\x00\x00\x00")
+        + frontend_message(b"S")
+    )
+    messages = []
+    while True:
+        item = read_message(s)
+        messages.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in messages if kind == b"T"), None)
+    row = next((payload for kind, payload in messages if kind == b"D"), None)
+    command = next((payload for kind, payload in messages if kind == b"C"), None)
+    check(
+        "merge wire: extended portal retains DEFAULT update and RETURNING metadata",
+        description is not None
+        and row_description_type_oids(description) == [23, 23]
+        and row_description_formats(description) == [0, 0]
+        and row is not None
+        and text_row_fields(row) == ["1", "41"]
+        and command == b"MERGE 1\x00",
+        messages,
+    )
+    s.close()
+
+
 def test_typed_trigger_query_program_over_raw_simple_query():
     s = connect()
     s.sendall(startup_payload(0))

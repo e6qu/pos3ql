@@ -1218,6 +1218,66 @@ def test_plpgsql_catalog_locals_extend_bind_and_result_contracts():
     s.close()
 
 
+def test_plpgsql_declaration_contracts_over_raw_wire():
+    s = connect()
+    s.sendall(startup_payload(0))
+    drain_startup(s)
+    setup = simple_query(
+        s,
+        "CREATE TYPE wire_declaration_pair AS (id integer, label text); "
+        "CREATE TABLE wire_declaration_rows (id integer, label text); "
+        "INSERT INTO wire_declaration_rows VALUES (7, 'row'); "
+        "CREATE FUNCTION wire_declaration_contract() RETURNS text LANGUAGE plpgsql AS "
+        "'DECLARE typed_id wire_declaration_rows.id%TYPE := 7; "
+        "table_row wire_declaration_rows%ROWTYPE; "
+        "composite_row wire_declaration_pair%ROWTYPE; dynamic_row RECORD; "
+        "dynamic_execute RECORD; fixed CONSTANT integer := 9; required integer NOT NULL := 4; "
+        "BEGIN SELECT id, label INTO table_row FROM wire_declaration_rows WHERE id = typed_id; "
+        "SELECT id, label INTO composite_row FROM wire_declaration_rows WHERE id = typed_id; "
+        "SELECT id, label INTO dynamic_row FROM wire_declaration_rows WHERE id = typed_id; "
+        "EXECUTE ''SELECT id, label FROM wire_declaration_rows WHERE id = 7'' INTO dynamic_execute; "
+        "RETURN typed_id::text || '':'' || table_row.label || '':'' || composite_row.label || '':'' "
+        "|| dynamic_row.label || '':'' || dynamic_execute.label || '':'' || fixed::text || '':'' "
+        "|| required::text; END'",
+    )
+    check(
+        "declaration-contract raw-wire setup succeeds",
+        not any(kind == b"E" for kind, _ in setup),
+        setup,
+    )
+    parse = frontend_message(
+        b"P",
+        b"wire_declaration_contract_statement\x00SELECT wire_declaration_contract()\x00"
+        + struct.pack("!h", 0),
+    )
+    bind = frontend_message(
+        b"B",
+        b"wire_declaration_contract_portal\x00wire_declaration_contract_statement\x00"
+        + struct.pack("!hhh", 0, 0, 0),
+    )
+    describe = frontend_message(b"D", b"Pwire_declaration_contract_portal\x00")
+    execute = frontend_message(b"E", b"wire_declaration_contract_portal\x00\x00\x00\x00\x00")
+    s.sendall(parse + bind + describe + execute + frontend_message(b"S"))
+    output = []
+    while True:
+        item = read_message(s)
+        output.append(item)
+        if item[0] == b"Z":
+            break
+    description = next((payload for kind, payload in output if kind == b"T"), None)
+    row = next((payload for kind, payload in output if kind == b"D"), None)
+    check(
+        "declaration contracts survive Parse, Bind, Describe, and portal execution",
+        not any(kind == b"E" for kind, _ in output)
+        and description is not None
+        and row_description_type_oids(description) == [25]
+        and row is not None
+        and text_row_fields(row) == ["7:row:row:row:row:9:4"],
+        output,
+    )
+    s.close()
+
+
 def test_portal_describe_preserves_type_modifier():
     s = connect()
     s.sendall(startup_payload(0))

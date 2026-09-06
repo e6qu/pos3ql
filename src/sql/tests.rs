@@ -45419,9 +45419,11 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
          PUBLICATION changes WITH (connect = false, slot_name = NONE)",
     );
     let origin_floor = engine.storage.lsn();
+    let stream = engine.subscription_stream("apply_changes").unwrap();
+    let expected_origin = crate::stack_format!(48, "pos3ql_subscription_{:x}", stream.created_at());
     let mut apply = SubscriptionApply::new(
         &mut budget,
-        engine.subscription_stream("apply_changes").unwrap(),
+        stream,
         8,
         config.txn_rows,
         1 << 16,
@@ -45443,6 +45445,13 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     begin[8] = 40;
     begin[20] = 1;
     receive(&mut apply, &mut engine, 40, &begin);
+    let origin = [
+        b'O', 0, 0, 0, 0, 0, 0, 0, 40, b'u', b'p', b's', b't', b'r', b'e', b'a', b'm', 0,
+    ];
+    assert_eq!(
+        receive(&mut apply, &mut engine, 40, &origin),
+        ApplyResult::None
+    );
     let insert = [
         b'I', 0, 0, 0, 1, b'N', 0, 2, b't', 0, 0, 0, 1, b'1', b't', 0, 0, 0, 5, b'f', b'i', b'r',
         b's', b't',
@@ -45487,6 +45496,25 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         .unwrap()
         .expect("applied transaction remains in the publisher journal");
     assert!(any_emitted);
+    let mut at = 0usize;
+    let mut saw_origin = false;
+    while at < origin_send.len() {
+        let bytes = origin_send.readable();
+        assert_eq!(bytes[at], crate::pg::wire::FMSG_COPY_DATA);
+        let length = u32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+        let payload = &bytes[at + 5..at + 1 + length];
+        if let crate::pg::pginput::CopyData::XLogData {
+            message: crate::pg::pginput::Message::Origin { commit_lsn, name },
+            ..
+        } = crate::pg::pginput::copy_data(payload).unwrap()
+        {
+            assert_eq!(commit_lsn, 41);
+            assert_eq!(name, expected_origin.as_str());
+            saw_origin = true;
+        }
+        at += 1 + length;
+    }
+    assert!(saw_origin);
     origin_scratch.clear();
     origin_send.clear();
     let (_, none_emitted) = engine
@@ -45711,6 +45739,38 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         ["2|durable|local"]
     );
     drop(apply);
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SUBSCRIPTION apply_changes SET (origin = none)",
+    );
+    let no_origin_stream = engine.subscription_stream("apply_changes").unwrap();
+    let no_origin_behavior = engine
+        .storage
+        .subscription("apply_changes", 0)
+        .unwrap()
+        .1
+        .behavior;
+    let mut no_origin_apply = SubscriptionApply::new(
+        &mut budget,
+        no_origin_stream,
+        8,
+        config.txn_rows,
+        1 << 16,
+        121,
+        no_origin_behavior,
+    )
+    .unwrap();
+    begin[8] = 130;
+    begin[20] = 8;
+    receive(&mut no_origin_apply, &mut engine, 130, &begin);
+    let bytes = frame(130, &origin);
+    let error = no_origin_apply
+        .receive(&mut engine, copy_data(&bytes[..25 + origin.len()]).unwrap())
+        .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::PROTOCOL_VIOLATION);
+    assert_eq!(no_origin_apply.confirmed_lsn(), 121);
+    drop(no_origin_apply);
     drop(engine);
     let mut replay_budget = Budget::new(1 << 27);
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();

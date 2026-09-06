@@ -3232,6 +3232,7 @@ impl Engine {
             let mut at = 0usize;
             let mut transaction_id = 0u32;
             let mut has_replication_origin = false;
+            let mut subscription_origin = None;
             let mut truncates = [PendingTruncate {
                 command_id: 0,
                 table_slots: [0; crate::sql::txn::MAX_TRUNCATE_TABLES],
@@ -3250,11 +3251,22 @@ impl Engine {
                 {
                     transaction_id = id;
                 }
-                if matches!(
-                    crate::wal::decode_record(&transaction[at + 16..at + total]),
-                    Some(WalOp::AdvanceSubscription { .. })
-                ) {
+                if let Some(WalOp::AdvanceSubscription {
+                    created_at,
+                    confirmed_lsn,
+                    ..
+                }) = crate::wal::decode_record(&transaction[at + 16..at + total])
+                {
                     has_replication_origin = true;
+                    if subscription_origin
+                        .replace((created_at, confirmed_lsn))
+                        .is_some()
+                    {
+                        return Err(sql_err!(
+                            sqlstate::PROTOCOL_VIOLATION,
+                            "replication transaction advances more than one subscription frontier"
+                        ));
+                    }
                 }
                 if let Some(WalOp::Truncate {
                     tables,
@@ -3504,6 +3516,20 @@ impl Engine {
                     })
                 })
                 .map_err(|_| overflow())?;
+            if let Some((created_at, origin_lsn)) = subscription_origin {
+                // PostgreSQL replication-origin names identify the local
+                // stream that applied this transaction. `created_at` remains
+                // stable across subscription rename and is persisted in the
+                // same WAL record as the acknowledged publisher frontier.
+                let origin_name = stack_format!(48, "pos3ql_subscription_{created_at:x}");
+                responder
+                    .copy_data(&|message| {
+                        pgoutput::xlog_data(message, floor, end_lsn, |plugin| {
+                            pgoutput::origin(plugin, origin_lsn, origin_name.as_str())
+                        })
+                    })
+                    .map_err(|_| overflow())?;
+            }
             at = 0;
             while at < transaction.len() {
                 let length =

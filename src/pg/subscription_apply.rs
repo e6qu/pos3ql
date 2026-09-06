@@ -583,6 +583,29 @@ impl SubscriptionApply {
                     frame_end_lsn
                 )),
             },
+            Message::Origin { name, .. } => {
+                if self.behavior.origin != crate::storage::SubscriptionOrigin::Any {
+                    return Err(Self::protocol_error(
+                        "subscription received an origin despite origin = none",
+                    ));
+                }
+                if name.is_empty()
+                    || !matches!(
+                        self.remote,
+                        RemoteTransaction::Applying { .. }
+                            | RemoteTransaction::Skipping { .. }
+                            | RemoteTransaction::Streaming {
+                                segment_open: true,
+                                ..
+                            }
+                    )
+                {
+                    return Err(Self::protocol_error(
+                        "subscription ORIGIN is outside an active transaction",
+                    ));
+                }
+                Ok(ApplyResult::None)
+            }
             Message::Relation { xid, relation } => {
                 if xid.is_some() {
                     self.require_message_xid(xid)?;

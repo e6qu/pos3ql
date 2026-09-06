@@ -126,6 +126,12 @@ pub enum Message<'a> {
         commit_lsn: u64,
         end_lsn: u64,
     },
+    /// Identifies a transaction that was applied from another replication
+    /// node. The name is only meaningful within the publisher's topology.
+    Origin {
+        commit_lsn: u64,
+        name: &'a str,
+    },
     Relation {
         xid: Option<u32>,
         relation: Relation<'a>,
@@ -327,6 +333,10 @@ fn message<'a>(bytes: &'a [u8], state: &mut DecodeState) -> Result<Message<'a>, 
                 end_lsn,
             }
         }
+        b'O' => Message::Origin {
+            commit_lsn: input.u64()?,
+            name: input.cstr()?,
+        },
         b'R' => {
             let xid = streamed_xid(&mut input, *state)?;
             let id = input.u32()?;
@@ -610,6 +620,30 @@ mod tests {
         assert_eq!(relation.columns()[0].name, "id");
         assert_eq!(
             copy_data(&bytes[..25 + relation_frame.len() - 1]),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn origin_message_retains_the_publisher_identity_without_allocation() {
+        let origin = [
+            b'O', 0, 0, 0, 0, 0, 0, 0, 41, b'c', b'a', b's', b'c', b'a', b'd', b'e', 0,
+        ];
+        let bytes = xlog(&origin);
+        guard::forbid_alloc(|| {
+            assert!(matches!(
+                copy_data(&bytes[..25 + origin.len()]),
+                Ok(CopyData::XLogData {
+                    message: Message::Origin {
+                        commit_lsn: 41,
+                        name: "cascade",
+                    },
+                    ..
+                })
+            ));
+        });
+        assert_eq!(
+            copy_data(&bytes[..25 + origin.len() - 1]),
             Err(DecodeError::Truncated)
         );
     }

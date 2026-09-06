@@ -96,6 +96,15 @@ pub fn commit(message: &mut MsgOut, commit_lsn: u64) {
     message.i64(0);
 }
 
+/// pgoutput Origin marks a transaction that this node previously applied
+/// through one of its subscriptions. Consumers using `origin = none` can
+/// therefore exclude it without relying on a local implementation detail.
+pub fn origin(message: &mut MsgOut, commit_lsn: u64, name: &str) {
+    message.u8(b'O');
+    message.i64(commit_lsn as i64);
+    message.cstr(name);
+}
+
 /// Complete pgoutput Relation metadata, assembled before encoding so the
 /// parallel column fields cannot diverge at the wire boundary.
 pub struct Relation<'a> {
@@ -232,6 +241,19 @@ mod tests {
         assert_eq!(&bytes[30..31], b"B");
         assert_eq!(i64::from_be_bytes(bytes[6..14].try_into().unwrap()), 7);
         assert_eq!(i64::from_be_bytes(bytes[14..22].try_into().unwrap()), 9);
+    }
+
+    #[test]
+    fn origin_marks_the_stable_upstream_commit_position() {
+        let mut budget = Budget::new(1024);
+        let mut buffer = FixedBuf::new(&mut budget, "pgoutput", 256).unwrap();
+        let mut frame = MsgOut::begin(&mut buffer, b'd');
+        origin(&mut frame, 41, "pos3ql_subscription_2a");
+        frame.finish().unwrap();
+        let bytes = buffer.readable();
+        assert_eq!(bytes[5], b'O');
+        assert_eq!(i64::from_be_bytes(bytes[6..14].try_into().unwrap()), 41);
+        assert_eq!(&bytes[14..], b"pos3ql_subscription_2a\0");
     }
 
     #[test]

@@ -754,7 +754,7 @@ pg_dump -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -f "$WORK/outbound.sql" > "$WORK/outbound_dump.out" 2>&1
 outbound_dump_status=$?
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
-  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader; CREATE ROLE outbound_reader' \
+  -v ON_ERROR_STOP=1 -c 'DROP PUBLICATION IF EXISTS outbound_dump_changes; DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader; CREATE ROLE outbound_reader' \
   > "$WORK/outbound_drop.out" 2>&1
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 -f "$WORK/outbound.sql" \
@@ -960,7 +960,7 @@ fi
 # name. Keep the PostgreSQL oracle as clean as the fresh pos3ql restart below,
 # so pg_type cardinality probes do not inherit this tooling fixture.
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
-  -v ON_ERROR_STOP=1 -c 'SELECT lo_unlink(94001) WHERE EXISTS (SELECT 1 FROM pg_largeobject_metadata WHERE oid = 94001); DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader' \
+  -v ON_ERROR_STOP=1 -c 'SELECT lo_unlink(94001) WHERE EXISTS (SELECT 1 FROM pg_largeobject_metadata WHERE oid = 94001); DROP PUBLICATION IF EXISTS outbound_dump_changes; DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader' \
   > "$WORK/outbound_cleanup.out" 2>&1 || {
     bad "clean outbound pg_dump fixture from PostgreSQL"
     tail -40 "$WORK/outbound_cleanup.out"

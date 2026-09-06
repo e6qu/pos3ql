@@ -2968,7 +2968,12 @@ fn execute_row_trigger_body<'a>(
                 "trigger body exceeds the statement arena"
             )
         })?;
-    let program = parse_trigger_program(source, context.arena)?;
+    let program = resolve_plpgsql_program_locals(
+        parse_trigger_program(source, context.arena)?,
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+    )?;
     let transition_relations =
         trigger_transition_relations(trigger, definition, transition_rows, context.arena)?;
     let mut local_values = [Datum::Null; MAX_COLUMNS];
@@ -13997,9 +14002,18 @@ struct TriggerLocalAssignment<'a> {
 }
 
 #[derive(Clone, Copy)]
+struct ParsedTriggerLocalDecl<'a> {
+    name: SqlName,
+    type_name: &'a str,
+    type_mod: i32,
+    initial: Option<&'a Expr<'a>>,
+}
+
+#[derive(Clone, Copy)]
 struct TriggerLocalDecl<'a> {
     name: SqlName,
     ctype: ColType,
+    user_type: Option<crate::storage::UserTypeName>,
     type_mod: i32,
     initial: Option<&'a Expr<'a>>,
 }
@@ -14643,6 +14657,12 @@ struct TriggerBlock<'a> {
 #[derive(Clone, Copy)]
 struct TriggerProgram<'a> {
     locals: &'a [TriggerLocalDecl<'a>],
+    body: TriggerBlock<'a>,
+}
+
+#[derive(Clone, Copy)]
+struct ParsedTriggerProgram<'a> {
+    locals: &'a [ParsedTriggerLocalDecl<'a>],
     body: TriggerBlock<'a>,
 }
 
@@ -15553,7 +15573,7 @@ fn parse_trigger_local<'a>(
     statement: &'a str,
     arena: &'a Arena,
     program_kind: PlpgsqlProgramKind,
-) -> Result<TriggerLocalDecl<'a>, SqlError> {
+) -> Result<ParsedTriggerLocalDecl<'a>, SqlError> {
     let initial = trigger_top_level_keyword(statement, ":=")
         .map(|offset| (offset, 2))
         .or_else(|| trigger_top_level_keyword(statement, "default").map(|offset| (offset, 7)))
@@ -15588,24 +15608,9 @@ fn parse_trigger_local<'a>(
         return Err(unsupported_trigger_body());
     }
     let (type_name, type_mod) = super::parser::parse_type_name(type_source, arena)?;
-    let Some(ctype) = ColType::from_sql_name(type_name) else {
-        return Err(sql_err!(
-            sqlstate::UNDEFINED_OBJECT,
-            "type \"{}\" does not exist",
-            type_name
-        ));
-    };
-    if ctype.is_pseudo() && ctype != ColType::Record {
-        return Err(sql_err!(
-            sqlstate::INVALID_FUNCTION_DEFINITION,
-            "PL/pgSQL local \"{}\" has pseudo-type {}",
-            name.as_str(),
-            type_name
-        ));
-    }
-    Ok(TriggerLocalDecl {
+    Ok(ParsedTriggerLocalDecl {
         name,
-        ctype,
+        type_name,
         type_mod,
         initial,
     })
@@ -17259,7 +17264,7 @@ fn parse_plpgsql_program<'a>(
     body: &'a str,
     arena: &'a Arena,
     program_kind: PlpgsqlProgramKind,
-) -> Result<TriggerProgram<'a>, SqlError> {
+) -> Result<ParsedTriggerProgram<'a>, SqlError> {
     let body = body.trim().strip_suffix(';').unwrap_or(body.trim()).trim();
     let (locals, body) = if let Some(declarations) = strip_trigger_keyword(body, "declare") {
         let Some(begin_at) = trigger_top_level_keyword(declarations, "begin") else {
@@ -17274,7 +17279,7 @@ fn parse_plpgsql_program<'a>(
             if locals[..local_count]
                 .iter()
                 .flatten()
-                .any(|prior: &TriggerLocalDecl<'_>| prior.name == local.name)
+                .any(|prior: &ParsedTriggerLocalDecl<'_>| prior.name == local.name)
             {
                 return Err(sql_err!(
                     sqlstate::DUPLICATE_COLUMN,
@@ -17330,20 +17335,64 @@ fn parse_plpgsql_program<'a>(
     if program_kind == PlpgsqlProgramKind::Trigger && !has_return {
         return Err(unsupported_trigger_body());
     }
-    Ok(TriggerProgram { locals, body })
+    Ok(ParsedTriggerProgram { locals, body })
+}
+
+/// Resolves every declaration once at the catalog boundary shared by stored
+/// routines, triggers, and anonymous blocks.  Syntax parsing retains the
+/// spelling because it deliberately has no storage borrow; execution receives
+/// only concrete representations plus their durable user-type identities.
+fn resolve_plpgsql_program_locals<'a>(
+    program: ParsedTriggerProgram<'a>,
+    storage: &Storage,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<TriggerProgram<'a>, SqlError> {
+    let mut resolved = [TriggerLocalDecl {
+        name: SqlName::EMPTY,
+        ctype: ColType::Bool,
+        user_type: None,
+        type_mod: -1,
+        initial: None,
+    }; MAX_COLUMNS];
+    for (index, local) in program.locals.iter().copied().enumerate() {
+        let result = resolve_routine_type(storage, txid, local.type_name)?;
+        if result.ctype.is_pseudo() && result.ctype != ColType::Record {
+            return Err(sql_err!(
+                sqlstate::INVALID_FUNCTION_DEFINITION,
+                "PL/pgSQL local \"{}\" has pseudo-type {}",
+                local.name.as_str(),
+                local.type_name
+            ));
+        }
+        resolved[index] = TriggerLocalDecl {
+            name: local.name,
+            ctype: result.ctype,
+            user_type: result.user_type,
+            type_mod: local.type_mod,
+            initial: local.initial,
+        };
+    }
+    let locals = arena
+        .alloc_slice_copy(&resolved[..program.locals.len()])
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(TriggerProgram {
+        locals: &*locals,
+        body: program.body,
+    })
 }
 
 fn parse_trigger_program<'a>(
     body: &'a str,
     arena: &'a Arena,
-) -> Result<TriggerProgram<'a>, SqlError> {
+) -> Result<ParsedTriggerProgram<'a>, SqlError> {
     parse_plpgsql_program(body, arena, PlpgsqlProgramKind::Trigger)
 }
 
 fn parse_event_trigger_program<'a>(
     body: &'a str,
     arena: &'a Arena,
-) -> Result<TriggerProgram<'a>, SqlError> {
+) -> Result<ParsedTriggerProgram<'a>, SqlError> {
     parse_plpgsql_program(body, arena, PlpgsqlProgramKind::EventTrigger)
 }
 
@@ -17407,7 +17456,12 @@ pub(crate) fn execute_anonymous_plpgsql<'a>(
     arena: &'a Arena,
     responder: &mut Responder<'_>,
 ) -> Result<(), SqlError> {
-    let program = parse_plpgsql_program(source, arena, PlpgsqlProgramKind::Anonymous)?;
+    let program = resolve_plpgsql_program_locals(
+        parse_plpgsql_program(source, arena, PlpgsqlProgramKind::Anonymous)?,
+        &engine.storage,
+        txn.txid,
+        arena,
+    )?;
     let definition = TableDef::empty();
     let invocation = TriggerInvocation::anonymous();
     let mut context = TriggerExecContext {
@@ -17478,7 +17532,12 @@ pub(crate) fn execute_event_trigger<'a>(
     let source = arena
         .alloc_str(routine.body.as_str())
         .map_err(|_| super::query::arena_full_pub())?;
-    let program = parse_event_trigger_program(source, arena)?;
+    let program = resolve_plpgsql_program_locals(
+        parse_event_trigger_program(source, arena)?,
+        &engine.storage,
+        txn.txid,
+        arena,
+    )?;
     let definition = TableDef::empty();
     let invocation = TriggerInvocation::event_trigger(routine, event, tag, arena)?;
     let mut context = TriggerExecContext {
@@ -17553,7 +17612,12 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
     let source = arena
         .alloc_str(routine.body.as_str())
         .map_err(|_| super::query::arena_full_pub())?;
-    let program = parse_plpgsql_program(source, arena, PlpgsqlProgramKind::Procedure)?;
+    let program = resolve_plpgsql_program_locals(
+        parse_plpgsql_program(source, arena, PlpgsqlProgramKind::Procedure)?,
+        &engine.storage,
+        txn.txid,
+        arena,
+    )?;
     let mut declarations = [None; MAX_COLUMNS];
     let mut seeded = [Datum::Null; MAX_COLUMNS];
     let mut declaration_count = 0usize;
@@ -17590,6 +17654,7 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
         declarations[declaration_count] = Some(TriggerLocalDecl {
             name: parameter.name,
             ctype: parameter.ctype,
+            user_type: parameter.user_type,
             type_mod: -1,
             initial: None,
         });
@@ -17709,7 +17774,12 @@ pub(crate) fn execute_plpgsql_function<'a>(
         .alloc_str(routine.body.as_str())
         .map_err(|_| super::query::arena_full_pub())?;
     let program_kind = plpgsql_function_program_kind(routine);
-    let program = parse_plpgsql_program(source, arena, program_kind)?;
+    let program = resolve_plpgsql_program_locals(
+        parse_plpgsql_program(source, arena, program_kind)?,
+        &engine.storage,
+        txn.txid,
+        arena,
+    )?;
     let mut declarations = [None; MAX_COLUMNS];
     let mut seeded = [Datum::Null; MAX_COLUMNS];
     let mut declaration_count = 0usize;
@@ -17726,6 +17796,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         declarations[declaration_count] = Some(TriggerLocalDecl {
             name: parameter.name,
             ctype: parameter.ctype,
+            user_type: parameter.user_type,
             type_mod: -1,
             initial: None,
         });
@@ -17755,6 +17826,7 @@ pub(crate) fn execute_plpgsql_function<'a>(
         declarations[declaration_count] = Some(TriggerLocalDecl {
             name: parameter.name,
             ctype: parameter.ctype,
+            user_type: parameter.user_type,
             type_mod: -1,
             initial: None,
         });
@@ -17873,7 +17945,12 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
     let source = arena
         .alloc_str(routine.body.as_str())
         .map_err(|_| super::query::arena_full_pub())?;
-    let program = parse_plpgsql_program(source, arena, PlpgsqlProgramKind::SetFunction)?;
+    let program = resolve_plpgsql_program_locals(
+        parse_plpgsql_program(source, arena, PlpgsqlProgramKind::SetFunction)?,
+        &engine.storage,
+        txn.txid,
+        arena,
+    )?;
     let mut declarations = [None; MAX_COLUMNS];
     let mut seeded = [Datum::Null; MAX_COLUMNS];
     let mut declaration_count = 0usize;
@@ -17890,6 +17967,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         declarations[declaration_count] = Some(TriggerLocalDecl {
             name: parameter.name,
             ctype: parameter.ctype,
+            user_type: parameter.user_type,
             type_mod: -1,
             initial: None,
         });
@@ -17921,6 +17999,7 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
         declarations[declaration_count] = Some(TriggerLocalDecl {
             name: output.name,
             ctype: output.ctype,
+            user_type: output.user_type,
             type_mod: -1,
             initial: None,
         });
@@ -18263,8 +18342,17 @@ where
         }
         if let Some(qualifier) = qualifier
             && let Some(index) = self.local_index(qualifier)
-            && let Datum::Record(fields) = self.values[index]
         {
+            let fields = match self.values[index] {
+                Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+                _ => {
+                    return Err(sql_err!(
+                        sqlstate::UNDEFINED_TABLE,
+                        "missing FROM-clause entry for table \"{}\"",
+                        qualifier
+                    ));
+                }
+            };
             return fields
                 .iter()
                 .find(|field| field.name.eq_ignore_ascii_case(name))
@@ -18308,7 +18396,7 @@ where
                 qualifier
                     .and_then(|qualifier| self.local_index(qualifier))
                     .and_then(|index| match self.values[index] {
-                        Datum::Record(fields) => fields
+                        Datum::Record(fields) | Datum::Composite { fields, .. } => fields
                             .iter()
                             .find(|field| field.name.eq_ignore_ascii_case(name))
                             .and_then(|field| ColType::from_oid(field.type_oid)),
@@ -18358,7 +18446,7 @@ where
         };
         self.local_index(name)
             .and_then(|index| match self.values[index] {
-                Datum::Record(fields) => fields
+                Datum::Record(fields) | Datum::Composite { fields, .. } => fields
                     .iter()
                     .find(|candidate| candidate.name.eq_ignore_ascii_case(field))
                     .and_then(|candidate| ColType::from_oid(candidate.type_oid)),
@@ -18379,17 +18467,19 @@ where
         {
             return self.transition.column_user_type(qualifier, name);
         }
-        if qualifier.is_none()
-            && (self.local_index(name).is_some()
-                || plpgsql_context_field(self.invocation.program_kind, name).is_some()
-                || TriggerStatusVariable::parse(name).is_some())
-            || (TriggerExceptionVariable::parse(name).is_some()
-                && self.invocation.exception.is_some())
-        {
-            None
-        } else {
-            self.transition.column_user_type(qualifier, name)
+        if qualifier.is_none() {
+            if let Some(index) = self.local_index(name) {
+                return self.locals[index].user_type;
+            }
+            if plpgsql_context_field(self.invocation.program_kind, name).is_some()
+                || TriggerStatusVariable::parse(name).is_some()
+                || (TriggerExceptionVariable::parse(name).is_some()
+                    && self.invocation.exception.is_some())
+            {
+                return None;
+            }
         }
+        self.transition.column_user_type(qualifier, name)
     }
 }
 
@@ -18657,6 +18747,11 @@ where
         qualifier: Option<&str>,
         name: &str,
     ) -> Option<crate::storage::UserTypeName> {
+        if qualifier.is_none()
+            && let Some(index) = self.local_index(name)
+        {
+            return self.locals[index].user_type;
+        }
         self.definition
             .column_index(name)
             .filter(|_| matches!(qualifier, Some(value) if value.eq_ignore_ascii_case("old") || value.eq_ignore_ascii_case("new")))
@@ -21162,12 +21257,7 @@ fn initialize_trigger_locals<'a>(
 ) -> Result<(), SqlError> {
     for (index, local) in locals.iter().enumerate() {
         if let Some(value) = seeded.get(index).copied() {
-            values[index] = apply_typmod(
-                cast_to(value, local.ctype, context.arena)?,
-                local.ctype,
-                local.type_mod,
-                context.arena,
-            )?;
+            values[index] = coerce_plpgsql_local(context, *local, value)?;
             continue;
         }
         values[index] = Datum::Null;
@@ -21182,12 +21272,7 @@ fn initialize_trigger_locals<'a>(
             transition: &transition,
         };
         let value = eval_trigger_expression(context, initial, &scope)?;
-        values[index] = apply_typmod(
-            cast_to(value, local.ctype, context.arena)?,
-            local.ctype,
-            local.type_mod,
-            context.arena,
-        )?;
+        values[index] = coerce_plpgsql_local(context, *local, value)?;
     }
     Ok(())
 }
@@ -21205,21 +21290,34 @@ fn trigger_local_index(locals: &[TriggerLocalDecl<'_>], name: SqlName) -> Result
         })
 }
 
+fn coerce_plpgsql_local<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    local: TriggerLocalDecl<'a>,
+    value: Datum<'a>,
+) -> Result<Datum<'a>, SqlError> {
+    let value = coerce_routine_argument(
+        value,
+        crate::storage::RoutineArgumentDef {
+            name: local.name,
+            ctype: local.ctype,
+            user_type: local.user_type,
+        },
+        context.storage(),
+        context.txn.txid,
+        context.arena,
+    )?;
+    apply_typmod(value, local.ctype, local.type_mod, context.arena)
+}
+
 fn assign_trigger_local<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
     locals: &[TriggerLocalDecl<'a>],
     values: &mut [Datum<'a>; MAX_COLUMNS],
     target: SqlName,
     value: Datum<'a>,
-    arena: &'a Arena,
 ) -> Result<(), SqlError> {
     let index = trigger_local_index(locals, target)?;
-    let local = locals[index];
-    values[index] = apply_typmod(
-        cast_to(value, local.ctype, arena)?,
-        local.ctype,
-        local.type_mod,
-        arena,
-    )?;
+    values[index] = coerce_plpgsql_local(context, locals[index], value)?;
     Ok(())
 }
 
@@ -21829,13 +21927,7 @@ fn execute_trigger_block<'a>(
                 };
                 let value = eval_trigger_expression(context, assignment.expression, &scope)?;
                 if locals.iter().any(|local| local.name == assignment.name) {
-                    assign_trigger_local(
-                        locals,
-                        local_values,
-                        assignment.name,
-                        value,
-                        context.arena,
-                    )?;
+                    assign_trigger_local(context, locals, local_values, assignment.name, value)?;
                     let local = trigger_local_index(locals, assignment.name)?;
                     status.assign_output_local(local, local_values[local]);
                 } else if TriggerStatusVariable::parse(assignment.name.as_str()).is_some() {
@@ -21845,13 +21937,7 @@ fn execute_trigger_block<'a>(
                         _ => unreachable!("boolean cast preserves its datum kind"),
                     };
                 } else {
-                    assign_trigger_local(
-                        locals,
-                        local_values,
-                        assignment.name,
-                        value,
-                        context.arena,
-                    )?;
+                    assign_trigger_local(context, locals, local_values, assignment.name, value)?;
                 }
             }
             TriggerStatement::LoopControl(control) => {
@@ -21968,13 +22054,8 @@ fn execute_trigger_block<'a>(
                     }
                 }
                 for (index, &target) in targets[..statement.targets.len()].iter().enumerate() {
-                    let local = locals[target];
-                    local_values[target] = apply_typmod(
-                        cast_to(selected[index], local.ctype, context.arena)?,
-                        local.ctype,
-                        local.type_mod,
-                        context.arena,
-                    )?;
+                    local_values[target] =
+                        coerce_plpgsql_local(context, locals[target], selected[index])?;
                 }
             }
             TriggerStatement::DynamicSelectInto(statement) => {
@@ -22169,13 +22250,8 @@ fn execute_trigger_block<'a>(
                     }
                 }
                 for (index, &target) in targets[..statement.targets.len()].iter().enumerate() {
-                    let local = locals[target];
-                    local_values[target] = apply_typmod(
-                        cast_to(selected[index], local.ctype, context.arena)?,
-                        local.ctype,
-                        local.type_mod,
-                        context.arena,
-                    )?;
+                    local_values[target] =
+                        coerce_plpgsql_local(context, locals[target], selected[index])?;
                 }
             }
             TriggerStatement::DynamicQuery(query) => {
@@ -22428,13 +22504,7 @@ fn execute_trigger_block<'a>(
                             )
                         }
                     };
-                    assign_trigger_local(
-                        locals,
-                        local_values,
-                        assignment.target,
-                        value,
-                        context.arena,
-                    )?;
+                    assign_trigger_local(context, locals, local_values, assignment.target, value)?;
                 }
             }
             TriggerStatement::GetStackedDiagnostics(statement) => {
@@ -22469,13 +22539,7 @@ fn execute_trigger_block<'a>(
                         })
                         .transpose()?
                         .unwrap_or(Datum::Null);
-                    assign_trigger_local(
-                        locals,
-                        local_values,
-                        assignment.target,
-                        value,
-                        context.arena,
-                    )?;
+                    assign_trigger_local(context, locals, local_values, assignment.target, value)?;
                 }
             }
             TriggerStatement::Exception(exception_block) => {
@@ -22912,11 +22976,11 @@ fn execute_trigger_block<'a>(
                         } {
                             iterated = true;
                             if let Err(error) = assign_trigger_local(
+                                context,
                                 locals,
                                 local_values,
                                 program.target,
                                 Datum::Int8(value),
-                                context.arena,
                             ) {
                                 status.unshadow_output_local(target);
                                 local_values[target] = prior_target;
@@ -23034,11 +23098,11 @@ fn execute_trigger_block<'a>(
                         for value in values.iter().copied() {
                             iterated = true;
                             if let Err(error) = assign_trigger_local(
+                                context,
                                 locals,
                                 local_values,
                                 program.target,
                                 value,
-                                context.arena,
                             ) {
                                 status.unshadow_output_local(target);
                                 local_values[target] = prior_target;
@@ -23117,11 +23181,11 @@ fn execute_trigger_block<'a>(
                         for value in values.iter().copied() {
                             iterated = true;
                             if let Err(error) = assign_trigger_local(
+                                context,
                                 locals,
                                 local_values,
                                 program.target,
                                 value,
-                                context.arena,
                             ) {
                                 status.unshadow_output_local(target);
                                 local_values[target] = prior_target;
@@ -23267,11 +23331,11 @@ fn execute_trigger_block<'a>(
                         for value in values.iter().copied() {
                             iterated = true;
                             if let Err(error) = assign_trigger_local(
+                                context,
                                 locals,
                                 local_values,
                                 program.target,
                                 value,
-                                context.arena,
                             ) {
                                 status.unshadow_output_local(target);
                                 local_values[target] = prior_target;
@@ -24289,7 +24353,12 @@ fn fire_statement_triggers_with_rows<'a>(
                 )
             })?
         };
-        let program = parse_trigger_program(source, context.arena)?;
+        let program = resolve_plpgsql_program_locals(
+            parse_trigger_program(source, context.arena)?,
+            context.storage(),
+            context.txn.txid,
+            context.arena,
+        )?;
         let transition_relations =
             trigger_transition_relations(&trigger, definition, rows, context.arena)?;
         let mut no_new = None;
@@ -30158,12 +30227,6 @@ pub fn create_routine(
                     .iter()
                     .filter(|argument| argument.mode.is_output())
                     .count();
-                if output_parameter_count > 1 {
-                    return sql_fail(sql_err!(
-                        sqlstate::FEATURE_NOT_SUPPORTED,
-                        "PL/pgSQL functions with multiple OUT parameters are not supported"
-                    ));
-                }
                 let program_kind = if result.ctype == ColType::Void {
                     PlpgsqlProgramKind::VoidFunction
                 } else if output_parameter_count == 1 {
@@ -30175,6 +30238,11 @@ pub fn create_routine(
                     Ok(program) => program,
                     Err(error) => return sql_fail(error),
                 };
+                let program =
+                    match resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
+                        Ok(program) => program,
+                        Err(error) => return sql_fail(error),
+                    };
                 if let Err(error) = validate_plpgsql_routine_namespace(
                     &program,
                     &parameters[..routine.arguments.len()],
@@ -30231,6 +30299,11 @@ pub fn create_routine(
                     Ok(program) => program,
                     Err(error) => return sql_fail(error),
                 };
+                let program =
+                    match resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
+                        Ok(program) => program,
+                        Err(error) => return sql_fail(error),
+                    };
                 let mut namespace = [RoutineParameterDef::EMPTY; MAX_ROUTINE_ARGUMENTS];
                 let mut namespace_count = routine.arguments.len();
                 namespace[..namespace_count].copy_from_slice(&parameters[..namespace_count]);
@@ -30296,7 +30369,11 @@ pub fn create_routine(
                     "trigger functions require a string-literal body"
                 ));
             }
-            if let Err(error) = parse_trigger_program(body_text, arena) {
+            let program = match parse_trigger_program(body_text, arena) {
+                Ok(program) => program,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
                 return sql_fail(error);
             }
         }
@@ -30307,7 +30384,11 @@ pub fn create_routine(
                     "event trigger functions require a string-literal body"
                 ));
             }
-            if let Err(error) = parse_event_trigger_program(body_text, arena) {
+            let program = match parse_event_trigger_program(body_text, arena) {
+                Ok(program) => program,
+                Err(error) => return sql_fail(error),
+            };
+            if let Err(error) = resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
                 return sql_fail(error);
             }
         }
@@ -30327,6 +30408,11 @@ pub fn create_routine(
                 }
                 let program =
                     match parse_plpgsql_program(body_text, arena, PlpgsqlProgramKind::Procedure) {
+                        Ok(program) => program,
+                        Err(error) => return sql_fail(error),
+                    };
+                let program =
+                    match resolve_plpgsql_program_locals(program, storage, txn.txid, arena) {
                         Ok(program) => program,
                         Err(error) => return sql_fail(error),
                     };

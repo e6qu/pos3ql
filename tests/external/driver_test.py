@@ -131,6 +131,57 @@ cur.execute("SELECT value FROM drv_plpgsql_log")
 assert cur.fetchone() == (42,)
 print("plpgsql procedure ok")
 
+# Local declarations resolve against the catalog before a function crosses an
+# extended-protocol Bind/Result boundary. Domain validation, enum identity,
+# and composite field access must remain one typed contract.
+cur.execute("CREATE TYPE drv_local_state AS ENUM ('ready', 'done')")
+cur.execute("CREATE TYPE drv_local_pair AS (number integer, label text)")
+cur.execute("CREATE DOMAIN drv_local_positive AS integer CHECK (VALUE > 0)")
+cur.execute(
+    "CREATE FUNCTION drv_catalog_local(input_value drv_local_positive) RETURNS text "
+    "LANGUAGE plpgsql AS 'DECLARE checked drv_local_positive := input_value; "
+    "state drv_local_state := ''ready''; pair drv_local_pair; BEGIN "
+    "checked := checked + 1; state := ''done''; "
+    "pair := ROW(checked, state::text); "
+    "RETURN pair.number::text || '':'' || pair.label; END'"
+)
+cur.execute(
+    "CREATE PROCEDURE drv_catalog_local_procedure("
+    "IN input_value drv_local_positive, OUT output_state drv_local_state) "
+    "LANGUAGE plpgsql AS 'DECLARE state drv_local_state := ''ready''; "
+    "BEGIN state := ''done''; output_state := state; END'"
+)
+cur.execute(
+    "CREATE FUNCTION drv_catalog_local_trigger() RETURNS trigger LANGUAGE plpgsql "
+    "AS 'DECLARE checked drv_local_positive := NEW.value; "
+    "state drv_local_state := ''ready''; BEGIN state := ''done''; "
+    "INSERT INTO drv_catalog_local_audit VALUES (state::text); RETURN NEW; END'"
+)
+cur.execute("CREATE TABLE drv_catalog_local_audit (label text)")
+cur.execute("CREATE TABLE drv_catalog_local_rows (value integer)")
+cur.execute(
+    "CREATE TRIGGER drv_catalog_local_rows_audit BEFORE INSERT ON drv_catalog_local_rows "
+    "FOR EACH ROW EXECUTE FUNCTION drv_catalog_local_trigger()"
+)
+cur.execute("SELECT drv_catalog_local(%s::drv_local_positive)", (4,))
+assert cur.fetchone() == ("5:done",)
+bcur = conn.cursor(binary=True)
+bcur.execute("SELECT drv_catalog_local(%s::drv_local_positive)", (4,))
+assert [column.type_code for column in bcur.description] == [25], bcur.description
+assert bcur.fetchone() == ("5:done",)
+bcur.close()
+cur.execute("CALL drv_catalog_local_procedure(%s::drv_local_positive, %s)", (4, None))
+assert cur.fetchone() == ("done",)
+cur.execute("INSERT INTO drv_catalog_local_rows VALUES (%s)", (5,))
+cur.execute("SELECT label FROM drv_catalog_local_audit")
+assert cur.fetchone() == ("done",)
+try:
+    cur.execute("SELECT drv_catalog_local(%s::drv_local_positive)", (0,))
+    raise AssertionError("expected catalog local domain violation")
+except psycopg.errors.CheckViolation as error:
+    assert error.sqlstate == "23514", error.sqlstate
+print("catalog-typed PL/pgSQL locals extended protocol ok")
+
 # Dynamic analyzed output crosses an extended Bind/Result boundary as a
 # PostgreSQL value, including the inner EXECUTE parameter.
 cur.execute(

@@ -5095,7 +5095,7 @@ mod tests {
 
         let mut parse = Vec::new();
         parse.extend_from_slice(
-            b"generic_explain\0EXPLAIN (GENERIC_PLAN, FORMAT JSON) SELECT $1::integer\0",
+            b"generic_explain\0EXPLAIN (GENERIC_PLAN, FORMAT XML) SELECT $1::integer\0",
         );
         parse.extend_from_slice(&1i16.to_be_bytes());
         parse.extend_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
@@ -5135,8 +5135,8 @@ mod tests {
             connection
                 .send
                 .readable()
-                .windows(b"\"Node Type\"".len())
-                .any(|frame| frame == b"\"Node Type\""),
+                .windows(b"<Plan><Node-Type>".len())
+                .any(|frame| frame == b"<Plan><Node-Type>"),
             "{}",
             String::from_utf8_lossy(connection.send.readable())
         );

@@ -159,7 +159,7 @@ DROP USER MAPPING	complete	tests/external/ci_diff.sh
 DROP VIEW	complete	76_stored_dependencies.sql
 END	complete	05_transactions.sql
 EXECUTE	complete	14_surface.sql
-EXPLAIN	partial	48_vacuum_analyze.sql
+EXPLAIN	partial	48_vacuum_analyze.sql, 131_plpgsql_functions.sql, raw-wire portal, and driver structured-output coverage
 FETCH	complete	39_cursors.sql
 GRANT	partial	83_roles_acl.sql, 133_privilege_targets.sql, 140_catalog_schema_evolution.sql, and 141_routine_attribute_evolution.sql
 IMPORT FOREIGN SCHEMA	complete	tests/external/ci_diff.sh

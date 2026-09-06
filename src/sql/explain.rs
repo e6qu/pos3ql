@@ -18,6 +18,7 @@ use crate::sql::guc::PlannerSettings;
 use crate::sql::query::{self, QueryScope};
 use crate::sql::types::{ColDesc, Datum, oid};
 use crate::sql_err;
+use crate::stack_format;
 use crate::storage::Storage;
 use crate::store::BlockIoStats;
 use crate::util::StackStr;
@@ -1314,14 +1315,18 @@ pub(super) fn visit_text_rows<E>(
         }
         if index == 0 && options.buffers {
             let actual = actual.expect("BUFFERS requires ANALYZE");
-            let mut buffers = StackStr::<512>::new();
             let hits = actual.io.ram_hits.saturating_add(actual.io.disk_hits);
-            let _ = write!(
-                buffers,
-                "  Buffers: shared hit={} read={}",
-                hits, actual.io.object_gets
-            );
-            emit(buffers.as_str())?;
+            if hits != 0 || actual.io.object_gets != 0 {
+                let mut buffers = StackStr::<512>::new();
+                let _ = write!(buffers, "  Buffers: shared");
+                if hits != 0 {
+                    let _ = write!(buffers, " hit={hits}");
+                }
+                if actual.io.object_gets != 0 {
+                    let _ = write!(buffers, " read={}", actual.io.object_gets);
+                }
+                emit(buffers.as_str())?;
+            }
         }
         if index == 0
             && options.wal
@@ -1506,6 +1511,50 @@ fn json_string(out: &mut StackStr<16_384>, value: &str) {
     let _ = write!(out, "\"");
 }
 
+/// PostgreSQL names an index scan's operation and index independently in
+/// machine-readable EXPLAIN. Text keeps the conventional combined spelling.
+fn structured_node_name(node: &PlanNode) -> (&str, Option<&str>) {
+    let name = node.name.as_str();
+    match name.strip_prefix("Index Scan using ") {
+        Some(index) => ("Index Scan", Some(index)),
+        None => (name, None),
+    }
+}
+
+/// Appends PostgreSQL's runtime fields for the one executor boundary that is
+/// currently instrumented.  Cache tiers map onto PostgreSQL's shared hit/read
+/// vocabulary at this client-visible boundary; the unmodelled local and temp
+/// counters remain explicitly zero instead of being omitted.
+fn render_json_runtime(out: &mut StackStr<16_384>, options: ExplainOptions, actual: ExplainActual) {
+    if options.timing {
+        let _ = write!(
+            out,
+            ",\"Actual Startup Time\":0.000,\"Actual Total Time\":{:.3}",
+            actual.elapsed_micros as f64 / 1_000.0
+        );
+    }
+    let _ = write!(
+        out,
+        ",\"Actual Rows\":{:.2},\"Actual Loops\":1",
+        actual.rows as f64
+    );
+    if options.buffers {
+        let _ = write!(
+            out,
+            ",\"Shared Hit Blocks\":{},\"Shared Read Blocks\":{},\"Shared Dirtied Blocks\":0,\"Shared Written Blocks\":0,\"Local Hit Blocks\":0,\"Local Read Blocks\":0,\"Local Dirtied Blocks\":0,\"Local Written Blocks\":0,\"Temp Read Blocks\":0,\"Temp Written Blocks\":0",
+            actual.io.ram_hits.saturating_add(actual.io.disk_hits),
+            actual.io.object_gets,
+        );
+    }
+    if options.wal {
+        let _ = write!(
+            out,
+            ",\"WAL Records\":{},\"WAL FPI\":0,\"WAL Bytes\":{},\"WAL Buffers Full\":0",
+            actual.wal_records, actual.wal_bytes
+        );
+    }
+}
+
 fn render_json_node(
     plan: &Plan,
     at: usize,
@@ -1514,9 +1563,14 @@ fn render_json_node(
     out: &mut StackStr<16_384>,
 ) -> usize {
     let node = &plan.nodes[at];
+    let (node_type, index_name) = structured_node_name(node);
     let _ = write!(out, "{{\"Node Type\":");
-    json_string(out, node.name.as_str());
+    json_string(out, node_type);
     let _ = write!(out, ",\"Parallel Aware\":false,\"Async Capable\":false");
+    if let Some(index_name) = index_name {
+        let _ = write!(out, ",\"Index Name\":");
+        json_string(out, index_name);
+    }
     if !node.relation.as_str().is_empty() {
         let _ = write!(out, ",\"Relation Name\":");
         json_string(out, node.relation.as_str());
@@ -1542,33 +1596,7 @@ fn render_json_node(
     if at == 0
         && let Some(actual) = actual
     {
-        if options.timing {
-            let _ = write!(
-                out,
-                ",\"Actual Startup Time\":0.000,\"Actual Total Time\":{:.3}",
-                actual.elapsed_micros as f64 / 1_000.0
-            );
-        }
-        let _ = write!(
-            out,
-            ",\"Actual Rows\":{:.2},\"Actual Loops\":1",
-            actual.rows as f64
-        );
-        if options.buffers {
-            let _ = write!(
-                out,
-                ",\"Shared Hit Blocks\":{},\"Shared Read Blocks\":{}",
-                actual.io.ram_hits.saturating_add(actual.io.disk_hits),
-                actual.io.object_gets
-            );
-        }
-        if options.wal {
-            let _ = write!(
-                out,
-                ",\"WAL Records\":{},\"WAL FPI\":0,\"WAL Bytes\":{},\"WAL Buffers Full\":0",
-                actual.wal_records, actual.wal_bytes
-            );
-        }
+        render_json_runtime(out, options, actual);
     }
     let mut next = at + 1;
     let mut first = true;
@@ -1628,6 +1656,272 @@ fn render_xml_settings(out: &mut StackStr<16_384>, settings: &PlannerSettings) {
         let _ = write!(out, ">");
     }
     let _ = write!(out, "</Settings>");
+}
+
+fn xml_field(out: &mut StackStr<16_384>, name: &str, value: &str) {
+    let _ = write!(out, "<{name}>");
+    xml_text(out, value);
+    let _ = write!(out, "</{name}>");
+}
+
+fn render_xml_runtime(out: &mut StackStr<16_384>, options: ExplainOptions, actual: ExplainActual) {
+    if options.timing {
+        xml_field(out, "Actual-Startup-Time", "0.000");
+        let elapsed = stack_format!(32, "{:.3}", actual.elapsed_micros as f64 / 1_000.0);
+        xml_field(out, "Actual-Total-Time", elapsed.as_str());
+    }
+    xml_field(
+        out,
+        "Actual-Rows",
+        stack_format!(32, "{:.2}", actual.rows as f64).as_str(),
+    );
+    xml_field(out, "Actual-Loops", "1");
+    if options.buffers {
+        let hit = actual.io.ram_hits.saturating_add(actual.io.disk_hits);
+        for (name, value) in [
+            ("Shared-Hit-Blocks", hit),
+            ("Shared-Read-Blocks", actual.io.object_gets),
+            ("Shared-Dirtied-Blocks", 0),
+            ("Shared-Written-Blocks", 0),
+            ("Local-Hit-Blocks", 0),
+            ("Local-Read-Blocks", 0),
+            ("Local-Dirtied-Blocks", 0),
+            ("Local-Written-Blocks", 0),
+            ("Temp-Read-Blocks", 0),
+            ("Temp-Written-Blocks", 0),
+        ] {
+            xml_field(out, name, stack_format!(32, "{value}").as_str());
+        }
+    }
+    if options.wal {
+        xml_field(
+            out,
+            "WAL-Records",
+            stack_format!(32, "{}", actual.wal_records).as_str(),
+        );
+        xml_field(out, "WAL-FPI", "0");
+        xml_field(
+            out,
+            "WAL-Bytes",
+            stack_format!(32, "{}", actual.wal_bytes).as_str(),
+        );
+        xml_field(out, "WAL-Buffers-Full", "0");
+    }
+}
+
+/// The internal plan is preorder plus depth.  Reconstructing the tree at the
+/// rendering boundary keeps XML's nested `<Plans>` contract from depending on
+/// executor layout or a second heap-owned representation.
+fn render_xml_node(
+    plan: &Plan,
+    at: usize,
+    options: ExplainOptions,
+    actual: Option<ExplainActual>,
+    out: &mut StackStr<16_384>,
+) -> usize {
+    let node = &plan.nodes[at];
+    let (node_type, index_name) = structured_node_name(node);
+    let _ = write!(out, "<Plan>");
+    xml_field(out, "Node-Type", node_type);
+    xml_field(out, "Parallel-Aware", "false");
+    xml_field(out, "Async-Capable", "false");
+    if let Some(index_name) = index_name {
+        xml_field(out, "Index-Name", index_name);
+    }
+    if !node.relation.as_str().is_empty() {
+        xml_field(out, "Relation-Name", node.relation.as_str());
+    }
+    if options.costs {
+        xml_field(
+            out,
+            "Startup-Cost",
+            stack_format!(32, "{:.2}", node.startup_cost).as_str(),
+        );
+        xml_field(
+            out,
+            "Total-Cost",
+            stack_format!(32, "{:.2}", node.total_cost).as_str(),
+        );
+        xml_field(
+            out,
+            "Plan-Rows",
+            stack_format!(32, "{}", node.rows).as_str(),
+        );
+        xml_field(
+            out,
+            "Plan-Width",
+            stack_format!(32, "{}", node.width).as_str(),
+        );
+    }
+    if options.verbose && !node.output.as_str().is_empty() {
+        let _ = write!(out, "<Output>");
+        for column in node.output.as_str().split(", ") {
+            xml_field(out, "Item", column);
+        }
+        let _ = write!(out, "</Output>");
+    }
+    xml_field(out, "Disabled", "false");
+    if at == 0
+        && let Some(actual) = actual
+    {
+        render_xml_runtime(out, options, actual);
+    }
+    let mut next = at + 1;
+    if next < plan.count && plan.nodes[next].depth > node.depth {
+        let _ = write!(out, "<Plans>");
+        while next < plan.count && plan.nodes[next].depth > node.depth {
+            if plan.nodes[next].depth != node.depth + 1 {
+                break;
+            }
+            next = render_xml_node(plan, next, options, None, out);
+        }
+        let _ = write!(out, "</Plans>");
+    }
+    let _ = write!(out, "</Plan>");
+    next
+}
+
+fn yaml_indent(out: &mut StackStr<16_384>, depth: usize) {
+    for _ in 0..depth {
+        let _ = write!(out, " ");
+    }
+}
+
+fn yaml_field(out: &mut StackStr<16_384>, indent: usize, name: &str, value: &str) {
+    yaml_indent(out, indent);
+    let _ = write!(out, "{name}: ");
+    json_string(out, value);
+    let _ = writeln!(out);
+}
+
+fn yaml_number(
+    out: &mut StackStr<16_384>,
+    indent: usize,
+    name: &str,
+    value: impl core::fmt::Display,
+) {
+    yaml_indent(out, indent);
+    let _ = writeln!(out, "{name}: {value}");
+}
+
+fn render_yaml_runtime(
+    out: &mut StackStr<16_384>,
+    indent: usize,
+    options: ExplainOptions,
+    actual: ExplainActual,
+) {
+    if options.timing {
+        yaml_number(out, indent, "Actual Startup Time", "0.000");
+        yaml_number(
+            out,
+            indent,
+            "Actual Total Time",
+            stack_format!(32, "{:.3}", actual.elapsed_micros as f64 / 1_000.0),
+        );
+    }
+    yaml_number(
+        out,
+        indent,
+        "Actual Rows",
+        stack_format!(32, "{:.2}", actual.rows as f64),
+    );
+    yaml_number(out, indent, "Actual Loops", 1);
+    if options.buffers {
+        let hit = actual.io.ram_hits.saturating_add(actual.io.disk_hits);
+        for (name, value) in [
+            ("Shared Hit Blocks", hit),
+            ("Shared Read Blocks", actual.io.object_gets),
+            ("Shared Dirtied Blocks", 0),
+            ("Shared Written Blocks", 0),
+            ("Local Hit Blocks", 0),
+            ("Local Read Blocks", 0),
+            ("Local Dirtied Blocks", 0),
+            ("Local Written Blocks", 0),
+            ("Temp Read Blocks", 0),
+            ("Temp Written Blocks", 0),
+        ] {
+            yaml_number(out, indent, name, value);
+        }
+    }
+    if options.wal {
+        yaml_number(out, indent, "WAL Records", actual.wal_records);
+        yaml_number(out, indent, "WAL FPI", 0);
+        yaml_number(out, indent, "WAL Bytes", actual.wal_bytes);
+        yaml_number(out, indent, "WAL Buffers Full", 0);
+    }
+}
+
+fn render_yaml_node(
+    plan: &Plan,
+    at: usize,
+    options: ExplainOptions,
+    actual: Option<ExplainActual>,
+    out: &mut StackStr<16_384>,
+    indent: usize,
+    list_entry: bool,
+) -> usize {
+    let node = &plan.nodes[at];
+    let (node_type, index_name) = structured_node_name(node);
+    let field_indent = if list_entry { indent + 2 } else { indent };
+    yaml_indent(out, indent);
+    if list_entry {
+        let _ = write!(out, "- ");
+    }
+    let _ = write!(out, "Node Type: ");
+    json_string(out, node_type);
+    let _ = writeln!(out);
+    yaml_number(out, field_indent, "Parallel Aware", "false");
+    yaml_number(out, field_indent, "Async Capable", "false");
+    if let Some(index_name) = index_name {
+        yaml_field(out, field_indent, "Index Name", index_name);
+    }
+    if !node.relation.as_str().is_empty() {
+        yaml_field(out, field_indent, "Relation Name", node.relation.as_str());
+    }
+    if options.costs {
+        yaml_number(
+            out,
+            field_indent,
+            "Startup Cost",
+            stack_format!(32, "{:.2}", node.startup_cost),
+        );
+        yaml_number(
+            out,
+            field_indent,
+            "Total Cost",
+            stack_format!(32, "{:.2}", node.total_cost),
+        );
+        yaml_number(out, field_indent, "Plan Rows", node.rows);
+        yaml_number(out, field_indent, "Plan Width", node.width);
+    }
+    if options.verbose && !node.output.as_str().is_empty() {
+        yaml_indent(out, field_indent);
+        let _ = writeln!(out, "Output:");
+        for column in node.output.as_str().split(", ") {
+            yaml_indent(out, field_indent + 2);
+            let _ = write!(out, "- ");
+            json_string(out, column);
+            let _ = writeln!(out);
+        }
+    }
+    yaml_number(out, field_indent, "Disabled", "false");
+    if at == 0
+        && let Some(actual) = actual
+    {
+        render_yaml_runtime(out, field_indent, options, actual);
+    }
+    let mut next = at + 1;
+    if next < plan.count && plan.nodes[next].depth > node.depth {
+        yaml_indent(out, field_indent);
+        let _ = writeln!(out, "Plans:");
+        while next < plan.count && plan.nodes[next].depth > node.depth {
+            if plan.nodes[next].depth != node.depth + 1 {
+                break;
+            }
+            next = render_yaml_node(plan, next, options, None, out, field_indent + 2, true);
+        }
+    }
+    next
 }
 
 fn render_document(
@@ -1700,38 +1994,13 @@ fn render_document(
         ExplainFormat::Xml => {
             let _ = write!(
                 out,
-                "<explain xmlns=\"http://www.postgresql.org/2009/explain\"><Query><Plan>"
+                "<explain xmlns=\"http://www.postgresql.org/2009/explain\"><Query>"
             );
-            for node in &plan.nodes[..plan.count] {
-                let _ = write!(out, "<Node><Node-Type>");
-                xml_text(&mut out, node.name.as_str());
-                let _ = write!(
-                    out,
-                    "</Node-Type><Parallel-Aware>false</Parallel-Aware><Async-Capable>false</Async-Capable>"
-                );
-                if !node.relation.as_str().is_empty() {
-                    let _ = write!(out, "<Relation-Name>");
-                    xml_text(&mut out, node.relation.as_str());
-                    let _ = write!(out, "</Relation-Name>");
-                }
-                if options.costs {
-                    let _ = write!(
-                        out,
-                        "<Startup-Cost>{:.2}</Startup-Cost><Total-Cost>{:.2}</Total-Cost><Plan-Rows>{}</Plan-Rows><Plan-Width>{}</Plan-Width>",
-                        node.startup_cost, node.total_cost, node.rows, node.width
-                    );
-                }
-                let _ = write!(out, "<Disabled>false</Disabled>");
-                if options.verbose && !node.output.as_str().is_empty() {
-                    let _ = write!(out, "<Output>");
-                    for column in node.output.as_str().split(", ") {
-                        let _ = write!(out, "<Item>");
-                        xml_text(&mut out, column);
-                        let _ = write!(out, "</Item>");
-                    }
-                    let _ = write!(out, "</Output>");
-                }
-                let _ = write!(out, "</Node>");
+            // XML carries the same tree as JSON and YAML rather than a flat
+            // sequence of synthetic `<Node>` wrappers.
+            render_xml_node(plan, 0, options, actual, &mut out);
+            if options.settings {
+                render_xml_settings(&mut out, settings);
             }
             if options.memory {
                 let used = core::mem::size_of::<Plan>()
@@ -1741,20 +2010,11 @@ fn render_document(
                     )
                     .div_ceil(1024);
                 let allocated = core::mem::size_of::<Plan>().div_ceil(1024);
-                let _ = write!(out, "</Plan>");
-                if options.settings {
-                    render_xml_settings(&mut out, settings);
-                }
                 let _ = write!(
                     out,
                     "<Planning><Memory-Used>{}</Memory-Used><Memory-Allocated>{}</Memory-Allocated></Planning>",
                     used, allocated
                 );
-            } else if options.summary {
-                let _ = write!(out, "</Plan>");
-                if options.settings {
-                    render_xml_settings(&mut out, settings);
-                }
             }
             if options.summary {
                 let _ = write!(
@@ -1782,58 +2042,12 @@ fn render_document(
                         actual.elapsed_micros as f64 / 1_000.0
                     );
                 }
-            } else if !options.memory {
-                let _ = write!(out, "</Plan>");
-                if options.settings {
-                    render_xml_settings(&mut out, settings);
-                }
             }
             let _ = write!(out, "</Query></explain>");
         }
         ExplainFormat::Yaml => {
             let _ = writeln!(out, "- Plan:");
-            for node in &plan.nodes[..plan.count] {
-                for _ in 0..=node.depth {
-                    let _ = write!(out, "  ");
-                }
-                let _ = write!(out, "- Node Type: ");
-                json_string(&mut out, node.name.as_str());
-                let _ = writeln!(out);
-                for _ in 0..=node.depth {
-                    let _ = write!(out, "  ");
-                }
-                let _ = writeln!(out, "  Parallel Aware: false");
-                for _ in 0..=node.depth {
-                    let _ = write!(out, "  ");
-                }
-                let _ = writeln!(out, "  Async Capable: false");
-                if !node.relation.as_str().is_empty() {
-                    for _ in 0..=node.depth {
-                        let _ = write!(out, "  ");
-                    }
-                    let _ = write!(out, "  Relation Name: ");
-                    json_string(&mut out, node.relation.as_str());
-                    let _ = writeln!(out);
-                }
-                if options.verbose && !node.output.as_str().is_empty() {
-                    for _ in 0..=node.depth {
-                        let _ = write!(out, "  ");
-                    }
-                    let _ = writeln!(out, "  Output:");
-                    for column in node.output.as_str().split(", ") {
-                        for _ in 0..=node.depth {
-                            let _ = write!(out, "  ");
-                        }
-                        let _ = write!(out, "    - ");
-                        json_string(&mut out, column);
-                        let _ = writeln!(out);
-                    }
-                }
-                for _ in 0..=node.depth {
-                    let _ = write!(out, "  ");
-                }
-                let _ = writeln!(out, "  Disabled: false");
-            }
+            render_yaml_node(plan, 0, options, actual, &mut out, 4, false);
             if options.settings {
                 let _ = writeln!(out, "  Settings:");
                 for setting in settings.entries() {
@@ -1931,8 +2145,9 @@ pub(super) fn emit_plan(
 
 #[cfg(test)]
 mod tests {
-    use super::object_request_cost;
+    use super::{PlanNode, object_request_cost, structured_node_name};
     use crate::store::BlockIoStats;
+    use crate::util::StackStr;
 
     #[test]
     fn object_cost_bootstraps_then_uses_completed_read_latency() {
@@ -1956,6 +2171,18 @@ mod tests {
                 ..BlockIoStats::default()
             }),
             0.01
+        );
+    }
+
+    #[test]
+    fn structured_index_scan_separates_operation_and_index_name() {
+        let node = PlanNode {
+            name: StackStr::from_str("Index Scan using accounts_pkey"),
+            ..PlanNode::EMPTY
+        };
+        assert_eq!(
+            structured_node_name(&node),
+            ("Index Scan", Some("accounts_pkey"))
         );
     }
 }

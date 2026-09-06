@@ -395,8 +395,26 @@ BEGIN
   EXECUTE 'PREPARE plpgsql_dynamic_generic_plan(integer) AS SELECT $1::integer';
   EXECUTE 'EXPLAIN (GENERIC_PLAN, FORMAT JSON) EXECUTE plpgsql_dynamic_generic_plan(41)'
     INTO STRICT plan;
+  IF position('"Node Type"' IN plan) = 0 THEN
+    RAISE EXCEPTION 'EXPLAIN generic JSON result mismatch';
+  END IF;
+  EXECUTE 'EXPLAIN (FORMAT XML, SUMMARY OFF) SELECT value
+    FROM plpgsql_dynamic_session_rows ORDER BY value' INTO STRICT plan;
+  IF position('<Node-Type>Sort</Node-Type>' IN plan) = 0
+     OR position('<Plans>' IN plan) = 0
+     OR position('<Node-Type>Seq Scan</Node-Type>' IN plan) = 0
+     OR position('<Node><Node-Type>' IN plan) <> 0 THEN
+    RAISE EXCEPTION 'EXPLAIN XML tree result mismatch';
+  END IF;
+  EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT YAML)
+    SELECT value FROM plpgsql_dynamic_session_rows' INTO STRICT plan;
+  IF position('Actual Rows:' IN plan) = 0
+     OR position('Shared Dirtied Blocks: 0' IN plan) = 0
+     OR position('WAL Records: 0' IN plan) = 0 THEN
+    RAISE EXCEPTION 'EXPLAIN YAML runtime result mismatch';
+  END IF;
   EXECUTE 'DEALLOCATE plpgsql_dynamic_generic_plan';
-  RETURN plan IS NOT NULL;
+  RETURN true;
 END
 $$;
 CREATE FUNCTION plpgsql_dynamic_analyze_compound() RETURNS void

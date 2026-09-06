@@ -151,7 +151,16 @@ cur.execute("EXPLAIN (SETTINGS, FORMAT JSON) SELECT 1")
 assert '"Settings":{"search_path":"public"}' in cur.fetchone()[0]
 cur.execute("EXPLAIN (GENERIC_PLAN, FORMAT JSON) SELECT %s::integer", (41,))
 assert '"Node Type"' in cur.fetchone()[0]
-print("EXPLAIN settings and generic extended protocol ok")
+cur.execute("EXPLAIN (FORMAT XML, SUMMARY OFF) SELECT 1 UNION ALL SELECT 2")
+xml_plan = cur.fetchone()[0]
+assert "<Plans><Plan>" in xml_plan and "<Node><Node-Type>" not in xml_plan
+cur.execute(
+    "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT YAML) SELECT %s::integer",
+    (41,),
+)
+yaml_plan = cur.fetchone()[0]
+assert "Actual Rows:" in yaml_plan and "WAL Records: 0" in yaml_plan
+print("EXPLAIN settings, generic plans, and structured output extended protocol ok")
 
 # Array subscripts are client-visible values, not an internal zero-based
 # representation, across extended Bind and Result.

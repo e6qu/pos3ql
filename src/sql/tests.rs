@@ -32395,9 +32395,8 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "{rows:?}"
     );
     assert!(
-        rows.iter()
-            .any(|row| row.starts_with("  Buffers: shared hit=")),
-        "{rows:?}"
+        !rows.iter().any(|row| row.starts_with("  Buffers:")),
+        "a no-I/O execution must not invent a zero-valued text buffer line: {rows:?}"
     );
     assert!(
         rows.iter().any(|row| row.starts_with("Execution Time: ")),
@@ -32652,6 +32651,52 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
     ));
     assert!(yaml[0].starts_with("- Plan:\n"), "{yaml:?}");
     assert!(yaml[0].contains("Node Type: \"Result\""), "{yaml:?}");
+
+    // Structured renderers must preserve the plan tree rather than emitting
+    // a flat internal-node dump.  XML's root is a Plan element (not a
+    // synthetic Node), and YAML represents a mapping under Plan.
+    let xml_tree = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (FORMAT XML, SUMMARY OFF) SELECT payload FROM ep ORDER BY payload",
+    ));
+    assert!(xml_tree[0].contains("<Plan><Node-Type>Sort</Node-Type>"));
+    assert!(xml_tree[0].contains("<Plans><Plan><Node-Type>Seq Scan</Node-Type>"));
+    assert!(!xml_tree[0].contains("<Node><Node-Type>"));
+    let yaml_tree = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (FORMAT YAML, SUMMARY OFF) SELECT payload FROM ep ORDER BY payload",
+    ));
+    assert!(yaml_tree[0].contains("- Plan:\n    Node Type: \"Sort\""));
+    assert!(yaml_tree[0].contains("    Plans:\n      - Node Type: \"Seq Scan\""));
+
+    // PostgreSQL includes the complete zero-valued runtime metric shape in
+    // structured formats when BUFFERS or WAL is requested, unlike text.
+    let xml_runtime = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT XML) SELECT payload FROM ep WHERE id = 2",
+    ));
+    assert!(xml_runtime[0].contains("<Actual-Rows>1.00</Actual-Rows>"));
+    assert!(xml_runtime[0].contains("<Shared-Dirtied-Blocks>0</Shared-Dirtied-Blocks>"));
+    assert!(xml_runtime[0].contains("<WAL-Records>0</WAL-Records>"));
+    let json_runtime = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT JSON) SELECT payload FROM ep WHERE id = 2",
+    ));
+    assert!(json_runtime[0].contains("\"Actual Rows\":1.00"));
+    assert!(json_runtime[0].contains("\"Shared Dirtied Blocks\":0"));
+    assert!(json_runtime[0].contains("\"WAL Records\":0"));
+    let yaml_runtime = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT YAML) SELECT payload FROM ep WHERE id = 2",
+    ));
+    assert!(yaml_runtime[0].contains("Actual Rows: 1.00"));
+    assert!(yaml_runtime[0].contains("Shared Dirtied Blocks: 0"));
+    assert!(yaml_runtime[0].contains("WAL Records: 0"));
 }
 
 #[test]

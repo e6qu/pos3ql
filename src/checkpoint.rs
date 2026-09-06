@@ -7055,13 +7055,20 @@ impl Checkpointer {
                     "manifest exceeds its fixed buffer"
                 )
             })?;
-            for (index, (table, mask)) in publication.tables[..publication.table_count]
+            for (index, ((table, mask), descendants)) in publication.tables
+                [..publication.table_count]
                 .iter()
                 .zip(&publication.table_column_masks[..publication.table_count])
+                .zip(&publication.table_include_descendants[..publication.table_count])
                 .enumerate()
             {
                 let filter = publication.table_filters.get(index);
-                write!(&mut self.manifest_buf, " {table} {mask} ").map_err(|_| {
+                write!(
+                    &mut self.manifest_buf,
+                    " {table} {mask} {} ",
+                    u8::from(*descendants)
+                )
+                .map_err(|_| {
                     sql_err!(
                         sqlstate::PROGRAM_LIMIT_EXCEEDED,
                         "manifest exceeds its fixed buffer"
@@ -10135,11 +10142,17 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
     }
     let mut tables = [u16::MAX; crate::storage::MAX_PUBLICATION_TABLES];
     let mut table_column_masks = [0u64; crate::storage::MAX_PUBLICATION_TABLES];
+    let mut table_include_descendants = [false; crate::storage::MAX_PUBLICATION_TABLES];
     let mut table_filter_sql =
         [crate::util::StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES];
     for index in 0..count {
         tables[index] = parse_field(words.next(), "pub table")?;
         table_column_masks[index] = parse_field(words.next(), "pub table column mask")?;
+        table_include_descendants[index] = match parse_field(words.next(), "pub descendants")? {
+            0 => false,
+            1 => true,
+            _ => return Err(CheckpointSetupError::Corrupt("pub descendants")),
+        };
         let filter = words
             .next()
             .ok_or(CheckpointSetupError::Corrupt("pub row filter"))?;
@@ -10168,6 +10181,7 @@ fn load_publication(storage: &mut Storage, line: &str) -> Result<(), CheckpointS
                 all_tables: flags & 1 != 0,
                 tables: &tables[..count],
                 table_column_masks: &table_column_masks[..count],
+                table_include_descendants: &table_include_descendants[..count],
                 table_filter_sql: &table_filter_sql[..count],
                 schemas: &schemas[..schema_count],
                 publish_insert: flags & 2 != 0,
@@ -10817,15 +10831,16 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
             "trailing subscription fields",
         ));
     }
+    let name = sql_name(&name)?;
     if enabled {
         connection
-            .require_endpoint()
+            .require_endpoint_for(name)
             .map_err(|_| CheckpointSetupError::Corrupt("enabled subscription endpoint"))?;
     }
     let slot = storage
         .create_subscription(
             crate::storage::SubscriptionSpec {
-                name: sql_name(&name)?,
+                name,
                 connection,
                 publications: &publications[..count],
                 enabled,
@@ -10872,7 +10887,7 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
     }
     if cleanup {
         let dropped = storage
-            .drop_subscription(&name, 0)
+            .drop_subscription(name.as_str(), 0)
             .map_err(|error| {
                 CheckpointSetupError::ObjectStore(format!(
                     "manifest subscription cleanup rejected: {}",

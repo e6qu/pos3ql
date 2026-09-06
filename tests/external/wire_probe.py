@@ -2899,13 +2899,24 @@ def test_subscription_definition_lifecycle_over_raw_wire():
     drain_startup(s)
     created = simple_query(
         s,
-        "CREATE SUBSCRIPTION wire_subscription CONNECTION 'host=publisher port=5432' "
+        "CREATE SUBSCRIPTION wire_subscription CONNECTION "
+        "'postgresql://repl@127.0.0.1:5432/publisher?sslmode=disable&application_name=wire%20apply' "
         "PUBLICATION sales WITH (connect = false, slot_name = NONE)",
     )
     check(
         "raw wire: CREATE disabled subscription completes",
         any(kind == b"C" and payload == b"CREATE SUBSCRIPTION\x00" for kind, payload in created),
         created,
+    )
+    uri_catalog = simple_query(
+        s,
+        "SELECT subconninfo FROM pg_subscription WHERE subname = 'wire_subscription'",
+    )
+    check(
+        "raw wire: URI subscription conninfo retains escaped catalog spelling",
+        first_text_row(uri_catalog)
+        == "postgresql://repl@127.0.0.1:5432/publisher?sslmode=disable&application_name=wire%20apply",
+        uri_catalog,
     )
     altered = simple_query(
         s,

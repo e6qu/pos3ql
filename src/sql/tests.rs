@@ -44490,7 +44490,7 @@ fn enabled_subscription_has_one_complete_durable_worker_description() {
         runtime.publications[..runtime.publication_count],
         [SqlName::parse("changes").unwrap()]
     );
-    assert_eq!(runtime.endpoint.application_name(), Some("apply_changes"));
+    assert_eq!(runtime.endpoint.application_name(), "apply_changes");
     assert_eq!(runtime.confirmed_lsn, 0);
 }
 
@@ -44783,6 +44783,74 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
     assert_eq!(
         runtime.bootstrap,
         crate::storage::SubscriptionBootstrap::Refresh { copy_data: false }
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn subscription_uri_conninfo_is_durable_and_resolves_the_protocol_default_once() {
+    let mut config = test_config("subscription-uri-conninfo");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("subscription-uri-conninfo-{}", std::process::id());
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION uri_changes CONNECTION \
+         'postgresql://repl:secret%20word@127.0.0.1:5432/publisher?sslmode=disable&application_name=uri%20worker' \
+         PUBLICATION changes WITH (connect = false, slot_name = NONE); \
+         CREATE SUBSCRIPTION default_named_changes CONNECTION \
+         'postgres://repl@127.0.0.1:5432/publisher?sslmode=disable' \
+         PUBLICATION changes WITH (connect = false, slot_name = NONE)",
+    );
+    assert_eq!(
+        engine
+            .subscription_endpoint("uri_changes")
+            .unwrap()
+            .application_name(),
+        Some("uri worker")
+    );
+    assert_eq!(
+        engine
+            .subscription_endpoint("default_named_changes")
+            .unwrap()
+            .application_name(),
+        Some("default_named_changes")
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT subname, subconninfo FROM pg_subscription ORDER BY subname",
+        )),
+        [
+            "default_named_changes|postgres://repl@127.0.0.1:5432/publisher?sslmode=disable",
+            "uri_changes|postgresql://repl:secret%20word@127.0.0.1:5432/publisher?sslmode=disable&application_name=uri%20worker",
+        ]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new((1 << 29) + (96 << 20));
+    let replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        replayed
+            .subscription_endpoint("default_named_changes")
+            .unwrap()
+            .application_name(),
+        Some("default_named_changes"),
+        "cold recovery rebuilds the complete subscription transport identity"
+    );
+    assert_eq!(
+        replayed
+            .subscription_endpoint("uri_changes")
+            .unwrap()
+            .password(),
+        Some("secret word")
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
@@ -45351,9 +45419,11 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
          PUBLICATION changes WITH (connect = false, slot_name = NONE)",
     );
     let origin_floor = engine.storage.lsn();
+    let stream = engine.subscription_stream("apply_changes").unwrap();
+    let expected_origin = crate::stack_format!(48, "pos3ql_subscription_{:x}", stream.created_at());
     let mut apply = SubscriptionApply::new(
         &mut budget,
-        engine.subscription_stream("apply_changes").unwrap(),
+        stream,
         8,
         config.txn_rows,
         1 << 16,
@@ -45375,6 +45445,13 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
     begin[8] = 40;
     begin[20] = 1;
     receive(&mut apply, &mut engine, 40, &begin);
+    let origin = [
+        b'O', 0, 0, 0, 0, 0, 0, 0, 40, b'u', b'p', b's', b't', b'r', b'e', b'a', b'm', 0,
+    ];
+    assert_eq!(
+        receive(&mut apply, &mut engine, 40, &origin),
+        ApplyResult::None
+    );
     let insert = [
         b'I', 0, 0, 0, 1, b'N', 0, 2, b't', 0, 0, 0, 1, b'1', b't', 0, 0, 0, 5, b'f', b'i', b'r',
         b's', b't',
@@ -45419,6 +45496,25 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         .unwrap()
         .expect("applied transaction remains in the publisher journal");
     assert!(any_emitted);
+    let mut at = 0usize;
+    let mut saw_origin = false;
+    while at < origin_send.len() {
+        let bytes = origin_send.readable();
+        assert_eq!(bytes[at], crate::pg::wire::FMSG_COPY_DATA);
+        let length = u32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+        let payload = &bytes[at + 5..at + 1 + length];
+        if let crate::pg::pginput::CopyData::XLogData {
+            message: crate::pg::pginput::Message::Origin { commit_lsn, name },
+            ..
+        } = crate::pg::pginput::copy_data(payload).unwrap()
+        {
+            assert_eq!(commit_lsn, 41);
+            assert_eq!(name, expected_origin.as_str());
+            saw_origin = true;
+        }
+        at += 1 + length;
+    }
+    assert!(saw_origin);
     origin_scratch.clear();
     origin_send.clear();
     let (_, none_emitted) = engine
@@ -45643,6 +45739,38 @@ fn pgoutput_apply_is_typed_transactional_and_acknowledges_only_after_commit() {
         ["2|durable|local"]
     );
     drop(apply);
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER SUBSCRIPTION apply_changes SET (origin = none)",
+    );
+    let no_origin_stream = engine.subscription_stream("apply_changes").unwrap();
+    let no_origin_behavior = engine
+        .storage
+        .subscription("apply_changes", 0)
+        .unwrap()
+        .1
+        .behavior;
+    let mut no_origin_apply = SubscriptionApply::new(
+        &mut budget,
+        no_origin_stream,
+        8,
+        config.txn_rows,
+        1 << 16,
+        121,
+        no_origin_behavior,
+    )
+    .unwrap();
+    begin[8] = 130;
+    begin[20] = 8;
+    receive(&mut no_origin_apply, &mut engine, 130, &begin);
+    let bytes = frame(130, &origin);
+    let error = no_origin_apply
+        .receive(&mut engine, copy_data(&bytes[..25 + origin.len()]).unwrap())
+        .unwrap_err();
+    assert_eq!(error.sqlstate, sqlstate::PROTOCOL_VIOLATION);
+    assert_eq!(no_origin_apply.confirmed_lsn(), 121);
+    drop(no_origin_apply);
     drop(engine);
     let mut replay_budget = Budget::new(1 << 27);
     let mut replayed = Engine::new(&config, &mut replay_budget).unwrap();
@@ -46081,6 +46209,104 @@ fn publication_alterations_are_transactional_catalog_accurate_and_replayable() {
 }
 
 #[test]
+fn publication_descendant_selection_is_typed_durable_and_protocol_visible() {
+    let mut config = test_config("publication-descendants");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("publication-descendants-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new(1 << 30);
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_parent (id integer PRIMARY KEY, value text); \
+         CREATE TABLE publication_child (extra integer) INHERITS (publication_parent); \
+         CREATE PUBLICATION publication_descendants \
+           FOR TABLE publication_parent (id) WHERE (id > 0)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT tablename, attnames::text, rowfilter FROM pg_publication_tables \
+             WHERE pubname = 'publication_descendants' ORDER BY tablename",
+        )),
+        [
+            "publication_child|{id}|(id > 0)",
+            "publication_parent|{id}|(id > 0)",
+        ],
+        "the default table target includes ordinary descendants and retains its projection/filter"
+    );
+    let floor = engine.storage.lsn();
+    let mut transaction = TxnState::new(&mut budget, 256).unwrap();
+    run_txn(
+        &mut engine,
+        &mut budget,
+        &mut transaction,
+        "INSERT INTO publication_child (id, value, extra) VALUES (1, 'included', 9)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut budget, "publication descendant scratch", 1 << 16).unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut budget, "publication descendant send", 1 << 16).unwrap();
+    let (_, emitted) = engine
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("publication_descendants").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("child transaction remains available to a publication cursor");
+    assert!(emitted);
+    assert!(send.readable().contains(&b'I'));
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_descendants \
+           SET TABLE ONLY publication_parent (id) WHERE (id > 0)",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT tablename FROM pg_publication_tables \
+             WHERE pubname = 'publication_descendants' ORDER BY tablename",
+        )),
+        ["publication_parent"],
+        "ONLY excludes ordinary inheritance descendants"
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_descendants \
+           SET TABLE publication_parent * (id) WHERE (id > 0)",
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut recovery_budget = Budget::new(1 << 30);
+    let mut recovered = Engine::new(&config, &mut recovery_budget).unwrap();
+    assert_eq!(
+        data_rows(&run_with(
+            &mut recovered,
+            &mut recovery_budget,
+            "SELECT tablename, attnames::text, rowfilter FROM pg_publication_tables \
+             WHERE pubname = 'publication_descendants' ORDER BY tablename",
+        )),
+        [
+            "publication_child|{id}|(id > 0)",
+            "publication_parent|{id}|(id > 0)",
+        ],
+        "the explicit descendant contract survives the object-store manifest"
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
 fn publication_schema_selection_is_transactional_catalog_accurate_and_replayable() {
     let mut config = test_config("publication-schema-replay");
     config.object_store_on = true;
@@ -46154,6 +46380,7 @@ fn publication_membership_and_lifetime_require_the_right_owner() {
         "CREATE ROLE publication_owner; \
          CREATE ROLE publication_other; \
          GRANT CREATE ON SCHEMA public TO publication_owner; \
+         GRANT CREATE ON DATABASE postgres TO publication_owner; \
          CREATE TABLE other_publication_table (id integer)",
     );
     let mut owner_guc = GucState::new();
@@ -46196,6 +46423,110 @@ fn publication_membership_and_lifetime_require_the_right_owner() {
 }
 
 #[test]
+fn publication_scope_and_column_selection_require_postgresql_privileges() {
+    let (mut engine, mut budget) = test_engine();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE ROLE publication_limited; \
+         CREATE ROLE publication_owner_target; \
+         GRANT CREATE ON SCHEMA public TO publication_limited; \
+         GRANT publication_owner_target TO publication_limited WITH ADMIN OPTION; \
+         CREATE SCHEMA publication_scope",
+    );
+    let mut limited = GucState::new();
+    limited.set_session_user("publication_limited");
+    run_with_guc(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE publication_scope_target (id integer PRIMARY KEY)",
+        1 << 18,
+        &mut limited,
+    );
+    let no_database_create = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION publication_scope_changes FOR TABLE publication_scope_target",
+        1 << 18,
+        &mut limited,
+    );
+    assert!(
+        String::from_utf8_lossy(&no_database_create).contains("permission denied for database"),
+        "{}",
+        String::from_utf8_lossy(&no_database_create)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT CREATE ON DATABASE postgres TO publication_limited",
+    );
+    let explicit = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION publication_scope_changes FOR TABLE publication_scope_target",
+        1 << 18,
+        &mut limited,
+    );
+    let explicit = String::from_utf8_lossy(&explicit);
+    assert!(explicit.contains("CREATE PUBLICATION"), "{explicit}");
+    let owner_without_database_create = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_scope_changes OWNER TO publication_owner_target",
+        1 << 18,
+        &mut limited,
+    );
+    assert!(
+        String::from_utf8_lossy(&owner_without_database_create)
+            .contains("permission denied for database"),
+        "{}",
+        String::from_utf8_lossy(&owner_without_database_create)
+    );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "GRANT CREATE ON DATABASE postgres TO publication_owner_target",
+    );
+    let owner_with_database_create = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "ALTER PUBLICATION publication_scope_changes OWNER TO publication_owner_target",
+        1 << 18,
+        &mut limited,
+    );
+    assert!(
+        String::from_utf8_lossy(&owner_with_database_create).contains("ALTER PUBLICATION"),
+        "{}",
+        String::from_utf8_lossy(&owner_with_database_create)
+    );
+    let all_tables = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION publication_scope_all FOR ALL TABLES",
+        1 << 18,
+        &mut limited,
+    );
+    assert!(
+        String::from_utf8_lossy(&all_tables)
+            .contains("must be superuser to create a FOR ALL TABLES publication"),
+        "{}",
+        String::from_utf8_lossy(&all_tables)
+    );
+    let mixed = run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE PUBLICATION publication_scope_mixed \
+         FOR TABLE publication_scope_target (id), TABLES IN SCHEMA publication_scope",
+    );
+    assert!(
+        String::from_utf8_lossy(&mixed)
+            .contains("cannot specify a column list when publishing tables in a schema"),
+        "{}",
+        String::from_utf8_lossy(&mixed)
+    );
+}
+
+#[test]
 fn publication_owner_changes_are_transactional_and_durable() {
     let mut config = test_config("publication-owner-replay");
     config.object_store_on = true;
@@ -46209,7 +46540,8 @@ fn publication_owner_changes_are_transactional_and_durable() {
         &mut budget,
         "CREATE ROLE publication_first_owner; \
          CREATE ROLE publication_second_owner; \
-         GRANT CREATE ON SCHEMA public TO publication_first_owner",
+         GRANT CREATE ON SCHEMA public TO publication_first_owner; \
+         GRANT CREATE ON DATABASE postgres TO publication_first_owner",
     );
     let mut first_owner = GucState::new();
     first_owner.set_session_user("publication_first_owner");

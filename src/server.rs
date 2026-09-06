@@ -357,7 +357,7 @@ impl SubscriptionBootstrapWork {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct SubscriptionBinding {
     stream: crate::storage::SubscriptionStream,
-    endpoint: crate::pg::replication_client::ConnectionInfo,
+    endpoint: crate::pg::replication_client::SubscriptionEndpoint,
     publications: [crate::storage::SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
     publication_count: usize,
     slot: Option<crate::storage::SqlName>,
@@ -1101,7 +1101,10 @@ impl Server {
                     self.unbind_subscription(slot);
                 }
                 let worker = &mut self.subscriptions[slot];
-                match worker.client.bind_drop_slot(cleanup.endpoint, cleanup.slot) {
+                match worker
+                    .client
+                    .bind_drop_slot(cleanup.endpoint.connection(), cleanup.slot)
+                {
                     Ok(()) => {
                         worker.name = Some(cleanup.name);
                         worker.cleanup = Some((cleanup.created_at, cleanup.name));
@@ -1158,7 +1161,7 @@ impl Server {
                             worker.bootstrap.copy_setup = None;
                             worker.bootstrap.line.clear();
                             let result = worker.client.bind_create_slot(
-                                runtime.endpoint,
+                                runtime.endpoint.connection(),
                                 bootstrap_slot,
                                 runtime.behavior,
                             );
@@ -1183,7 +1186,7 @@ impl Server {
                             worker.bootstrap.copy_setup = None;
                             worker.bootstrap.line.clear();
                             let result = worker.client.bind_create_slot(
-                                runtime.endpoint,
+                                runtime.endpoint.connection(),
                                 bootstrap_slot,
                                 crate::storage::SubscriptionBehavior::POSTGRESQL_18_DEFAULT,
                             );
@@ -1198,7 +1201,7 @@ impl Server {
                             })?;
                             worker.client.bind(
                                 crate::pg::replication_client::ReplicationClientSetup {
-                                    endpoint: runtime.endpoint,
+                                    endpoint: runtime.endpoint.connection(),
                                     slot: publisher_slot,
                                     publications: &runtime.publications
                                         [..runtime.publication_count],
@@ -1329,7 +1332,10 @@ impl Server {
             worker.client.unbind();
             worker
                 .client
-                .bind_drop_slot(binding.endpoint, binding.bootstrap_slot.ok_or(())?)
+                .bind_drop_slot(
+                    binding.endpoint.connection(),
+                    binding.bootstrap_slot.ok_or(())?,
+                )
                 .map_err(|_| ())?;
             let fd = worker.client.raw_fd();
             self.reactor
@@ -1462,7 +1468,7 @@ impl Server {
                     .definition
                     .expect("bound subscription has a definition")
                     .endpoint;
-                match worker.sql.bind_sql(endpoint) {
+                match worker.sql.bind_sql(endpoint.connection()) {
                     Ok(()) => {
                         let fd = worker.sql.raw_fd();
                         if self
@@ -2318,7 +2324,10 @@ mod tests {
                 crate::storage::SqlName::parse("apply").unwrap(),
                 7,
             ),
-            endpoint,
+            endpoint: crate::pg::replication_client::SubscriptionEndpoint::resolve(
+                endpoint,
+                crate::storage::SqlName::parse("apply").unwrap(),
+            ),
             publications,
             publication_count: 1,
             slot: Some(crate::storage::SqlName::parse("publisher_slot").unwrap()),

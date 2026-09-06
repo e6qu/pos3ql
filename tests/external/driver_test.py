@@ -640,6 +640,22 @@ except psycopg.DatabaseError as error:
     assert error.sqlstate == "2202H", error.sqlstate
 print("TABLESAMPLE extended protocol ok")
 
+# Subscription URI conninfo is catalog text at the SQL boundary, but its
+# escaped values must become one typed bounded transport identity on restart.
+cur.execute(
+    "CREATE SUBSCRIPTION drv_uri_subscription CONNECTION "
+    "'postgresql://repl:secret%20word@127.0.0.1:5432/publisher?sslmode=disable&application_name=driver%20apply' "
+    "PUBLICATION changes WITH (connect = false, slot_name = NONE)"
+)
+cur.execute(
+    "SELECT subconninfo FROM pg_subscription WHERE subname = 'drv_uri_subscription'"
+)
+assert cur.fetchone() == (
+    "postgresql://repl:secret%20word@127.0.0.1:5432/publisher?sslmode=disable&application_name=driver%20apply",
+)
+cur.execute("DROP SUBSCRIPTION drv_uri_subscription")
+print("subscription URI conninfo extended protocol ok")
+
 conn.close()
 
 print("ALL DRIVER TESTS PASSED")

@@ -27,17 +27,17 @@ use crate::sql::ast::{
     IndexStorageOptionNames, IndexStorageOptions, IndexTargetScope, OperatorClassMember,
     OperatorFamilyMember, OperatorFamilyMemberIdentity, OperatorIdentity, OperatorOperands,
     PartitionBound, PartitionClause, PartitionStrategy, PolicyCommand, PolicyExpression,
-    PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationOperations, PublicationTarget,
-    RelationPersistence, RelationStorageOptionNames, RelationStorageOptions, RoleOptions,
-    RoutineArgument, RoutineArgumentMode, RoutineCreateKind, RoutineIdentity, RoutineParallel,
-    RoutineResultColumn, RoutineTargetKind, RuleAction, RuleEvent, RuleMode, SchemaAuthorization,
-    SchemaName, StatisticsExpression, StatisticsKey, StatisticsKeys, StatisticsKinds,
-    StatisticsName, StatisticsTarget, SubscriptionBehavior, SubscriptionConnect,
-    SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName, SubscriptionSlotPlan,
-    SubscriptionStreaming, SubscriptionSynchronousCommit, TableAccessMethod, TableMembership,
-    TablespaceOptionNames, TablespaceOptions, TextSearchConfigurationSource, TextSearchObjectKind,
-    TextSearchOption, TransformFunction, TriggerEvent, TriggerIdentity, TriggerKind, TriggerTiming,
-    TriggerTransitionTables, ViewSecurity, ViewSecurityBarrier,
+    PolicyIdentity, PolicyPermissiveness, PolicyRole, PublicationDescendants,
+    PublicationOperations, PublicationTarget, RelationPersistence, RelationStorageOptionNames,
+    RelationStorageOptions, RoleOptions, RoutineArgument, RoutineArgumentMode, RoutineCreateKind,
+    RoutineIdentity, RoutineParallel, RoutineResultColumn, RoutineTargetKind, RuleAction,
+    RuleEvent, RuleMode, SchemaAuthorization, SchemaName, StatisticsExpression, StatisticsKey,
+    StatisticsKeys, StatisticsKinds, StatisticsName, StatisticsTarget, SubscriptionBehavior,
+    SubscriptionConnect, SubscriptionOptions, SubscriptionOrigin, SubscriptionSlotName,
+    SubscriptionSlotPlan, SubscriptionStreaming, SubscriptionSynchronousCommit, TableAccessMethod,
+    TableMembership, TablespaceOptionNames, TablespaceOptions, TextSearchConfigurationSource,
+    TextSearchObjectKind, TextSearchOption, TransformFunction, TriggerEvent, TriggerIdentity,
+    TriggerKind, TriggerTiming, TriggerTransitionTables, ViewSecurity, ViewSecurityBarrier,
 };
 use crate::sql::eval::sqlstate;
 
@@ -5685,7 +5685,7 @@ impl<'a> Parser<'a> {
                 self.expect_ident("tables")?;
                 (true, &[][..], &[][..])
             } else {
-                let (tables, schemas) = self.publication_targets()?;
+                let (tables, schemas) = self.publication_targets(true)?;
                 (false, tables, schemas)
             }
         } else {
@@ -6076,14 +6076,14 @@ impl<'a> Parser<'a> {
                     publish_generated_columns,
                 }
             } else {
-                let (tables, schemas) = self.publication_targets()?;
+                let (tables, schemas) = self.publication_targets(true)?;
                 AlterPublicationAction::SetTargets { tables, schemas }
             }
         } else if self.eat_ident("add")? {
-            let (tables, schemas) = self.publication_targets()?;
+            let (tables, schemas) = self.publication_targets(true)?;
             AlterPublicationAction::AddTargets { tables, schemas }
         } else if self.eat_ident("drop")? {
-            let (tables, schemas) = self.publication_targets()?;
+            let (tables, schemas) = self.publication_targets(false)?;
             AlterPublicationAction::DropTargets { tables, schemas }
         } else {
             return Err(self.err_here("expected SET, ADD, or DROP after ALTER PUBLICATION"));
@@ -6093,12 +6093,14 @@ impl<'a> Parser<'a> {
 
     fn publication_targets(
         &mut self,
+        allow_details: bool,
     ) -> Result<(&'a [PublicationTarget<'a>], &'a [&'a str]), ParseError> {
         let mut tables = [PublicationTarget {
             relation: QualName {
                 schema: None,
                 name: "",
             },
+            descendants: PublicationDescendants::Include,
             columns: &[],
             filter: None,
             filter_text: None,
@@ -6112,10 +6114,18 @@ impl<'a> Parser<'a> {
                     if table_count == MAX_LIST {
                         return Err(self.limit("publication tables", MAX_LIST));
                     }
+                    let descendants = if self.eat_ident("only")? {
+                        PublicationDescendants::Only
+                    } else {
+                        PublicationDescendants::Include
+                    };
                     let relation = self.qual_name("table name")?;
+                    if self.eat_op("*")? && descendants == PublicationDescendants::Only {
+                        return Err(self.err_here("ONLY and * cannot be specified together"));
+                    }
                     let mut columns = [""; MAX_LIST];
                     let mut column_count = 0usize;
-                    if self.eat_op("(")? {
+                    if allow_details && self.eat_op("(")? {
                         loop {
                             if column_count == columns.len() {
                                 return Err(self.limit("publication columns", columns.len()));
@@ -6128,7 +6138,7 @@ impl<'a> Parser<'a> {
                         }
                         self.expect_op(")")?;
                     }
-                    let (filter, filter_text) = if self.eat_ident("where")? {
+                    let (filter, filter_text) = if allow_details && self.eat_ident("where")? {
                         self.expect_op("(")?;
                         let start = self.peek_at;
                         let filter = self.expression(0)?;
@@ -6140,6 +6150,7 @@ impl<'a> Parser<'a> {
                     };
                     tables[table_count] = PublicationTarget {
                         relation,
+                        descendants,
                         columns: self.arena_slice(&columns[..column_count])?,
                         filter,
                         filter_text,

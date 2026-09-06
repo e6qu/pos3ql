@@ -8528,6 +8528,42 @@ mod tests {
     }
 
     #[test]
+    fn publication_descendant_selection_is_typed_at_the_parse_boundary() {
+        with_parser(
+            "CREATE PUBLICATION changes FOR TABLE parent, ONLY isolated, explicit *",
+            |parser| {
+                let Some(Stmt::CreatePublication { tables, .. }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("publication descendants did not parse")
+                };
+                assert!(matches!(
+                    tables[0].descendants,
+                    crate::sql::ast::PublicationDescendants::Include
+                ));
+                assert!(matches!(
+                    tables[1].descendants,
+                    crate::sql::ast::PublicationDescendants::Only
+                ));
+                assert!(matches!(
+                    tables[2].descendants,
+                    crate::sql::ast::PublicationDescendants::Include
+                ));
+            },
+        );
+        for source in [
+            "CREATE PUBLICATION changes FOR TABLE ONLY parent *",
+            "ALTER PUBLICATION changes DROP TABLE parent (id)",
+            "ALTER PUBLICATION changes DROP TABLE parent WHERE (id > 0)",
+        ] {
+            let mut budget = Budget::new(1 << 20);
+            let arena =
+                Arena::new(&mut budget, "invalid publication descendants", 1 << 18).unwrap();
+            let mut parser = Parser::new(source, &arena).unwrap();
+            assert!(parser.next_stmt().is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn alter_publication_set_table_does_not_consume_the_set_keyword_twice() {
         with_parser("ALTER PUBLICATION changes SET TABLE orders", |parser| {
             let Some(Stmt::AlterPublication { action, .. }) = parser.next_stmt().unwrap() else {

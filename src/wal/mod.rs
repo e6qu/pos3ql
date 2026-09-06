@@ -86,9 +86,12 @@ const KIND_SET_OBJECT_OWNER: u8 = 31;
 const KIND_SET_OBJECT_ACL: u8 = 32;
 const KIND_REWRITE_TABLE: u8 = 33;
 const KIND_SET_DEFAULT_ACL: u8 = 34;
-const KIND_CREATE_PUBLICATION: u8 = 35;
+// Publication records carry the typed ordinary-descendant selection added
+// after the original record layout. New kinds make older bytes fail recovery
+// loudly instead of being reinterpreted as a different catalog contract.
+const KIND_CREATE_PUBLICATION_V2: u8 = 128;
 const KIND_DROP_PUBLICATION: u8 = 36;
-const KIND_ALTER_PUBLICATION: u8 = 42;
+const KIND_ALTER_PUBLICATION_V2: u8 = 129;
 const KIND_SET_PUBLICATION_OWNER: u8 = 43;
 const KIND_RENAME_PUBLICATION: u8 = 44;
 const KIND_CREATE_ROUTINE: u8 = 45;
@@ -185,7 +188,7 @@ const KIND_CREATE_REPLICATION_SLOT: u8 = 38;
 const KIND_DROP_REPLICATION_SLOT: u8 = 39;
 const KIND_ADVANCE_REPLICATION_SLOT: u8 = 40;
 const KIND_TRUNCATE: u8 = 41;
-const LAST_KIND: u8 = KIND_SET_VIEW_OPTIONS;
+const LAST_KIND: u8 = KIND_ALTER_PUBLICATION_V2;
 const DOMAIN_PAYLOAD_WITH_BASE_SLOT: u8 = u8::MAX;
 const DOMAIN_PAYLOAD_WITH_CONSTRAINT_VALIDATION: u8 = u8::MAX - 1;
 const NO_DOMAIN_BASE_SLOT: u16 = u16::MAX;
@@ -610,6 +613,7 @@ pub(crate) enum WalOp<'a> {
         all_tables: bool,
         tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
         table_column_masks: [u64; crate::storage::MAX_PUBLICATION_TABLES],
+        table_include_descendants: [bool; crate::storage::MAX_PUBLICATION_TABLES],
         table_filter_sql: [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
             crate::storage::MAX_PUBLICATION_TABLES],
         table_count: usize,
@@ -632,6 +636,7 @@ pub(crate) enum WalOp<'a> {
         all_tables: bool,
         tables: [u16; crate::storage::MAX_PUBLICATION_TABLES],
         table_column_masks: [u64; crate::storage::MAX_PUBLICATION_TABLES],
+        table_include_descendants: [bool; crate::storage::MAX_PUBLICATION_TABLES],
         table_filter_sql: [StackStr<{ crate::storage::PUBLICATION_FILTER_SQL_MAX }>;
             crate::storage::MAX_PUBLICATION_TABLES],
         table_count: usize,
@@ -2023,9 +2028,9 @@ fn op_kind(operation: &WalOp) -> u8 {
         WalOp::RenameView { .. } => KIND_RENAME_VIEW,
         WalOp::SetRule { .. } => KIND_SET_RULE,
         WalOp::DropRule { .. } => KIND_DROP_RULE,
-        WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION,
+        WalOp::CreatePublication { .. } => KIND_CREATE_PUBLICATION_V2,
         WalOp::DropPublication { .. } => KIND_DROP_PUBLICATION,
-        WalOp::AlterPublication { .. } => KIND_ALTER_PUBLICATION,
+        WalOp::AlterPublication { .. } => KIND_ALTER_PUBLICATION_V2,
         WalOp::SetPublicationOwner { .. } => KIND_SET_PUBLICATION_OWNER,
         WalOp::RenamePublication { .. } => KIND_RENAME_PUBLICATION,
         WalOp::CreateSubscription { .. } => KIND_CREATE_SUBSCRIPTION,
@@ -2438,7 +2443,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + 1
-                + table_count * 10
+                + table_count * 11
                 + schema_count
                 + table_filter_sql[..*table_count]
                     .iter()
@@ -2457,7 +2462,7 @@ fn encoded_payload_len(operation: &WalOp) -> usize {
                 + 1
                 + 1
                 + 1
-                + table_count * 10
+                + table_count * 11
                 + schema_count
                 + table_filter_sql[..*table_count]
                     .iter()
@@ -4130,6 +4135,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             all_tables,
             tables,
             table_column_masks,
+            table_include_descendants,
             table_filter_sql,
             table_count,
             publish_insert,
@@ -4161,6 +4167,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             for mask in &table_column_masks[..*table_count] {
                 ok = ok && buffer.append(&mask.to_le_bytes());
             }
+            for descendants in &table_include_descendants[..*table_count] {
+                ok = ok && buffer.append(&[u8::from(*descendants)]);
+            }
             for filter in &table_filter_sql[..*table_count] {
                 ok = ok
                     && buffer.append(&(filter.as_str().len() as u16).to_le_bytes())
@@ -4175,6 +4184,7 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             all_tables,
             tables,
             table_column_masks,
+            table_include_descendants,
             table_filter_sql,
             table_count,
             schemas,
@@ -4204,6 +4214,9 @@ fn append_payload(buffer: &mut FixedBuf, operation: &WalOp) -> bool {
             }
             for mask in &table_column_masks[..*table_count] {
                 ok = ok && buffer.append(&mask.to_le_bytes());
+            }
+            for descendants in &table_include_descendants[..*table_count] {
+                ok = ok && buffer.append(&[u8::from(*descendants)]);
             }
             for filter in &table_filter_sql[..*table_count] {
                 ok = ok
@@ -6990,7 +7003,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 name,
             })
         }
-        KIND_CREATE_PUBLICATION => {
+        KIND_CREATE_PUBLICATION_V2 => {
             let name = take_name(&mut at)?;
             let owner = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?);
             at += 2;
@@ -7016,6 +7029,15 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *mask = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
                 at += 8;
             }
+            let mut table_include_descendants = [false; crate::storage::MAX_PUBLICATION_TABLES];
+            for descendants in &mut table_include_descendants[..count] {
+                *descendants = match *payload.get(at)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                at += 1;
+            }
             let mut table_filter_sql = [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES];
             for filter in &mut table_filter_sql[..count] {
                 let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
@@ -7039,6 +7061,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 all_tables: flags & 1 != 0,
                 tables,
                 table_column_masks,
+                table_include_descendants,
                 table_filter_sql,
                 table_count: count,
                 schemas,
@@ -7059,7 +7082,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
             let name = take_name(&mut at)?;
             (at == payload.len()).then_some(WalOp::DropPublication { name })
         }
-        KIND_ALTER_PUBLICATION => {
+        KIND_ALTER_PUBLICATION_V2 => {
             let name = take_name(&mut at)?;
             let flags = *payload.get(at)?;
             at += 1;
@@ -7083,6 +7106,15 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 *mask = u64::from_le_bytes(payload.get(at..at + 8)?.try_into().ok()?);
                 at += 8;
             }
+            let mut table_include_descendants = [false; crate::storage::MAX_PUBLICATION_TABLES];
+            for descendants in &mut table_include_descendants[..count] {
+                *descendants = match *payload.get(at)? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                };
+                at += 1;
+            }
             let mut table_filter_sql = [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES];
             for filter in &mut table_filter_sql[..count] {
                 let len = u16::from_le_bytes(payload.get(at..at + 2)?.try_into().ok()?) as usize;
@@ -7105,6 +7137,7 @@ fn decode_op(kind: u8, payload: &[u8]) -> Option<WalOp<'_>> {
                 all_tables: flags & 1 != 0,
                 tables,
                 table_column_masks,
+                table_include_descendants,
                 table_filter_sql,
                 table_count: count,
                 schemas,
@@ -11985,6 +12018,7 @@ mod tests {
                     all_tables: false,
                     tables: publication_tables,
                     table_column_masks: [0; crate::storage::MAX_PUBLICATION_TABLES],
+                    table_include_descendants: [false; crate::storage::MAX_PUBLICATION_TABLES],
                     table_filter_sql: [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES],
                     table_count: 2,
                     schemas: [u8::MAX; crate::storage::MAX_SCHEMAS],
@@ -12005,6 +12039,7 @@ mod tests {
                     all_tables: false,
                     tables: publication_tables,
                     table_column_masks: [0; crate::storage::MAX_PUBLICATION_TABLES],
+                    table_include_descendants: [false; crate::storage::MAX_PUBLICATION_TABLES],
                     table_filter_sql: [StackStr::new(); crate::storage::MAX_PUBLICATION_TABLES],
                     table_count: 2,
                     schemas: [u8::MAX; crate::storage::MAX_SCHEMAS],
@@ -12249,6 +12284,14 @@ mod tests {
         wal.append_committed(27, &WalOp::Commit { transaction_id: 2 })
             .unwrap();
         wal.commit();
+    }
+
+    #[test]
+    fn obsolete_publication_layouts_are_never_reinterpreted() {
+        assert!(decode_op(35, &[]).is_none());
+        assert!(decode_op(42, &[]).is_none());
+        assert_ne!(KIND_CREATE_PUBLICATION_V2, 35);
+        assert_ne!(KIND_ALTER_PUBLICATION_V2, 42);
     }
 
     #[test]

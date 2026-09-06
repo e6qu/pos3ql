@@ -74,7 +74,7 @@ type ReturningCapture<'a> = dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), Sq
 #[derive(Clone, Copy)]
 pub(crate) struct SubscriptionRuntime {
     pub stream: crate::storage::SubscriptionStream,
-    pub endpoint: crate::pg::replication_client::ConnectionInfo,
+    pub endpoint: crate::pg::replication_client::SubscriptionEndpoint,
     pub publications: [SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
     pub publication_count: usize,
     pub slot: Option<SqlName>,
@@ -91,7 +91,7 @@ pub(crate) struct SubscriptionRuntime {
 pub(crate) struct SubscriptionCleanupRuntime {
     pub created_at: u64,
     pub name: SqlName,
-    pub endpoint: crate::pg::replication_client::ConnectionInfo,
+    pub endpoint: crate::pg::replication_client::SubscriptionEndpoint,
     pub slot: SqlName,
 }
 
@@ -1573,25 +1573,40 @@ enum PublicationOperation {
 }
 
 /// Finds the explicit publication member that makes `table_slot` publishable.
-/// PostgreSQL makes every partition an implicit member when an ancestor is
-/// published; the leaf itself wins when both appear explicitly.
+/// Partitions are always implicit members. Ordinary inheritance is selected
+/// only by a non-`ONLY` membership record.
 pub(crate) fn publication_partition_member(
     storage: &Storage,
     publication: &crate::storage::PublicationDef,
     table_slot: usize,
 ) -> Option<usize> {
-    let mut current = table_slot;
-    loop {
+    if let Some(index) = publication.tables[..publication.table_count]
+        .iter()
+        .position(|member| usize::from(*member) == table_slot)
+    {
+        return Some(index);
+    }
+    let mut partition = table_slot;
+    while let Some(crate::storage::PartitionAttachment { parent, .. }) =
+        storage.table_def(partition, 0).partition.attachment
+    {
+        partition = usize::from(parent);
         if let Some(index) = publication.tables[..publication.table_count]
             .iter()
-            .position(|member| usize::from(*member) == current)
+            .position(|member| usize::from(*member) == partition)
         {
             return Some(index);
         }
-        let crate::storage::PartitionAttachment { parent, .. } =
-            storage.table_def(current, 0).partition.attachment?;
-        current = usize::from(parent);
     }
+    publication.tables[..publication.table_count]
+        .iter()
+        .enumerate()
+        .find_map(|(index, member)| {
+            let member = usize::from(*member);
+            (publication.table_include_descendants[index]
+                && storage.relation_descends_from(table_slot, member, 0))
+            .then_some(index)
+        })
 }
 
 /// Schema publications inherit through a partition tree too: a parent in the
@@ -1694,6 +1709,7 @@ fn publication_projection_mask(
     }
     let index = publication_partition_member(storage, publication, table_slot)?;
     if usize::from(publication.tables[index]) != table_slot
+        && storage.partition_descends_from(table_slot, usize::from(publication.tables[index]), 0)
         && !publication.publish_via_partition_root
     {
         return Some(implicit_mask());
@@ -1794,10 +1810,15 @@ fn publication_row_matches(
         let Some(index) = publication_partition_member(storage, publication, table_slot) else {
             continue;
         };
-        // With PostgreSQL's default leaf identity, an ancestor's row filter
-        // does not become the leaf's filter.  Only an explicitly named leaf
-        // has a filter in this representation.
+        // With PostgreSQL's default leaf identity, a partition ancestor's
+        // filter does not become the leaf's filter. Ordinary inheritance
+        // keeps the selected parent's contract.
         if usize::from(publication.tables[index]) != table_slot
+            && storage.partition_descends_from(
+                table_slot,
+                usize::from(publication.tables[index]),
+                0,
+            )
             && !publication.publish_via_partition_root
         {
             return Ok(true);
@@ -1854,7 +1875,7 @@ impl Engine {
         Some(SubscriptionCleanupRuntime {
             created_at,
             name,
-            endpoint: connection.endpoint()?.for_subscription(name),
+            endpoint: connection.endpoint_for(name)?,
             slot: remote_slot,
         })
     }
@@ -1949,50 +1970,53 @@ impl Engine {
                         ))
             })
             .and_then(|(_, subscription)| {
-                subscription.connection.endpoint().and_then(|endpoint| {
-                    let publisher_slot = subscription
-                        .slot
-                        .name()
-                        .map(crate::storage::ReplicationSlotName::sql_name);
-                    let bootstrap_slot = match subscription.bootstrap {
-                        crate::storage::SubscriptionBootstrap::CopyExternalSlot
-                        | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
-                        | crate::storage::SubscriptionBootstrap::Refresh { .. } => {
-                            let generated =
-                                stack_format!(63, "pos3ql_{:x}_sync", subscription.created_at);
-                            Some(
-                                crate::storage::ReplicationSlotName::parse(generated.as_str())
-                                    .ok()?
-                                    .sql_name(),
-                            )
-                        }
-                        _ => publisher_slot,
-                    };
-                    self.storage
-                        .subscription_stream(slot, 0)
-                        .map(|stream| SubscriptionRuntime {
-                            stream,
-                            endpoint: endpoint.for_subscription(subscription.name),
-                            publications: subscription.publications,
-                            publication_count: subscription.publication_count,
-                            slot: publisher_slot,
-                            manage_slot_behavior: matches!(
-                                subscription.slot,
-                                crate::storage::SubscriptionSlot::Managed(_)
-                            ),
-                            bootstrap_slot,
-                            drop_bootstrap_slot: matches!(
-                                subscription.bootstrap,
-                                crate::storage::SubscriptionBootstrap::CopyExternalSlot
-                                    | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
-                                    | crate::storage::SubscriptionBootstrap::Refresh { .. }
-                            ),
-                            confirmed_lsn: subscription.confirmed_lsn,
-                            bootstrap: subscription.bootstrap,
-                            enabled: subscription.enabled_to(0),
-                            behavior: subscription.behavior,
+                subscription
+                    .connection
+                    .endpoint_for(subscription.name)
+                    .and_then(|endpoint| {
+                        let publisher_slot = subscription
+                            .slot
+                            .name()
+                            .map(crate::storage::ReplicationSlotName::sql_name);
+                        let bootstrap_slot = match subscription.bootstrap {
+                            crate::storage::SubscriptionBootstrap::CopyExternalSlot
+                            | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
+                            | crate::storage::SubscriptionBootstrap::Refresh { .. } => {
+                                let generated =
+                                    stack_format!(63, "pos3ql_{:x}_sync", subscription.created_at);
+                                Some(
+                                    crate::storage::ReplicationSlotName::parse(generated.as_str())
+                                        .ok()?
+                                        .sql_name(),
+                                )
+                            }
+                            _ => publisher_slot,
+                        };
+                        self.storage.subscription_stream(slot, 0).map(|stream| {
+                            SubscriptionRuntime {
+                                stream,
+                                endpoint,
+                                publications: subscription.publications,
+                                publication_count: subscription.publication_count,
+                                slot: publisher_slot,
+                                manage_slot_behavior: matches!(
+                                    subscription.slot,
+                                    crate::storage::SubscriptionSlot::Managed(_)
+                                ),
+                                bootstrap_slot,
+                                drop_bootstrap_slot: matches!(
+                                    subscription.bootstrap,
+                                    crate::storage::SubscriptionBootstrap::CopyExternalSlot
+                                        | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
+                                        | crate::storage::SubscriptionBootstrap::Refresh { .. }
+                                ),
+                                confirmed_lsn: subscription.confirmed_lsn,
+                                bootstrap: subscription.bootstrap,
+                                enabled: subscription.enabled_to(0),
+                                behavior: subscription.behavior,
+                            }
                         })
-                })
+                    })
             })
     }
     /// Returns the startup-bounded endpoint retained for a durable
@@ -2004,7 +2028,8 @@ impl Engine {
     ) -> Option<crate::pg::replication_client::ConnectionInfo> {
         self.storage
             .subscription(name, 0)
-            .and_then(|(_, subscription)| subscription.connection.endpoint())
+            .and_then(|(_, subscription)| subscription.connection.endpoint_for(subscription.name))
+            .map(crate::pg::replication_client::SubscriptionEndpoint::connection)
     }
 
     pub fn subscription_confirmed_lsn(&self, name: &str) -> Option<u64> {
@@ -3207,6 +3232,7 @@ impl Engine {
             let mut at = 0usize;
             let mut transaction_id = 0u32;
             let mut has_replication_origin = false;
+            let mut subscription_origin = None;
             let mut truncates = [PendingTruncate {
                 command_id: 0,
                 table_slots: [0; crate::sql::txn::MAX_TRUNCATE_TABLES],
@@ -3225,11 +3251,22 @@ impl Engine {
                 {
                     transaction_id = id;
                 }
-                if matches!(
-                    crate::wal::decode_record(&transaction[at + 16..at + total]),
-                    Some(WalOp::AdvanceSubscription { .. })
-                ) {
+                if let Some(WalOp::AdvanceSubscription {
+                    created_at,
+                    confirmed_lsn,
+                    ..
+                }) = crate::wal::decode_record(&transaction[at + 16..at + total])
+                {
                     has_replication_origin = true;
+                    if subscription_origin
+                        .replace((created_at, confirmed_lsn))
+                        .is_some()
+                    {
+                        return Err(sql_err!(
+                            sqlstate::PROTOCOL_VIOLATION,
+                            "replication transaction advances more than one subscription frontier"
+                        ));
+                    }
                 }
                 if let Some(WalOp::Truncate {
                     tables,
@@ -3479,6 +3516,20 @@ impl Engine {
                     })
                 })
                 .map_err(|_| overflow())?;
+            if let Some((created_at, origin_lsn)) = subscription_origin {
+                // PostgreSQL replication-origin names identify the local
+                // stream that applied this transaction. `created_at` remains
+                // stable across subscription rename and is persisted in the
+                // same WAL record as the acknowledged publisher frontier.
+                let origin_name = stack_format!(48, "pos3ql_subscription_{created_at:x}");
+                responder
+                    .copy_data(&|message| {
+                        pgoutput::xlog_data(message, floor, end_lsn, |plugin| {
+                            pgoutput::origin(plugin, origin_lsn, origin_name.as_str())
+                        })
+                    })
+                    .map_err(|_| overflow())?;
+            }
             at = 0;
             while at < transaction.len() {
                 let length =
@@ -18148,6 +18199,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             all_tables,
             tables,
             table_column_masks,
+            table_include_descendants,
             table_filter_sql,
             table_count,
             schemas,
@@ -18165,6 +18217,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     all_tables,
                     tables: &tables[..table_count],
                     table_column_masks: &table_column_masks[..table_count],
+                    table_include_descendants: &table_include_descendants[..table_count],
                     table_filter_sql: &table_filter_sql[..table_count],
                     schemas: &schemas[..schema_count],
                     publish_insert,
@@ -18189,6 +18242,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             all_tables,
             tables,
             table_column_masks,
+            table_include_descendants,
             table_filter_sql,
             table_count,
             schemas,
@@ -18204,6 +18258,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 all_tables,
                 tables,
                 table_column_masks,
+                table_include_descendants,
                 table_filters: crate::storage::PublicationFilters::from_sql(
                     &table_filter_sql[..table_count],
                 )?,
@@ -18254,7 +18309,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         } => {
             let connection = crate::storage::SubscriptionConnInfo::parse(connection)?;
             if enabled {
-                validate_recovered_enabled_subscription(connection)?;
+                validate_recovered_enabled_subscription(
+                    connection,
+                    crate::storage::SqlName::parse(name)?,
+                )?;
             }
             let slot = storage.create_subscription(
                 crate::storage::SubscriptionSpec {
@@ -18314,7 +18372,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 )
             })?;
             if enabled {
-                validate_recovered_enabled_subscription(subscription.connection)?;
+                validate_recovered_enabled_subscription(
+                    subscription.connection,
+                    crate::storage::SqlName::parse(name)?,
+                )?;
             }
             if matches!(
                 storage.set_subscription_enabled(slot, enabled, 0)?,
@@ -18462,7 +18523,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             })?;
             let connection = crate::storage::SubscriptionConnInfo::parse(connection)?;
             if subscription.enabled_to(0) {
-                validate_recovered_enabled_subscription(connection)?;
+                validate_recovered_enabled_subscription(
+                    connection,
+                    crate::storage::SqlName::parse(name)?,
+                )?;
             }
             let definition = crate::storage::SubscriptionDefinition::from_parts(
                 connection,
@@ -19748,8 +19812,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
 
 fn validate_recovered_enabled_subscription(
     connection: crate::storage::SubscriptionConnInfo,
+    subscription: crate::storage::SqlName,
 ) -> Result<(), SqlError> {
-    connection.require_endpoint().map(|_| ())
+    connection.require_endpoint_for(subscription).map(|_| ())
 }
 
 #[cfg(test)]

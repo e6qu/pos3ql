@@ -198,14 +198,23 @@ impl SubscriptionConnInfo {
         self.text.as_str()
     }
 
-    /// The typed publisher endpoint, when this conninfo is usable by the
-    /// bounded replication client.
-    pub(crate) fn endpoint(&self) -> Option<ConnectionInfo> {
-        self.endpoint
+    /// Resolves PostgreSQL's documented subscription `application_name`
+    /// default while the catalog identity is still available.  Workers receive
+    /// only this complete transport contract.
+    pub(crate) fn endpoint_for(
+        &self,
+        subscription: SqlName,
+    ) -> Option<crate::pg::replication_client::SubscriptionEndpoint> {
+        self.endpoint.map(|endpoint| {
+            crate::pg::replication_client::SubscriptionEndpoint::resolve(endpoint, subscription)
+        })
     }
 
-    pub(crate) fn require_endpoint(&self) -> Result<ConnectionInfo, SqlError> {
-        self.endpoint.ok_or_else(|| {
+    pub(crate) fn require_endpoint_for(
+        &self,
+        subscription: SqlName,
+    ) -> Result<crate::pg::replication_client::SubscriptionEndpoint, SqlError> {
+        self.endpoint_for(subscription).ok_or_else(|| {
             sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "enabled subscription connection string requires a numeric host, port, user, dbname, and sslmode"
@@ -4340,6 +4349,9 @@ pub struct PublicationDef {
     /// A zero mask means the member publishes all columns; otherwise bit n
     /// selects PostgreSQL attribute n + 1.
     pub table_column_masks: [u64; MAX_PUBLICATION_TABLES],
+    /// Ordinary inheritance descendants selected by each explicit member.
+    /// Partition descendants are always implicit PostgreSQL members.
+    pub table_include_descendants: [bool; MAX_PUBLICATION_TABLES],
     pub table_filters: PublicationFilters,
     pub table_count: usize,
     pub schemas: [u8; MAX_SCHEMAS],
@@ -4363,6 +4375,7 @@ pub(crate) struct PublicationDefinition {
     pub all_tables: bool,
     pub tables: [u16; MAX_PUBLICATION_TABLES],
     pub table_column_masks: [u64; MAX_PUBLICATION_TABLES],
+    pub table_include_descendants: [bool; MAX_PUBLICATION_TABLES],
     pub table_filters: PublicationFilters,
     pub table_count: usize,
     pub schemas: [u8; MAX_SCHEMAS],
@@ -4404,6 +4417,7 @@ pub struct PublicationSpec<'a> {
     pub all_tables: bool,
     pub tables: &'a [u16],
     pub table_column_masks: &'a [u64],
+    pub table_include_descendants: &'a [bool],
     pub table_filter_sql: &'a [StackStr<PUBLICATION_FILTER_SQL_MAX>],
     pub schemas: &'a [u8],
     pub publish_insert: bool,
@@ -5115,6 +5129,7 @@ impl PublicationDef {
             all_tables: self.all_tables,
             tables: self.tables,
             table_column_masks: self.table_column_masks,
+            table_include_descendants: self.table_include_descendants,
             table_filters: self.table_filters,
             table_count: self.table_count,
             schemas: self.schemas,
@@ -5138,6 +5153,7 @@ impl PublicationDef {
         self.all_tables = definition.all_tables;
         self.tables = definition.tables;
         self.table_column_masks = definition.table_column_masks;
+        self.table_include_descendants = definition.table_include_descendants;
         self.table_filters = definition.table_filters;
         self.table_count = definition.table_count;
         self.schemas = definition.schemas;
@@ -12411,6 +12427,7 @@ impl Storage {
                     all_tables: false,
                     tables: [u16::MAX; MAX_PUBLICATION_TABLES],
                     table_column_masks: [0; MAX_PUBLICATION_TABLES],
+                    table_include_descendants: [false; MAX_PUBLICATION_TABLES],
                     table_filters: PublicationFilters::EMPTY,
                     table_count: 0,
                     schemas: [u8::MAX; MAX_SCHEMAS],
@@ -25630,6 +25647,12 @@ impl Storage {
                 "publication table projections do not match publication members"
             ));
         }
+        if spec.table_include_descendants.len() != spec.tables.len() {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "publication descendant selections do not match publication members"
+            ));
+        }
         if spec.table_filter_sql.len() != spec.tables.len() {
             return Err(sql_err!(
                 sqlstate::INTERNAL_ERROR,
@@ -25687,6 +25710,9 @@ impl Storage {
         let mut table_column_masks = [0u64; MAX_PUBLICATION_TABLES];
         table_column_masks[..spec.table_column_masks.len()]
             .copy_from_slice(spec.table_column_masks);
+        let mut table_include_descendants = [false; MAX_PUBLICATION_TABLES];
+        table_include_descendants[..spec.table_include_descendants.len()]
+            .copy_from_slice(spec.table_include_descendants);
         let table_filters = PublicationFilters::from_sql(spec.table_filter_sql)?;
         let mut schemas = [u8::MAX; MAX_SCHEMAS];
         schemas[..spec.schemas.len()].copy_from_slice(spec.schemas);
@@ -25699,6 +25725,7 @@ impl Storage {
             all_tables: spec.all_tables,
             tables: members,
             table_column_masks,
+            table_include_descendants,
             table_filters,
             table_count: spec.tables.len(),
             schemas,

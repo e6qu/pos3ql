@@ -36,7 +36,7 @@ ALTER OPERATOR CLASS	complete	117_cast_operator_catalog.sql
 ALTER OPERATOR FAMILY	complete	117_cast_operator_catalog.sql
 ALTER POLICY	complete	106_row_level_security.sql
 ALTER PROCEDURE	partial	90_routine_lifecycle.sql and 141_routine_attribute_evolution.sql
-ALTER PUBLICATION	partial	84_publication.sql
+ALTER PUBLICATION	complete	84_publication.sql, typed descendant selection, WAL/checkpoint recovery, and raw pgoutput coverage
 ALTER ROLE	partial	83_roles_acl.sql and 100_role_credentials.sql cover typed role specifications, SCRAM/MD5 credentials, settings, aliases, and recovery
 ALTER ROUTINE	partial	90_routine_lifecycle.sql, 141_routine_attribute_evolution.sql, and aggregate extension dependencies in 111_extension_lifecycle.sql
 ALTER RULE	complete	tests/external/differential/122_rewrite_rules.sql
@@ -88,7 +88,7 @@ CREATE OPERATOR CLASS	complete	117_cast_operator_catalog.sql (btree; unsupported
 CREATE OPERATOR FAMILY	complete	117_cast_operator_catalog.sql (btree; unsupported access methods are rejected)
 CREATE POLICY	complete	106_row_level_security.sql
 CREATE PROCEDURE	partial	89_sql_procedures.sql, 100_plpgsql_procedures.sql, 141_routine_attribute_evolution.sql, and 142_plpgsql_catalog_locals.sql
-CREATE PUBLICATION	partial	84_publication.sql
+CREATE PUBLICATION	complete	84_publication.sql, typed descendant selection, privilege boundary, WAL/checkpoint recovery, and raw pgoutput coverage
 CREATE ROLE	partial	83_roles_acl.sql, 100_role_credentials.sql, and 140_catalog_schema_evolution.sql cover attributes, SCRAM/MD5 credentials, aliases, initial memberships, and recovery
 CREATE RULE	complete	tests/external/differential/122_rewrite_rules.sql
 CREATE SCHEMA	complete	37_schemas.sql and typed dynamic-utility checkpoint/cold-recovery coverage
@@ -136,7 +136,7 @@ DROP OPERATOR FAMILY	partial	117_cast_operator_catalog.sql
 DROP OWNED	complete	83_roles_acl.sql
 DROP POLICY	complete	106_row_level_security.sql
 DROP PROCEDURE	partial	89_sql_procedures.sql and 141_routine_attribute_evolution.sql
-DROP PUBLICATION	partial	84_publication.sql
+DROP PUBLICATION	complete	84_publication.sql and publication lifecycle recovery coverage
 DROP ROLE	partial	83_roles_acl.sql and 100_role_credentials.sql cover dependencies, aliases, quoted special names, and recovery
 DROP ROUTINE	partial	90_routine_lifecycle.sql and 141_routine_attribute_evolution.sql
 DROP RULE	complete	tests/external/differential/122_rewrite_rules.sql

@@ -181,9 +181,22 @@ pub enum AlterMaterializedViewAction<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PublicationTarget<'a> {
     pub relation: QualName<'a>,
+    /// PostgreSQL distinguishes an explicit table member from its ordinary
+    /// inheritance descendants. Partitions remain implicit publication
+    /// members as required by the replication protocol.
+    pub descendants: PublicationDescendants,
     pub columns: &'a [&'a str],
     pub filter: Option<&'a Expr<'a>>,
     pub filter_text: Option<&'a str>,
+}
+
+/// The table-selection contract written by `[ ONLY ] table_name [ * ]`.
+/// `Include` is PostgreSQL's default and `*` spelling; it is not inferred
+/// after parsing so catalog, WAL, and checkpoint state retain it exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationDescendants {
+    Only,
+    Include,
 }
 
 /// A resolved built-in collation identity.  The parser resolves the spelling

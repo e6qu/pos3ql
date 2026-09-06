@@ -1537,6 +1537,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             Ok(None)
         }
         Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. }
         | Expr::Exists(_)
@@ -1562,7 +1563,7 @@ fn fold_check<'a>(expression: &Expr<'a>, arena: &'a Arena) -> Result<Option<bool
             }
             Ok(None)
         }
-        Expr::Field { base, .. } => {
+        Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => {
             fold_check(base, arena)?;
             Ok(None)
         }
@@ -2271,7 +2272,7 @@ pub fn eval_full<'a>(
             sqlstate::SYNTAX_ERROR,
             "DEFAULT is only allowed as a DML assignment value"
         )),
-        Expr::Subquery(_) | Expr::ArraySubquery(_) => {
+        Expr::Subquery(_) | Expr::RowSubquery { .. } | Expr::ArraySubquery(_) => {
             if let Some(subs) = hooks.subs {
                 for (node, v, _) in subs.scalars {
                     if core::ptr::eq(*node, expression as *const _) {
@@ -2893,6 +2894,49 @@ pub fn eval_full<'a>(
                 _ => Err(crate::sql::exec::not_composite(field, type_name_of(&b))),
             }
         }
+        Expr::RecordFieldIndex { base, index } => match eval_full(base, arena, params, row, hooks)?
+        {
+            Datum::Null => Ok(Datum::Null),
+            Datum::Record(fields) | Datum::Composite { fields, .. } => fields
+                .get(index as usize)
+                .map(|field| field.value)
+                .ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::INTERNAL_ERROR,
+                        "multi-column assignment record has too few fields"
+                    )
+                }),
+            Datum::CompositeText {
+                slot,
+                physical_fields,
+                text,
+            } => {
+                let catalog = hooks.catalog.ok_or_else(|| {
+                    sql_err!(
+                        sqlstate::FEATURE_NOT_SUPPORTED,
+                        "named composite catalog access is unavailable"
+                    )
+                })?;
+                let Datum::Composite { fields, .. } =
+                    catalog.materialize_composite(slot, physical_fields, text, arena)?
+                else {
+                    unreachable!("catalog materializes named composites")
+                };
+                fields
+                    .get(index as usize)
+                    .map(|field| field.value)
+                    .ok_or_else(|| {
+                        sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "multi-column assignment record has too few fields"
+                        )
+                    })
+            }
+            _ => Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "multi-column assignment source is not a record"
+            )),
+        },
         Expr::AnyAll {
             operand,
             operator,

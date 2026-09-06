@@ -604,6 +604,7 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
         Expr::RoutineParam { .. } => {}
         Expr::RecursiveState { .. } => {}
         Expr::Subquery(_)
+        | Expr::RowSubquery { .. }
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. }
         | Expr::Exists(_)
@@ -692,7 +693,9 @@ fn validate_check_refs(expression: &Expr, def: &TableDef, cols: &mut u64) -> Res
                 validate_check_refs(e, def, cols)?;
             }
         }
-        Expr::Field { base, .. } => validate_check_refs(base, def, cols)?,
+        Expr::Field { base, .. } | Expr::RecordFieldIndex { base, .. } => {
+            validate_check_refs(base, def, cols)?
+        }
         Expr::AnyAll { operand, array, .. } => {
             validate_check_refs(operand, def, cols)?;
             validate_check_refs(array, def, cols)?;

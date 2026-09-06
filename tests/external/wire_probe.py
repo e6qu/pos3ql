@@ -3826,15 +3826,15 @@ def test_merge_extended_portal_preserves_default_and_returning_shape():
     drain_startup(s)
     setup = simple_query(
         s,
-        "CREATE TABLE wire_merge_target (id integer PRIMARY KEY, value integer DEFAULT 41); "
-        "INSERT INTO wire_merge_target VALUES (1, 0)",
+        "CREATE TABLE wire_merge_target (id integer PRIMARY KEY, a integer DEFAULT 41, b integer DEFAULT 42); "
+        "INSERT INTO wire_merge_target VALUES (1, 0, 0)",
     )
     check("merge wire: setup succeeds", not any(kind == b"E" for kind, _ in setup), setup)
 
     query = (
         "MERGE INTO wire_merge_target AS target USING (VALUES ($1)) AS source(id) "
-        "ON target.id = source.id WHEN MATCHED THEN UPDATE SET value = DEFAULT "
-        "RETURNING target.id, target.value"
+        "ON target.id = source.id WHEN MATCHED THEN UPDATE SET (a, b) = (DEFAULT, DEFAULT) "
+        "RETURNING target.id, target.a, target.b"
     )
     parse = frontend_message(
         b"P", b"wire_merge_statement\x00" + query.encode() + b"\x00" + struct.pack("!hi", 1, 23)
@@ -3866,10 +3866,10 @@ def test_merge_extended_portal_preserves_default_and_returning_shape():
     check(
         "merge wire: extended portal retains DEFAULT update and RETURNING metadata",
         description is not None
-        and row_description_type_oids(description) == [23, 23]
-        and row_description_formats(description) == [0, 0]
+        and row_description_type_oids(description) == [23, 23, 23]
+        and row_description_formats(description) == [0, 0, 0]
         and row is not None
-        and text_row_fields(row) == ["1", "41"]
+        and text_row_fields(row) == ["1", "41", "42"]
         and command == b"MERGE 1\x00",
         messages,
     )

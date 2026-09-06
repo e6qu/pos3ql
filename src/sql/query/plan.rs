@@ -1147,7 +1147,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
                 + lower.map_or(0, |e| postpone_cost(e, scope, arena))
                 + upper.map_or(0, |e| postpone_cost(e, scope, arena))
         }
-        Field { base, .. } => postpone_cost(base, scope, arena),
+        Field { base, .. } | RecordFieldIndex { base, .. } => postpone_cost(base, scope, arena),
         AnyAll { operand, array, .. } => {
             let elements = if let Array(items) = array {
                 items.len() as u32
@@ -1158,6 +1158,7 @@ pub(super) fn postpone_cost(e: &Expr, scope: &QueryScope, arena: &Arena) -> u32 
         }
         // Subqueries carry a subplan's cost in PostgreSQL and are postponed.
         Subquery(_)
+        | RowSubquery { .. }
         | Exists(_)
         | ArraySubquery(_)
         | InSubquery { .. }

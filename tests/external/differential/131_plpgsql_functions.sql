@@ -38,6 +38,7 @@ DROP FUNCTION IF EXISTS plpgsql_dynamic_session_portal();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_lock();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_analyze_json();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_analyze_compound();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_generic_explain();
 DROP FUNCTION IF EXISTS plpgsql_array_subscripts();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_constraints();
 DROP PUBLICATION IF EXISTS plpgsql_dynamic_catalog_publication;
@@ -387,6 +388,35 @@ BEGIN
   IF plan IS NULL THEN RAISE EXCEPTION 'EXPLAIN ANALYZE JSON result mismatch'; END IF;
 END
 $$;
+CREATE FUNCTION plpgsql_dynamic_generic_explain() RETURNS boolean
+  LANGUAGE plpgsql AS $$
+DECLARE plan text;
+BEGIN
+  EXECUTE 'PREPARE plpgsql_dynamic_generic_plan(integer) AS SELECT $1::integer';
+  EXECUTE 'EXPLAIN (GENERIC_PLAN, FORMAT JSON) EXECUTE plpgsql_dynamic_generic_plan(41)'
+    INTO STRICT plan;
+  IF position('"Node Type"' IN plan) = 0 THEN
+    RAISE EXCEPTION 'EXPLAIN generic JSON result mismatch';
+  END IF;
+  EXECUTE 'EXPLAIN (FORMAT XML, SUMMARY OFF) SELECT value
+    FROM plpgsql_dynamic_session_rows ORDER BY value' INTO STRICT plan;
+  IF position('<Node-Type>Sort</Node-Type>' IN plan) = 0
+     OR position('<Plans>' IN plan) = 0
+     OR position('<Node-Type>Seq Scan</Node-Type>' IN plan) = 0
+     OR position('<Node><Node-Type>' IN plan) <> 0 THEN
+    RAISE EXCEPTION 'EXPLAIN XML tree result mismatch';
+  END IF;
+  EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT YAML)
+    SELECT value FROM plpgsql_dynamic_session_rows' INTO STRICT plan;
+  IF position('Actual Rows:' IN plan) = 0
+     OR position('Shared Dirtied Blocks: 0' IN plan) = 0
+     OR position('WAL Records: 0' IN plan) = 0 THEN
+    RAISE EXCEPTION 'EXPLAIN YAML runtime result mismatch';
+  END IF;
+  EXECUTE 'DEALLOCATE plpgsql_dynamic_generic_plan';
+  RETURN true;
+END
+$$;
 CREATE FUNCTION plpgsql_dynamic_analyze_compound() RETURNS void
   LANGUAGE plpgsql AS $$
 DECLARE plan text;
@@ -465,6 +495,7 @@ SELECT plpgsql_dynamic_analyze_compound();
 SELECT count(*) FROM plpgsql_dynamic_session_rows;
 SELECT plpgsql_dynamic_session_deallocate();
 SELECT plpgsql_dynamic_analyze_json();
+SELECT plpgsql_dynamic_generic_explain();
 BEGIN;
 SELECT plpgsql_dynamic_session_lock();
 COMMIT;
@@ -575,6 +606,7 @@ DROP FUNCTION plpgsql_dynamic_session_deallocate();
 DROP FUNCTION plpgsql_dynamic_session_portal();
 DROP FUNCTION plpgsql_dynamic_session_lock();
 DROP FUNCTION plpgsql_dynamic_analyze_json();
+DROP FUNCTION plpgsql_dynamic_generic_explain();
 DROP FUNCTION plpgsql_dynamic_session_constraints();
 DROP PUBLICATION plpgsql_dynamic_catalog_publication;
 DROP MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized;

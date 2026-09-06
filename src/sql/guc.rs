@@ -148,6 +148,20 @@ pub(crate) fn active_row_security() -> bool {
     })
 }
 
+/// Snapshot the active session's planner inputs for nested SQL, such as a
+/// PL/pgSQL dynamic statement.  Statement execution installs this context for
+/// the entire recursive call chain.
+pub(crate) fn active_planner_settings() -> PlannerSettings {
+    ACTIVE_GUC.with(|active| {
+        let pointer = active.get();
+        if pointer.is_null() {
+            return PlannerSettings::EMPTY;
+        }
+        // SAFETY: `enter_eval_scope` owns the pointer's dynamic extent.
+        unsafe { &*pointer }.planner_settings()
+    })
+}
+
 pub fn set_active_config(
     name: &str,
     value: Option<&str>,
@@ -493,6 +507,45 @@ struct GucValues {
     default_transaction_read_only: bool,
     default_transaction_deferrable: bool,
     password_encryption: PasswordEncryption,
+}
+
+/// Planner inputs reported by `EXPLAIN (SETTINGS)`.  This is deliberately a
+/// closed snapshot: only values consulted while resolving a query belong here,
+/// rather than every session presentation setting.
+#[derive(Clone, Copy)]
+pub(crate) struct PlannerSettings {
+    entries: [PlannerSetting; 1],
+    count: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PlannerSetting {
+    name: &'static str,
+    value: StackStr<128>,
+}
+
+impl PlannerSettings {
+    pub(crate) const EMPTY: Self = Self {
+        entries: [PlannerSetting {
+            name: "",
+            value: StackStr::new(),
+        }],
+        count: 0,
+    };
+
+    pub(crate) fn entries(&self) -> &[PlannerSetting] {
+        &self.entries[..self.count]
+    }
+}
+
+impl PlannerSetting {
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) fn value(&self) -> &str {
+        self.value.as_str()
+    }
 }
 
 /// PostgreSQL's closed credential format choice for new plaintext role
@@ -966,6 +1019,24 @@ impl GucState {
 
     pub fn search_path(&self) -> StackStr<128> {
         self.store.borrow().current.search_path
+    }
+
+    /// Captures the non-default session values which the planner consumes.
+    /// The returned storage is fixed-size and owns its values so rendering can
+    /// continue after the GUC borrow ends.
+    pub(crate) fn planner_settings(&self) -> PlannerSettings {
+        let state = self.store.borrow();
+        let current = &state.current;
+        let built_in = GucValues::new();
+        let mut settings = PlannerSettings::EMPTY;
+        if current.search_path != built_in.search_path {
+            settings.entries[settings.count] = PlannerSetting {
+                name: "search_path",
+                value: current.search_path,
+            };
+            settings.count += 1;
+        }
+        settings
     }
 
     pub fn default_tablespace(&self) -> StackStr<64> {

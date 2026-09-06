@@ -143,6 +143,25 @@ cur.execute("SELECT drv_dynamic_analyze(%s)", (41,))
 assert cur.fetchone() == (True,)
 print("plpgsql dynamic analyze extended protocol ok")
 
+# Planner options remain ordinary PostgreSQL result values through a driver's
+# Parse/Bind/Execute path: SETTINGS reflects the active session and
+# GENERIC_PLAN accepts a bound placeholder without using its value to plan.
+cur.execute("SET search_path = public")
+cur.execute("EXPLAIN (SETTINGS, FORMAT JSON) SELECT 1")
+assert '"Settings":{"search_path":"public"}' in cur.fetchone()[0]
+cur.execute("EXPLAIN (GENERIC_PLAN, FORMAT JSON) SELECT %s::integer", (41,))
+assert '"Node Type"' in cur.fetchone()[0]
+cur.execute("EXPLAIN (FORMAT XML, SUMMARY OFF) SELECT 1 UNION ALL SELECT 2")
+xml_plan = cur.fetchone()[0]
+assert "<Plans><Plan>" in xml_plan and "<Node><Node-Type>" not in xml_plan
+cur.execute(
+    "EXPLAIN (ANALYZE, BUFFERS, WAL, TIMING OFF, FORMAT YAML) SELECT %s::integer",
+    (41,),
+)
+yaml_plan = cur.fetchone()[0]
+assert "Actual Rows:" in yaml_plan and "WAL Records: 0" in yaml_plan
+print("EXPLAIN settings, generic plans, and structured output extended protocol ok")
+
 # Array subscripts are client-visible values, not an internal zero-based
 # representation, across extended Bind and Result.
 array_value = "[4:6]={10,20,10}"

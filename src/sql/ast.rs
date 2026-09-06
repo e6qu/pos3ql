@@ -378,6 +378,14 @@ pub enum ExplainSerialize {
     Binary,
 }
 
+/// Whether EXPLAIN plans against the bound values supplied by the caller or
+/// the declared parameter shape of a prepared query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainPlanMode {
+    Custom,
+    Generic,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionIsolation {
     ReadUncommitted,
@@ -439,7 +447,7 @@ pub struct ExplainOptions {
     pub timing: bool,
     pub summary: bool,
     pub memory: bool,
-    pub generic_plan: bool,
+    pub plan_mode: ExplainPlanMode,
     pub serialize: ExplainSerialize,
     pub format: ExplainFormat,
 }
@@ -455,7 +463,7 @@ impl ExplainOptions {
         timing: true,
         summary: false,
         memory: false,
-        generic_plan: false,
+        plan_mode: ExplainPlanMode::Custom,
         serialize: ExplainSerialize::None,
         format: ExplainFormat::Text,
     };

@@ -10817,15 +10817,16 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
             "trailing subscription fields",
         ));
     }
+    let name = sql_name(&name)?;
     if enabled {
         connection
-            .require_endpoint()
+            .require_endpoint_for(name)
             .map_err(|_| CheckpointSetupError::Corrupt("enabled subscription endpoint"))?;
     }
     let slot = storage
         .create_subscription(
             crate::storage::SubscriptionSpec {
-                name: sql_name(&name)?,
+                name,
                 connection,
                 publications: &publications[..count],
                 enabled,
@@ -10872,7 +10873,7 @@ fn load_subscription(storage: &mut Storage, line: &str) -> Result<(), Checkpoint
     }
     if cleanup {
         let dropped = storage
-            .drop_subscription(&name, 0)
+            .drop_subscription(name.as_str(), 0)
             .map_err(|error| {
                 CheckpointSetupError::ObjectStore(format!(
                     "manifest subscription cleanup rejected: {}",

@@ -198,14 +198,23 @@ impl SubscriptionConnInfo {
         self.text.as_str()
     }
 
-    /// The typed publisher endpoint, when this conninfo is usable by the
-    /// bounded replication client.
-    pub(crate) fn endpoint(&self) -> Option<ConnectionInfo> {
-        self.endpoint
+    /// Resolves PostgreSQL's documented subscription `application_name`
+    /// default while the catalog identity is still available.  Workers receive
+    /// only this complete transport contract.
+    pub(crate) fn endpoint_for(
+        &self,
+        subscription: SqlName,
+    ) -> Option<crate::pg::replication_client::SubscriptionEndpoint> {
+        self.endpoint.map(|endpoint| {
+            crate::pg::replication_client::SubscriptionEndpoint::resolve(endpoint, subscription)
+        })
     }
 
-    pub(crate) fn require_endpoint(&self) -> Result<ConnectionInfo, SqlError> {
-        self.endpoint.ok_or_else(|| {
+    pub(crate) fn require_endpoint_for(
+        &self,
+        subscription: SqlName,
+    ) -> Result<crate::pg::replication_client::SubscriptionEndpoint, SqlError> {
+        self.endpoint_for(subscription).ok_or_else(|| {
             sql_err!(
                 sqlstate::INVALID_PARAMETER_VALUE,
                 "enabled subscription connection string requires a numeric host, port, user, dbname, and sslmode"

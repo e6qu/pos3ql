@@ -12682,7 +12682,7 @@ pub fn create_subscription(
         _ => crate::storage::SubscriptionBootstrap::Ready,
     };
     if options.enabled {
-        match connection.require_endpoint() {
+        match connection.require_endpoint_for(name) {
             Ok(_) => {}
             Err(error) => return sql_fail(error),
         }
@@ -12798,7 +12798,10 @@ pub fn alter_subscription(
                         "cannot enable a subscription without an existing publisher slot"
                     ));
                 }
-                if let Err(error) = validate_enabled_subscription(definition.connection) {
+                if let Err(error) = validate_enabled_subscription(
+                    definition.connection,
+                    subscription.name_for(txn.txid),
+                ) {
                     return sql_fail(error);
                 }
             }
@@ -12832,7 +12835,8 @@ pub fn alter_subscription(
                 Err(error) => return sql_fail(error),
             };
             if subscription.enabled_to(txn.txid)
-                && let Err(error) = validate_enabled_subscription(connection)
+                && let Err(error) =
+                    validate_enabled_subscription(connection, subscription.name_for(txn.txid))
             {
                 return sql_fail(error);
             }
@@ -13193,7 +13197,7 @@ fn stage_subscription_refresh(
             "cannot refresh a subscription without a replication slot"
         ));
     }
-    validate_enabled_subscription(definition.connection)?;
+    validate_enabled_subscription(definition.connection, SqlName::parse(name)?)?;
     let bootstrap = crate::storage::SubscriptionBootstrap::Refresh { copy_data };
     let prior = match storage.set_subscription_bootstrap(slot, bootstrap, txn.txid)? {
         crate::storage::SubscriptionBootstrapChange::Unchanged => return Ok(()),
@@ -13220,8 +13224,9 @@ fn stage_subscription_refresh(
 
 fn validate_enabled_subscription(
     connection: crate::storage::SubscriptionConnInfo,
+    subscription: SqlName,
 ) -> Result<(), SqlError> {
-    connection.require_endpoint().map(|_| ())
+    connection.require_endpoint_for(subscription).map(|_| ())
 }
 
 struct SubscriptionDefinitionUpdate<'a> {

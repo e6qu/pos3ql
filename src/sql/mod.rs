@@ -74,7 +74,7 @@ type ReturningCapture<'a> = dyn for<'row> FnMut(&[Datum<'row>]) -> Result<(), Sq
 #[derive(Clone, Copy)]
 pub(crate) struct SubscriptionRuntime {
     pub stream: crate::storage::SubscriptionStream,
-    pub endpoint: crate::pg::replication_client::ConnectionInfo,
+    pub endpoint: crate::pg::replication_client::SubscriptionEndpoint,
     pub publications: [SqlName; crate::storage::MAX_SUBSCRIPTION_PUBLICATIONS],
     pub publication_count: usize,
     pub slot: Option<SqlName>,
@@ -91,7 +91,7 @@ pub(crate) struct SubscriptionRuntime {
 pub(crate) struct SubscriptionCleanupRuntime {
     pub created_at: u64,
     pub name: SqlName,
-    pub endpoint: crate::pg::replication_client::ConnectionInfo,
+    pub endpoint: crate::pg::replication_client::SubscriptionEndpoint,
     pub slot: SqlName,
 }
 
@@ -1854,7 +1854,7 @@ impl Engine {
         Some(SubscriptionCleanupRuntime {
             created_at,
             name,
-            endpoint: connection.endpoint()?.for_subscription(name),
+            endpoint: connection.endpoint_for(name)?,
             slot: remote_slot,
         })
     }
@@ -1949,50 +1949,53 @@ impl Engine {
                         ))
             })
             .and_then(|(_, subscription)| {
-                subscription.connection.endpoint().and_then(|endpoint| {
-                    let publisher_slot = subscription
-                        .slot
-                        .name()
-                        .map(crate::storage::ReplicationSlotName::sql_name);
-                    let bootstrap_slot = match subscription.bootstrap {
-                        crate::storage::SubscriptionBootstrap::CopyExternalSlot
-                        | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
-                        | crate::storage::SubscriptionBootstrap::Refresh { .. } => {
-                            let generated =
-                                stack_format!(63, "pos3ql_{:x}_sync", subscription.created_at);
-                            Some(
-                                crate::storage::ReplicationSlotName::parse(generated.as_str())
-                                    .ok()?
-                                    .sql_name(),
-                            )
-                        }
-                        _ => publisher_slot,
-                    };
-                    self.storage
-                        .subscription_stream(slot, 0)
-                        .map(|stream| SubscriptionRuntime {
-                            stream,
-                            endpoint: endpoint.for_subscription(subscription.name),
-                            publications: subscription.publications,
-                            publication_count: subscription.publication_count,
-                            slot: publisher_slot,
-                            manage_slot_behavior: matches!(
-                                subscription.slot,
-                                crate::storage::SubscriptionSlot::Managed(_)
-                            ),
-                            bootstrap_slot,
-                            drop_bootstrap_slot: matches!(
-                                subscription.bootstrap,
-                                crate::storage::SubscriptionBootstrap::CopyExternalSlot
-                                    | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
-                                    | crate::storage::SubscriptionBootstrap::Refresh { .. }
-                            ),
-                            confirmed_lsn: subscription.confirmed_lsn,
-                            bootstrap: subscription.bootstrap,
-                            enabled: subscription.enabled_to(0),
-                            behavior: subscription.behavior,
+                subscription
+                    .connection
+                    .endpoint_for(subscription.name)
+                    .and_then(|endpoint| {
+                        let publisher_slot = subscription
+                            .slot
+                            .name()
+                            .map(crate::storage::ReplicationSlotName::sql_name);
+                        let bootstrap_slot = match subscription.bootstrap {
+                            crate::storage::SubscriptionBootstrap::CopyExternalSlot
+                            | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
+                            | crate::storage::SubscriptionBootstrap::Refresh { .. } => {
+                                let generated =
+                                    stack_format!(63, "pos3ql_{:x}_sync", subscription.created_at);
+                                Some(
+                                    crate::storage::ReplicationSlotName::parse(generated.as_str())
+                                        .ok()?
+                                        .sql_name(),
+                                )
+                            }
+                            _ => publisher_slot,
+                        };
+                        self.storage.subscription_stream(slot, 0).map(|stream| {
+                            SubscriptionRuntime {
+                                stream,
+                                endpoint,
+                                publications: subscription.publications,
+                                publication_count: subscription.publication_count,
+                                slot: publisher_slot,
+                                manage_slot_behavior: matches!(
+                                    subscription.slot,
+                                    crate::storage::SubscriptionSlot::Managed(_)
+                                ),
+                                bootstrap_slot,
+                                drop_bootstrap_slot: matches!(
+                                    subscription.bootstrap,
+                                    crate::storage::SubscriptionBootstrap::CopyExternalSlot
+                                        | crate::storage::SubscriptionBootstrap::CopyWithoutSlot
+                                        | crate::storage::SubscriptionBootstrap::Refresh { .. }
+                                ),
+                                confirmed_lsn: subscription.confirmed_lsn,
+                                bootstrap: subscription.bootstrap,
+                                enabled: subscription.enabled_to(0),
+                                behavior: subscription.behavior,
+                            }
                         })
-                })
+                    })
             })
     }
     /// Returns the startup-bounded endpoint retained for a durable
@@ -2004,7 +2007,8 @@ impl Engine {
     ) -> Option<crate::pg::replication_client::ConnectionInfo> {
         self.storage
             .subscription(name, 0)
-            .and_then(|(_, subscription)| subscription.connection.endpoint())
+            .and_then(|(_, subscription)| subscription.connection.endpoint_for(subscription.name))
+            .map(crate::pg::replication_client::SubscriptionEndpoint::connection)
     }
 
     pub fn subscription_confirmed_lsn(&self, name: &str) -> Option<u64> {
@@ -18254,7 +18258,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         } => {
             let connection = crate::storage::SubscriptionConnInfo::parse(connection)?;
             if enabled {
-                validate_recovered_enabled_subscription(connection)?;
+                validate_recovered_enabled_subscription(
+                    connection,
+                    crate::storage::SqlName::parse(name)?,
+                )?;
             }
             let slot = storage.create_subscription(
                 crate::storage::SubscriptionSpec {
@@ -18314,7 +18321,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 )
             })?;
             if enabled {
-                validate_recovered_enabled_subscription(subscription.connection)?;
+                validate_recovered_enabled_subscription(
+                    subscription.connection,
+                    crate::storage::SqlName::parse(name)?,
+                )?;
             }
             if matches!(
                 storage.set_subscription_enabled(slot, enabled, 0)?,
@@ -18462,7 +18472,10 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             })?;
             let connection = crate::storage::SubscriptionConnInfo::parse(connection)?;
             if subscription.enabled_to(0) {
-                validate_recovered_enabled_subscription(connection)?;
+                validate_recovered_enabled_subscription(
+                    connection,
+                    crate::storage::SqlName::parse(name)?,
+                )?;
             }
             let definition = crate::storage::SubscriptionDefinition::from_parts(
                 connection,
@@ -19748,8 +19761,9 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
 
 fn validate_recovered_enabled_subscription(
     connection: crate::storage::SubscriptionConnInfo,
+    subscription: crate::storage::SqlName,
 ) -> Result<(), SqlError> {
-    connection.require_endpoint().map(|_| ())
+    connection.require_endpoint_for(subscription).map(|_| ())
 }
 
 #[cfg(test)]

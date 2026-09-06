@@ -44490,7 +44490,7 @@ fn enabled_subscription_has_one_complete_durable_worker_description() {
         runtime.publications[..runtime.publication_count],
         [SqlName::parse("changes").unwrap()]
     );
-    assert_eq!(runtime.endpoint.application_name(), Some("apply_changes"));
+    assert_eq!(runtime.endpoint.application_name(), "apply_changes");
     assert_eq!(runtime.confirmed_lsn, 0);
 }
 
@@ -44783,6 +44783,74 @@ fn subscription_lifecycle_uses_the_transaction_visible_stream_definition() {
     assert_eq!(
         runtime.bootstrap,
         crate::storage::SubscriptionBootstrap::Refresh { copy_data: false }
+    );
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+}
+
+#[test]
+fn subscription_uri_conninfo_is_durable_and_resolves_the_protocol_default_once() {
+    let mut config = test_config("subscription-uri-conninfo");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("subscription-uri-conninfo-{}", std::process::id());
+    config.block_cache_bytes = crate::store::BLOCK_SIZE;
+    config.disk_cache_bytes = crate::store::BLOCK_SIZE;
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    let mut budget = Budget::new((1 << 29) + (96 << 20));
+    let mut engine = Engine::new(&config, &mut budget).unwrap();
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE SUBSCRIPTION uri_changes CONNECTION \
+         'postgresql://repl:secret%20word@127.0.0.1:5432/publisher?sslmode=disable&application_name=uri%20worker' \
+         PUBLICATION changes WITH (connect = false, slot_name = NONE); \
+         CREATE SUBSCRIPTION default_named_changes CONNECTION \
+         'postgres://repl@127.0.0.1:5432/publisher?sslmode=disable' \
+         PUBLICATION changes WITH (connect = false, slot_name = NONE)",
+    );
+    assert_eq!(
+        engine
+            .subscription_endpoint("uri_changes")
+            .unwrap()
+            .application_name(),
+        Some("uri worker")
+    );
+    assert_eq!(
+        engine
+            .subscription_endpoint("default_named_changes")
+            .unwrap()
+            .application_name(),
+        Some("default_named_changes")
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT subname, subconninfo FROM pg_subscription ORDER BY subname",
+        )),
+        [
+            "default_named_changes|postgres://repl@127.0.0.1:5432/publisher?sslmode=disable",
+            "uri_changes|postgresql://repl:secret%20word@127.0.0.1:5432/publisher?sslmode=disable&application_name=uri%20worker",
+        ]
+    );
+    assert!(engine.checkpoint().unwrap());
+    drop(engine);
+    let mut replay_budget = Budget::new((1 << 29) + (96 << 20));
+    let replayed = Engine::new(&config, &mut replay_budget).unwrap();
+    assert_eq!(
+        replayed
+            .subscription_endpoint("default_named_changes")
+            .unwrap()
+            .application_name(),
+        Some("default_named_changes"),
+        "cold recovery rebuilds the complete subscription transport identity"
+    );
+    assert_eq!(
+        replayed
+            .subscription_endpoint("uri_changes")
+            .unwrap()
+            .password(),
+        Some("secret word")
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }

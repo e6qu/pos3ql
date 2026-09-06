@@ -49,8 +49,51 @@ pub struct ConnectionInfo {
     ssl_mode: SslMode,
 }
 
+/// A publisher endpoint after PostgreSQL's subscription-specific
+/// `application_name` rule has been resolved.  Ordinary connection parsing
+/// deliberately retains an omitted application name; subscription catalog
+/// resolution turns that explicit protocol default into a complete transport
+/// value before a worker is bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SubscriptionEndpoint {
+    connection: ConnectionInfo,
+}
+
+impl SubscriptionEndpoint {
+    pub(crate) fn resolve(mut connection: ConnectionInfo, subscription: SqlName) -> Self {
+        if connection.application_name.is_none() {
+            connection.application_name = Some(StackStr::from_str(subscription.as_str()));
+        }
+        Self { connection }
+    }
+
+    pub(crate) fn connection(self) -> ConnectionInfo {
+        self.connection
+    }
+
+    #[cfg(test)]
+    pub(crate) fn host(&self) -> &str {
+        self.connection.host()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn port(&self) -> u16 {
+        self.connection.port()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn application_name(&self) -> &str {
+        self.connection
+            .application_name()
+            .expect("SubscriptionEndpoint resolves application_name")
+    }
+}
+
 impl ConnectionInfo {
     pub fn parse(input: &str) -> Result<Self, ConnectionInfoError> {
+        if input.starts_with("postgresql://") || input.starts_with("postgres://") {
+            return parse_connection_uri(input);
+        }
         let mut parser = ConnectionParser { input, at: 0 };
         let mut host = None;
         let mut port = None;
@@ -129,13 +172,6 @@ impl ConnectionInfo {
         self.application_name.as_ref().map(StackStr::as_str)
     }
 
-    pub(crate) fn for_subscription(mut self, subscription: SqlName) -> Self {
-        if self.application_name.is_none() {
-            self.application_name = Some(StackStr::from_str(subscription.as_str()));
-        }
-        self
-    }
-
     pub fn ssl_mode(&self) -> SslMode {
         self.ssl_mode
     }
@@ -182,9 +218,236 @@ impl ConnectionInfo {
 /// Disabled subscriptions retain this validated catalog text without opening a
 /// remote connection; enabling one requires `ConnectionInfo` below.
 pub(crate) fn validate_connection_syntax(input: &str) -> Result<(), ConnectionInfoError> {
+    if input.starts_with("postgresql://") || input.starts_with("postgres://") {
+        return validate_connection_uri(input);
+    }
     let mut parser = ConnectionParser { input, at: 0 };
     while parser.pair()?.is_some() {}
     Ok(())
+}
+
+fn decoded_uri_component<const N: usize>(input: &str) -> Result<StackStr<N>, ConnectionInfoError> {
+    let mut bytes = [0_u8; N];
+    let mut length = 0usize;
+    let mut at = 0usize;
+    while at < input.len() {
+        let byte = input.as_bytes()[at];
+        let decoded = if byte == b'%' {
+            let high = *input
+                .as_bytes()
+                .get(at + 1)
+                .ok_or(ConnectionInfoError::Syntax)?;
+            let low = *input
+                .as_bytes()
+                .get(at + 2)
+                .ok_or(ConnectionInfoError::Syntax)?;
+            at += 3;
+            hex(high)
+                .zip(hex(low))
+                .map(|(high, low)| high << 4 | low)
+                .ok_or(ConnectionInfoError::Syntax)?
+        } else {
+            at += 1;
+            byte
+        };
+        if length == bytes.len() {
+            return Err(ConnectionInfoError::Limit);
+        }
+        bytes[length] = decoded;
+        length += 1;
+    }
+    let decoded =
+        core::str::from_utf8(&bytes[..length]).map_err(|_| ConnectionInfoError::InvalidValue)?;
+    bounded(decoded)
+}
+
+const fn hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UriParts {
+    host: Option<StackStr<45>>,
+    port: Option<StackStr<5>>,
+    user: Option<StackStr<63>>,
+    database: Option<StackStr<63>>,
+    password: Option<StackStr<256>>,
+    application_name: Option<StackStr<64>>,
+    ssl_mode: Option<StackStr<16>>,
+}
+
+impl UriParts {
+    const fn new() -> Self {
+        Self {
+            host: None,
+            port: None,
+            user: None,
+            database: None,
+            password: None,
+            application_name: None,
+            ssl_mode: None,
+        }
+    }
+
+    fn set<const N: usize>(
+        field: &mut Option<StackStr<N>>,
+        value: StackStr<N>,
+    ) -> Result<(), ConnectionInfoError> {
+        if field.replace(value).is_some() {
+            return Err(ConnectionInfoError::Duplicate);
+        }
+        Ok(())
+    }
+
+    fn apply_query_pair(
+        &mut self,
+        key: &str,
+        value: &str,
+        strict: bool,
+    ) -> Result<(), ConnectionInfoError> {
+        match key {
+            "host" => Self::set(&mut self.host, decoded_uri_component(value)?),
+            "port" => Self::set(&mut self.port, decoded_uri_component(value)?),
+            "user" => Self::set(&mut self.user, decoded_uri_component(value)?),
+            "dbname" => Self::set(&mut self.database, decoded_uri_component(value)?),
+            "password" => Self::set(&mut self.password, decoded_uri_component(value)?),
+            "application_name" => {
+                Self::set(&mut self.application_name, decoded_uri_component(value)?)
+            }
+            "sslmode" => Self::set(&mut self.ssl_mode, decoded_uri_component(value)?),
+            _ if strict => Err(ConnectionInfoError::UnsupportedOption),
+            _ => {
+                let _ = decoded_uri_component::<SUBSCRIPTION_URI_COMPONENT_BYTES>(value)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+const SUBSCRIPTION_URI_COMPONENT_BYTES: usize = 256;
+
+fn parse_uri_parts(input: &str, strict: bool) -> Result<UriParts, ConnectionInfoError> {
+    let rest = input
+        .strip_prefix("postgresql://")
+        .or_else(|| input.strip_prefix("postgres://"))
+        .ok_or(ConnectionInfoError::Syntax)?;
+    let (authority_and_path, query) = rest
+        .split_once('?')
+        .map_or((rest, None), |(path, query)| (path, Some(query)));
+    let (authority, path) = authority_and_path
+        .split_once('/')
+        .map_or((authority_and_path, ""), |(authority, path)| {
+            (authority, path)
+        });
+    if authority.is_empty()
+        || authority.contains('/')
+        || path.contains('/')
+        || authority.contains('#')
+        || path.contains('#')
+    {
+        return Err(ConnectionInfoError::Syntax);
+    }
+    let mut parts = UriParts::new();
+    let (userinfo, hostport) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(userinfo, hostport)| {
+            (Some(userinfo), hostport)
+        });
+    if let Some(userinfo) = userinfo {
+        if userinfo.is_empty() || userinfo.contains('@') {
+            return Err(ConnectionInfoError::Syntax);
+        }
+        let (user, password) = userinfo
+            .split_once(':')
+            .map_or((userinfo, None), |(user, password)| (user, Some(password)));
+        UriParts::set(&mut parts.user, decoded_uri_component(user)?)?;
+        if let Some(password) = password {
+            UriParts::set(&mut parts.password, decoded_uri_component(password)?)?;
+        }
+    }
+    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+        let (host, remainder) = rest.split_once(']').ok_or(ConnectionInfoError::Syntax)?;
+        let port = remainder
+            .strip_prefix(':')
+            .ok_or(ConnectionInfoError::Syntax)?;
+        if host.is_empty() || port.is_empty() || remainder[1..].contains(':') {
+            return Err(ConnectionInfoError::Syntax);
+        }
+        (host, port)
+    } else {
+        hostport
+            .split_once(':')
+            .ok_or(ConnectionInfoError::Syntax)?
+    };
+    UriParts::set(&mut parts.host, decoded_uri_component(host)?)?;
+    UriParts::set(&mut parts.port, decoded_uri_component(port)?)?;
+    if !path.is_empty() {
+        UriParts::set(&mut parts.database, decoded_uri_component(path)?)?;
+    }
+    if let Some(query) = query {
+        if query.is_empty() {
+            return Err(ConnectionInfoError::Syntax);
+        }
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').ok_or(ConnectionInfoError::Syntax)?;
+            if key.is_empty() {
+                return Err(ConnectionInfoError::Syntax);
+            }
+            let key = decoded_uri_component::<64>(key)?;
+            parts.apply_query_pair(key.as_str(), value, strict)?;
+        }
+    }
+    Ok(parts)
+}
+
+fn validate_connection_uri(input: &str) -> Result<(), ConnectionInfoError> {
+    let _ = parse_uri_parts(input, false)?;
+    Ok(())
+}
+
+fn parse_connection_uri(input: &str) -> Result<ConnectionInfo, ConnectionInfoError> {
+    let parts = parse_uri_parts(input, true)?;
+    let host = parts.host.ok_or(ConnectionInfoError::Missing("host"))?;
+    if host.as_str().parse::<IpAddr>().is_err() {
+        return Err(ConnectionInfoError::NonNumericHost);
+    }
+    let port = parts
+        .port
+        .ok_or(ConnectionInfoError::Missing("port"))?
+        .as_str()
+        .parse::<u16>()
+        .map_err(|_| ConnectionInfoError::InvalidPort)?;
+    if port == 0 {
+        return Err(ConnectionInfoError::InvalidPort);
+    }
+    let user = parts.user.ok_or(ConnectionInfoError::Missing("user"))?;
+    let database = parts
+        .database
+        .ok_or(ConnectionInfoError::Missing("dbname"))?;
+    let ssl_mode = match parts
+        .ssl_mode
+        .ok_or(ConnectionInfoError::Missing("sslmode"))?
+        .as_str()
+    {
+        "disable" => SslMode::Disable,
+        "prefer" => SslMode::Prefer,
+        "require" => SslMode::Require,
+        _ => return Err(ConnectionInfoError::UnsupportedSslMode),
+    };
+    Ok(ConnectionInfo {
+        host,
+        port,
+        user,
+        database,
+        password: parts.password,
+        application_name: parts.application_name,
+        ssl_mode,
+    })
 }
 
 fn bounded<const N: usize>(value: &str) -> Result<StackStr<N>, ConnectionInfoError> {
@@ -1912,6 +2175,52 @@ mod tests {
                 "host=127.0.0.1 host=127.0.0.2 port=5432 user=repl dbname=target sslmode=disable"
             ),
             Err(ConnectionInfoError::Duplicate)
+        ));
+    }
+
+    #[test]
+    fn subscription_uri_conninfo_is_typed_before_a_worker_is_bound() {
+        guard::forbid_alloc(|| {
+            let connection = ConnectionInfo::parse(
+                "postgresql://repl:secret%20word@127.0.0.1:5432/publisher?sslmode=disable&application_name=apply%20worker",
+            )
+            .unwrap();
+            assert_eq!(connection.host(), "127.0.0.1");
+            assert_eq!(connection.port(), 5432);
+            assert_eq!(connection.user(), "repl");
+            assert_eq!(connection.database(), "publisher");
+            assert_eq!(connection.password(), Some("secret word"));
+            assert_eq!(connection.application_name(), Some("apply worker"));
+            assert_eq!(connection.ssl_mode(), SslMode::Disable);
+
+            let defaulted =
+                ConnectionInfo::parse("postgres://repl@127.0.0.1:5432/publisher?sslmode=disable")
+                    .unwrap();
+            let endpoint = SubscriptionEndpoint::resolve(
+                defaulted,
+                SqlName::parse("subscription_default").unwrap(),
+            );
+            assert_eq!(
+                endpoint.connection().application_name(),
+                Some("subscription_default"),
+                "PostgreSQL defaults a subscription standby name to its subscription name"
+            );
+        });
+        assert!(matches!(
+            ConnectionInfo::parse(
+                "postgresql://repl@127.0.0.1:5432/publisher?sslmode=disable&unsupported=value"
+            ),
+            Err(ConnectionInfoError::UnsupportedOption)
+        ));
+        assert!(matches!(
+            ConnectionInfo::parse("postgresql://repl@127.0.0.1:5432/publisher?sslmode=dis%ZZable"),
+            Err(ConnectionInfoError::Syntax)
+        ));
+        assert!(matches!(
+            validate_connection_syntax(
+                "postgresql://repl@127.0.0.1:5432/publisher?sslmode=disable&bad%ZZ=value"
+            ),
+            Err(ConnectionInfoError::Syntax)
         ));
     }
 

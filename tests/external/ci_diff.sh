@@ -489,8 +489,12 @@ else
       SELECT key,built_in FROM extension_dump.extension_config ORDER BY key;
       SELECT extension_dump.extension_identity('restored');
       SELECT value FROM extension_dump.extension_snapshot;
+      SELECT count(*) FROM pg_foreign_data_wrapper WHERE fdwname='extension_member_wrapper';
+      SELECT count(*) FROM pg_foreign_server WHERE srvname='extension_member_server';
+      SELECT count(*) FROM pg_foreign_table WHERE ftrelid='extension_dump.extension_member_foreign'::regclass;
+      SELECT count(*) FROM pg_event_trigger WHERE evtname='extension_member_event';
     " 2>/dev/null)
-  expected_extension_observed=$'pos3ql_base|1.0|extension_dump\npos3ql_ext|2.0|extension_dump\n0\nuser row|f\nrestored\n42'
+  expected_extension_observed=$'pos3ql_base|1.0|extension_dump\npos3ql_ext|2.0|extension_dump\n0\nuser row|f\nrestored\n42\n1\n1\n1\n1'
   if [[ "$extension_observed" == "$expected_extension_observed" ]]; then
     ok "SQL extension definitions and configuration rows survive pg_dump into PostgreSQL 18"
   else

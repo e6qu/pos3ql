@@ -11686,10 +11686,12 @@ impl Storage {
             foreign::ForeignObjectClass::Mapping | foreign::ForeignObjectClass::Table => None,
         };
         if let Some(class) = access {
-            self.clear_object_acl_entries(AccessObject {
+            let object = AccessObject {
                 class,
                 slot: slot as u16,
-            });
+            };
+            self.clear_object_acl_entries(object);
+            self.clear_extension_dependencies_for_object(object);
         }
         if class == foreign::ForeignObjectClass::Server {
             self.drop_comments_by_subid(CommentClass::ForeignServer, slot as u32);
@@ -19868,7 +19870,6 @@ impl Storage {
         if exists
             && kind == ExtensionDependencyKind::Member
             && let Some(other) = self.extension_member_of(object, txid)
-            && other != extension
         {
             return Err(sql_err!(
                 sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -36289,6 +36290,10 @@ impl Storage {
         self.drop_object_comments(CommentClass::EventTrigger, "", name.as_str());
         self.event_triggers[slot].pending = None;
         self.event_triggers[slot].ddl_state = self.event_triggers[slot].ddl_state.commit_drop();
+        self.clear_extension_dependencies_for_object(AccessObject {
+            class: AccessClass::EventTrigger,
+            slot: slot as u16,
+        });
     }
 
     pub(crate) fn rollback_event_trigger_drop(&mut self, slot: usize, txid: u32) {

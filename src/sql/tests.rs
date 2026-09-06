@@ -5549,7 +5549,12 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
          SELECT pg_catalog.pg_extension_config_dump('typed_config', 'WHERE NOT built_in');\n\
          SELECT pg_catalog.pg_extension_config_dump('typed_config_sequence', '');\n\
          CREATE VIEW typed_view AS SELECT id, value FROM typed_values;\n\
-         CREATE MATERIALIZED VIEW typed_snapshot AS SELECT 42 AS value;\n",
+         CREATE MATERIALIZED VIEW typed_snapshot AS SELECT 42 AS value;\n\
+         CREATE FOREIGN DATA WRAPPER typed_script_wrapper NO HANDLER NO VALIDATOR;\n\
+         CREATE SERVER typed_script_server FOREIGN DATA WRAPPER typed_script_wrapper;\n\
+         CREATE FOREIGN TABLE typed_script_foreign(id integer) SERVER typed_script_server;\n\
+         CREATE FUNCTION typed_script_event_function() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;\n\
+         CREATE EVENT TRIGGER typed_script_event ON ddl_command_end EXECUTE FUNCTION typed_script_event_function();\n",
     )
     .unwrap();
     std::fs::write(
@@ -5628,20 +5633,26 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
          SELECT value, enabled FROM moved_extensions.typed_values; \
          SELECT nextval('moved_extensions.typed_sequence'); \
          SELECT value FROM moved_extensions.typed_snapshot; \
-         SELECT count(*) FROM moved_extensions.typed_view;",
+         SELECT count(*) FROM moved_extensions.typed_view; \
+         SELECT count(*) FROM pg_foreign_table \
+           WHERE ftrelid='moved_extensions.typed_script_foreign'::regclass; \
+         SELECT count(*) FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid \
+           WHERE e.extname='typed_ext' AND d.deptype='e';",
     );
     assert_eq!(
         data_rows(&output),
         [
             "base_ext|1.0|extensions|t",
             "typed_ext|1.0|extensions|t",
-            "10",
+            "15",
             "t|{\"WHERE NOT built_in\",\"\"}",
             "5",
             "kept|t",
             "1",
             "42",
             "1",
+            "1",
+            "13",
         ],
         "{}",
         String::from_utf8_lossy(&output)
@@ -5660,6 +5671,10 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
              SELECT nextval('moved_extensions.typed_sequence'); \
              SELECT value FROM moved_extensions.typed_snapshot; \
              SELECT count(*) FROM moved_extensions.typed_view; \
+             SELECT count(*) FROM pg_foreign_table \
+               WHERE ftrelid='moved_extensions.typed_script_foreign'::regclass; \
+             SELECT count(*) FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid \
+               WHERE e.extname='typed_ext' AND d.deptype='e'; \
              SELECT extcondition::text FROM pg_extension WHERE extname='typed_ext'; \
              SELECT description FROM pg_description d JOIN pg_extension e \
                ON e.oid=d.objoid WHERE e.extname='typed_ext'",
@@ -5672,6 +5687,8 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
             "2",
             "42",
             "1",
+            "1",
+            "13",
             "{\"WHERE built_in IS FALSE\",\"\"}",
             "typed extension v2"
         ]
@@ -5693,6 +5710,10 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
              SELECT value, enabled FROM moved_extensions.typed_values; \
              SELECT value FROM moved_extensions.typed_snapshot; \
              SELECT count(*) FROM moved_extensions.typed_view; \
+             SELECT count(*) FROM pg_foreign_table \
+               WHERE ftrelid='moved_extensions.typed_script_foreign'::regclass; \
+             SELECT count(*) FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid \
+               WHERE e.extname='typed_ext' AND d.deptype='e'; \
              SELECT extcondition::text FROM pg_extension WHERE extname='typed_ext'; \
              SELECT version FROM pg_available_extension_versions \
                WHERE name='typed_ext' ORDER BY version; \
@@ -5708,6 +5729,8 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
             "kept|t",
             "42",
             "1",
+            "1",
+            "13",
             "{\"WHERE built_in IS FALSE\",\"\"}",
             "1.0",
             "2.0",
@@ -5754,11 +5777,15 @@ fn extension_packages_execute_transactionally_and_recover_catalog_state() {
          SELECT count(*) FROM pg_extension; \
          SELECT count(*) FROM pg_class WHERE relname='typed_values'; \
          SELECT count(*) FROM pg_proc WHERE proname='typed_identity'; \
-         SELECT count(*) FROM pg_proc WHERE proname='aggregate_dependency_total'",
+         SELECT count(*) FROM pg_proc WHERE proname='aggregate_dependency_total'; \
+         SELECT count(*) FROM pg_foreign_data_wrapper WHERE fdwname='typed_script_wrapper'; \
+         SELECT count(*) FROM pg_foreign_server WHERE srvname='typed_script_server'; \
+         SELECT count(*) FROM pg_class WHERE relname='typed_script_foreign'; \
+         SELECT count(*) FROM pg_event_trigger WHERE evtname='typed_script_event'",
     );
     assert_eq!(
         data_rows(&dropped),
-        ["0", "0", "0", "0"],
+        ["0", "0", "0", "0", "0", "0", "0", "0"],
         "{}",
         String::from_utf8_lossy(&dropped)
     );
@@ -6004,16 +6031,80 @@ fn extension_lifecycle_rejects_invalid_states_and_obeys_dependency_classes() {
         String::from_utf8_lossy(&automatic)
     );
 
-    let aggregate_dependency = run_with(
+    let special_members = run_with(
         &mut engine,
         &mut budget,
-        "ALTER AGGREGATE extension_sum(integer) DEPENDS ON EXTENSION required_ext",
+        "CREATE EXTENSION empty_ext; \
+         CREATE FOREIGN DATA WRAPPER extension_member_wrapper NO HANDLER NO VALIDATOR; \
+         CREATE SERVER extension_member_server FOREIGN DATA WRAPPER extension_member_wrapper; \
+         CREATE FOREIGN TABLE extension_member_foreign(id integer) \
+           SERVER extension_member_server; \
+         CREATE FUNCTION extension_member_event_function() RETURNS event_trigger \
+           LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$; \
+         CREATE EVENT TRIGGER extension_member_event ON ddl_command_end \
+           EXECUTE FUNCTION extension_member_event_function(); \
+         ALTER EXTENSION empty_ext ADD FOREIGN DATA WRAPPER extension_member_wrapper; \
+         ALTER EXTENSION empty_ext ADD SERVER extension_member_server; \
+         ALTER EXTENSION empty_ext ADD FOREIGN TABLE extension_member_foreign; \
+         ALTER EXTENSION empty_ext ADD EVENT TRIGGER extension_member_event",
     );
     assert!(
-        String::from_utf8_lossy(&aggregate_dependency).contains("C42601"),
+        !String::from_utf8_lossy(&special_members).contains("SERROR"),
         "{}",
-        String::from_utf8_lossy(&aggregate_dependency)
+        String::from_utf8_lossy(&special_members)
     );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_depend d JOIN pg_extension e ON e.oid=d.refobjid \
+               WHERE e.extname='empty_ext' AND d.deptype='e'",
+        )),
+        ["4"]
+    );
+    for command in [
+        "ALTER EXTENSION empty_ext ADD FOREIGN DATA WRAPPER extension_member_wrapper",
+        "ALTER EXTENSION empty_ext ADD SERVER extension_member_server",
+        "ALTER EXTENSION empty_ext ADD FOREIGN TABLE extension_member_foreign",
+        "ALTER EXTENSION empty_ext ADD EVENT TRIGGER extension_member_event",
+    ] {
+        let duplicate = run_with(&mut engine, &mut budget, command);
+        assert!(
+            String::from_utf8_lossy(&duplicate).contains("C55000"),
+            "{command}: {}",
+            String::from_utf8_lossy(&duplicate)
+        );
+    }
+    for command in [
+        "DROP FOREIGN TABLE extension_member_foreign",
+        "DROP SERVER extension_member_server",
+        "DROP FOREIGN DATA WRAPPER extension_member_wrapper",
+        "DROP EVENT TRIGGER extension_member_event",
+    ] {
+        let rejected = run_with(&mut engine, &mut budget, command);
+        assert!(
+            String::from_utf8_lossy(&rejected).contains("extension \"empty_ext\" requires it"),
+            "{command}: {}",
+            String::from_utf8_lossy(&rejected)
+        );
+    }
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "DROP EXTENSION empty_ext; \
+             SELECT count(*) FROM pg_foreign_data_wrapper \
+               WHERE fdwname='extension_member_wrapper'; \
+             SELECT count(*) FROM pg_foreign_server \
+               WHERE srvname='extension_member_server'; \
+             SELECT count(*) FROM pg_foreign_table \
+               WHERE ftrelid='extension_member_foreign'::regclass; \
+             SELECT count(*) FROM pg_event_trigger \
+               WHERE evtname='extension_member_event'",
+        )),
+        ["0", "0", "0", "0"]
+    );
+
     let index_if_exists_dependency = run_with(
         &mut engine,
         &mut budget,

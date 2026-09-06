@@ -25,6 +25,19 @@ JOIN pg_class AS c
 WHERE e.extname = 'pos3ql_ext' AND c.relname = 'extension_rows';
 
 INSERT INTO extension_install.extension_rows VALUES (1, 'before');
+CREATE FOREIGN DATA WRAPPER extension_member_fdw NO HANDLER NO VALIDATOR;
+CREATE SERVER extension_member_server
+  FOREIGN DATA WRAPPER extension_member_fdw;
+CREATE FOREIGN TABLE extension_install.extension_member_foreign (id integer)
+  SERVER extension_member_server;
+CREATE FUNCTION extension_member_event_function() RETURNS event_trigger
+LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;
+CREATE EVENT TRIGGER extension_member_event ON ddl_command_end
+WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION extension_member_event_function();
+ALTER EXTENSION pos3ql_ext ADD FOREIGN DATA WRAPPER extension_member_fdw;
+ALTER EXTENSION pos3ql_ext ADD SERVER extension_member_server;
+ALTER EXTENSION pos3ql_ext ADD FOREIGN TABLE extension_install.extension_member_foreign;
+ALTER EXTENSION pos3ql_ext ADD EVENT TRIGGER extension_member_event;
 ALTER EXTENSION pos3ql_ext UPDATE TO '2.0';
 SELECT id, value, enabled FROM extension_install.extension_rows;
 
@@ -35,6 +48,8 @@ FROM pg_extension AS e
 JOIN pg_namespace AS n ON n.oid = e.extnamespace
 WHERE e.extname = 'pos3ql_ext';
 SELECT extension_moved.extension_identity('moved') AS identity;
+SELECT count(*) FROM pg_foreign_table
+WHERE ftrelid = 'extension_moved.extension_member_foreign'::regclass;
 
 CREATE TABLE extension_member(id integer);
 ALTER EXTENSION pos3ql_ext ADD TABLE extension_member;
@@ -66,6 +81,7 @@ CREATE AGGREGATE extension_auto_sum(integer) (
   INITCOND = '0'
 );
 ALTER ROUTINE extension_auto_sum(integer) DEPENDS ON EXTENSION pos3ql_ext;
+ALTER AGGREGATE extension_auto_sum(integer) DEPENDS ON EXTENSION pos3ql_ext;
 
 SELECT count(*)
 FROM pg_depend AS d
@@ -89,6 +105,13 @@ SELECT count(*) FROM pg_class
 WHERE relname IN ('extension_auto_index', 'extension_auto_matview');
 SELECT count(*) FROM pg_proc
 WHERE proname IN ('extension_auto_function', 'extension_auto_state', 'extension_auto_sum');
+SELECT count(*) FROM pg_foreign_data_wrapper WHERE fdwname = 'extension_member_fdw';
+SELECT count(*) FROM pg_foreign_server WHERE srvname = 'extension_member_server';
+SELECT count(*)
+FROM pg_foreign_table AS f
+JOIN pg_class AS c ON c.oid = f.ftrelid
+WHERE c.relname = 'extension_member_foreign';
+SELECT count(*) FROM pg_event_trigger WHERE evtname = 'extension_member_event';
 SELECT value FROM extension_survivor;
 SELECT count(*) FROM extension_member;
 

@@ -4130,6 +4130,7 @@ pub enum AlterRoutineAction<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionRelationKind {
     Table,
+    ForeignTable,
     View,
     MaterializedView,
     Sequence,
@@ -4151,6 +4152,9 @@ pub enum ExtensionMemberIdentity<'a> {
     Schema(&'a str),
     Domain(QualName<'a>),
     Type(QualName<'a>),
+    EventTrigger(&'a str),
+    ForeignDataWrapper(&'a str),
+    ForeignServer(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

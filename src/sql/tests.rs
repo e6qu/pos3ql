@@ -9351,6 +9351,25 @@ fn role_database_settings_are_transactional_catalogued_and_object_durable() {
         guc.get_owned("search_path").unwrap().as_str(),
         "configured_login, public"
     );
+    let planner_settings = guc.planner_settings();
+    assert_eq!(planner_settings.entries().len(), 1);
+    assert_eq!(planner_settings.entries()[0].name(), "search_path");
+    assert_eq!(
+        planner_settings.entries()[0].value(),
+        "configured_login, public"
+    );
+    let configured_explain_bytes = run_with_guc(
+        &mut engine,
+        &mut budget,
+        "EXPLAIN (SETTINGS) SELECT 1",
+        1 << 18,
+        &mut guc,
+    );
+    let configured_explain = String::from_utf8_lossy(&configured_explain_bytes);
+    assert!(
+        configured_explain.contains("Settings: search_path = 'configured_login, public'"),
+        "{configured_explain}"
+    );
     assert_eq!(guc.get_owned("statement_timeout").unwrap().as_str(), "0");
     assert!(engine.checkpoint().unwrap());
     drop(engine);
@@ -9370,6 +9389,28 @@ fn role_database_settings_are_transactional_catalogued_and_object_durable() {
             .unwrap()
             .as_str(),
         "role-database-default"
+    );
+    let recovered_planner_settings = recovered_guc.planner_settings();
+    assert_eq!(recovered_planner_settings.entries().len(), 1);
+    assert_eq!(
+        recovered_planner_settings.entries()[0].name(),
+        "search_path"
+    );
+    assert_eq!(
+        recovered_planner_settings.entries()[0].value(),
+        "configured_login, public"
+    );
+    let recovered_explain_bytes = run_with_guc(
+        &mut recovered,
+        &mut recovered_budget,
+        "EXPLAIN (SETTINGS) SELECT 1",
+        1 << 18,
+        &mut recovered_guc,
+    );
+    let recovered_explain = String::from_utf8_lossy(&recovered_explain_bytes);
+    assert!(
+        recovered_explain.contains("Settings: search_path = 'configured_login, public'"),
+        "{recovered_explain}"
     );
     assert_eq!(
         data_rows(&run_with(
@@ -32387,14 +32428,81 @@ fn explain_uses_statistics_and_analyze_executes_without_returning_query_rows() {
         "EXPLAIN (GENERIC_PLAN, ANALYZE) SELECT * FROM ep",
     );
     assert!(String::from_utf8_lossy(&invalid_generic).contains("22023"));
-    for command in [
-        "EXPLAIN (SETTINGS) SELECT * FROM ep",
-        "EXPLAIN (GENERIC_PLAN) SELECT * FROM ep",
+    let settings = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "SET search_path = public; EXPLAIN (SETTINGS) SELECT * FROM ep",
+    ));
+    assert!(
+        settings
+            .iter()
+            .any(|row| row == "Settings: search_path = 'public'"),
+        "{settings:?}"
+    );
+    for (format, expected) in [
+        ("JSON", "\"Settings\":{\"search_path\":\"public\"}"),
+        (
+            "XML",
+            "<Settings><search_path>public</search_path></Settings>",
+        ),
+        ("YAML", "Settings:\n    search_path: \"public\""),
     ] {
-        let output = run_with(&mut engine, &mut budget, command);
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            &format!(
+                "SET search_path = public; EXPLAIN (SETTINGS, FORMAT {format}) SELECT * FROM ep"
+            ),
+        );
         let text = String::from_utf8_lossy(&output);
-        assert!(text.contains("0A000"), "{command}: {text}");
+        assert!(text.contains(expected), "{format}: {text}");
     }
+    let generic = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "PREPARE ep_by_id(int) AS SELECT payload FROM ep WHERE id = $1; \
+         EXPLAIN (GENERIC_PLAN) EXECUTE ep_by_id(2)",
+    ));
+    assert!(
+        generic.iter().any(|row| row.contains("Seq Scan on ep")),
+        "{generic:?}"
+    );
+    let analyzed_prepared = data_rows(&run_with(
+        &mut engine,
+        &mut budget,
+        "PREPARE ep_analyze(int) AS SELECT payload FROM ep WHERE id = $1; \
+         EXPLAIN (ANALYZE) EXECUTE ep_analyze(2)",
+    ));
+    assert!(
+        analyzed_prepared
+            .iter()
+            .any(|row| row.contains("actual time") && row.contains("rows=1.00")),
+        "{analyzed_prepared:?}"
+    );
+    let dynamic_settings = run_with(
+        &mut engine,
+        &mut budget,
+        "SET search_path = public; \
+         CREATE FUNCTION ep_dynamic_explain_settings() RETURNS boolean LANGUAGE plpgsql AS $$ \
+         DECLARE plan text; \
+         BEGIN \
+           EXECUTE 'EXPLAIN (SETTINGS, FORMAT JSON) SELECT * FROM ep' INTO STRICT plan; \
+           IF position('\"Settings\":{\"search_path\":\"public\"}' IN plan) = 0 THEN \
+             RETURN false; \
+           END IF; \
+           EXECUTE 'PREPARE ep_dynamic_generic(int) AS SELECT payload FROM ep WHERE id = $1'; \
+           EXECUTE 'EXPLAIN (GENERIC_PLAN, FORMAT JSON) EXECUTE ep_dynamic_generic(2)' \
+             INTO STRICT plan; \
+           RETURN position('\"Node Type\"' IN plan) > 0; \
+         END $$; \
+         SELECT ep_dynamic_explain_settings()",
+    );
+    assert_eq!(
+        data_rows(&dynamic_settings),
+        ["t"],
+        "dynamic EXPLAIN must render the active planner settings: {}",
+        String::from_utf8_lossy(&dynamic_settings)
+    );
 
     let detailed = data_rows(&run_with(
         &mut engine,

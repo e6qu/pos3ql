@@ -14,6 +14,7 @@ use crate::sql::ast::{
     SetOp, SetQuery, SetTree, Stmt,
 };
 use crate::sql::eval::{SqlError, sqlstate};
+use crate::sql::guc::PlannerSettings;
 use crate::sql::query::{self, QueryScope};
 use crate::sql::types::{ColDesc, Datum, oid};
 use crate::sql_err;
@@ -1283,10 +1284,11 @@ fn emit_text(
     plan: &Plan,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
+    settings: &PlannerSettings,
     responder: &mut Responder,
 ) -> Result<(), WireFull> {
     responder.row_description(&[ColDesc::new("QUERY PLAN", oid::TEXT, -1)])?;
-    visit_text_rows(plan, options, actual, |line| {
+    visit_text_rows(plan, options, actual, settings, |line| {
         responder.data_row(&[Datum::Text(line)])
     })?;
     responder.command_complete("EXPLAIN")
@@ -1296,6 +1298,7 @@ pub(super) fn visit_text_rows<E>(
     plan: &Plan,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
+    settings: &PlannerSettings,
     mut emit: impl FnMut(&str) -> Result<(), E>,
 ) -> Result<(), E> {
     for (index, node) in plan.nodes[..plan.count].iter().enumerate() {
@@ -1333,6 +1336,25 @@ pub(super) fn visit_text_rows<E>(
             );
             emit(wal.as_str())?;
         }
+    }
+    if options.settings && !settings.entries().is_empty() {
+        let mut line = StackStr::<512>::new();
+        let _ = write!(line, "Settings: ");
+        for (index, setting) in settings.entries().iter().enumerate() {
+            if index != 0 {
+                let _ = write!(line, ", ");
+            }
+            let _ = write!(line, "{} = '", setting.name());
+            for character in setting.value().chars() {
+                if character == '\'' {
+                    let _ = write!(line, "''");
+                } else {
+                    let _ = write!(line, "{character}");
+                }
+            }
+            let _ = write!(line, "'");
+        }
+        emit(line.as_str())?;
     }
     if options.memory {
         emit("Planning:")?;
@@ -1594,10 +1616,25 @@ fn xml_text(out: &mut StackStr<16_384>, value: &str) {
     }
 }
 
+fn render_xml_settings(out: &mut StackStr<16_384>, settings: &PlannerSettings) {
+    let _ = write!(out, "<Settings>");
+    for setting in settings.entries() {
+        let _ = write!(out, "<");
+        xml_text(out, setting.name());
+        let _ = write!(out, ">");
+        xml_text(out, setting.value());
+        let _ = write!(out, "</");
+        xml_text(out, setting.name());
+        let _ = write!(out, ">");
+    }
+    let _ = write!(out, "</Settings>");
+}
+
 fn render_document(
     plan: &Plan,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
+    settings: &PlannerSettings,
 ) -> Result<StackStr<16_384>, SqlError> {
     let mut out = StackStr::new();
     match options.format {
@@ -1605,6 +1642,18 @@ fn render_document(
         ExplainFormat::Json => {
             let _ = write!(out, "[{{\"Plan\":");
             render_json_node(plan, 0, options, actual, &mut out);
+            if options.settings {
+                let _ = write!(out, ",\"Settings\":{{");
+                for (index, setting) in settings.entries().iter().enumerate() {
+                    if index != 0 {
+                        let _ = write!(out, ",");
+                    }
+                    json_string(&mut out, setting.name());
+                    let _ = write!(out, ":");
+                    json_string(&mut out, setting.value());
+                }
+                let _ = write!(out, "}}");
+            }
             if options.memory {
                 let used = core::mem::size_of::<Plan>()
                     .saturating_sub(
@@ -1692,13 +1741,20 @@ fn render_document(
                     )
                     .div_ceil(1024);
                 let allocated = core::mem::size_of::<Plan>().div_ceil(1024);
+                let _ = write!(out, "</Plan>");
+                if options.settings {
+                    render_xml_settings(&mut out, settings);
+                }
                 let _ = write!(
                     out,
-                    "</Plan><Planning><Memory-Used>{}</Memory-Used><Memory-Allocated>{}</Memory-Allocated></Planning>",
+                    "<Planning><Memory-Used>{}</Memory-Used><Memory-Allocated>{}</Memory-Allocated></Planning>",
                     used, allocated
                 );
             } else if options.summary {
                 let _ = write!(out, "</Plan>");
+                if options.settings {
+                    render_xml_settings(&mut out, settings);
+                }
             }
             if options.summary {
                 let _ = write!(
@@ -1728,6 +1784,9 @@ fn render_document(
                 }
             } else if !options.memory {
                 let _ = write!(out, "</Plan>");
+                if options.settings {
+                    render_xml_settings(&mut out, settings);
+                }
             }
             let _ = write!(out, "</Query></explain>");
         }
@@ -1774,6 +1833,14 @@ fn render_document(
                     let _ = write!(out, "  ");
                 }
                 let _ = writeln!(out, "  Disabled: false");
+            }
+            if options.settings {
+                let _ = writeln!(out, "  Settings:");
+                for setting in settings.entries() {
+                    let _ = write!(out, "    {}: ", setting.name());
+                    json_string(&mut out, setting.value());
+                    let _ = writeln!(out);
+                }
             }
             if options.memory {
                 let used = core::mem::size_of::<Plan>()
@@ -1831,12 +1898,13 @@ pub(super) fn visit_plan_rows(
     plan: &Plan,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
+    settings: &PlannerSettings,
     mut emit: impl FnMut(&str) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     if options.format == ExplainFormat::Text {
-        return visit_text_rows(plan, options, actual, |line| emit(line));
+        return visit_text_rows(plan, options, actual, settings, |line| emit(line));
     }
-    let document = render_document(plan, options, actual)?;
+    let document = render_document(plan, options, actual, settings)?;
     emit(document.as_str())
 }
 
@@ -1844,13 +1912,14 @@ pub(super) fn emit_plan(
     plan: &Plan,
     options: ExplainOptions,
     actual: Option<ExplainActual>,
+    settings: &PlannerSettings,
     responder: &mut Responder,
 ) -> Result<Result<(), SqlError>, WireFull> {
     if options.format == ExplainFormat::Text {
-        emit_text(plan, options, actual, responder)?;
+        emit_text(plan, options, actual, settings, responder)?;
         return Ok(Ok(()));
     }
-    let document = match render_document(plan, options, actual) {
+    let document = match render_document(plan, options, actual, settings) {
         Ok(document) => document,
         Err(error) => return Ok(Err(error)),
     };

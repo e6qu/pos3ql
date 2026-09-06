@@ -21025,12 +21025,26 @@ fn execute_plpgsql_dynamic_explain(
     options: ExplainOptions,
     statement: &Stmt<'_>,
     arguments: &[Datum],
+    scope: &TriggerLocalScope<'_, '_>,
     emit: &mut dyn FnMut(&str) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
+    let planned = resolve_plpgsql_dynamic_prepared(
+        context,
+        BoundPlpgsqlDynamicQuery {
+            statement,
+            arguments,
+        },
+        scope,
+    )?;
+    let settings = if options.settings {
+        super::guc::active_planner_settings()
+    } else {
+        super::guc::PlannerSettings::EMPTY
+    };
     let plan = super::explain::plan_statement(
         context.storage(),
         context.txn.txid,
-        statement,
+        planned.statement,
         context.arena,
     )?;
     let actual = if options.analyze {
@@ -21052,8 +21066,14 @@ fn execute_plpgsql_dynamic_explain(
         let touched_mark = txn.touched().len();
         let started = std::time::Instant::now();
         responder.begin_discard_query_output(options.serialize);
-        let execution =
-            engine.execute_explained_statement(statement, arena, arguments, txn, guc, responder);
+        let execution = engine.execute_explained_statement(
+            planned.statement,
+            arena,
+            planned.arguments,
+            txn,
+            guc,
+            responder,
+        );
         let output = responder.finish_discard_query_output();
         match execution {
             Err(_) => {
@@ -21069,7 +21089,7 @@ fn execute_plpgsql_dynamic_explain(
         let (after_wal_records, after_wal_bytes) = engine.wal.stage_stats(txn.txid);
         let (row_wal_records, row_wal_bytes) = engine.explained_row_wal_stats(txn, touched_mark)?;
         Some(super::explain::ExplainActual {
-            rows: super::explained_root_rows(statement, output.rows),
+            rows: super::explained_root_rows(planned.statement, output.rows),
             elapsed_micros,
             io: engine.storage.block_io_stats().saturating_sub(before),
             serialized_bytes: output.serialized_bytes,
@@ -21084,7 +21104,7 @@ fn execute_plpgsql_dynamic_explain(
     } else {
         None
     };
-    super::explain::visit_plan_rows(&plan, options, actual, emit)
+    super::explain::visit_plan_rows(&plan, options, actual, &settings, emit)
 }
 
 fn rollback_trigger_subtransaction(context: &mut TriggerExecContext<'_, '_, '_>, index: usize) {
@@ -22015,6 +22035,7 @@ fn execute_trigger_block<'a>(
                             *options,
                             statement,
                             query.arguments,
+                            &scope,
                             &mut |line| {
                                 let line = arena
                                     .alloc_str(line)
@@ -22215,6 +22236,7 @@ fn execute_trigger_block<'a>(
                             *options,
                             statement,
                             query.arguments,
+                            &scope,
                             &mut |_| Ok(()),
                         )?;
                         0

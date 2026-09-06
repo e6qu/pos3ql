@@ -12044,6 +12044,102 @@ impl Engine {
         result
     }
 
+    /// Parses the stored SQL for EXPLAIN without evaluating EXECUTE arguments.
+    /// `GENERIC_PLAN` deliberately reaches this boundary before values exist;
+    /// the prepared pool supplies the declared parameter shape.
+    fn prepared_statement_for_explain<'a>(
+        &self,
+        name: &str,
+        argument_count: usize,
+        sqlprep: &SqlPreparedPool,
+        arena: &'a Arena,
+    ) -> Result<&'a Stmt<'a>, SqlError> {
+        let text = sqlprep.get(name).ok_or_else(|| SqlError {
+            sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
+            message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
+        })?;
+        let declared = sqlprep.get_types(name).map_or(0, |types| types.len());
+        if declared != 0 && argument_count != declared {
+            return Err(SqlError {
+                sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
+                message: stack_format!(
+                    192,
+                    "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
+                    name,
+                    declared,
+                    argument_count
+                ),
+            });
+        }
+        let text = arena.alloc_str(text).map_err(|_| SqlError {
+            sqlstate: SqlState::known(sqlstate::PROGRAM_LIMIT_EXCEEDED),
+            message: stack_format!(192, "statement too large for SQL arena"),
+        })?;
+        let mut parser = Parser::new(text, arena).map_err(|error| parse_error_to_sql(&error))?;
+        let statement = parser
+            .next_stmt()
+            .map_err(|error| parse_error_to_sql(&error))?
+            .ok_or_else(|| sql_err!(sqlstate::SYNTAX_ERROR, "prepared statement has no query"))?;
+        if parser
+            .next_stmt()
+            .map_err(|error| parse_error_to_sql(&error))?
+            .is_some()
+        {
+            return Err(sql_err!(
+                sqlstate::SYNTAX_ERROR,
+                "prepared statement must contain exactly one statement"
+            ));
+        }
+        arena
+            .alloc(statement)
+            .map(|statement| &*statement)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "statement too large for SQL arena"
+                )
+            })
+    }
+
+    /// Evaluates SQL-level EXECUTE arguments once for an analyzed prepared
+    /// statement.  Planning and execution therefore use the same declared
+    /// parameter contract instead of treating EXPLAIN as a second protocol.
+    fn prepared_explain_arguments<'a>(
+        &self,
+        name: &str,
+        arguments: &[&'a Expr<'a>],
+        outer_params: &[Datum<'a>],
+        sqlprep: &SqlPreparedPool,
+        arena: &'a Arena,
+    ) -> Result<([Datum<'a>; parser::MAX_LIST], usize), SqlError> {
+        let declared = sqlprep.get_types(name).ok_or_else(|| SqlError {
+            sqlstate: SqlState::known(sqlstate::INVALID_SQL_STATEMENT_NAME),
+            message: stack_format!(192, "prepared statement \"{}\" does not exist", name),
+        })?;
+        if !declared.is_empty() && arguments.len() != declared.len() {
+            return Err(SqlError {
+                sqlstate: SqlState::known(sqlstate::PROTOCOL_VIOLATION),
+                message: stack_format!(
+                    192,
+                    "wrong number of parameters for prepared statement \"{}\": expected {}, got {}",
+                    name,
+                    declared.len(),
+                    arguments.len()
+                ),
+            });
+        }
+        let mut values = [Datum::Null; parser::MAX_LIST];
+        for (index, argument) in arguments.iter().enumerate() {
+            let value = eval(argument, arena, outer_params, &NoColumns)?;
+            values[index] = if index < declared.len() {
+                eval::cast(value, declared[index].internal_name(), arena)?
+            } else {
+                value
+            };
+        }
+        Ok((values, arguments.len()))
+    }
+
     /// Outer Result: wire-level trouble. Inner Result: SQL-level error.
     #[allow(clippy::too_many_arguments)]
     fn execute_stmt(
@@ -12588,10 +12684,44 @@ impl Engine {
         };
         let outcome = match statement {
             Stmt::Explain { options, statement } => {
-                let plan = explain::plan_statement(&self.storage, txn.txid, statement, arena);
+                let settings = if options.settings {
+                    guc.planner_settings()
+                } else {
+                    guc::PlannerSettings::EMPTY
+                };
+                let planned_statement = match statement {
+                    Stmt::ExecutePrepared { name, args } => {
+                        match self.prepared_statement_for_explain(name, args.len(), sqlprep, arena)
+                        {
+                            Ok(statement) => statement,
+                            Err(error) => return Ok(Err(error)),
+                        }
+                    }
+                    _ => statement,
+                };
+                let plan =
+                    explain::plan_statement(&self.storage, txn.txid, planned_statement, arena);
                 let plan = match plan {
                     Ok(plan) => plan,
                     Err(error) => return Ok(Err(error)),
+                };
+                let mut prepared_params = [Datum::Null; parser::MAX_LIST];
+                let prepared_count = if options.analyze {
+                    match statement {
+                        Stmt::ExecutePrepared { name, args } => {
+                            let (values, count) = match self
+                                .prepared_explain_arguments(name, args, params, sqlprep, arena)
+                            {
+                                Ok(values) => values,
+                                Err(error) => return Ok(Err(error)),
+                            };
+                            prepared_params = values;
+                            count
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    0
                 };
                 let actual = if options.analyze {
                     let before = self.storage.block_io_stats();
@@ -12599,8 +12729,19 @@ impl Engine {
                     let touched_mark = txn.touched().len();
                     let started = std::time::Instant::now();
                     responder.begin_discard_query_output(options.serialize);
-                    let execution = self
-                        .execute_explained_statement(statement, arena, params, txn, guc, responder);
+                    let execution_params = if matches!(statement, Stmt::ExecutePrepared { .. }) {
+                        &prepared_params[..prepared_count]
+                    } else {
+                        params
+                    };
+                    let execution = self.execute_explained_statement(
+                        planned_statement,
+                        arena,
+                        execution_params,
+                        txn,
+                        guc,
+                        responder,
+                    );
                     let output = responder.finish_discard_query_output();
                     match execution {
                         Err(wire) => return Err(wire),
@@ -12616,7 +12757,7 @@ impl Engine {
                             Err(error) => return Ok(Err(error)),
                         };
                     Some(explain::ExplainActual {
-                        rows: explained_root_rows(statement, output.rows),
+                        rows: explained_root_rows(planned_statement, output.rows),
                         elapsed_micros,
                         io: self.storage.block_io_stats().saturating_sub(before),
                         serialized_bytes: output.serialized_bytes,
@@ -12631,7 +12772,7 @@ impl Engine {
                 } else {
                     None
                 };
-                explain::emit_plan(&plan, *options, actual, responder)
+                explain::emit_plan(&plan, *options, actual, &settings, responder)
             }
             Stmt::With { .. } if reset_workspace => self.execute_modification_resumable(
                 statement, arena, params, txn, sqlprep, cursors, guc, responder,

@@ -5075,6 +5075,83 @@ mod tests {
     }
 
     #[test]
+    fn extended_portal_accepts_generic_explain_without_inspecting_bound_values() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let suffix = NEXT.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "pos3ql-generic-explain-wire-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut config = Config::default_dev();
+        config.data_dir = directory.to_string_lossy().into_owned();
+        config.max_tables = 8;
+        config.table_rows = 256;
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).expect("engine");
+        let mut connection = Conn::new(&config, &mut budget).expect("connection");
+        connection.phase = Phase::Ready;
+
+        let mut parse = Vec::new();
+        parse.extend_from_slice(
+            b"generic_explain\0EXPLAIN (GENERIC_PLAN, FORMAT JSON) SELECT $1::integer\0",
+        );
+        parse.extend_from_slice(&1i16.to_be_bytes());
+        parse.extend_from_slice(&crate::sql::types::oid::INT4.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_PARSE, &parse));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut bind = Vec::new();
+        bind.extend_from_slice(b"generic_explain_portal\0generic_explain\0");
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&2i32.to_be_bytes());
+        bind.extend_from_slice(b"42");
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        connection.recv.append(&frontend(wire::FMSG_BIND, &bind));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        connection.send.clear();
+
+        let mut execute = Vec::new();
+        execute.extend_from_slice(b"generic_explain_portal\0");
+        execute.extend_from_slice(&0i32.to_be_bytes());
+        connection
+            .recv
+            .append(&frontend(wire::FMSG_EXECUTE, &execute));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        assert!(
+            connection
+                .send
+                .readable()
+                .windows(b"\"Node Type\"".len())
+                .any(|frame| frame == b"\"Node Type\""),
+            "{}",
+            String::from_utf8_lossy(connection.send.readable())
+        );
+
+        connection.recv.append(&frontend(wire::FMSG_SYNC, b""));
+        assert!(matches!(
+            connection.process_message(&mut engine),
+            Step::Continue
+        ));
+        drop(connection);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn startup_event_trigger_escape_hatch_is_superuser_only() {
         let guc = GucState::new();
         let error = apply_startup_options(&guc, "-c event_triggers=off", false)

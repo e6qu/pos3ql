@@ -38,6 +38,7 @@ DROP FUNCTION IF EXISTS plpgsql_dynamic_session_portal();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_lock();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_analyze_json();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_analyze_compound();
+DROP FUNCTION IF EXISTS plpgsql_dynamic_generic_explain();
 DROP FUNCTION IF EXISTS plpgsql_array_subscripts();
 DROP FUNCTION IF EXISTS plpgsql_dynamic_session_constraints();
 DROP PUBLICATION IF EXISTS plpgsql_dynamic_catalog_publication;
@@ -387,6 +388,17 @@ BEGIN
   IF plan IS NULL THEN RAISE EXCEPTION 'EXPLAIN ANALYZE JSON result mismatch'; END IF;
 END
 $$;
+CREATE FUNCTION plpgsql_dynamic_generic_explain() RETURNS boolean
+  LANGUAGE plpgsql AS $$
+DECLARE plan text;
+BEGIN
+  EXECUTE 'PREPARE plpgsql_dynamic_generic_plan(integer) AS SELECT $1::integer';
+  EXECUTE 'EXPLAIN (GENERIC_PLAN, FORMAT JSON) EXECUTE plpgsql_dynamic_generic_plan(41)'
+    INTO STRICT plan;
+  EXECUTE 'DEALLOCATE plpgsql_dynamic_generic_plan';
+  RETURN plan IS NOT NULL;
+END
+$$;
 CREATE FUNCTION plpgsql_dynamic_analyze_compound() RETURNS void
   LANGUAGE plpgsql AS $$
 DECLARE plan text;
@@ -465,6 +477,7 @@ SELECT plpgsql_dynamic_analyze_compound();
 SELECT count(*) FROM plpgsql_dynamic_session_rows;
 SELECT plpgsql_dynamic_session_deallocate();
 SELECT plpgsql_dynamic_analyze_json();
+SELECT plpgsql_dynamic_generic_explain();
 BEGIN;
 SELECT plpgsql_dynamic_session_lock();
 COMMIT;
@@ -575,6 +588,7 @@ DROP FUNCTION plpgsql_dynamic_session_deallocate();
 DROP FUNCTION plpgsql_dynamic_session_portal();
 DROP FUNCTION plpgsql_dynamic_session_lock();
 DROP FUNCTION plpgsql_dynamic_analyze_json();
+DROP FUNCTION plpgsql_dynamic_generic_explain();
 DROP FUNCTION plpgsql_dynamic_session_constraints();
 DROP PUBLICATION plpgsql_dynamic_catalog_publication;
 DROP MATERIALIZED VIEW plpgsql_dynamic_catalog_materialized;

@@ -863,7 +863,11 @@ impl<'a> Parser<'a> {
                     } else if option.eq_ignore_ascii_case("memory") {
                         options.memory = enabled;
                     } else if option.eq_ignore_ascii_case("generic_plan") {
-                        options.generic_plan = enabled;
+                        options.plan_mode = if enabled {
+                            ExplainPlanMode::Generic
+                        } else {
+                            ExplainPlanMode::Custom
+                        };
                     } else {
                         return Err(self.err_here("unrecognized EXPLAIN option"));
                     }
@@ -915,7 +919,7 @@ impl<'a> Parser<'a> {
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
             });
         }
-        if options.generic_plan && options.analyze {
+        if options.plan_mode == ExplainPlanMode::Generic && options.analyze {
             return Err(ParseError {
                 at: self.peek_at,
                 message: stack_format!(
@@ -923,20 +927,6 @@ impl<'a> Parser<'a> {
                     "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together"
                 ),
                 sqlstate: sqlstate::INVALID_PARAMETER_VALUE,
-            });
-        }
-        if options.settings {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "EXPLAIN option SETTINGS is not supported"),
-                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
-            });
-        }
-        if options.generic_plan {
-            return Err(ParseError {
-                at: self.peek_at,
-                message: stack_format!(96, "EXPLAIN option GENERIC_PLAN is not supported"),
-                sqlstate: sqlstate::FEATURE_NOT_SUPPORTED,
             });
         }
         let statement = self.statement()?;

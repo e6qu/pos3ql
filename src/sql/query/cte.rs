@@ -4374,10 +4374,12 @@ fn subst_merge<'a>(
                         columns,
                         values,
                         default_values,
+                        overriding,
                     } => MergeSourceAction::Insert {
                         columns,
                         values: subst_expr_slice(values, context, arena)?,
                         default_values,
+                        overriding,
                     },
                     MergeSourceAction::DoNothing => MergeSourceAction::DoNothing,
                 },
@@ -4386,6 +4388,7 @@ fn subst_merge<'a>(
     }
     Ok(Merge {
         target: rewrite_stored_relation_name(statement.target, context, arena)?,
+        target_inheritance: statement.target_inheritance,
         target_alias: statement.target_alias,
         source: subst_tableref(&statement.source, context, arena)?,
         on: subst_expr(statement.on, context, arena)?,

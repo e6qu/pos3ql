@@ -51999,11 +51999,21 @@ pub fn merge<'a>(
     for when in statement.whens {
         match when.action() {
             MergeAction::Update(assignments) => {
+                let mut assigned = 0u64;
                 for (name, _) in assignments {
                     let Some(column) = def.column_index(name) else {
                         return sql_fail(undefined_column(name));
                     };
-                    update_columns |= 1u64 << column;
+                    let bit = 1u64 << column;
+                    if assigned & bit != 0 {
+                        return sql_fail(sql_err!(
+                            sqlstate::SYNTAX_ERROR,
+                            "multiple assignments to same column \"{}\"",
+                            name
+                        ));
+                    }
+                    assigned |= bit;
+                    update_columns |= bit;
                 }
             }
             MergeAction::Insert {
@@ -52014,11 +52024,21 @@ pub fn merge<'a>(
                 if columns.is_empty() {
                     insert_columns |= all_columns_mask(&def);
                 } else {
+                    let mut assigned = 0u64;
                     for name in columns {
                         let Some(column) = def.column_index(name) else {
                             return sql_fail(undefined_column(name));
                         };
-                        insert_columns |= 1u64 << column;
+                        let bit = 1u64 << column;
+                        if assigned & bit != 0 {
+                            return sql_fail(sql_err!(
+                                sqlstate::SYNTAX_ERROR,
+                                "column \"{}\" specified more than once",
+                                name
+                            ));
+                        }
+                        assigned |= bit;
+                        insert_columns |= bit;
                     }
                 }
             }
@@ -52470,7 +52490,13 @@ pub fn merge<'a>(
     let mut target_schema = [ColType::Bool; MAX_COLUMNS];
     def.schema(&mut target_schema);
     let target_schema = &target_schema[..def.n_columns];
-    let leaves = match dml_leaf_slots(storage, table_index, txn.txid, arena) {
+    let leaves = match dml_leaf_slots_for(
+        storage,
+        table_index,
+        statement.target_inheritance,
+        txn.txid,
+        arena,
+    ) {
         Ok(leaves) => leaves,
         Err(error) => return sql_fail(error),
     };
@@ -52493,6 +52519,13 @@ pub fn merge<'a>(
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
     let target_vals: &mut [&[Datum]] = match arena.alloc_slice_with(n_target, |_| &[][..]) {
+        Ok(s) => s,
+        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    };
+    // Child tables can retain physical columns outside the logical parent
+    // shape. Candidate expressions see the parent shape, while an update of a
+    // child row must preserve that child-only suffix verbatim.
+    let target_suffixes: &mut [&[Datum]] = match arena.alloc_slice_with(n_target, |_| &[][..]) {
         Ok(s) => s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
@@ -52553,8 +52586,13 @@ pub fn merge<'a>(
                 Ok(b) => &*b,
                 Err(_) => return sql_fail(super::query::arena_full_pub()),
             };
+            let row_definition = *storage.table_def(row_table, txn.txid);
+            let mut row_schema = [ColType::Bool; MAX_COLUMNS];
+            row_definition.schema(&mut row_schema);
             let mut vals = [Datum::Null; MAX_COLUMNS];
-            if let Err(e) = rowenc::decode(bytes, target_schema, &mut vals) {
+            if let Err(e) =
+                rowenc::decode(bytes, &row_schema[..row_definition.n_columns], &mut vals)
+            {
                 return sql_fail(e);
             }
             if let Some(plan) = select_security {
@@ -52578,13 +52616,14 @@ pub fn merge<'a>(
                     Err(error) => return sql_fail(error),
                 }
             }
-            let owned = match arena.alloc_slice_copy(&vals[..def.n_columns]) {
+            let owned = match arena.alloc_slice_copy(&vals[..row_definition.n_columns]) {
                 Ok(v) => &*v,
                 Err(_) => return sql_fail(super::query::arena_full_pub()),
             };
             ids[accepted] = row_id;
             tables[accepted] = row_table;
-            target_vals[accepted] = owned;
+            target_vals[accepted] = &owned[..def.n_columns];
+            target_suffixes[accepted] = &owned[def.n_columns..];
             accepted += 1;
         }
         n_target = accepted;
@@ -52856,22 +52895,77 @@ pub fn merge<'a>(
                                 return sql_fail(undefined_column(name));
                             };
                             action_update_columns |= 1u64 << ci;
-                            let v = match eval_merge_expression(
-                                expression,
-                                storage,
-                                txn.txid,
-                                seq_session,
-                                arena,
-                                params,
-                                &lookup,
-                            ) {
-                                Ok(v) => v,
-                                Err(e) => return sql_fail(e),
-                            };
-                            match coerce(v, &def.columns()[ci], storage, txn.txid, arena) {
-                                Ok(v) => new_values[ci] = v,
-                                Err(e) => return sql_fail(e),
+                            if def.columns()[ci].default.is_generated()
+                                && !matches!(expression, Expr::DefaultMarker)
+                            {
+                                return sql_fail(sql_err!(
+                                    sqlstate::GENERATED_ALWAYS,
+                                    "column \"{}\" can only be updated to DEFAULT",
+                                    def.columns()[ci].name.as_str()
+                                ));
                             }
+                            let value = if matches!(expression, Expr::DefaultMarker) {
+                                if def.columns()[ci].auto_increment {
+                                    match next_auto_value(
+                                        storage,
+                                        target_tables[j],
+                                        ci,
+                                        def.columns()[ci].ctype,
+                                        seq_session,
+                                        txn.txid,
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(error) => return sql_fail(error),
+                                    }
+                                } else {
+                                    let sequence = crate::sql::sequence::SeqEval::new(
+                                        storage,
+                                        seq_session,
+                                        txn.txid,
+                                    );
+                                    let catalog =
+                                        super::query::storage_catalog(storage, arena, txn.txid);
+                                    let hooks = EvalHooks {
+                                        catalog: Some(&catalog),
+                                        sequences: Some(&sequence),
+                                        ..NO_HOOKS
+                                    };
+                                    match column_default_value(
+                                        storage,
+                                        txn.txid,
+                                        &def.columns()[ci],
+                                        defaults[ci],
+                                        arena,
+                                        &hooks,
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(error) => return sql_fail(error),
+                                    }
+                                }
+                            } else {
+                                match eval_merge_expression(
+                                    expression,
+                                    storage,
+                                    txn.txid,
+                                    seq_session,
+                                    arena,
+                                    params,
+                                    &lookup,
+                                ) {
+                                    Ok(value) => match coerce(
+                                        value,
+                                        &def.columns()[ci],
+                                        storage,
+                                        txn.txid,
+                                        arena,
+                                    ) {
+                                        Ok(value) => value,
+                                        Err(error) => return sql_fail(error),
+                                    },
+                                    Err(error) => return sql_fail(error),
+                                }
+                            };
+                            new_values[ci] = value;
                         }
                         if let Err(e) = compute_generated(
                             &def,
@@ -52951,19 +53045,35 @@ pub fn merge<'a>(
                         if let Err(e) = check_not_null(&def, &new_values) {
                             return sql_fail(e);
                         }
-                        let updated_table = match storage.partition_target(
-                            table_index,
-                            &new_values[..def.n_columns],
-                            txn.txid,
-                        ) {
-                            Ok(target) => target,
-                            Err(error) => return sql_fail(error),
+                        let updated_table = if def.partition.scheme.is_some() {
+                            match storage.partition_target(
+                                table_index,
+                                &new_values[..def.n_columns],
+                                txn.txid,
+                            ) {
+                                Ok(target) => target,
+                                Err(error) => return sql_fail(error),
+                            }
+                        } else {
+                            // Ordinary inheritance is a scan selection, not a
+                            // partition-routing rule. Updating through a
+                            // parent retains the physical child and its
+                            // child-only fields.
+                            target_tables[j]
+                        };
+                        let mut physical_schema = [ColType::Bool; MAX_COLUMNS];
+                        let constraint_schema = if updated_table == target_tables[j] {
+                            let physical_definition = storage.table_def(updated_table, txn.txid);
+                            physical_definition.schema(&mut physical_schema);
+                            &physical_schema[..physical_definition.n_columns]
+                        } else {
+                            target_schema
                         };
                         if let Err(e) = enforce_row_constraints(
                             storage,
                             updated_table,
                             &def,
-                            target_schema,
+                            constraint_schema,
                             &new_values[..def.n_columns],
                             Some(target_ids[j]),
                             txn.txid,
@@ -52974,12 +53084,30 @@ pub fn merge<'a>(
                         ) {
                             return sql_fail(e);
                         }
-                        let len = rowenc::encoded_len(&new_values[..def.n_columns]);
-                        let out = match arena.alloc_slice_with(len, |_| 0u8) {
-                            Ok(o) => o,
-                            Err(_) => return sql_fail(super::query::arena_full_pub()),
+                        let out = if updated_table == target_tables[j] {
+                            let row_definition = *storage.table_def(updated_table, txn.txid);
+                            let mut physical_new = [Datum::Null; MAX_COLUMNS];
+                            physical_new[..def.n_columns]
+                                .copy_from_slice(&new_values[..def.n_columns]);
+                            physical_new[def.n_columns..row_definition.n_columns]
+                                .copy_from_slice(target_suffixes[j]);
+                            let len =
+                                rowenc::encoded_len(&physical_new[..row_definition.n_columns]);
+                            let out = match arena.alloc_slice_with(len, |_| 0u8) {
+                                Ok(out) => out,
+                                Err(_) => return sql_fail(super::query::arena_full_pub()),
+                            };
+                            rowenc::encode(&physical_new[..row_definition.n_columns], out);
+                            out
+                        } else {
+                            let len = rowenc::encoded_len(&new_values[..def.n_columns]);
+                            let out = match arena.alloc_slice_with(len, |_| 0u8) {
+                                Ok(out) => out,
+                                Err(_) => return sql_fail(super::query::arena_full_pub()),
+                            };
+                            rowenc::encode(&new_values[..def.n_columns], out);
+                            out
                         };
-                        rowenc::encode(&new_values[..def.n_columns], out);
                         let (loc, slice) = match storage.heap.append(out.len()) {
                             Ok(x) => x,
                             Err(e) => return sql_fail(e),
@@ -53152,6 +53280,7 @@ pub fn merge<'a>(
                         columns,
                         values,
                         default_values,
+                        overriding,
                     } => {
                         match merge_insert(
                             storage,
@@ -53161,6 +53290,7 @@ pub fn merge<'a>(
                             columns,
                             values,
                             default_values,
+                            overriding,
                             &source_ctx,
                             &generated,
                             &defaults,
@@ -53294,6 +53424,7 @@ fn merge_insert<'a>(
     columns: &[&str],
     values: &[&'a Expr<'a>],
     default_values: bool,
+    overriding: Overriding,
     source_ctx: &RowCtx<'_, 'a, '_>,
     generated: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
     defaults: &[Option<&'a Expr<'a>>; MAX_COLUMNS],
@@ -53341,7 +53472,15 @@ fn merge_insert<'a>(
             ..super::eval::NO_HOOKS
         };
         for (i, expression) in values.iter().enumerate() {
+            if matches!(expression, Expr::DefaultMarker) {
+                continue;
+            }
             reject_generated_write(def, targets[i])?;
+            match identity_action(def, targets[i], overriding) {
+                IdentityAction::Reject => return Err(reject_identity_write(def, targets[i])),
+                IdentityAction::UseSequence => continue,
+                IdentityAction::Accept => {}
+            }
             let v = super::eval::eval_full(expression, arena, params, source_ctx, &hooks)?;
             row[targets[i]] = coerce(v, &def.columns()[targets[i]], storage, txn.txid, arena)?;
             explicit[targets[i]] = true;
@@ -56196,14 +56335,6 @@ pub(crate) fn update<'a>(
                 for (index, (_, expression)) in statement.assignments.iter().enumerate() {
                     observed[index] = expression;
                 }
-                let sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                let hooks = super::eval::EvalHooks {
-                    subs: Some(&subs),
-                    catalog: Some(&catalog),
-                    sequences: Some(&sequences),
-                    ..super::eval::NO_HOOKS
-                };
                 let joined_scope = outer.map(|outer| JoinedTriggerDmlScope {
                     row: &context,
                     outer,
@@ -56212,64 +56343,125 @@ pub(crate) fn update<'a>(
                     .as_ref()
                     .map(|scope| scope as &dyn ColumnLookup<'_>)
                     .unwrap_or(&context);
-                let mut set_err: Option<SqlError> = None;
-                let r = super::query::first_from_match(
-                    storage,
-                    from,
-                    txn.txid,
-                    statement.where_clause,
-                    &observed[..statement.assignments.len()],
-                    arena,
-                    params,
-                    joined_target,
-                    &mut |combined| {
-                        for (a, (_, expression)) in statement.assignments.iter().enumerate() {
-                            // A generated target's `= DEFAULT` is a no-op here; it
-                            // is recomputed from the finished row below.
-                            if def.columns()[targets[a]].default.is_generated() {
-                                continue;
-                            }
-                            if matches!(expression, Expr::DefaultMarker) {
-                                physical_new[targets[a]] = column_default_value(
+                // `scratch` contains only target rows with a FROM match. Resolve
+                // sequence-backed defaults before the joined scan takes its
+                // immutable storage borrow, then install them in that match.
+                let mut auto_defaults = [Datum::Null; MAX_COLUMNS];
+                for (a, (_, expression)) in statement.assignments.iter().enumerate() {
+                    if matches!(expression, Expr::DefaultMarker)
+                        && def.columns()[targets[a]].auto_increment
+                    {
+                        auto_defaults[a] = match next_auto_value(
+                            storage,
+                            row_table,
+                            targets[a],
+                            def.columns()[targets[a]].ctype,
+                            seq_session,
+                            txn.txid,
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => return sql_fail(error),
+                        };
+                    }
+                }
+                let matched = {
+                    let r = super::query::first_from_match(
+                        storage,
+                        from,
+                        txn.txid,
+                        statement.where_clause,
+                        &observed[..statement.assignments.len()],
+                        arena,
+                        params,
+                        joined_target,
+                        &mut |combined| {
+                            for (a, (_, expression)) in statement.assignments.iter().enumerate() {
+                                // A generated target's `= DEFAULT` is a no-op here; it
+                                // is recomputed from the finished row below.
+                                if def.columns()[targets[a]].default.is_generated() {
+                                    continue;
+                                }
+                                if matches!(expression, Expr::DefaultMarker)
+                                    && def.columns()[targets[a]].auto_increment
+                                {
+                                    physical_new[targets[a]] = auto_defaults[a];
+                                    continue;
+                                }
+                                let sequences = crate::sql::sequence::SeqEval::new(
                                     storage,
+                                    seq_session,
                                     txn.txid,
-                                    &def.columns()[targets[a]],
-                                    defaults[targets[a]],
-                                    arena,
-                                    &hooks,
-                                )?;
-                                continue;
+                                );
+                                let catalog =
+                                    super::query::storage_catalog(storage, arena, txn.txid);
+                                let hooks = super::eval::EvalHooks {
+                                    subs: Some(&subs),
+                                    catalog: Some(&catalog),
+                                    sequences: Some(&sequences),
+                                    ..super::eval::NO_HOOKS
+                                };
+                                if matches!(expression, Expr::DefaultMarker) {
+                                    physical_new[targets[a]] = column_default_value(
+                                        storage,
+                                        txn.txid,
+                                        &def.columns()[targets[a]],
+                                        defaults[targets[a]],
+                                        arena,
+                                        &hooks,
+                                    )?;
+                                } else {
+                                    let v =
+                                        eval_full(expression, arena, params, &combined, &hooks)?;
+                                    physical_new[targets[a]] = coerce(
+                                        v,
+                                        &def.columns()[targets[a]],
+                                        storage,
+                                        txn.txid,
+                                        arena,
+                                    )?;
+                                }
                             }
-                            let v = eval_full(expression, arena, params, &combined, &hooks)?;
-                            physical_new[targets[a]] =
-                                coerce(v, &def.columns()[targets[a]], storage, txn.txid, arena)?;
-                        }
-                        Ok(())
-                    },
-                );
-                match r {
-                    Ok(_) => {}
-                    Err(e) => set_err = Some(e),
-                }
-                if let Some(e) = set_err {
-                    return sql_fail(e);
-                }
+                            Ok(())
+                        },
+                    );
+                    match r {
+                        Ok(matched) => matched,
+                        Err(error) => return sql_fail(error),
+                    }
+                };
+                debug_assert!(matched, "the joined row collector selected this target");
             } else {
                 // `nextval`/`setval` in a SET expression advance once per updated
                 // row; a scoped sequence evaluator (shared `&storage`) supplies
                 // them and is dropped before the row is written back mutably.
-                let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
-                let catalog = super::query::storage_catalog(storage, arena, txn.txid);
-                let hooks = super::eval::EvalHooks {
-                    subs: Some(&subs),
-                    catalog: Some(&catalog),
-                    sequences: Some(&seq),
-                    ..super::eval::NO_HOOKS
-                };
                 for (a, (_, expression)) in statement.assignments.iter().enumerate() {
                     if def.columns()[targets[a]].default.is_generated() {
                         continue; // recomputed from the finished row below
                     }
+                    if matches!(expression, Expr::DefaultMarker)
+                        && def.columns()[targets[a]].auto_increment
+                    {
+                        physical_new[targets[a]] = match next_auto_value(
+                            storage,
+                            row_table,
+                            targets[a],
+                            def.columns()[targets[a]].ctype,
+                            seq_session,
+                            txn.txid,
+                        ) {
+                            Ok(value) => value,
+                            Err(e) => return sql_fail(e),
+                        };
+                        continue;
+                    }
+                    let seq = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let hooks = super::eval::EvalHooks {
+                        subs: Some(&subs),
+                        catalog: Some(&catalog),
+                        sequences: Some(&seq),
+                        ..super::eval::NO_HOOKS
+                    };
                     if matches!(expression, Expr::DefaultMarker) {
                         physical_new[targets[a]] = match column_default_value(
                             storage,
@@ -63081,6 +63273,37 @@ fn dml_leaf_slots<'a>(
     txid: u32,
     arena: &'a Arena,
 ) -> Result<&'a [usize], SqlError> {
+    dml_leaf_slots_for(
+        storage,
+        table_index,
+        crate::sql::ast::RelationInheritance::Descendants,
+        txid,
+        arena,
+    )
+}
+
+/// Resolves a writable target according to the parsed inheritance contract.
+/// `ONLY` remains a distinct state until this boundary, so an insert action can
+/// still use the logical target while match/update/delete scans use its chosen
+/// physical row set.
+fn dml_leaf_slots_for<'a>(
+    storage: &Storage,
+    table_index: usize,
+    inheritance: crate::sql::ast::RelationInheritance,
+    txid: u32,
+    arena: &'a Arena,
+) -> Result<&'a [usize], SqlError> {
+    if inheritance == crate::sql::ast::RelationInheritance::Only {
+        return arena
+            .alloc_slice_copy(&[table_index])
+            .map(|slots| &*slots)
+            .map_err(|_| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "partition target list exceeds the statement arena"
+                )
+            });
+    }
     let slots = arena
         .alloc_slice_with(storage.table_count(), |_| 0usize)
         .map_err(|_| {

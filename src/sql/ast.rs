@@ -4602,6 +4602,9 @@ pub struct Delete<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Merge<'a> {
     pub target: QualName<'a>,
+    /// Whether target-row matching includes inheritance descendants. INSERT
+    /// actions always name `target` itself, as PostgreSQL specifies.
+    pub target_inheritance: RelationInheritance,
     /// Correlation name for the target (defaults to its table name).
     pub target_alias: Option<&'a str>,
     /// The data source: a table, subquery, or `(VALUES ...)`.
@@ -4647,6 +4650,7 @@ pub enum MergeSourceAction<'a> {
         columns: &'a [&'a str],
         values: &'a [&'a Expr<'a>],
         default_values: bool,
+        overriding: Overriding,
     },
     DoNothing,
 }
@@ -4678,6 +4682,7 @@ pub enum MergeActionRef<'a> {
         columns: &'a [&'a str],
         values: &'a [&'a Expr<'a>],
         default_values: bool,
+        overriding: Overriding,
     },
     DoNothing,
 }
@@ -4713,10 +4718,12 @@ impl<'a> MergeWhen<'a> {
                     columns,
                     values,
                     default_values,
+                    overriding,
                 } => MergeActionRef::Insert {
                     columns,
                     values,
                     default_values,
+                    overriding,
                 },
                 MergeSourceAction::DoNothing => MergeActionRef::DoNothing,
             },

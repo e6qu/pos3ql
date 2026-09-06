@@ -167,7 +167,7 @@ INSERT	complete	02_dml_returning.sql
 LISTEN	complete	14_surface.sql
 LOAD	complete	sql::tests::native_hook_ddl_rejects_before_catalog_publication
 LOCK	complete	67_for_update.sql
-MERGE	partial	58_merge.sql
+MERGE	partial	58_merge.sql covers typed candidate/action states, DEFAULT including identity sequences, identity OVERRIDING, independent target/source inheritance selection, ordinary-child physical-shape preservation, triggers, RETURNING, CTEs, and recovery
 MOVE	complete	39_cursors.sql
 NOTIFY	complete	14_surface.sql
 PREPARE	complete	14_surface.sql

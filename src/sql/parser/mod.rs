@@ -6388,13 +6388,25 @@ impl<'a> Parser<'a> {
         }))
     }
 
-    /// `MERGE INTO target [AS alias] USING source [AS alias] ON cond
+    /// `MERGE INTO [ONLY] target [*] [AS alias] USING source [AS alias] ON cond
     /// { WHEN MATCHED | WHEN NOT MATCHED [BY SOURCE | BY TARGET] ... }...`.
     fn merge(&mut self) -> Result<Stmt<'a>, ParseError> {
         use crate::sql::ast::{Merge, MergeMatchKind, MergeTargetAction, MergeWhen};
         self.expect_ident("merge")?;
         self.expect_ident("into")?;
+        let target_inheritance = if self.eat_ident("only")? {
+            RelationInheritance::Only
+        } else {
+            RelationInheritance::Descendants
+        };
+        let parenthesized = target_inheritance == RelationInheritance::Only && self.eat_op("(")?;
         let target = self.qual_name("target table")?;
+        if parenthesized {
+            self.expect_op(")")?;
+        }
+        if target_inheritance == RelationInheritance::Descendants {
+            let _ = self.eat_op("*")?;
+        }
         let target_alias =
             if self.eat_ident("as")? || matches!(self.peeked, Tok::Ident(w) if w != "using") {
                 Some(self.col_ident("target alias")?)
@@ -6469,6 +6481,7 @@ impl<'a> Parser<'a> {
         let returning = self.returning()?;
         Ok(Stmt::Merge(Merge {
             target,
+            target_inheritance,
             target_alias,
             source,
             on,
@@ -6540,12 +6553,28 @@ impl<'a> Parser<'a> {
             self.expect_op(")")?;
             columns = self.arena_slice(&names[..c])?;
         }
+        let overriding = if self.eat_ident("overriding")? {
+            let mode = if self.eat_ident("system")? {
+                crate::sql::ast::Overriding::System
+            } else {
+                self.expect_ident("user")?;
+                crate::sql::ast::Overriding::User
+            };
+            self.expect_ident("value")?;
+            mode
+        } else {
+            crate::sql::ast::Overriding::None
+        };
         if self.eat_ident("default")? {
             self.expect_ident("values")?;
+            if !matches!(overriding, crate::sql::ast::Overriding::None) {
+                return Err(self.err_here("OVERRIDING is not allowed with DEFAULT VALUES"));
+            }
             return Ok(MergeSourceAction::Insert {
                 columns,
                 values: &[],
                 default_values: true,
+                overriding,
             });
         }
         self.expect_ident("values")?;
@@ -6568,6 +6597,7 @@ impl<'a> Parser<'a> {
             columns,
             values: self.arena_slice(&vals[..v])?,
             default_values: false,
+            overriding,
         })
     }
 

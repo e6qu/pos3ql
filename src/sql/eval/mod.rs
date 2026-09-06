@@ -185,6 +185,7 @@ pub mod sqlstate {
     pub const DATA_EXCEPTION: &str = "22000";
     pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
     pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
+    pub const ERROR_IN_ASSIGNMENT: &str = "22005";
     pub const ZERO_LENGTH_CHARACTER_STRING: &str = "2200F";
     pub const INVALID_DATETIME_FORMAT: &str = "22007";
     pub const DATETIME_FIELD_OVERFLOW: &str = "22008";

@@ -182,6 +182,42 @@ except psycopg.errors.CheckViolation as error:
     assert error.sqlstate == "23514", error.sqlstate
 print("catalog-typed PL/pgSQL locals extended protocol ok")
 
+# `%TYPE`, `%ROWTYPE`, RECORD, CONSTANT, and NOT NULL declarations retain
+# their contract across the driver's extended Parse/Bind/Execute path.
+cur.execute("CREATE TYPE drv_declaration_pair AS (id integer, label text)")
+cur.execute("CREATE TABLE drv_declaration_rows (id integer, label text)")
+cur.execute("INSERT INTO drv_declaration_rows VALUES (7, 'row')")
+cur.execute(
+    "CREATE FUNCTION drv_declaration_contract() RETURNS text LANGUAGE plpgsql AS "
+    "'DECLARE typed_id drv_declaration_rows.id%TYPE := 7; "
+    "table_row drv_declaration_rows%ROWTYPE; composite_row drv_declaration_pair%ROWTYPE; "
+    "dynamic_row RECORD; dynamic_execute RECORD; fixed CONSTANT integer := 9; "
+    "required integer NOT NULL := 4; BEGIN "
+    "SELECT id, label INTO table_row FROM drv_declaration_rows WHERE id = typed_id; "
+    "SELECT id, label INTO composite_row FROM drv_declaration_rows WHERE id = typed_id; "
+    "SELECT id, label INTO dynamic_row FROM drv_declaration_rows WHERE id = typed_id; "
+    "EXECUTE ''SELECT id, label FROM drv_declaration_rows WHERE id = 7'' INTO dynamic_execute; "
+    "RETURN typed_id::text || '':'' || table_row.label || '':'' || composite_row.label || '':'' "
+    "|| dynamic_row.label || '':'' || dynamic_execute.label || '':'' || fixed::text || '':'' "
+    "|| required::text; END'"
+)
+cur.execute("SELECT drv_declaration_contract()")
+assert cur.fetchone() == ("7:row:row:row:row:9:4",)
+bcur = conn.cursor(binary=True)
+bcur.execute("SELECT drv_declaration_contract()")
+assert [column.type_code for column in bcur.description] == [25], bcur.description
+assert bcur.fetchone() == ("7:row:row:row:row:9:4",)
+bcur.close()
+try:
+    cur.execute(
+        "CREATE FUNCTION drv_declaration_constant_error() RETURNS integer LANGUAGE plpgsql AS "
+        "'DECLARE fixed CONSTANT integer := 1; BEGIN fixed := 2; RETURN fixed; END'"
+    )
+    raise AssertionError("expected constant assignment to fail during routine creation")
+except psycopg.DatabaseError as error:
+    assert error.sqlstate == "22005", error.sqlstate
+print("plpgsql declaration contracts extended protocol ok")
+
 # Dynamic analyzed output crosses an extended Bind/Result boundary as a
 # PostgreSQL value, including the inner EXECUTE parameter.
 cur.execute(

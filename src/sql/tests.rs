@@ -387,6 +387,112 @@ fn plpgsql_catalog_typed_locals_are_validated_and_durable() {
 }
 
 #[test]
+fn plpgsql_declaration_contracts_are_typed_and_durable() {
+    let mut config = test_config("plpgsql-declaration-contracts");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.object_store_namespace = format!("plpgsql-declaration-contracts-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let output = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TYPE declaration_pair AS (id integer, label text); \
+             CREATE TABLE declaration_rows (id integer, label text); \
+             CREATE TABLE declaration_audit (label text); \
+             INSERT INTO declaration_rows VALUES (7, 'row'); \
+             CREATE FUNCTION declaration_contract_value() RETURNS text LANGUAGE plpgsql AS $$ \
+               DECLARE typed_id declaration_rows.id%TYPE := 7; \
+                       typed_label declaration_pair.label%TYPE := 'pair'; \
+                       table_row declaration_rows%ROWTYPE; \
+                       composite_row declaration_pair%ROWTYPE; \
+                       dynamic_row RECORD; \
+                       dynamic_execute RECORD; \
+                       fixed CONSTANT integer := 9; \
+                       required integer NOT NULL := 4; \
+               BEGIN \
+                 SELECT id, label INTO table_row FROM declaration_rows WHERE id = typed_id; \
+                 SELECT id, label INTO composite_row FROM declaration_rows WHERE id = typed_id; \
+                 SELECT id, label INTO dynamic_row FROM declaration_rows WHERE id = typed_id; \
+                 EXECUTE 'SELECT id, label FROM declaration_rows WHERE id = 7' INTO dynamic_execute; \
+                 RETURN typed_id::text || ':' || typed_label || ':' || table_row.label || ':' \
+                   || composite_row.label || ':' || dynamic_row.label || ':' || dynamic_execute.label \
+                   || ':' || fixed::text \
+                   || ':' || required::text; \
+               END $$; \
+             CREATE PROCEDURE declaration_contract_procedure() LANGUAGE plpgsql AS $$ \
+               DECLARE copied declaration_rows%ROWTYPE; \
+               BEGIN SELECT id, label INTO copied FROM declaration_rows WHERE id = 7; \
+                     INSERT INTO declaration_audit VALUES (copied.label); END $$; \
+             CREATE FUNCTION declaration_contract_trigger() RETURNS trigger LANGUAGE plpgsql AS $$ \
+               DECLARE typed_id declaration_rows.id%TYPE := NEW.id; \
+               BEGIN INSERT INTO declaration_audit VALUES (typed_id::text); RETURN NEW; END $$; \
+             CREATE TRIGGER declaration_contract_rows_audit BEFORE INSERT ON declaration_rows \
+               FOR EACH ROW EXECUTE FUNCTION declaration_contract_trigger(); \
+             DO $$ DECLARE note declaration_rows.label%TYPE := 'do'; \
+                            required integer NOT NULL := 1; \
+                BEGIN INSERT INTO declaration_audit VALUES (note); END $$; \
+             SELECT declaration_contract_value(); \
+             CALL declaration_contract_procedure(); \
+             INSERT INTO declaration_rows VALUES (8, 'trigger'); \
+             SELECT label FROM declaration_audit ORDER BY label",
+        );
+        assert_eq!(
+            data_rows(&output),
+            ["7:pair:row:row:row:row:9:4", "8", "do", "row"],
+            "{}",
+            String::from_utf8_lossy(&output)
+        );
+        for (sql, state) in [
+            (
+                "CREATE FUNCTION declaration_constant_error() RETURNS integer LANGUAGE plpgsql AS $$ \
+                   DECLARE fixed CONSTANT integer := 1; BEGIN fixed := 2; RETURN fixed; END $$; \
+                 SELECT declaration_constant_error()",
+                "22005",
+            ),
+            (
+                "DO $$ DECLARE required integer NOT NULL; BEGIN NULL; END $$",
+                "22004",
+            ),
+            (
+                "DO $$ DECLARE required integer NOT NULL := 1; BEGIN required := NULL; END $$",
+                "22004",
+            ),
+        ] {
+            let error = run_with(&mut engine, &mut budget, sql);
+            assert!(
+                String::from_utf8_lossy(&error).contains(state),
+                "{}",
+                String::from_utf8_lossy(&error)
+            );
+        }
+        assert!(engine.checkpoint().unwrap());
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    let output = run_with(
+        &mut recovered,
+        &mut budget,
+        "SELECT declaration_contract_value(); CALL declaration_contract_procedure(); \
+         SELECT label FROM declaration_audit ORDER BY label",
+    );
+    assert_eq!(
+        data_rows(&output),
+        ["7:pair:row:row:row:row:9:4", "8", "do", "row", "row"],
+        "{}",
+        String::from_utf8_lossy(&output)
+    );
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn plpgsql_dynamic_catalog_utilities_are_typed_and_durable() {
     let mut config = test_config("plpgsql_dynamic_catalog_utilities");
     config.object_store_on = true;

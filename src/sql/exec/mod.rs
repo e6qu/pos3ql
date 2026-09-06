@@ -14004,9 +14004,27 @@ struct TriggerLocalAssignment<'a> {
 #[derive(Clone, Copy)]
 struct ParsedTriggerLocalDecl<'a> {
     name: SqlName,
-    type_name: &'a str,
-    type_mod: i32,
+    ty: ParsedPlpgsqlLocalType<'a>,
     initial: Option<&'a Expr<'a>>,
+    constant: bool,
+    not_null: bool,
+}
+
+/// A local declaration has either a complete type spelling or a catalog
+/// reference that is resolved before the interpreter receives the program.
+/// In particular, `%TYPE` and `%ROWTYPE` cannot reach execution as strings.
+#[derive(Clone, Copy)]
+enum ParsedPlpgsqlLocalType<'a> {
+    Named { name: &'a str, type_mod: i32 },
+    Column { relation: &'a str, column: &'a str },
+    Row { relation: &'a str },
+    Record,
+}
+
+#[derive(Clone, Copy)]
+enum PlpgsqlRecordShape {
+    Dynamic,
+    Table(u16),
 }
 
 #[derive(Clone, Copy)]
@@ -14016,6 +14034,9 @@ struct TriggerLocalDecl<'a> {
     user_type: Option<crate::storage::UserTypeName>,
     type_mod: i32,
     initial: Option<&'a Expr<'a>>,
+    record_shape: Option<PlpgsqlRecordShape>,
+    constant: bool,
+    not_null: bool,
 }
 
 /// PostgreSQL's immutable per-firing trigger variables.  The parser keeps
@@ -15603,17 +15624,61 @@ fn parse_trigger_local<'a>(
             name.as_str()
         ));
     }
-    let type_source = declaration[split..].trim();
-    if type_source.is_empty() {
+    let mut declaration = declaration[split..].trim();
+    let constant = strip_trigger_keyword(declaration, "constant").is_some();
+    if let Some(rest) = strip_trigger_keyword(declaration, "constant") {
+        declaration = rest.trim();
+    }
+    let not_null = declaration
+        .get(declaration.len().saturating_sub(8)..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("not null"))
+        && declaration[..declaration.len() - 8]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_whitespace);
+    if not_null {
+        declaration = declaration[..declaration.len() - 8].trim_end();
+    }
+    if declaration.is_empty() {
         return Err(unsupported_trigger_body());
     }
-    let (type_name, type_mod) = super::parser::parse_type_name(type_source, arena)?;
+    let ty = if declaration.eq_ignore_ascii_case("record") {
+        ParsedPlpgsqlLocalType::Record
+    } else if let Some(reference) = strip_plpgsql_type_suffix(declaration, "%type") {
+        let (relation, column) = reference
+            .trim()
+            .rsplit_once('.')
+            .ok_or_else(unsupported_trigger_body)?;
+        if relation.is_empty() || column.is_empty() {
+            return Err(unsupported_trigger_body());
+        }
+        ParsedPlpgsqlLocalType::Column { relation, column }
+    } else if let Some(relation) = strip_plpgsql_type_suffix(declaration, "%rowtype") {
+        if relation.trim().is_empty() {
+            return Err(unsupported_trigger_body());
+        }
+        ParsedPlpgsqlLocalType::Row {
+            relation: relation.trim(),
+        }
+    } else {
+        let (name, type_mod) = super::parser::parse_type_name(declaration, arena)?;
+        ParsedPlpgsqlLocalType::Named { name, type_mod }
+    };
     Ok(ParsedTriggerLocalDecl {
         name,
-        type_name,
-        type_mod,
+        ty,
         initial,
+        constant,
+        not_null,
     })
+}
+
+fn strip_plpgsql_type_suffix<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
+    let head = value.get(..value.len().checked_sub(suffix.len())?)?;
+    value
+        .get(head.len()..)
+        .filter(|tail| tail.eq_ignore_ascii_case(suffix))
+        .map(|_| head)
 }
 
 fn parse_trigger_select_into<'a>(
@@ -17354,32 +17419,239 @@ fn resolve_plpgsql_program_locals<'a>(
         user_type: None,
         type_mod: -1,
         initial: None,
+        record_shape: None,
+        constant: false,
+        not_null: false,
     }; MAX_COLUMNS];
     for (index, local) in program.locals.iter().copied().enumerate() {
-        let result = resolve_routine_type(storage, txid, local.type_name)?;
-        if result.ctype.is_pseudo() && result.ctype != ColType::Record {
+        let (ctype, user_type, type_mod, record_shape) = match local.ty {
+            ParsedPlpgsqlLocalType::Named { name, type_mod } => {
+                let result = resolve_routine_type(storage, txid, name)?;
+                (result.ctype, result.user_type, type_mod, None)
+            }
+            ParsedPlpgsqlLocalType::Column { relation, column } => {
+                resolve_plpgsql_column_type(storage, txid, relation, column)?
+            }
+            ParsedPlpgsqlLocalType::Row { relation } => {
+                resolve_plpgsql_rowtype(storage, txid, relation)?
+            }
+            ParsedPlpgsqlLocalType::Record => {
+                (ColType::Record, None, -1, Some(PlpgsqlRecordShape::Dynamic))
+            }
+        };
+        if ctype.is_pseudo() && ctype != ColType::Record {
             return Err(sql_err!(
                 sqlstate::INVALID_FUNCTION_DEFINITION,
                 "PL/pgSQL local \"{}\" has pseudo-type {}",
                 local.name.as_str(),
-                local.type_name
+                ctype.name()
             ));
         }
         resolved[index] = TriggerLocalDecl {
             name: local.name,
-            ctype: result.ctype,
-            user_type: result.user_type,
-            type_mod: local.type_mod,
+            ctype,
+            user_type,
+            type_mod,
             initial: local.initial,
+            record_shape,
+            constant: local.constant,
+            not_null: local.not_null,
         };
     }
     let locals = arena
         .alloc_slice_copy(&resolved[..program.locals.len()])
         .map_err(|_| super::query::arena_full_pub())?;
-    Ok(TriggerProgram {
+    let program = TriggerProgram {
         locals: &*locals,
         body: program.body,
-    })
+    };
+    validate_plpgsql_constant_assignments(&program)?;
+    Ok(program)
+}
+
+fn validate_plpgsql_constant_assignments(program: &TriggerProgram<'_>) -> Result<(), SqlError> {
+    fn reject(target: SqlName, locals: &[TriggerLocalDecl<'_>]) -> Result<(), SqlError> {
+        if let Some(local) = locals
+            .iter()
+            .find(|local| local.name == target && local.constant)
+        {
+            return Err(sql_err!(
+                sqlstate::ERROR_IN_ASSIGNMENT,
+                "variable \"{}\" is declared CONSTANT",
+                local.name.as_str()
+            ));
+        }
+        Ok(())
+    }
+    fn validate_block(
+        current: TriggerBlock<'_>,
+        locals: &[TriggerLocalDecl<'_>],
+    ) -> Result<(), SqlError> {
+        for statement in current.statements {
+            match *statement {
+                TriggerStatement::LocalAssign(assignment) => reject(assignment.name, locals)?,
+                TriggerStatement::SelectInto(statement) => {
+                    for target in statement.targets {
+                        reject(*target, locals)?;
+                    }
+                }
+                TriggerStatement::DynamicSelectInto(statement) => {
+                    for target in statement.targets {
+                        reject(*target, locals)?;
+                    }
+                }
+                TriggerStatement::GetDiagnostics(statement) => {
+                    for assignment in statement.assignments {
+                        reject(assignment.target, locals)?;
+                    }
+                }
+                TriggerStatement::GetStackedDiagnostics(statement) => {
+                    for assignment in statement.assignments {
+                        reject(assignment.target, locals)?;
+                    }
+                }
+                TriggerStatement::For(statement) => {
+                    reject(statement.target, locals)?;
+                    validate_block(statement.block, locals)?;
+                }
+                TriggerStatement::While(statement) => validate_block(statement.block, locals)?,
+                TriggerStatement::Loop(block_value) => validate_block(block_value, locals)?,
+                TriggerStatement::If(statement) => {
+                    for branch in statement.branches {
+                        validate_block(branch.block, locals)?;
+                    }
+                }
+                TriggerStatement::Case(statement) => {
+                    for branch in statement.branches {
+                        validate_block(branch.block, locals)?;
+                    }
+                    if let Some(otherwise) = statement.otherwise {
+                        validate_block(otherwise, locals)?;
+                    }
+                }
+                TriggerStatement::Exception(statement) => {
+                    validate_block(statement.protected, locals)?;
+                    for handler in statement.handlers {
+                        validate_block(handler.block, locals)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    validate_block(program.body, program.locals)
+}
+
+fn resolve_plpgsql_column_type(
+    storage: &Storage,
+    txid: u32,
+    relation: &str,
+    column: &str,
+) -> Result<
+    (
+        ColType,
+        Option<crate::storage::UserTypeName>,
+        i32,
+        Option<PlpgsqlRecordShape>,
+    ),
+    SqlError,
+> {
+    if let Some(resolved) = storage.resolve_relation(
+        relation.split_once('.').map(|(schema, _)| schema),
+        relation.rsplit_once('.').map_or(relation, |(_, name)| name),
+        txid,
+    ) {
+        let crate::storage::ResolvedRelation::Table(slot) = resolved else {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not a table",
+                relation
+            ));
+        };
+        let definition = storage.table_def(slot, txid);
+        let column = definition.column_index(column).ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "column \"{}\" of relation \"{}\" does not exist",
+                column,
+                relation
+            )
+        })?;
+        let field = definition.columns()[column];
+        return Ok((field.ctype, field.user_type, field.type_mod, None));
+    }
+    let result = resolve_routine_type(storage, txid, relation)?;
+    let ColType::Composite(slot) = result.ctype else {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a composite type",
+            relation
+        ));
+    };
+    let definition = storage.composite_for(usize::from(slot), txid);
+    let field = definition
+        .fields_for(txid)
+        .iter()
+        .find(|field| !field.dropped && field.name.as_str() == column)
+        .ok_or_else(|| {
+            sql_err!(
+                sqlstate::UNDEFINED_COLUMN,
+                "attribute \"{}\" of composite type \"{}\" does not exist",
+                column,
+                relation
+            )
+        })?;
+    Ok((field.ctype, field.user_type, field.type_mod, None))
+}
+
+fn resolve_plpgsql_rowtype(
+    storage: &Storage,
+    txid: u32,
+    written: &str,
+) -> Result<
+    (
+        ColType,
+        Option<crate::storage::UserTypeName>,
+        i32,
+        Option<PlpgsqlRecordShape>,
+    ),
+    SqlError,
+> {
+    if let Some(resolved) = storage.resolve_relation(
+        written.split_once('.').map(|(schema, _)| schema),
+        written.rsplit_once('.').map_or(written, |(_, name)| name),
+        txid,
+    ) {
+        let crate::storage::ResolvedRelation::Table(slot) = resolved else {
+            return Err(sql_err!(
+                sqlstate::WRONG_OBJECT_TYPE,
+                "\"{}\" is not a table row type",
+                written
+            ));
+        };
+        let slot = u16::try_from(slot).map_err(|_| {
+            sql_err!(
+                sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                "table catalog exceeds PL/pgSQL rowtype capacity"
+            )
+        })?;
+        return Ok((
+            ColType::Record,
+            None,
+            -1,
+            Some(PlpgsqlRecordShape::Table(slot)),
+        ));
+    }
+    let result = resolve_routine_type(storage, txid, written)?;
+    let ColType::Composite(_) = result.ctype else {
+        return Err(sql_err!(
+            sqlstate::WRONG_OBJECT_TYPE,
+            "\"{}\" is not a row type",
+            written
+        ));
+    };
+    Ok((result.ctype, result.user_type, -1, None))
 }
 
 fn parse_trigger_program<'a>(
@@ -17657,6 +17929,9 @@ pub(crate) fn execute_plpgsql_procedure<'a>(
             user_type: parameter.user_type,
             type_mod: -1,
             initial: None,
+            record_shape: None,
+            constant: false,
+            not_null: false,
         });
         seeded[declaration_count] = input.unwrap_or(Datum::Null);
         declaration_count += 1;
@@ -17799,6 +18074,9 @@ pub(crate) fn execute_plpgsql_function<'a>(
             user_type: parameter.user_type,
             type_mod: -1,
             initial: None,
+            record_shape: None,
+            constant: false,
+            not_null: false,
         });
         seeded[declaration_count] = inputs[input_index];
         declaration_count += 1;
@@ -17829,6 +18107,9 @@ pub(crate) fn execute_plpgsql_function<'a>(
             user_type: parameter.user_type,
             type_mod: -1,
             initial: None,
+            record_shape: None,
+            constant: false,
+            not_null: false,
         });
         declaration_count += 1;
     }
@@ -17970,6 +18251,9 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
             user_type: parameter.user_type,
             type_mod: -1,
             initial: None,
+            record_shape: None,
+            constant: false,
+            not_null: false,
         });
         seeded[declaration_count] = inputs[input_index];
         declaration_count += 1;
@@ -18002,6 +18286,9 @@ pub(crate) fn execute_plpgsql_table_function<'a>(
             user_type: output.user_type,
             type_mod: -1,
             initial: None,
+            record_shape: None,
+            constant: false,
+            not_null: false,
         });
         declaration_count += 1;
     }
@@ -21262,6 +21549,13 @@ fn initialize_trigger_locals<'a>(
         }
         values[index] = Datum::Null;
         let Some(initial) = local.initial else {
+            if local.not_null {
+                return Err(sql_err!(
+                    sqlstate::NULL_VALUE_NOT_ALLOWED,
+                    "variable \"{}\" declared NOT NULL cannot default to NULL",
+                    local.name.as_str()
+                ));
+            }
             continue;
         };
         let scope = TriggerLocalScope {
@@ -21295,18 +21589,87 @@ fn coerce_plpgsql_local<'a>(
     local: TriggerLocalDecl<'a>,
     value: Datum<'a>,
 ) -> Result<Datum<'a>, SqlError> {
-    let value = coerce_routine_argument(
-        value,
-        crate::storage::RoutineArgumentDef {
-            name: local.name,
-            ctype: local.ctype,
-            user_type: local.user_type,
-        },
-        context.storage(),
-        context.txn.txid,
-        context.arena,
-    )?;
-    apply_typmod(value, local.ctype, local.type_mod, context.arena)
+    let value = match local.record_shape {
+        Some(PlpgsqlRecordShape::Table(slot)) => {
+            coerce_plpgsql_table_rowtype(context, slot, value)?
+        }
+        Some(PlpgsqlRecordShape::Dynamic) | None => coerce_routine_argument(
+            value,
+            crate::storage::RoutineArgumentDef {
+                name: local.name,
+                ctype: local.ctype,
+                user_type: local.user_type,
+            },
+            context.storage(),
+            context.txn.txid,
+            context.arena,
+        )?,
+    };
+    let value = apply_typmod(value, local.ctype, local.type_mod, context.arena)?;
+    if local.not_null && value.is_null() {
+        return Err(sql_err!(
+            sqlstate::NULL_VALUE_NOT_ALLOWED,
+            "null value cannot be assigned to variable \"{}\" declared NOT NULL",
+            local.name.as_str()
+        ));
+    }
+    Ok(value)
+}
+
+fn coerce_plpgsql_table_rowtype<'a>(
+    context: &TriggerExecContext<'_, 'a, '_>,
+    slot: u16,
+    value: Datum<'a>,
+) -> Result<Datum<'a>, SqlError> {
+    if value.is_null() {
+        return Ok(Datum::Null);
+    }
+    let fields = match value {
+        Datum::Record(fields) | Datum::Composite { fields, .. } => fields,
+        _ => {
+            return Err(sql_err!(
+                sqlstate::DATATYPE_MISMATCH,
+                "cannot assign a non-record value to a table row variable"
+            ));
+        }
+    };
+    let definition = context
+        .storage()
+        .table_def(usize::from(slot), context.txn.txid);
+    if fields.len() != definition.n_columns {
+        return Err(sql_err!(
+            sqlstate::DATATYPE_MISMATCH,
+            "record has {} fields but row type has {}",
+            fields.len(),
+            definition.n_columns
+        ));
+    }
+    let mut coerced = [RecordField {
+        name: "",
+        type_oid: 0,
+        value: Datum::Null,
+    }; MAX_COLUMNS];
+    for (index, (source, column)) in fields.iter().zip(definition.columns()).enumerate() {
+        coerced[index] = RecordField {
+            name: context
+                .arena
+                .alloc_str(column.name.as_str())
+                .map_err(|_| super::query::arena_full_pub())?,
+            type_oid: column.ctype.oid(),
+            value: coerce(
+                source.value,
+                column,
+                context.storage(),
+                context.txn.txid,
+                context.arena,
+            )?,
+        };
+    }
+    let fields = context
+        .arena
+        .alloc_slice_copy(&coerced[..definition.n_columns])
+        .map_err(|_| super::query::arena_full_pub())?;
+    Ok(Datum::Record(&*fields))
 }
 
 fn assign_trigger_local<'a>(
@@ -21317,6 +21680,13 @@ fn assign_trigger_local<'a>(
     value: Datum<'a>,
 ) -> Result<(), SqlError> {
     let index = trigger_local_index(locals, target)?;
+    if locals[index].constant {
+        return Err(sql_err!(
+            sqlstate::ERROR_IN_ASSIGNMENT,
+            "variable \"{}\" is declared CONSTANT",
+            locals[index].name.as_str()
+        ));
+    }
     values[index] = coerce_plpgsql_local(context, locals[index], value)?;
     Ok(())
 }
@@ -22000,6 +22370,23 @@ fn execute_trigger_block<'a>(
                     invocation,
                     transition: &transition,
                 };
+                let record_target = statement.targets.len() == 1
+                    && matches!(
+                        locals[targets[0]].ctype,
+                        ColType::Record | ColType::Composite(_)
+                    );
+                let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                let record_width = if record_target {
+                    super::query::describe_select(
+                        query,
+                        context.storage(),
+                        context.txn.txid,
+                        context.arena,
+                        &mut columns,
+                    )?
+                } else {
+                    0
+                };
                 let sequence = crate::sql::sequence::SeqEval::new(
                     context.storage(),
                     context.seq_session(),
@@ -22017,7 +22404,7 @@ fn execute_trigger_block<'a>(
                     Some(&scope),
                     Some(&sequence),
                     &mut |values| {
-                        if values.len() != statement.targets.len() {
+                        if !record_target && values.len() != statement.targets.len() {
                             return Err(sql_err!(
                                 sqlstate::DATATYPE_MISMATCH,
                                 "query returned {} columns but SELECT INTO expects {}",
@@ -22025,9 +22412,38 @@ fn execute_trigger_block<'a>(
                                 statement.targets.len()
                             ));
                         }
+                        if record_target && values.len() != record_width {
+                            return Err(sql_err!(
+                                sqlstate::INTERNAL_ERROR,
+                                "SELECT INTO record shape changed during execution"
+                            ));
+                        }
                         if !found {
-                            for (index, value) in values.iter().copied().enumerate() {
-                                selected[index] = detached_trigger_datum(value, context.arena)?;
+                            if record_target {
+                                let mut fields = [RecordField {
+                                    name: "",
+                                    type_oid: 0,
+                                    value: Datum::Null,
+                                }; MAX_PROJ];
+                                for (index, value) in values.iter().copied().enumerate() {
+                                    fields[index] = RecordField {
+                                        name: context
+                                            .arena
+                                            .alloc_str(columns[index].name)
+                                            .map_err(|_| super::query::arena_full_pub())?,
+                                        type_oid: columns[index].type_oid,
+                                        value: detached_trigger_datum(value, context.arena)?,
+                                    };
+                                }
+                                let fields = context
+                                    .arena
+                                    .alloc_slice_copy(&fields[..values.len()])
+                                    .map_err(|_| super::query::arena_full_pub())?;
+                                selected[0] = Datum::Record(&*fields);
+                            } else {
+                                for (index, value) in values.iter().copied().enumerate() {
+                                    selected[index] = detached_trigger_datum(value, context.arena)?;
+                                }
                             }
                             found = true;
                         }
@@ -22053,9 +22469,14 @@ fn execute_trigger_block<'a>(
                         }
                     }
                 }
-                for (index, &target) in targets[..statement.targets.len()].iter().enumerate() {
-                    local_values[target] =
-                        coerce_plpgsql_local(context, locals[target], selected[index])?;
+                for (index, _) in targets[..statement.targets.len()].iter().enumerate() {
+                    assign_trigger_local(
+                        context,
+                        locals,
+                        local_values,
+                        statement.targets[index],
+                        selected[index],
+                    )?;
                 }
             }
             TriggerStatement::DynamicSelectInto(statement) => {
@@ -22090,8 +22511,42 @@ fn execute_trigger_block<'a>(
                     bind_plpgsql_dynamic_query(context, statement.query, &scope)?,
                     &scope,
                 )?;
+                let record_target = statement.targets.len() == 1
+                    && matches!(
+                        locals[targets[0]].ctype,
+                        ColType::Record | ColType::Composite(_)
+                    );
+                let (record_width, record_names, record_type_oids) = {
+                    let mut columns = [ColDesc::new("", 0, 0); MAX_PROJ];
+                    let record_width = match query.statement {
+                        Stmt::Select(select) if record_target => super::query::describe_select(
+                            select,
+                            context.storage(),
+                            context.txn.txid,
+                            context.arena,
+                            &mut columns,
+                        )?,
+                        Stmt::SetQuery(set_query) if record_target => {
+                            super::query::describe_set_query(
+                                context.storage(),
+                                context.txn.txid,
+                                set_query,
+                                &mut columns,
+                                context.arena,
+                            )?
+                        }
+                        _ => 0,
+                    };
+                    let mut names = [StackStr::<63>::new(); MAX_PROJ];
+                    let mut type_oids = [0i32; MAX_PROJ];
+                    for (index, column) in columns[..record_width].iter().enumerate() {
+                        names[index] = StackStr::from_str(column.name);
+                        type_oids[index] = column.type_oid;
+                    }
+                    (record_width, names, type_oids)
+                };
                 let mut capture = |values: &[Datum]| {
-                    if values.len() != statement.targets.len() {
+                    if !record_target && values.len() != statement.targets.len() {
                         return Err(sql_err!(
                             sqlstate::DATATYPE_MISMATCH,
                             "query returned {} columns but EXECUTE INTO expects {}",
@@ -22099,9 +22554,38 @@ fn execute_trigger_block<'a>(
                             statement.targets.len()
                         ));
                     }
+                    if record_target && record_width != 0 && values.len() != record_width {
+                        return Err(sql_err!(
+                            sqlstate::INTERNAL_ERROR,
+                            "EXECUTE INTO record shape changed during execution"
+                        ));
+                    }
                     if !found {
-                        for (index, value) in values.iter().copied().enumerate() {
-                            selected[index] = detached_trigger_datum(value, context.arena)?;
+                        if record_target {
+                            let mut fields = [RecordField {
+                                name: "",
+                                type_oid: 0,
+                                value: Datum::Null,
+                            }; MAX_PROJ];
+                            for (index, value) in values.iter().copied().enumerate() {
+                                fields[index] = RecordField {
+                                    name: context
+                                        .arena
+                                        .alloc_str(record_names[index].as_str())
+                                        .map_err(|_| super::query::arena_full_pub())?,
+                                    type_oid: record_type_oids[index],
+                                    value: detached_trigger_datum(value, context.arena)?,
+                                };
+                            }
+                            let fields = context
+                                .arena
+                                .alloc_slice_copy(&fields[..values.len()])
+                                .map_err(|_| super::query::arena_full_pub())?;
+                            selected[0] = Datum::Record(&*fields);
+                        } else {
+                            for (index, value) in values.iter().copied().enumerate() {
+                                selected[index] = detached_trigger_datum(value, context.arena)?;
+                            }
                         }
                         found = true;
                     }
@@ -22249,9 +22733,14 @@ fn execute_trigger_block<'a>(
                         }
                     }
                 }
-                for (index, &target) in targets[..statement.targets.len()].iter().enumerate() {
-                    local_values[target] =
-                        coerce_plpgsql_local(context, locals[target], selected[index])?;
+                for (index, _) in targets[..statement.targets.len()].iter().enumerate() {
+                    assign_trigger_local(
+                        context,
+                        locals,
+                        local_values,
+                        statement.targets[index],
+                        selected[index],
+                    )?;
                 }
             }
             TriggerStatement::DynamicQuery(query) => {

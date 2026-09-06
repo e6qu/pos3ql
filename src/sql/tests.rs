@@ -43647,8 +43647,10 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
         &mut engine,
         &mut budget,
         "CREATE TABLE publication_projected (id int PRIMARY KEY, visible text, hidden text); \
-         CREATE PUBLICATION projected_changes FOR TABLE publication_projected (id, visible) WHERE (id > 0) \
-         WITH (publish = 'insert, update, delete')",
+         CREATE PUBLICATION projected_changes FOR TABLE publication_projected \
+         WITH (publish = 'insert, update, delete'); \
+         ALTER PUBLICATION projected_changes \
+           SET TABLE publication_projected (id, visible) WHERE (id > 0)",
     );
     assert_eq!(
         data_rows(&run_with(
@@ -43687,6 +43689,16 @@ fn publication_column_lists_are_typed_catalog_state_and_survive_replay() {
         )),
         ["(id > 0)"],
         "publication filters survive checkpoint recovery"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut replayed,
+            &mut replay_budget,
+            "SELECT attnames::text, rowfilter FROM pg_publication_tables \
+             WHERE pubname = 'projected_changes'"
+        )),
+        ["{id,visible}|(id > 0)"],
+        "publication table projections render PostgreSQL row filters"
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
@@ -43757,6 +43769,33 @@ fn publication_row_filters_follow_column_renames_through_replication_and_recover
         ["(event_id > 0)"],
         "the rebased predicate survives object-store checkpoint recovery"
     );
+    let floor = replayed.storage.lsn();
+    let mut replay_transaction = TxnState::new(&mut replay_budget, 256).unwrap();
+    run_txn(
+        &mut replayed,
+        &mut replay_budget,
+        &mut replay_transaction,
+        "INSERT INTO publication_filter_rename VALUES (2)",
+    );
+    let mut scratch =
+        crate::mem::FixedBuf::new(&mut replay_budget, "recovered publication scratch", 1 << 16)
+            .unwrap();
+    let mut send =
+        crate::mem::FixedBuf::new(&mut replay_budget, "recovered publication send", 1 << 16)
+            .unwrap();
+    let (_, emitted) = replayed
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("publication_filter_rename_changes").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("recovered publication transaction is retained");
+    assert!(emitted);
+    assert!(send.readable().contains(&b'I'));
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
@@ -45807,6 +45846,39 @@ fn publication_owner_changes_are_transactional_and_durable() {
         )),
         ["publication_second_owner"]
     );
+    let floor = replayed.storage.lsn();
+    let mut replay_transaction = TxnState::new(&mut replay_budget, 256).unwrap();
+    run_txn(
+        &mut replayed,
+        &mut replay_budget,
+        &mut replay_transaction,
+        "INSERT INTO publication_owner_source VALUES (1)",
+    );
+    let mut scratch = crate::mem::FixedBuf::new(
+        &mut replay_budget,
+        "recovered publication owner scratch",
+        1 << 16,
+    )
+    .unwrap();
+    let mut send = crate::mem::FixedBuf::new(
+        &mut replay_budget,
+        "recovered publication owner send",
+        1 << 16,
+    )
+    .unwrap();
+    let (_, emitted) = replayed
+        .emit_replication_transaction(
+            floor,
+            &[crate::storage::SqlName::parse("publication_owner_changes_renamed").unwrap()],
+            false,
+            crate::pg::pgoutput::ProtocolVersion::V2,
+            &mut scratch,
+            &mut Responder::new(&mut send),
+        )
+        .unwrap()
+        .expect("recovered renamed publication transaction is retained");
+    assert!(emitted);
+    assert!(send.readable().contains(&b'I'));
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
 
@@ -46284,6 +46356,54 @@ fn index_lifecycle_is_partition_aware_catalog_complete_and_durable() {
 }
 
 #[test]
+fn catalog_vectors_are_typed_durable_and_cold_recoverable() {
+    let mut config = test_config("catalog-vectors-cold-recovery");
+    config.object_store_on = true;
+    config.object_store_sim = true;
+    config.wal_upload = true;
+    config.wal_upload_sync = true;
+    config.object_store_namespace = format!("catalog-vectors-cold-{}", std::process::id());
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+
+    {
+        let mut budget = Budget::new(1 << 29);
+        let mut engine = Engine::new(&config, &mut budget).unwrap();
+        let created = run_with(
+            &mut engine,
+            &mut budget,
+            "CREATE TABLE durable_catalog_vectors (\
+                 id integer PRIMARY KEY,\
+                 attributes int2vector DEFAULT '3 -4',\
+                 identifiers oidvector DEFAULT '7 8'); \
+             INSERT INTO durable_catalog_vectors VALUES \
+                 (1, ARRAY[1::int2, 2::int2]::int2vector, '9 10'::oidvector), \
+                 (2, DEFAULT, DEFAULT)",
+        );
+        assert!(
+            !String::from_utf8_lossy(&created).contains("ERROR"),
+            "{}",
+            String::from_utf8_lossy(&created)
+        );
+        assert!(engine.checkpoint().unwrap());
+        engine.commit_wal().unwrap();
+    }
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+
+    let mut budget = Budget::new(1 << 29);
+    let mut recovered = Engine::new(&config, &mut budget).unwrap();
+    let rows = run_with(
+        &mut recovered,
+        &mut budget,
+        "SELECT attributes::int2[]::text, identifiers::oid[]::text \
+           FROM durable_catalog_vectors ORDER BY id",
+    );
+    assert_eq!(data_rows(&rows), ["{1,2}|{9,10}", "{3,-4}|{7,8}"]);
+    drop(recovered);
+    crate::object_store::sim::drop_namespace(&config.object_store_namespace);
+    std::fs::remove_dir_all(&config.data_dir).unwrap();
+}
+
+#[test]
 fn pg_dump_bootstrap_surface() {
     let (mut engine, mut budget) = test_engine();
     assert_eq!(
@@ -46335,6 +46455,68 @@ fn pg_dump_bootstrap_surface() {
         )),
         ["t"]
     );
+    run_with(
+        &mut engine,
+        &mut budget,
+        "CREATE TABLE pg_dump_publication_rows (id integer PRIMARY KEY, visible text, hidden text); \
+         CREATE PUBLICATION pg_dump_publication_changes \
+           FOR TABLE pg_dump_publication_rows (id, visible) WHERE (id > 0) \
+           WITH (publish = 'insert, update')",
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT prattrs::int2[]::text \
+               FROM pg_catalog.pg_publication_rel pr \
+               JOIN pg_catalog.pg_publication pub ON pub.oid = pr.prpubid \
+              WHERE pub.pubname = 'pg_dump_publication_changes'",
+        )),
+        ["{1,2}"]
+    );
+    let catalog_vector_casts = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT ARRAY[1::int2, 2::int2]::int2vector::int2[]::text, \
+                    ARRAY[1::oid, 2::oid]::oidvector::oid[]::text",
+    );
+    assert!(
+        !String::from_utf8_lossy(&catalog_vector_casts).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&catalog_vector_casts)
+    );
+    assert_eq!(data_rows(&catalog_vector_casts), ["{1,2}|{1,2}"]);
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT indclass[1]::oid,indclass[0] IS NULL \
+               FROM pg_catalog.pg_index \
+              WHERE indrelid = 'pg_dump_publication_rows'::regclass",
+        )),
+        ["1978|t"]
+    );
+    let publication_dump = run_with(
+        &mut engine,
+        &mut budget,
+        "SELECT pg_catalog.pg_get_expr(prqual, prrelid), \
+                    CASE WHEN pr.prattrs IS NOT NULL THEN \
+                      ARRAY(SELECT attname \
+                              FROM pg_catalog.generate_series(0, \
+                                   pg_catalog.array_upper(pr.prattrs::pg_catalog.int2[], 1)) s, \
+                                   pg_catalog.pg_attribute \
+                             WHERE attrelid = pr.prrelid AND attnum = prattrs[s]) \
+                    ELSE NULL END::text \
+               FROM pg_catalog.pg_publication_rel pr \
+               JOIN pg_catalog.pg_publication pub ON pub.oid = pr.prpubid \
+              WHERE pub.pubname = 'pg_dump_publication_changes'",
+    );
+    assert!(
+        !String::from_utf8_lossy(&publication_dump).contains("ERROR"),
+        "{}",
+        String::from_utf8_lossy(&publication_dump)
+    );
+    assert_eq!(data_rows(&publication_dump), ["(id > 0)|{id,visible}"]);
     assert_eq!(
         data_rows(&run_with(
             &mut engine,

@@ -571,6 +571,15 @@ INSERT INTO outbound_dump.items(mood,location,moods,locations,marked_location,ma
    ARRAY[ROW(300,400)::outbound_dump.location_domain], 'two');
 ALTER TYPE outbound_dump.location ADD ATTRIBUTE z integer;
 ALTER TYPE outbound_dump.location RENAME ATTRIBUTE x TO east;
+CREATE TABLE outbound_dump.publication_rows (
+  id integer PRIMARY KEY,
+  visible text,
+  hidden text
+);
+CREATE PUBLICATION outbound_dump_changes
+  FOR TABLE outbound_dump.publication_rows (id, visible) WHERE (id > 0)
+  WITH (publish = 'insert, update');
+ALTER PUBLICATION outbound_dump_changes OWNER TO outbound_reader;
 CREATE SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.mood SET SCHEMA outbound_type_target;
 ALTER TYPE outbound_dump.location SET SCHEMA outbound_type_target;
@@ -742,11 +751,10 @@ COMMENT ON LARGE OBJECT 94001 IS 'dumped large object';
 SQL
 outbound_setup_status=$?
 pg_dump -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
-  --no-owner \
   -f "$WORK/outbound.sql" > "$WORK/outbound_dump.out" 2>&1
 outbound_dump_status=$?
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
-  -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader; CREATE ROLE outbound_reader' \
+  -v ON_ERROR_STOP=1 -c 'DROP PUBLICATION IF EXISTS outbound_dump_changes; DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader; CREATE ROLE outbound_reader' \
   > "$WORK/outbound_drop.out" 2>&1
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 -f "$WORK/outbound.sql" \
@@ -903,8 +911,16 @@ else
       SELECT indexname FROM pg_indexes
        WHERE schemaname='outbound_dump' AND tablename='search_documents'
        ORDER BY indexname;
+      SELECT pubname,pubowner::regrole::text,puballtables,pubinsert,pubupdate,pubdelete,pubtruncate,
+             pubviaroot,pubgencols
+        FROM pg_publication
+       WHERE pubname = 'outbound_dump_changes';
+      SELECT schemaname,tablename,attnames::text,rowfilter
+        FROM pg_publication_tables
+       WHERE pubname = 'outbound_dump_changes';
     " 2>/dev/null)
   expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\n9|nine\nINSERT 0 1\n9|nine\noutbound_redirect|t|dumped rewrite rule\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1\nbyte_order|c|t|latin1_to_utf8|t\none\nthree\ntwo\nc3a9\ndumped collation|dumped conversion\n1|\'42\':2 \'cats\':1|\'cats\' & \'42\'|t\n2|\'7\':2 \'dogs\':1|\'dogs\'|t\n\'9\':2 \'birds\':1|{birds}\ndumped search configuration\n4\noutbound_search_expression_idx\noutbound_search_query_idx\noutbound_search_terms_idx\nsearch_documents_pkey'
+  expected_outbound_observed+=$'\noutbound_dump_changes|outbound_reader|f|t|t|f|f|f|n\noutbound_dump|publication_rows|{id,visible}|(id > 0)'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else
@@ -944,7 +960,7 @@ fi
 # name. Keep the PostgreSQL oracle as clean as the fresh pos3ql restart below,
 # so pg_type cardinality probes do not inherit this tooling fixture.
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
-  -v ON_ERROR_STOP=1 -c 'SELECT lo_unlink(94001) WHERE EXISTS (SELECT 1 FROM pg_largeobject_metadata WHERE oid = 94001); DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader' \
+  -v ON_ERROR_STOP=1 -c 'SELECT lo_unlink(94001) WHERE EXISTS (SELECT 1 FROM pg_largeobject_metadata WHERE oid = 94001); DROP PUBLICATION IF EXISTS outbound_dump_changes; DROP SCHEMA IF EXISTS outbound_dump CASCADE; DROP SCHEMA IF EXISTS outbound_type_target CASCADE; DROP ROLE IF EXISTS outbound_reader' \
   > "$WORK/outbound_cleanup.out" 2>&1 || {
     bad "clean outbound pg_dump fixture from PostgreSQL"
     tail -40 "$WORK/outbound_cleanup.out"

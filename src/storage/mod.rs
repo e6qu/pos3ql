@@ -416,6 +416,14 @@ pub enum OwnedDatum {
         len: u8,
         bytes: [u8; MAX_DEFAULT_TEXT],
     },
+    Int2Vector {
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
+    OidVector {
+        len: u8,
+        bytes: [u8; MAX_DEFAULT_TEXT],
+    },
     Range {
         kind: crate::sql::types::RangeKind,
         multirange: bool,
@@ -521,17 +529,13 @@ impl OwnedDatum {
                     "cannot store a pseudo-type value in a column"
                 ));
             }
-            Datum::Int2Vector(_) => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot store an int2vector value in a column"
-                ));
+            Datum::Int2Vector(raw) => {
+                let (len, bytes) = Self::bytes(raw, "int2vector")?;
+                Self::Int2Vector { len, bytes }
             }
-            Datum::OidVector(_) => {
-                return Err(sql_err!(
-                    sqlstate::FEATURE_NOT_SUPPORTED,
-                    "cannot store an oidvector value in a column"
-                ));
+            Datum::OidVector(raw) => {
+                let (len, bytes) = Self::bytes(raw, "oidvector")?;
+                Self::OidVector { len, bytes }
             }
             Datum::Regtype {
                 referenced_oid,
@@ -748,6 +752,8 @@ impl OwnedDatum {
                 element: *element,
                 raw: &bytes[..*len as usize],
             },
+            Self::Int2Vector { len, bytes } => Datum::Int2Vector(&bytes[..*len as usize]),
+            Self::OidVector { len, bytes } => Datum::OidVector(&bytes[..*len as usize]),
             Self::Range {
                 kind,
                 multirange,

@@ -1868,12 +1868,16 @@ fn record_shape_metadata_dyn(
                     .ok()
                     .and_then(|ctype| match ctype {
                         ColType::Array(element) => Some(element.to_coltype()),
+                        ColType::Int2Vector => Some(ColType::Int2),
+                        ColType::OidVector => Some(ColType::Oid),
                         _ => None,
                     }),
                 Expr::Field { base, field } => record_field_type(base, field, columns)
                     .ok()
                     .and_then(|ctype| match ctype {
                         ColType::Array(element) => Some(element.to_coltype()),
+                        ColType::Int2Vector => Some(ColType::Int2),
+                        ColType::OidVector => Some(ColType::Oid),
                         _ => None,
                     }),
                 _ => infer_type_res(array, columns)
@@ -3009,6 +3013,8 @@ pub fn infer_type_res(
             } else {
                 match coltype_of_oid(infer_type_res(base, columns)?.0) {
                     Some(ColType::Array(e)) => of(e.to_coltype()),
+                    Some(ColType::Int2Vector) => of(ColType::Int2),
+                    Some(ColType::OidVector) => of(ColType::Oid),
                     Some(ColType::Name) => of(ColType::Bpchar),
                     Some(ctype) if matches!(base, Expr::Subscript { .. }) => of(ctype),
                     _ => (oid::UNKNOWN, -2),

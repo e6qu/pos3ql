@@ -9744,6 +9744,9 @@ pub(crate) fn encoded_default_len(d: &Option<OwnedDatum>) -> usize {
         Some(OwnedDatum::Json { len, .. }) | Some(OwnedDatum::Bit { len, .. }) => 2 + *len as usize,
         Some(OwnedDatum::Bytea { len, .. }) => 1 + *len as usize,
         Some(OwnedDatum::Array { len, .. }) => 5 + *len as usize,
+        Some(OwnedDatum::Int2Vector { len, .. }) | Some(OwnedDatum::OidVector { len, .. }) => {
+            1 + *len as usize
+        }
         Some(OwnedDatum::Range { len, .. }) => 3 + *len as usize,
     }
 }
@@ -10049,6 +10052,18 @@ pub(crate) fn encode_default_bytes(d: &Option<OwnedDatum>, out: &mut [u8]) -> us
             out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
             2 + *len as usize
         }
+        Some(OwnedDatum::Int2Vector { len, bytes }) => {
+            out[0] = 31;
+            out[1] = *len;
+            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            2 + *len as usize
+        }
+        Some(OwnedDatum::OidVector { len, bytes }) => {
+            out[0] = 32;
+            out[1] = *len;
+            out[2..2 + *len as usize].copy_from_slice(&bytes[..*len as usize]);
+            2 + *len as usize
+        }
     }
 }
 
@@ -10282,6 +10297,25 @@ pub(crate) fn decode_default(payload: &[u8], at: &mut usize) -> Option<Option<Ow
             Some(OwnedDatum::Bytea {
                 len: len as u8,
                 bytes,
+            })
+        }
+        31 | 32 => {
+            let len = *payload.get(*at)? as usize;
+            *at += 1;
+            if (tag == 31 && !len.is_multiple_of(2)) || (tag == 32 && !len.is_multiple_of(4)) {
+                return None;
+            }
+            let bytes = decode_bounded_default_bytes(payload, at, len)?;
+            Some(if tag == 31 {
+                OwnedDatum::Int2Vector {
+                    len: len as u8,
+                    bytes,
+                }
+            } else {
+                OwnedDatum::OidVector {
+                    len: len as u8,
+                    bytes,
+                }
             })
         }
         25 => {
@@ -10706,6 +10740,8 @@ mod tests {
     fn typed_default_codec_size_and_round_trip_agree() {
         let mut text = [0u8; crate::storage::MAX_DEFAULT_TEXT];
         text[..3].copy_from_slice(b"101");
+        let mut vector = [0u8; crate::storage::MAX_DEFAULT_TEXT];
+        vector[..4].copy_from_slice(&[1, 0, 2, 0]);
         let defaults = [
             None,
             Some(OwnedDatum::Char(0xff)),
@@ -10750,6 +10786,14 @@ mod tests {
             Some(OwnedDatum::Bytea {
                 len: 3,
                 bytes: text,
+            }),
+            Some(OwnedDatum::Int2Vector {
+                len: 4,
+                bytes: vector,
+            }),
+            Some(OwnedDatum::OidVector {
+                len: 4,
+                bytes: vector,
             }),
         ];
         for default in defaults {

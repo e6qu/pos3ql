@@ -265,10 +265,10 @@ normalize() {
 run_corpus() { # port name file
   if [[ "$1" == "$PG_PORT" ]]; then
     PGOPTIONS="-c timezone=UTC -c extension_control_path=$REFERENCE_EXTENSION_CONTROL_ROOT" \
-      "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -a -q -P pager=off \
+      stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$REFERENCE_DATABASE" -X -a -q -P pager=off \
         -v VERBOSITY=verbose -f "$3" 2>&1
   else
-    "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
+    stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -X -a -q -P pager=off \
       -v VERBOSITY=verbose -f "$3" 2>&1
   fi | normalize > "$WORK/$2"
   if [[ "$1" == "$P3_PORT" ]] && ! server_alive "$P3_PID"; then
@@ -380,7 +380,7 @@ normalize_exact() {
 run_exact() { # port name file
   local database=postgres
   [[ "$1" == "$PG_PORT" ]] && database=$REFERENCE_DATABASE
-  "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -a -q -P pager=off \
+  stdbuf -o0 -e0 "$PSQL" -h 127.0.0.1 -p "$1" -U postgres -d "$database" -X -a -q -P pager=off \
     -v VERBOSITY=verbose -f "$3" 2>&1 | normalize_exact > "$WORK/$2"
 }
 

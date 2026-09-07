@@ -159,3 +159,17 @@ DROP TABLE mg_inherit_target_child;
 DROP TABLE mg_inherit_target;
 DROP TABLE mg_inherit_source_child;
 DROP TABLE mg_inherit_source;
+
+-- A MERGE source is one statement input. Counting by executing it once and
+-- then materializing it again would duplicate volatile effects and could see
+-- two different foreign snapshots.
+CREATE SEQUENCE mg_source_once_sequence;
+CREATE TABLE mg_source_once_target (id bigint PRIMARY KEY);
+MERGE INTO mg_source_once_target AS target
+USING (VALUES (nextval('mg_source_once_sequence'))) AS source(id)
+ON target.id = source.id
+WHEN NOT MATCHED THEN INSERT (id) VALUES (source.id);
+SELECT id FROM mg_source_once_target;
+SELECT last_value FROM mg_source_once_sequence;
+DROP TABLE mg_source_once_target;
+DROP SEQUENCE mg_source_once_sequence;

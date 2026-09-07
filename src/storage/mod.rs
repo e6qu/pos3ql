@@ -10528,6 +10528,14 @@ pub(crate) struct ForeignSession {
     timeout: std::time::Duration,
 }
 
+#[derive(Clone, Copy)]
+struct ForeignStatementContext {
+    transaction_id: u32,
+    serializable: bool,
+    savepoints: [crate::util::StackStr<63>; crate::sql::txn::MAX_SAVEPOINTS],
+    savepoint_count: usize,
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -10561,7 +10569,7 @@ pub struct Storage {
     foreign: foreign::ForeignCatalog,
     foreign_client: std::cell::RefCell<Option<crate::pg::replication_client::ReplicationClient>>,
     foreign_session: std::cell::RefCell<Option<ForeignSession>>,
-    foreign_statement_isolation: Cell<Option<(u32, bool)>>,
+    foreign_statement_context: Cell<Option<ForeignStatementContext>>,
     subscription_relations: FixedVec<SubscriptionRelation>,
     matviews: FixedVec<MatviewDef>,
     matview_dependencies: FixedVec<StoredQueryDependencies>,
@@ -13237,7 +13245,7 @@ impl Storage {
             foreign,
             foreign_client: std::cell::RefCell::new(None),
             foreign_session: std::cell::RefCell::new(None),
-            foreign_statement_isolation: Cell::new(None),
+            foreign_statement_context: Cell::new(None),
             subscription_relations,
             matviews,
             matview_dependencies,
@@ -13392,15 +13400,46 @@ impl Storage {
     /// foreign scan can open its remote counterpart.  Execution is
     /// single-threaded, while the session identity above remains the durable
     /// ownership check across statements.
-    pub(crate) fn set_foreign_statement_isolation(&self, transaction_id: u32, serializable: bool) {
-        self.foreign_statement_isolation
-            .set(Some((transaction_id, serializable)));
+    pub(crate) fn set_foreign_statement_context(
+        &self,
+        transaction_id: u32,
+        serializable: bool,
+        savepoints: &[crate::util::StackStr<63>],
+    ) {
+        let mut names = [crate::util::StackStr::new(); crate::sql::txn::MAX_SAVEPOINTS];
+        names[..savepoints.len()].copy_from_slice(savepoints);
+        self.foreign_statement_context
+            .set(Some(ForeignStatementContext {
+                transaction_id,
+                serializable,
+                savepoints: names,
+                savepoint_count: savepoints.len(),
+            }));
     }
 
     pub(crate) fn foreign_statement_is_serializable(&self, transaction_id: u32) -> bool {
-        self.foreign_statement_isolation
+        self.foreign_statement_context
             .get()
-            .is_some_and(|(current, serializable)| current == transaction_id && serializable)
+            .is_some_and(|context| context.transaction_id == transaction_id && context.serializable)
+    }
+
+    pub(crate) fn foreign_statement_savepoints(
+        &self,
+        transaction_id: u32,
+    ) -> (
+        [crate::util::StackStr<63>; crate::sql::txn::MAX_SAVEPOINTS],
+        usize,
+    ) {
+        self.foreign_statement_context
+            .get()
+            .filter(|context| context.transaction_id == transaction_id)
+            .map_or(
+                (
+                    [crate::util::StackStr::new(); crate::sql::txn::MAX_SAVEPOINTS],
+                    0,
+                ),
+                |context| (context.savepoints, context.savepoint_count),
+            )
     }
 
     pub(crate) fn prepared_transaction_catalog(&self) -> &[PreparedTransactionCatalogEntry] {

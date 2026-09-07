@@ -237,6 +237,40 @@ fn enter_session(
                 Ok(())
             })?;
         }
+        // The remote session is opened lazily. Recreate savepoints that were
+        // established before the first foreign access so later RELEASE and
+        // ROLLBACK TO operate on the same transaction shape locally and
+        // remotely.
+        let (savepoints, savepoint_count) = storage.foreign_statement_savepoints(txid);
+        for name in &savepoints[..savepoint_count] {
+            let mut command = StackStr::<256>::new();
+            let _ = command.write_str("SAVEPOINT ");
+            quote_identifier(&mut command, name.as_str());
+            if command.is_truncated() {
+                return Err(sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "foreign savepoint command exceeds its fixed buffer"
+                ));
+            }
+            client.query(command.as_str()).map_err(client_error)?;
+            ready = false;
+            while !ready {
+                poll_client(&mut client, deadline, &mut |event| {
+                    match event {
+                        ClientEvent::Sql(SqlEvent::CommandComplete { tag: "SAVEPOINT" }) => {}
+                        ClientEvent::Sql(SqlEvent::Ready {
+                            transaction_status: b'T',
+                        }) => ready = true,
+                        _ => {
+                            return Err(ClientError::Protocol(
+                                crate::pg::replication_client::FrameError::Malformed,
+                            ));
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+        }
         Ok(())
     })();
     if let Err(error) = result {
@@ -947,12 +981,12 @@ pub(crate) fn materialize<'a>(
 /// identity is selected separately from user columns, then converted into the
 /// bounded physical-row representation consumed by local DML predicates.
 /// It never becomes a fabricated local heap row identifier.
-pub(crate) fn visit_mutable_rows(
+pub(crate) fn visit_mutable_rows<'arena>(
     storage: &Storage,
     table_slot: usize,
     txid: u32,
-    arena: &Arena,
-    visit: &mut impl FnMut(RemoteTupleId, &[u8]) -> Result<(), SqlError>,
+    arena: &'arena Arena,
+    visit: &mut impl FnMut(RemoteTupleId, &'arena [u8]) -> Result<(), SqlError>,
 ) -> Result<(), SqlError> {
     let (endpoint, table, foreign, timeout) = endpoint(storage, table_slot, txid)?;
     let remote_schema = foreign

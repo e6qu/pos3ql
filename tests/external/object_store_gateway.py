@@ -6,6 +6,7 @@ import hashlib
 import http.server
 import os
 import pathlib
+import threading
 import urllib.parse
 
 
@@ -18,6 +19,7 @@ def object_path(root, namespace, key):
 class Gateway(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     root = None
+    mutation_lock = threading.Lock()
 
     def log_message(self, *_):
         pass
@@ -35,29 +37,39 @@ class Gateway(http.server.BaseHTTPRequestHandler):
 
     def fail(self, status, message):
         data = message.encode()
-        self.send_response(status)
-        self.send_header("content-length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def read_body(self):
-        return self.rfile.read(int(self.headers.get("content-length", "0")))
+        length = int(self.headers.get("content-length", "0"))
+        if length < 0:
+            raise ValueError("invalid content length")
+        data = self.rfile.read(length)
+        if len(data) != length:
+            raise ValueError("truncated request body")
+        return data
 
     def do_PUT(self):
         try:
             _, namespace, key = self.target()
             path = object_path(self.root, namespace, key)
-            exists = path.exists()
-            if self.headers.get("if-none-match") == "*" and exists:
-                return self.fail(412, "exists")
-            if "if-match" in self.headers:
-                if not exists or self.etag(path.read_bytes()) != self.headers["if-match"]:
-                    return self.fail(412, "generation changed")
             data = self.read_body()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(path.suffix + ".tmp")
-            temporary.write_bytes(data)
-            os.replace(temporary, path)
+            with self.mutation_lock:
+                exists = path.exists()
+                if self.headers.get("if-none-match") == "*" and exists:
+                    return self.fail(412, "exists")
+                if "if-match" in self.headers:
+                    if not exists or self.etag(path.read_bytes()) != self.headers["if-match"]:
+                        return self.fail(412, "generation changed")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix(path.suffix + ".tmp")
+                temporary.write_bytes(data)
+                os.replace(temporary, path)
             self.send_response(200)
             self.send_header("etag", self.etag(data))
             self.send_header("content-length", "0")
@@ -98,7 +110,8 @@ class Gateway(http.server.BaseHTTPRequestHandler):
         try:
             _, namespace, key = self.target()
             path = object_path(self.root, namespace, key)
-            path.unlink(missing_ok=True)
+            with self.mutation_lock:
+                path.unlink(missing_ok=True)
             self.send_response(204)
             self.end_headers()
         except ValueError:

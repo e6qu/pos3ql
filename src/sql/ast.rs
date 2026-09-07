@@ -357,6 +357,7 @@ pub enum CreateSchemaElement<'a> {
 pub struct MaintenanceTarget<'a> {
     pub table: QualName<'a>,
     pub columns: &'a [&'a str],
+    pub inheritance: RelationInheritance,
 }
 
 /// The VACUUM modes this object-native engine can execute. Other PostgreSQL

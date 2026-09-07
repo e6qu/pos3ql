@@ -1336,7 +1336,7 @@ fn foreign_data_catalog_views_enforce_postgresql_credential_visibility() {
 }
 
 #[test]
-fn foreign_table_mutation_rejections_match_postgres_fdw_surface() {
+fn foreign_table_conflict_rejections_match_postgres_fdw_surface() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
         &mut engine,
@@ -1354,7 +1354,6 @@ fn foreign_table_mutation_rejections_match_postgres_fdw_surface() {
         String::from_utf8_lossy(&setup)
     );
     for statement in [
-        "MERGE INTO mutation_target t USING mutation_target s ON t.id = s.id WHEN MATCHED THEN DELETE",
         "INSERT INTO mutation_target VALUES (1) ON CONFLICT (id) DO NOTHING",
         "INSERT INTO mutation_target VALUES (1) ON CONFLICT DO UPDATE SET id = 2",
     ] {
@@ -5009,6 +5008,14 @@ fn native_hook_ddl_rejects_before_catalog_publication() {
     for sql in [
         "CREATE OR REPLACE TRANSFORM FOR integer LANGUAGE plpgsql (TO SQL WITH FUNCTION pg_catalog.int4recv(internal), FROM SQL WITH FUNCTION pg_catalog.int4recv(internal))",
         "DROP TRANSFORM IF EXISTS FOR integer LANGUAGE plpgsql",
+        "CREATE FUNCTION native_window(integer) RETURNS integer LANGUAGE sql WINDOW RETURN $1",
+        "CREATE FUNCTION transformed(integer) RETURNS integer LANGUAGE sql TRANSFORM FOR TYPE integer RETURN $1",
+        "CREATE FUNCTION supported(integer) RETURNS integer LANGUAGE sql SUPPORT pg_catalog.array_unnest_support RETURN $1",
+        "CREATE FUNCTION linked(integer) RETURNS integer LANGUAGE plpgsql AS 'untrusted-library', 'entrypoint'",
+        "CREATE TRUSTED PROCEDURAL LANGUAGE native_language HANDLER pg_catalog.plpgsql_call_handler",
+        "CREATE LANGUAGE handlerless_language",
+        "ALTER LANGUAGE plpgsql RENAME TO mutated_language",
+        "DROP LANGUAGE IF EXISTS plpgsql CASCADE",
         "LOAD 'untrusted-library'",
         "SECURITY LABEL ON TABLE untrusted_target IS 'label'",
     ] {
@@ -5055,6 +5062,18 @@ fn native_hook_ddl_rejects_before_catalog_publication() {
         row_description_type_oids(&output),
         [26, 26, 26, 26, 24, 24],
         "pg_transform must retain PostgreSQL's oid/regproc wire shape"
+    );
+    assert_eq!(
+        data_rows(&run_with(
+            &mut engine,
+            &mut budget,
+            "SELECT count(*) FROM pg_proc \
+               WHERE proname IN ('native_window', 'transformed', 'supported', 'linked'); \
+             SELECT count(*) FROM pg_language \
+               WHERE lanname IN ('native_language', 'handlerless_language', 'mutated_language')",
+        )),
+        ["0", "0"],
+        "native hooks must reject before publishing any catalog identity"
     );
     crate::object_store::sim::drop_namespace(&config.object_store_namespace);
 }
@@ -31050,6 +31069,24 @@ fn merge_statement() {
         "{}",
         String::from_utf8_lossy(&inserted)
     );
+    let volatile_source = run_with(
+        &mut e,
+        &mut b,
+        "CREATE SEQUENCE merge_source_once_sequence; \
+         CREATE TABLE merge_source_once_target (id bigint PRIMARY KEY); \
+         MERGE INTO merge_source_once_target AS target \
+         USING (VALUES (nextval('merge_source_once_sequence'))) AS source(id) \
+         ON target.id = source.id \
+         WHEN NOT MATCHED THEN INSERT (id) VALUES (source.id); \
+         SELECT id FROM merge_source_once_target; \
+         SELECT last_value FROM merge_source_once_sequence",
+    );
+    assert_eq!(
+        data_rows(&volatile_source),
+        ["1", "1"],
+        "MERGE must evaluate a volatile source exactly once: {}",
+        String::from_utf8_lossy(&volatile_source)
+    );
 
     let no_action = run_with(
         &mut e,
@@ -31562,6 +31599,22 @@ fn merge_returning_streams_actions_and_materializes_ctes() {
         ["UPDATE|1|again", "INSERT|3|third"],
         "{}",
         String::from_utf8_lossy(&cte)
+    );
+    let target_only = run_with(
+        &mut engine,
+        &mut budget,
+        "MERGE INTO merge_return_target AS target \
+         USING (VALUES (1, 'present')) AS source(source_id, source_value) \
+         ON target.id = source.source_id \
+         WHEN NOT MATCHED BY SOURCE AND target.id = 2 \
+           THEN UPDATE SET value = 'target only' \
+         RETURNING merge_action(), source.source_id, source.source_value, source_value, target.id",
+    );
+    assert_eq!(
+        data_rows(&target_only),
+        ["UPDATE|NULL|NULL|NULL|2"],
+        "MERGE RETURNING keeps an absent source as a typed NULL row: {}",
+        String::from_utf8_lossy(&target_only)
     );
     let invalid_context = run_with(&mut engine, &mut budget, "SELECT merge_action()");
     assert!(
@@ -32602,6 +32655,9 @@ fn vacuum_and_analyze() {
     for cmd in [
         "VACUUM FREEZE vt",
         "VACUUM (SKIP_LOCKED) vt",
+        "VACUUM PROCESS_MAIN vt",
+        "VACUUM SKIP_DATABASE_STATS",
+        "VACUUM ONLY_DATABASE_STATS",
         "ANALYZE (VERBOSE) vt",
     ] {
         let text = String::from_utf8_lossy(&run_with(&mut e, &mut b, cmd)).to_string();
@@ -32642,6 +32698,40 @@ fn vacuum_and_analyze() {
     assert_eq!(statistics.columns[1].distinct_values, 2);
     assert_eq!(statistics.columns[0].null_fraction_ppm, 0);
     assert!(statistics.average_row_width > 0);
+    let inheritance = run_with(
+        &mut e,
+        &mut b,
+        "CREATE TABLE maintenance_parent (a integer); \
+         CREATE TABLE maintenance_child (b integer) INHERITS (maintenance_parent); \
+         INSERT INTO maintenance_parent VALUES (1); \
+         INSERT INTO maintenance_child VALUES (2, 20), (3, 30); \
+         ANALYZE ONLY maintenance_parent",
+    );
+    assert!(
+        !message_types(&inheritance).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&inheritance)
+    );
+    let parent_slot = e
+        .storage
+        .find_table("public", "maintenance_parent")
+        .unwrap();
+    let child_slot = e.storage.find_table("public", "maintenance_child").unwrap();
+    assert!(e.storage.table_statistics(parent_slot, 0).valid);
+    assert!(!e.storage.table_statistics(child_slot, 0).valid);
+    let inherited = run_with(&mut e, &mut b, "ANALYZE maintenance_parent *");
+    assert!(
+        !message_types(&inherited).contains(&b'E'),
+        "{}",
+        String::from_utf8_lossy(&inherited)
+    );
+    assert_eq!(e.storage.table_statistics(child_slot, 0).rows, 2);
+    let contradictory = run_with(&mut e, &mut b, "ANALYZE ONLY maintenance_parent *");
+    assert!(
+        String::from_utf8_lossy(&contradictory).contains("42601"),
+        "{}",
+        String::from_utf8_lossy(&contradictory)
+    );
     run_with(
         &mut e,
         &mut b,

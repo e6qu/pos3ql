@@ -27,7 +27,7 @@ Permanent, unlogged, and session-temporary tables, indexes, identity sequences, 
 
 Verification includes unit/property tests, SQLLogicTest and differential runs against PostgreSQL, psql and driver probes, object-store cold-start and crash recovery, and deterministic storage fault simulation.
 
-The completion work is object-native logical-replication interoperability where practical and remaining PostgreSQL SQL/catalog/tooling coverage. Physical demand is proven through query execution and DML sources; PostgreSQL physical/binary-WAL replication is not a target. See [PLAN.md](PLAN.md).
+All 183 PostgreSQL 18 top-level commands have a tested execution contract or an explicit architecture boundary; `tests/postgresql18_commands.tsv` is the ratchet. The remaining completion work is object-native logical-replication interoperability where practical and compatibility discovered by continuing differential, driver, and dump/restore testing. Physical demand is proven through query execution and DML sources; PostgreSQL physical/binary-WAL replication is not a target. See [PLAN.md](PLAN.md).
 
 ## Quick start
 

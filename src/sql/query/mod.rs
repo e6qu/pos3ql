@@ -4893,7 +4893,7 @@ pub(crate) fn select_query_resumable<'a, 'statement>(
     // Catalog relations (pg_catalog / information_schema) are synthesized and
     // registered as derived tables by resolve_exec, so they flow through the
     // general executor — joins, subqueries, aggregates, and ORDER BY included.
-    let scope = match QueryScope::resolve_exec(storage, from, txid, arena, params) {
+    let scope = match QueryScope::resolve_exec(storage, from, txid, arena, params, seq) {
         Ok(s) => s,
         Err(e) => return sql_fail(e),
     };
@@ -6169,7 +6169,7 @@ fn select_into_rows_mode<'a>(
             emit(&vals[..n])?;
             return Ok(());
         };
-        let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
+        let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, seq, outer)?;
         let statement = resolve_group_ordinals(statement, Some(&scope), arena, storage, txid)?;
         check_key_types(statement, &scope, arena)?;
         let mut sub_exprs: [Option<&Expr>; 2 + MAX_PROJ + 2 * MAX_JOIN_TABLES] =
@@ -6339,7 +6339,7 @@ fn select_into_rows_mode<'a>(
     };
 
     collect_table_sample_expressions(from, &mut sub_exprs[1 + MAX_PROJ..]);
-    let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
+    let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, seq, outer)?;
     let outer_subs = prepare_outer_subqueries(&sub_exprs, storage, txid, arena, params)?;
     let correlated = outer_subs.correlated;
     let mut where_correlated = [&Expr::Null; MAX_SUBQUERIES];
@@ -8381,7 +8381,8 @@ pub fn first_from_match<'a>(
     target: &dyn ColumnLookup<'a>,
     on_match: &mut dyn FnMut(&dyn ColumnLookup<'a>) -> Result<(), SqlError>,
 ) -> Result<bool, SqlError> {
-    let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, Some(target))?;
+    let scope =
+        QueryScope::resolve_exec_outer(storage, from, txid, arena, params, None, Some(target))?;
     let mut subquery_expressions = [None; 1 + 2 * MAX_JOIN_TABLES];
     subquery_expressions[0] = where_clause;
     collect_table_sample_expressions(from, &mut subquery_expressions[1..]);

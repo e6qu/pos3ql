@@ -942,6 +942,59 @@ impl ReplicationClient {
         Ok(())
     }
 
+    /// Executes one unnamed extended-protocol statement with text parameters.
+    /// Parameter bytes cross the PostgreSQL protocol as values, never as SQL
+    /// source text. The query must provide type context for every parameter.
+    pub(crate) fn query_params(
+        &mut self,
+        query: &str,
+        params: &[Option<&[u8]>],
+    ) -> Result<(), ClientError> {
+        if self.state != ClientState::SqlReady
+            || query.is_empty()
+            || query.as_bytes().contains(&0)
+            || params.len() > i16::MAX as usize
+        {
+            return Err(ClientError::Protocol(FrameError::Malformed));
+        }
+        let mark = self.send.mark();
+        let result = (|| {
+            let mut parse = MsgOut::begin(&mut self.send, wire::FMSG_PARSE);
+            parse.u8(0).bytes(query.as_bytes()).u8(0).i16(0);
+            parse.finish().map_err(|_| ClientError::WireFull)?;
+
+            let mut bind = MsgOut::begin(&mut self.send, wire::FMSG_BIND);
+            bind.u8(0).u8(0).i16(0).i16(params.len() as i16);
+            for value in params {
+                match value {
+                    Some(value) if value.len() <= i32::MAX as usize => {
+                        bind.i32(value.len() as i32).bytes(value);
+                    }
+                    Some(_) => return Err(ClientError::WireFull),
+                    None => {
+                        bind.i32(-1);
+                    }
+                }
+            }
+            // Zero result-format codes selects text for every result column.
+            bind.i16(0);
+            bind.finish().map_err(|_| ClientError::WireFull)?;
+
+            let mut execute = MsgOut::begin(&mut self.send, wire::FMSG_EXECUTE);
+            execute.u8(0).i32(0);
+            execute.finish().map_err(|_| ClientError::WireFull)?;
+            MsgOut::begin(&mut self.send, wire::FMSG_SYNC)
+                .finish()
+                .map_err(|_| ClientError::WireFull)
+        })();
+        if let Err(error) = result {
+            self.send.truncate_to(mark);
+            return Err(error);
+        }
+        self.state = ClientState::AwaitingSql;
+        Ok(())
+    }
+
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
         self.stream
             .as_ref()
@@ -1354,6 +1407,8 @@ fn consume_frame<'a>(
         BackendFrame::CommandComplete { tag } if *state == ClientState::AwaitingSql => {
             return Ok(Some(ClientEvent::Sql(SqlEvent::CommandComplete { tag })));
         }
+        BackendFrame::ParseComplete | BackendFrame::BindComplete | BackendFrame::NoData
+            if *state == ClientState::AwaitingSql => {}
         BackendFrame::ReadyForQuery { transaction_status }
             if *state == ClientState::AwaitingSql && matches!(transaction_status, b'I' | b'T') =>
         {
@@ -1640,6 +1695,9 @@ pub enum BackendFrame<'a> {
     RowDescription { fields: u16 },
     DataRow(SqlDataRow<'a>),
     CommandComplete { tag: &'a str },
+    ParseComplete,
+    BindComplete,
+    NoData,
     Error { fields: &'a [u8] },
     Notice { fields: &'a [u8] },
 }
@@ -1895,6 +1953,9 @@ pub fn next_frame(bytes: &[u8]) -> Result<Option<(usize, BackendFrame<'_>)>, Fra
             }
             BackendFrame::CommandComplete { tag }
         }
+        wire::MSG_PARSE_COMPLETE if payload.is_empty() => BackendFrame::ParseComplete,
+        wire::MSG_BIND_COMPLETE if payload.is_empty() => BackendFrame::BindComplete,
+        wire::MSG_NO_DATA if payload.is_empty() => BackendFrame::NoData,
         wire::MSG_ERROR_RESPONSE => BackendFrame::Error { fields: payload },
         wire::MSG_NOTICE_RESPONSE => BackendFrame::Notice { fields: payload },
         _ => return Err(FrameError::Malformed),
@@ -2306,6 +2367,67 @@ mod tests {
         );
         assert!(publisher_diagnostic(b"SERROR\0Mmissing code\0\0").is_err());
         assert!(publisher_diagnostic(b"C42704\0Mfirst\0Msecond\0\0").is_err());
+    }
+
+    #[test]
+    fn unnamed_extended_query_keeps_values_out_of_sql_source() {
+        let mut budget = Budget::new(16 * 1024);
+        let mut client = ReplicationClient::new_unbound(&mut budget, 1, 4096, 4096, None).unwrap();
+        client.purpose = ClientPurpose::Sql;
+        client.state = ClientState::SqlReady;
+        guard::forbid_alloc(|| {
+            client
+                .query_params(
+                    "INSERT INTO remote_rows (value, note) VALUES ($1::integer, $2::text)",
+                    &[Some(b"42"), Some(b"a quote: ' is data")],
+                )
+                .unwrap();
+        });
+
+        let bytes = client.send.readable();
+        let mut at = 0usize;
+        let mut next = || {
+            let length = i32::from_be_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            let frame = &bytes[at..at + length + 1];
+            at += length + 1;
+            frame
+        };
+        let parse = next();
+        assert_eq!(parse[0], wire::FMSG_PARSE);
+        assert_eq!(
+            &parse[5..],
+            b"\0INSERT INTO remote_rows (value, note) VALUES ($1::integer, $2::text)\0\0\0"
+        );
+        let bind = next();
+        assert_eq!(bind[0], wire::FMSG_BIND);
+        // The quote stays in a length-delimited Bind value; it never occurs in
+        // the Parse SQL source above.
+        assert!(
+            bind.windows(b"a quote: ' is data".len())
+                .any(|part| part == b"a quote: ' is data")
+        );
+        assert_eq!(next(), &[wire::FMSG_EXECUTE, 0, 0, 0, 9, 0, 0, 0, 0, 0]);
+        assert_eq!(next(), &[wire::FMSG_SYNC, 0, 0, 0, 4]);
+        assert_eq!(at, bytes.len());
+        assert_eq!(client.state, ClientState::AwaitingSql);
+
+        for kind in [
+            wire::MSG_PARSE_COMPLETE,
+            wire::MSG_BIND_COMPLETE,
+            wire::MSG_NO_DATA,
+        ] {
+            assert_eq!(
+                next_frame(&[kind, 0, 0, 0, 4]),
+                Ok(Some((
+                    5,
+                    match kind {
+                        wire::MSG_PARSE_COMPLETE => BackendFrame::ParseComplete,
+                        wire::MSG_BIND_COMPLETE => BackendFrame::BindComplete,
+                        _ => BackendFrame::NoData,
+                    }
+                )))
+            );
+        }
     }
 
     #[test]

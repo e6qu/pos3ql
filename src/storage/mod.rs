@@ -10446,6 +10446,17 @@ pub(crate) struct PreparedTransactionCatalogEntry {
     pub prepared_lsn: u64,
 }
 
+/// One transaction-owned PostgreSQL foreign session.  The transport has one
+/// startup-reserved slot, so this identity is the boundary that prevents a
+/// remote transaction from being reused by another local transaction or
+/// endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForeignSession {
+    transaction_id: u32,
+    endpoint: crate::pg::replication_client::ConnectionInfo,
+    timeout: std::time::Duration,
+}
+
 pub struct Storage {
     pub heap: RowHeap,
     tables: FixedVec<Table>,
@@ -10478,6 +10489,8 @@ pub struct Storage {
     subscriptions: FixedVec<SubscriptionDef>,
     foreign: foreign::ForeignCatalog,
     foreign_client: std::cell::RefCell<Option<crate::pg::replication_client::ReplicationClient>>,
+    foreign_session: std::cell::RefCell<Option<ForeignSession>>,
+    foreign_statement_isolation: Cell<Option<(u32, bool)>>,
     subscription_relations: FixedVec<SubscriptionRelation>,
     matviews: FixedVec<MatviewDef>,
     matview_dependencies: FixedVec<StoredQueryDependencies>,
@@ -12848,6 +12861,8 @@ impl Storage {
             subscriptions,
             foreign,
             foreign_client: std::cell::RefCell::new(None),
+            foreign_session: std::cell::RefCell::new(None),
+            foreign_statement_isolation: Cell::new(None),
             subscription_relations,
             matviews,
             matview_dependencies,
@@ -12928,6 +12943,87 @@ impl Storage {
         Ok(std::cell::RefMut::map(client, |client| {
             client.as_mut().expect("checked foreign client")
         }))
+    }
+
+    /// Returns whether this transaction already owns the only configured
+    /// foreign session.  A different transaction or endpoint cannot borrow it:
+    /// that would merge two remote transaction scopes.
+    pub(crate) fn foreign_session_active(
+        &self,
+        transaction_id: u32,
+        endpoint: crate::pg::replication_client::ConnectionInfo,
+    ) -> Result<bool, SqlError> {
+        match *self.foreign_session.borrow() {
+            None => Ok(false),
+            Some(ForeignSession {
+                transaction_id: owner,
+                endpoint: active_endpoint,
+                ..
+            }) if owner == transaction_id && active_endpoint == endpoint => Ok(true),
+            Some(_) => Err(crate::sql_err!(
+                crate::sql::eval::sqlstate::TOO_MANY_CONNECTIONS,
+                "configured foreign PostgreSQL session capacity is exhausted"
+            )),
+        }
+    }
+
+    pub(crate) fn activate_foreign_session(
+        &self,
+        transaction_id: u32,
+        endpoint: crate::pg::replication_client::ConnectionInfo,
+        timeout: std::time::Duration,
+    ) {
+        let prior = self.foreign_session.replace(Some(ForeignSession {
+            transaction_id,
+            endpoint,
+            timeout,
+        }));
+        assert!(
+            prior.is_none(),
+            "foreign session was checked before activation"
+        );
+    }
+
+    pub(crate) fn foreign_session_endpoint(
+        &self,
+        transaction_id: u32,
+    ) -> Option<crate::pg::replication_client::ConnectionInfo> {
+        self.foreign_session
+            .borrow()
+            .filter(|session| session.transaction_id == transaction_id)
+            .map(|session| session.endpoint)
+    }
+
+    pub(crate) fn foreign_session_timeout(
+        &self,
+        transaction_id: u32,
+    ) -> Option<std::time::Duration> {
+        self.foreign_session
+            .borrow()
+            .filter(|session| session.transaction_id == transaction_id)
+            .map(|session| session.timeout)
+    }
+
+    pub(crate) fn clear_foreign_session(&self, transaction_id: u32) {
+        let mut session = self.foreign_session.borrow_mut();
+        if session.is_some_and(|active| active.transaction_id == transaction_id) {
+            *session = None;
+        }
+    }
+
+    /// The engine publishes the currently executing transaction before a
+    /// foreign scan can open its remote counterpart.  Execution is
+    /// single-threaded, while the session identity above remains the durable
+    /// ownership check across statements.
+    pub(crate) fn set_foreign_statement_isolation(&self, transaction_id: u32, serializable: bool) {
+        self.foreign_statement_isolation
+            .set(Some((transaction_id, serializable)));
+    }
+
+    pub(crate) fn foreign_statement_is_serializable(&self, transaction_id: u32) -> bool {
+        self.foreign_statement_isolation
+            .get()
+            .is_some_and(|(current, serializable)| current == transaction_id && serializable)
     }
 
     pub(crate) fn prepared_transaction_catalog(&self) -> &[PreparedTransactionCatalogEntry] {

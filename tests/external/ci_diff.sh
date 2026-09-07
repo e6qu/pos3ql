@@ -363,6 +363,111 @@ else
   bad "foreign scan driver behavior"
   cat "$WORK/foreign_driver.out"
 fi
+foreign_mutation=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -Atq -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null
+BEGIN;
+INSERT INTO pos3ql_fdw_source (id, scores, pair, note)
+  VALUES (4, ARRAY[7,8], ROW(40,'four')::public.pos3ql_fdw_pair, 'quote '' is data')
+  RETURNING id, pair::text, note;
+SAVEPOINT discard_foreign_insert;
+INSERT INTO pos3ql_fdw_source (id, scores, pair, note)
+  VALUES (5, ARRAY[9], ROW(50,'discard')::public.pos3ql_fdw_pair, 'discard');
+ROLLBACK TO SAVEPOINT discard_foreign_insert;
+UPDATE pos3ql_fdw_source
+  SET note = note || ' updated'
+  WHERE id = 4
+  RETURNING id, note;
+SAVEPOINT discard_foreign_delete;
+DELETE FROM pos3ql_fdw_source WHERE id = 4 RETURNING id, note;
+ROLLBACK TO SAVEPOINT discard_foreign_delete;
+COMMIT;
+SELECT id, pair::text, note FROM pos3ql_fdw_source WHERE id >= 4 ORDER BY id;
+SQL
+)
+foreign_mutation_reference=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+  -X -Atq -F '|' -v ON_ERROR_STOP=1 \
+  -c "SELECT id, pair::text, note FROM public.pos3ql_fdw_source WHERE id >= 4 ORDER BY id" 2>/dev/null)
+if [[ "$foreign_mutation" == $'4|(40,four)|quote \' is data\n4|quote \' is data updated\n4|quote \' is data updated\n4|(40,four)|quote \' is data updated' \
+      && "$foreign_mutation_reference" == $'4|(40,four)|quote \' is data updated' ]]; then
+  ok "foreign INSERT, UPDATE and DELETE use Bind, RETURNING, commit and savepoint boundaries"
+else
+  bad "foreign mutation transaction behavior"
+  printf 'pos3ql:\n%s\nreference:\n%s\n' "$foreign_mutation" "$foreign_mutation_reference"
+fi
+if printf '6\tCOPY from pos3ql\n' | psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -v ON_ERROR_STOP=1 -c 'COPY pos3ql_fdw_source (id, note) FROM STDIN' \
+  > "$WORK/foreign_copy_in.out" 2>&1; then
+  foreign_copy=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+    -X -Atq -v ON_ERROR_STOP=1 -c 'COPY pos3ql_fdw_source (id, note) TO STDOUT' 2>/dev/null)
+  foreign_copy_reference=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+    -X -Atq -v ON_ERROR_STOP=1 -c 'COPY public.pos3ql_fdw_source (id, note) TO STDOUT' 2>/dev/null)
+  if [[ "$foreign_copy" == "$foreign_copy_reference" ]]; then
+    ok "foreign COPY FROM and TO keep remote rows and text framing"
+  else
+    bad "foreign COPY row parity"
+    printf 'pos3ql:\n%s\nreference:\n%s\n' "$foreign_copy" "$foreign_copy_reference"
+  fi
+else
+  bad "foreign COPY FROM"
+  cat "$WORK/foreign_copy_in.out"
+fi
+foreign_copy_transition=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -Atq -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null
+CREATE TABLE pos3ql_foreign_copy_audit (n integer);
+CREATE FUNCTION pos3ql_foreign_copy_audit_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO pos3ql_foreign_copy_audit SELECT count(*) FROM new_rows;
+  RETURN NULL;
+END;
+$$;
+CREATE TRIGGER pos3ql_foreign_copy_audit_trigger
+  AFTER INSERT ON pos3ql_fdw_source
+  REFERENCING NEW TABLE AS new_rows
+  FOR EACH STATEMENT EXECUTE FUNCTION pos3ql_foreign_copy_audit_fn();
+COPY pos3ql_fdw_source (id, note) FROM STDIN;
+8	COPY transition
+\.
+SELECT n FROM pos3ql_foreign_copy_audit;
+SQL
+)
+foreign_copy_transition_reference=$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+  -X -Atq -v ON_ERROR_STOP=1 -c "SELECT note FROM public.pos3ql_fdw_source WHERE id = 8" 2>/dev/null)
+if [[ "$foreign_copy_transition" == 1 && "$foreign_copy_transition_reference" == 'COPY transition' ]]; then
+  ok "foreign COPY retains statement transition rows without local shadows"
+else
+  bad "foreign COPY transition rows"
+  printf 'transition:\n%s\nreference:\n%s\n' "$foreign_copy_transition" "$foreign_copy_transition_reference"
+fi
+if P3_PORT="$P3_PORT" PGHOST="$PGHOST" PGPORT="$PGPORT" PGUSER="$PGUSER" "$PY" - <<'PY' \
+  > "$WORK/foreign_copy_binary.out" 2>&1
+import os
+import psycopg
+
+p3 = dict(host="127.0.0.1", port=int(os.environ["P3_PORT"]),
+          user=os.environ["PGUSER"], dbname="postgres")
+reference = dict(host=os.environ["PGHOST"], port=int(os.environ["PGPORT"]),
+                 user=os.environ["PGUSER"], dbname="postgres")
+
+with psycopg.connect(**p3) as connection:
+    with connection.cursor() as cursor:
+        with cursor.copy("COPY pos3ql_fdw_source (id, note) FROM STDIN WITH (FORMAT BINARY)") as copy:
+            copy.set_types(["int4", "text"])
+            copy.write_row((7, "binary COPY"))
+
+def copy_bytes(connection_info):
+    with psycopg.connect(**connection_info) as connection:
+        with connection.cursor() as cursor:
+            with cursor.copy("COPY public.pos3ql_fdw_source (id, note) TO STDOUT WITH (FORMAT BINARY)") as copy:
+                return b"".join(bytes(part) for part in iter(copy.read, b""))
+
+assert copy_bytes(p3) == copy_bytes(reference)
+PY
+then
+  ok "foreign binary COPY uses raw v3 framing without local rows"
+else
+  bad "foreign binary COPY framing"
+  cat "$WORK/foreign_copy_binary.out"
+fi
 psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 > "$WORK/foreign_privilege_setup.out" 2>&1 <<SQL
 CREATE ROLE pos3ql_fdw_reader;
@@ -387,7 +492,7 @@ foreign_hidden=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -Atq -v ON_ERROR_STOP=1 \
   -c 'SET ROLE pos3ql_fdw_observer; SELECT bool_and(umoptions IS NULL) FROM pg_user_mapping' \
   2>/dev/null)
-if [[ $foreign_privilege_setup_status -eq 0 && "$foreign_allowed" == $'1\n2\n3' \
+if [[ $foreign_privilege_setup_status -eq 0 && "$foreign_allowed" == $'1\n2\n3\n4\n6\n7\n8' \
       && $foreign_denied_status -ne 0 && "$foreign_hidden" == t ]]; then
   ok "foreign scans enforce column demand and hide other mappings"
 else
@@ -399,11 +504,22 @@ restart_p3 || exit 1
 foreign_recovered=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -At -F '|' -v ON_ERROR_STOP=1 \
   -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id" 2>/dev/null)
-if [[ "$foreign_recovered" == "$foreign_reference" ]]; then
+if [[ "$foreign_recovered" == "$(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres \
+  -X -At -F '|' -v ON_ERROR_STOP=1 \
+  -c "SELECT id,scores::text,pair::text,note FROM pos3ql_fdw_source ORDER BY id" 2>/dev/null)" ]]; then
   ok "foreign metadata and typed scans survive WAL restart"
 else
   bad "foreign metadata restart recovery"
   printf 'reference:\n%s\nrecovered:\n%s\n' "$foreign_reference" "$foreign_recovered"
+fi
+if psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 -c 'TRUNCATE pos3ql_fdw_source' > "$WORK/foreign_truncate.out" 2>&1 \
+  && [[ $(psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -Atq \
+      -v ON_ERROR_STOP=1 -c 'SELECT count(*) FROM public.pos3ql_fdw_source' 2>/dev/null) == 0 ]]; then
+  ok "foreign TRUNCATE changes only the remote relation"
+else
+  bad "foreign TRUNCATE"
+  cat "$WORK/foreign_truncate.out"
 fi
 psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 -c 'DROP TABLE public.pos3ql_fdw_source; DROP TYPE public.pos3ql_fdw_pair' \

@@ -1336,7 +1336,7 @@ fn foreign_data_catalog_views_enforce_postgresql_credential_visibility() {
 }
 
 #[test]
-fn unsupported_foreign_table_mutations_fail_before_touching_local_storage() {
+fn foreign_table_mutation_rejections_match_postgres_fdw_surface() {
     let (mut engine, mut budget) = test_engine();
     let setup = run_with(
         &mut engine,
@@ -1354,12 +1354,9 @@ fn unsupported_foreign_table_mutations_fail_before_touching_local_storage() {
         String::from_utf8_lossy(&setup)
     );
     for statement in [
-        "INSERT INTO mutation_target VALUES (1)",
-        "UPDATE mutation_target SET id = 2",
-        "DELETE FROM mutation_target",
         "MERGE INTO mutation_target t USING mutation_target s ON t.id = s.id WHEN MATCHED THEN DELETE",
-        "TRUNCATE mutation_target",
-        "COPY mutation_target TO STDOUT",
+        "INSERT INTO mutation_target VALUES (1) ON CONFLICT (id) DO NOTHING",
+        "INSERT INTO mutation_target VALUES (1) ON CONFLICT DO UPDATE SET id = 2",
     ] {
         let output = run_with(&mut engine, &mut budget, statement);
         let rendered = String::from_utf8_lossy(&output);

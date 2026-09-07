@@ -3887,6 +3887,10 @@ impl Engine {
         txn: &mut TxnState,
         takes_snapshot: bool,
     ) -> Result<(), SqlError> {
+        self.storage.set_foreign_statement_isolation(
+            txn.txid,
+            txn.isolation == TransactionIsolation::Serializable,
+        );
         txn.begin_command();
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
         let snapshot = if takes_snapshot {
@@ -4719,6 +4723,12 @@ impl Engine {
             self.rollback_txn(txn, guc);
             return Err(error);
         }
+        if prepared_slot.is_none()
+            && let Err(error) = foreign::commit_session(&self.storage, txn.txid)
+        {
+            self.rollback_txn(txn, guc);
+            return Err(error);
+        }
         let finish_result = match prepared_slot {
             Some(slot) => {
                 let metadata = self.prepared_transactions.slot(slot).metadata();
@@ -5518,6 +5528,17 @@ impl Engine {
                 ),
             ));
         }
+        if self.storage.foreign_session_endpoint(txn.txid).is_some() {
+            return Err(fail(
+                self,
+                txn,
+                cursors,
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot PREPARE a transaction that has operated on a foreign table"
+                ),
+            ));
+        }
         let current = eval::funcs::system::current_user_owned();
         let owner = self
             .storage
@@ -6126,6 +6147,7 @@ impl Engine {
             txn.clear();
             return;
         }
+        foreign::abort_session(&self.storage, txn.txid);
         self.storage.release_snapshot(txn.txid);
         self.storage.release_serializable(txn.txid);
         self.storage.release_table_locks(txn.txid);
@@ -14600,6 +14622,13 @@ impl Engine {
                 if let Err(e) = txn.savepoint(name, mark, self.storage.lock_mark()) {
                     return Ok(Err(e));
                 }
+                if let Err(error) = foreign::savepoint(&self.storage, txn.txid, name) {
+                    let index = txn
+                        .savepoint_index(name)
+                        .expect("savepoint was inserted before remote mirroring");
+                    txn.release_savepoints_from(index);
+                    return Ok(Err(error));
+                }
                 guc.savepoint();
                 responder.command_complete("SAVEPOINT")?;
                 Ok(Ok(()))
@@ -14613,6 +14642,11 @@ impl Engine {
                 }
                 match txn.savepoint_index(name) {
                     Some(index) => {
+                        if let Err(error) =
+                            foreign::release_savepoint(&self.storage, txn.txid, name)
+                        {
+                            return Ok(Err(error));
+                        }
                         txn.release_savepoints_from(index);
                         guc.release_savepoints_from(index);
                         responder.command_complete("RELEASE")?;
@@ -14639,6 +14673,9 @@ impl Engine {
                         name
                     )));
                 };
+                if let Err(error) = foreign::rollback_to_savepoint(&self.storage, txn.txid, name) {
+                    return Ok(Err(error));
+                }
                 self.rollback_to_savepoint(txn, index, guc);
                 responder.command_complete("ROLLBACK")?;
                 Ok(Ok(()))

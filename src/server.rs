@@ -810,6 +810,8 @@ impl Server {
         // Ensure the journal is durable even if no checkpoint ran.
         if self.engine.commit_wal().is_err() {
             stderr_line(b"pos3ql: final WAL upload failed\n");
+        } else if self.engine.mark_clean_shutdown().is_err() {
+            stderr_line(b"pos3ql: clean shutdown marker failed\n");
         }
         stderr_line(
             b"pos3ql: shutdown complete

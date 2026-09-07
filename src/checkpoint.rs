@@ -180,6 +180,212 @@ fn push_slot_list(list: &mut SlotList, prior: PrevSst) -> Result<(), SqlError> {
     Ok(())
 }
 
+pub(crate) struct TemporarySpiller {
+    blocks: std::rc::Rc<std::cell::RefCell<crate::store::EphemeralBlockStore>>,
+    handles: Vec<SstHandle>,
+    sst_arena: Arena,
+    writer: SstWriter,
+}
+
+impl TemporarySpiller {
+    pub(crate) fn budget_bytes(config: &Config) -> usize {
+        crate::store::EphemeralBlockStore::budget_bytes(config.temporary_spill_bytes)
+            + MAX_CKPT_TABLES * crate::storage::MAX_SPILL_SSTS * core::mem::size_of::<SstHandle>()
+            + SST_ARENA_BYTES
+            + SstWriter::budget_bytes()
+    }
+
+    pub(crate) fn new(config: &Config, budget: &mut Budget) -> Result<Self, CheckpointSetupError> {
+        std::fs::create_dir_all(&config.data_dir).map_err(|error| {
+            CheckpointSetupError::ObjectStore(format!("create data_dir: {error}"))
+        })?;
+        let path = std::path::Path::new(&config.data_dir).join("temporary-spill");
+        let blocks =
+            crate::store::EphemeralBlockStore::open(budget, &path, config.temporary_spill_bytes)
+                .map_err(|error| {
+                    CheckpointSetupError::ObjectStore(format!("temporary spill store: {error}"))
+                })?;
+        Ok(Self {
+            blocks: std::rc::Rc::new(std::cell::RefCell::new(blocks)),
+            handles: Vec::with_capacity(MAX_CKPT_TABLES * crate::storage::MAX_SPILL_SSTS),
+            sst_arena: Arena::new(budget, "temporary spill sst", SST_ARENA_BYTES)
+                .map_err(CheckpointSetupError::Budget)?,
+            writer: SstWriter::new(),
+        })
+    }
+
+    pub(crate) fn block_store(
+        &self,
+    ) -> std::rc::Rc<std::cell::RefCell<crate::store::EphemeralBlockStore>> {
+        std::rc::Rc::clone(&self.blocks)
+    }
+
+    /// Flushes one dirty temporary table into the process-local block store.
+    /// This deliberately has no manifest phase: installing the handle and
+    /// evicting its heap rows is safe only for the current process, and a
+    /// restart discards both the temporary catalog and this file.
+    pub(crate) fn spill_step(
+        &mut self,
+        storage: &mut Storage,
+        sort_scratch: &mut FixedVec<(u64, RowHome)>,
+    ) -> Result<Option<usize>, SqlError> {
+        self.reclaim(storage)?;
+        let Some(slot) = (0..storage.physical_table_count()).find(|&slot| {
+            let table = storage.table(slot);
+            table.live
+                && table.def.persistence == crate::storage::RelationPersistence::Temporary
+                && table.dirty
+        }) else {
+            return Ok(None);
+        };
+        let generation = storage.table(slot).generation;
+        let delta = storage.table(slot).n_spill_ssts > 0
+            && storage.table(slot).n_spill_ssts < crate::storage::MAX_SPILL_SSTS
+            && !storage.table(slot).tombstones_overflow;
+
+        sort_scratch.clear();
+        storage.for_each_row_state(slot, &mut |rowid, state| {
+            use core::ops::ControlFlow;
+            let has_version =
+                state.committed.is_some() || state.committed_lsn != 0 || !state.history.is_empty();
+            if !has_version {
+                return Ok(ControlFlow::Continue(()));
+            }
+            let resident = matches!(state.committed, Some(RowHome::Heap(_)))
+                || (state.committed.is_none() && state.committed_lsn != 0)
+                || (0..state.history.len()).any(|index| {
+                    state.history.get(index).is_some_and(|version| {
+                        version.home.is_none() || matches!(version.home, Some(RowHome::Heap(_)))
+                    })
+                });
+            if delta && !resident {
+                return Ok(ControlFlow::Continue(()));
+            }
+            let marker = state
+                .committed
+                .or_else(|| {
+                    (0..state.history.len()).find_map(|index| state.history.get(index)?.home)
+                })
+                .unwrap_or(RowHome::Heap(crate::storage::RowLoc { offset: 0, len: 0 }));
+            sort_scratch.push((rowid, marker)).map_err(|error| {
+                sql_err!(
+                    sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                    "temporary spill scratch: {}",
+                    error
+                )
+            })?;
+            Ok(ControlFlow::Continue(()))
+        })?;
+        sort_scratch
+            .as_mut_slice()
+            .sort_unstable_by_key(|(rowid, _)| *rowid);
+
+        self.sst_arena.reset();
+        self.writer.reset();
+        let mut schema = [ColType::Bool; MAX_COLUMNS];
+        let columns = storage.table(slot).def.schema(&mut schema);
+        self.writer
+            .set_pax_schema(&schema[..columns])
+            .map_err(temporary_sst_to_sql)?;
+        self.writer
+            .set_pax_fillfactor(storage.table(slot).def.storage_options.fillfactor)
+            .map_err(temporary_sst_to_sql)?;
+        let writer = &mut self.writer;
+        let blocks = &self.blocks;
+        for &(rowid, _) in sort_scratch.iter() {
+            let Some(state) = storage.row_state(slot, rowid)? else {
+                continue;
+            };
+            let mut append_version =
+                |commit_lsn: u64, home: Option<RowHome>| -> Result<(), SqlError> {
+                    if delta && home.is_some_and(|location| !matches!(location, RowHome::Heap(_))) {
+                        return Ok(());
+                    }
+                    let key = SstKey::at(rowid, commit_lsn);
+                    if let Some(location) = home {
+                        storage.with_row_bytes(slot, rowid, location, |row| {
+                            writer
+                                .append_version(&mut *blocks.borrow_mut(), key, row)
+                                .map_err(temporary_sst_to_sql)
+                        })?
+                    } else {
+                        writer
+                            .append_tombstone_version(&mut *blocks.borrow_mut(), key)
+                            .map_err(temporary_sst_to_sql)?
+                    }
+                    Ok(())
+                };
+            if state.committed.is_some() || state.committed_lsn != 0 {
+                append_version(state.committed_lsn, state.committed)?;
+            }
+            for index in 0..state.history.len() {
+                if let Some(version) = state.history.get(index) {
+                    append_version(version.lsn, version.home)?;
+                }
+            }
+        }
+        let handle = writer
+            .finish(&mut *blocks.borrow_mut())
+            .map_err(temporary_sst_to_sql)?;
+        match (delta, handle) {
+            (true, Some(handle)) => storage.append_spill(slot, handle),
+            (true, None) => {}
+            (false, Some(handle)) => storage.collapse_spill(slot, handle),
+            (false, None) => storage.set_spill_list(slot, &[]),
+        }
+        storage.clear_tombstones(slot);
+        storage.clear_table_dirty_through(slot, generation);
+        self.reclaim(storage)?;
+        Ok(Some(slot))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_count(&self) -> usize {
+        self.blocks.borrow().block_count()
+    }
+
+    pub(crate) fn cleanup(&mut self, storage: &Storage) {
+        if let Err(error) = self.reclaim(storage) {
+            let message = stack_format!(
+                512,
+                "pos3ql: temporary spill cleanup failed ({}): {}\n",
+                error.sqlstate,
+                error.message.as_str()
+            );
+            crate::util::stderr_line(message.as_str());
+        }
+    }
+
+    fn reclaim(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        self.handles.clear();
+        for slot in 0..storage.physical_table_count() {
+            let table = storage.table(slot);
+            if !table.live
+                || table.def.persistence != crate::storage::RelationPersistence::Temporary
+            {
+                continue;
+            }
+            for handle in table.spill_ssts.iter().take(table.n_spill_ssts).flatten() {
+                if self.handles.len() == self.handles.capacity() {
+                    return Err(sql_err!(
+                        sqlstate::PROGRAM_LIMIT_EXCEEDED,
+                        "temporary spill handle roster exceeds its fixed capacity"
+                    ));
+                }
+                self.handles.push(*handle);
+            }
+        }
+        if self.handles.is_empty() {
+            self.blocks.borrow_mut().clear();
+            return Ok(());
+        }
+        self.blocks
+            .borrow_mut()
+            .retain(&self.handles)
+            .map_err(temporary_store_to_sql)
+    }
+}
+
 pub(crate) struct Checkpointer {
     pub(crate) client: ObjectStore,
     /// The block-grid path to the bucket: RAM frames over a disk slot file
@@ -387,6 +593,8 @@ impl Checkpointer {
         let must_free_full_list = storage.has_active_snapshots()
             && (0..storage.physical_table_count()).any(|slot| {
                 storage.table(slot).live
+                    && storage.table(slot).def.persistence
+                        != crate::storage::RelationPersistence::Temporary
                     && storage.table(slot).dirty
                     && self
                         .prev_ssts
@@ -394,7 +602,10 @@ impl Checkpointer {
                         .is_some_and(|list| list.n == crate::storage::MAX_SPILL_SSTS)
             });
         for slot in 0..storage.physical_table_count().min(MAX_CKPT_TABLES) {
-            if !storage.table(slot).live {
+            if !storage.table(slot).live
+                || storage.table(slot).def.persistence
+                    == crate::storage::RelationPersistence::Temporary
+            {
                 continue;
             }
             let Some(list) = self.prev_ssts.get(slot) else {
@@ -712,6 +923,11 @@ impl Checkpointer {
         &self,
     ) -> std::rc::Rc<std::cell::RefCell<TieredStore<OwnedObjectStore>>> {
         std::rc::Rc::clone(&self.blocks)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn published_spill_generation_count(&self, slot: usize) -> usize {
+        self.prev_ssts.get(slot).map_or(0, |list| list.n)
     }
 
     pub(crate) fn enable_async_block_reads(&mut self) {
@@ -1304,6 +1520,24 @@ impl Checkpointer {
                         ..TableDef::empty()
                     };
                     pending_def = Some((mindex, def, 0, [0i64; crate::storage::MAX_COLUMNS]));
+                }
+                Some("persist") => {
+                    let Some((_, def, _, _)) = pending_def.as_mut() else {
+                        return Err(CheckpointSetupError::Corrupt("persist outside table"));
+                    };
+                    let code = words
+                        .next()
+                        .and_then(|word| word.as_bytes().first().copied())
+                        .and_then(crate::storage::RelationPersistence::from_code)
+                        .ok_or(CheckpointSetupError::Corrupt("invalid table persistence"))?;
+                    if code == crate::storage::RelationPersistence::Temporary
+                        || words.next().is_some()
+                    {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "invalid durable table persistence",
+                        ));
+                    }
+                    def.persistence = code;
                 }
                 Some("col4") => {
                     let Some((_, def, seen, _)) = pending_def.as_mut() else {
@@ -4343,7 +4577,7 @@ impl Checkpointer {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     load_policy(storage, line)?;
                 }
-                Some("sq5") => {
+                tag @ (Some("sq5") | Some("sq6")) => {
                     finish_pending(storage, &mut slot_of, pending_def.take())?;
                     let read_hex = |w: Option<&str>, what: &'static str| {
                         w.ok_or(CheckpointSetupError::Corrupt(what))
@@ -4357,6 +4591,20 @@ impl Checkpointer {
                     };
                     let schema = read_hex(words.next(), "sq5 schema missing")?;
                     let name = read_hex(words.next(), "sq5 name missing")?;
+                    let persistence = if tag == Some("sq6") {
+                        words
+                            .next()
+                            .and_then(|word| word.as_bytes().first().copied())
+                            .and_then(crate::storage::RelationPersistence::from_code)
+                            .ok_or(CheckpointSetupError::Corrupt("sq6 persistence missing"))?
+                    } else {
+                        crate::storage::RelationPersistence::Permanent
+                    };
+                    if persistence == crate::storage::RelationPersistence::Temporary {
+                        return Err(CheckpointSetupError::Corrupt(
+                            "temporary sequence in manifest",
+                        ));
+                    }
                     let data_type: u8 = parse_field(words.next(), "sq5 type")?;
                     let increment: i64 = parse_field(words.next(), "sq5 increment")?;
                     let min_value: i64 = parse_field(words.next(), "sq5 min")?;
@@ -4396,19 +4644,22 @@ impl Checkpointer {
                     let generator_for = read_link(&mut words, "sequence generator missing")?;
                     let slot = storage
                         .create_sequence(
-                            sql_name(&schema)?,
-                            sql_name(&name)?,
-                            crate::storage::SeqSpec {
-                                data_type: crate::storage::SeqType::from_u8(data_type),
-                                increment,
-                                min_value,
-                                max_value,
-                                start_value,
-                                cache,
-                                cycle: cycle != 0,
+                            crate::storage::SequenceCreateSpec {
+                                schema: sql_name(&schema)?,
+                                name: sql_name(&name)?,
+                                spec: crate::storage::SeqSpec {
+                                    data_type: crate::storage::SeqType::from_u8(data_type),
+                                    increment,
+                                    min_value,
+                                    max_value,
+                                    start_value,
+                                    cache,
+                                    cycle: cycle != 0,
+                                },
+                                owner,
+                                generator_for,
+                                persistence,
                             },
-                            owner,
-                            generator_for,
                             0,
                         )
                         .map_err(|e| {
@@ -5661,6 +5912,7 @@ impl Checkpointer {
             self.published_lsn_pending_maintenance = None;
             return Ok(CheckpointStep::Published { lsn });
         }
+        self.reconcile_published_spill_lists(storage);
         let pinned_full_list = storage.has_active_snapshots()
             && self.merge_done.is_none()
             && (0..storage.physical_table_count()).any(|slot| {
@@ -5725,12 +5977,68 @@ impl Checkpointer {
         Ok(CheckpointStep::Published { lsn })
     }
 
+    /// For a live relation, storage's installed handles and `prev_ssts` name
+    /// the same published generation. A DROP, unlogged crash reset, or slot
+    /// reuse deliberately clears storage first; carrying the old per-slot
+    /// list forward would then make the new relation a delta of its retired
+    /// occupant and resurrect those rows on the next cold start.
+    ///
+    /// Reconcile before merge selection as well as slicing: a stale list at
+    /// the compaction trigger must not start reading the old relation under
+    /// the replacement's schema. Any slice or merge already built for the
+    /// retired identity is now an orphan and is discarded before publish.
+    fn reconcile_published_spill_lists(&mut self, storage: &Storage) {
+        for slot in 0..storage.physical_table_count().min(MAX_CKPT_TABLES) {
+            let Some(published) = self.prev_ssts.get(slot).copied() else {
+                continue;
+            };
+            if published.n == 0 {
+                continue;
+            }
+            let table = storage.table(slot);
+            let matches_storage = table.live
+                && table.def.persistence != crate::storage::RelationPersistence::Temporary
+                && table.n_spill_ssts == published.n
+                && (0..published.n).all(|index| {
+                    table.spill_ssts[index] == published.ssts[index].map(|prior| prior.handle)
+                });
+            if matches_storage {
+                continue;
+            }
+
+            self.prev_ssts[slot] = SlotList::EMPTY;
+            if slot < self.prev_scratch.len() {
+                self.prev_scratch[slot] = SlotList::EMPTY;
+            }
+            self.pending_installs
+                .retain(|(pending_slot, _)| *pending_slot != slot);
+            self.pending_value_installs
+                .retain(|install| install.slot != slot);
+            self.sliced_generation[slot] = 0;
+            self.sliced_this_sweep[slot] = false;
+            if self.merge_job.as_ref().is_some_and(|job| job.slot == slot) {
+                self.merge_job = None;
+            }
+            if self
+                .merge_done
+                .as_ref()
+                .is_some_and(|done| done.slot == slot)
+            {
+                self.merge_done = None;
+            }
+            self.merge_overflow[slot] = None;
+        }
+    }
+
     /// Whether `slot` still needs a slice this sweep: it changed since its
     /// slice, or was never sliced while dirty. (Compaction is the merge
     /// job's business, not the sweep's.)
     fn needs_slice(&self, storage: &Storage, slot: usize) -> bool {
         let table = storage.table(slot);
-        table.live && table.dirty && self.sliced_generation[slot] != table.generation
+        table.live
+            && table.def.persistence != crate::storage::RelationPersistence::Temporary
+            && table.dirty
+            && self.sliced_generation[slot] != table.generation
     }
 
     /// Assembles and publishes the manifest from the sweep's recorded
@@ -6260,7 +6568,9 @@ impl Checkpointer {
         }
         for slot in 0..storage.physical_table_count() {
             let table = storage.table(slot);
-            if !table.live {
+            if !table.live
+                || table.def.persistence == crate::storage::RelationPersistence::Temporary
+            {
                 // A dropped table's recorded list must not linger into the
                 // GC keep-set the swap below publishes.
                 if slot < self.prev_scratch.len() {
@@ -6336,6 +6646,10 @@ impl Checkpointer {
                 )
             })?;
             write_manifest(&mut self.manifest_buf, table_line.as_str())?;
+            write_manifest(
+                &mut self.manifest_buf,
+                format_args!("persist {}", table.def.persistence.code() as char),
+            )?;
             if table.def.schema.as_str() != "public" {
                 use core::fmt::Write;
                 let mut hex = StackStr::<130>::new();
@@ -7332,9 +7646,10 @@ impl Checkpointer {
             write_manifest(
                 &mut self.manifest_buf,
                 format_args!(
-                    "sq5 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                    "sq6 {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                     hschema.as_str(),
                     hname.as_str(),
+                    seq.persistence.code() as char,
                     seq.data_type.to_u8(),
                     seq.increment,
                     seq.min_value,
@@ -8318,6 +8633,11 @@ impl Checkpointer {
         // Object comments: `cmt <class> <subid> <hex-schema> <hex-name>
         // <hex-text>`. Only committed comments carrying text are written.
         for comment in storage.checkpoint_comments() {
+            if comment.class == crate::storage::CommentClass::Relation
+                && comment.schema.as_str().starts_with("pg_temp_")
+            {
+                continue;
+            }
             if let Some(database) = comment.database {
                 write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
             }
@@ -8621,6 +8941,9 @@ impl Checkpointer {
         // cold manifest load can resolve stable runtime slots from names.
         let mut write_owner = |object: crate::storage::AccessObject| -> Result<(), SqlError> {
             use core::fmt::Write;
+            if storage.access_object_is_temporary(object, 0) {
+                return Ok(());
+            }
             if let Some(database) = storage.access_object_database(object) {
                 write_database_context(&mut self.manifest_buf, &mut database_context, database)?;
             }
@@ -8740,6 +9063,9 @@ impl Checkpointer {
             })?;
         }
         for (_, acl) in storage.checkpoint_acls() {
+            if storage.access_object_is_temporary(acl.object, 0) {
+                continue;
+            }
             if !storage.access_object_is_live_in_catalog(acl.object) {
                 continue;
             }
@@ -8802,6 +9128,9 @@ impl Checkpointer {
             }
         }
         for (_, acl) in storage.checkpoint_column_acls() {
+            if storage.access_object_is_temporary(acl.target.relation(), 0) {
+                continue;
+            }
             if !storage.access_object_is_live_in_catalog(acl.target.relation()) {
                 continue;
             }
@@ -9577,6 +9906,30 @@ fn sst_to_sql(e: crate::store::SstError) -> SqlError {
             )
         }
         other => sql_err!(SQLSTATE_IO, "checkpoint sst: {:?}", other),
+    }
+}
+
+fn temporary_sst_to_sql(error: crate::store::SstError) -> SqlError {
+    match error {
+        crate::store::SstError::Store(crate::store::StoreError::Unavailable) => sql_err!(
+            sqlstate::PROGRAM_LIMIT_EXCEEDED,
+            "temporary spill store is full; raise temporary_spill_bytes"
+        ),
+        other => sql_err!(sqlstate::IO_ERROR, "temporary spill sst: {:?}", other),
+    }
+}
+
+fn temporary_store_to_sql(error: crate::store::StoreError) -> SqlError {
+    match error {
+        crate::store::StoreError::Unavailable => sql_err!(
+            sqlstate::IO_ERROR,
+            "temporary spill store could not compact its local file"
+        ),
+        other => sql_err!(
+            sqlstate::INTERNAL_ERROR,
+            "temporary spill store is corrupt: {:?}",
+            other
+        ),
     }
 }
 

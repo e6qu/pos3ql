@@ -994,6 +994,12 @@ pub trait CatalogAccess {
     }
     /// Whether this OID names a relation eligible for a publication.
     fn relation_is_publishable(&self, oid: i32) -> Option<bool>;
+    fn current_temporary_namespace_oid(&self) -> i32 {
+        0
+    }
+    fn is_other_temporary_namespace(&self, _oid: i32) -> bool {
+        false
+    }
     /// The index definition for this OID: `col == 0` gives the whole
     /// `btree (col, ...)` form; `col > 0` gives the name of that 1-based indexed
     /// column. `None` if no such index is known.

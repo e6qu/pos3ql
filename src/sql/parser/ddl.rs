@@ -1498,7 +1498,7 @@ impl<'a> Parser<'a> {
         }
         if self.eat_ident("materialized")? {
             self.expect_ident("view")?;
-            return self.create_materialized_view();
+            return self.create_materialized_view(RelationPersistence::Permanent);
         }
         if self.eat_ident("index")? {
             return self.create_index(false);
@@ -1517,7 +1517,7 @@ impl<'a> Parser<'a> {
             return self.create_schema();
         }
         if self.eat_ident("sequence")? {
-            return self.create_sequence();
+            return self.create_sequence(RelationPersistence::Permanent);
         }
         if self.eat_ident("domain")? {
             return self.create_domain();
@@ -1531,13 +1531,37 @@ impl<'a> Parser<'a> {
         if self.eat_ident("group")? {
             return self.create_role(false);
         }
-        let persistence = if self.eat_ident("unlogged")? {
+        let temporary_scope = if self.eat_ident("global")? {
+            self.warn(stack_format!(
+                96,
+                "GLOBAL is deprecated in temporary table creation"
+            ));
+            Some("GLOBAL")
+        } else if self.eat_ident("local")? {
+            Some("LOCAL")
+        } else {
+            None
+        };
+        let persistence = if let Some(scope) = temporary_scope {
+            if !(self.eat_ident("temporary")? || self.eat_ident("temp")?) {
+                let _ = scope;
+                return Err(self.err_here("expected TEMPORARY or TEMP after GLOBAL or LOCAL"));
+            }
+            RelationPersistence::Temporary
+        } else if self.eat_ident("unlogged")? {
             RelationPersistence::Unlogged
         } else if self.eat_ident("temporary")? || self.eat_ident("temp")? {
             RelationPersistence::Temporary
         } else {
             RelationPersistence::Permanent
         };
+        if self.eat_ident("sequence")? {
+            return self.create_sequence(persistence);
+        }
+        if persistence == RelationPersistence::Unlogged && self.eat_ident("materialized")? {
+            self.expect_ident("view")?;
+            return self.create_materialized_view(persistence);
+        }
         self.create_table(false, persistence)
     }
 
@@ -4299,6 +4323,7 @@ impl<'a> Parser<'a> {
         if_not_exists: bool,
         kind: crate::sql::ast::CreateTableAsKind,
         options: crate::sql::ast::TableAsOptions<'a>,
+        persistence: RelationPersistence,
     ) -> Result<Stmt<'a>, ParseError> {
         let start = self.peek_at;
         let _ = self.query_select()?;
@@ -4319,6 +4344,7 @@ impl<'a> Parser<'a> {
             if_not_exists,
             kind,
             options,
+            persistence,
         })
     }
 
@@ -4329,6 +4355,8 @@ impl<'a> Parser<'a> {
         let mut access_method = TableAccessMethod::Heap;
         let mut tablespace = None;
         let mut storage_options = RelationStorageOptions::DEFAULT;
+        let mut on_commit = crate::sql::ast::OnCommitAction::PreserveRows;
+        let mut has_on_commit = false;
         loop {
             if self.eat_ident("using")? {
                 let method = self.any_ident("table access method")?;
@@ -4343,6 +4371,23 @@ impl<'a> Parser<'a> {
                 self.expect_op(")")?;
             } else if self.eat_ident("tablespace")? {
                 tablespace = Some(self.col_ident("tablespace name")?);
+            } else if self.eat_ident("on")? {
+                if has_on_commit {
+                    return Err(self.err_here("ON COMMIT specified more than once"));
+                }
+                self.expect_ident("commit")?;
+                on_commit = if self.eat_ident("preserve")? {
+                    self.expect_ident("rows")?;
+                    crate::sql::ast::OnCommitAction::PreserveRows
+                } else if self.eat_ident("delete")? {
+                    self.expect_ident("rows")?;
+                    crate::sql::ast::OnCommitAction::DeleteRows
+                } else if self.eat_ident("drop")? {
+                    crate::sql::ast::OnCommitAction::Drop
+                } else {
+                    return Err(self.err_here("expected PRESERVE ROWS, DELETE ROWS, or DROP"));
+                };
+                has_on_commit = true;
             } else {
                 break;
             }
@@ -4351,12 +4396,16 @@ impl<'a> Parser<'a> {
             access_method,
             tablespace,
             storage_options,
+            on_commit,
         })
     }
 
     /// `CREATE SEQUENCE [IF NOT EXISTS] name [options]` ("create sequence"
     /// consumed).
-    fn create_sequence(&mut self) -> Result<Stmt<'a>, ParseError> {
+    fn create_sequence(
+        &mut self,
+        persistence: RelationPersistence,
+    ) -> Result<Stmt<'a>, ParseError> {
         let if_not_exists = if self.eat_ident("if")? {
             self.expect_ident("not")?;
             self.expect_ident("exists")?;
@@ -4370,6 +4419,7 @@ impl<'a> Parser<'a> {
             name,
             if_not_exists,
             options,
+            persistence,
         })
     }
 
@@ -4785,6 +4835,24 @@ impl<'a> Parser<'a> {
             });
         }
         if self.eat_ident("set")? {
+            if self.eat_ident("logged")? {
+                return Ok(Stmt::AlterSequence {
+                    name,
+                    if_exists,
+                    action: crate::sql::ast::AlterSequenceAction::SetPersistence(
+                        RelationPersistence::Permanent,
+                    ),
+                });
+            }
+            if self.eat_ident("unlogged")? {
+                return Ok(Stmt::AlterSequence {
+                    name,
+                    if_exists,
+                    action: crate::sql::ast::AlterSequenceAction::SetPersistence(
+                        RelationPersistence::Unlogged,
+                    ),
+                });
+            }
             self.expect_ident("schema")?;
             return Ok(Stmt::AlterSequence {
                 name,
@@ -4970,7 +5038,10 @@ impl<'a> Parser<'a> {
     /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(col, ...)] AS <query>
     /// [WITH [NO] DATA]` ("create materialized view" consumed). A `(` here is
     /// always a column-name list (a materialized view has no column defs).
-    fn create_materialized_view(&mut self) -> Result<Stmt<'a>, ParseError> {
+    fn create_materialized_view(
+        &mut self,
+        persistence: RelationPersistence,
+    ) -> Result<Stmt<'a>, ParseError> {
         let if_not_exists = if self.eat_ident("if")? {
             self.expect_ident("not")?;
             self.expect_ident("exists")?;
@@ -5005,6 +5076,7 @@ impl<'a> Parser<'a> {
             if_not_exists,
             crate::sql::ast::CreateTableAsKind::MaterializedView,
             options,
+            persistence,
         )
     }
 
@@ -5052,6 +5124,7 @@ impl<'a> Parser<'a> {
                 partition: PartitionClause::None,
                 membership: TableMembership::None,
                 persistence: RelationPersistence::Permanent,
+                on_commit: crate::sql::ast::OnCommitAction::PreserveRows,
                 access_method: TableAccessMethod::Heap,
                 tablespace: None,
                 storage_options: RelationStorageOptions::DEFAULT,
@@ -5136,6 +5209,7 @@ impl<'a> Parser<'a> {
                         name,
                         if_not_exists,
                         options,
+                        persistence: _,
                     } => CreateSchemaElement::Sequence {
                         name,
                         if_not_exists,
@@ -7421,6 +7495,7 @@ impl<'a> Parser<'a> {
                 },
                 membership: TableMembership::None,
                 persistence,
+                on_commit: crate::sql::ast::OnCommitAction::PreserveRows,
                 access_method,
                 tablespace,
                 storage_options: RelationStorageOptions::DEFAULT,
@@ -7453,9 +7528,13 @@ impl<'a> Parser<'a> {
                 if_not_exists,
                 crate::sql::ast::CreateTableAsKind::Table,
                 crate::sql::ast::TableAsOptions::DEFAULT,
+                persistence,
             );
         }
-        if matches!(self.peeked, Tok::Ident("using" | "with" | "tablespace")) {
+        if matches!(
+            self.peeked,
+            Tok::Ident("using" | "with" | "tablespace" | "on")
+        ) {
             if foreign {
                 return Err(self.err_here("CREATE FOREIGN TABLE AS is not supported by PostgreSQL"));
             }
@@ -7467,6 +7546,7 @@ impl<'a> Parser<'a> {
                 if_not_exists,
                 crate::sql::ast::CreateTableAsKind::Table,
                 options,
+                persistence,
             );
         }
         if matches!(membership, TableMembership::OfType(_)) && self.peeked != Tok::Op("(") {
@@ -7502,6 +7582,7 @@ impl<'a> Parser<'a> {
                 partition: PartitionClause::None,
                 membership,
                 persistence,
+                on_commit: crate::sql::ast::OnCommitAction::PreserveRows,
                 access_method,
                 tablespace,
                 storage_options,
@@ -7545,6 +7626,7 @@ impl<'a> Parser<'a> {
                     if_not_exists,
                     crate::sql::ast::CreateTableAsKind::Table,
                     options,
+                    persistence,
                 );
             }
             // Otherwise it is a column definition whose name we already read.
@@ -7815,6 +7897,8 @@ impl<'a> Parser<'a> {
         let mut access_method = TableAccessMethod::Heap;
         let mut tablespace = None;
         let mut storage_options = RelationStorageOptions::DEFAULT;
+        let mut on_commit = crate::sql::ast::OnCommitAction::PreserveRows;
+        let mut has_on_commit = false;
         loop {
             if self.eat_ident("with")? {
                 self.expect_op("(")?;
@@ -7848,6 +7932,23 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_op(")")?;
                 membership = TableMembership::Inherits(self.arena_slice(&parents[..n_parents])?);
+            } else if self.eat_ident("on")? {
+                if has_on_commit {
+                    return Err(self.err_here("ON COMMIT specified more than once"));
+                }
+                self.expect_ident("commit")?;
+                on_commit = if self.eat_ident("preserve")? {
+                    self.expect_ident("rows")?;
+                    crate::sql::ast::OnCommitAction::PreserveRows
+                } else if self.eat_ident("delete")? {
+                    self.expect_ident("rows")?;
+                    crate::sql::ast::OnCommitAction::DeleteRows
+                } else if self.eat_ident("drop")? {
+                    crate::sql::ast::OnCommitAction::Drop
+                } else {
+                    return Err(self.err_here("expected PRESERVE ROWS, DELETE ROWS, or DROP"));
+                };
+                has_on_commit = true;
             } else {
                 break;
             }
@@ -7863,6 +7964,7 @@ impl<'a> Parser<'a> {
             partition,
             membership,
             persistence,
+            on_commit,
             access_method,
             tablespace,
             storage_options,

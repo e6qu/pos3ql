@@ -1181,6 +1181,34 @@ fn attach_fkey(
         };
         *storage.table_def(pi, txid)
     };
+    let compatible_persistence = match def.persistence {
+        crate::storage::RelationPersistence::Permanent => {
+            parent_def.persistence == crate::storage::RelationPersistence::Permanent
+        }
+        crate::storage::RelationPersistence::Unlogged => {
+            parent_def.persistence != crate::storage::RelationPersistence::Temporary
+        }
+        crate::storage::RelationPersistence::Temporary => {
+            parent_def.persistence == crate::storage::RelationPersistence::Temporary
+        }
+    };
+    if !compatible_persistence {
+        let relation_kind = match def.persistence {
+            crate::storage::RelationPersistence::Permanent => "permanent",
+            crate::storage::RelationPersistence::Unlogged => "unlogged",
+            crate::storage::RelationPersistence::Temporary => "temporary",
+        };
+        return Err(sql_err!(
+            sqlstate::INVALID_TABLE_DEFINITION,
+            "constraints on {} tables may reference only {} tables",
+            relation_kind,
+            match def.persistence {
+                crate::storage::RelationPersistence::Unlogged => "permanent or unlogged",
+                crate::storage::RelationPersistence::Permanent => "permanent",
+                crate::storage::RelationPersistence::Temporary => "temporary",
+            }
+        ));
+    }
     // Referenced columns default to the parent's primary key.
     let mut pcol_names: [&str; MAX_INDEX_COLS] = [""; MAX_INDEX_COLS];
     let n_parent;

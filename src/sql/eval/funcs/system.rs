@@ -516,6 +516,8 @@ pub(crate) fn dispatch<'a>(
             | "has_tablespace_privilege"
             | "has_parameter_privilege"
             | "pg_relation_is_publishable"
+            | "pg_my_temp_schema"
+            | "pg_is_other_temp_schema"
             | "pg_get_indexdef"
             | "pg_get_constraintdef"
             | "pg_get_partkeydef"
@@ -539,6 +541,7 @@ pub(crate) fn dispatch<'a>(
             | "pg_get_statisticsobjdef_expressions"
             | "pg_get_statisticsobjdef_columns"
             | "format_type"
+            | "to_regclass"
             | "pg_encoding_to_char"
             | "pg_char_to_encoding"
             | "getdatabaseencoding"
@@ -994,6 +997,26 @@ pub(crate) fn dispatch<'a>(
                 .map(Datum::Bool)
                 .unwrap_or(Datum::Null))
             }
+            "pg_my_temp_schema" => {
+                arity(0)?;
+                Ok(Datum::Oid(
+                    hooks
+                        .catalog
+                        .map_or(0, |catalog| catalog.current_temporary_namespace_oid())
+                        as u32,
+                ))
+            }
+            "pg_is_other_temp_schema" => {
+                arity(1)?;
+                let Some(catalog) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let oid = match CatalogOid::parse(eval_full(args[0], arena, params, row, hooks)?)? {
+                    Some(oid) => oid.0,
+                    None => return Ok(Datum::Null),
+                };
+                Ok(Datum::Bool(catalog.is_other_temporary_namespace(oid)))
+            }
             "pg_get_indexdef" => {
                 // `(oid, n, _)` with n>0 returns the n-th indexed column.
                 let Some(cat) = hooks.catalog else {
@@ -1390,6 +1413,31 @@ pub(crate) fn dispatch<'a>(
                 Ok(Datum::Text(
                     arena.alloc_str(text.as_str()).map_err(|_| arena_full())?,
                 ))
+            }
+            "to_regclass" => {
+                arity(1)?;
+                let value = eval_full(args[0], arena, params, row, hooks)?;
+                let name = match value {
+                    Datum::Text(name) | Datum::Bpchar(name) => name.trim_end_matches(' '),
+                    Datum::Null => return Ok(Datum::Null),
+                    other => return Err(type_mismatch("to_regclass", &other)),
+                };
+                let Some(cat) = hooks.catalog else {
+                    return Ok(Datum::Null);
+                };
+                let referenced_oid = match name.parse::<i32>() {
+                    Ok(oid) if oid >= 0 => oid,
+                    _ => match cat.reloid(name) {
+                        Some(oid) => oid,
+                        None => return Ok(Datum::Null),
+                    },
+                };
+                let rendered = cat.relname(referenced_oid, arena)?.unwrap_or(name);
+                Ok(Datum::RegObject {
+                    type_oid: crate::sql::types::oid::REGCLASS,
+                    referenced_oid,
+                    name: rendered,
+                })
             }
             "pg_encoding_to_char" => {
                 arity(1)?;

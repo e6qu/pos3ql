@@ -281,7 +281,7 @@ pub struct Parser<'a> {
     /// The `INTO table` clause a top-level SELECT carried, with the byte range
     /// of the clause itself so the query can be reconstructed without it (for
     /// reuse of the CREATE TABLE AS machinery). `None` when there was none.
-    into_clause: Option<(QualName<'a>, usize, usize)>,
+    into_clause: Option<(QualName<'a>, RelationPersistence, usize, usize)>,
     /// A column/domain DEFAULT ends before a following `NOT NULL`. Ordinarily
     /// `NOT` is an infix-expression prefix (`NOT IN`, `NOT LIKE`, ...), so the
     /// expression parser needs this narrow bit of grammar context to leave the
@@ -1611,10 +1611,17 @@ impl<'a> Parser<'a> {
             if self.into_clause.is_some() {
                 return Err(self.err_here("multiple INTO clauses in one query"));
             }
+            let persistence = if self.eat_ident("unlogged")? {
+                RelationPersistence::Unlogged
+            } else if self.eat_ident("temporary")? || self.eat_ident("temp")? {
+                RelationPersistence::Temporary
+            } else {
+                RelationPersistence::Permanent
+            };
             let _ = self.eat_ident("table")?;
             let name = self.qual_name("table name")?;
             let into_end = self.peek_at;
-            self.into_clause = Some((name, into_start, into_end));
+            self.into_clause = Some((name, persistence, into_start, into_end));
         }
 
         let from = if self.eat_ident("from")? {
@@ -2186,7 +2193,7 @@ impl<'a> Parser<'a> {
         let into = self.into_clause.take();
         self.into_clause = saved_into;
         (self.windows, self.n_windows) = enclosing_windows;
-        if let Some((name, into_start, into_end)) = into {
+        if let Some((name, persistence, into_start, into_end)) = into {
             // Reconstruct the query without its INTO clause and hand it to the
             // CREATE TABLE AS machinery.
             let sql = self
@@ -2205,6 +2212,7 @@ impl<'a> Parser<'a> {
                 if_not_exists: false,
                 kind: CreateTableAsKind::SelectInto,
                 options: crate::sql::ast::TableAsOptions::DEFAULT,
+                persistence,
             });
         }
         if let SetTree::Select(s) = body {
@@ -8978,6 +8986,7 @@ mod tests {
         with_parser(
             "CREATE TABLE from_query AS SELECT 1; \
              CREATE MATERIALIZED VIEW materialized_query USING heap WITH (fillfactor = 75) AS SELECT 1; \
+             CREATE UNLOGGED MATERIALIZED VIEW unlogged_materialized_query AS SELECT 1; \
              SELECT 1 INTO selected_query",
             |parser| {
                 let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
@@ -8990,6 +8999,14 @@ mod tests {
                 };
                 assert_eq!(kind, crate::sql::ast::CreateTableAsKind::MaterializedView);
                 assert_eq!(options.storage_options.fillfactor, Some(75));
+                let Some(Stmt::CreateTableAs {
+                    kind, persistence, ..
+                }) = parser.next_stmt().unwrap()
+                else {
+                    panic!("CREATE UNLOGGED MATERIALIZED VIEW did not parse")
+                };
+                assert_eq!(kind, crate::sql::ast::CreateTableAsKind::MaterializedView);
+                assert_eq!(persistence, crate::sql::ast::RelationPersistence::Unlogged);
                 let Some(Stmt::CreateTableAs { kind, .. }) = parser.next_stmt().unwrap() else {
                     panic!("SELECT INTO did not parse")
                 };

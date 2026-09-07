@@ -84,9 +84,12 @@ if command -v javac >/dev/null; then
       --connect-timeout 10 --max-time 30 -o "$JAR" \
       "https://repo1.maven.org/maven2/org/postgresql/postgresql/$JDBC_VER/postgresql-$JDBC_VER.jar" \
       && jar tf "$JAR" >/dev/null; then
-    javac -cp "$JAR" -d "$WORK" "$DRV/JdbcTest.java"
-    jdbc() { java -cp "$WORK:$JAR" JdbcTest "$2" "$3" > "$1" 2>&1; }
-    diff_driver jdbc jdbc
+    if javac -cp "$JAR" -d "$WORK" "$DRV/JdbcTest.java"; then
+      jdbc() { java -cp "$WORK:$JAR" JdbcTest "$2" "$3" > "$1" 2>&1; }
+      diff_driver jdbc jdbc
+    else
+      bad "jdbc (fixture compilation failed)"
+    fi
   else
     bad "jdbc (driver artifact unavailable or invalid)"
   fi

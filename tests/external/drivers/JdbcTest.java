@@ -10,7 +10,11 @@
 // The pgJDBC jar must be on the classpath.
 
 import java.sql.*;
+import java.io.IOException;
+import java.io.StringReader;
 import java.util.UUID;
+import org.postgresql.PGConnection;
+import org.postgresql.copy.CopyManager;
 import org.postgresql.util.PGobject;
 
 public class JdbcTest {
@@ -30,6 +34,7 @@ public class JdbcTest {
             typedValuesAndPortalPaging(c);
             standardRoutine(c);
             tableSampling(c);
+            relationPersistence(c, url);
             metadata(c);
         } catch (SQLException e) {
             line("FATAL " + sqlstate(e) + " " + firstLine(e.getMessage()));
@@ -266,6 +271,47 @@ public class JdbcTest {
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
                 line("system sample rows=" + rs.getInt(1));
+            }
+        }
+    }
+
+    static void relationPersistence(Connection c, String url) throws SQLException, IOException {
+        try (Statement s = c.createStatement()) {
+            s.execute("DROP TABLE IF EXISTS jdbc_persistence");
+            s.execute("DROP TABLE IF EXISTS jdbc_unlogged");
+            s.execute("CREATE TABLE jdbc_persistence (id integer)");
+            s.execute("INSERT INTO jdbc_persistence VALUES (1)");
+            s.execute("CREATE UNLOGGED TABLE jdbc_unlogged (id integer)");
+            s.execute("INSERT INTO jdbc_unlogged VALUES (7)");
+            s.execute("CREATE TEMP TABLE jdbc_persistence (id integer) ON COMMIT PRESERVE ROWS");
+        }
+        CopyManager copy = c.unwrap(PGConnection.class).getCopyAPI();
+        long copied = copy.copyIn("COPY jdbc_persistence (id) FROM STDIN", new StringReader("2\n3\n"));
+        line("temp copy rows=" + copied);
+        try (Statement s = c.createStatement(); ResultSet rs = s.executeQuery(
+                "SELECT (SELECT relpersistence::text FROM pg_class WHERE oid='jdbc_persistence'::regclass), "
+                + "(SELECT relpersistence::text FROM pg_class WHERE oid='public.jdbc_persistence'::regclass), "
+                + "(SELECT relpersistence::text FROM pg_class WHERE oid='jdbc_unlogged'::regclass)")) {
+            rs.next();
+            line("persistence " + rs.getString(1) + "|" + rs.getString(2) + "|" + rs.getString(3));
+        }
+        try (Connection other = DriverManager.getConnection(url, "postgres", "");
+             Statement s = other.createStatement();
+             ResultSet rs = s.executeQuery("SELECT id FROM jdbc_persistence")) {
+            rs.next();
+            line("temp isolation 2,3|" + rs.getInt(1));
+        }
+        try (Statement s = c.createStatement()) {
+            s.execute("BEGIN");
+            s.execute("CREATE TEMP TABLE jdbc_delete (id integer) ON COMMIT DELETE ROWS");
+            s.execute("CREATE TEMP TABLE jdbc_drop (id integer) ON COMMIT DROP");
+            s.execute("INSERT INTO jdbc_delete VALUES (9)");
+            s.execute("INSERT INTO jdbc_drop VALUES (10)");
+            s.execute("COMMIT");
+            try (ResultSet rs = s.executeQuery(
+                    "SELECT (SELECT count(*) FROM jdbc_delete), to_regclass('jdbc_drop') IS NULL")) {
+                rs.next();
+                line("on commit " + rs.getInt(1) + "|" + rs.getBoolean(2));
             }
         }
     }

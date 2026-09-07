@@ -61,6 +61,10 @@ fn run() -> Result<(), String> {
         "  disk cache   {:>12} (disk, not RAM)",
         FmtBytes(config.disk_cache_bytes)
     );
+    println!(
+        "  temp spill   {:>12} (local ephemeral disk)",
+        FmtBytes(config.temporary_spill_bytes)
+    );
 
     if config.object_store_sim {
         return Err(

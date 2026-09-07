@@ -40,7 +40,7 @@ pub mod txn;
 pub mod types;
 pub mod tzif;
 
-use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer};
+use crate::checkpoint::{CheckpointSetupError, CheckpointStep, Checkpointer, TemporarySpiller};
 use crate::config::Config;
 use crate::mem::arena::Arena;
 use crate::mem::budget::{Budget, BudgetError};
@@ -166,6 +166,7 @@ pub struct Engine {
     storage: Storage,
     wal: Wal,
     ckpt: Option<Checkpointer>,
+    temporary_spiller: Option<TemporarySpiller>,
     /// A published manifest whose local bookkeeping still needs to finish.
     /// Keeping this state makes publication and its cleanup one retriable
     /// completion protocol instead of reporting success after the manifest.
@@ -222,6 +223,7 @@ pub struct Engine {
     active_system_settings: [Option<ActiveSystemSetting>; crate::storage::MAX_SYSTEM_SETTINGS],
     system_settings_reloaded: bool,
     discard_protocol_state: bool,
+    clean_shutdown_path: std::path::PathBuf,
 }
 
 pub(crate) struct CursorStatementContext<'a, 'response> {
@@ -2628,10 +2630,20 @@ impl Engine {
                 config.foreign_receive_bytes,
                 config.foreign_send_bytes,
             )
+            + if config.temporary_spill_bytes == 0 {
+                0
+            } else {
+                TemporarySpiller::budget_bytes(config)
+            }
             + if config.object_store_on {
-                // The checkpointer's fixed parts plus the spilled-row reader's
-                // two scratch sets.
-                Checkpointer::budget_bytes(config) + crate::storage::SpillReader::budget_bytes()
+                crate::storage::SpillReader::budget_bytes(true)
+            } else if config.temporary_spill_bytes != 0 {
+                crate::storage::SpillReader::budget_bytes(false)
+            } else {
+                0
+            }
+            + if config.object_store_on {
+                Checkpointer::budget_bytes(config)
             } else {
                 0
             }
@@ -2641,19 +2653,51 @@ impl Engine {
     /// (when enabled), and replays the journal tail on top. Startup only.
     pub fn new(config: &Config, budget: &mut Budget) -> Result<Self, EngineSetupError> {
         crate::sql::tzif::init_catalog();
+        let mut clean_shutdown_path = std::path::PathBuf::from(&config.data_dir);
+        clean_shutdown_path.push("clean.shutdown");
+        let clean_shutdown_lsn = std::fs::read(&clean_shutdown_path)
+            .ok()
+            .filter(|bytes| bytes.len() == 8)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("length checked")));
+        if clean_shutdown_path.exists() {
+            std::fs::remove_file(&clean_shutdown_path).map_err(|error| {
+                EngineSetupError::Wal(crate::wal::WalSetupError::Io(
+                    "remove clean shutdown marker",
+                    error,
+                ))
+            })?;
+            std::fs::File::open(&config.data_dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    EngineSetupError::Wal(crate::wal::WalSetupError::Io(
+                        "sync clean shutdown marker removal",
+                        error,
+                    ))
+                })?;
+        }
         let mut storage = Storage::new(config, budget)?;
         storage.configure_collation(config, budget)?;
         storage.load_extension_packages(config)?;
+        let temporary_spiller = (config.temporary_spill_bytes != 0)
+            .then(|| TemporarySpiller::new(config, budget))
+            .transpose()?;
         let mut ckpt = if config.object_store_on {
             Some(Checkpointer::new(config, budget)?)
         } else {
             None
         };
-        // The spilled-row read path shares the checkpointer's block stack;
-        // it must exist before the manifest load installs spilled rows.
-        if let Some(c) = &ckpt {
-            let reader = crate::storage::SpillReader::new(budget, c.block_stack())
-                .map_err(EngineSetupError::Budget)?;
+        // The temporary store exists in every mode. The durable stack is
+        // optional, but when present must attach before manifest load installs
+        // object-backed row homes.
+        if ckpt.is_some() || temporary_spiller.is_some() {
+            let reader = crate::storage::SpillReader::new(
+                budget,
+                ckpt.as_ref().map(Checkpointer::block_stack),
+                temporary_spiller
+                    .as_ref()
+                    .map(TemporarySpiller::block_store),
+            )
+            .map_err(EngineSetupError::Budget)?;
             storage.attach_spill(reader);
         }
         let floor = match &mut ckpt {
@@ -2767,6 +2811,20 @@ impl Engine {
             c.publish_commit_batch(first, &segment)?;
         }
         storage.ensure_no_pending_replay_table_rewrite()?;
+        let mut recovered_transaction_id = recovered_transaction_id;
+        if clean_shutdown_lsn != Some(storage.lsn()) && storage.has_unlogged_relations() {
+            storage.reset_unlogged_relations()?;
+            recovered_transaction_id = recovered_transaction_id.wrapping_add(1).max(1);
+            let provisional_lsn = storage.lsn().saturating_add(1);
+            wal.stage(
+                recovered_transaction_id,
+                provisional_lsn,
+                &WalOp::ResetUnloggedRelations,
+            )?;
+            let commit_lsn = wal.commit_stage(recovered_transaction_id, storage.lsn())?;
+            wal.commit();
+            storage.set_lsn(commit_lsn);
+        }
         storage.reconcile_serials();
         // Replay's row installs bypass the per-row value-index maintenance, so
         // rebuild every table's uniqueness indexes from the recovered committed
@@ -2801,6 +2859,7 @@ impl Engine {
             storage,
             wal,
             ckpt,
+            temporary_spiller,
             post_publish_cleanup: None,
             pending_copy: None,
             wal_upload: config.wal_upload && config.object_store_on,
@@ -2842,7 +2901,24 @@ impl Engine {
             active_system_settings,
             system_settings_reloaded: false,
             discard_protocol_state: false,
+            clean_shutdown_path,
         })
+    }
+
+    pub(crate) fn mark_clean_shutdown(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut marker = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&self.clean_shutdown_path)?;
+        marker.write_all(&self.storage.lsn().to_le_bytes())?;
+        marker.sync_all()?;
+        let parent = self
+            .clean_shutdown_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("clean shutdown marker has no parent"))?;
+        std::fs::File::open(parent)?.sync_all()
     }
 
     pub(crate) fn replication_identity(&self) -> (u64, u64) {
@@ -3964,11 +4040,19 @@ impl Engine {
             let transaction_id = txn.txid;
             let tables = txn.truncate_wal_tables();
             tables.clear();
+            let mut durable_table_count = 0usize;
             for &table_slot in &event.tables[..event.table_count] {
                 let definition = self.storage.table_def(table_slot as usize, transaction_id);
+                if definition.persistence == crate::storage::RelationPersistence::Temporary {
+                    continue;
+                }
                 for name in [definition.schema.as_str(), definition.name.as_str()] {
                     assert!(tables.append(&[name.len() as u8]) && tables.append(name.as_bytes()));
                 }
+                durable_table_count += 1;
+            }
+            if durable_table_count == 0 {
+                continue;
             }
             let lsn = self.storage.lsn() + 1;
             if let Err(error) = self.wal.stage(
@@ -3976,7 +4060,7 @@ impl Engine {
                 lsn,
                 &WalOp::Truncate {
                     tables: tables.readable(),
-                    table_count: event.table_count,
+                    table_count: durable_table_count,
                     cascade: event.cascade,
                     restart_identity: event.restart_identity,
                     command_id: event.command_id,
@@ -4008,6 +4092,9 @@ impl Engine {
                 continue;
             }
             let def = self.storage.table_def(table as usize, txn.txid);
+            if def.persistence == crate::storage::RelationPersistence::Temporary {
+                continue;
+            }
             let name = def.name;
             let schema = def.schema;
             let lsn = self.storage.lsn() + 1;
@@ -4075,6 +4162,9 @@ impl Engine {
                 continue;
             }
             let def = *self.storage.table_def(i, txn.txid);
+            if def.persistence == crate::storage::RelationPersistence::Temporary {
+                continue;
+            }
             let name = def.name;
             let schema = def.schema;
             for c in 0..def.n_columns {
@@ -4106,6 +4196,9 @@ impl Engine {
         for i in 0..self.storage.sequence_count() {
             let seq = self.storage.sequence_for(i, txn.txid);
             if !seq.visible_to(txn.txid) || !self.storage.sequence_value_dirty_for(i, txn.txid) {
+                continue;
+            }
+            if seq.persistence == crate::storage::RelationPersistence::Temporary {
                 continue;
             }
             let schema = seq.schema;
@@ -4143,6 +4236,9 @@ impl Engine {
             let statistics =
                 pending.unwrap_or_else(|| self.storage.table_statistics(slot, txn.txid));
             let definition = *self.storage.table_def(slot, txn.txid);
+            if definition.persistence == crate::storage::RelationPersistence::Temporary {
+                continue;
+            }
             let lsn = self.storage.lsn() + 1;
             if let Err(error) = self.wal.stage(
                 txn.txid,
@@ -4165,6 +4261,12 @@ impl Engine {
             else {
                 continue;
             };
+            let table = usize::from(self.storage.extended_statistics(slot).table);
+            if self.storage.table_def(table, txn.txid).persistence
+                == crate::storage::RelationPersistence::Temporary
+            {
+                continue;
+            }
             let definition = self
                 .storage
                 .extended_statistics(slot)
@@ -4419,6 +4521,9 @@ impl Engine {
             let Some(object) = object else {
                 continue;
             };
+            if self.storage.access_object_is_temporary(object, txn.txid) {
+                continue;
+            }
             if !self.storage.access_object_visible_to(object, txn.txid) {
                 continue;
             }
@@ -4472,6 +4577,9 @@ impl Engine {
             }
             let entry = self.storage.acl_entry(slot as usize);
             let object = entry.object;
+            if self.storage.access_object_is_temporary(object, txn.txid) {
+                continue;
+            }
             if !self.storage.access_object_visible_to(object, txn.txid) {
                 continue;
             }
@@ -4538,6 +4646,9 @@ impl Engine {
             }
             let entry = *self.storage.column_acl_entry(slot as usize);
             let relation = entry.target.relation();
+            if self.storage.access_object_is_temporary(relation, txn.txid) {
+                continue;
+            }
             if !self.storage.access_object_visible_to(relation, txn.txid) {
                 continue;
             }
@@ -5323,11 +5434,13 @@ impl Engine {
         // a loud error reported to the client — like a post-commit upload
         // failure, the data is committed regardless — never a silent drop.
         let notify_result = self.flush_committed_notifications(txn);
+        let temporary_result = self.storage.apply_temporary_on_commit();
         if let Some(guc) = guc {
             guc.commit_transaction();
         }
+        self.storage.clear_temporary_transaction(txn.txid);
         txn.clear();
-        notify_result.and(index_result)
+        notify_result.and(index_result).and(temporary_result)
     }
 
     /// Publishes foreign-catalog images before any extension edge that names
@@ -5536,6 +5649,17 @@ impl Engine {
                 sql_err!(
                     sqlstate::FEATURE_NOT_SUPPORTED,
                     "cannot PREPARE a transaction that has operated on a foreign table"
+                ),
+            ));
+        }
+        if self.storage.transaction_used_temporary_relation(txn.txid) {
+            return Err(fail(
+                self,
+                txn,
+                cursors,
+                sql_err!(
+                    sqlstate::FEATURE_NOT_SUPPORTED,
+                    "cannot PREPARE a transaction that has operated on temporary objects"
                 ),
             ));
         }
@@ -6172,6 +6296,7 @@ impl Engine {
             }
         }
         self.wal.discard_stage(txn.txid);
+        self.storage.clear_temporary_transaction(txn.txid);
         txn.clear();
     }
 
@@ -7223,6 +7348,10 @@ impl Engine {
     pub fn drop_connection(&mut self, conn_id: i32) {
         self.notify.drop_conn(conn_id);
         self.invalidate_replication_snapshot(conn_id);
+        self.storage.drop_connection_temporary_relations(conn_id);
+        if let Some(spiller) = self.temporary_spiller.as_mut() {
+            spiller.cleanup(&self.storage);
+        }
     }
 
     /// One complete COPY data line (no trailing newline).
@@ -7407,12 +7536,46 @@ impl Engine {
                 }
             };
         }
+        let heap_full = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 65;
+        let history_full = self.storage.history_pressure();
+        let temporary_map_full = self.storage.temporary_map_pressure();
+        if (heap_full || history_full || temporary_map_full)
+            && let Some(spiller) = self.temporary_spiller.as_mut()
+            && let Some(slot) = match spiller.spill_step(&mut self.storage, &mut self.scratch) {
+                Ok(slot) => slot,
+                Err(error) => {
+                    let message = stack_format!(
+                        512,
+                        "pos3ql: temporary spill failed ({}): {}\n",
+                        error.sqlstate,
+                        error.message.as_str()
+                    );
+                    crate::util::stderr_line(message.as_str());
+                    return false;
+                }
+            }
+        {
+            if !self.storage.has_active_snapshots() {
+                self.storage.release_table_histories(slot);
+            }
+            self.storage.evict_committed_table(slot);
+            if let Err(error) = self.storage.compact_heap(&mut self.compact_scratch) {
+                let message = stack_format!(
+                    512,
+                    "pos3ql: temporary spill cleanup failed ({}): {}\n",
+                    error.sqlstate,
+                    error.message.as_str()
+                );
+                crate::util::stderr_line(message.as_str());
+                return false;
+            }
+            self.storage.evict_redundant_entries(slot);
+            return true;
+        }
         let Some(ckpt) = self.ckpt.as_mut() else {
             return true;
         };
-        let heap_full = self.storage.heap.used() * 100 >= self.storage.heap.capacity() * 65;
         let wal_full = self.wal.used_bytes() * 100 >= self.wal.capacity_bytes() * 50;
-        let history_full = self.storage.history_pressure();
         if !(ckpt.sweep_active()
             || ckpt.maintenance_pending()
             || ckpt.merge_work_pending(&self.storage)
@@ -7511,6 +7674,7 @@ impl Engine {
         lock_timeout_expired: bool,
     ) -> Result<ExecutionStatus, WireFull> {
         self.current_conn_id = conn_id;
+        self.storage.set_current_connection_id(conn_id);
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -7719,6 +7883,7 @@ impl Engine {
     ) -> Result<ExtendedExecutionStatus, WireFull> {
         let _parameter_types = exec::enter_bound_parameter_types(parameter_type_oids);
         self.current_conn_id = conn_id;
+        self.storage.set_current_connection_id(conn_id);
         let mut parser = match Parser::new(text, arena) {
             Ok(p) => p,
             Err(e) => {
@@ -7866,6 +8031,7 @@ impl Engine {
         conn_id: i32,
     ) -> Result<bool, WireFull> {
         self.current_conn_id = conn_id;
+        self.storage.set_current_connection_id(conn_id);
         datetime::begin_statement();
         self.ensure_txn(txn, TxnMode::Implicit, guc);
         if txn.failed {
@@ -13704,6 +13870,7 @@ impl Engine {
                 if_not_exists,
                 kind,
                 options,
+                persistence,
             } => exec::create_table_as(
                 &mut self.storage,
                 &mut self.wal,
@@ -13715,6 +13882,7 @@ impl Engine {
                 *if_not_exists,
                 *kind == ast::CreateTableAsKind::MaterializedView,
                 *options,
+                *persistence,
                 guc.search_path().as_str(),
                 guc.seq_session(),
                 arena,
@@ -13748,13 +13916,17 @@ impl Engine {
                 name,
                 if_not_exists,
                 options,
+                persistence,
             } => exec::create_sequence(
                 &mut self.storage,
                 &mut self.wal,
                 txn,
-                name,
-                *if_not_exists,
-                options,
+                exec::CreateSequenceCommand {
+                    name,
+                    if_not_exists: *if_not_exists,
+                    options,
+                    persistence: *persistence,
+                },
                 responder,
             ),
             Stmt::AlterSequence {
@@ -16772,6 +16944,7 @@ pub(crate) fn requalify_schema_element<'a>(
             name: requalify(*name)?,
             if_not_exists: *if_not_exists,
             options: *options,
+            persistence: crate::sql::ast::RelationPersistence::Permanent,
         },
         ast::CreateSchemaElement::Trigger(trigger) => {
             let kind = match trigger.kind {
@@ -17077,6 +17250,7 @@ fn replay_transaction_batches(
                             cycle,
                             owner,
                             generator_for,
+                            persistence,
                         } => {
                             let spec = crate::storage::SeqSpec {
                                 data_type: crate::storage::SeqType::from_u8(data_type),
@@ -17098,6 +17272,7 @@ fn replay_transaction_batches(
                                         spec,
                                         owner,
                                         generator_for,
+                                        persistence,
                                         restart: None,
                                     },
                                     transaction_id,
@@ -17110,11 +17285,14 @@ fn replay_transaction_batches(
                                 )?;
                             } else {
                                 let sequence = storage.create_sequence(
-                                    crate::storage::SqlName::parse(schema)?,
-                                    crate::storage::SqlName::parse(name)?,
-                                    spec,
-                                    owner,
-                                    generator_for,
+                                    crate::storage::SequenceCreateSpec {
+                                        schema: crate::storage::SqlName::parse(schema)?,
+                                        name: crate::storage::SqlName::parse(name)?,
+                                        spec,
+                                        owner,
+                                        generator_for,
+                                        persistence,
+                                    },
                                     transaction_id,
                                 )?;
                                 prepared
@@ -18676,6 +18854,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
             cycle,
             owner,
             generator_for,
+            persistence,
         } => {
             let spec = crate::storage::SeqSpec {
                 data_type: crate::storage::SeqType::from_u8(data_type),
@@ -18697,6 +18876,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                         spec,
                         owner,
                         generator_for,
+                        persistence,
                         restart: None,
                     },
                     0,
@@ -18704,11 +18884,14 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                 storage.commit_sequence_alter(slot, 0);
             } else {
                 let slot = storage.create_sequence(
-                    crate::storage::SqlName::parse(schema)?,
-                    crate::storage::SqlName::parse(name)?,
-                    spec,
-                    owner,
-                    generator_for,
+                    crate::storage::SequenceCreateSpec {
+                        schema: crate::storage::SqlName::parse(schema)?,
+                        name: crate::storage::SqlName::parse(name)?,
+                        spec,
+                        owner,
+                        generator_for,
+                        persistence,
+                    },
                     0,
                 )?;
                 storage.commit_sequence_create(slot);
@@ -18727,6 +18910,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
         } => {
             storage.apply_sequence_advance(schema, name, last, is_called);
         }
+        WalOp::ResetUnloggedRelations => storage.reset_unlogged_relations()?,
         WalOp::CreateDomain(def) => {
             // An ALTER replays as a redefinition: redefine in place if it
             // exists, else create it committed (txid 0).
@@ -19313,6 +19497,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     spec,
                     owner: current.owner,
                     generator_for: current.generator_for,
+                    persistence: current.persistence,
                     restart: None,
                 },
                 0,
@@ -19349,6 +19534,7 @@ fn apply_wal_op(storage: &mut Storage, lsn: u64, operator: WalOp) -> Result<(), 
                     spec,
                     owner: current.owner,
                     generator_for: current.generator_for,
+                    persistence: current.persistence,
                     restart: None,
                 },
                 0,

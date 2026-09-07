@@ -125,6 +125,10 @@ pub struct Config {
     pub block_cache_bytes: usize,
     /// Disk budget for locally cached objects (not RAM).
     pub disk_cache_bytes: usize,
+    /// Fixed local-disk budget for session-temporary table SSTs. Unlike the
+    /// object cache, this store is authoritative only for the running process:
+    /// it is recreated empty at startup and never published to object storage.
+    pub temporary_spill_bytes: usize,
     /// Durable object storage on/off. When on, checkpoints snapshot to the
     /// configured namespace and a wiped node cold-starts from it.
     pub object_store_on: bool,
@@ -237,6 +241,7 @@ impl Config {
             max_value_indexes: 16,
             block_cache_bytes: 128 * MIB,
             disk_cache_bytes: GIB,
+            temporary_spill_bytes: GIB,
             object_store_on: false,
             object_store_sim: false,
             wal_upload: false,
@@ -476,6 +481,10 @@ impl Config {
                     config.disk_cache_bytes =
                         parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
                 }
+                "temporary_spill_bytes" => {
+                    config.temporary_spill_bytes =
+                        parse_size(value).map_err(|m| ConfigError::at(line_no, m))?
+                }
                 "wal_upload" => {
                     config.wal_upload = match value {
                         "on" | "true" => true,
@@ -633,6 +642,17 @@ impl Config {
             return Err(ConfigError::at(
                 0,
                 "collation_scratch_bytes must be greater than zero".to_string(),
+            ));
+        }
+        if config.temporary_spill_bytes != 0
+            && config.temporary_spill_bytes < crate::store::BLOCK_SIZE
+        {
+            return Err(ConfigError::at(
+                0,
+                format!(
+                    "temporary_spill_bytes must be at least {} bytes",
+                    crate::store::BLOCK_SIZE
+                ),
             ));
         }
         if config.max_rules == 0 {
@@ -843,6 +863,7 @@ max_replication_slots = 12
 max_subscriptions = 7
 max_rules = 19
 memtable_bytes = 16MiB   # small for tests
+temporary_spill_bytes = 32MiB
 sql_arena_bytes = 4096
 ";
         let c = Config::parse(text).unwrap();
@@ -853,9 +874,22 @@ sql_arena_bytes = 4096
         assert_eq!(c.max_subscriptions, 7);
         assert_eq!(c.max_rules, 19);
         assert_eq!(c.memtable_bytes, 16 * MIB);
+        assert_eq!(c.temporary_spill_bytes, 32 * MIB);
         assert_eq!(c.sql_arena_bytes, 4096);
         // Untouched keys keep defaults.
         assert_eq!(c.block_cache_bytes, Config::default_dev().block_cache_bytes);
+    }
+
+    #[test]
+    fn temporary_spill_must_hold_at_least_one_block() {
+        let error = Config::parse("temporary_spill_bytes = 1KiB\n").unwrap_err();
+        assert!(error.to_string().contains("must be at least 262144 bytes"));
+        assert_eq!(
+            Config::parse("temporary_spill_bytes = 0\n")
+                .unwrap()
+                .temporary_spill_bytes,
+            0
+        );
     }
 
     #[test]

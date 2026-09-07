@@ -88,6 +88,16 @@ psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X \
   -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 SET client_min_messages = warning;
 DO $$
+DECLARE extension_name text;
+BEGIN
+  FOR extension_name IN
+    SELECT extname FROM pg_extension WHERE extname <> 'plpgsql'
+  LOOP
+    EXECUTE format('DROP EXTENSION %I CASCADE', extension_name);
+  END LOOP;
+END
+$$;
+DO $$
 DECLARE
   object record;
   routine_identity text;
@@ -788,6 +798,13 @@ ALTER TABLE outbound_dump.constraint_items ADD CONSTRAINT outbound_constraint_fk
   DEFERRABLE INITIALLY DEFERRED NOT VALID;
 CREATE SEQUENCE outbound_dump.manual_sequence START WITH 41;
 SELECT nextval('outbound_dump.manual_sequence');
+CREATE UNLOGGED TABLE outbound_dump.transient_rows (
+  id integer GENERATED ALWAYS AS IDENTITY,
+  value text
+);
+INSERT INTO outbound_dump.transient_rows(value) VALUES ('dumped unlogged row');
+CREATE UNLOGGED SEQUENCE outbound_dump.transient_sequence START WITH 71;
+SELECT nextval('outbound_dump.transient_sequence');
 CREATE MATERIALIZED VIEW outbound_dump.item_count AS SELECT count(*) AS count FROM outbound_dump.items;
 CREATE FUNCTION outbound_dump.dump_answer() RETURNS integer LANGUAGE sql AS 'SELECT 42';
 CREATE FUNCTION outbound_dump.dump_total_state(state bigint, value integer)
@@ -1038,9 +1055,17 @@ else
       SELECT schemaname,tablename,attnames::text,rowfilter
         FROM pg_publication_tables
        WHERE pubname = 'outbound_dump_changes';
+      SELECT relname,relpersistence
+        FROM pg_class
+       WHERE relnamespace = 'outbound_dump'::regnamespace
+         AND relname IN ('transient_rows', 'transient_rows_id_seq', 'transient_sequence')
+       ORDER BY relname;
+      SELECT id,value FROM outbound_dump.transient_rows;
+      SELECT last_value,is_called FROM outbound_dump.transient_sequence;
     " 2>/dev/null)
   expected_outbound_observed=$'1|ok|1|2|t|ok|8|10|200|one\n2|great|3|4|t|great|10|30|400|two\n1|one\n2|two\n1|one\n2|two\n3\nINSERT 0 1\nYES|ALWAYS\n3|30\nINSERT 0 1\n2|21\nUPDATE 1\n1|10\nDELETE 1\nUPDATE 2\n2|200\n3|300\n2|200\nDELETE 1\n3|300\n9|nine\nINSERT 0 1\n9|nine\noutbound_redirect|t|dumped rewrite rule\noutbound_items_note_check\nt\nt\ndumped table comment|dumped column comment\n2\n42\n1\noutbound_constraint_check|c|f|f|f|t\noutbound_constraint_exclusion|x|t|t|t|t\noutbound_constraint_fk|f|t|t|f|t\noutbound_constraint_key|u|t|t|t|t\nt|t|f|t|t\nok|9|12|{great}|14|15\n1|one|10|1\n2|two|20|2\n||30|3\nt|t\noutbound_reader_rows|PERMISSIVE|ALL|{outbound_reader}|t|t\n{security_invoker=true}\nSET\n1|outbound_reader\nRESET\n10|1\n20|2\nINSERT 0 1\n30\nBEGIN\nINSERT 0 1\n0\nCOMMIT\n7\ndumped partition trigger|4\nI|1\n7|C\n10\n2|x\nok|t\nf|a\noutbound_int_class|outbound_int_family\n3|1\nbyte_order|c|t|latin1_to_utf8|t\none\nthree\ntwo\nc3a9\ndumped collation|dumped conversion\n1|\'42\':2 \'cats\':1|\'cats\' & \'42\'|t\n2|\'7\':2 \'dogs\':1|\'dogs\'|t\n\'9\':2 \'birds\':1|{birds}\ndumped search configuration\n4\noutbound_search_expression_idx\noutbound_search_query_idx\noutbound_search_terms_idx\nsearch_documents_pkey'
   expected_outbound_observed+=$'\noutbound_dump_changes|outbound_reader|f|t|t|f|f|f|n\noutbound_dump|publication_rows|{id,visible}|(id > 0)'
+  expected_outbound_observed+=$'\ntransient_rows|u\ntransient_rows_id_seq|u\ntransient_sequence|u\n1|dumped unlogged row\n71|t'
   if [[ "$outbound_observed" == "$expected_outbound_observed" ]]; then
     ok "pos3ql pg_dump restores into PostgreSQL 18 with data, identity, and writable views"
   else

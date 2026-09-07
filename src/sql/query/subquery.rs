@@ -1471,7 +1471,8 @@ fn subquery_exists<'a>(
         }
         return Ok(true);
     };
-    let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
+    let scope =
+        QueryScope::resolve_exec_outer(storage, from, txid, arena, params, hooks.sequences, outer)?;
     let mut found = false;
     let pax_columns = match select.where_clause {
         Some(predicate) => pax_column_demand(&scope, from, &[predicate]),
@@ -2693,7 +2694,8 @@ fn run_subquery<'a>(
             subquery_witness_with_outer(storage, txid, item, None, outer)?,
         ));
     };
-    let scope = QueryScope::resolve_exec_outer(storage, from, txid, arena, params, outer)?;
+    let scope =
+        QueryScope::resolve_exec_outer(storage, from, txid, arena, params, hooks.sequences, outer)?;
 
     // `SELECT *` is a single-column subquery only if the source is exactly one
     // column; expand it to that column so the row-value path below applies.

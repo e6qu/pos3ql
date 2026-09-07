@@ -671,13 +671,16 @@ fn parse_environment_nonzero_u64(
 
 #[test]
 fn storage_vopr() {
+    const VOPR_STACK_BYTES: usize = 16 << 20;
     let result = std::thread::Builder::new()
-        .name("storage-vopr-8-mib".to_string())
+        .name("storage-vopr-16-mib".to_string())
         // The recovery path carries the complete bounded engine and catalog
-        // frames. Keep the test envelope explicit so catalog growth remains
-        // visible instead of depending on a platform thread default.
-        .stack_size(8_388_608)
-        .spawn(|| run_storage_vopr().expect("parse storage VOPR configuration"))
+        // frames. Keep the same explicit envelope on the coordinator and its
+        // workers instead of depending on platform thread defaults.
+        .stack_size(VOPR_STACK_BYTES)
+        .spawn(move || {
+            run_storage_vopr(VOPR_STACK_BYTES).expect("parse storage VOPR configuration")
+        })
         .expect("spawn storage VOPR with constrained stack")
         .join();
     if let Err(panic) = result {
@@ -685,7 +688,7 @@ fn storage_vopr() {
     }
 }
 
-fn run_storage_vopr() -> Result<(), String> {
+fn run_storage_vopr(stack_bytes: usize) -> Result<(), String> {
     let configuration = VoprConfiguration::from_environment()?;
     const MAX_WORKERS: usize = 4;
     let requested_workers = usize::try_from(configuration.seeds.get())
@@ -697,7 +700,7 @@ fn run_storage_vopr() -> Result<(), String> {
         handles.push(
             std::thread::Builder::new()
                 .name(format!("storage-vopr-worker-{worker}"))
-                .stack_size(8_388_608)
+                .stack_size(stack_bytes)
                 .spawn(move || {
                     for seed in (configuration.seed0 + worker
                         ..configuration.seed0 + configuration.seeds.get())

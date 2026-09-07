@@ -252,6 +252,43 @@ exec(compile(src, "driver_test.py", "exec"))
 EOF
 then ok "psycopg driver"; else bad "psycopg driver"; cat "$WORK/driver.out"; fi
 
+# --- architecture-excluded native hooks reject before catalog publication --
+native_boundary_output=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -Atq -v VERBOSITY=verbose 2>&1 <<'SQL'
+CREATE OR REPLACE TRANSFORM FOR integer LANGUAGE plpgsql
+  (TO SQL WITH FUNCTION pg_catalog.int4recv(internal),
+   FROM SQL WITH FUNCTION pg_catalog.int4recv(internal));
+DROP TRANSFORM IF EXISTS FOR integer LANGUAGE plpgsql;
+CREATE FUNCTION native_window(integer) RETURNS integer LANGUAGE sql WINDOW RETURN $1;
+CREATE FUNCTION transformed(integer) RETURNS integer LANGUAGE sql
+  TRANSFORM FOR TYPE integer RETURN $1;
+CREATE FUNCTION supported(integer) RETURNS integer LANGUAGE sql
+  SUPPORT pg_catalog.array_unnest_support RETURN $1;
+CREATE FUNCTION linked(integer) RETURNS integer LANGUAGE plpgsql
+  AS 'untrusted-library', 'entrypoint';
+CREATE TRUSTED PROCEDURAL LANGUAGE native_language
+  HANDLER pg_catalog.plpgsql_call_handler;
+CREATE LANGUAGE handlerless_language;
+ALTER LANGUAGE plpgsql RENAME TO mutated_language;
+DROP LANGUAGE IF EXISTS plpgsql CASCADE;
+LOAD 'untrusted-library';
+SELECT 'CATALOG|' || count(*) FROM pg_proc
+ WHERE proname IN ('native_window', 'transformed', 'supported', 'linked');
+SELECT 'CATALOG|' || count(*) FROM pg_language
+ WHERE lanname IN ('native_language', 'handlerless_language', 'mutated_language');
+SQL
+)
+native_boundary_status=$?
+native_boundary_errors=$(printf '%s\n' "$native_boundary_output" | grep -c 'ERROR:  0A000:')
+native_boundary_catalog=$(printf '%s\n' "$native_boundary_output" | grep '^CATALOG|' || true)
+if [[ $native_boundary_status -eq 0 && $native_boundary_errors -eq 11 \
+      && "$native_boundary_catalog" == $'CATALOG|0\nCATALOG|0' ]]; then
+  ok "native hook DDL has explicit catalog-atomic architecture boundaries"
+else
+  bad "native hook DDL rejection boundary"
+  printf '%s\n' "$native_boundary_output"
+fi
+
 # --- postgres_fdw scan/import, typed values, driver Bind, and restart -------
 restart_p3_fresh || exit 1
 echo "=== PostgreSQL foreign-data vertical slice ==="
@@ -404,6 +441,58 @@ else
   bad "foreign mutation transaction behavior"
   printf 'pos3ql:\n%s\nreference:\n%s\n' "$foreign_mutation" "$foreign_mutation_reference"
 fi
+cat > "$WORK/foreign_merge.sql" <<'SQL'
+BEGIN;
+SAVEPOINT outer_foreign_merge;
+SAVEPOINT before_foreign_merge;
+WITH changed AS (
+  MERGE INTO pos3ql_fdw_source AS target
+  USING (VALUES (1, 'merged'), (2, 'delete'), (9, 'inserted')) AS source(id, note)
+  ON target.id = source.id
+  WHEN MATCHED AND source.note = 'delete' THEN DELETE
+  WHEN MATCHED THEN UPDATE SET note = source.note
+  WHEN NOT MATCHED THEN INSERT (id, scores, pair, note)
+    VALUES (source.id, ARRAY[9,NULL], ROW(90,'nine')::public.pos3ql_fdw_pair, source.note)
+  WHEN NOT MATCHED BY SOURCE AND target.id = 3 THEN UPDATE SET note = 'target only'
+  RETURNING merge_action() AS action, source.id AS source_id, target.id, target.note
+)
+SELECT action, source_id, id, note FROM changed ORDER BY source_id;
+SELECT id, note FROM pos3ql_fdw_source WHERE id IN (1,2,3,9) ORDER BY id;
+ROLLBACK TO SAVEPOINT before_foreign_merge;
+SELECT id, note FROM pos3ql_fdw_source WHERE id IN (1,2,3,9) ORDER BY id;
+RELEASE SAVEPOINT before_foreign_merge;
+ROLLBACK TO SAVEPOINT outer_foreign_merge;
+ROLLBACK;
+SQL
+psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d postgres -X -Atq -F '|' \
+  -v ON_ERROR_STOP=1 -f "$WORK/foreign_merge.sql" > "$WORK/foreign_merge_reference.out" 2>&1
+foreign_merge_reference_status=$?
+psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X -Atq -F '|' \
+  -v ON_ERROR_STOP=1 -f "$WORK/foreign_merge.sql" > "$WORK/foreign_merge_pos3ql.out" 2>&1
+foreign_merge_pos3ql_status=$?
+foreign_merge_commit=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
+  -X -Atq -F '|' -v ON_ERROR_STOP=1 <<'SQL' 2>/dev/null
+MERGE INTO pos3ql_fdw_source AS target
+USING (VALUES (1, 'merged'), (2, 'delete'), (9, 'inserted')) AS source(id, note)
+ON target.id = source.id
+WHEN MATCHED AND source.note = 'delete' THEN DELETE
+WHEN MATCHED THEN UPDATE SET note = source.note
+WHEN NOT MATCHED THEN INSERT (id, scores, pair, note)
+  VALUES (source.id, ARRAY[9,NULL], ROW(90,'nine')::public.pos3ql_fdw_pair, source.note)
+WHEN NOT MATCHED BY SOURCE AND target.id = 3 THEN UPDATE SET note = 'target only';
+SELECT id, scores::text, pair::text, note
+  FROM pos3ql_fdw_source WHERE id IN (1,2,3,9) ORDER BY id;
+SQL
+)
+if [[ $foreign_merge_reference_status -eq 0 && $foreign_merge_pos3ql_status -eq 0 ]] \
+  && cmp -s "$WORK/foreign_merge_reference.out" "$WORK/foreign_merge_pos3ql.out" \
+  && [[ "$foreign_merge_commit" == $'1|{1,2}|(10,one)|merged\n3|{5,NULL}|(30,)|target only\n9|{9,NULL}|(90,nine)|inserted' ]]; then
+  ok "foreign MERGE actions, RETURNING, commit and savepoint rollback match PostgreSQL"
+else
+  bad "foreign MERGE transaction behavior"
+  diff -u "$WORK/foreign_merge_reference.out" "$WORK/foreign_merge_pos3ql.out" || true
+  printf 'committed rows:\n%s\n' "$foreign_merge_commit"
+fi
 if printf '6\tCOPY from pos3ql\n' | psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -v ON_ERROR_STOP=1 -c 'COPY pos3ql_fdw_source (id, note) FROM STDIN' \
   > "$WORK/foreign_copy_in.out" 2>&1; then
@@ -498,16 +587,29 @@ if psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
 else
   foreign_denied_status=$?
 fi
+if psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres -X \
+  -v ON_ERROR_STOP=1 \
+  -c "SET ROLE pos3ql_fdw_reader; \
+      MERGE INTO pos3ql_fdw_source AS target \
+      USING (VALUES (1)) AS source(id) ON target.id = source.id \
+      WHEN MATCHED THEN UPDATE SET note = 'forbidden'" \
+  > "$WORK/foreign_merge_privilege_denied.out" 2>&1; then
+  foreign_merge_denied_status=0
+else
+  foreign_merge_denied_status=$?
+fi
 foreign_hidden=$(psql -h 127.0.0.1 -p "$P3_PORT" -U "$PGUSER" -d postgres \
   -X -Atq -v ON_ERROR_STOP=1 \
   -c 'SET ROLE pos3ql_fdw_observer; SELECT bool_and(umoptions IS NULL) FROM pg_user_mapping' \
   2>/dev/null)
-if [[ $foreign_privilege_setup_status -eq 0 && "$foreign_allowed" == $'1\n2\n3\n4\n6\n7\n8' \
-      && $foreign_denied_status -ne 0 && "$foreign_hidden" == t ]]; then
-  ok "foreign scans enforce column demand and hide other mappings"
+if [[ $foreign_privilege_setup_status -eq 0 && "$foreign_allowed" == $'1\n3\n4\n6\n7\n8\n9' \
+      && $foreign_denied_status -ne 0 && $foreign_merge_denied_status -ne 0 \
+      && "$foreign_hidden" == t ]]; then
+  ok "foreign scans and MERGE enforce privileges and hide other mappings"
 else
   bad "foreign scan and mapping privilege behavior"
-  cat "$WORK/foreign_privilege_setup.out" "$WORK/foreign_privilege_denied.out"
+  cat "$WORK/foreign_privilege_setup.out" "$WORK/foreign_privilege_denied.out" \
+    "$WORK/foreign_merge_privilege_denied.out"
   printf 'allowed:\n%s\nhidden:\n%s\n' "$foreign_allowed" "$foreign_hidden"
 fi
 restart_p3 || exit 1

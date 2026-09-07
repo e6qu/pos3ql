@@ -932,6 +932,17 @@ impl TxnState {
         !self.savepoints.is_empty()
     }
 
+    pub(crate) fn copy_savepoint_names(&self, output: &mut [StackStr<63>]) -> usize {
+        let count = self.savepoints.len().min(output.len());
+        for (target, savepoint) in output[..count]
+            .iter_mut()
+            .zip(&self.savepoints.as_slice()[..count])
+        {
+            *target = savepoint.name;
+        }
+        count
+    }
+
     /// The ReadyForQuery status byte: idle / in transaction / failed.
     /// The current command-id, stamped on this statement's row writes and used
     /// as the read snapshot within the statement.

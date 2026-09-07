@@ -3963,9 +3963,13 @@ impl Engine {
         txn: &mut TxnState,
         takes_snapshot: bool,
     ) -> Result<(), SqlError> {
-        self.storage.set_foreign_statement_isolation(
+        let mut foreign_savepoints =
+            [crate::util::StackStr::new(); crate::sql::txn::MAX_SAVEPOINTS];
+        let foreign_savepoint_count = txn.copy_savepoint_names(&mut foreign_savepoints);
+        self.storage.set_foreign_statement_context(
             txn.txid,
             txn.isolation == TransactionIsolation::Serializable,
+            &foreign_savepoints[..foreign_savepoint_count],
         );
         txn.begin_command();
         self.storage.set_read_snapshot(crate::storage::SNAPSHOT_ALL);
@@ -6542,20 +6546,30 @@ impl Engine {
         txid: u32,
     ) -> Result<(), SqlError> {
         for target in targets {
-            let slot = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
-            let definition = self.storage.table_def(slot, txid);
-            for column in target.columns {
-                if !definition
-                    .columns()
-                    .iter()
-                    .any(|metadata| metadata.name.as_str() == *column)
+            let root = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
+            for slot in 0..self.storage.table_count() {
+                if !self.storage.table_slot_visible_to(slot, txid)
+                    || !self.storage.relation_visible_to_current_session(slot, txid)
+                    || (slot != root
+                        && (target.inheritance == ast::RelationInheritance::Only
+                            || !self.storage.relation_descends_from(slot, root, txid)))
                 {
-                    return Err(sql_err!(
-                        sqlstate::UNDEFINED_COLUMN,
-                        "column \"{}\" of relation \"{}\" does not exist",
-                        column,
-                        target.table.name
-                    ));
+                    continue;
+                }
+                let definition = self.storage.table_def(slot, txid);
+                for column in target.columns {
+                    if !definition
+                        .columns()
+                        .iter()
+                        .any(|metadata| metadata.name.as_str() == *column)
+                    {
+                        return Err(sql_err!(
+                            sqlstate::UNDEFINED_COLUMN,
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            column,
+                            target.table.name
+                        ));
+                    }
                 }
             }
         }
@@ -6570,15 +6584,26 @@ impl Engine {
     ) -> Result<(), SqlError> {
         if targets.is_empty() {
             for slot in 0..self.storage.table_count() {
-                if self.storage.table(slot).visible_to(txid) {
+                if self.storage.table_slot_visible_to(slot, txid)
+                    && self.storage.relation_visible_to_current_session(slot, txid)
+                {
                     self.storage.lock_table(txid, slot, mode, false)?;
                 }
             }
             return Ok(());
         }
         for target in targets {
-            let slot = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
-            self.storage.lock_table(txid, slot, mode, false)?;
+            let root = exec::resolve_dml_table(&self.storage, &target.table, txid)?;
+            for slot in 0..self.storage.table_count() {
+                if self.storage.table_slot_visible_to(slot, txid)
+                    && self.storage.relation_visible_to_current_session(slot, txid)
+                    && (slot == root
+                        || (target.inheritance == ast::RelationInheritance::Descendants
+                            && self.storage.relation_descends_from(slot, root, txid)))
+                {
+                    self.storage.lock_table(txid, slot, mode, false)?;
+                }
+            }
         }
         Ok(())
     }
@@ -6592,7 +6617,11 @@ impl Engine {
         let mut total_rows = 0u64;
         if targets.is_empty() {
             for slot in 0..self.storage.table_count() {
-                if self.storage.table(slot).visible_to(txn.txid) {
+                if self.storage.table_slot_visible_to(slot, txn.txid)
+                    && self
+                        .storage
+                        .relation_visible_to_current_session(slot, txn.txid)
+                {
                     txn.record_statistics(slot as u32)?;
                     total_rows = total_rows
                         .saturating_add(self.storage.analyze_table(slot, txn.txid, &[])?.rows);
@@ -6608,31 +6637,43 @@ impl Engine {
             return Ok(total_rows);
         }
         for target in targets {
-            let slot = exec::resolve_dml_table(&self.storage, &target.table, txn.txid)?;
-            let definition = self.storage.table_def(slot, txn.txid);
-            let mut selected = [0usize; crate::storage::MAX_COLUMNS];
-            let mut selected_count = 0usize;
-            for column in target.columns {
-                selected[selected_count] = definition
-                    .columns()
-                    .iter()
-                    .position(|metadata| metadata.name.as_str() == *column)
-                    .expect("maintenance targets were validated");
-                selected_count += 1;
+            let root = exec::resolve_dml_table(&self.storage, &target.table, txn.txid)?;
+            for slot in 0..self.storage.table_count() {
+                if !self.storage.table_slot_visible_to(slot, txn.txid)
+                    || !self
+                        .storage
+                        .relation_visible_to_current_session(slot, txn.txid)
+                    || (slot != root
+                        && (target.inheritance == ast::RelationInheritance::Only
+                            || !self.storage.relation_descends_from(slot, root, txn.txid)))
+                {
+                    continue;
+                }
+                let definition = self.storage.table_def(slot, txn.txid);
+                let mut selected = [0usize; crate::storage::MAX_COLUMNS];
+                let mut selected_count = 0usize;
+                for column in target.columns {
+                    selected[selected_count] = definition
+                        .columns()
+                        .iter()
+                        .position(|metadata| metadata.name.as_str() == *column)
+                        .expect("maintenance targets were validated");
+                    selected_count += 1;
+                }
+                txn.record_statistics(slot as u32)?;
+                total_rows = total_rows.saturating_add(
+                    self.storage
+                        .analyze_table(slot, txn.txid, &selected[..selected_count])?
+                        .rows,
+                );
+                exec::analyze_extended_statistics(
+                    &mut self.storage,
+                    txn,
+                    slot,
+                    &selected[..selected_count],
+                    &mut self.work,
+                )?;
             }
-            txn.record_statistics(slot as u32)?;
-            total_rows = total_rows.saturating_add(
-                self.storage
-                    .analyze_table(slot, txn.txid, &selected[..selected_count])?
-                    .rows,
-            );
-            exec::analyze_extended_statistics(
-                &mut self.storage,
-                txn,
-                slot,
-                &selected[..selected_count],
-                &mut self.work,
-            )?;
         }
         Ok(total_rows)
     }

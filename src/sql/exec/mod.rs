@@ -52018,6 +52018,9 @@ struct MergeLookup<'d, 'v> {
     /// PostgreSQL-visible: referring to the source there is a missing
     /// FROM-clause entry, not a NULL-valued row.
     source: Option<&'v [Datum<'v>]>,
+    /// RETURNING is typed against the complete source/target output scope;
+    /// the absent half of a target-only candidate is a NULL row there.
+    source_namespace_when_absent: bool,
     /// Names and images exist only while evaluating a `RETURNING` list.
     old_name: Option<&'d str>,
     old: Option<&'v [Datum<'v>]>,
@@ -52049,6 +52052,11 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
                     .column_index(name)
                     .map(|i| source[i])
                     .ok_or_else(|| undefined_column(name)),
+                None if self.source_namespace_when_absent => self
+                    .source_def
+                    .column_index(name)
+                    .map(|_| Datum::Null)
+                    .ok_or_else(|| undefined_column(name)),
                 None => Err(sql_err!(
                     sqlstate::UNDEFINED_TABLE,
                     "missing FROM-clause entry for table \"{}\"",
@@ -52062,7 +52070,9 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
             )),
             None => match (
                 self.target_def.column_index(name),
-                self.source.and_then(|_| self.source_def.column_index(name)),
+                (self.source.is_some() || self.source_namespace_when_absent)
+                    .then(|| self.source_def.column_index(name))
+                    .flatten(),
             ) {
                 (Some(_), Some(_)) => Err(sql_err!(
                     sqlstate::AMBIGUOUS_COLUMN,
@@ -52072,6 +52082,7 @@ impl<'v> ColumnLookup<'v> for MergeLookup<'_, 'v> {
                 (Some(i), None) => Ok(self.target[i]),
                 (None, Some(i)) => match self.source {
                     Some(source) => Ok(source[i]),
+                    None if self.source_namespace_when_absent => Ok(Datum::Null),
                     None => Err(undefined_column(name)),
                 },
                 (None, None) => Err(undefined_column(name)),
@@ -52117,15 +52128,21 @@ impl<'d> MergeLookup<'d, '_> {
                 .target_def
                 .column_index(name)
                 .map(|index| &self.target_def.columns()[index]),
-            Some(qualifier) if qualifier == self.source_alias => self.source.and_then(|_| {
-                self.source_def
-                    .column_index(name)
-                    .map(|index| &self.source_def.columns()[index])
-            }),
+            Some(qualifier) if qualifier == self.source_alias => self
+                .source
+                .and_then(|_| self.source_def.column_index(name))
+                .or_else(|| {
+                    self.source_namespace_when_absent
+                        .then(|| self.source_def.column_index(name))
+                        .flatten()
+                })
+                .map(|index| &self.source_def.columns()[index]),
             Some(_) => None,
             None => match (
                 self.target_def.column_index(name),
-                self.source.and_then(|_| self.source_def.column_index(name)),
+                (self.source.is_some() || self.source_namespace_when_absent)
+                    .then(|| self.source_def.column_index(name))
+                    .flatten(),
             ) {
                 (Some(index), None) => Some(&self.target_def.columns()[index]),
                 (None, Some(index)) => Some(&self.source_def.columns()[index]),
@@ -52505,12 +52522,7 @@ pub fn merge<'a>(
         }
     }
     let def = *storage.table_def(table_index, txn.txid);
-    if def.kind == crate::storage::TableKind::Foreign {
-        return sql_fail(sql_err!(
-            sqlstate::FEATURE_NOT_SUPPORTED,
-            "foreign-table MERGE is not supported"
-        ));
-    }
+    let foreign_target = def.kind == crate::storage::TableKind::Foreign;
     let target_alias = statement.target_alias.or(Some(statement.target.name));
     let mut update_columns = 0u64;
     let mut insert_columns = 0u64;
@@ -52942,9 +52954,13 @@ pub fn merge<'a>(
         // must not reduce the bounded arena available to the source snapshot.
         unsafe { arena.rewind_to(mark) };
     }
-    // Pass 1: count source rows. Pass 2: encode each to arena bytes.
-    let source_count_mark = arena.mark();
+    // Materialize the source exactly once. Re-evaluating it to count first
+    // would duplicate volatile effects and could observe a different foreign
+    // snapshot on the second pass.
     let mut n_source = 0usize;
+    let mut source_capacity = 0usize;
+    let mut source_rows_ptr: *mut &[u8] = core::ptr::null_mut();
+    let source_sequences = crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
     if let Err(e) = super::query::select_into_rows(
         storage,
         txn.txid,
@@ -52952,42 +52968,40 @@ pub fn merge<'a>(
         arena,
         params,
         None,
-        None,
-        &mut |_| {
+        Some(&source_sequences),
+        &mut |values| {
+            let encoded = encode_projected_pub(values, arena)?;
+            if n_source == source_capacity {
+                let next_capacity = if source_capacity == 0 {
+                    8
+                } else {
+                    source_capacity
+                        .checked_mul(2)
+                        .ok_or_else(super::query::arena_full_pub)?
+                };
+                let fresh = arena
+                    .alloc_slice_with(next_capacity, |_| &[][..])
+                    .map_err(|_| super::query::arena_full_pub())?;
+                if n_source != 0 {
+                    let previous =
+                        unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) };
+                    fresh[..n_source].copy_from_slice(previous);
+                }
+                source_rows_ptr = fresh.as_mut_ptr();
+                source_capacity = next_capacity;
+            }
+            unsafe { source_rows_ptr.add(n_source).write(encoded) };
             n_source += 1;
             Ok(())
         },
     ) {
-        unsafe { arena.rewind_to(source_count_mark) };
         return sql_fail(e);
     }
-    // Counting cannot retain a datum: retaining its temporary query rows
-    // would make a small VALUES source consume the output arena twice.
-    unsafe { arena.rewind_to(source_count_mark) };
-    let empty: &[u8] = &[];
-    let source_rows: &mut [&[u8]] = match arena.alloc_slice_with(n_source, |_| empty) {
-        Ok(r) => r,
-        Err(_) => return sql_fail(super::query::arena_full_pub()),
+    let source_rows: &[&[u8]] = if n_source == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(source_rows_ptr, n_source) }
     };
-    {
-        let mut at = 0usize;
-        if let Err(e) = super::query::select_into_rows(
-            storage,
-            txn.txid,
-            &source_select,
-            arena,
-            params,
-            None,
-            None,
-            &mut |vals| {
-                source_rows[at] = encode_projected_pub(vals, arena)?;
-                at += 1;
-                Ok(())
-            },
-        ) {
-            return sql_fail(e);
-        }
-    }
     let mut insert_transitions = if merge_events & TriggerEvents::INSERT != 0
         && transition_capture_required(
             storage,
@@ -53019,19 +53033,91 @@ pub fn merge<'a>(
         Err(error) => return sql_fail(error),
     };
     let mut n_target = 0usize;
-    for &leaf in leaves {
-        n_target = match storage.visible_row_count(leaf, txn.txid) {
-            Ok(n) => match n_target.checked_add(n) {
-                Some(total) => total,
-                None => return sql_fail(super::query::arena_full_pub()),
+    let mut foreign_rows: *mut Option<(crate::sql::foreign::RemoteTupleId, &'a [Datum<'a>])> =
+        core::ptr::null_mut();
+    let mut foreign_capacity = 0usize;
+    if foreign_target {
+        if let Err(error) = crate::sql::foreign::visit_mutable_rows(
+            storage,
+            table_index,
+            txn.txid,
+            arena,
+            &mut |tuple_id, bytes| {
+                let mut values = [Datum::Null; MAX_COLUMNS];
+                rowenc::decode(bytes, target_schema, &mut values)?;
+                if let Some(plan) = select_security {
+                    let context = RowCtx {
+                        def: &def,
+                        values: &values[..def.n_columns],
+                        alias: None,
+                    };
+                    let catalog = super::query::storage_catalog(storage, arena, txn.txid);
+                    let sequences =
+                        crate::sql::sequence::SeqEval::new(storage, seq_session, txn.txid);
+                    let hooks = EvalHooks {
+                        catalog: Some(&catalog),
+                        sequences: Some(&sequences),
+                        ..NO_HOOKS
+                    };
+                    if !super::query::row_security_passes(
+                        plan, &context, storage, txn.txid, arena, params, &hooks,
+                    )? {
+                        return Ok(());
+                    }
+                }
+                let owned = arena
+                    .alloc_slice_copy(&values[..def.n_columns])
+                    .map_err(|_| super::query::arena_full_pub())?;
+                if n_target == foreign_capacity {
+                    let next_capacity = if foreign_capacity == 0 {
+                        8
+                    } else {
+                        foreign_capacity
+                            .checked_mul(2)
+                            .ok_or_else(super::query::arena_full_pub)?
+                    };
+                    let fresh = arena
+                        .alloc_slice_with(next_capacity, |_| None)
+                        .map_err(|_| super::query::arena_full_pub())?;
+                    if n_target != 0 {
+                        let previous =
+                            unsafe { core::slice::from_raw_parts(foreign_rows, n_target) };
+                        fresh[..n_target].copy_from_slice(previous);
+                    }
+                    foreign_rows = fresh.as_mut_ptr();
+                    foreign_capacity = next_capacity;
+                }
+                unsafe { foreign_rows.add(n_target).write(Some((tuple_id, owned))) };
+                n_target += 1;
+                Ok(())
             },
-            Err(error) => return sql_fail(error),
-        };
+        ) {
+            return sql_fail(error);
+        }
+    } else {
+        for &leaf in leaves {
+            n_target = match storage.visible_row_count(leaf, txn.txid) {
+                Ok(n) => match n_target.checked_add(n) {
+                    Some(total) => total,
+                    None => return sql_fail(super::query::arena_full_pub()),
+                },
+                Err(error) => return sql_fail(error),
+            };
+        }
     }
     let target_ids: &mut [u64] = match arena.alloc_slice_with(n_target, |_| 0u64) {
         Ok(s) => s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
+    let mut target_remote_ids: Option<&mut [Option<crate::sql::foreign::RemoteTupleId>]> =
+        if foreign_target {
+            match arena.alloc_slice_with(n_target, |_| None) {
+                Ok(ids) => Some(ids),
+                Err(_) => return sql_fail(super::query::arena_full_pub()),
+            }
+        } else {
+            None
+        };
     let target_tables: &mut [usize] = match arena.alloc_slice_with(n_target, |_| usize::MAX) {
         Ok(s) => s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
@@ -53058,7 +53144,21 @@ pub fn merge<'a>(
         Ok(s) => s,
         Err(_) => return sql_fail(super::query::arena_full_pub()),
     };
-    {
+    if foreign_target {
+        let rows = if n_target == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(foreign_rows, n_target) }
+        };
+        for (index, row) in rows.iter().enumerate() {
+            let (tuple_id, values) = row.expect("foreign MERGE rows are initialized");
+            target_tables[index] = table_index;
+            target_remote_ids
+                .as_deref_mut()
+                .expect("foreign targets allocate remote tuple identities")[index] = Some(tuple_id);
+            target_vals[index] = values;
+        }
+    } else {
         use core::ops::ControlFlow;
         // Snapshot rowid + home first (the closure cannot borrow the arena while
         // `storage` is borrowed), then decode.
@@ -53230,6 +53330,7 @@ pub fn merge<'a>(
                 source_def,
                 source_alias,
                 source: (!by_source).then_some(sv),
+                source_namespace_when_absent: false,
                 old_name: None,
                 old: None,
                 new_name: None,
@@ -53335,23 +53436,53 @@ pub fn merge<'a>(
                         } {
                             break;
                         }
-                        affected[j] = true;
-                        match storage.write_pending(
-                            target_tables[j],
-                            target_ids[j],
-                            txn.txid,
-                            txn.command_id(),
-                            None,
-                        ) {
-                            Ok(prior) => {
-                                if let Err(e) =
-                                    txn.touch(target_tables[j] as u32, target_ids[j], prior)
-                                {
-                                    return sql_fail(e);
+                        let mut deleted_values = [Datum::Null; MAX_COLUMNS];
+                        deleted_values[..def.n_columns].copy_from_slice(target_vals[j]);
+                        if let Some(tuple_id) = target_remote_ids
+                            .as_deref()
+                            .and_then(|identities| identities[j])
+                        {
+                            let deleted = match crate::sql::foreign::delete_row(
+                                storage,
+                                target_tables[j],
+                                txn.txid,
+                                tuple_id,
+                                arena,
+                            ) {
+                                Ok(Some(deleted)) => deleted,
+                                Ok(None) => {
+                                    return sql_fail(sql_err!(
+                                        sqlstate::SERIALIZATION_FAILURE,
+                                        "foreign row changed before MERGE could delete it"
+                                    ));
                                 }
+                                Err(error) => return sql_fail(error),
+                            };
+                            if let Err(error) =
+                                rowenc::decode(deleted, target_schema, &mut deleted_values)
+                            {
+                                return sql_fail(error);
                             }
-                            Err(e) => return sql_fail(e),
+                        } else {
+                            match storage.write_pending(
+                                target_tables[j],
+                                target_ids[j],
+                                txn.txid,
+                                txn.command_id(),
+                                None,
+                            ) {
+                                Ok(prior) => {
+                                    if let Err(e) =
+                                        txn.touch(target_tables[j] as u32, target_ids[j], prior)
+                                    {
+                                        return sql_fail(e);
+                                    }
+                                }
+                                Err(e) => return sql_fail(e),
+                            }
                         }
+                        affected[j] = true;
+                        let deleted_values = &deleted_values[..def.n_columns];
                         if let Err(error) = fire_partition_row_triggers(
                             storage,
                             txn,
@@ -53365,13 +53496,13 @@ pub fn merge<'a>(
                             false,
                             false,
                             0,
-                            Some(target_vals[j]),
+                            Some(deleted_values),
                             None,
                         ) {
                             return sql_fail(error);
                         }
                         if let Some(transitions) = delete_transitions.as_mut()
-                            && let Err(error) = transitions.push_old(target_vals[j], arena)
+                            && let Err(error) = transitions.push_old(deleted_values, arena)
                         {
                             return sql_fail(error);
                         }
@@ -53386,7 +53517,7 @@ pub fn merge<'a>(
                                 source_alias,
                                 (!by_source).then_some(sv),
                                 statement.returning,
-                                Some(target_vals[j]),
+                                Some(deleted_values),
                                 None,
                                 "DELETE",
                                 arena,
@@ -53408,10 +53539,12 @@ pub fn merge<'a>(
                         let mut new_values = [Datum::Null; MAX_COLUMNS];
                         new_values[..def.n_columns].copy_from_slice(target_vals[j]);
                         let mut action_update_columns = 0u64;
-                        for (name, expression) in assignments.iter() {
+                        let mut action_targets = [0usize; MAX_COLUMNS];
+                        for (assignment, (name, expression)) in assignments.iter().enumerate() {
                             let Some(ci) = def.column_index(name) else {
                                 return sql_fail(undefined_column(name));
                             };
+                            action_targets[assignment] = ci;
                             action_update_columns |= 1u64 << ci;
                             if def.columns()[ci].default.is_generated()
                                 && !matches!(expression, Expr::DefaultMarker)
@@ -53563,7 +53696,9 @@ pub fn merge<'a>(
                         if let Err(e) = check_not_null(&def, &new_values) {
                             return sql_fail(e);
                         }
-                        let updated_table = if def.partition.scheme.is_some() {
+                        let updated_table = if foreign_target {
+                            target_tables[j]
+                        } else if def.partition.scheme.is_some() {
                             match storage.partition_target(
                                 table_index,
                                 &new_values[..def.n_columns],
@@ -53593,7 +53728,7 @@ pub fn merge<'a>(
                             &def,
                             constraint_schema,
                             &new_values[..def.n_columns],
-                            Some(target_ids[j]),
+                            (!foreign_target).then_some(target_ids[j]),
                             txn.txid,
                             Some(txn),
                             &checks,
@@ -53602,101 +53737,128 @@ pub fn merge<'a>(
                         ) {
                             return sql_fail(e);
                         }
-                        let out = if updated_table == target_tables[j] {
-                            let row_definition = *storage.table_def(updated_table, txn.txid);
-                            let mut physical_new = [Datum::Null; MAX_COLUMNS];
-                            physical_new[..def.n_columns]
-                                .copy_from_slice(&new_values[..def.n_columns]);
-                            physical_new[def.n_columns..row_definition.n_columns]
-                                .copy_from_slice(target_suffixes[j]);
-                            let len =
-                                rowenc::encoded_len(&physical_new[..row_definition.n_columns]);
-                            let out = match arena.alloc_slice_with(len, |_| 0u8) {
-                                Ok(out) => out,
-                                Err(_) => return sql_fail(super::query::arena_full_pub()),
-                            };
-                            rowenc::encode(&physical_new[..row_definition.n_columns], out);
-                            out
-                        } else {
-                            let len = rowenc::encoded_len(&new_values[..def.n_columns]);
-                            let out = match arena.alloc_slice_with(len, |_| 0u8) {
-                                Ok(out) => out,
-                                Err(_) => return sql_fail(super::query::arena_full_pub()),
-                            };
-                            rowenc::encode(&new_values[..def.n_columns], out);
-                            out
-                        };
-                        let (loc, slice) = match storage.heap.append(out.len()) {
-                            Ok(x) => x,
-                            Err(e) => return sql_fail(e),
-                        };
-                        slice.copy_from_slice(out);
-                        if updated_table == target_tables[j] {
-                            match storage.write_pending(
-                                updated_table,
-                                target_ids[j],
+                        if let Some(tuple_id) = target_remote_ids
+                            .as_deref()
+                            .and_then(|identities| identities[j])
+                        {
+                            let changed = match crate::sql::foreign::update_row(
+                                storage,
+                                target_tables[j],
                                 txn.txid,
-                                txn.command_id(),
-                                Some(loc),
+                                crate::sql::foreign::RemoteUpdate {
+                                    tuple_id,
+                                    target_columns: &action_targets[..assignments.len()],
+                                    values: &mut new_values[..def.n_columns],
+                                    render: responder.render_context(),
+                                },
+                                arena,
                             ) {
-                                Ok(prior) => {
-                                    if let Err(e) =
-                                        txn.touch(updated_table as u32, target_ids[j], prior)
-                                    {
-                                        storage.restore_pending(
-                                            updated_table,
-                                            target_ids[j],
-                                            txn.txid,
-                                            prior,
-                                        );
-                                        return sql_fail(e);
-                                    }
-                                }
-                                Err(e) => return sql_fail(e),
-                            }
-                        } else {
-                            let inserted_rowid = storage.next_rowid();
-                            let prior = match storage.write_pending(
-                                updated_table,
-                                inserted_rowid,
-                                txn.txid,
-                                txn.command_id(),
-                                Some(loc),
-                            ) {
-                                Ok(prior) => prior,
+                                Ok(changed) => changed,
                                 Err(error) => return sql_fail(error),
                             };
-                            if let Err(error) =
-                                txn.touch(updated_table as u32, inserted_rowid, prior)
-                            {
-                                storage.restore_pending(
+                            if !changed {
+                                return sql_fail(sql_err!(
+                                    sqlstate::SERIALIZATION_FAILURE,
+                                    "foreign row changed before MERGE could update it"
+                                ));
+                            }
+                        } else {
+                            let out = if updated_table == target_tables[j] {
+                                let row_definition = *storage.table_def(updated_table, txn.txid);
+                                let mut physical_new = [Datum::Null; MAX_COLUMNS];
+                                physical_new[..def.n_columns]
+                                    .copy_from_slice(&new_values[..def.n_columns]);
+                                physical_new[def.n_columns..row_definition.n_columns]
+                                    .copy_from_slice(target_suffixes[j]);
+                                let len =
+                                    rowenc::encoded_len(&physical_new[..row_definition.n_columns]);
+                                let out = match arena.alloc_slice_with(len, |_| 0u8) {
+                                    Ok(out) => out,
+                                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                                };
+                                rowenc::encode(&physical_new[..row_definition.n_columns], out);
+                                out
+                            } else {
+                                let len = rowenc::encoded_len(&new_values[..def.n_columns]);
+                                let out = match arena.alloc_slice_with(len, |_| 0u8) {
+                                    Ok(out) => out,
+                                    Err(_) => return sql_fail(super::query::arena_full_pub()),
+                                };
+                                rowenc::encode(&new_values[..def.n_columns], out);
+                                out
+                            };
+                            let (loc, slice) = match storage.heap.append(out.len()) {
+                                Ok(x) => x,
+                                Err(e) => return sql_fail(e),
+                            };
+                            slice.copy_from_slice(out);
+                            if updated_table == target_tables[j] {
+                                match storage.write_pending(
+                                    updated_table,
+                                    target_ids[j],
+                                    txn.txid,
+                                    txn.command_id(),
+                                    Some(loc),
+                                ) {
+                                    Ok(prior) => {
+                                        if let Err(e) =
+                                            txn.touch(updated_table as u32, target_ids[j], prior)
+                                        {
+                                            storage.restore_pending(
+                                                updated_table,
+                                                target_ids[j],
+                                                txn.txid,
+                                                prior,
+                                            );
+                                            return sql_fail(e);
+                                        }
+                                    }
+                                    Err(e) => return sql_fail(e),
+                                }
+                            } else {
+                                let inserted_rowid = storage.next_rowid();
+                                let prior = match storage.write_pending(
                                     updated_table,
                                     inserted_rowid,
                                     txn.txid,
-                                    prior,
-                                );
-                                return sql_fail(error);
-                            }
-                            let prior = match storage.write_pending(
-                                target_tables[j],
-                                target_ids[j],
-                                txn.txid,
-                                txn.command_id(),
-                                None,
-                            ) {
-                                Ok(prior) => prior,
-                                Err(error) => return sql_fail(error),
-                            };
-                            if let Err(error) =
-                                txn.touch(target_tables[j] as u32, target_ids[j], prior)
-                            {
-                                storage.restore_pending(
+                                    txn.command_id(),
+                                    Some(loc),
+                                ) {
+                                    Ok(prior) => prior,
+                                    Err(error) => return sql_fail(error),
+                                };
+                                if let Err(error) =
+                                    txn.touch(updated_table as u32, inserted_rowid, prior)
+                                {
+                                    storage.restore_pending(
+                                        updated_table,
+                                        inserted_rowid,
+                                        txn.txid,
+                                        prior,
+                                    );
+                                    return sql_fail(error);
+                                }
+                                let prior = match storage.write_pending(
                                     target_tables[j],
                                     target_ids[j],
                                     txn.txid,
-                                    prior,
-                                );
-                                return sql_fail(error);
+                                    txn.command_id(),
+                                    None,
+                                ) {
+                                    Ok(prior) => prior,
+                                    Err(error) => return sql_fail(error),
+                                };
+                                if let Err(error) =
+                                    txn.touch(target_tables[j] as u32, target_ids[j], prior)
+                                {
+                                    storage.restore_pending(
+                                        target_tables[j],
+                                        target_ids[j],
+                                        txn.txid,
+                                        prior,
+                                    );
+                                    return sql_fail(error);
+                                }
                             }
                         }
                         if let Err(error) = fire_partition_row_triggers(
@@ -54110,7 +54272,26 @@ fn merge_insert<'a>(
         arena,
         params,
     )?;
-    store_row(storage, txn, target_table, None, &row_arr[..def.n_columns])?;
+    if def.kind == crate::storage::TableKind::Foreign {
+        if crate::sql::foreign::insert_row(
+            storage,
+            target_table,
+            txn.txid,
+            &mut row_arr[..def.n_columns],
+            false,
+            responder.render_context(),
+            arena,
+        )?
+        .is_none()
+        {
+            return Err(sql_err!(
+                sqlstate::INTERNAL_ERROR,
+                "foreign MERGE INSERT returned no row"
+            ));
+        }
+    } else {
+        store_row(storage, txn, target_table, None, &row_arr[..def.n_columns])?;
+    }
     fire_partition_row_triggers(
         storage,
         txn,
@@ -56175,9 +56356,9 @@ fn emit_projected(
     Ok(Ok(()))
 }
 
-/// Emits one MERGE `RETURNING` row. The candidate lookup keeps the source
-/// namespace absent for target-only candidates, exactly as it was while the
-/// action expression was evaluated.
+/// Emits one MERGE `RETURNING` row. Unlike a target-only action expression,
+/// PostgreSQL keeps the source namespace visible here and projects its absent
+/// row as typed NULL values.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn emit_merge_returning<'a>(
     storage: &Storage,
@@ -56204,6 +56385,7 @@ fn emit_merge_returning<'a>(
         source_def,
         source_alias,
         source,
+        source_namespace_when_absent: true,
         old_name: Some(returning.old_name()),
         old,
         new_name: Some(returning.new_name()),
@@ -56268,15 +56450,8 @@ fn emit_merge_returning<'a>(
                 }
             }
             SelectItem::TableWildcard(qualifier) if *qualifier == source_alias => {
-                let Some(source) = source else {
-                    return Ok(Err(sql_err!(
-                        sqlstate::UNDEFINED_TABLE,
-                        "missing FROM-clause entry for table \"{}\"",
-                        qualifier
-                    )));
-                };
-                for value in source {
-                    projected[n] = *value;
+                for index in 0..source_def.n_columns {
+                    projected[n] = source.map_or(Datum::Null, |values| values[index]);
                     n += 1;
                 }
             }

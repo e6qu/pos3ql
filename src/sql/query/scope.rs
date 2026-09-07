@@ -10,7 +10,7 @@
 
 use crate::mem::arena::Arena;
 use crate::sql::ast::{BinaryOp, Expr, FromClause, MAX_USING_COLUMNS, MaterializedCte, TableRef};
-use crate::sql::eval::{ColumnLookup, SqlError, sqlstate};
+use crate::sql::eval::{ColumnLookup, SequenceAccess, SqlError, sqlstate};
 use crate::sql::types::{ColType, Datum};
 use crate::sql_err;
 use crate::storage::{ColumnMeta, MAX_COLUMNS, SqlName, Storage, TableDef, UserTypeName};
@@ -328,8 +328,9 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
+        sequences: Option<&dyn SequenceAccess>,
     ) -> Result<QueryScope<'a>, SqlError> {
-        Self::resolve_exec_outer(storage, from, txid, arena, params, None)
+        Self::resolve_exec_outer(storage, from, txid, arena, params, sequences, None)
     }
 
     /// Execution scope with an enclosing row available while FROM items are
@@ -341,12 +342,13 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
+        sequences: Option<&dyn SequenceAccess>,
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<QueryScope<'a>, SqlError> {
         let mut scope = QueryScope::empty(storage, txid, arena, from)?;
-        scope.add_exec(storage, &from.base, txid, arena, params, outer)?;
+        scope.add_exec(storage, &from.base, txid, arena, params, sequences, outer)?;
         for j in from.joins {
-            scope.add_exec(storage, &j.table, txid, arena, params, outer)?;
+            scope.add_exec(storage, &j.table, txid, arena, params, sequences, outer)?;
         }
         scope.build_merges(from, arena, Some(arena))?;
         Ok(scope)
@@ -432,6 +434,10 @@ impl<'d> QueryScope<'d> {
     }
 
     /// Add one FROM item, materializing a derived table if `tref` is a subquery.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "execution scope carries typed transaction, memory, sequence, and correlation contexts"
+    )]
     fn add_exec<'a>(
         &mut self,
         storage: &'a Storage,
@@ -439,6 +445,7 @@ impl<'d> QueryScope<'d> {
         txid: u32,
         arena: &'a Arena,
         params: &[Datum<'a>],
+        sequences: Option<&dyn SequenceAccess>,
         outer: Option<&dyn ColumnLookup<'a>>,
     ) -> Result<(), SqlError>
     where
@@ -543,7 +550,7 @@ impl<'d> QueryScope<'d> {
                 arena,
                 params,
                 None,
-                None,
+                sequences,
                 &mut |values| {
                     storage
                         .with_block_store(|blocks| {
@@ -575,7 +582,7 @@ impl<'d> QueryScope<'d> {
                 arena,
                 params,
                 None,
-                None,
+                sequences,
                 &mut |values| {
                     let encoded = crate::sql::exec::encode_projected_pub(values, arena)?;
                     if len == cap {

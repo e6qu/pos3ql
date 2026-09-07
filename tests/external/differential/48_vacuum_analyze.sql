@@ -22,6 +22,26 @@ ANALYZE vt (a, b);
 ANALYZE missing_table;
 ANALYZE vt (missing_column);
 
+-- Maintenance targets retain PostgreSQL's inheritance selection. ONLY
+-- touches the named relation; the default and explicit `*` include every
+-- ordinary-inheritance descendant.
+CREATE TABLE maintenance_parent (a integer);
+CREATE TABLE maintenance_child (b integer) INHERITS (maintenance_parent);
+INSERT INTO maintenance_parent VALUES (1);
+INSERT INTO maintenance_child VALUES (2, 20), (3, 30);
+ANALYZE ONLY maintenance_parent;
+SELECT relname, reltuples::integer
+  FROM pg_class WHERE relname IN ('maintenance_parent', 'maintenance_child')
+  ORDER BY relname;
+ANALYZE maintenance_parent *;
+SELECT relname, reltuples::integer
+  FROM pg_class WHERE relname IN ('maintenance_parent', 'maintenance_child')
+  ORDER BY relname;
+VACUUM ONLY maintenance_parent;
+VACUUM maintenance_parent *;
+ANALYZE ONLY maintenance_parent *;
+DROP TABLE maintenance_parent CASCADE;
+
 -- The data is untouched by maintenance.
 SELECT count(*) FROM vt;
 

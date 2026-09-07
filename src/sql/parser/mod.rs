@@ -3489,9 +3489,12 @@ impl<'a> Parser<'a> {
                             | "skip_locked"
                             | "disable_page_skipping"
                             | "index_cleanup"
+                            | "process_main"
                             | "process_toast"
                             | "truncate"
                             | "parallel"
+                            | "skip_database_stats"
+                            | "only_database_stats"
                             | "buffer_usage_limit"
                     )
                 ) {
@@ -3514,6 +3517,7 @@ impl<'a> Parser<'a> {
         let empty_target = crate::sql::ast::MaintenanceTarget {
             table: QualName::bare(""),
             columns: &[],
+            inheritance: crate::sql::ast::RelationInheritance::Descendants,
         };
         let mut targets = [empty_target; 64];
         let mut target_count = 0usize;
@@ -3522,7 +3526,15 @@ impl<'a> Parser<'a> {
                 if target_count == targets.len() {
                     return Err(self.unexpected("too many maintenance targets"));
                 }
+                let inheritance = if self.eat_ident("only")? {
+                    crate::sql::ast::RelationInheritance::Only
+                } else {
+                    crate::sql::ast::RelationInheritance::Descendants
+                };
                 let table = self.qual_name("table name")?;
+                if self.eat_op("*")? && inheritance == crate::sql::ast::RelationInheritance::Only {
+                    return Err(self.err_here("ONLY and * cannot be used together"));
+                }
                 let mut column_names = [""; crate::storage::MAX_COLUMNS];
                 let mut column_count = 0usize;
                 if self.eat_op("(")? {
@@ -3541,6 +3553,7 @@ impl<'a> Parser<'a> {
                 targets[target_count] = crate::sql::ast::MaintenanceTarget {
                     table,
                     columns: self.arena_slice(&column_names[..column_count])?,
+                    inheritance,
                 };
                 target_count += 1;
                 if !self.eat_op(",")? {
